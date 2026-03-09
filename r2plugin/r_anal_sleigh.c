@@ -225,6 +225,8 @@ static size_t struct_decl_memo_capacity = 0;
 #define SLEIGH_TYPE_MAX_BLOCKS_DEFAULT 500
 #define SLEIGH_TYPE_WRITEBACK_GLOBAL_MAX_FCNS 128
 #define SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT 128
+#define SLEIGH_CALLER_PROP_MAX_PER_CALLEE 256
+#define SLEIGH_CALLER_PROP_MAX_TOTAL 2048
 #define SLEIGH_CALLER_PROP_SAMPLE_MAX 5
 #define SLEIGH_TAINT_LABEL_MAX 6
 #define SLEIGH_COMMENT_PREFIX_SEMANTIC "sla:"
@@ -6929,6 +6931,9 @@ static void propagate_signature_to_direct_callers(
 	len = RVecAnalRef_length (refs);
 	for (i = 0; i < len; i++) {
 		RAnalRef *ref = RVecAnalRef_at (refs, i);
+		if (callee_callers_count >= SLEIGH_CALLER_PROP_MAX_PER_CALLEE) {
+			break;
+		}
 		if (!ref || !ref->at || !is_caller_propagation_ref_type (ref->type)) {
 			continue;
 		}
@@ -6939,6 +6944,10 @@ static void propagate_signature_to_direct_callers(
 		ut64 caller_site = callee_callers[i];
 		RAnalFunction *caller_fcn;
 		ut64 caller_addr;
+
+		if (state->updated_callers_count >= SLEIGH_CALLER_PROP_MAX_TOTAL) {
+			break;
+		}
 
 		state->prop_callers_considered++;
 		caller_fcn = r_anal_get_fcn_in (anal, caller_site, 0);
