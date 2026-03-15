@@ -1579,7 +1579,7 @@ mod tests {
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::from([(
             "tmp:stackaddr_1".to_string(),
-            StackSlotProvenance { offset: -0x18 },
+            StackSlotProvenance::new(-0x18),
         )]);
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(

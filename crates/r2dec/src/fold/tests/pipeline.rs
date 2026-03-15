@@ -4170,6 +4170,46 @@ mod tests {
     }
 
     #[test]
+    fn local_branch_condition_does_not_inline_return_register_call_history() {
+        let block = make_block(vec![
+            SSAOp::Call {
+                target: make_var("const:401000", 0, 8),
+            },
+            SSAOp::CallDefine {
+                dst: make_var("EAX", 1, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 1, 8),
+                src: make_var("EAX", 1, 4),
+            },
+            SSAOp::IntNotEqual {
+                dst: make_var("tmp:pred", 1, 1),
+                a: make_var("RAX", 1, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::CBranch {
+                cond: make_var("tmp:pred", 1, 1),
+                target: make_var("const:1000", 0, 8),
+            },
+        ]);
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.analyze_blocks(std::slice::from_ref(&block));
+
+        let cond = ctx
+            .extract_condition_from_block(&block)
+            .expect("local branch condition");
+        assert_eq!(
+            cond,
+            CExpr::binary(
+                BinaryOp::Ne,
+                CExpr::Var("rax_1".to_string()),
+                CExpr::IntLit(0),
+            )
+        );
+    }
+
+    #[test]
     fn test_use_info_deterministic() {
         let eax_0 = make_var("EAX", 0, 4);
         let tmp = make_var("tmp:8200", 1, 4);
@@ -4313,6 +4353,126 @@ mod tests {
         ctx.analyze_function_structure(&func);
 
         assert!(ctx.state.return_blocks.contains(&0x1000));
+    }
+
+    #[test]
+    fn annotate_stack_slot_semantics_keeps_scalar_return_kind_across_multiple_return_exits() {
+        use r2il::R2ILBlock;
+        use r2ssa::SSAFunction;
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut early_return = R2ILBlock::new(0x1008, 4);
+        early_return.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut scalar_path = R2ILBlock::new(0x1004, 4);
+        scalar_path.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let mut final_exit = R2ILBlock::new(0x1010, 4);
+        final_exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[
+            entry,
+            early_return,
+            scalar_path,
+            final_exit,
+        ])
+        .expect("ssa function");
+        func = func.with_name("sym._multi_return_scalar_slot");
+
+        func.get_block_mut(0x1000).expect("entry").ops = vec![SSAOp::CBranch {
+            cond: make_var("tmp:cond", 1, 1),
+            target: make_var("ram:1008", 0, 8),
+        }];
+        func.get_block_mut(0x1004).expect("scalar_path").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:retaddr", 1, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:retaddr", 1, 8),
+                val: make_var("EDI", 0, 4),
+            },
+            SSAOp::Branch {
+                target: make_var("ram:1010", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x1008).expect("early_return").ops = vec![SSAOp::Return {
+            target: make_var("RIP", 1, 8),
+        }];
+        func.get_block_mut(0x1010).expect("final_exit").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:retaddr", 2, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:retload", 1, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:retaddr", 2, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 1, 4),
+                src: make_var("tmp:retload", 1, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 1, 8),
+                src: make_var("EAX", 1, 4),
+            },
+            SSAOp::Return {
+                target: make_var("RIP", 2, 8),
+            },
+        ];
+
+        let empty_u64 = Box::leak(Box::new(HashMap::new()));
+        let empty_str = Box::leak(Box::new(HashMap::new()));
+        let empty_ty = Box::leak(Box::new(HashMap::new()));
+        let empty_saved = Box::leak(Box::new(HashSet::new()));
+        let arg_regs = Box::leak(Box::new(vec![
+            "rdi".to_string(),
+            "rsi".to_string(),
+            "rdx".to_string(),
+            "rcx".to_string(),
+            "r8".to_string(),
+            "r9".to_string(),
+        ]));
+        let env = PassEnv {
+            ptr_size: 8,
+            sp_name: "rsp",
+            fp_name: "rbp",
+            ret_reg_name: "rax",
+            function_names: empty_u64,
+            strings: empty_u64,
+            symbols: empty_u64,
+            arg_regs,
+            param_register_aliases: empty_str,
+            caller_saved_regs: empty_saved,
+            type_hints: empty_ty,
+            type_oracle: None,
+        };
+
+        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
+        let mut info = analysis::UseInfo::analyze(&fold_blocks, &env);
+        analysis::use_info::annotate_stack_slot_semantics(
+            &mut info,
+            &func,
+            &HashSet::from([-4]),
+            &env,
+        );
+
+        assert!(info.stack_slots.values().any(|slot| {
+            slot.offset == -4
+                && slot.return_carrier
+                && slot.value_kind == crate::analysis::StackSlotValueKind::Scalar
+        }));
     }
 
     #[test]
@@ -4549,6 +4709,20 @@ mod tests {
             },
         ];
         func.get_block_mut(0x100c).expect("exit").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:retaddr", 3, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:ret", 1, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:retaddr", 3, 8),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 1, 8),
+                src: make_var("tmp:ret", 1, 4),
+            },
             SSAOp::IntAdd {
                 dst: make_var("RSP", 2, 8),
                 a: make_var("RSP", 1, 8),
@@ -9524,6 +9698,1244 @@ mod tests {
             "expected concrete branch returns, got:\n{output}"
         );
         assert!(!output.contains("{\n    }\n"), "unexpected empty if body in:\n{output}");
+    }
+
+    #[test]
+    fn decompile_x86_solve_equation_fixture_shape_uses_arg_not_raw_stack_deref() {
+        use r2il::R2ILBlock;
+        use r2ssa::{PhiNode, SSAFunction};
+
+        let mut entry = R2ILBlock::new(0x100000850, 0x18);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x100000871, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut then_block = R2ILBlock::new(0x100000868, 9);
+        then_block.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100000878, 8),
+        });
+        let mut else_block = R2ILBlock::new(0x100000871, 7);
+        else_block.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100000878, 8),
+        });
+        let mut exit = R2ILBlock::new(0x100000878, 5);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let blocks = vec![entry, then_block, else_block, exit];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func = func.with_name("sym._solve_equation_fixture_shape");
+
+        func.get_block_mut(0x100000850).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: make_var("tmp:27d00", 1, 8),
+                src: make_var("RBP", 0, 8),
+            },
+            SSAOp::IntSub {
+                dst: make_var("RSP", 1, 8),
+                a: make_var("RSP", 0, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("RSP", 1, 8),
+                val: make_var("tmp:27d00", 1, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("RBP", 1, 8),
+                src: make_var("RSP", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 1, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6a80", 1, 4),
+                src: make_var("EDI", 0, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 1, 8),
+                val: make_var("tmp:6a80", 1, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 2, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 1, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 2, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 1, 4),
+                src: make_var("tmp:11f00", 1, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 1, 8),
+                src: make_var("EAX", 1, 4),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("CF", 1, 1),
+                a: make_var("EAX", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntLeft {
+                dst: make_var("EAX", 2, 4),
+                a: make_var("EAX", 1, 4),
+                b: make_var("const:1", 0, 4),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("tmp:69e80", 1, 1),
+                a: make_var("EAX", 2, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntXor {
+                dst: make_var("OF", 1, 1),
+                a: make_var("CF", 1, 1),
+                b: make_var("tmp:69e80", 1, 1),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 2, 8),
+                src: make_var("EAX", 2, 4),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("SF", 1, 1),
+                a: make_var("EAX", 2, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("ZF", 1, 1),
+                a: make_var("EAX", 2, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c200", 1, 4),
+                a: make_var("EAX", 2, 4),
+                b: make_var("const:ff", 0, 4),
+            },
+            SSAOp::PopCount {
+                dst: make_var("tmp:2c280", 1, 4),
+                src: make_var("tmp:2c200", 1, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c300", 1, 4),
+                a: make_var("tmp:2c280", 1, 4),
+                b: make_var("const:1", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("PF", 1, 1),
+                a: make_var("tmp:2c300", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntCarry {
+                dst: make_var("CF", 2, 1),
+                a: make_var("EAX", 2, 4),
+                b: make_var("const:5", 0, 4),
+            },
+            SSAOp::IntSCarry {
+                dst: make_var("OF", 2, 1),
+                a: make_var("EAX", 2, 4),
+                b: make_var("const:5", 0, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("EAX", 3, 4),
+                a: make_var("EAX", 2, 4),
+                b: make_var("const:5", 0, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 3, 8),
+                src: make_var("EAX", 3, 4),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("SF", 2, 1),
+                a: make_var("EAX", 3, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("ZF", 2, 1),
+                a: make_var("EAX", 3, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c200", 2, 4),
+                a: make_var("EAX", 3, 4),
+                b: make_var("const:ff", 0, 4),
+            },
+            SSAOp::PopCount {
+                dst: make_var("tmp:2c280", 2, 4),
+                src: make_var("tmp:2c200", 2, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c300", 2, 4),
+                a: make_var("tmp:2c280", 2, 4),
+                b: make_var("const:1", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("PF", 2, 1),
+                a: make_var("tmp:2c300", 2, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 3, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff4", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6a80", 2, 4),
+                src: make_var("EAX", 3, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 3, 8),
+                val: make_var("tmp:6a80", 2, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 4, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff4", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 2, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 4, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:3e900", 1, 4),
+                src: make_var("tmp:11f00", 2, 4),
+            },
+            SSAOp::IntLess {
+                dst: make_var("CF", 3, 1),
+                a: make_var("tmp:3e900", 1, 4),
+                b: make_var("const:19", 0, 4),
+            },
+            SSAOp::IntSBorrow {
+                dst: make_var("OF", 3, 1),
+                a: make_var("tmp:3e900", 1, 4),
+                b: make_var("const:19", 0, 4),
+            },
+            SSAOp::IntSub {
+                dst: make_var("tmp:3ea00", 1, 4),
+                a: make_var("tmp:3e900", 1, 4),
+                b: make_var("const:19", 0, 4),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("SF", 3, 1),
+                a: make_var("tmp:3ea00", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("ZF", 3, 1),
+                a: make_var("tmp:3ea00", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c200", 3, 4),
+                a: make_var("tmp:3ea00", 1, 4),
+                b: make_var("const:ff", 0, 4),
+            },
+            SSAOp::PopCount {
+                dst: make_var("tmp:2c280", 3, 4),
+                src: make_var("tmp:2c200", 3, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c300", 3, 4),
+                a: make_var("tmp:2c280", 3, 4),
+                b: make_var("const:1", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("PF", 3, 1),
+                a: make_var("tmp:2c300", 3, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::BoolNot {
+                dst: make_var("tmp:12800", 1, 1),
+                src: make_var("ZF", 3, 1),
+            },
+            SSAOp::CBranch {
+                target: make_var("ram:100000871", 0, 8),
+                cond: make_var("tmp:12800", 1, 1),
+            },
+        ];
+        func.get_block_mut(0x100000868).expect("then").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 5, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 5, 8),
+                val: make_var("const:1", 0, 4),
+            },
+            SSAOp::Branch {
+                target: make_var("ram:100000878", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x100000871).expect("else").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 6, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 6, 8),
+                val: make_var("const:0", 0, 4),
+            },
+        ];
+        func.get_block_mut(0x100000878).expect("exit").phis = vec![
+            PhiNode {
+                dst: make_var("tmp:4700", 7, 8),
+                sources: vec![
+                    (0x100000868, make_var("tmp:4700", 0, 8)),
+                    (0x100000871, make_var("tmp:4700", 0, 8)),
+                ],
+            },
+            PhiNode {
+                dst: make_var("tmp:6a80", 5, 4),
+                sources: vec![
+                    (0x100000868, make_var("tmp:6a80", 0, 4)),
+                    (0x100000871, make_var("tmp:6a80", 0, 4)),
+                ],
+            },
+        ];
+        func.get_block_mut(0x100000878).expect("exit").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 8, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 3, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 8, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 4, 4),
+                src: make_var("tmp:11f00", 3, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 4, 8),
+                src: make_var("EAX", 4, 4),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:55400", 1, 8),
+                src: make_var("const:0", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:55400", 2, 8),
+                space: "ram".to_string(),
+                addr: make_var("RSP", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("RSP", 2, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("RBP", 2, 8),
+                src: make_var("tmp:55400", 2, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("RIP", 1, 8),
+                space: "ram".to_string(),
+                addr: make_var("RSP", 2, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("RSP", 3, 8),
+                a: make_var("RSP", 2, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Return {
+                target: make_var("RIP", 1, 8),
+            },
+        ];
+
+        let mut ctx = make_x86_64_ctx();
+        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
+        ctx.analyze_blocks(&fold_blocks);
+        ctx.analyze_function_structure(&func);
+
+        let cond = ctx
+            .extract_condition_from_block(func.get_block(0x100000850).expect("entry"))
+            .expect("solve_equation condition");
+        assert_eq!(
+            cond,
+            CExpr::binary(
+                BinaryOp::Ne,
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::binary(
+                        BinaryOp::Shl,
+                        CExpr::Var("arg1".to_string()),
+                        CExpr::IntLit(1),
+                    ),
+                    CExpr::IntLit(5),
+                ),
+                CExpr::IntLit(19),
+            )
+        );
+
+        let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(FunctionTypeFacts {
+            merged_signature: Some(signature_spec(
+                Some(crate::CType::Int(64)),
+                vec![("arg1", Some(crate::CType::Int(32)))],
+            )),
+            external_stack_vars: HashMap::from([
+                (
+                    -12,
+                    stack_var_spec("var_ch", Some(crate::CType::Int(32)), Some("RBP")),
+                ),
+                (
+                    -8,
+                    stack_var_spec(
+                        "var_8h",
+                        Some(crate::CType::Pointer(Box::new(crate::CType::Void))),
+                        Some("RBP"),
+                    ),
+                ),
+                (
+                    -4,
+                    stack_var_spec("var_4h", Some(crate::CType::Int(32)), Some("RBP")),
+                ),
+                (
+                    8,
+                    stack_var_spec("var_8h", Some(crate::CType::Int(64)), Some("RBP")),
+                ),
+            ]),
+            ..FunctionTypeFacts::default()
+        });
+
+        let output = decompiler.decompile(&func);
+        assert!(
+            output.contains("int64_t sym._solve_equation_fixture_shape(int32_t arg1)"),
+            "unexpected function signature:\n{output}"
+        );
+        assert!(
+            output.contains("if ((arg1 << 1) + 5 != 19)"),
+            "expected arg-backed scalar condition, got:\n{output}"
+        );
+        assert!(
+            !output.contains("*(rbp"),
+            "unexpected raw frame deref in:\n{output}"
+        );
+    }
+
+    #[test]
+    fn decompile_x86_bool_carrier_chain_reconstructs_scalar_condition_and_returns() {
+        use r2il::R2ILBlock;
+        use r2ssa::SSAFunction;
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut fallthrough = R2ILBlock::new(0x1004, 4);
+        fallthrough.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut taken = R2ILBlock::new(0x1008, 4);
+        taken.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut exit = R2ILBlock::new(0x100c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let blocks = vec![entry, fallthrough, taken, exit];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func = func.with_name("sym._test_bool_carrier_chain");
+
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntSub {
+                dst: make_var("RSP", 1, 8),
+                a: make_var("RSP", 0, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::IntNotEqual {
+                dst: make_var("tmp:neq", 1, 1),
+                a: make_var("EDI", 0, 4),
+                b: make_var("ESI", 0, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("tmp:widen", 1, 4),
+                src: make_var("tmp:neq", 1, 1),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:condaddr", 1, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:condaddr", 1, 8),
+                val: make_var("tmp:widen", 1, 4),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:condreload", 1, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:condaddr", 1, 8),
+            },
+            SSAOp::IntNotEqual {
+                dst: make_var("tmp:branch", 1, 1),
+                a: make_var("tmp:condreload", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::CBranch {
+                target: make_var("ram:1008", 0, 8),
+                cond: make_var("tmp:branch", 1, 1),
+            },
+        ];
+        func.get_block_mut(0x1004).expect("else").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:retaddr", 1, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:retaddr", 1, 8),
+                val: make_var("ESI", 0, 4),
+            },
+            SSAOp::Branch {
+                target: make_var("ram:100c", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x1008).expect("then").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:retaddr", 2, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:retaddr", 2, 8),
+                val: make_var("EDI", 0, 4),
+            },
+            SSAOp::Branch {
+                target: make_var("ram:100c", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x100c).expect("exit").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("RSP", 2, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("RIP", 1, 8),
+                space: "ram".to_string(),
+                addr: make_var("RSP", 2, 8),
+            },
+            SSAOp::Return {
+                target: make_var("RIP", 1, 8),
+            },
+        ];
+
+        let mut ctx = make_x86_64_ctx();
+        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
+        ctx.analyze_blocks(&fold_blocks);
+        ctx.analyze_function_structure(&func);
+
+        let cond_slot = ctx
+            .debug_stack_slot_provenance("tmp:condreload_1")
+            .expect("predicate carrier slot");
+        assert!(cond_slot.is_scalar_predicate_carrier(), "{cond_slot:?}");
+        let ret_slot = ctx
+            .debug_stack_slot_provenance("tmp:retaddr_1")
+            .expect("return carrier slot");
+        assert!(ret_slot.is_scalar_return_carrier(), "{ret_slot:?}");
+
+        let entry = func.get_block(0x1000).expect("entry");
+        let cond = ctx
+            .extract_condition_from_block(entry)
+            .expect("scalarized condition");
+        assert_eq!(
+            cond,
+            CExpr::binary(
+                BinaryOp::Ne,
+                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg2".to_string()),
+            )
+        );
+
+        let then_stmts = ctx.fold_block(func.get_block(0x1008).expect("then"), 0x1008);
+        let else_stmts = ctx.fold_block(func.get_block(0x1004).expect("else"), 0x1004);
+        let Some(CStmt::Return(Some(then_expr))) = then_stmts.last() else {
+            panic!("then block should fold to a scalar return, got {then_stmts:?}");
+        };
+        let Some(CStmt::Return(Some(else_expr))) = else_stmts.last() else {
+            panic!("else block should fold to a scalar return, got {else_stmts:?}");
+        };
+        assert_eq!(then_expr, &CExpr::Var("arg1".to_string()));
+        assert_eq!(else_expr, &CExpr::Var("arg2".to_string()));
+
+        let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(FunctionTypeFacts {
+            merged_signature: Some(signature_spec(
+                Some(crate::CType::Int(64)),
+                vec![
+                    ("arg1", Some(crate::CType::Int(32))),
+                    ("arg2", Some(crate::CType::Int(32))),
+                ],
+            )),
+            external_stack_vars: HashMap::from([
+                (
+                    -4,
+                    stack_var_spec("var_4h", Some(crate::CType::Int(32)), Some("RBP")),
+                ),
+                (
+                    -8,
+                    stack_var_spec("var_8h", Some(crate::CType::UInt(32)), Some("RBP")),
+                ),
+            ]),
+            ..FunctionTypeFacts::default()
+        });
+
+        let output = decompiler.decompile(&func);
+        assert!(
+            output.contains("int64_t sym._test_bool_carrier_chain(int32_t arg1, int32_t arg2)"),
+            "unexpected function signature:\n{output}"
+        );
+        assert!(
+            output.contains("if (arg1 != arg2)"),
+            "expected source-like scalar branch condition, got:\n{output}"
+        );
+        assert!(
+            output.contains("return arg1;") && output.contains("return arg2;"),
+            "expected scalar branch-selected returns, got:\n{output}"
+        );
+        for bad in ["rbp", "rsp", "&var_", "*(", "var_4h =", "var_8h"] {
+            assert!(
+                !output.contains(bad),
+                "unexpected stack/address artifact {bad:?} in:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn decompile_x86_bool_carrier_chain_fixture_shape_reconstructs_source_like_output() {
+        use r2il::R2ILBlock;
+        use r2ssa::{PhiNode, SSAFunction};
+
+        let mut entry = R2ILBlock::new(0x100001050, 0x2a);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x100001082, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut fallthrough = R2ILBlock::new(0x10000107a, 8);
+        fallthrough.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100001088, 8),
+        });
+        let mut taken = R2ILBlock::new(0x100001082, 6);
+        taken.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100001088, 8),
+        });
+        let mut exit = R2ILBlock::new(0x100001088, 5);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let blocks = vec![entry, fallthrough, taken, exit];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func = func.with_name("sym._test_bool_carrier_chain_fixture_shape");
+
+        func.get_block_mut(0x100001050).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: make_var("tmp:27d00", 1, 8),
+                src: make_var("RBP", 0, 8),
+            },
+            SSAOp::IntSub {
+                dst: make_var("RSP", 1, 8),
+                a: make_var("RSP", 0, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("RSP", 1, 8),
+                val: make_var("tmp:27d00", 1, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("RBP", 1, 8),
+                src: make_var("RSP", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 1, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6a80", 1, 4),
+                src: make_var("EDI", 0, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 1, 8),
+                val: make_var("tmp:6a80", 1, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 2, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff4", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6a80", 2, 4),
+                src: make_var("ESI", 0, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 2, 8),
+                val: make_var("tmp:6a80", 2, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 3, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 1, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 3, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 1, 4),
+                src: make_var("tmp:11f00", 1, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 1, 8),
+                src: make_var("EAX", 1, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 4, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff4", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:6a80", 3, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 4, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:3f680", 1, 4),
+                src: make_var("tmp:6a80", 3, 4),
+            },
+            SSAOp::IntLess {
+                dst: make_var("CF", 1, 1),
+                a: make_var("EAX", 1, 4),
+                b: make_var("tmp:3f680", 1, 4),
+            },
+            SSAOp::IntSBorrow {
+                dst: make_var("OF", 1, 1),
+                a: make_var("EAX", 1, 4),
+                b: make_var("tmp:3f680", 1, 4),
+            },
+            SSAOp::IntSub {
+                dst: make_var("tmp:3f780", 1, 4),
+                a: make_var("EAX", 1, 4),
+                b: make_var("tmp:3f680", 1, 4),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("SF", 1, 1),
+                a: make_var("tmp:3f780", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("ZF", 1, 1),
+                a: make_var("tmp:3f780", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c200", 1, 4),
+                a: make_var("tmp:3f780", 1, 4),
+                b: make_var("const:ff", 0, 4),
+            },
+            SSAOp::PopCount {
+                dst: make_var("tmp:2c280", 1, 4),
+                src: make_var("tmp:2c200", 1, 4),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c300", 1, 4),
+                a: make_var("tmp:2c280", 1, 4),
+                b: make_var("const:1", 0, 4),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("PF", 1, 1),
+                a: make_var("tmp:2c300", 1, 4),
+                b: make_var("const:0", 0, 4),
+            },
+            SSAOp::BoolNot {
+                dst: make_var("tmp:12800", 1, 1),
+                src: make_var("ZF", 1, 1),
+            },
+            SSAOp::Copy {
+                dst: make_var("AL", 1, 1),
+                src: make_var("tmp:12800", 1, 1),
+            },
+            SSAOp::Copy {
+                dst: make_var("CF", 2, 1),
+                src: make_var("const:0", 0, 1),
+            },
+            SSAOp::Copy {
+                dst: make_var("OF", 2, 1),
+                src: make_var("const:0", 0, 1),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("AL", 2, 1),
+                a: make_var("AL", 1, 1),
+                b: make_var("const:1", 0, 1),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("SF", 2, 1),
+                a: make_var("AL", 2, 1),
+                b: make_var("const:0", 0, 1),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("ZF", 2, 1),
+                a: make_var("AL", 2, 1),
+                b: make_var("const:0", 0, 1),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c200", 2, 1),
+                a: make_var("AL", 2, 1),
+                b: make_var("const:ff", 0, 1),
+            },
+            SSAOp::PopCount {
+                dst: make_var("tmp:2c280", 2, 1),
+                src: make_var("tmp:2c200", 2, 1),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c300", 2, 1),
+                a: make_var("tmp:2c280", 2, 1),
+                b: make_var("const:1", 0, 1),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("PF", 2, 1),
+                a: make_var("tmp:2c300", 2, 1),
+                b: make_var("const:0", 0, 1),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("EAX", 2, 4),
+                src: make_var("AL", 2, 1),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 2, 8),
+                src: make_var("EAX", 2, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 5, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff0", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6a80", 4, 4),
+                src: make_var("EAX", 2, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 5, 8),
+                val: make_var("tmp:6a80", 4, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 6, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff0", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 2, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 6, 8),
+            },
+            SSAOp::IntSExt {
+                dst: make_var("RAX", 3, 8),
+                src: make_var("tmp:11f00", 2, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 7, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:ffffffffffffffe8", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6b00", 1, 8),
+                src: make_var("RAX", 3, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 7, 8),
+                val: make_var("tmp:6b00", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 8, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:ffffffffffffffe8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f80", 1, 8),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 8, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:3ea80", 1, 8),
+                src: make_var("tmp:11f80", 1, 8),
+            },
+            SSAOp::IntLess {
+                dst: make_var("CF", 3, 1),
+                a: make_var("tmp:3ea80", 1, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::IntSBorrow {
+                dst: make_var("OF", 3, 1),
+                a: make_var("tmp:3ea80", 1, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::IntSub {
+                dst: make_var("tmp:3eb80", 1, 8),
+                a: make_var("tmp:3ea80", 1, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::IntSLess {
+                dst: make_var("SF", 3, 1),
+                a: make_var("tmp:3eb80", 1, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("ZF", 3, 1),
+                a: make_var("tmp:3eb80", 1, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c200", 3, 8),
+                a: make_var("tmp:3eb80", 1, 8),
+                b: make_var("const:ff", 0, 8),
+            },
+            SSAOp::PopCount {
+                dst: make_var("tmp:2c280", 3, 8),
+                src: make_var("tmp:2c200", 3, 8),
+            },
+            SSAOp::IntAnd {
+                dst: make_var("tmp:2c300", 3, 8),
+                a: make_var("tmp:2c280", 3, 8),
+                b: make_var("const:1", 0, 8),
+            },
+            SSAOp::IntEqual {
+                dst: make_var("PF", 3, 1),
+                a: make_var("tmp:2c300", 3, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::BoolNot {
+                dst: make_var("tmp:12800", 2, 1),
+                src: make_var("ZF", 3, 1),
+            },
+            SSAOp::CBranch {
+                target: make_var("ram:100001082", 0, 8),
+                cond: make_var("tmp:12800", 2, 1),
+            },
+        ];
+        func.get_block_mut(0x10000107a).expect("else").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 9, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff4", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 3, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 9, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 3, 4),
+                src: make_var("tmp:11f00", 3, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 4, 8),
+                src: make_var("EAX", 3, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 10, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6a80", 5, 4),
+                src: make_var("EAX", 3, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 10, 8),
+                val: make_var("tmp:6a80", 5, 4),
+            },
+            SSAOp::Branch {
+                target: make_var("ram:100001088", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x100001082).expect("then").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 11, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 4, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 11, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 4, 4),
+                src: make_var("tmp:11f00", 4, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 5, 8),
+                src: make_var("EAX", 4, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 12, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:6a80", 6, 4),
+                src: make_var("EAX", 4, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 12, 8),
+                val: make_var("tmp:6a80", 6, 4),
+            },
+        ];
+        func.get_block_mut(0x100001088).expect("exit").phis = vec![
+            PhiNode {
+                dst: make_var("EAX", 5, 4),
+                sources: vec![(0x10000107a, make_var("EAX", 0, 4)), (0x100001082, make_var("EAX", 0, 4))],
+            },
+            PhiNode {
+                dst: make_var("RAX", 6, 8),
+                sources: vec![(0x10000107a, make_var("RAX", 0, 8)), (0x100001082, make_var("RAX", 0, 8))],
+            },
+            PhiNode {
+                dst: make_var("tmp:11f00", 5, 4),
+                sources: vec![(0x10000107a, make_var("tmp:11f00", 0, 4)), (0x100001082, make_var("tmp:11f00", 0, 4))],
+            },
+            PhiNode {
+                dst: make_var("tmp:4700", 13, 8),
+                sources: vec![(0x10000107a, make_var("tmp:4700", 0, 8)), (0x100001082, make_var("tmp:4700", 0, 8))],
+            },
+            PhiNode {
+                dst: make_var("tmp:6a80", 7, 4),
+                sources: vec![(0x10000107a, make_var("tmp:6a80", 0, 4)), (0x100001082, make_var("tmp:6a80", 0, 4))],
+            },
+        ];
+        func.get_block_mut(0x100001088).expect("exit").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 14, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 6, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 14, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 6, 4),
+                src: make_var("tmp:11f00", 6, 4),
+            },
+            SSAOp::IntZExt {
+                dst: make_var("RAX", 7, 8),
+                src: make_var("EAX", 6, 4),
+            },
+            SSAOp::Copy {
+                dst: make_var("tmp:55400", 1, 8),
+                src: make_var("const:0", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:55400", 2, 8),
+                space: "ram".to_string(),
+                addr: make_var("RSP", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("RSP", 2, 8),
+                a: make_var("RSP", 1, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("RBP", 2, 8),
+                src: make_var("tmp:55400", 2, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("RIP", 1, 8),
+                space: "ram".to_string(),
+                addr: make_var("RSP", 2, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("RSP", 3, 8),
+                a: make_var("RSP", 2, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Return {
+                target: make_var("RIP", 1, 8),
+            },
+        ];
+
+        let mut ctx = make_x86_64_ctx();
+        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
+        ctx.analyze_blocks(&fold_blocks);
+        ctx.analyze_function_structure(&func);
+
+        let cond_slot = ctx
+            .debug_stack_slot_provenance("tmp:11f80_1")
+            .expect("predicate carrier slot");
+        assert!(cond_slot.is_scalar_predicate_carrier(), "{cond_slot:?}");
+        let ret_slot = ctx
+            .debug_stack_slot_provenance("tmp:4700_10")
+            .expect("return carrier slot");
+        assert!(ret_slot.is_scalar_return_carrier(), "{ret_slot:?}");
+
+        let entry = func.get_block(0x100001050).expect("entry");
+        let cond = ctx
+            .extract_condition_from_block(entry)
+            .expect("scalarized condition");
+        assert_eq!(
+            cond,
+            CExpr::binary(
+                BinaryOp::Ne,
+                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg2".to_string()),
+            )
+        );
+        let then_stmts = ctx.fold_block(func.get_block(0x100001082).expect("then"), 0x100001082);
+        let else_stmts = ctx.fold_block(func.get_block(0x10000107a).expect("else"), 0x10000107a);
+        assert_eq!(then_stmts, vec![CStmt::Return(Some(CExpr::Var("arg1".to_string())))]);
+        assert_eq!(else_stmts, vec![CStmt::Return(Some(CExpr::Var("arg2".to_string())))]);
+
+        let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(FunctionTypeFacts {
+            merged_signature: Some(signature_spec(
+                Some(crate::CType::Int(64)),
+                vec![
+                    ("arg1", Some(crate::CType::Int(32))),
+                    ("arg2", Some(crate::CType::Int(32))),
+                ],
+            )),
+            external_stack_vars: HashMap::from([
+                (
+                    -4,
+                    stack_var_spec("var_4h", Some(crate::CType::Int(32)), Some("RBP")),
+                ),
+                (
+                    -8,
+                    stack_var_spec("var_8h", Some(crate::CType::Int(32)), Some("RBP")),
+                ),
+                (
+                    -12,
+                    stack_var_spec("var_ch", Some(crate::CType::Int(32)), Some("RBP")),
+                ),
+                (
+                    -16,
+                    stack_var_spec("var_10h", Some(crate::CType::UInt(32)), Some("RBP")),
+                ),
+                (
+                    -24,
+                    stack_var_spec("var_18h", Some(crate::CType::Int(64)), Some("RBP")),
+                ),
+            ]),
+            ..FunctionTypeFacts::default()
+        });
+
+        let output = decompiler.decompile(&func);
+        assert!(
+            output.contains("int64_t sym._test_bool_carrier_chain_fixture_shape(int32_t arg1, int32_t arg2)"),
+            "unexpected function signature:\n{output}"
+        );
+        assert!(
+            output.contains("if (arg1 != arg2)"),
+            "expected source-like scalar branch condition, got:\n{output}"
+        );
+        assert!(
+            output.contains("return arg1;") && output.contains("return arg2;"),
+            "expected scalar branch-selected returns, got:\n{output}"
+        );
+        for bad in ["rbp", "rsp", "&var_", "*(", "var_4h =", "var_8h", "var_ch"] {
+            assert!(
+                !output.contains(bad),
+                "unexpected stack/address artifact {bad:?} in:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_context_visible_expr_ranking_prefers_scalar_candidates_over_stack_artifacts() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.state.analysis_ctx.use_info.stack_slots.insert(
+            "var_8h".to_string(),
+            crate::analysis::StackSlotProvenance {
+                offset: -8,
+                predicate_carrier: true,
+                return_carrier: false,
+                value_kind: crate::analysis::StackSlotValueKind::Scalar,
+            },
+        );
+        ctx.state.analysis_ctx.use_info.stack_slots.insert(
+            "var_ch".to_string(),
+            crate::analysis::StackSlotProvenance {
+                offset: -12,
+                predicate_carrier: false,
+                return_carrier: true,
+                value_kind: crate::analysis::StackSlotValueKind::Scalar,
+            },
+        );
+
+        let raw_stack_load = CExpr::Deref(Box::new(CExpr::binary(
+            BinaryOp::Add,
+            CExpr::Var("rbp".to_string()),
+            CExpr::IntLit(-8),
+        )));
+        let raw_return_stack_load = CExpr::Deref(Box::new(CExpr::binary(
+            BinaryOp::Add,
+            CExpr::Var("rbp".to_string()),
+            CExpr::IntLit(-12),
+        )));
+        let scalar_arg1 = CExpr::Var("arg1".to_string());
+        assert_eq!(
+            ctx.debug_choose_scalar_predicate_expr(
+                Some(raw_stack_load.clone()),
+                Some(scalar_arg1.clone()),
+            ),
+            Some(scalar_arg1.clone())
+        );
+        assert_eq!(
+            ctx.debug_choose_scalar_predicate_expr(
+                Some(CExpr::AddrOf(Box::new(CExpr::Var("var_8h".to_string())))),
+                Some(scalar_arg1.clone()),
+            ),
+            Some(scalar_arg1.clone())
+        );
+
+        let scalar_arg2 = CExpr::Var("arg2".to_string());
+        assert_eq!(
+            ctx.debug_choose_scalar_return_expr(
+                Some(CExpr::AddrOf(Box::new(CExpr::Var("var_ch".to_string())))),
+                Some(scalar_arg2.clone()),
+            ),
+            Some(scalar_arg2.clone())
+        );
+        assert_eq!(
+            ctx.debug_choose_scalar_return_expr(
+                Some(raw_return_stack_load),
+                Some(scalar_arg2.clone()),
+            ),
+            Some(scalar_arg2.clone())
+        );
+
+        assert_eq!(
+            ctx.debug_choose_generic_visible_expr(
+                Some(CExpr::Var("arg1".to_string())),
+                Some(CExpr::AddrOf(Box::new(CExpr::Var("var_8h".to_string())))),
+            ),
+            Some(CExpr::AddrOf(Box::new(CExpr::Var("var_8h".to_string()))))
+        );
     }
 
     #[test]

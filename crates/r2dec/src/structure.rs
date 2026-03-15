@@ -249,7 +249,33 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         }
 
+        if let Some(expr) = Self::selector_expr_from_condition(&self.get_branch_condition(addr)) {
+            return expr;
+        }
+
         CExpr::Var("test".to_string())
+    }
+
+    fn selector_expr_from_condition(cond: &CExpr) -> Option<CExpr> {
+        match cond {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::selector_expr_from_condition(inner)
+            }
+            CExpr::Binary {
+                op: BinaryOp::Eq | BinaryOp::Ne,
+                left,
+                right,
+            } => {
+                if matches!(left.as_ref(), CExpr::IntLit(_) | CExpr::UIntLit(_)) {
+                    return Some((**right).clone());
+                }
+                if matches!(right.as_ref(), CExpr::IntLit(_) | CExpr::UIntLit(_)) {
+                    return Some((**left).clone());
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     fn structure_switch_region(
@@ -1030,6 +1056,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             _ => return None,
         };
 
+        if self.func.switch_info(switch_view.switch_block).is_some() {
+            return None;
+        }
         if switch_view.default.is_some() || switch_view.cases.len() < 4 {
             return None;
         }
@@ -2486,6 +2515,22 @@ mod tests {
                 },
                 CStmt::ret(Some(CExpr::IntLit(0))),
             ])
+        );
+    }
+
+    #[test]
+    fn selector_expr_from_condition_extracts_non_constant_side() {
+        let cond = CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::binary(BinaryOp::BitAnd, v("i"), CExpr::IntLit(7)),
+            CExpr::IntLit(0),
+        );
+
+        let selector = ControlFlowStructurer::selector_expr_from_condition(&cond)
+            .expect("selector expression");
+        assert_eq!(
+            selector,
+            CExpr::binary(BinaryOp::BitAnd, v("i"), CExpr::IntLit(7))
         );
     }
 

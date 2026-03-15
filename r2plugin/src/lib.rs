@@ -3332,7 +3332,13 @@ fn merge_initial_type_evidence(initial_ty: &r2dec::CType, evidence: &mut TypeEvi
         r2dec::CType::Bool => evidence.bool_like = evidence.bool_like.max(1),
         r2dec::CType::Int(bits) | r2dec::CType::UInt(bits) => {
             evidence.scalar_likely = evidence.scalar_likely.max(1);
-            evidence.width_bits = evidence.width_bits.max(*bits);
+            if !(evidence.has_scalar_signal()
+                && !evidence.has_pointer_signal()
+                && evidence.width_bits > 0
+                && evidence.width_bits < *bits)
+            {
+                evidence.width_bits = evidence.width_bits.max(*bits);
+            }
         }
         r2dec::CType::Float(bits) => {
             evidence.scalar_proven = evidence.scalar_proven.max(1);
@@ -3355,7 +3361,15 @@ fn fallback_scalar_type(
         return r2dec::CType::Bool;
     }
 
-    let width_bits = evidence.width_bits.max(var_size_bytes.saturating_mul(8));
+    let carrier_bits = var_size_bytes.saturating_mul(8);
+    let width_bits = if evidence.has_scalar_signal()
+        && !evidence.has_pointer_signal()
+        && evidence.width_bits > 0
+    {
+        evidence.width_bits
+    } else {
+        evidence.width_bits.max(carrier_bits)
+    };
     let width_bits = match width_bits {
         0 => {
             if ptr_bits >= 64 {
@@ -3447,11 +3461,31 @@ fn resolve_evidence_driven_type(
         initial_ty,
         r2dec::CType::Bool | r2dec::CType::Int(_) | r2dec::CType::UInt(_)
     );
+    let preferred_scalar = fallback_scalar_type(var_size_bytes, evidence, ptr_bits);
+    let scalar_width_narrows = match (&initial_ty, &preferred_scalar) {
+        (r2dec::CType::Bool, r2dec::CType::Bool) => false,
+        (r2dec::CType::Int(initial_bits), r2dec::CType::Int(preferred_bits))
+        | (r2dec::CType::Int(initial_bits), r2dec::CType::UInt(preferred_bits))
+        | (r2dec::CType::UInt(initial_bits), r2dec::CType::Int(preferred_bits))
+        | (r2dec::CType::UInt(initial_bits), r2dec::CType::UInt(preferred_bits)) => {
+            preferred_bits < initial_bits
+        }
+        (r2dec::CType::Int(_), r2dec::CType::Bool)
+        | (r2dec::CType::UInt(_), r2dec::CType::Bool) => true,
+        _ => false,
+    };
 
     if initial_is_pointer && pointer_score.saturating_add(1) >= scalar_score {
         return initial_ty;
     }
     if initial_is_scalar && scalar_score.saturating_add(1) >= pointer_score {
+        if scalar_width_narrows
+            && evidence.has_scalar_signal()
+            && !evidence.has_pointer_signal()
+            && !evidence.has_conflict()
+        {
+            return preferred_scalar;
+        }
         return initial_ty;
     }
 
@@ -3477,7 +3511,7 @@ fn resolve_evidence_driven_type(
     if scalar_score > pointer_score
         || matches!(initial_ty, r2dec::CType::Void | r2dec::CType::Unknown)
     {
-        return fallback_scalar_type(var_size_bytes, evidence, ptr_bits);
+        return preferred_scalar;
     }
 
     sanitize_inferred_param_type(initial_ty, var_size_bytes, ptr_bits)
@@ -3489,6 +3523,7 @@ fn collect_type_evidence_for_var(
     initial_ty: &r2dec::CType,
 ) -> TypeEvidence {
     let key = types::ssa_var_key(var);
+    let family = types::scalar_register_family_key(&var.name);
     let mut evidence = TypeEvidence::default();
     if evidence_ctx.pointer_vars.contains(&key) {
         evidence.pointer_proven = 1;
@@ -3505,8 +3540,72 @@ fn collect_type_evidence_for_var(
     if let Some(bits) = evidence_ctx.width_bits.get(&key) {
         evidence.width_bits = *bits;
     }
+    if evidence.pointer_proven == 0
+        && signal_present_for_register_family(&evidence_ctx.pointer_vars, &family, var.version)
+    {
+        evidence.pointer_proven = 1;
+    }
+    if evidence.scalar_proven == 0
+        && signal_present_for_register_family(
+            &evidence_ctx.scalar_proven_vars,
+            &family,
+            var.version,
+        )
+    {
+        evidence.scalar_proven = 1;
+    }
+    if evidence.scalar_likely == 0
+        && signal_present_for_register_family(
+            &evidence_ctx.scalar_likely_vars,
+            &family,
+            var.version,
+        )
+    {
+        evidence.scalar_likely = 1;
+    }
+    if evidence.bool_like == 0
+        && signal_present_for_register_family(&evidence_ctx.bool_like_vars, &family, var.version)
+    {
+        evidence.bool_like = 1;
+    }
+    if evidence.width_bits == 0
+        && let Some(bits) =
+            width_hint_for_register_family(&evidence_ctx.width_bits, &family, var.version)
+    {
+        evidence.width_bits = bits;
+    }
     merge_initial_type_evidence(initial_ty, &mut evidence);
     evidence
+}
+
+fn signal_present_for_register_family(
+    keys: &std::collections::HashSet<String>,
+    family: &str,
+    version: u32,
+) -> bool {
+    keys.iter()
+        .any(|key| key_matches_register_family_version(key, family, version))
+}
+
+fn width_hint_for_register_family(
+    hints: &std::collections::HashMap<String, u32>,
+    family: &str,
+    version: u32,
+) -> Option<u32> {
+    hints
+        .iter()
+        .filter(|(key, _)| key_matches_register_family_version(key, family, version))
+        .map(|(_, bits)| *bits)
+        .filter(|bits| *bits > 0)
+        .min()
+}
+
+fn key_matches_register_family_version(key: &str, family: &str, version: u32) -> bool {
+    let Some((name, version_str)) = key.rsplit_once('_') else {
+        return false;
+    };
+    version_str.parse::<u32>().ok() == Some(version)
+        && types::scalar_register_family_key(name) == family
 }
 
 fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
@@ -6549,6 +6648,76 @@ mod tests {
     fn materialize_signature_type_rewrites_unknown_return_to_scalar_fallback() {
         let ty = materialize_signature_ctype(r2dec::CType::Unknown, 64);
         assert_eq!(ty, r2dec::CType::Int(64));
+    }
+
+    #[test]
+    fn fallback_scalar_type_prefers_narrow_evidence_for_wide_scalar_carrier() {
+        let ty = fallback_scalar_type(
+            8,
+            &TypeEvidence {
+                scalar_proven: 1,
+                width_bits: 32,
+                ..TypeEvidence::default()
+            },
+            64,
+        );
+        assert_eq!(ty, r2dec::CType::Int(32));
+    }
+
+    #[test]
+    fn resolve_evidence_driven_type_can_narrow_wide_scalar_carrier() {
+        let ty = resolve_evidence_driven_type(
+            r2dec::CType::Int(64),
+            8,
+            64,
+            &TypeEvidence {
+                scalar_proven: 1,
+                width_bits: 32,
+                ..TypeEvidence::default()
+            },
+        );
+        assert_eq!(ty, r2dec::CType::Int(32));
+    }
+
+    #[test]
+    fn merge_initial_type_evidence_preserves_narrow_scalar_hint_over_wide_carrier_type() {
+        let mut evidence = TypeEvidence {
+            scalar_proven: 1,
+            width_bits: 32,
+            ..TypeEvidence::default()
+        };
+        merge_initial_type_evidence(&r2dec::CType::Int(64), &mut evidence);
+        assert_eq!(evidence.width_bits, 32);
+    }
+
+    #[test]
+    fn collect_type_evidence_uses_arm64_register_family_alias_when_only_w_view_is_present() {
+        let blocks = vec![r2ssa::SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:sp8", 1, 8),
+                    val: r2ssa::SSAVar::new("W0", 0, 4),
+                },
+                r2ssa::SSAOp::IntEqual {
+                    dst: r2ssa::SSAVar::new("tmp:eq", 1, 1),
+                    a: r2ssa::SSAVar::new("W0", 0, 4),
+                    b: r2ssa::SSAVar::new("const:0", 0, 4),
+                },
+            ],
+        }];
+        let evidence_ctx = types::collect_signature_type_evidence_context(&blocks);
+        let evidence = collect_type_evidence_for_var(
+            &evidence_ctx,
+            &r2ssa::SSAVar::new("X0", 0, 8),
+            &r2dec::CType::Int(64),
+        );
+        let ty = resolve_evidence_driven_type(r2dec::CType::Int(64), 8, 64, &evidence);
+
+        assert_eq!(evidence.width_bits, 32);
+        assert_eq!(ty, r2dec::CType::Int(32));
     }
 
     #[test]

@@ -12,6 +12,10 @@ RUST_LIB = libr2sleigh_plugin
 # CARGO_TARGET_DIR (e.g. shared incremental target on self-hosted runners).
 CARGO_TARGET_DIR ?= ../target
 RUST_BUILD_DIR = $(CARGO_TARGET_DIR)/$(RUST_TARGET)
+RUST_RUNTIME_SUBDIR = r2sleigh
+RUST_LIB_LOCAL = $(RUST_RUNTIME_SUBDIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+RUST_LINK_TARGET = $(abspath $(RUST_BUILD_DIR))/deps/$(RUST_LIB).$(RUST_LIB_EXT)
+RUST_RUNTIME_REF = @loader_path/$(RUST_LIB_LOCAL)
 
 # Detect OS
 UNAME := $(shell uname)
@@ -40,13 +44,20 @@ LDFLAGS = $(R2_LDFLAGS) -L$(RUST_BUILD_DIR) -lr2sleigh_plugin $(LDFLAGS_OS) -lst
 ANAL_PLUGIN_SO = $(ANAL_PLUGIN_NAME).$(PLUGIN_EXT)
 ARCH_PLUGIN_SO = $(ARCH_PLUGIN_NAME).$(PLUGIN_EXT)
 
-.PHONY: all clean install uninstall rust rust-debug rust-release help arch_sleigh.o r_anal_sleigh_arch.o
+.PHONY: all clean install uninstall rust rust-debug rust-release help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs
 
-all: $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
+all: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 
 # Build the analysis plugin shared object
 $(ANAL_PLUGIN_SO): r_anal_sleigh.c $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	$(CC) $(CFLAGS_SO) -o $@ $< $(LDFLAGS)
+ifeq ($(UNAME),Darwin)
+	@for from in "$(RUST_LINK_TARGET)" "@loader_path/$(RUST_LIB).$(RUST_LIB_EXT)"; do \
+		if otool -L $@ | grep -Fq "$$from"; then \
+			install_name_tool -change "$$from" "$(RUST_RUNTIME_REF)" $@; \
+		fi; \
+	done
+endif
 
 # Build the architecture plugin shared object
 ARCH_PLUGIN_OBJS = arch_sleigh.o r_anal_sleigh_arch.o
@@ -59,14 +70,27 @@ r_anal_sleigh_arch.o: r_anal_sleigh.c
 
 $(ARCH_PLUGIN_SO): $(ARCH_PLUGIN_OBJS) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	$(CC) $(CFLAGS_SO) -o $@ $(ARCH_PLUGIN_OBJS) $(LDFLAGS)
+ifeq ($(UNAME),Darwin)
+	@for from in "$(RUST_LINK_TARGET)" "@loader_path/$(RUST_LIB).$(RUST_LIB_EXT)"; do \
+		if otool -L $@ | grep -Fq "$$from"; then \
+			install_name_tool -change "$$from" "$(RUST_RUNTIME_REF)" $@; \
+		fi; \
+	done
+endif
 
 # Build Rust library (release)
 rust-release:
 	cd .. && cargo build --release --features $(RUST_FEATURES) -p r2sleigh-plugin
+ifeq ($(UNAME),Darwin)
+	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+endif
 
 # Build Rust library (debug)
 rust-debug:
 	cd .. && cargo build --features $(RUST_FEATURES) -p r2sleigh-plugin
+ifeq ($(UNAME),Darwin)
+	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+endif
 
 # Default rust target
 ifeq ($(RUST_TARGET),release)
@@ -77,10 +101,17 @@ rust: rust-debug
 $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): rust-debug
 endif
 
+$(RUST_LIB_LOCAL): $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	mkdir -p $(RUST_RUNTIME_SUBDIR)
+	rm -f $(RUST_LIB).$(RUST_LIB_EXT)
+	cp $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) $@
+
 # Install plugins
-install: $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
+install: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 	@mkdir -p $(R2_PLUGIN_DIR)
+	@mkdir -p $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)
 	rm -f $(R2_PLUGIN_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	cp $(RUST_LIB_LOCAL) $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)/
 	cp $(ANAL_PLUGIN_SO) $(R2_PLUGIN_DIR)/
 	cp $(ARCH_PLUGIN_SO) $(R2_PLUGIN_DIR)/
 	@echo "Installed to $(R2_PLUGIN_DIR)"
@@ -90,11 +121,14 @@ uninstall:
 	rm -f $(R2_PLUGIN_DIR)/$(ANAL_PLUGIN_SO)
 	rm -f $(R2_PLUGIN_DIR)/$(ARCH_PLUGIN_SO)
 	rm -f $(R2_PLUGIN_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	rm -f $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	@echo "Uninstalled from $(R2_PLUGIN_DIR)"
 
 # Clean build artifacts
 clean:
 	rm -f $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO) $(ARCH_PLUGIN_OBJS)
+	rm -f $(RUST_LIB).$(RUST_LIB_EXT)
+	rm -rf $(RUST_RUNTIME_SUBDIR)
 
 # Full clean including Rust
 distclean: clean

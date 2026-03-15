@@ -209,12 +209,15 @@ impl<'a> FoldingContext<'a> {
                 SSAOp::Copy { src, .. }
                 | SSAOp::IntZExt { src, .. }
                 | SSAOp::IntSExt { src, .. }
-                | SSAOp::Subpiece { src, .. } => self
-                    .local_branch_condition_expr(block, idx, src, depth + 1)
-                    .or_else(|| self.local_expr_for_var(block, idx, src, depth + 1)),
+                | SSAOp::Subpiece { src, .. } => self.choose_preferred_scalar_predicate_expr(
+                    self.local_branch_condition_expr(block, idx, src, depth + 1),
+                    self.local_expr_for_var(block, idx, src, depth + 1),
+                ),
                 SSAOp::BoolNot { src, .. } => self
-                    .local_branch_condition_expr(block, idx, src, depth + 1)
-                    .or_else(|| self.local_expr_for_var(block, idx, src, depth + 1))
+                    .choose_preferred_scalar_predicate_expr(
+                        self.local_branch_condition_expr(block, idx, src, depth + 1),
+                        self.local_expr_for_var(block, idx, src, depth + 1),
+                    )
                     .map(|expr| CExpr::unary(UnaryOp::Not, expr)),
                 SSAOp::IntEqual { a, b, .. } => {
                     self.local_compare_expr(block, idx, BinaryOp::Eq, a, b, depth + 1)
@@ -269,15 +272,25 @@ impl<'a> FoldingContext<'a> {
         var: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
-        if depth > MAX_PREDICATE_OPERAND_DEPTH {
-            return Some(CExpr::Var(self.var_name(var)));
-        }
-
         if var.is_const() {
             return Some(self.const_to_expr(var));
         }
 
-        if depth > 0 && self.inputs.arch.is_return_register_name(&var.name) {
+        let lower_name = var.name.to_ascii_lowercase();
+        if self.inputs.arch.is_stack_base_name(&lower_name)
+            || self.inputs.arch.is_frame_pointer_name(&lower_name)
+        {
+            return Some(CExpr::Var(lower_name));
+        }
+
+        if depth > 0
+            && self.inputs.arch.is_return_register_name(&lower_name)
+            && self.local_return_register_chain_is_call_result(block, before_idx, var, 0)
+        {
+            return Some(CExpr::Var(self.var_name(var)));
+        }
+
+        if depth > MAX_PREDICATE_OPERAND_DEPTH {
             return Some(CExpr::Var(self.var_name(var)));
         }
 
@@ -360,14 +373,39 @@ impl<'a> FoldingContext<'a> {
             };
         }
 
-        let lower_name = var.name.to_ascii_lowercase();
-        if self.inputs.arch.is_stack_base_name(&lower_name)
-            || self.inputs.arch.is_frame_pointer_name(&lower_name)
-        {
-            return Some(CExpr::Var(lower_name));
+        Some(CExpr::Var(self.var_name(var)))
+    }
+
+    fn local_return_register_chain_is_call_result(
+        &self,
+        block: &FunctionSSABlock,
+        before_idx: usize,
+        var: &SSAVar,
+        depth: u32,
+    ) -> bool {
+        if depth > MAX_PREDICATE_OPERAND_DEPTH {
+            return false;
         }
 
-        Some(CExpr::Var(self.var_name(var)))
+        let Some((idx, op)) = block.ops[..before_idx]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, op)| op.dst() == Some(var))
+        else {
+            return false;
+        };
+
+        match op {
+            SSAOp::CallDefine { .. } => true,
+            SSAOp::Copy { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Subpiece { src, .. } => {
+                self.local_return_register_chain_is_call_result(block, idx, src, depth + 1)
+            }
+            _ => false,
+        }
     }
 
     fn local_binary_expr(
@@ -385,7 +423,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn normalize_local_branch_expr(&self, expr: CExpr) -> CExpr {
-        match expr {
+        let normalized = match expr {
             CExpr::Binary {
                 op: BinaryOp::Eq,
                 left,
@@ -429,6 +467,12 @@ impl<'a> FoldingContext<'a> {
                 }
             }
             other => other,
+        };
+
+        if self.is_predicate_like_expr(&normalized) {
+            self.simplify_condition_expr(normalized)
+        } else {
+            normalized
         }
     }
 
@@ -467,6 +511,7 @@ impl<'a> FoldingContext<'a> {
         addr: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
+        let slot = self.stack_slots_map().get(&addr.display_name()).copied();
         for (store_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
             if let SSAOp::Store {
                 addr: store_addr,
@@ -475,7 +520,23 @@ impl<'a> FoldingContext<'a> {
             } = op
                 && self.local_addrs_match(block, store_idx, store_addr, op_idx, addr, depth + 1)
             {
-                return self.local_expr_for_var(block, store_idx, val, depth + 1);
+                let stored = self.local_expr_for_var(block, store_idx, val, depth + 1);
+                if slot.is_some_and(|slot| slot.is_scalar_predicate_carrier()) {
+                    if let Some(stored) = stored {
+                        return Some(stored);
+                    }
+                    let alias = self
+                        .local_expr_for_var(block, op_idx, addr, depth + 1)
+                        .and_then(|addr_expr| {
+                            self.simplify_stack_access(&addr_expr)
+                                .filter(|name| {
+                                    !super::op_lower::is_generic_stack_placeholder_alias(name)
+                                })
+                                .map(CExpr::Var)
+                        });
+                    return alias;
+                }
+                return stored;
             }
         }
 
@@ -484,6 +545,10 @@ impl<'a> FoldingContext<'a> {
             && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
         {
             return Some(CExpr::Var(alias));
+        }
+
+        if slot.is_some_and(|slot| slot.is_scalar_predicate_carrier()) {
+            return None;
         }
 
         Some(CExpr::deref(addr_expr))
@@ -498,19 +563,30 @@ impl<'a> FoldingContext<'a> {
         right: &SSAVar,
         depth: u32,
     ) -> bool {
-        left == right
-            || self
-                .local_expr_for_var(block, left_idx, left, depth + 1)
-                .zip(self.local_expr_for_var(block, right_idx, right, depth + 1))
-                .map(|(lhs, rhs)| {
-                    lhs == rhs
-                        || self
-                            .simplify_stack_access(&lhs)
-                            .zip(self.simplify_stack_access(&rhs))
-                            .map(|(lhs_alias, rhs_alias)| lhs_alias == rhs_alias)
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false)
+        if left == right {
+            return true;
+        }
+
+        if self
+            .extract_stack_offset_from_var(left)
+            .zip(self.extract_stack_offset_from_var(right))
+            .map(|(lhs, rhs)| lhs == rhs)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        self.local_expr_for_var(block, left_idx, left, depth + 1)
+            .zip(self.local_expr_for_var(block, right_idx, right, depth + 1))
+            .map(|(lhs, rhs)| {
+                lhs == rhs
+                    || self
+                        .simplify_stack_access(&lhs)
+                        .zip(self.simplify_stack_access(&rhs))
+                        .map(|(lhs_alias, rhs_alias)| lhs_alias == rhs_alias)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 
     /// Get the expression for a condition variable, always inlining its definition.
@@ -669,15 +745,17 @@ impl<'a> FoldingContext<'a> {
                     CExpr::binary(BinaryOp::Ge, *left, *right)
                 }
             }
-            CExpr::Binary {
-                op: BinaryOp::And,
-                left,
-                right,
-            } => {
-                if let Some(gt) = self.rewrite_signed_positive_and(left.as_ref(), right.as_ref()) {
+            CExpr::Binary { op, left, right } if matches!(op, BinaryOp::And | BinaryOp::BitAnd) => {
+                if let Some(masked_bool) =
+                    self.rewrite_boolean_mask_and(left.as_ref(), right.as_ref())
+                {
+                    masked_bool
+                } else if let Some(gt) =
+                    self.rewrite_signed_positive_and(left.as_ref(), right.as_ref())
+                {
                     gt
                 } else {
-                    CExpr::binary(BinaryOp::And, *left, *right)
+                    CExpr::binary(op, *left, *right)
                 }
             }
             CExpr::Binary {
@@ -776,6 +854,16 @@ impl<'a> FoldingContext<'a> {
             return Some(CExpr::binary(BinaryOp::Gt, ge_lhs, ge_rhs));
         }
 
+        None
+    }
+
+    pub(super) fn rewrite_boolean_mask_and(&self, left: &CExpr, right: &CExpr) -> Option<CExpr> {
+        if self.is_predicate_one_expr(left) && self.is_boolean_value_expr(right) {
+            return Some(right.clone());
+        }
+        if self.is_predicate_one_expr(right) && self.is_boolean_value_expr(left) {
+            return Some(left.clone());
+        }
         None
     }
 

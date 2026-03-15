@@ -517,8 +517,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.test_loop_switch
-a:sla.dec | jq -Rs 'contains("switch (")'
+a:sla.dec sym._test_loop_switch | jq -Rs 'contains("switch (")'
 EOF_CMDS
 RUN
 
@@ -545,9 +544,8 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.check_secret
-pdd | jq -Rs 'contains("return") and (contains("Missing plugin for \'pdd\'")|not)'
-pdd | jq -Rs 'contains("return") and (contains("Missing plugin for")|not)'
+s sym._check_secret
+pdd | jq -Rs 'contains("return") and (contains("Missing plugin for '\''pdd'\''")|not)'
 EOF_CMDS
 RUN
 
@@ -559,7 +557,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.check_secret
+s sym._check_secret
 pdD | jq -Rs 'contains("return") and (contains("Invalid pd subcommand")|not)'
 EOF_CMDS
 RUN
@@ -572,7 +570,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-pdd dbg.solve_equation | jq -Rs '(contains("solve_equation") or contains("dbg.solve_equation")) and contains("return")'
+pdd sym._solve_equation | jq -Rs '(contains("solve_equation") or contains("sym._solve_equation")) and contains("return")'
 EOF_CMDS
 RUN
 
@@ -599,8 +597,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.check_secret
-a:sla.dec | jq -Rs 'contains("int32_t") or contains("int64_t") or contains("uint32_t")'
+a:sla.dec sym._check_secret | jq -Rs 'contains("int32_t") or contains("int64_t") or contains("uint32_t")'
 EOF_CMDS
 RUN
 
@@ -612,8 +609,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.check_secret
-a:sla.dec | jq -Rs 'contains("if") and contains("return")'
+a:sla.dec sym._check_secret | jq -Rs 'contains("if") and contains("return")'
 EOF_CMDS
 RUN
 
@@ -625,8 +621,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.solve_equation
-a:sla.dec | jq -Rs 'contains("{") and contains("}")'
+a:sla.dec sym._solve_equation | jq -Rs 'contains("{") and contains("}")'
 EOF_CMDS
 RUN
 
@@ -638,8 +633,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.test_guard_inversion_goto
-a:sla.dec | jq -Rs 'contains("if (") and contains("return")'
+a:sla.dec sym._test_guard_inversion_goto | jq -Rs 'contains("if (") and contains("return")'
 EOF_CMDS
 RUN
 
@@ -723,8 +717,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s entry0
-a:sla.dec | jq -Rs '(contains(" = eax ^ eax;")|not) and (contains(" = rax ^ rax;")|not)'
+a:sla.dec entry0 | jq -Rs '(contains(" = eax ^ eax;")|not) and (contains(" = rax ^ rax;")|not)'
 EOF_CMDS
 RUN
 
@@ -751,8 +744,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.process_string
-a:sla.dec | jq -Rs '(contains("*(rbp")|not)'
+a:sla.dec sym._process_string | jq -Rs '(contains("*(rbp")|not)'
 EOF_CMDS
 RUN
 
@@ -779,8 +771,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs 'contains("Usage: %s <test_num> [args...]") and (contains("switch (") or contains("if ("))'
+a:sla.dec sym._main | jq -Rs 'contains("Usage: %s <test_num> [args...]") and (contains("switch (") or contains("if ("))'
 EOF_CMDS
 RUN
 
@@ -792,8 +783,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs 'contains("return 1;") and (contains("return argc;")|not)'
+a:sla.dec sym._main | jq -Rs 'contains("return 1;") and (contains("return argc;")|not)'
 EOF_CMDS
 RUN
 
@@ -805,8 +795,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs 'contains("switch (local_") and (contains("switch (test)")|not)'
+a:sla.dec sym._main | jq -Rs 'contains("switch (local_") and (contains("switch (test)")|not)'
 EOF_CMDS
 RUN
 
@@ -818,8 +807,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '([splits("\n")] | map(select(contains("unlock(%d, %d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("unlock(%d, %d, %d) = %d") and contains("local_2c, local_30, local_34, sym._unlock(local_2c, local_30, local_34));") and (contains("sym._unlock(local_2c, local_30, local_34);")|not) and (contains("stack_")|not) and (contains("&stack")|not) and (contains("lr")|not) and (test("\\bx[0-9]+_[0-9]+\\b")|not) and (test("\\bw[0-9]+_[0-9]+\\b")|not))'
+a:sla.dec sym._main | jq -Rs '([splits("\n")] | map(select(contains("unlock(%d, %d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("unlock(%d, %d, %d) = %d") and contains("local_2c, local_30, local_34, sym._unlock(local_2c, local_30, local_34));") and (contains("sym._unlock(local_2c, local_30, local_34);")|not) and (contains("stack_")|not) and (contains("&stack")|not) and (contains("lr")|not) and (test("\\bx[0-9]+_[0-9]+\\b")|not) and (test("\\bw[0-9]+_[0-9]+\\b")|not))'
 EOF_CMDS
 RUN
 
@@ -831,8 +819,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '([splits("\n")] | map(select(contains("solve_equation(%d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("solve_equation(%d) = %d") and contains("local_5c, sym._solve_equation(local_5c));") and (contains("sym._solve_equation(local_5c);")|not) and (contains("stack_")|not) and (contains("&stack")|not) and (contains("lr")|not) and (test("\\bx[0-9]+_[0-9]+\\b")|not) and (test("\\bw[0-9]+_[0-9]+\\b")|not))'
+a:sla.dec sym._main | jq -Rs '([splits("\n")] | map(select(contains("solve_equation(%d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("solve_equation(%d) = %d") and contains("local_5c, sym._solve_equation(local_5c));") and (contains("sym._solve_equation(local_5c);")|not) and (contains("stack_")|not) and (contains("&stack")|not) and (contains("lr")|not) and (test("\\bx[0-9]+_[0-9]+\\b")|not) and (test("\\bw[0-9]+_[0-9]+\\b")|not))'
 EOF_CMDS
 RUN
 
@@ -844,8 +831,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '([splits("\n")] | map(select(contains("complex_check(%d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("complex_check(%d, %d) = %d") and contains("local_60, local_64, sym._complex_check(local_60, local_64));") and (contains("sym._complex_check(local_60, local_64);")|not) and (contains("stack_")|not) and (contains("&stack")|not) and (contains("lr")|not) and (test("\\bx[0-9]+_[0-9]+\\b")|not) and (test("\\bw[0-9]+_[0-9]+\\b")|not))'
+a:sla.dec sym._main | jq -Rs '([splits("\n")] | map(select(contains("complex_check(%d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("complex_check(%d, %d) = %d") and contains("local_60, local_64, sym._complex_check(local_60, local_64));") and (contains("sym._complex_check(local_60, local_64);")|not) and (contains("stack_")|not) and (contains("&stack")|not) and (contains("lr")|not) and (test("\\bx[0-9]+_[0-9]+\\b")|not) and (test("\\bw[0-9]+_[0-9]+\\b")|not))'
 EOF_CMDS
 RUN
 
@@ -857,8 +843,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '(length > 0) and contains("return 1;") and contains("switch (var_") and (contains("return argc;")|not)'
+a:sla.dec sym._main | jq -Rs '(length > 0) and contains("return 1;") and contains("switch (var_") and (contains("return argc;")|not)'
 EOF_CMDS
 RUN
 
@@ -870,8 +855,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '([splits("\n")] | map(select(contains("unlock(%d, %d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("var_3e0h, var_3dch, var_3d8h, sym._unlock(var_3e0h, var_3dch, var_3d8h));") and (contains("sym._unlock(var_3e0h, var_3dch, var_3d8h);")|not) and (contains("0U")|not) and (contains("&stack")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains(" r8")|not) and (contains("atoi(")|not))'
+a:sla.dec sym._main | jq -Rs '([splits("\n")] | map(select(contains("unlock(%d, %d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("var_3e0h, var_3dch, var_3d8h, sym._unlock(var_3e0h, var_3dch, var_3d8h));") and (contains("sym._unlock(var_3e0h, var_3dch, var_3d8h);")|not) and (contains("0U")|not) and (contains("&stack")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains(" r8")|not) and (contains("atoi(")|not))'
 EOF_CMDS
 RUN
 
@@ -883,8 +867,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '([splits("\n")] | map(select(contains("solve_equation(%d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("var_3e4h, sym._solve_equation(var_3e4h));") and (contains("sym._solve_equation(var_3e4h);")|not) and (contains("0U")|not) and (contains("&stack")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains(" r8")|not) and (contains("atoi(")|not))'
+a:sla.dec sym._main | jq -Rs '([splits("\n")] | map(select(contains("solve_equation(%d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("var_3e4h, sym._solve_equation(var_3e4h));") and (contains("sym._solve_equation(var_3e4h);")|not) and (contains("0U")|not) and (contains("&stack")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains(" r8")|not) and (contains("atoi(")|not))'
 EOF_CMDS
 RUN
 
@@ -896,8 +879,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '([splits("\n")] | map(select(contains("complex_check(%d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("var_3ech, var_3e8h, sym._complex_check(var_3ech, var_3e8h));") and (contains("sym._complex_check(var_3ech, var_3e8h);")|not) and (contains("0U")|not) and (contains("&stack")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains(" r8")|not) and (contains("atoi(")|not))'
+a:sla.dec sym._main | jq -Rs '([splits("\n")] | map(select(contains("complex_check(%d, %d) = %d")))) as $lines | ($lines | length) == 1 and ($lines[0] | contains("var_3ech, var_3e8h, sym._complex_check(var_3ech, var_3e8h));") and (contains("sym._complex_check(var_3ech, var_3e8h);")|not) and (contains("0U")|not) and (contains("&stack")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains(" r8")|not) and (contains("atoi(")|not))'
 EOF_CMDS
 RUN
 
@@ -909,8 +891,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '([splits("\n")] | map(select(contains("Copied: %s") or contains("vuln_alloc(%d, %d) = %p") or contains("free(")))) as $lines | ($lines | any(contains("sym.imp.printf(\"Copied: %s\\n\", var_38h);")) and any(contains("sym.imp.free(var_38h);")) and any(contains("sym.imp.printf(\"vuln_alloc(%d, %d) = %p\\n\", var_3ch, var_40h, sym._vuln_alloc(var_3ch, var_40h));")) and any(contains("sym.imp.free(var_48h);")) and (tostring | contains("0U")|not) and (tostring | contains("&stack")|not) and (tostring | contains("eax_")|not) and (tostring | contains("rax_")|not))'
+a:sla.dec sym._main | jq -Rs '([splits("\n")] | map(select(contains("Copied: %s") or contains("vuln_alloc(%d, %d) = %p") or contains("free(")))) as $lines | ($lines | any(.[]; contains("sym.imp.printf(\"Copied: %s") and contains("var_38h);")) and any(.[]; contains("sym.imp.free(var_38h);")) and any(.[]; contains("sym.imp.printf(\"vuln_alloc(%d, %d) = %p") and contains("var_3ch, var_40h, sym._vuln_alloc(var_3ch, var_40h));")) and any(.[]; contains("sym.imp.free(var_48h);")) and (tostring | contains("0U")|not) and (tostring | contains("&stack")|not) and (tostring | contains("eax_")|not) and (tostring | contains("rax_")|not))'
 EOF_CMDS
 RUN
 
@@ -922,8 +903,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.check_secret
-a:sla.dec | head -n1 | jq -Rs 'contains("int32_t")'
+a:sla.dec sym._check_secret | head -n1 | jq -Rs 'contains("int32_t")'
 EOF_CMDS
 RUN
 
@@ -935,8 +915,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.solve_equation
-a:sla.dec | head -n1 | jq -Rs '((contains("void ")|not) and (contains("int32_t") or contains("int64_t")))'
+a:sla.dec sym._solve_equation | head -n1 | jq -Rs '((contains("void ")|not) and (contains("int32_t") or contains("int64_t")))'
 EOF_CMDS
 RUN
 
@@ -948,8 +927,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.test_multi_use_temp
-a:sla.dec | jq -Rs '(contains(" = arg1 + 1;")|not)'
+a:sla.dec sym._test_multi_use_temp | jq -Rs '(contains(" = arg1 + 1;")|not)'
 EOF_CMDS
 RUN
 
@@ -1196,8 +1174,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs '(contains("dbg.main(") or contains("main(")) and (contains("sym.imp.atoi") or contains("sym.imp.printf") or contains("sym.imp.puts"))'
+a:sla.dec sym._main | jq -Rs '(contains("sym._main(") or contains("main(")) and (contains("sym.imp.atoi") or contains("sym.imp.printf") or contains("sym.imp.puts"))'
 EOF_CMDS
 RUN
 
@@ -1209,8 +1186,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.main
-a:sla.dec | jq -Rs 'contains("Usage: %s <test_num> [args...]") and contains("sym.imp.printf")'
+a:sla.dec sym._main | jq -Rs 'contains("Usage: %s <test_num> [args...]") and contains("sym.imp.printf")'
 EOF_CMDS
 RUN
 

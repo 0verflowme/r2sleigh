@@ -940,6 +940,25 @@ fn ssa_var_is_register_like(name: &str) -> bool {
         || lower.starts_with("space"))
 }
 
+pub(crate) fn scalar_register_family_key(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+
+    if let Some(idx) = lower.strip_prefix('x').or_else(|| lower.strip_prefix('w'))
+        && !idx.is_empty()
+        && idx.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return format!("aarch64:gpr:{idx}");
+    }
+
+    match lower.as_str() {
+        "fp" => "aarch64:gpr:29".to_string(),
+        "lr" => "aarch64:gpr:30".to_string(),
+        "sp" | "wsp" => "aarch64:sp".to_string(),
+        "xzr" | "wzr" => "aarch64:zr".to_string(),
+        _ => lower,
+    }
+}
+
 fn collect_register_version_keys(
     ssa_blocks: &[r2ssa::SSABlock],
 ) -> std::collections::HashMap<String, Vec<String>> {
@@ -952,7 +971,7 @@ fn collect_register_version_keys(
                 if !ssa_var_is_register_like(&var.name) {
                     return;
                 }
-                let reg_name = var.name.to_ascii_lowercase();
+                let reg_name = scalar_register_family_key(&var.name);
                 reg_versions
                     .entry(reg_name)
                     .or_default()
@@ -969,6 +988,130 @@ fn collect_register_version_keys(
         keys.dedup();
     }
     reg_versions
+}
+
+fn set_width_hint_prefer_narrower(
+    width_hints: &mut std::collections::HashMap<String, u32>,
+    key: String,
+    bits: u32,
+) -> bool {
+    if bits == 0 {
+        return false;
+    }
+    match width_hints.get(&key).copied() {
+        Some(current) if current == bits => false,
+        Some(current) if current > 0 && current <= bits => false,
+        _ => {
+            width_hints.insert(key, bits);
+            true
+        }
+    }
+}
+
+fn normalize_register_family_width_hints(
+    register_versions: &std::collections::HashMap<String, Vec<String>>,
+    width_hints: &mut std::collections::HashMap<String, u32>,
+) -> bool {
+    let mut changed = false;
+    for reg_keys in register_versions.values() {
+        let max_bits = reg_keys
+            .iter()
+            .filter_map(|key| width_hints.get(key).copied())
+            .max()
+            .unwrap_or(0);
+        let min_bits = reg_keys
+            .iter()
+            .filter_map(|key| {
+                let current = width_hints.get(key).copied().unwrap_or(0);
+                let natural = register_key_natural_bits(key).unwrap_or(0);
+                let candidate = match (current, natural) {
+                    (0, 0) => 0,
+                    (0, natural) => natural,
+                    (current, 0) => current,
+                    (current, natural) => current.min(natural),
+                };
+                (candidate > 0).then_some(candidate)
+            })
+            .min()
+            .unwrap_or(0);
+        let preferred_bits = if min_bits > 0 && max_bits == 64 && min_bits <= 32 {
+            min_bits
+        } else {
+            max_bits
+        };
+        for key in reg_keys {
+            changed |= set_width_hint_prefer_narrower(width_hints, key.clone(), preferred_bits);
+        }
+    }
+    changed
+}
+
+fn register_key_natural_bits(key: &str) -> Option<u32> {
+    let reg = key.split('_').next()?;
+    if let Some(idx) = reg.strip_prefix('w')
+        && !idx.is_empty()
+        && idx.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Some(32);
+    }
+    if let Some(idx) = reg.strip_prefix('x')
+        && !idx.is_empty()
+        && idx.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Some(64);
+    }
+    match reg {
+        "wsp" | "wzr" => Some(32),
+        "sp" | "fp" | "lr" | "xzr" => Some(64),
+        _ => None,
+    }
+}
+
+fn propagate_normalized_scalar_result_widths(
+    ssa_blocks: &[r2ssa::SSABlock],
+    width_hints: &mut std::collections::HashMap<String, u32>,
+) -> bool {
+    let mut changed = false;
+    for block in ssa_blocks {
+        for op in &block.ops {
+            let (dst, source_bits) = match op {
+                r2ssa::SSAOp::Copy { dst, src }
+                | r2ssa::SSAOp::Cast { dst, src }
+                | r2ssa::SSAOp::New { dst, src }
+                | r2ssa::SSAOp::IntZExt { dst, src }
+                | r2ssa::SSAOp::IntSExt { dst, src }
+                | r2ssa::SSAOp::Subpiece { dst, src, .. } => {
+                    let bits = width_hints.get(&ssa_var_key(src)).copied().unwrap_or(0);
+                    (dst, bits)
+                }
+                r2ssa::SSAOp::IntAdd { dst, a, b }
+                | r2ssa::SSAOp::IntSub { dst, a, b }
+                | r2ssa::SSAOp::IntMult { dst, a, b }
+                | r2ssa::SSAOp::IntDiv { dst, a, b }
+                | r2ssa::SSAOp::IntSDiv { dst, a, b }
+                | r2ssa::SSAOp::IntRem { dst, a, b }
+                | r2ssa::SSAOp::IntSRem { dst, a, b }
+                | r2ssa::SSAOp::IntAnd { dst, a, b }
+                | r2ssa::SSAOp::IntOr { dst, a, b }
+                | r2ssa::SSAOp::IntXor { dst, a, b }
+                | r2ssa::SSAOp::IntLeft { dst, a, b }
+                | r2ssa::SSAOp::IntRight { dst, a, b }
+                | r2ssa::SSAOp::IntSRight { dst, a, b } => {
+                    let bits = [a, b]
+                        .into_iter()
+                        .filter(|var| !ssa_var_is_const(var))
+                        .filter_map(|var| width_hints.get(&ssa_var_key(var)).copied())
+                        .filter(|bits| *bits > 0)
+                        .max()
+                        .unwrap_or(0);
+                    (dst, bits)
+                }
+                _ => continue,
+            };
+            changed |= set_width_hint_prefer_narrower(width_hints, ssa_var_key(dst), source_bits);
+        }
+    }
+    changed
 }
 
 fn ssa_var_is_stack_base(var: &r2ssa::SSAVar) -> bool {
@@ -1383,6 +1526,49 @@ fn infer_scalar_var_evidence_from_ssa(
         for block in ssa_blocks {
             for op in &block.ops {
                 match op {
+                    r2ssa::SSAOp::IntAdd { dst, a, b }
+                    | r2ssa::SSAOp::IntSub { dst, a, b }
+                    | r2ssa::SSAOp::IntMult { dst, a, b }
+                    | r2ssa::SSAOp::IntDiv { dst, a, b }
+                    | r2ssa::SSAOp::IntSDiv { dst, a, b }
+                    | r2ssa::SSAOp::IntRem { dst, a, b }
+                    | r2ssa::SSAOp::IntSRem { dst, a, b }
+                    | r2ssa::SSAOp::IntAnd { dst, a, b }
+                    | r2ssa::SSAOp::IntOr { dst, a, b }
+                    | r2ssa::SSAOp::IntXor { dst, a, b }
+                    | r2ssa::SSAOp::IntLeft { dst, a, b }
+                    | r2ssa::SSAOp::IntRight { dst, a, b }
+                    | r2ssa::SSAOp::IntSRight { dst, a, b } => {
+                        let dst_key = ssa_var_key(dst);
+                        let a_key = ssa_var_key(a);
+                        let b_key = ssa_var_key(b);
+                        let any_proven =
+                            scalar_proven.contains(&a_key) || scalar_proven.contains(&b_key);
+                        let any_likely = scalar_likely.contains(&a_key)
+                            || scalar_likely.contains(&b_key)
+                            || any_proven;
+                        if any_proven {
+                            changed |= scalar_proven.insert(dst_key.clone());
+                        }
+                        if any_likely {
+                            changed |= scalar_likely.insert(dst_key.clone());
+                        }
+
+                        let operand_bits = [a, b]
+                            .into_iter()
+                            .filter(|var| !ssa_var_is_const(var))
+                            .filter_map(|var| width_hints.get(&ssa_var_key(var)).copied())
+                            .filter(|bits| *bits > 0)
+                            .max()
+                            .unwrap_or(0);
+                        if operand_bits > 0 {
+                            let entry = width_hints.entry(dst_key).or_insert(0);
+                            if operand_bits != *entry {
+                                *entry = operand_bits;
+                                changed = true;
+                            }
+                        }
+                    }
                     r2ssa::SSAOp::Phi { dst, sources } => {
                         let dst_key = ssa_var_key(dst);
                         let any_proven = sources
@@ -1472,6 +1658,17 @@ fn infer_scalar_var_evidence_from_ssa(
                 .filter_map(|key| width_hints.get(key).copied())
                 .max()
                 .unwrap_or(0);
+            let min_bits = reg_keys
+                .iter()
+                .filter_map(|key| width_hints.get(key).copied())
+                .filter(|bits| *bits > 0)
+                .min()
+                .unwrap_or(0);
+            let preferred_bits = if min_bits > 0 && max_bits == 64 && min_bits <= 32 {
+                min_bits
+            } else {
+                max_bits
+            };
             for key in reg_keys {
                 if any_proven {
                     changed |= scalar_proven.insert(key.clone());
@@ -1482,10 +1679,10 @@ fn infer_scalar_var_evidence_from_ssa(
                 if any_bool {
                     changed |= bool_like.insert(key.clone());
                 }
-                if max_bits > 0 {
+                if preferred_bits > 0 {
                     let entry = width_hints.entry(key.clone()).or_insert(0);
-                    if max_bits > *entry {
-                        *entry = max_bits;
+                    if preferred_bits != *entry {
+                        *entry = preferred_bits;
                         changed = true;
                     }
                 }
@@ -1500,8 +1697,12 @@ pub(crate) fn collect_signature_type_evidence_context(
     ssa_blocks: &[r2ssa::SSABlock],
 ) -> crate::SignatureTypeEvidenceContext {
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks);
-    let (scalar_proven_vars, scalar_likely_vars, bool_like_vars, width_bits) =
+    let (scalar_proven_vars, scalar_likely_vars, bool_like_vars, mut width_bits) =
         infer_scalar_var_evidence_from_ssa(ssa_blocks);
+    let register_versions = collect_register_version_keys(ssa_blocks);
+    normalize_register_family_width_hints(&register_versions, &mut width_bits);
+    propagate_normalized_scalar_result_widths(ssa_blocks, &mut width_bits);
+    normalize_register_family_width_hints(&register_versions, &mut width_bits);
     crate::SignatureTypeEvidenceContext {
         pointer_vars,
         scalar_proven_vars,
@@ -1559,6 +1760,64 @@ fn strongest_hint_for_aliases(
         }
     }
     best
+}
+
+fn width_hint_key_matches_family(key: &str, family: &str) -> bool {
+    let Some((name, _version)) = key.rsplit_once('_') else {
+        return false;
+    };
+    scalar_register_family_key(name) == family
+}
+
+fn width_hint_key_matches_family_version(key: &str, family: &str, version: u32) -> bool {
+    let Some((name, version_str)) = key.rsplit_once('_') else {
+        return false;
+    };
+    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
+}
+
+fn recovered_arg_family_width_hint(
+    evidence: &crate::SignatureTypeEvidenceContext,
+    src: &r2ssa::SSAVar,
+) -> Option<u32> {
+    let family = scalar_register_family_key(&src.name);
+    evidence
+        .width_bits
+        .iter()
+        .filter(|(key, bits)| {
+            **bits > 0 && width_hint_key_matches_family_version(key, &family, src.version)
+        })
+        .map(|(_, bits)| *bits)
+        .min()
+        .or_else(|| {
+            evidence
+                .width_bits
+                .iter()
+                .filter(|(key, bits)| **bits > 0 && width_hint_key_matches_family(key, &family))
+                .map(|(_, bits)| *bits)
+                .min()
+        })
+}
+
+fn recovered_arg_type_hint(
+    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
+    canonical: &str,
+    aliases: &[&str],
+    src: &r2ssa::SSAVar,
+    signature_evidence: Option<&crate::SignatureTypeEvidenceContext>,
+) -> Option<String> {
+    let best_hint = strongest_hint_for_aliases(reg_type_hints, canonical, aliases);
+    if let Some(hint) = best_hint.as_ref()
+        && hint.rank == TypeHintRank::Pointer
+    {
+        return Some(hint.ty.clone());
+    }
+    if let Some(evidence) = signature_evidence
+        && let Some(bits) = recovered_arg_family_width_hint(evidence, src)
+    {
+        return Some(size_to_type(bits.div_ceil(8)));
+    }
+    best_hint.map(|hint| hint.ty)
 }
 
 pub(crate) fn merge_register_type_hints(
@@ -1634,6 +1893,8 @@ pub(crate) fn recover_vars_from_ssa(
     let mut seen_offsets: HashMap<i64, usize> = HashMap::new();
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
     let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(arch);
+    let signature_evidence =
+        semantic_typing_enabled.then(|| collect_signature_type_evidence_context(ssa_blocks));
     let (usage_reg_type_hints, pointer_var_keys) = if semantic_typing_enabled {
         infer_usage_register_type_hints(ssa_blocks)
     } else {
@@ -1730,8 +1991,13 @@ pub(crate) fn recover_vars_from_ssa(
                         {
                             seen_arg_regs.insert(canonical.to_string());
                             let hinted_type = if semantic_typing_enabled {
-                                strongest_hint_for_aliases(&reg_type_hints, canonical, aliases)
-                                    .map(|hint| hint.ty)
+                                recovered_arg_type_hint(
+                                    &reg_type_hints,
+                                    canonical,
+                                    aliases,
+                                    src,
+                                    signature_evidence.as_ref(),
+                                )
                             } else {
                                 None
                             };
@@ -3005,6 +3271,86 @@ mod tests {
         assert_eq!(sig.params[0].param_type, "int32_t");
         assert_eq!(sig.params[1].name, "argv");
         assert_eq!(sig.params[1].param_type, "int8_t**");
+    }
+
+    #[test]
+    fn scalar_register_family_key_merges_arm64_x_and_w_aliases() {
+        assert_eq!(scalar_register_family_key("X0"), "aarch64:gpr:0");
+        assert_eq!(scalar_register_family_key("w0"), "aarch64:gpr:0");
+        assert_eq!(scalar_register_family_key("fp"), "aarch64:gpr:29");
+        assert_eq!(scalar_register_family_key("lr"), "aarch64:gpr:30");
+    }
+
+    #[test]
+    fn scalar_width_hints_narrow_arm64_x_family_from_w_family_usage() {
+        let blocks = vec![r2ssa::SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("W8", 1, 4),
+                    src: r2ssa::SSAVar::new("W0", 0, 4),
+                },
+                r2ssa::SSAOp::IntZExt {
+                    dst: r2ssa::SSAVar::new("X9", 1, 8),
+                    src: r2ssa::SSAVar::new("W8", 1, 4),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("X10", 1, 8),
+                    a: r2ssa::SSAVar::new("X0", 0, 8),
+                    b: r2ssa::SSAVar::new("const:1", 0, 8),
+                },
+            ],
+        }];
+
+        let evidence = collect_signature_type_evidence_context(&blocks);
+        assert_eq!(
+            evidence.width_bits.get("x0_0"),
+            Some(&32),
+            "{:?}",
+            evidence.width_bits
+        );
+        assert_eq!(
+            evidence.width_bits.get("x9_1"),
+            Some(&32),
+            "{:?}",
+            evidence.width_bits
+        );
+        assert_eq!(
+            evidence.width_bits.get("x10_1"),
+            Some(&32),
+            "{:?}",
+            evidence.width_bits
+        );
+    }
+
+    #[test]
+    fn recover_vars_prefers_arm64_family_width_hint_for_wide_arg_carrier() {
+        let blocks = vec![r2ssa::SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("X8", 1, 8),
+                    src: r2ssa::SSAVar::new("X0", 0, 8),
+                },
+                r2ssa::SSAOp::IntAnd {
+                    dst: r2ssa::SSAVar::new("W9", 1, 4),
+                    a: r2ssa::SSAVar::new("W0", 0, 4),
+                    b: r2ssa::SSAVar::new("const:ff", 0, 4),
+                },
+            ],
+        }];
+
+        let arch = ArchSpec::new("aarch64");
+        let vars = recover_vars_from_ssa(
+            &blocks,
+            Some(&arch),
+            &std::collections::HashMap::new(),
+            true,
+        );
+        let arg0 = vars.iter().find(|var| var.name == "arg0").expect("arg0");
+        assert_eq!(arg0.var_type, "int32_t");
     }
 
     #[test]

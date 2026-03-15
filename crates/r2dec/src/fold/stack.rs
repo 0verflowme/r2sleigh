@@ -313,7 +313,18 @@ impl<'a> FoldingContext<'a> {
             .get(&offset)
             .cloned()
             .map(|name| self.canonicalize_stack_name(&name).unwrap_or(name))
-            .or_else(|| self.external_stack_name_for_offset(offset));
+            .or_else(|| self.external_stack_name_for_offset(offset))
+            .or_else(|| {
+                self.stack_slots_map()
+                    .values()
+                    .any(|slot| slot.offset == offset)
+                    .then(|| Self::stack_synthetic_name(offset))
+            })
+            .or_else(|| {
+                (offset < 0
+                    && (!self.stack_slots_map().is_empty() || !self.definitions_map().is_empty()))
+                .then(|| Self::stack_synthetic_name(offset))
+            });
         resolved.map(|name| {
             if self.is_reserved_param_alias_name(&name) {
                 Self::stack_synthetic_name(offset)

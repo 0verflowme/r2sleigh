@@ -68,8 +68,17 @@ struct LowerFrame {
     with_call_args: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibleExprContext {
+    Generic,
+    ScalarPredicate,
+    ScalarReturn,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct VisibleExprQuality {
+    scalar_signal: i32,
+    predicate_signal: i32,
     semantic_shapes: i32,
     semantic_names: i32,
     stable_pointer_shapes: i32,
@@ -77,6 +86,8 @@ struct VisibleExprQuality {
     transient_reg_penalty: i32,
     temp_penalty: i32,
     zero_offset_penalty: i32,
+    address_shape_penalty: i32,
+    stack_home_penalty: i32,
     node_penalty: i32,
 }
 
@@ -390,6 +401,12 @@ impl<'a> FoldingContext<'a> {
             func,
             &env,
         );
+        analysis::use_info::annotate_stack_slot_semantics(
+            self.state.analysis_ctx.semantic_mut(),
+            func,
+            &self.state.return_stack_slots,
+            &env,
+        );
     }
 
     fn detect_return_stack_slots(&mut self, func: &SSAFunction, exit_addr: u64) {
@@ -493,11 +510,11 @@ impl<'a> FoldingContext<'a> {
         let mut loaded_slots = HashSet::new();
         let mut saw_control_return = false;
 
-        for op in &block.ops {
+        for (op_idx, op) in block.ops.iter().enumerate() {
             match op {
-                SSAOp::Load { addr, .. } => {
-                    if let SSAOp::Load { dst, .. } = op
-                        && self.is_control_return_target(dst)
+                SSAOp::Load { dst, addr, .. } => {
+                    if self.is_control_return_target(dst)
+                        || self.load_is_control_epilogue_artifact(block, op_idx, dst)
                     {
                         continue;
                     }
@@ -530,6 +547,43 @@ impl<'a> FoldingContext<'a> {
         }
 
         loaded_slots.into_iter().next()
+    }
+
+    fn load_is_control_epilogue_artifact(
+        &self,
+        block: &SSABlock,
+        load_idx: usize,
+        loaded_dst: &SSAVar,
+    ) -> bool {
+        let mut saw_use = false;
+        for op in block.ops.iter().skip(load_idx + 1) {
+            let uses_dst = op.sources().contains(&loaded_dst);
+            if !uses_dst {
+                continue;
+            }
+            saw_use = true;
+            match op {
+                SSAOp::Copy { dst, src }
+                | SSAOp::IntZExt { dst, src }
+                | SSAOp::IntSExt { dst, src }
+                | SSAOp::Trunc { dst, src }
+                | SSAOp::Cast { dst, src }
+                    if src == loaded_dst =>
+                {
+                    let lower = dst.name.to_ascii_lowercase();
+                    if self.is_control_return_target(dst)
+                        || self.inputs.arch.is_stack_pointer_name(&lower)
+                        || self.inputs.arch.is_frame_pointer_name(&lower)
+                    {
+                        continue;
+                    }
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+
+        saw_use
     }
 
     fn stack_slot_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
@@ -3261,8 +3315,234 @@ impl<'a> FoldingContext<'a> {
         self.lookup_type_hint(&rendered).cloned()
     }
 
+    fn stack_slot_provenance_for_name(&self, name: &str) -> Option<analysis::StackSlotProvenance> {
+        self.stack_slots_map()
+            .get(name)
+            .copied()
+            .or_else(|| {
+                self.stack_slots_map()
+                    .get(&name.to_ascii_lowercase())
+                    .copied()
+            })
+            .or_else(|| {
+                self.find_ssa_name_for_rendered_alias(name)
+                    .and_then(|ssa_name| self.stack_slots_map().get(&ssa_name).copied())
+            })
+    }
+
+    fn scalar_context_root_candidate_for_name(
+        &self,
+        name: &str,
+        context: VisibleExprContext,
+    ) -> Option<CExpr> {
+        if !matches!(
+            context,
+            VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+        ) {
+            return None;
+        }
+
+        let stable_scalar_expr_for_offset = |ctx: &FoldingContext<'_>, offset: i64| {
+            (offset < 0)
+                .then(|| ctx.use_info().stable_stack_values.get(&offset))
+                .flatten()
+                .filter(|value| matches!(value, analysis::SemanticValue::Scalar(_)))
+                .and_then(|value| ctx.render_semantic_value(value, 0, &mut HashSet::new()))
+        };
+
+        if let Some(offset) = self
+            .forwarded_values_map()
+            .get(name)
+            .and_then(|prov| prov.stack_slot)
+            .or_else(|| {
+                self.stack_slot_provenance_for_name(name)
+                    .map(|slot| slot.offset)
+            })
+            && let Some(candidate) = stable_scalar_expr_for_offset(self, offset)
+            && !self.expr_is_address_artifact_in_scalar_context(&candidate)
+        {
+            return Some(candidate);
+        }
+
+        let root_name = self.resolve_copy_root_name_in_fold(name);
+        if root_name == name {
+            return None;
+        }
+
+        if let Some(offset) = self
+            .forwarded_values_map()
+            .get(&root_name)
+            .and_then(|prov| prov.stack_slot)
+            .or_else(|| {
+                self.stack_slot_provenance_for_name(&root_name)
+                    .map(|slot| slot.offset)
+            })
+            && let Some(candidate) = stable_scalar_expr_for_offset(self, offset)
+            && !self.expr_is_address_artifact_in_scalar_context(&candidate)
+        {
+            return Some(candidate);
+        }
+
+        let unresolved_root = self
+            .guess_ssa_var_from_name(&root_name)
+            .map(|var| CExpr::Var(self.var_name(&var)))
+            .or_else(|| Some(self.expr_for_ssa_fallback_name(&root_name)));
+        let semantic_root = self
+            .render_semantic_value_by_name(&root_name, 0, &mut HashSet::new())
+            .filter(|candidate| !self.expr_is_address_artifact_in_scalar_context(candidate));
+        self.choose_preferred_visible_expr_in_context(unresolved_root, semantic_root, context)
+            .filter(|candidate| !self.expr_is_address_artifact_in_scalar_context(candidate))
+    }
+
+    fn is_autogenerated_stack_home_name(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower == "saved_fp"
+            || lower.starts_with("stack_")
+            || lower.strip_prefix("var_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_hexdigit() || ch == 'h')
+            })
+    }
+
+    fn is_named_scalar_local(&self, name: &str) -> bool {
+        self.stack_slot_provenance_for_name(name).is_some()
+            && !self.is_autogenerated_stack_home_name(name)
+            && !self.is_low_signal_visible_name(name)
+            && !self.is_transient_visible_name(name)
+    }
+
+    fn expr_is_stack_base_like(&self, expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Var(name) => {
+                let lower = name.to_ascii_lowercase();
+                self.inputs.arch.is_stack_base_name(&lower)
+                    || self.inputs.arch.is_frame_pointer_name(&lower)
+                    || lower == "stack"
+                    || lower == "saved_fp"
+                    || is_generic_stack_placeholder_alias(name)
+            }
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                self.expr_is_stack_base_like(inner)
+            }
+            CExpr::Unary { operand, .. } => self.expr_is_stack_base_like(operand),
+            _ => false,
+        }
+    }
+
+    fn expr_contains_raw_stack_base_arithmetic(&self, expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub,
+                left,
+                right,
+            } => {
+                self.expr_is_stack_base_like(left)
+                    || self.expr_is_stack_base_like(right)
+                    || self.expr_contains_raw_stack_base_arithmetic(left)
+                    || self.expr_contains_raw_stack_base_arithmetic(right)
+            }
+            CExpr::Paren(inner)
+            | CExpr::AddrOf(inner)
+            | CExpr::Deref(inner)
+            | CExpr::Cast { expr: inner, .. } => {
+                self.expr_contains_raw_stack_base_arithmetic(inner)
+            }
+            CExpr::Unary { operand, .. } => self.expr_contains_raw_stack_base_arithmetic(operand),
+            CExpr::Binary { left, right, .. } => {
+                self.expr_contains_raw_stack_base_arithmetic(left)
+                    || self.expr_contains_raw_stack_base_arithmetic(right)
+            }
+            CExpr::Subscript { base, index } => {
+                self.expr_contains_raw_stack_base_arithmetic(base)
+                    || self.expr_contains_raw_stack_base_arithmetic(index)
+            }
+            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+                self.expr_contains_raw_stack_base_arithmetic(base)
+            }
+            CExpr::Call { func, args } => {
+                self.expr_contains_raw_stack_base_arithmetic(func)
+                    || args
+                        .iter()
+                        .any(|arg| self.expr_contains_raw_stack_base_arithmetic(arg))
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_contains_raw_stack_base_arithmetic(cond)
+                    || self.expr_contains_raw_stack_base_arithmetic(then_expr)
+                    || self.expr_contains_raw_stack_base_arithmetic(else_expr)
+            }
+            CExpr::Comma(exprs) => exprs
+                .iter()
+                .any(|inner| self.expr_contains_raw_stack_base_arithmetic(inner)),
+            CExpr::Sizeof(inner) => self.expr_contains_raw_stack_base_arithmetic(inner),
+            _ => false,
+        }
+    }
+
+    fn expr_is_address_artifact_in_scalar_context(&self, expr: &CExpr) -> bool {
+        match expr {
+            CExpr::AddrOf(_)
+            | CExpr::Deref(_)
+            | CExpr::Subscript { .. }
+            | CExpr::Member { .. }
+            | CExpr::PtrMember { .. } => true,
+            CExpr::Var(name) => {
+                self.is_non_index_pointer_expr(expr)
+                    && !matches!(
+                        self.stack_slot_provenance_for_name(name),
+                        Some(slot) if slot.is_scalar_predicate_carrier() || slot.is_scalar_return_carrier()
+                    )
+            }
+            CExpr::Cast { ty, expr: inner } => {
+                matches!(ty, CType::Pointer(_))
+                    || self.expr_is_address_artifact_in_scalar_context(inner)
+            }
+            CExpr::Paren(inner) => self.expr_is_address_artifact_in_scalar_context(inner),
+            CExpr::Unary { operand, .. } => {
+                self.expr_is_address_artifact_in_scalar_context(operand)
+            }
+            CExpr::Binary { left, right, .. } => {
+                self.expr_contains_raw_stack_base_arithmetic(expr)
+                    || self.expr_is_address_artifact_in_scalar_context(left)
+                    || self.expr_is_address_artifact_in_scalar_context(right)
+            }
+            CExpr::Call { func, args } => {
+                self.expr_is_address_artifact_in_scalar_context(func)
+                    || args
+                        .iter()
+                        .any(|arg| self.expr_is_address_artifact_in_scalar_context(arg))
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_is_address_artifact_in_scalar_context(cond)
+                    || self.expr_is_address_artifact_in_scalar_context(then_expr)
+                    || self.expr_is_address_artifact_in_scalar_context(else_expr)
+            }
+            CExpr::Comma(exprs) => exprs
+                .iter()
+                .any(|inner| self.expr_is_address_artifact_in_scalar_context(inner)),
+            CExpr::Sizeof(inner) => self.expr_is_address_artifact_in_scalar_context(inner),
+            _ => false,
+        }
+    }
+
     pub(crate) fn prefers_visible_expr(&self, current: &CExpr, candidate: &CExpr) -> bool {
-        self.visible_expr_quality(candidate) > self.visible_expr_quality(current)
+        self.prefers_visible_expr_in_context(current, candidate, VisibleExprContext::Generic)
+    }
+
+    fn prefers_visible_expr_in_context(
+        &self,
+        current: &CExpr,
+        candidate: &CExpr,
+        context: VisibleExprContext,
+    ) -> bool {
+        self.visible_expr_quality_in_context(candidate, context)
+            > self.visible_expr_quality_in_context(current, context)
     }
 
     pub(super) fn choose_preferred_visible_expr(
@@ -3270,11 +3550,36 @@ impl<'a> FoldingContext<'a> {
         current: Option<CExpr>,
         candidate: Option<CExpr>,
     ) -> Option<CExpr> {
+        self.choose_preferred_visible_expr_in_context(
+            current,
+            candidate,
+            VisibleExprContext::Generic,
+        )
+    }
+
+    pub(super) fn choose_preferred_scalar_predicate_expr(
+        &self,
+        current: Option<CExpr>,
+        candidate: Option<CExpr>,
+    ) -> Option<CExpr> {
+        self.choose_preferred_visible_expr_in_context(
+            current,
+            candidate,
+            VisibleExprContext::ScalarPredicate,
+        )
+    }
+
+    fn choose_preferred_visible_expr_in_context(
+        &self,
+        current: Option<CExpr>,
+        candidate: Option<CExpr>,
+        context: VisibleExprContext,
+    ) -> Option<CExpr> {
         match (current, candidate) {
             (None, other) => other,
             (some @ Some(_), None) => some,
             (Some(current_expr), Some(candidate_expr)) => {
-                if self.prefers_visible_expr(&current_expr, &candidate_expr) {
+                if self.prefers_visible_expr_in_context(&current_expr, &candidate_expr, context) {
                     Some(candidate_expr)
                 } else {
                     Some(current_expr)
@@ -3294,15 +3599,45 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn best_visible_definition(&self, name: &str) -> Option<CExpr> {
-        self.choose_preferred_visible_expr(
+        self.best_visible_definition_in_context(name, VisibleExprContext::Generic)
+    }
+
+    fn best_visible_definition_in_context(
+        &self,
+        name: &str,
+        context: VisibleExprContext,
+    ) -> Option<CExpr> {
+        self.choose_preferred_visible_expr_in_context(
             self.lookup_definition(name),
             self.formatted_defs_map().get(name).cloned(),
+            context,
         )
     }
 
     fn visible_expr_quality(&self, expr: &CExpr) -> VisibleExprQuality {
+        self.visible_expr_quality_in_context(expr, VisibleExprContext::Generic)
+    }
+
+    fn visible_expr_quality_in_context(
+        &self,
+        expr: &CExpr,
+        context: VisibleExprContext,
+    ) -> VisibleExprQuality {
         let mut quality = VisibleExprQuality::default();
-        self.accumulate_visible_expr_quality(expr, &mut quality, 0);
+        self.accumulate_visible_expr_quality(expr, &mut quality, 0, context);
+        if matches!(context, VisibleExprContext::ScalarPredicate)
+            && self.is_predicate_like_expr(expr)
+        {
+            quality.predicate_signal += 12;
+            quality.scalar_signal += 4;
+        }
+        if matches!(
+            context,
+            VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+        ) && self.expr_contains_raw_stack_base_arithmetic(expr)
+        {
+            quality.address_shape_penalty -= 24;
+        }
         quality
     }
 
@@ -3311,6 +3646,7 @@ impl<'a> FoldingContext<'a> {
         expr: &CExpr,
         quality: &mut VisibleExprQuality,
         depth: u32,
+        context: VisibleExprContext,
     ) {
         if depth > MAX_SIMPLE_EXPR_DEPTH {
             return;
@@ -3328,6 +3664,47 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     quality.semantic_names += 3;
                 }
+                if matches!(
+                    context,
+                    VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+                ) {
+                    if self.arg_alias_for_rendered_name(name).is_some() || is_generic_arg_name(name)
+                    {
+                        quality.scalar_signal += 12;
+                    }
+                    if self.lookup_predicate_expr(name).is_some()
+                        || self.condition_vars_set().contains(name)
+                    {
+                        quality.predicate_signal += 8;
+                        quality.scalar_signal += 4;
+                    }
+                    if self.is_named_scalar_local(name) {
+                        quality.scalar_signal += 6;
+                    }
+                    if self.is_autogenerated_stack_home_name(name)
+                        && self.stack_slot_provenance_for_name(name).is_some()
+                    {
+                        quality.stack_home_penalty -= 18;
+                    }
+                    if matches!(
+                        self.stack_slot_provenance_for_name(name),
+                        Some(slot)
+                            if slot.is_scalar_predicate_carrier()
+                                || slot.is_scalar_return_carrier()
+                    ) {
+                        quality.scalar_signal += 4;
+                    }
+                    if self.is_non_index_pointer_expr(expr)
+                        && !matches!(
+                            self.stack_slot_provenance_for_name(name),
+                            Some(slot)
+                                if slot.is_scalar_predicate_carrier()
+                                    || slot.is_scalar_return_carrier()
+                        )
+                    {
+                        quality.address_shape_penalty -= 20;
+                    }
+                }
             }
             CExpr::Subscript { base, index } => {
                 quality.semantic_shapes += 6;
@@ -3335,22 +3712,48 @@ impl<'a> FoldingContext<'a> {
                 if self.is_non_index_pointer_expr(index) {
                     quality.transient_reg_penalty -= 10;
                 }
-                self.accumulate_visible_expr_quality(base, quality, depth + 1);
-                self.accumulate_visible_expr_quality(index, quality, depth + 1);
+                if matches!(
+                    context,
+                    VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+                ) {
+                    quality.address_shape_penalty -= 24;
+                }
+                self.accumulate_visible_expr_quality(base, quality, depth + 1, context);
+                self.accumulate_visible_expr_quality(index, quality, depth + 1, context);
             }
             CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
                 quality.semantic_shapes += 7;
                 quality.stable_pointer_shapes += 2;
-                self.accumulate_visible_expr_quality(base, quality, depth + 1);
+                if matches!(
+                    context,
+                    VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+                ) {
+                    quality.address_shape_penalty -= 24;
+                }
+                self.accumulate_visible_expr_quality(base, quality, depth + 1, context);
             }
             CExpr::Deref(inner) | CExpr::AddrOf(inner) => {
                 quality.stable_pointer_shapes += 1;
-                self.accumulate_visible_expr_quality(inner, quality, depth + 1);
+                if matches!(
+                    context,
+                    VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+                ) {
+                    quality.address_shape_penalty -= 30;
+                }
+                self.accumulate_visible_expr_quality(inner, quality, depth + 1, context);
             }
-            CExpr::Cast { expr: inner, .. }
-            | CExpr::Paren(inner)
-            | CExpr::Unary { operand: inner, .. } => {
-                self.accumulate_visible_expr_quality(inner, quality, depth + 1);
+            CExpr::Cast { ty, expr: inner } => {
+                if matches!(
+                    context,
+                    VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+                ) && matches!(ty, CType::Pointer(_))
+                {
+                    quality.address_shape_penalty -= 24;
+                }
+                self.accumulate_visible_expr_quality(inner, quality, depth + 1, context);
+            }
+            CExpr::Paren(inner) | CExpr::Unary { operand: inner, .. } => {
+                self.accumulate_visible_expr_quality(inner, quality, depth + 1, context);
             }
             CExpr::Binary { op, left, right } => {
                 if matches!(op, BinaryOp::Add | BinaryOp::Sub)
@@ -3359,13 +3762,20 @@ impl<'a> FoldingContext<'a> {
                 {
                     quality.zero_offset_penalty -= 10;
                 }
-                self.accumulate_visible_expr_quality(left, quality, depth + 1);
-                self.accumulate_visible_expr_quality(right, quality, depth + 1);
+                if matches!(
+                    context,
+                    VisibleExprContext::ScalarPredicate | VisibleExprContext::ScalarReturn
+                ) && self.expr_contains_raw_stack_base_arithmetic(expr)
+                {
+                    quality.address_shape_penalty -= 18;
+                }
+                self.accumulate_visible_expr_quality(left, quality, depth + 1, context);
+                self.accumulate_visible_expr_quality(right, quality, depth + 1, context);
             }
             CExpr::Call { func, args } => {
-                self.accumulate_visible_expr_quality(func, quality, depth + 1);
+                self.accumulate_visible_expr_quality(func, quality, depth + 1, context);
                 for arg in args {
-                    self.accumulate_visible_expr_quality(arg, quality, depth + 1);
+                    self.accumulate_visible_expr_quality(arg, quality, depth + 1, context);
                 }
             }
             CExpr::Ternary {
@@ -3373,16 +3783,18 @@ impl<'a> FoldingContext<'a> {
                 then_expr,
                 else_expr,
             } => {
-                self.accumulate_visible_expr_quality(cond, quality, depth + 1);
-                self.accumulate_visible_expr_quality(then_expr, quality, depth + 1);
-                self.accumulate_visible_expr_quality(else_expr, quality, depth + 1);
+                self.accumulate_visible_expr_quality(cond, quality, depth + 1, context);
+                self.accumulate_visible_expr_quality(then_expr, quality, depth + 1, context);
+                self.accumulate_visible_expr_quality(else_expr, quality, depth + 1, context);
             }
             CExpr::Comma(exprs) => {
                 for inner in exprs {
-                    self.accumulate_visible_expr_quality(inner, quality, depth + 1);
+                    self.accumulate_visible_expr_quality(inner, quality, depth + 1, context);
                 }
             }
-            CExpr::Sizeof(inner) => self.accumulate_visible_expr_quality(inner, quality, depth + 1),
+            CExpr::Sizeof(inner) => {
+                self.accumulate_visible_expr_quality(inner, quality, depth + 1, context)
+            }
             CExpr::IntLit(_)
             | CExpr::UIntLit(_)
             | CExpr::FloatLit(_)
@@ -3654,25 +4066,40 @@ impl<'a> FoldingContext<'a> {
         if let Some(resolved) = self.resolve_return_expr_from_defs(&target_expr, 0, &mut visited)
             && resolved != target_expr
         {
-            best = self.choose_preferred_visible_expr(best, Some(resolved));
+            best = self.preferred_return_candidate(best, Some(resolved));
         }
 
-        if let Some(last) = last_ret_value
-            && {
-                let last = self.resolve_return_candidate(&last);
-                self.is_predicate_like_expr(&last)
-                    || self.is_low_level_return_artifact(&target_expr)
-                    || self.is_uninitialized_return_reg(&target_expr)
-                    || best
-                        .as_ref()
-                        .is_some_and(|current| self.prefers_visible_expr(current, &last))
-            }
-        {
+        if let Some(last) = last_ret_value {
             let last = self.resolve_return_candidate(&last);
-            best = self.choose_preferred_visible_expr(best, Some(last));
+            best = self.preferred_return_candidate(best, Some(last));
         }
 
         best.unwrap_or(target_expr)
+    }
+
+    fn should_emit_return_slot_assignment(&self, offset: i64, value: &CExpr) -> bool {
+        let is_scalar_return_slot = self
+            .stack_slots_map()
+            .values()
+            .copied()
+            .any(|slot| slot.offset == offset && slot.is_scalar_return_carrier());
+        let is_return_slot =
+            is_scalar_return_slot || self.state.return_stack_slots.contains(&offset);
+        if !is_return_slot {
+            return true;
+        }
+
+        match value {
+            CExpr::Var(name) => {
+                !(self.arg_alias_for_rendered_name(name).is_some()
+                    || is_generic_arg_name(name)
+                    || self.is_named_scalar_local(name))
+            }
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                self.should_emit_return_slot_assignment(offset, inner)
+            }
+            _ => true,
+        }
     }
 
     fn is_control_return_target(&self, target: &SSAVar) -> bool {
@@ -4187,6 +4614,53 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn debug_semanticize_visible_expr(&self, expr: &CExpr) -> CExpr {
         let mut visited = HashSet::new();
         self.semanticize_visible_expr(expr, 0, &mut visited)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_choose_generic_visible_expr(
+        &self,
+        current: Option<CExpr>,
+        candidate: Option<CExpr>,
+    ) -> Option<CExpr> {
+        self.choose_preferred_visible_expr_in_context(
+            current,
+            candidate,
+            VisibleExprContext::Generic,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_choose_scalar_predicate_expr(
+        &self,
+        current: Option<CExpr>,
+        candidate: Option<CExpr>,
+    ) -> Option<CExpr> {
+        self.choose_preferred_visible_expr_in_context(
+            current,
+            candidate,
+            VisibleExprContext::ScalarPredicate,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_choose_scalar_return_expr(
+        &self,
+        current: Option<CExpr>,
+        candidate: Option<CExpr>,
+    ) -> Option<CExpr> {
+        self.choose_preferred_visible_expr_in_context(
+            current,
+            candidate,
+            VisibleExprContext::ScalarReturn,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stack_slot_provenance(
+        &self,
+        name: &str,
+    ) -> Option<analysis::StackSlotProvenance> {
+        self.stack_slot_provenance_for_name(name)
     }
 
     #[cfg(test)]
@@ -5382,17 +5856,19 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn normalize_final_stmt_calls(&self, stmt: CStmt) -> CStmt {
         match stmt {
-            CStmt::Expr(expr) => CStmt::Expr(self.normalize_final_call_expr(expr)),
+            CStmt::Expr(expr) => CStmt::Expr(self.normalize_final_assign_expr(expr)),
             CStmt::Decl { ty, name, init } => CStmt::Decl {
                 ty,
                 name,
                 init: init.map(|expr| self.normalize_final_call_expr(expr)),
             },
             CStmt::Block(stmts) => CStmt::Block(
-                stmts
-                    .into_iter()
-                    .map(|stmt| self.normalize_final_stmt_calls(stmt))
-                    .collect(),
+                self.prune_redundant_assign_return_pairs(
+                    stmts
+                        .into_iter()
+                        .map(|stmt| self.normalize_final_stmt_calls(stmt))
+                        .collect(),
+                ),
             ),
             CStmt::If {
                 cond,
@@ -5432,25 +5908,101 @@ impl<'a> FoldingContext<'a> {
                     .into_iter()
                     .map(|case| crate::ast::SwitchCase {
                         value: self.normalize_final_call_expr(case.value),
-                        body: case
-                            .body
-                            .into_iter()
-                            .map(|stmt| self.normalize_final_stmt_calls(stmt))
-                            .collect(),
+                        body: self.prune_redundant_assign_return_pairs(
+                            case.body
+                                .into_iter()
+                                .map(|stmt| self.normalize_final_stmt_calls(stmt))
+                                .collect(),
+                        ),
                     })
                     .collect(),
                 default: default.map(|stmts| {
-                    stmts
-                        .into_iter()
-                        .map(|stmt| self.normalize_final_stmt_calls(stmt))
-                        .collect()
+                    self.prune_redundant_assign_return_pairs(
+                        stmts
+                            .into_iter()
+                            .map(|stmt| self.normalize_final_stmt_calls(stmt))
+                            .collect(),
+                    )
                 }),
             },
             CStmt::Return(expr) => {
-                CStmt::Return(expr.map(|expr| self.normalize_final_call_expr(expr)))
+                CStmt::Return(expr.map(|expr| self.normalize_final_return_expr_candidate(expr)))
             }
             other => other,
         }
+    }
+
+    fn normalize_final_assign_expr(&self, expr: CExpr) -> CExpr {
+        let normalized = self.normalize_final_call_expr(expr);
+        match normalized {
+            CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            } => {
+                let rhs = if let CExpr::Var(name) = left.as_ref()
+                    && self
+                        .stack_offset_for_visible_storage_name(name)
+                        .is_some_and(|offset| self.state.return_stack_slots.contains(&offset))
+                {
+                    self.normalize_final_return_expr_candidate(*right)
+                } else {
+                    *right
+                };
+                CExpr::assign(*left, rhs)
+            }
+            other => other,
+        }
+    }
+
+    fn normalize_final_return_expr_candidate(&self, expr: CExpr) -> CExpr {
+        let normalized = self.normalize_final_call_expr(expr);
+        let resolved = self.resolve_return_candidate(&normalized);
+        self.sanitize_final_return_expr(resolved, normalized)
+    }
+
+    fn prune_redundant_assign_return_pairs(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
+        if stmts.len() < 2 {
+            return stmts;
+        }
+
+        let mut out = Vec::with_capacity(stmts.len());
+        let mut idx = 0;
+        while idx < stmts.len() {
+            let skip_assignment = if let Some(CStmt::Return(Some(ret_expr))) = stmts.get(idx + 1) {
+                match &stmts[idx] {
+                    CStmt::Expr(CExpr::Binary {
+                        op: BinaryOp::Assign,
+                        left,
+                        right,
+                    }) => match left.as_ref() {
+                        CExpr::Var(name) => self
+                            .stack_offset_for_visible_storage_name(name)
+                            .is_some_and(|offset| {
+                                let rhs = self.resolve_return_candidate(right);
+                                let ret = self.resolve_return_candidate(ret_expr);
+                                rhs == ret
+                                    && self.state.return_stack_slots.contains(&offset)
+                                    && !self.should_emit_return_slot_assignment(offset, &rhs)
+                            }),
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            if skip_assignment {
+                idx += 1;
+                continue;
+            }
+
+            out.push(stmts[idx].clone());
+            idx += 1;
+        }
+
+        out
     }
 
     /// Convert a block to folded C statements.
@@ -5514,6 +6066,7 @@ impl<'a> FoldingContext<'a> {
                     .filter(|name| !is_generic_stack_placeholder_alias(name))
                     && let Some(value) = last_ret_value.clone()
                     && value != CExpr::Var(local_name.clone())
+                    && self.should_emit_return_slot_assignment(offset, &value)
                     && let Some(assign) = self.assign_stmt(CExpr::Var(local_name), value)
                 {
                     stmts.push(assign);
@@ -5538,7 +6091,7 @@ impl<'a> FoldingContext<'a> {
                             .arch
                             .is_return_register_name(&dst.name.to_lowercase()) =>
                     {
-                        last_ret_value = Some(self.tracked_return_expr(src));
+                        last_ret_value = Some(self.get_return_expr(src));
                     }
                     SSAOp::IntZExt { dst, src }
                     | SSAOp::IntSExt { dst, src }
@@ -5550,7 +6103,7 @@ impl<'a> FoldingContext<'a> {
                             .is_return_register_name(&dst.name.to_lowercase()) =>
                     {
                         let ty = type_from_size(dst.size);
-                        last_ret_value = Some(CExpr::cast(ty, self.tracked_return_expr(src)));
+                        last_ret_value = Some(CExpr::cast(ty, self.get_return_expr(src)));
                     }
                     _ => {
                         if let Some(dst) = op.dst()
@@ -5659,8 +6212,56 @@ impl<'a> FoldingContext<'a> {
         }
 
         let stmts = self.propagate_ephemeral_copies(stmts);
-        let out = self.prune_dead_temp_assignments(stmts);
+        let out =
+            self.prune_redundant_return_slot_assignments(self.prune_dead_temp_assignments(stmts));
         self.current_block_addr.set(None);
+        out
+    }
+
+    fn prune_redundant_return_slot_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
+        if stmts.len() < 2 {
+            return stmts;
+        }
+
+        let mut out = Vec::with_capacity(stmts.len());
+        let mut idx = 0;
+        while idx < stmts.len() {
+            let skip_assignment = if let Some(CStmt::Return(Some(ret_expr))) = stmts.get(idx + 1) {
+                match &stmts[idx] {
+                    CStmt::Expr(CExpr::Binary {
+                        op: BinaryOp::Assign,
+                        left,
+                        right,
+                    }) => match left.as_ref() {
+                        CExpr::Var(name) => {
+                            match self.stack_offset_for_visible_storage_name(name) {
+                                Some(offset) => {
+                                    let rhs = self.resolve_return_candidate(right);
+                                    let ret = self.resolve_return_candidate(ret_expr);
+                                    rhs == ret
+                                        && self.state.return_stack_slots.contains(&offset)
+                                        && !self.should_emit_return_slot_assignment(offset, &rhs)
+                                }
+                                None => false,
+                            }
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            if skip_assignment {
+                idx += 1;
+                continue;
+            }
+
+            out.push(stmts[idx].clone());
+            idx += 1;
+        }
+
         out
     }
 

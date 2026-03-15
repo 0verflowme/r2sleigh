@@ -6,7 +6,8 @@ use r2ssa::{SSAFunction, SSAOp, SSAVar};
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
     NormalizedAddr, PassEnv, ScalarValue, SemanticCallArg, SemanticValue, StackSlotProvenance,
-    UseInfo, UseInfoAnalysisMode, ValueProvenance, ValueRef, lower::LowerCtx, utils,
+    StackSlotValueKind, UseInfo, UseInfoAnalysisMode, ValueProvenance, ValueRef, lower::LowerCtx,
+    utils,
 };
 use crate::ast::{BinaryOp, CExpr};
 use crate::fold::op_lower::parse_const_value;
@@ -210,7 +211,10 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
             .or_insert_with(|| value.clone());
     }
     for (key, value) in &baseline.stack_slots {
-        info.stack_slots.entry(key.clone()).or_insert(*value);
+        info.stack_slots
+            .entry(key.clone())
+            .and_modify(|existing| *existing = existing.merge(*value))
+            .or_insert(*value);
     }
 }
 
@@ -940,6 +944,85 @@ pub(crate) fn populate_frame_slot_merges(
     }
 }
 
+pub(crate) fn annotate_stack_slot_semantics(
+    info: &mut UseInfo,
+    func: &SSAFunction,
+    return_slots: &HashSet<i64>,
+    env: &PassEnv<'_>,
+) {
+    let mut offset_semantics: HashMap<i64, StackSlotProvenance> = HashMap::new();
+    for slot in info.stack_slots.values().copied() {
+        merge_stack_slot_semantics(&mut offset_semantics, slot);
+    }
+
+    for slot_offset in return_slots {
+        merge_stack_slot_semantics(
+            &mut offset_semantics,
+            StackSlotProvenance {
+                offset: *slot_offset,
+                predicate_carrier: false,
+                return_carrier: true,
+                value_kind: StackSlotValueKind::Unknown,
+            },
+        );
+        merge_stack_slot_semantics(
+            &mut offset_semantics,
+            StackSlotProvenance {
+                offset: *slot_offset,
+                predicate_carrier: false,
+                return_carrier: true,
+                value_kind: stack_slot_value_kind_from_return_slot_stores(
+                    info,
+                    func,
+                    *slot_offset,
+                    env,
+                ),
+            },
+        );
+    }
+
+    for summary in info.frame_slot_merges.values() {
+        merge_stack_slot_semantics(
+            &mut offset_semantics,
+            StackSlotProvenance {
+                offset: summary.slot_offset,
+                predicate_carrier: false,
+                return_carrier: return_slots.contains(&summary.slot_offset),
+                value_kind: stack_slot_value_kind_from_merge_summary(summary),
+            },
+        );
+    }
+
+    for block in func.blocks() {
+        for (idx, op) in block.ops.iter().enumerate() {
+            let SSAOp::CBranch { cond, .. } = op else {
+                continue;
+            };
+            let Some(predicate_slot) =
+                predicate_carrier_slot_for_branch(info, block, idx, cond, env, 0)
+            else {
+                continue;
+            };
+
+            let provenance = StackSlotProvenance {
+                offset: predicate_slot.offset,
+                predicate_carrier: true,
+                return_carrier: return_slots.contains(&predicate_slot.offset),
+                value_kind: StackSlotValueKind::Scalar,
+            };
+            merge_stack_slot_semantics(&mut offset_semantics, provenance);
+            merge_named_stack_slot_semantics(info, predicate_slot.load_name, provenance);
+            merge_named_stack_slot_semantics(info, predicate_slot.addr_name, provenance);
+        }
+    }
+
+    for slot in info.stack_slots.values_mut() {
+        if let Some(offset_fact) = offset_semantics.get(&slot.offset).copied() {
+            *slot = slot.merge(offset_fact);
+        }
+    }
+}
+
 pub(crate) fn populate_switch_selector_roots(
     info: &mut UseInfo,
     func: &SSAFunction,
@@ -991,6 +1074,404 @@ fn switch_selector_value_for_block(
     }
 
     best
+}
+
+#[derive(Debug)]
+struct PredicateCarrierSlotMatch {
+    offset: i64,
+    load_name: String,
+    addr_name: String,
+}
+
+const MAX_STACK_CARRIER_TRACE_DEPTH: u32 = 12;
+
+fn merge_stack_slot_semantics(
+    slots: &mut HashMap<i64, StackSlotProvenance>,
+    candidate: StackSlotProvenance,
+) {
+    slots
+        .entry(candidate.offset)
+        .and_modify(|existing| *existing = existing.merge(candidate))
+        .or_insert(candidate);
+}
+
+fn merge_named_stack_slot_semantics(
+    info: &mut UseInfo,
+    name: String,
+    candidate: StackSlotProvenance,
+) {
+    info.stack_slots
+        .entry(name)
+        .and_modify(|existing| *existing = existing.merge(candidate))
+        .or_insert(candidate);
+}
+
+fn stack_slot_value_kind_from_merge_summary(summary: &FrameSlotMergeSummary) -> StackSlotValueKind {
+    let mut kinds = summary
+        .incoming
+        .values()
+        .map(stack_slot_value_kind_from_semantic_value);
+    let Some(first) = kinds.next() else {
+        return StackSlotValueKind::Unknown;
+    };
+    if first == StackSlotValueKind::Unknown {
+        return StackSlotValueKind::Unknown;
+    }
+    if kinds.all(|kind| kind == first) {
+        first
+    } else {
+        StackSlotValueKind::Unknown
+    }
+}
+
+fn stack_slot_value_kind_from_semantic_value(value: &SemanticValue) -> StackSlotValueKind {
+    match value {
+        SemanticValue::Scalar(_) => StackSlotValueKind::Scalar,
+        SemanticValue::Address(_) => StackSlotValueKind::AddressLike,
+        SemanticValue::Load { .. } | SemanticValue::Unknown => StackSlotValueKind::Unknown,
+    }
+}
+
+fn predicate_carrier_slot_for_branch(
+    info: &UseInfo,
+    block: &SSABlock,
+    branch_idx: usize,
+    cond: &SSAVar,
+    env: &PassEnv<'_>,
+    depth: u32,
+) -> Option<PredicateCarrierSlotMatch> {
+    if depth > MAX_STACK_CARRIER_TRACE_DEPTH || cond.is_const() {
+        return None;
+    }
+
+    for (idx, op) in block.ops[..branch_idx].iter().enumerate().rev() {
+        if op.dst() != Some(cond) {
+            continue;
+        }
+        return match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Subpiece { src, .. }
+            | SSAOp::BoolNot { src, .. } => {
+                predicate_carrier_slot_for_branch(info, block, idx, src, env, depth + 1)
+            }
+            SSAOp::IntSub { a, b, .. } if var_is_zero_constant(a) || var_is_zero_constant(b) => {
+                let passthrough = if var_is_zero_constant(a) { b } else { a };
+                predicate_carrier_slot_for_branch(info, block, idx, passthrough, env, depth + 1)
+            }
+            SSAOp::IntEqual { a, b, .. }
+            | SSAOp::IntNotEqual { a, b, .. }
+            | SSAOp::IntLess { a, b, .. }
+            | SSAOp::IntSLess { a, b, .. }
+            | SSAOp::IntLessEqual { a, b, .. }
+            | SSAOp::IntSLessEqual { a, b, .. } => {
+                compare_zero_predicate_carrier_slot_for_operands(
+                    info,
+                    block,
+                    idx,
+                    a,
+                    b,
+                    env,
+                    depth + 1,
+                )
+            }
+            SSAOp::Load { dst, addr, .. } => {
+                predicate_carrier_slot_for_load(info, block, idx, dst, addr, env, depth + 1)
+            }
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn compare_zero_predicate_carrier_slot_for_operands(
+    info: &UseInfo,
+    block: &SSABlock,
+    before_idx: usize,
+    a: &SSAVar,
+    b: &SSAVar,
+    env: &PassEnv<'_>,
+    depth: u32,
+) -> Option<PredicateCarrierSlotMatch> {
+    let a_zero = var_is_zero_constant(a);
+    let b_zero = var_is_zero_constant(b);
+    if a_zero == b_zero {
+        return None;
+    }
+
+    let candidate = if a_zero { b } else { a };
+    predicate_carrier_slot_for_branch(info, block, before_idx, candidate, env, depth + 1)
+}
+
+fn predicate_carrier_slot_for_load(
+    info: &UseInfo,
+    block: &SSABlock,
+    load_idx: usize,
+    dst: &SSAVar,
+    addr: &SSAVar,
+    env: &PassEnv<'_>,
+    depth: u32,
+) -> Option<PredicateCarrierSlotMatch> {
+    if depth > MAX_STACK_CARRIER_TRACE_DEPTH {
+        return None;
+    }
+
+    let offset = stack_slot_offset_for_addr(info, addr, env)?;
+    for (store_idx, op) in block.ops[..load_idx].iter().enumerate().rev() {
+        let SSAOp::Store {
+            addr: store_addr,
+            val,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let Some(store_offset) = stack_slot_offset_for_addr(info, store_addr, env) else {
+            continue;
+        };
+        if store_offset != offset {
+            continue;
+        }
+        if block_value_is_scalar_or_predicate(info, block, store_idx, val, env, depth + 1) {
+            return Some(PredicateCarrierSlotMatch {
+                offset,
+                load_name: dst.display_name(),
+                addr_name: addr.display_name(),
+            });
+        }
+    }
+    None
+}
+
+fn block_value_is_scalar_or_predicate(
+    info: &UseInfo,
+    block: &SSABlock,
+    before_idx: usize,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+    depth: u32,
+) -> bool {
+    if depth > MAX_STACK_CARRIER_TRACE_DEPTH {
+        return false;
+    }
+
+    if var.is_const() {
+        return true;
+    }
+
+    if semantic_source_value_for_var(info, var).is_some_and(|value| {
+        stack_slot_value_kind_from_semantic_value(&value) == StackSlotValueKind::Scalar
+    }) {
+        return true;
+    }
+
+    if semantic_var_is_pointer_like(info, var, env) {
+        return false;
+    }
+
+    for (idx, op) in block.ops[..before_idx].iter().enumerate().rev() {
+        if op.dst() != Some(var) {
+            continue;
+        }
+        return match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Subpiece { src, .. }
+            | SSAOp::BoolNot { src, .. } => {
+                block_value_is_scalar_or_predicate(info, block, idx, src, env, depth + 1)
+            }
+            SSAOp::IntEqual { .. }
+            | SSAOp::IntNotEqual { .. }
+            | SSAOp::IntLess { .. }
+            | SSAOp::IntSLess { .. }
+            | SSAOp::IntLessEqual { .. }
+            | SSAOp::IntSLessEqual { .. } => true,
+            SSAOp::IntSub { a, b, .. } if var_is_zero_constant(a) || var_is_zero_constant(b) => {
+                let passthrough = if var_is_zero_constant(a) { b } else { a };
+                block_value_is_scalar_or_predicate(info, block, idx, passthrough, env, depth + 1)
+            }
+            SSAOp::IntAnd { a, b, .. }
+            | SSAOp::IntOr { a, b, .. }
+            | SSAOp::IntXor { a, b, .. }
+            | SSAOp::BoolAnd { a, b, .. }
+            | SSAOp::BoolOr { a, b, .. } => {
+                block_value_is_scalar_or_predicate(info, block, idx, a, env, depth + 1)
+                    && block_value_is_scalar_or_predicate(info, block, idx, b, env, depth + 1)
+            }
+            SSAOp::Load { dst, addr, .. } => {
+                predicate_carrier_slot_for_load(info, block, idx, dst, addr, env, depth + 1)
+                    .is_some()
+            }
+            _ => false,
+        };
+    }
+
+    false
+}
+
+fn var_is_zero_constant(var: &SSAVar) -> bool {
+    parse_const_value(&var.name).is_some_and(|value| value == 0)
+}
+
+fn stack_slot_value_kind_from_return_slot_stores(
+    info: &UseInfo,
+    func: &SSAFunction,
+    slot_offset: i64,
+    env: &PassEnv<'_>,
+) -> StackSlotValueKind {
+    let mut kinds = Vec::new();
+    for exit_block in func.blocks().filter(|block| {
+        block
+            .ops
+            .iter()
+            .any(|op| matches!(op, SSAOp::Return { .. }))
+    }) {
+        if let Some(kind) =
+            stack_slot_value_kind_from_return_exit(info, func, exit_block, slot_offset, env)
+        {
+            kinds.push(kind);
+        }
+    }
+
+    let Some(first) = kinds.first().copied() else {
+        return StackSlotValueKind::Unknown;
+    };
+    if first == StackSlotValueKind::Unknown {
+        return StackSlotValueKind::Unknown;
+    }
+    if kinds.into_iter().all(|kind| kind == first) {
+        first
+    } else {
+        StackSlotValueKind::Unknown
+    }
+}
+
+fn stack_slot_value_kind_from_return_exit(
+    info: &UseInfo,
+    func: &SSAFunction,
+    exit_block: &SSABlock,
+    slot_offset: i64,
+    env: &PassEnv<'_>,
+) -> Option<StackSlotValueKind> {
+    let mut kinds = Vec::new();
+
+    if let Some(kind) = stack_slot_value_kind_from_block_store_to_exit(
+        info,
+        exit_block,
+        exit_block.addr,
+        slot_offset,
+        env,
+    ) {
+        kinds.push(kind);
+    }
+
+    for pred_addr in func.predecessors(exit_block.addr) {
+        let pred_block = func.get_block(pred_addr)?;
+        if let Some(kind) = stack_slot_value_kind_from_block_store_to_exit(
+            info,
+            pred_block,
+            exit_block.addr,
+            slot_offset,
+            env,
+        ) {
+            kinds.push(kind);
+        }
+    }
+
+    let first = kinds.first().copied()?;
+    if first == StackSlotValueKind::Unknown {
+        return Some(StackSlotValueKind::Unknown);
+    }
+    if kinds.into_iter().all(|kind| kind == first) {
+        Some(first)
+    } else {
+        Some(StackSlotValueKind::Unknown)
+    }
+}
+
+fn stack_slot_value_kind_from_block_store_to_exit(
+    info: &UseInfo,
+    block: &SSABlock,
+    exit_addr: u64,
+    slot_offset: i64,
+    env: &PassEnv<'_>,
+) -> Option<StackSlotValueKind> {
+    let mut exiting = false;
+
+    for (idx, op) in block.ops.iter().enumerate().rev() {
+        match op {
+            SSAOp::Return { .. } => exiting = true,
+            SSAOp::Branch { target } | SSAOp::CBranch { target, .. }
+                if crate::address::parse_address_from_var_name(&target.name) == Some(exit_addr) =>
+            {
+                exiting = true;
+            }
+            SSAOp::Store { addr, val, .. } if exiting => {
+                let Some(offset) = stack_slot_offset_for_addr(info, addr, env) else {
+                    continue;
+                };
+                if offset != slot_offset {
+                    continue;
+                }
+                return Some(value_kind_for_block_var(info, block, idx, val, env, 0));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn value_kind_for_block_var(
+    info: &UseInfo,
+    block: &SSABlock,
+    before_idx: usize,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+    depth: u32,
+) -> StackSlotValueKind {
+    if depth > 8 {
+        return StackSlotValueKind::Unknown;
+    }
+
+    let stable_scalar_load_kind = info
+        .semantic_values
+        .get(&var.display_name())
+        .and_then(|value| match value {
+            SemanticValue::Load { addr, .. } => normalized_stack_slot_offset(addr)
+                .filter(|offset| *offset < 0)
+                .and_then(|offset| info.stable_stack_values.get(&offset))
+                .map(stack_slot_value_kind_from_semantic_value),
+            _ => None,
+        })
+        .unwrap_or(StackSlotValueKind::Unknown);
+    if stable_scalar_load_kind == StackSlotValueKind::Scalar {
+        return StackSlotValueKind::Scalar;
+    }
+
+    let semantic_kind = semantic_source_value_for_var(info, var)
+        .map(|value| stack_slot_value_kind_from_semantic_value(&value))
+        .unwrap_or(StackSlotValueKind::Unknown);
+    if semantic_kind == StackSlotValueKind::Scalar {
+        return StackSlotValueKind::Scalar;
+    }
+
+    if block_value_is_scalar_or_predicate(info, block, before_idx, var, env, depth + 1) {
+        return StackSlotValueKind::Scalar;
+    }
+
+    if semantic_kind == StackSlotValueKind::AddressLike {
+        return StackSlotValueKind::AddressLike;
+    }
+
+    if semantic_var_is_pointer_like(info, var, env) {
+        return StackSlotValueKind::AddressLike;
+    }
+
+    semantic_kind
 }
 
 struct SwitchSelectorLoadCtx<'a, 'b> {
@@ -1390,7 +1871,7 @@ fn collect_definitions(
                 scratch
                     .info
                     .stack_slots
-                    .insert(addr.display_name(), StackSlotProvenance { offset });
+                    .insert(addr.display_name(), StackSlotProvenance::new(offset));
                 block_stack_values.insert(offset, val.clone());
                 if let Some(value) = semantic_stack_store_value(&scratch.info, val, env) {
                     block_stack_semantic_values.insert(offset, value);
@@ -1428,12 +1909,12 @@ fn collect_definitions(
             scratch
                 .info
                 .stack_slots
-                .insert(addr.display_name(), StackSlotProvenance { offset });
+                .insert(addr.display_name(), StackSlotProvenance::new(offset));
             if should_tag_loaded_value_as_stack_slot {
                 scratch
                     .info
                     .stack_slots
-                    .insert(dst.display_name(), StackSlotProvenance { offset });
+                    .insert(dst.display_name(), StackSlotProvenance::new(offset));
             }
 
             if let Some(stored_val) = block_stack_values
@@ -1637,6 +2118,11 @@ fn semantic_stack_store_value(
     var: &SSAVar,
     env: &PassEnv<'_>,
 ) -> Option<SemanticValue> {
+    if !semantic_var_is_pointer_like(info, var, env)
+        && let Some(value) = scalar_semantic_source_value_for_var(info, var)
+    {
+        return Some(value);
+    }
     if let Some(addr) = semantic_addr_for_var(info, var, env)
         && semantic_addr_has_meaningful_base(&addr)
     {
@@ -1778,6 +2264,16 @@ fn preserve_temp_copy_root_identity(
 fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'_>) {
     match op {
         SSAOp::Copy { dst, src } => {
+            if !semantic_var_is_pointer_like(&scratch.info, src, env)
+                && let Some(value) = scalar_semantic_source_value_for_var(&scratch.info, src)
+            {
+                insert_semantic_value(
+                    &mut scratch.info,
+                    dst.display_name(),
+                    preserve_temp_copy_root_identity(dst, src, value),
+                );
+                return;
+            }
             if semantic_var_is_pointer_like(&scratch.info, src, env)
                 && let Some(addr) = semantic_addr_for_var(&scratch.info, src, env)
                 && is_authoritative_addr(&addr)
@@ -1802,6 +2298,12 @@ fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'
         | SSAOp::Trunc { dst, src }
         | SSAOp::Cast { dst, src }
         | SSAOp::Subpiece { dst, src, .. } => {
+            if !semantic_var_is_pointer_like(&scratch.info, src, env)
+                && let Some(value) = scalar_semantic_source_value_for_var(&scratch.info, src)
+            {
+                insert_semantic_value(&mut scratch.info, dst.display_name(), value);
+                return;
+            }
             if semantic_var_is_pointer_like(&scratch.info, src, env)
                 && let Some(addr) = semantic_addr_for_var(&scratch.info, src, env)
                 && is_authoritative_addr(&addr)
@@ -1938,10 +2440,26 @@ fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'
                 && let Some(key) = normalized_addr_key(&scratch.info, &shape, env)
                 && let Some(value) = scratch.info.stable_memory_values.get(&key).cloned()
             {
-                scratch
-                    .info
-                    .semantic_values
-                    .insert(dst.display_name(), value);
+                if should_preserve_rooted_structured_load_identity_for_stable_memory(
+                    &scratch.info,
+                    &shape,
+                    env,
+                    &value,
+                ) {
+                    insert_semantic_value(
+                        &mut scratch.info,
+                        dst.display_name(),
+                        SemanticValue::Load {
+                            addr: shape.clone(),
+                            size: dst.size,
+                        },
+                    );
+                } else {
+                    scratch
+                        .info
+                        .semantic_values
+                        .insert(dst.display_name(), value);
+                }
                 insert_semantic_value(
                     &mut scratch.info,
                     addr.display_name(),
@@ -2570,6 +3088,33 @@ fn is_authoritative_addr(addr: &NormalizedAddr) -> bool {
     !matches!(addr.base, BaseRef::Raw(_))
 }
 
+fn should_preserve_rooted_structured_load_identity_for_stable_memory(
+    info: &UseInfo,
+    addr: &NormalizedAddr,
+    env: &PassEnv<'_>,
+    value: &SemanticValue,
+) -> bool {
+    if !matches!(value, SemanticValue::Scalar(_))
+        || (addr.index.is_none() && addr.offset_bytes == 0)
+    {
+        return false;
+    }
+
+    let BaseRef::Value(base_ref) = &addr.base else {
+        return false;
+    };
+
+    let lower = base_ref.var.name.to_ascii_lowercase();
+    if lower == env.fp_name || lower == env.sp_name {
+        return false;
+    }
+
+    env.param_register_aliases.contains_key(&lower)
+        || semantic_type_hint_names(info, &base_ref.var, env)
+            .iter()
+            .any(|name| env.type_hints.contains_key(name))
+}
+
 fn insert_semantic_value(info: &mut UseInfo, key: String, candidate: SemanticValue) {
     match info.semantic_values.get(&key) {
         Some(current) if semantic_value_rank(current) > semantic_value_rank(&candidate) => {}
@@ -2579,8 +3124,50 @@ fn insert_semantic_value(info: &mut UseInfo, key: String, candidate: SemanticVal
     }
 }
 
+fn resolve_stable_stack_load_semantic_value(
+    info: &UseInfo,
+    value: &SemanticValue,
+    depth: u32,
+) -> Option<SemanticValue> {
+    if depth > 8 {
+        return None;
+    }
+
+    match value {
+        SemanticValue::Load { addr, .. } => {
+            let stable_scalar = normalized_stack_slot_offset(addr)
+                .filter(|offset| *offset < 0)
+                .and_then(|offset| info.stable_stack_values.get(&offset))
+                .filter(|stable| matches!(stable, SemanticValue::Scalar(_)));
+            stable_scalar
+                .and_then(|stable| {
+                    resolve_stable_stack_load_semantic_value(info, stable, depth + 1)
+                })
+                .or_else(|| Some(value.clone()))
+        }
+        SemanticValue::Scalar(ScalarValue::Root(root)) => {
+            match info
+                .semantic_values
+                .get(&root.display_name())
+                .and_then(|inner| resolve_stable_stack_load_semantic_value(info, inner, depth + 1))
+            {
+                Some(inner @ SemanticValue::Scalar(_)) => Some(inner),
+                Some(SemanticValue::Address(_))
+                | Some(SemanticValue::Load { .. })
+                | Some(SemanticValue::Unknown)
+                | None => Some(value.clone()),
+            }
+        }
+        _ => Some(value.clone()),
+    }
+}
+
 fn semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<SemanticValue> {
-    if let Some(value) = info.semantic_values.get(&var.display_name()).cloned() {
+    if let Some(value) = info
+        .semantic_values
+        .get(&var.display_name())
+        .and_then(|value| resolve_stable_stack_load_semantic_value(info, value, 0))
+    {
         return Some(value);
     }
     if var.is_const() {
@@ -2612,6 +3199,11 @@ fn semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<Semanti
     ))))
 }
 
+fn scalar_semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<SemanticValue> {
+    semantic_source_value_for_var(info, var)
+        .filter(|value| matches!(value, SemanticValue::Scalar(_)))
+}
+
 fn ssa_var_from_display_name(display_name: &str, default_size: u32) -> Option<SSAVar> {
     let (base, version) = ssa_key_parts(display_name)?;
     Some(SSAVar::new(base, version, default_size))
@@ -2623,6 +3215,11 @@ fn semantic_source_value_from_provenance(
     env: &PassEnv<'_>,
 ) -> Option<SemanticValue> {
     if let Some(source_var) = &provenance.source_var {
+        if !semantic_var_is_pointer_like(info, source_var, env)
+            && let Some(value) = scalar_semantic_source_value_for_var(info, source_var)
+        {
+            return Some(value);
+        }
         if semantic_var_is_pointer_like(info, source_var, env) {
             return Some(SemanticValue::Address(
                 semantic_addr_for_var(info, source_var, env)
@@ -2637,12 +3234,20 @@ fn semantic_source_value_from_provenance(
 }
 
 fn semantic_or_scalar_source_value(info: &UseInfo, source_name: &str) -> Option<SemanticValue> {
-    if let Some(value) = info.semantic_values.get(source_name).cloned() {
+    if let Some(value) = info
+        .semantic_values
+        .get(source_name)
+        .and_then(|value| resolve_stable_stack_load_semantic_value(info, value, 0))
+    {
         return Some(value);
     }
 
     let root = resolve_copy_root_name(info, source_name);
-    if let Some(value) = info.semantic_values.get(&root).cloned() {
+    if let Some(value) = info
+        .semantic_values
+        .get(&root)
+        .and_then(|value| resolve_stable_stack_load_semantic_value(info, value, 0))
+    {
         return Some(value);
     }
 
@@ -8232,7 +8837,7 @@ mod tests {
         let src = mk("X0", 0, 8);
 
         info.stack_slots
-            .insert(loaded.display_name(), StackSlotProvenance { offset: 8 });
+            .insert(loaded.display_name(), StackSlotProvenance::new(8));
         info.forwarded_values.insert(
             loaded.display_name(),
             ValueProvenance {

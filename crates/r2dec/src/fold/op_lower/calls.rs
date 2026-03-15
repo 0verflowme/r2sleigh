@@ -152,9 +152,6 @@ impl<'a> FoldingContext<'a> {
                 let expr = self
                     .render_imported_semantic_arg_value(&value, !allow_string_like_resolution)
                     .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(&value));
-                if !allow_string_like_resolution {
-                    return self.rewrite_stack_expr(expr);
-                }
                 self.finalize_authoritative_imported_call_arg_expr(
                     expr,
                     preserve_stable_input_slot,
@@ -194,9 +191,6 @@ impl<'a> FoldingContext<'a> {
                 let expr = self
                     .render_imported_semantic_arg_value(&value, !allow_string_like_resolution)
                     .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(&value));
-                if !allow_string_like_resolution {
-                    return self.rewrite_stack_expr(expr);
-                }
                 self.finalize_authoritative_imported_call_arg_expr(
                     expr,
                     preserve_stable_input_slot,

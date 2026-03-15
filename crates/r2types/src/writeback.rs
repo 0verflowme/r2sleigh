@@ -223,17 +223,16 @@ struct GlobalAddrExpr {
 pub fn build_type_writeback_analysis(
     mut input: TypeWritebackAnalysisInput<'_>,
 ) -> TypeWritebackAnalysis {
-    let current_context_maps = signature_context_maps(
-        input.parsed_context.current_signature.as_ref(),
-        input.ptr_bits,
+    let mut merged_signature = merge_local_signature_into_merged_signature(
+        input.parsed_context.merged_signature.clone(),
+        inferred_signature_to_spec(&input.inferred_signature, input.ptr_bits),
     );
-
-    let mut merged_signature = input.parsed_context.merged_signature.clone();
     apply_main_signature_override(input.function_name, &mut merged_signature);
-    apply_signature_context_overrides(
-        &mut input.inferred_signature,
-        merged_signature.as_ref(),
+    merged_signature = merge_recovered_arg_types_into_signature(
+        merged_signature,
+        input.recovered_vars,
         input.ptr_bits,
+        input.function_name,
     );
 
     let mut diagnostics = input.diagnostics;
@@ -274,6 +273,12 @@ pub fn build_type_writeback_analysis(
     let merged_signature = merge_slot_type_overrides_into_signature(
         merged_signature,
         &local_structs.slot_type_overrides,
+        input.ptr_bits,
+    );
+    let current_context_maps = signature_context_maps(merged_signature.as_ref(), input.ptr_bits);
+    apply_signature_context_overrides(
+        &mut input.inferred_signature,
+        merged_signature.as_ref(),
         input.ptr_bits,
     );
     let type_facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
@@ -329,6 +334,191 @@ pub fn build_type_writeback_analysis(
         type_facts,
         plan,
     }
+}
+
+fn inferred_signature_to_spec(
+    signature: &InferredSignature,
+    ptr_bits: u32,
+) -> Option<FunctionSignatureSpec> {
+    let ret_type = parse_type_like_spec(&signature.ret_type, ptr_bits);
+    let params = signature
+        .params
+        .iter()
+        .map(|param| FunctionParamSpec {
+            name: param.name.clone(),
+            ty: parse_type_like_spec(&param.param_type, ptr_bits),
+        })
+        .collect::<Vec<_>>();
+    if ret_type.is_none() && params.iter().all(|param| param.ty.is_none()) {
+        return None;
+    }
+    Some(FunctionSignatureSpec { ret_type, params })
+}
+
+fn merge_local_signature_into_merged_signature(
+    external: Option<FunctionSignatureSpec>,
+    local: Option<FunctionSignatureSpec>,
+) -> Option<FunctionSignatureSpec> {
+    match (external, local) {
+        (None, None) => None,
+        (Some(signature), None) => Some(signature),
+        (None, Some(signature)) => Some(signature),
+        (Some(mut external), Some(local)) => {
+            if local_signature_should_override_external(
+                local.ret_type.as_ref(),
+                external.ret_type.as_ref(),
+            ) {
+                external.ret_type = local.ret_type;
+            } else if is_generic_signature_type(external.ret_type.as_ref()) {
+                external.ret_type = local.ret_type.or(external.ret_type);
+            }
+
+            if external.params.len() < local.params.len() {
+                external
+                    .params
+                    .resize_with(local.params.len(), || FunctionParamSpec {
+                        name: String::new(),
+                        ty: None,
+                    });
+            }
+
+            for (idx, local_param) in local.params.into_iter().enumerate() {
+                let target = &mut external.params[idx];
+                if target.name.is_empty() {
+                    target.name = format!("arg{}", idx + 1);
+                }
+                if !is_generic_arg_name(&local_param.name) && is_generic_arg_name(&target.name) {
+                    target.name = local_param.name.clone();
+                }
+                if local_signature_should_override_external(
+                    local_param.ty.as_ref(),
+                    target.ty.as_ref(),
+                ) {
+                    target.ty = local_param.ty;
+                } else if is_generic_signature_type(target.ty.as_ref()) {
+                    target.ty = local_param.ty.or(target.ty.take());
+                }
+            }
+
+            Some(external)
+        }
+    }
+}
+
+fn local_signature_should_override_external(
+    local: Option<&CTypeLike>,
+    external: Option<&CTypeLike>,
+) -> bool {
+    let Some(local) = local else {
+        return false;
+    };
+    match external {
+        None => true,
+        Some(external) if is_generic_signature_type(Some(external)) => true,
+        Some(external) => local_scalar_override_should_apply(local, external),
+    }
+}
+
+fn local_scalar_override_should_apply(local: &CTypeLike, external: &CTypeLike) -> bool {
+    match (local, external) {
+        (CTypeLike::Bool, CTypeLike::Bool) => false,
+        (
+            CTypeLike::Bool,
+            CTypeLike::Int {
+                bits: external_bits,
+                ..
+            },
+        ) => *external_bits >= 8,
+        (
+            CTypeLike::Int {
+                bits: local_bits,
+                signedness: local_signedness,
+            },
+            CTypeLike::Int {
+                bits: external_bits,
+                signedness: external_signedness,
+            },
+        ) => {
+            *local_bits < *external_bits
+                || (*local_bits == *external_bits
+                    && matches!(local_signedness, Signedness::Signed)
+                    && !matches!(external_signedness, Signedness::Signed))
+        }
+        _ => false,
+    }
+}
+
+fn merge_recovered_arg_types_into_signature(
+    mut signature: Option<FunctionSignatureSpec>,
+    vars: &[RecoveredVariable],
+    ptr_bits: u32,
+    function_name: &str,
+) -> Option<FunctionSignatureSpec> {
+    if is_c_main_function(function_name) {
+        return signature;
+    }
+
+    let local_arg_types = collect_recovered_arg_types(vars, ptr_bits);
+    if local_arg_types.is_empty() {
+        return signature;
+    }
+
+    let max_slot = local_arg_types.keys().copied().max()?;
+    let sig = signature.get_or_insert_with(Default::default);
+    while sig.params.len() <= max_slot {
+        let idx = sig.params.len();
+        sig.params.push(FunctionParamSpec {
+            name: format!("arg{}", idx + 1),
+            ty: None,
+        });
+    }
+
+    for (slot, local_ty) in local_arg_types {
+        let param = &mut sig.params[slot];
+        if param.name.is_empty() {
+            param.name = format!("arg{}", slot + 1);
+        }
+        if local_signature_should_override_external(Some(&local_ty), param.ty.as_ref())
+            || is_generic_signature_type(param.ty.as_ref())
+        {
+            param.ty = Some(local_ty);
+        }
+    }
+
+    signature
+}
+
+fn collect_recovered_arg_types(
+    vars: &[RecoveredVariable],
+    ptr_bits: u32,
+) -> BTreeMap<usize, CTypeLike> {
+    let mut out = BTreeMap::new();
+    for var in vars {
+        if !var.isarg {
+            continue;
+        }
+        let Some(slot) = var
+            .name
+            .strip_prefix("arg")
+            .and_then(|idx| idx.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(candidate) = parse_type_like_spec(&var.var_type, ptr_bits) else {
+            continue;
+        };
+        if is_generic_signature_type(Some(&candidate)) {
+            continue;
+        }
+        match out.get(&slot) {
+            Some(current)
+                if !local_signature_should_override_external(Some(&candidate), Some(current)) => {}
+            _ => {
+                out.insert(slot, candidate);
+            }
+        }
+    }
+    out
 }
 
 fn build_var_type_candidates(
@@ -1654,6 +1844,138 @@ mod tests {
                 .params[1]
                 .name,
             "argv"
+        );
+    }
+
+    #[test]
+    fn local_inferred_scalar_param_narrows_external_wide_signature() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.current_signature = Some(FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Unsigned,
+                }),
+            }],
+        });
+        parsed_context.merged_signature = parsed_context.current_signature.clone();
+
+        let vars = [RecoveredVariable {
+            name: "arg0".to_string(),
+            kind: "r".to_string(),
+            delta: 0,
+            var_type: "int32_t".to_string(),
+            isarg: true,
+            reg: Some("x0".to_string()),
+        }];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym._check_secret",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym._check_secret".to_string(),
+                signature: "int64_t sym._check_secret (int32_t arg1)".to_string(),
+                ret_type: "int64_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "arg1".to_string(),
+                    param_type: "int32_t".to_string(),
+                }],
+                callconv: String::new(),
+                arch: "aarch64".to_string(),
+                confidence: 90,
+                callconv_confidence: 0,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params[0].param_type, "int32_t");
+        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        let merged = analysis
+            .type_facts
+            .merged_signature
+            .as_ref()
+            .expect("merged signature");
+        assert_eq!(
+            merged.params[0].ty,
+            Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            })
+        );
+    }
+
+    #[test]
+    fn recovered_arg_types_narrow_external_signature_when_local_signature_is_still_wide() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.current_signature = Some(FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Unsigned,
+                }),
+            }],
+        });
+        parsed_context.merged_signature = parsed_context.current_signature.clone();
+
+        let vars = [RecoveredVariable {
+            name: "arg0".to_string(),
+            kind: "r".to_string(),
+            delta: 0,
+            var_type: "int32_t".to_string(),
+            isarg: true,
+            reg: Some("x0".to_string()),
+        }];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym._check_secret",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym._check_secret".to_string(),
+                signature: "int64_t sym._check_secret (uint64_t arg1)".to_string(),
+                ret_type: "int64_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "arg1".to_string(),
+                    param_type: "uint64_t".to_string(),
+                }],
+                callconv: String::new(),
+                arch: "aarch64".to_string(),
+                confidence: 90,
+                callconv_confidence: 0,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params[0].param_type, "int32_t");
+        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|sig| sig.params.first())
+                .and_then(|param| param.ty.clone()),
+            Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            })
         );
     }
 

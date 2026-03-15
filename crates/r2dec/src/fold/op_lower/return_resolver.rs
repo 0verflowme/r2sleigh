@@ -1,6 +1,16 @@
 use super::*;
 
 impl<'a> FoldingContext<'a> {
+    fn expr_is_structured_memory_candidate(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Member { .. } | CExpr::PtrMember { .. } | CExpr::Subscript { .. } => true,
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::expr_is_structured_memory_candidate(inner)
+            }
+            _ => false,
+        }
+    }
+
     fn refine_low_signal_semantic_candidate(&self, name: &str, candidate: CExpr) -> CExpr {
         if self.is_low_signal_visible_name(name)
             && matches!(candidate, CExpr::Var(_))
@@ -12,11 +22,94 @@ impl<'a> FoldingContext<'a> {
         candidate
     }
 
-    fn semanticized_raw_definition_candidate(&self, name: &str) -> Option<CExpr> {
+    fn semanticized_raw_definition_candidate_in_context(
+        &self,
+        name: &str,
+        context: VisibleExprContext,
+    ) -> Option<CExpr> {
         let raw = self.lookup_definition_raw(name)?;
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(&raw, 0, &mut semantic_visited);
-        self.choose_preferred_visible_expr(Some(raw), Some(semanticized))
+        self.choose_preferred_visible_expr_in_context(Some(raw), Some(semanticized), context)
+    }
+
+    fn return_context_for_slot_offset(&self, slot_offset: i64) -> VisibleExprContext {
+        self.stack_slots_map()
+            .values()
+            .copied()
+            .find(|slot| slot.offset == slot_offset && slot.is_scalar_return_carrier())
+            .map(|_| VisibleExprContext::ScalarReturn)
+            .unwrap_or(VisibleExprContext::Generic)
+    }
+
+    fn current_return_context(&self) -> VisibleExprContext {
+        if self
+            .state
+            .return_stack_slots
+            .iter()
+            .copied()
+            .any(|slot_offset| {
+                self.return_context_for_slot_offset(slot_offset) == VisibleExprContext::ScalarReturn
+            })
+        {
+            VisibleExprContext::ScalarReturn
+        } else {
+            VisibleExprContext::Generic
+        }
+    }
+
+    fn return_context_for_name(&self, name: &str) -> VisibleExprContext {
+        if self
+            .stack_slot_provenance_for_name(name)
+            .is_some_and(|slot| slot.is_scalar_return_carrier())
+        {
+            return VisibleExprContext::ScalarReturn;
+        }
+
+        let lower = name.to_ascii_lowercase();
+        if self.inputs.arch.is_return_register_name(&lower) {
+            return self.current_return_context();
+        }
+
+        self.current_return_context()
+    }
+
+    fn return_context_for_expr(&self, expr: &CExpr) -> VisibleExprContext {
+        match expr {
+            CExpr::Var(name) => self.return_context_for_name(name),
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                self.return_context_for_expr(inner)
+            }
+            _ => self.current_return_context(),
+        }
+    }
+
+    fn return_context_for_candidates(
+        &self,
+        current: Option<&CExpr>,
+        candidate: Option<&CExpr>,
+    ) -> VisibleExprContext {
+        if current.is_some_and(|expr| {
+            self.return_context_for_expr(expr) == VisibleExprContext::ScalarReturn
+        }) || candidate.is_some_and(|expr| {
+            self.return_context_for_expr(expr) == VisibleExprContext::ScalarReturn
+        }) {
+            VisibleExprContext::ScalarReturn
+        } else {
+            self.current_return_context()
+        }
+    }
+
+    fn expr_is_bad_return_candidate_in_context(
+        &self,
+        expr: &CExpr,
+        context: VisibleExprContext,
+    ) -> bool {
+        self.expr_contains_generic_stack_alias(expr)
+            || self.is_uninitialized_return_reg(expr)
+            || self.expr_is_transient_return_artifact(expr)
+            || (matches!(context, VisibleExprContext::ScalarReturn)
+                && self.expr_is_address_artifact_in_scalar_context(expr))
     }
 
     pub(crate) fn expr_contains_generic_stack_alias(&self, expr: &CExpr) -> bool {
@@ -97,12 +190,23 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn semantic_return_candidate_for_name(&self, name: &str) -> Option<CExpr> {
+        let context = self.return_context_for_name(name);
         let lower = name.to_ascii_lowercase();
         if self.inputs.arch.is_return_register_name(&lower)
             && let Some(block_addr) = self.current_block_addr.get()
             && let Some(merged) = self.merged_return_candidate_for_current_block(block_addr)
         {
             return Some(merged);
+        }
+
+        if let Some(candidate) =
+            self.scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
+        {
+            return Some(candidate);
+        }
+
+        if let Some(candidate) = self.scalar_context_root_candidate_for_name(name, context) {
+            return Some(candidate);
         }
 
         let merged = self
@@ -124,22 +228,45 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn resolve_return_candidate(&self, expr: &CExpr) -> CExpr {
+        self.resolve_return_candidate_in_context(expr, self.return_context_for_expr(expr))
+    }
+
+    fn resolve_return_candidate_in_context(
+        &self,
+        expr: &CExpr,
+        context: VisibleExprContext,
+    ) -> CExpr {
         let mut best = expr.clone();
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(expr, 0, &mut semantic_visited);
-        if self.prefers_visible_expr(&best, &semanticized) {
+        if self.prefers_visible_expr_in_context(&best, &semanticized, context) {
             best = semanticized;
         }
         let mut has_semantic_root = false;
         if let CExpr::Var(name) = expr {
+            if matches!(context, VisibleExprContext::Generic)
+                && let Some(candidate) = self.semantic_deref_candidate_for_name(name)
+                && Self::expr_is_structured_memory_candidate(&candidate)
+                && !Self::expr_is_structured_memory_candidate(&best)
+            {
+                best = candidate;
+            }
+            if let Some(candidate) = self
+                .scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
+                .or_else(|| self.scalar_context_root_candidate_for_name(name, context))
+                && self.prefers_visible_expr_in_context(&best, &candidate, context)
+            {
+                best = candidate;
+            }
             if let Some(semantic) = self.semantic_return_candidate_for_name(name) {
                 has_semantic_root = true;
-                if self.prefers_visible_expr(&best, &semantic) {
+                if self.prefers_visible_expr_in_context(&best, &semantic, context) {
                     best = semantic;
                 }
             }
-            if let Some(candidate) = self.semanticized_raw_definition_candidate(name)
-                && self.prefers_visible_expr(&best, &candidate)
+            if let Some(candidate) =
+                self.semanticized_raw_definition_candidate_in_context(name, context)
+                && self.prefers_visible_expr_in_context(&best, &candidate, context)
             {
                 best = candidate;
             }
@@ -147,28 +274,28 @@ impl<'a> FoldingContext<'a> {
         if !has_semantic_root {
             let mut visited = HashSet::new();
             if let Some(predicate) = self.predicate_return_candidate(expr, 0, &mut visited)
-                && self.prefers_visible_expr(&best, &predicate)
+                && self.prefers_visible_expr_in_context(&best, &predicate, context)
             {
                 best = predicate;
             }
 
             visited.clear();
             if let Some(resolved) = self.resolve_return_expr_from_defs(expr, 0, &mut visited)
-                && self.prefers_visible_expr(&best, &resolved)
+                && self.prefers_visible_expr_in_context(&best, &resolved, context)
             {
                 best = resolved;
             }
 
             if let CExpr::Var(name) = expr
                 && let Some(def) = self.lookup_definition(name)
-                && self.prefers_visible_expr(&best, &def)
+                && self.prefers_visible_expr_in_context(&best, &def, context)
             {
                 best = def;
             }
 
             if let CExpr::Var(name) = expr
-                && let Some(def) = self.best_visible_definition(name)
-                && self.prefers_visible_expr(&best, &def)
+                && let Some(def) = self.best_visible_definition_in_context(name, context)
+                && self.prefers_visible_expr_in_context(&best, &def, context)
             {
                 best = def;
             }
@@ -182,25 +309,38 @@ impl<'a> FoldingContext<'a> {
         current: Option<CExpr>,
         candidate: Option<CExpr>,
     ) -> Option<CExpr> {
+        let context = self.return_context_for_candidates(current.as_ref(), candidate.as_ref());
+        self.preferred_return_candidate_in_context(current, candidate, context)
+    }
+
+    fn preferred_return_candidate_in_context(
+        &self,
+        current: Option<CExpr>,
+        candidate: Option<CExpr>,
+        context: VisibleExprContext,
+    ) -> Option<CExpr> {
         match (current, candidate) {
             (None, other) => other,
             (some @ Some(_), None) => some,
             (Some(current_expr), Some(candidate_expr)) => {
-                let current_expr = self.resolve_return_candidate(&current_expr);
-                let candidate_expr = self.resolve_return_candidate(&candidate_expr);
-                let current_bad = self.expr_contains_generic_stack_alias(&current_expr)
-                    || self.is_uninitialized_return_reg(&current_expr)
-                    || self.expr_is_transient_return_artifact(&current_expr);
-                let candidate_bad = self.expr_contains_generic_stack_alias(&candidate_expr)
-                    || self.is_uninitialized_return_reg(&candidate_expr)
-                    || self.expr_is_transient_return_artifact(&candidate_expr);
+                let current_expr = self.resolve_return_candidate_in_context(&current_expr, context);
+                let candidate_expr =
+                    self.resolve_return_candidate_in_context(&candidate_expr, context);
+                let current_bad =
+                    self.expr_is_bad_return_candidate_in_context(&current_expr, context);
+                let candidate_bad =
+                    self.expr_is_bad_return_candidate_in_context(&candidate_expr, context);
                 if current_bad && !candidate_bad {
                     return Some(candidate_expr);
                 }
                 if candidate_bad && !current_bad {
                     return Some(current_expr);
                 }
-                self.choose_preferred_visible_expr(Some(current_expr), Some(candidate_expr))
+                self.choose_preferred_visible_expr_in_context(
+                    Some(current_expr),
+                    Some(candidate_expr),
+                    context,
+                )
             }
         }
     }
@@ -211,6 +351,7 @@ impl<'a> FoldingContext<'a> {
         slot_offset: i64,
     ) -> Option<CExpr> {
         let mut best = None;
+        let context = self.return_context_for_slot_offset(slot_offset);
         for summary in self.frame_slot_merges_map().values() {
             if summary.slot_offset != slot_offset {
                 continue;
@@ -219,8 +360,10 @@ impl<'a> FoldingContext<'a> {
                 continue;
             };
             let mut visited = HashSet::new();
-            let rendered = self.render_semantic_value(value, 0, &mut visited);
-            best = self.preferred_return_candidate(best, rendered);
+            let rendered = self
+                .render_semantic_value(value, 0, &mut visited)
+                .map(|expr| self.resolve_return_candidate_in_context(&expr, context));
+            best = self.preferred_return_candidate_in_context(best, rendered, context);
         }
         best
     }
@@ -404,6 +547,16 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> CExpr {
+        self.expand_return_expr_in_context(expr, depth, visited, self.return_context_for_expr(expr))
+    }
+
+    fn expand_return_expr_in_context(
+        &self,
+        expr: &CExpr,
+        depth: u32,
+        visited: &mut HashSet<String>,
+        context: VisibleExprContext,
+    ) -> CExpr {
         if depth > MAX_RETURN_EXPR_DEPTH {
             return expr.clone();
         }
@@ -423,25 +576,45 @@ impl<'a> FoldingContext<'a> {
                 if self.lookup_predicate_expr(name).is_some() {
                     return self.simplify_condition_expr(CExpr::Var(name.clone()));
                 }
+                if let Some(candidate) = self
+                    .scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
+                    .or_else(|| self.scalar_context_root_candidate_for_name(name, context))
+                {
+                    if !visited.insert(name.clone()) {
+                        return candidate;
+                    }
+                    let resolved =
+                        self.expand_return_expr_in_context(&candidate, depth + 1, visited, context);
+                    visited.remove(name);
+                    return if self.is_predicate_like_expr(&resolved) {
+                        self.simplify_condition_expr(resolved)
+                    } else {
+                        resolved
+                    };
+                }
 
                 let mut semantic_visited = HashSet::new();
                 if let Some(semantic) = self
                     .render_semantic_value_by_name(name, 0, &mut semantic_visited)
                     .map(|candidate| self.refine_low_signal_semantic_candidate(name, candidate))
-                    && (self.prefers_visible_expr(&CExpr::Var(name.clone()), &semantic)
-                        || (self.is_low_signal_visible_name(name)
-                            && matches!(
-                                semantic,
-                                CExpr::Subscript { .. }
-                                    | CExpr::Member { .. }
-                                    | CExpr::PtrMember { .. }
-                                    | CExpr::Deref(_)
-                            )))
+                    && (self.prefers_visible_expr_in_context(
+                        &CExpr::Var(name.clone()),
+                        &semantic,
+                        context,
+                    ) || (self.is_low_signal_visible_name(name)
+                        && matches!(
+                            semantic,
+                            CExpr::Subscript { .. }
+                                | CExpr::Member { .. }
+                                | CExpr::PtrMember { .. }
+                                | CExpr::Deref(_)
+                        )))
                 {
                     if !visited.insert(name.clone()) {
                         return semantic;
                     }
-                    let resolved = self.expand_return_expr(&semantic, depth + 1, visited);
+                    let resolved =
+                        self.expand_return_expr_in_context(&semantic, depth + 1, visited, context);
                     visited.remove(name);
                     return if self.is_predicate_like_expr(&resolved) {
                         self.simplify_condition_expr(resolved)
@@ -452,12 +625,17 @@ impl<'a> FoldingContext<'a> {
 
                 if self.is_low_signal_visible_name(name)
                     && let Some(candidate) = self.semantic_deref_candidate_for_name(name)
-                    && self.prefers_visible_expr(&CExpr::Var(name.clone()), &candidate)
+                    && self.prefers_visible_expr_in_context(
+                        &CExpr::Var(name.clone()),
+                        &candidate,
+                        context,
+                    )
                 {
                     if !visited.insert(name.clone()) {
                         return candidate;
                     }
-                    let resolved = self.expand_return_expr(&candidate, depth + 1, visited);
+                    let resolved =
+                        self.expand_return_expr_in_context(&candidate, depth + 1, visited, context);
                     visited.remove(name);
                     return if self.is_predicate_like_expr(&resolved) {
                         self.simplify_condition_expr(resolved)
@@ -466,13 +644,19 @@ impl<'a> FoldingContext<'a> {
                     };
                 }
 
-                if let Some(candidate) = self.semanticized_raw_definition_candidate(name)
-                    && self.prefers_visible_expr(&CExpr::Var(name.clone()), &candidate)
+                if let Some(candidate) =
+                    self.semanticized_raw_definition_candidate_in_context(name, context)
+                    && self.prefers_visible_expr_in_context(
+                        &CExpr::Var(name.clone()),
+                        &candidate,
+                        context,
+                    )
                 {
                     if !visited.insert(name.clone()) {
                         return candidate;
                     }
-                    let resolved = self.expand_return_expr(&candidate, depth + 1, visited);
+                    let resolved =
+                        self.expand_return_expr_in_context(&candidate, depth + 1, visited, context);
                     visited.remove(name);
                     return if self.is_predicate_like_expr(&resolved) {
                         self.simplify_condition_expr(resolved)
@@ -486,14 +670,18 @@ impl<'a> FoldingContext<'a> {
                 }
 
                 let resolved = self
-                    .choose_preferred_visible_expr(
+                    .choose_preferred_visible_expr_in_context(
                         self.lookup_definition(name),
-                        self.choose_preferred_visible_expr(
-                            self.semanticized_raw_definition_candidate(name),
-                            self.best_visible_definition(name),
+                        self.choose_preferred_visible_expr_in_context(
+                            self.semanticized_raw_definition_candidate_in_context(name, context),
+                            self.best_visible_definition_in_context(name, context),
+                            context,
                         ),
+                        context,
                     )
-                    .map(|inner| self.expand_return_expr(&inner, depth + 1, visited))
+                    .map(|inner| {
+                        self.expand_return_expr_in_context(&inner, depth + 1, visited, context)
+                    })
                     .unwrap_or_else(|| CExpr::Var(name.clone()));
 
                 visited.remove(name);
@@ -506,6 +694,8 @@ impl<'a> FoldingContext<'a> {
             CExpr::Deref(inner) => {
                 if let CExpr::Var(name) = inner.as_ref()
                     && let Some(candidate) = self.semantic_deref_candidate_for_name(name)
+                    && (!matches!(context, VisibleExprContext::ScalarReturn)
+                        || !self.expr_is_address_artifact_in_scalar_context(&candidate))
                 {
                     return candidate;
                 }
@@ -515,7 +705,8 @@ impl<'a> FoldingContext<'a> {
                 {
                     CExpr::Var(stack_var)
                 } else {
-                    let expanded_inner = self.expand_return_expr(inner, depth + 1, visited);
+                    let expanded_inner =
+                        self.expand_return_expr_in_context(inner, depth + 1, visited, context);
                     let mut semantic_visited = HashSet::new();
                     self.render_memory_access_from_visible_expr(
                         &expanded_inner,
@@ -529,8 +720,8 @@ impl<'a> FoldingContext<'a> {
             CExpr::Binary { op, left, right } => {
                 let rebuilt = CExpr::binary(
                     *op,
-                    self.expand_return_expr(left, depth + 1, visited),
-                    self.expand_return_expr(right, depth + 1, visited),
+                    self.expand_return_expr_in_context(left, depth + 1, visited, context),
+                    self.expand_return_expr_in_context(right, depth + 1, visited, context),
                 );
                 if self.is_predicate_like_expr(&rebuilt) {
                     self.simplify_condition_expr(rebuilt)
@@ -538,11 +729,15 @@ impl<'a> FoldingContext<'a> {
                     rebuilt
                 }
             }
-            CExpr::Paren(inner) => {
-                CExpr::Paren(Box::new(self.expand_return_expr(inner, depth + 1, visited)))
-            }
+            CExpr::Paren(inner) => CExpr::Paren(Box::new(self.expand_return_expr_in_context(
+                inner,
+                depth + 1,
+                visited,
+                context,
+            ))),
             CExpr::Cast { ty, expr: inner } => {
-                let expanded_inner = self.expand_return_expr(inner, depth + 1, visited);
+                let expanded_inner =
+                    self.expand_return_expr_in_context(inner, depth + 1, visited, context);
                 let simplified_inner = if self.is_predicate_like_expr(&expanded_inner) {
                     self.simplify_condition_expr(expanded_inner)
                 } else {
@@ -553,9 +748,9 @@ impl<'a> FoldingContext<'a> {
                     expr: Box::new(simplified_inner),
                 }
             }
-            _ => expr
-                .clone()
-                .map_children(&mut |child| self.expand_return_expr(&child, depth + 1, visited)),
+            _ => expr.clone().map_children(&mut |child| {
+                self.expand_return_expr_in_context(&child, depth + 1, visited, context)
+            }),
         }
     }
 
@@ -566,50 +761,64 @@ impl<'a> FoldingContext<'a> {
 
         let mut visited = HashSet::new();
         let root_name = var.display_name();
+        let context = self.return_context_for_name(&root_name);
         let unresolved = CExpr::Var(self.var_name(var));
         let semantic_root = self.semantic_return_candidate_for_name(&root_name);
         let base_root = if let Some(semantic_root) = semantic_root.clone() {
             let best = self
-                .preferred_return_candidate(
+                .preferred_return_candidate_in_context(
                     Some(semantic_root),
-                    self.semanticized_raw_definition_candidate(&root_name),
+                    self.semanticized_raw_definition_candidate_in_context(&root_name, context),
+                    context,
                 )
                 .unwrap_or_else(|| unresolved.clone());
-            self.preferred_return_candidate(Some(best), Some(unresolved.clone()))
-                .unwrap_or_else(|| unresolved.clone())
+            self.preferred_return_candidate_in_context(
+                Some(best),
+                Some(unresolved.clone()),
+                context,
+            )
+            .unwrap_or_else(|| unresolved.clone())
         } else {
             let best = self
-                .preferred_return_candidate(
+                .preferred_return_candidate_in_context(
                     self.lookup_definition(&root_name),
-                    self.semanticized_raw_definition_candidate(&root_name),
+                    self.semanticized_raw_definition_candidate_in_context(&root_name, context),
+                    context,
                 )
                 .and_then(|expr| {
-                    self.preferred_return_candidate(
+                    self.preferred_return_candidate_in_context(
                         Some(expr),
-                        self.best_visible_definition(&root_name),
+                        self.best_visible_definition_in_context(&root_name, context),
+                        context,
                     )
                 })
                 .or_else(|| self.lookup_definition(&root_name))
-                .or_else(|| self.best_visible_definition(&root_name))
+                .or_else(|| self.best_visible_definition_in_context(&root_name, context))
                 .unwrap_or_else(|| unresolved.clone());
-            self.preferred_return_candidate(Some(best), Some(unresolved.clone()))
-                .unwrap_or_else(|| unresolved.clone())
+            self.preferred_return_candidate_in_context(
+                Some(best),
+                Some(unresolved.clone()),
+                context,
+            )
+            .unwrap_or_else(|| unresolved.clone())
         };
         let root = if semantic_root.is_some() {
             base_root
         } else {
             let predicate_root = self.predicate_return_candidate(&unresolved, 0, &mut visited);
-            self.preferred_return_candidate(
-                self.choose_preferred_visible_expr(
+            self.preferred_return_candidate_in_context(
+                self.choose_preferred_visible_expr_in_context(
                     self.predicate_candidate_for_var(var),
                     predicate_root,
+                    context,
                 ),
                 Some(base_root),
+                context,
             )
             .unwrap_or_else(|| unresolved.clone())
         };
         let root = self.resolve_predicate_rhs_for_var(var, root);
-        let raw = self.expand_return_expr(&root, 0, &mut visited);
+        let raw = self.expand_return_expr_in_context(&root, 0, &mut visited, context);
         let mut semantic_visited = HashSet::new();
         let raw = self.semanticize_visible_expr(&raw, 0, &mut semantic_visited);
         let simplified = if self.is_predicate_like_expr(&raw) {
@@ -617,87 +826,101 @@ impl<'a> FoldingContext<'a> {
         } else {
             raw
         };
-        self.sanitize_return_expr(simplified, root, unresolved)
-    }
-
-    pub(super) fn tracked_return_expr(&self, var: &SSAVar) -> CExpr {
-        if var.is_const() {
-            return self.const_to_expr(var);
-        }
-
-        let name = var.display_name();
-        self.formatted_defs_map()
-            .get(&name)
-            .cloned()
-            .or_else(|| self.definitions_map().get(&name).cloned())
-            .unwrap_or_else(|| CExpr::Var(self.var_name(var)))
+        self.sanitize_return_expr_in_context(simplified, root, unresolved, context)
     }
 
     #[cfg(test)]
     pub(crate) fn debug_return_expr_stages(&self, var: &SSAVar) -> (CExpr, CExpr, CExpr) {
         let mut visited = HashSet::new();
         let root_name = var.display_name();
+        let context = self.return_context_for_name(&root_name);
         let unresolved = CExpr::Var(self.var_name(var));
         let semantic_root = self.semantic_return_candidate_for_name(&root_name);
         let base_root = if let Some(semantic_root) = semantic_root.clone() {
             let best = self
-                .preferred_return_candidate(
+                .preferred_return_candidate_in_context(
                     Some(semantic_root),
-                    self.semanticized_raw_definition_candidate(&root_name),
+                    self.semanticized_raw_definition_candidate_in_context(&root_name, context),
+                    context,
                 )
                 .unwrap_or_else(|| unresolved.clone());
-            self.preferred_return_candidate(Some(best), Some(unresolved.clone()))
-                .unwrap_or_else(|| unresolved.clone())
+            self.preferred_return_candidate_in_context(
+                Some(best),
+                Some(unresolved.clone()),
+                context,
+            )
+            .unwrap_or_else(|| unresolved.clone())
         } else {
             let best = self
-                .preferred_return_candidate(
+                .preferred_return_candidate_in_context(
                     self.lookup_definition(&root_name),
-                    self.semanticized_raw_definition_candidate(&root_name),
+                    self.semanticized_raw_definition_candidate_in_context(&root_name, context),
+                    context,
                 )
                 .and_then(|expr| {
-                    self.preferred_return_candidate(
+                    self.preferred_return_candidate_in_context(
                         Some(expr),
-                        self.best_visible_definition(&root_name),
+                        self.best_visible_definition_in_context(&root_name, context),
+                        context,
                     )
                 })
                 .or_else(|| self.lookup_definition(&root_name))
-                .or_else(|| self.best_visible_definition(&root_name))
+                .or_else(|| self.best_visible_definition_in_context(&root_name, context))
                 .unwrap_or_else(|| unresolved.clone());
-            self.preferred_return_candidate(Some(best), Some(unresolved.clone()))
-                .unwrap_or_else(|| unresolved.clone())
+            self.preferred_return_candidate_in_context(
+                Some(best),
+                Some(unresolved.clone()),
+                context,
+            )
+            .unwrap_or_else(|| unresolved.clone())
         };
         let root = if semantic_root.is_some() {
             base_root
         } else {
             let predicate_root = self.predicate_return_candidate(&unresolved, 0, &mut visited);
-            self.preferred_return_candidate(
-                self.choose_preferred_visible_expr(
+            self.preferred_return_candidate_in_context(
+                self.choose_preferred_visible_expr_in_context(
                     self.predicate_candidate_for_var(var),
                     predicate_root,
+                    context,
                 ),
                 Some(base_root),
+                context,
             )
             .unwrap_or_else(|| unresolved.clone())
         };
         let root = self.resolve_predicate_rhs_for_var(var, root);
-        let raw = self.expand_return_expr(&root, 0, &mut visited);
+        let raw = self.expand_return_expr_in_context(&root, 0, &mut visited, context);
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(&raw, 0, &mut semantic_visited);
         (root, raw, semanticized)
     }
 
-    fn sanitize_return_expr(&self, expr: CExpr, fallback: CExpr, unresolved: CExpr) -> CExpr {
-        self.preferred_return_candidate(
-            self.preferred_return_candidate(Some(unresolved.clone()), Some(fallback)),
+    fn sanitize_return_expr_in_context(
+        &self,
+        expr: CExpr,
+        fallback: CExpr,
+        unresolved: CExpr,
+        context: VisibleExprContext,
+    ) -> CExpr {
+        self.preferred_return_candidate_in_context(
+            self.preferred_return_candidate_in_context(
+                Some(unresolved.clone()),
+                Some(fallback),
+                context,
+            ),
             Some(expr),
+            context,
         )
         .unwrap_or(unresolved)
     }
 
     pub(super) fn sanitize_final_return_expr(&self, expr: CExpr, fallback: CExpr) -> CExpr {
-        self.preferred_return_candidate(
-            Some(self.resolve_return_candidate(&fallback)),
-            Some(self.resolve_return_candidate(&expr)),
+        let context = self.return_context_for_candidates(Some(&expr), Some(&fallback));
+        self.preferred_return_candidate_in_context(
+            Some(self.resolve_return_candidate_in_context(&fallback, context)),
+            Some(self.resolve_return_candidate_in_context(&expr, context)),
+            context,
         )
         .unwrap_or_else(|| CExpr::Var("return".to_string()))
     }

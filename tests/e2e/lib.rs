@@ -231,8 +231,11 @@ fn configure_plugin_env(command: &mut Command) {
 
     #[cfg(target_os = "windows")]
     const ANAL_PLUGIN_LIB: &str = "anal_sleigh.dll";
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    const ANAL_PLUGIN_LIB: &str = "anal_sleigh.dylib";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     const ANAL_PLUGIN_LIB: &str = "anal_sleigh.so";
+    const RUST_PLUGIN_SUBDIR: &str = "r2sleigh";
 
     static R2_HOME_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
     let home_override = R2_HOME_OVERRIDE.get_or_init(|| {
@@ -240,7 +243,9 @@ fn configure_plugin_env(command: &mut Command) {
         let mut plugin_src: Option<PathBuf> = None;
         for candidate in ["r2plugin", "../r2plugin", "../../r2plugin"] {
             let dir = cwd.join(candidate);
-            if dir.join(ANAL_PLUGIN_LIB).exists() && dir.join(RUST_PLUGIN_LIB).exists() {
+            if dir.join(ANAL_PLUGIN_LIB).exists()
+                && dir.join(RUST_PLUGIN_SUBDIR).join(RUST_PLUGIN_LIB).exists()
+            {
                 plugin_src = Some(dir);
                 break;
             }
@@ -248,15 +253,17 @@ fn configure_plugin_env(command: &mut Command) {
         let plugin_src = plugin_src?;
         let home_dir = std::env::temp_dir().join("r2sleigh-e2e-home");
         let plugin_dst = home_dir.join(".local/share/radare2/plugins");
+        let runtime_dst = plugin_dst.join(RUST_PLUGIN_SUBDIR);
         fs::create_dir_all(&plugin_dst).ok()?;
+        fs::create_dir_all(&runtime_dst).ok()?;
         fs::copy(
             plugin_src.join(ANAL_PLUGIN_LIB),
             plugin_dst.join(ANAL_PLUGIN_LIB),
         )
         .ok()?;
         fs::copy(
-            plugin_src.join(RUST_PLUGIN_LIB),
-            plugin_dst.join(RUST_PLUGIN_LIB),
+            plugin_src.join(RUST_PLUGIN_SUBDIR).join(RUST_PLUGIN_LIB),
+            runtime_dst.join(RUST_PLUGIN_LIB),
         )
         .ok()?;
         #[cfg(not(target_os = "windows"))]

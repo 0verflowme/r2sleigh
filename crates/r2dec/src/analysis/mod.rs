@@ -296,9 +296,21 @@ pub(crate) struct StackInfo {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum StackSlotValueKind {
+    Scalar,
+    AddressLike,
+    #[default]
+    Unknown,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StackSlotProvenance {
     pub(crate) offset: i64,
+    pub(crate) predicate_carrier: bool,
+    pub(crate) return_carrier: bool,
+    pub(crate) value_kind: StackSlotValueKind,
 }
 
 #[allow(dead_code)]
@@ -307,6 +319,45 @@ pub(crate) struct ValueProvenance {
     pub(crate) source: String,
     pub(crate) source_var: Option<SSAVar>,
     pub(crate) stack_slot: Option<i64>,
+}
+
+impl StackSlotProvenance {
+    pub(crate) fn new(offset: i64) -> Self {
+        Self {
+            offset,
+            predicate_carrier: false,
+            return_carrier: false,
+            value_kind: StackSlotValueKind::Unknown,
+        }
+    }
+
+    pub(crate) fn merge(self, other: Self) -> Self {
+        if self.offset != other.offset {
+            return self;
+        }
+        Self {
+            offset: self.offset,
+            predicate_carrier: self.predicate_carrier || other.predicate_carrier,
+            return_carrier: self.return_carrier || other.return_carrier,
+            value_kind: match (self.value_kind, other.value_kind) {
+                (StackSlotValueKind::Unknown, kind) | (kind, StackSlotValueKind::Unknown) => kind,
+                (lhs, rhs) if lhs == rhs => lhs,
+                _ => StackSlotValueKind::Unknown,
+            },
+        }
+    }
+
+    pub(crate) fn is_scalar(self) -> bool {
+        self.value_kind == StackSlotValueKind::Scalar
+    }
+
+    pub(crate) fn is_scalar_predicate_carrier(self) -> bool {
+        self.predicate_carrier && self.is_scalar()
+    }
+
+    pub(crate) fn is_scalar_return_carrier(self) -> bool {
+        self.return_carrier && self.is_scalar()
+    }
 }
 
 impl UseInfo {

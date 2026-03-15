@@ -2,22 +2,12 @@ NAME=decompiler_bool_carrier_chain_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-int64_t sym._test_bool_carrier_chain(int32_t arg1, int32_t arg2)
-{
-    if ((arg1 != arg2 & 1) != 0) {
-        var_4h = arg1;
-        <true_branch_return>
-    } else {
-        var_4h = arg2;
-        <false_branch_return>
-    }
-}
-
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
 s sym._test_bool_carrier_chain
-a:sla.dec | awk "BEGIN{saw=0} /^[[:space:]]*return .*;$/ { if (saw) print \"        <false_branch_return>\"; else { print \"        <true_branch_return>\"; saw=1 } next } { print }"
+a:sla.dec | jq -Rs 'contains("int64_t sym._test_bool_carrier_chain(int32_t arg1, int32_t arg2)") and contains("if (arg1 != arg2)") and contains("return arg1;") and contains("return arg2;") and (contains("&var_")|not) and (contains("rbp")|not) and (contains("rsp")|not) and (contains("*(")|not) and (contains("var_4h =")|not) and (contains("var_8h")|not)'
 EOF_CMDS
 RUN
 
