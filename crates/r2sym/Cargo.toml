@@ -11,7 +11,7 @@ r2ssa = { path = "../r2ssa" }
 serde.workspace = true
 thiserror.workspace = true
 z3 = "0.19.11"
-r2pipe = { version = "0.7", optional = true }
+r2pipe = { version = "0.8", optional = true }
 serde_json = { version = "1.0", optional = true }
 
 [features]

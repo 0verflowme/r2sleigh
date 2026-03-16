@@ -1138,11 +1138,12 @@ dependencies = [
 
 [[package]]
 name = "r2pipe"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63443078dfdb83f59820ed161863e38df38e8c6a2c3b85733ebac1bb65b4af2b"
+checksum = "2b823a15a98a6462385ba5568635c1da5bb165066a38a65b5c6004e126ed32c0"
 dependencies = [
  "libc",
+ "libloading",
  "serde",
  "serde_derive",
  "serde_json",
