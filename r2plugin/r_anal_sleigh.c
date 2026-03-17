@@ -390,45 +390,46 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	if (!anal || !fcn) {
 		return strdup ("{}");
 	}
-	RAnalFunctionContext *ctx = r_anal_function_context_collect (anal, fcn);
-	if (!ctx) {
-		return strdup ("{}");
-	}
+	RAnalFunctionSignature *signature = r_anal_function_get_signature (fcn);
+	RList *base_types = r_anal_types_baselist (anal);
 
 	PJ *pj = pj_new ();
 	if (!pj) {
-		r_anal_function_context_free (ctx);
+		r_list_free (base_types);
+		r_anal_function_signature_free (signature);
 		return strdup ("{}");
 	}
 
 	pj_o (pj);
 	pj_k (pj, "signature");
 	pj_o (pj);
-	if (ctx->function && ctx->function->name) {
-		pj_ks (pj, "name", ctx->function->name);
+	if (fcn->name) {
+		pj_ks (pj, "name", fcn->name);
 	}
-	if (ctx->function && ctx->function->ret_type) {
-		pj_ks (pj, "ret", ctx->function->ret_type);
+	if (signature && signature->ret_type) {
+		pj_ks (pj, "ret", signature->ret_type);
 	}
-	if (ctx->function && ctx->function->callconv) {
-		pj_ks (pj, "callconv", ctx->function->callconv);
+	if (signature && signature->callconv) {
+		pj_ks (pj, "callconv", signature->callconv);
 	}
-	if (ctx->function && ctx->function->is_noreturn) {
+	if (signature && signature->noreturn) {
 		pj_kb (pj, "noreturn", true);
 	}
 	pj_k (pj, "params");
 	pj_a (pj);
 	RListIter *iter;
 	RAnalFunctionParam *param;
-	r_list_foreach (ctx->function->params, iter, param) {
-		pj_o (pj);
-		if (param->name) {
-			pj_ks (pj, "name", param->name);
+	if (signature && signature->params) {
+		r_list_foreach (signature->params, iter, param) {
+			pj_o (pj);
+			if (param->name) {
+				pj_ks (pj, "name", param->name);
+			}
+			if (param->type) {
+				pj_ks (pj, "type", param->type);
+			}
+			pj_end (pj);
 		}
-		if (param->type) {
-			pj_ks (pj, "type", param->type);
-		}
-		pj_end (pj);
 	}
 	pj_end (pj);
 	pj_end (pj);
@@ -436,7 +437,7 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	pj_k (pj, "vars");
 	pj_a (pj);
 	RAnalVar **it;
-	R_VEC_FOREACH (&ctx->function->vars, it) {
+	R_VEC_FOREACH (&fcn->vars, it) {
 		RAnalVar *var = *it;
 		const char *base;
 		pj_o (pj);
@@ -463,14 +464,17 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	pj_k (pj, "base_types");
 	pj_a (pj);
 	RAnalBaseType *type;
-	r_list_foreach (ctx->base_types, iter, type) {
-		append_function_context_base_type (pj, type);
+	if (base_types) {
+		r_list_foreach (base_types, iter, type) {
+			append_function_context_base_type (pj, type);
+		}
 	}
 	pj_end (pj);
 	pj_end (pj);
 
 	char *json = pj_drain (pj);
-	r_anal_function_context_free (ctx);
+	r_list_free (base_types);
+	r_anal_function_signature_free (signature);
 	return json? json: strdup ("{}");
 }
 
@@ -5205,6 +5209,14 @@ static bool verify_practical_signature_consistency (
 	ConsistencyReasonCounters *reason_counters
 );
 
+static void function_signature_param_free(RAnalFunctionSignatureParam *param) {
+	if (param) {
+		free (param->name);
+		free (param->type);
+		free (param);
+	}
+}
+
 static bool apply_inferred_signature_typed(
 	RAnal *anal,
 	RAnalFunction *fcn,
@@ -5215,7 +5227,7 @@ static bool apply_inferred_signature_typed(
 	const RJson *j_expected_ret;
 	const RJson *j_expected_params;
 	const RJson *j_expected_callconv;
-	RAnalFunctionSignatureParam *params = NULL;
+	RList *params;
 	bool ok = false;
 	int param_count = 0;
 	int i = 0;
@@ -5237,45 +5249,52 @@ static bool apply_inferred_signature_typed(
 		return false;
 	}
 
-	param_count = json_array_object_count (j_expected_params);
-	if (param_count > 0) {
-		params = R_NEWS0 (RAnalFunctionSignatureParam, param_count);
-		if (!params) {
-			write_reason_msg (reason, reason_sz, "oom allocating typed signature params");
-			return false;
-		}
+	params = r_list_newf ((RListFree)function_signature_param_free);
+	if (!params) {
+		write_reason_msg (reason, reason_sz, "oom allocating typed signature params");
+		return false;
 	}
-
+	param_count = json_array_object_count (j_expected_params);
 	expected_param = json_next_object (j_expected_params->children.first);
 	while (expected_param && i < param_count) {
 		const RJson *j_expected_type = r_json_get (expected_param, "type");
 		const RJson *j_expected_name = r_json_get (expected_param, "name");
+		RAnalFunctionSignatureParam *param;
+
 		if (!json_is_string_with_value (j_expected_type)) {
 			write_reason_msg (reason, reason_sz, "missing typed arg type at index %d", i);
-			free (params);
+			r_list_free (params);
 			return false;
 		}
-		params[i].type = j_expected_type->str_value;
-		params[i].name = json_is_string_with_value (j_expected_name)? j_expected_name->str_value: NULL;
+		param = R_NEW0 (RAnalFunctionSignatureParam);
+		param->type = strdup (j_expected_type->str_value);
+		if (json_is_string_with_value (j_expected_name)) {
+			param->name = strdup (j_expected_name->str_value);
+		}
+		if (!param->type || (json_is_string_with_value (j_expected_name) && !param->name)) {
+			function_signature_param_free (param);
+			write_reason_msg (reason, reason_sz, "oom materializing typed arg at index %d", i);
+			r_list_free (params);
+			return false;
+		}
+		r_list_append (params, param);
 		expected_param = json_next_object (expected_param->next);
 		i++;
 	}
 	if (expected_param || i != param_count) {
 		write_reason_msg (reason, reason_sz, "typed param count mismatch while materializing payload");
-		free (params);
+		r_list_free (params);
 		return false;
 	}
 
-	ok = r_anal_function_apply_signature (
-		anal,
-		fcn,
-		j_expected_ret->str_value,
-		params,
-		(size_t)param_count,
-		json_is_string_with_value (j_expected_callconv)? j_expected_callconv->str_value: NULL,
-		fcn->is_noreturn
-	);
-	free (params);
+	RAnalFunctionSignature signature = {
+		.ret_type = (char *)j_expected_ret->str_value,
+		.callconv = json_is_string_with_value (j_expected_callconv)? (char *)j_expected_callconv->str_value: NULL,
+		.params = params,
+		.noreturn = fcn->is_noreturn,
+	};
+	ok = r_anal_function_set_signature (anal, fcn, &signature);
+	r_list_free (params);
 	if (!ok) {
 		write_reason_msg (reason, reason_sz, "typed signature apply failed");
 	}
@@ -6066,18 +6085,35 @@ static bool is_caller_propagation_ref_type (RAnalRefType type) {
 		|| masked == R_ANAL_REF_TYPE_JUMP;
 }
 
+static inline bool string_has_opaque_type_marker(const char *type) {
+	return type && strstr (type, "type_0x");
+}
+
 static bool function_has_opaque_type_markers(RAnal *anal, RAnalFunction *fcn) {
-	bool has_opaque = false;
-	RAnalFunctionContext *ctx;
+	RListIter *iter;
+	RAnalFunctionParam *param;
+	RAnalFunctionSignature *signature;
 	if (!anal || !fcn) {
 		return false;
 	}
-	ctx = r_anal_function_context_collect (anal, fcn);
-	if (ctx) {
-		has_opaque = ctx->function && ctx->function->has_opaque_type_markers;
-		r_anal_function_context_free (ctx);
+	signature = r_anal_function_get_signature (fcn);
+	if (!signature) {
+		return false;
 	}
-	return has_opaque;
+	if (string_has_opaque_type_marker (signature->ret_type)) {
+		r_anal_function_signature_free (signature);
+		return true;
+	}
+	if (signature->params) {
+		r_list_foreach (signature->params, iter, param) {
+			if (param && string_has_opaque_type_marker (param->type)) {
+				r_anal_function_signature_free (signature);
+				return true;
+			}
+		}
+	}
+	r_anal_function_signature_free (signature);
+	return false;
 }
 
 static bool run_caller_type_match (RAnal *anal, RCore *core, RAnalFunction *caller_fcn) {
@@ -6251,12 +6287,12 @@ static bool verify_practical_signature_consistency (
 	bool reason_argc_mismatch = false;
 	bool reason_argtype_mismatch = false;
 	bool reason_callconv_mismatch = false;
-	RAnalFunctionContext *ctx = NULL;
 	const RJson *j_expected_signature;
 	const RJson *j_expected_ret;
 	const RJson *j_expected_params;
 	const RJson *j_expected_callconv;
 	const RJson *j_expected_arch;
+	RAnalFunctionSignature *signature = NULL;
 	bool long_is_i64 = false;
 
 	if (afij_signature_drift) {
@@ -6278,14 +6314,14 @@ static bool verify_practical_signature_consistency (
 		long_is_i64 = is_x64_signature_arch (j_expected_arch->str_value);
 	}
 	if (check_signature || check_callconv) {
-		ctx = r_anal_function_context_collect (anal, fcn);
-		if (!ctx) {
+		signature = r_anal_function_get_signature (fcn);
+		if (!signature) {
 			reason_readback_fail = true;
 			ok = false;
 		}
 	}
 
-	if (check_signature && ctx) {
+	if (check_signature) {
 		const RJson *expected_param;
 		int expected_count;
 		int actual_count = 0;
@@ -6294,10 +6330,10 @@ static bool verify_practical_signature_consistency (
 
 		if (ok) {
 			if (!j_expected_ret || j_expected_ret->type != R_JSON_STRING
-					|| !ctx->function || R_STR_ISEMPTY (ctx->function->ret_type)) {
+					|| R_STR_ISEMPTY (signature->ret_type)) {
 				reason_readback_fail = true;
 				ok = false;
-			} else if (!types_match_canonical (j_expected_ret->str_value, ctx->function->ret_type, long_is_i64)) {
+			} else if (!types_match_canonical (j_expected_ret->str_value, signature->ret_type, long_is_i64)) {
 				reason_ret_mismatch = true;
 				ok = false;
 			}
@@ -6307,13 +6343,13 @@ static bool verify_practical_signature_consistency (
 				ok = false;
 			} else {
 				expected_count = json_array_object_count (j_expected_params);
-				actual_count = (int)r_list_length (ctx->function->params);
+				actual_count = (int)r_list_length (signature->params);
 				if (expected_count != actual_count) {
 					reason_argc_mismatch = true;
 					ok = false;
 				}
 				expected_param = json_next_object (j_expected_params->children.first);
-				iter = ctx->function->params? ctx->function->params->head: NULL;
+				iter = signature->params? signature->params->head: NULL;
 				actual_param = iter? iter->data: NULL;
 				while (expected_param && actual_param && ok) {
 					const RJson *j_expected_type = r_json_get (expected_param, "type");
@@ -6341,24 +6377,24 @@ static bool verify_practical_signature_consistency (
 		}
 	}
 
-	if (check_callconv && ctx) {
-		if (j_expected_callconv && j_expected_callconv->type == R_JSON_STRING
+	if (check_callconv) {
+		if (ok && j_expected_callconv && j_expected_callconv->type == R_JSON_STRING
 				&& j_expected_callconv->str_value && *j_expected_callconv->str_value) {
-			if (!ctx->function || R_STR_ISEMPTY (ctx->function->callconv)
-					|| !strings_match_normalized (j_expected_callconv->str_value, ctx->function->callconv)) {
+			if (R_STR_ISEMPTY (signature->callconv)
+					|| !strings_match_normalized (j_expected_callconv->str_value, signature->callconv)) {
 				reason_callconv_mismatch = true;
 				ok = false;
 			}
 		}
 	}
 
-	if (check_signature && ctx && afij_signature_drift) {
+	if (check_signature && afij_signature_drift) {
 		if (!j_expected_signature || j_expected_signature->type != R_JSON_STRING
 				|| !j_expected_signature->str_value || !*j_expected_signature->str_value) {
 			*afij_signature_drift = false;
-		} else if (!ctx->function || R_STR_ISEMPTY (ctx->function->signature)) {
+		} else if (!signature || R_STR_ISEMPTY (signature->signature)) {
 			*afij_signature_drift = true;
-		} else if (!strings_match_normalized (j_expected_signature->str_value, ctx->function->signature)) {
+		} else if (!strings_match_normalized (j_expected_signature->str_value, signature->signature)) {
 			*afij_signature_drift = true;
 		}
 	}
@@ -6380,8 +6416,8 @@ static bool verify_practical_signature_consistency (
 			reason_counters->callconv_mismatch++;
 		}
 	}
+	r_anal_function_signature_free (signature);
 
-	r_anal_function_context_free (ctx);
 	return ok;
 }
 
