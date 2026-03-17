@@ -4587,6 +4587,28 @@ static bool verify_callconv_apply(RAnal *anal, ut64 fcn_addr, const char *cc_nam
 	return strings_match_normalized (target_fcn->callconv, cc_name);
 }
 
+static bool signature_contains_cmd_separator(const char *signature) {
+	const unsigned char *p;
+
+	if (!signature || !*signature) {
+		return false;
+	}
+	for (p = (const unsigned char *)signature; *p; p++) {
+		switch (*p) {
+		case ';':
+		case '|':
+		case '&':
+		case '\n':
+		case '\r':
+		case '!':
+			return true;
+		default:
+			break;
+		}
+	}
+	return false;
+}
+
 static WritebackApplyResult apply_inferred_signature(
 	RAnal *anal,
 	RCore *core,
@@ -4613,6 +4635,12 @@ static WritebackApplyResult apply_inferred_signature(
 		return res;
 	}
 	res.cmd_fallback_attempted = true;
+	if (signature_contains_cmd_separator (signature)) {
+		write_reason_msg (res.detail, sizeof (res.detail),
+			"signature contains command separator");
+		res.cmd_apply_fail = true;
+		return res;
+	}
 	r_core_cmdf_at (core, fcn->addr, "afs %s", signature);
 	if (verify_signature_type_db_ex (anal, fcn, sig_root, res.detail, sizeof (res.detail))) {
 		res.path = WRITEBACK_APPLY_CMD;
