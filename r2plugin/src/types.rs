@@ -1563,7 +1563,7 @@ fn infer_scalar_var_evidence_from_ssa(
                             .unwrap_or(0);
                         if operand_bits > 0 {
                             let entry = width_hints.entry(dst_key).or_insert(0);
-                            if operand_bits != *entry {
+                            if operand_bits > *entry {
                                 *entry = operand_bits;
                                 changed = true;
                             }
@@ -1681,7 +1681,7 @@ fn infer_scalar_var_evidence_from_ssa(
                 }
                 if preferred_bits > 0 {
                     let entry = width_hints.entry(key.clone()).or_insert(0);
-                    if preferred_bits != *entry {
+                    if preferred_bits > *entry {
                         *entry = preferred_bits;
                         changed = true;
                     }
@@ -2520,6 +2520,9 @@ pub extern "C" fn r2sleigh_recover_vars(
     let Some(input) = build_function_input(ctx, blocks, num_blocks, 0, ptr::null()) else {
         return ptr::null_mut();
     };
+    let Some(analysis) = build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
 
     let semantic_typing_enabled = input.ctx.semantic_metadata_enabled;
     let reg_type_hints = if semantic_typing_enabled {
@@ -2528,18 +2531,12 @@ pub extern "C" fn r2sleigh_recover_vars(
         std::collections::HashMap::new()
     };
 
-    let ssa_blocks: Vec<r2ssa::SSABlock> = input
-        .blocks
-        .as_slice()
-        .iter()
-        .map(|blk| r2ssa::block::to_ssa(blk, input.ctx.disasm))
-        .collect();
-    if ssa_blocks.is_empty() {
+    if analysis.pattern_ssa_blocks.is_empty() {
         return ptr::null_mut();
     }
 
     let vars = recover_vars_from_ssa(
-        &ssa_blocks,
+        &analysis.pattern_ssa_blocks,
         input.ctx.arch,
         &reg_type_hints,
         semantic_typing_enabled,

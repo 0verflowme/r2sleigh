@@ -57,6 +57,7 @@ ifeq ($(UNAME),Darwin)
 			install_name_tool -change "$$from" "$(RUST_RUNTIME_REF)" $@; \
 		fi; \
 	done
+	@codesign --force --sign - $@ >/dev/null
 endif
 
 # Build the architecture plugin shared object
@@ -76,6 +77,7 @@ ifeq ($(UNAME),Darwin)
 			install_name_tool -change "$$from" "$(RUST_RUNTIME_REF)" $@; \
 		fi; \
 	done
+	@codesign --force --sign - $@ >/dev/null
 endif
 
 # Build Rust library (release)
@@ -83,6 +85,7 @@ rust-release:
 	cd .. && cargo build --release --features $(RUST_FEATURES) -p r2sleigh-plugin
 ifeq ($(UNAME),Darwin)
 	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	@codesign --force --sign - $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
 endif
 
 # Build Rust library (debug)
@@ -90,6 +93,7 @@ rust-debug:
 	cd .. && cargo build --features $(RUST_FEATURES) -p r2sleigh-plugin
 ifeq ($(UNAME),Darwin)
 	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	@codesign --force --sign - $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
 endif
 
 # Default rust target
@@ -105,6 +109,9 @@ $(RUST_LIB_LOCAL): $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	mkdir -p $(RUST_RUNTIME_SUBDIR)
 	rm -f $(RUST_LIB).$(RUST_LIB_EXT)
 	cp $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) $@
+ifeq ($(UNAME),Darwin)
+	@codesign --force --sign - $@ >/dev/null
+endif
 
 # Install plugins
 install: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
@@ -114,6 +121,11 @@ install: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 	cp $(RUST_LIB_LOCAL) $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)/
 	cp $(ANAL_PLUGIN_SO) $(R2_PLUGIN_DIR)/
 	cp $(ARCH_PLUGIN_SO) $(R2_PLUGIN_DIR)/
+ifeq ($(UNAME),Darwin)
+	@codesign --force --sign - $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
+	@codesign --force --sign - $(R2_PLUGIN_DIR)/$(ANAL_PLUGIN_SO) >/dev/null
+	@codesign --force --sign - $(R2_PLUGIN_DIR)/$(ARCH_PLUGIN_SO) >/dev/null
+endif
 	@echo "Installed to $(R2_PLUGIN_DIR)"
 
 # Uninstall plugins

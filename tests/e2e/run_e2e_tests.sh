@@ -6,7 +6,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 R2SLEIGH_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TEST_BINARY="$SCRIPT_DIR/test_func"
-PLUGIN_LIB="$R2SLEIGH_ROOT/target/release/libr2sleigh_plugin.so"
+case "$(uname)" in
+  Darwin) PLUGIN_LIB="$R2SLEIGH_ROOT/target/release/libr2sleigh_plugin.dylib" ;;
+  *) PLUGIN_LIB="$R2SLEIGH_ROOT/target/release/libr2sleigh_plugin.so" ;;
+esac
 
 echo "=== r2sleigh End-to-End Tests ==="
 echo "Test binary: $TEST_BINARY"

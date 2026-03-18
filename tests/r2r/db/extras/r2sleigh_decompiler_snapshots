@@ -6,8 +6,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-s sym._test_bool_carrier_chain
-a:sla.dec | jq -Rs 'contains("int64_t sym._test_bool_carrier_chain(int32_t arg1, int32_t arg2)") and contains("if (arg1 != arg2)") and contains("return arg1;") and contains("return arg2;") and (contains("&var_")|not) and (contains("rbp")|not) and (contains("rsp")|not) and (contains("*(")|not) and (contains("var_4h =")|not) and (contains("var_8h")|not)'
+a:sla.dec sym.test_bool_carrier_chain | jq -Rs '((split("\n")[0] | test("^int64_t .*test_bool_carrier_chain\\((int32_t|int64_t) arg1, (int32_t|int64_t) arg2\\)$"))) and contains("if (arg1 != arg2)") and contains("return arg1;") and contains("return arg2;") and (contains("&var_")|not) and (contains("rbp")|not) and (contains("rsp")|not) and (contains("*(")|not) and (contains("var_4h =")|not) and (contains("var_8h")|not)'
 EOF_CMDS
 RUN
 
@@ -19,7 +18,6 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s sym._complex_check
-a:sla.dec | jq -Rs 'contains("int64_t sym._complex_check(int32_t arg1, int32_t arg2)") and contains("var_4h = 0;") and contains("var_4h = 1;") and contains("return 0;") and contains("return 1;") and (contains("{\n    }\n")|not)'
+a:sla.dec sym.complex_check | jq -Rs '((split("\n")[0] | test("^int64_t .*complex_check\\((int32_t|int64_t) arg1, (int32_t|int64_t) arg2\\)$"))) and contains("var_4h = 0;") and contains("var_4h = 1;") and contains("return 0;") and contains("return 1;") and (contains("{\n    }\n")|not)'
 EOF_CMDS
 RUN

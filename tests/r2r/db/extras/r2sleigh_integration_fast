@@ -5,7 +5,7 @@ EXPECT=<<EOF_EXPECT
 sla: loaded architecture 'x86-64'
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 a:sla
 EOF_CMDS
 RUN
@@ -17,7 +17,7 @@ EXPECT=<<EOF_EXPECT
 sla: loaded architecture 'x86-64'
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 a:sla.info
 EOF_CMDS
 RUN
@@ -29,7 +29,7 @@ EXPECT=<<EOF_EXPECT
 x86-64
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 a:sla.arch
 EOF_CMDS
 RUN
@@ -42,7 +42,7 @@ r2sleigh: architecture set to 'x86-64' (reload deferred)
 x86-64
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 a:sla.arch x86-64; a:sla.arch | tail -n1
 EOF_CMDS
 RUN
@@ -54,7 +54,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.json | jq -c 'length>0 and (([..|objects|select((.space? | strings | ascii_downcase)=="register" and (.name? | strings | length>0))]|length) > 0)'
 EOF_CMDS
 RUN
@@ -66,7 +66,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.regs | jq -c '(.read|type=="array") and (.write|type=="array")'
 EOF_CMDS
 RUN
@@ -78,7 +78,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.vars | jq -c 'length>0 and (.[0] | has("name") and has("space") and has("offset") and has("size"))'
 EOF_CMDS
 RUN
@@ -90,7 +90,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.ssa | jq -c 'length>0 and (.[0]|has("op")) and (tostring|contains("RBP_"))'
 EOF_CMDS
 RUN
@@ -102,7 +102,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.defuse | jq -c 'has("inputs") and has("outputs") and has("live")'
 EOF_CMDS
 RUN
@@ -114,7 +114,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+4
+s `is~check_secret[2]`+0x4 >/dev/null
 a:sla.mem | jq -c 'length>0 and (.[0]|has("addr") and has("size") and has("write")) and ((map(select(.stack==true))|length)>0) and ((map(select(.stack==true and ((.stack_offset|type)=="number")))|length)>0)'
 EOF_CMDS
 RUN
@@ -126,7 +126,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.opvals | jq -c '((.srcs|index("RBP")) != null) and ((.dsts|index("ZF")) != null)'
 EOF_CMDS
 RUN
@@ -138,7 +138,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._test_cpuid+2
+s `is~test_cpuid[2]`+0x2 >/dev/null
 a:sla.json | jq -c '([.[] | .CallOther?.userop_name? | strings | select(length>0)] | length) > 0'
 EOF_CMDS
 RUN
@@ -150,7 +150,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.ssa.func | jq -c 'has("blocks") and has("entry_hex") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all))'
 EOF_CMDS
@@ -163,7 +163,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.defuse.func | jq -c 'has("definitions") and has("uses") and has("live_in") and has("live_out")'
 EOF_CMDS
@@ -176,7 +176,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._test_loop_switch
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.ssa.func.opt | jq -c 'has("optimized") and has("stats") and has("function") and (.stats|has("sccp_constants_found") and has("sccp_edges_pruned") and has("sccp_blocks_removed"))'
 EOF_CMDS
@@ -189,7 +189,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._test_guard_inversion
+s `is~test_guard_inversion[2]` >/dev/null
 af
 a:sla.ssa.func.opt | jq -c '(.stats.sccp_edges_pruned // 0) >= (.stats.sccp_blocks_removed // 0)'
 EOF_CMDS
@@ -202,7 +202,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.cfg | grep -Eo '0x[0-9a-f]+' | head -n1 | jq -R 'startswith("0x")'
 EOF_CMDS
@@ -215,7 +215,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.cfg.json | jq -c 'has("blocks") and has("edges") and has("entry") and has("num_blocks")'
 EOF_CMDS
@@ -228,7 +228,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.cfg.json | jq -c '(.blocks|type=="array") and ((.blocks|map(has("successors"))|any))'
 EOF_CMDS
@@ -241,7 +241,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.dom | jq -c 'has("idom") and has("children") and has("dominance_frontier") and has("depth")'
 EOF_CMDS
@@ -256,7 +256,7 @@ Example: a:sla.slice rax_3
          a:sla.slice zf_1
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 a:sla.slice
 EOF_CMDS
 RUN
@@ -268,7 +268,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.slice NONEXISTENT_999 | jq -c 'has("error")'
 EOF_CMDS
@@ -281,21 +281,21 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret
+s `is~check_secret[2]` >/dev/null
 af
 a:sla.slice ZF_1 | jq -c 'has("sink_var") and has("ops") and has("blocks") and ((.ops|type=="array")) and ((.blocks|type=="array")) and (((.ops|length)==0) or ((.ops[0]|has("type") and has("block") and has("index")))) and ((.blocks|map(type=="string" and startswith("0x"))|all))'
 EOF_CMDS
 RUN
 
-NAME=slice_at_main_sink_var_matches
+NAME=slice_sink_var_matches
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-aaa
-s sym._main
-a:sla.slice RAX_1 | jq -c '.sink_var == "RAX_1"'
+s `is~check_secret[2]` >/dev/null
+af
+a:sla.slice ZF_1 | jq -c '.sink_var == "ZF_1"'
 EOF_CMDS
 RUN

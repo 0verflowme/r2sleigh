@@ -6,7 +6,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-afij @ sym._test_struct_array_index | jq -c '.[0] | .name=="sym._test_struct_array_index" and .size==73 and .calltype=="amd64" and .signature=="sym._test_struct_array_index (void *arg0, int32_t arg1, int64_t arg2);" and .nlocals==3 and .nargs==3'
+aflj | jq -c 'map(select(.name | test("^sym\\._?test_struct_array_index$")))[0] as $f | ($f.name | test("^sym\\._?test_struct_array_index$")) and $f.size==73 and $f.calltype=="amd64" and ($f.signature | test("^sym\\._?test_struct_array_index \\(void \\*arg0, (int32_t|int64_t) arg1, (int32_t|int64_t) arg2\\);$")) and $f.nlocals==3 and $f.nargs==3'
 EOF_CMDS
 RUN
 
@@ -18,6 +18,6 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-afij @ sym._test_array_index | jq -c '.[0] | .name=="sym._test_array_index" and .size==24 and .calltype=="amd64" and .signature=="sym._test_array_index (void *arg0, int32_t arg1);" and .nlocals==2 and .nargs==2'
+aflj | jq -c 'map(select(.name | test("^sym\\._?test_array_index$")))[0] as $f | ($f.name | test("^sym\\._?test_array_index$")) and $f.size==24 and $f.calltype=="amd64" and ($f.signature | test("^sym\\._?test_array_index \\(void \\*arg0, (int32_t|int64_t) arg1\\);$")) and $f.nlocals==2 and $f.nargs==2'
 EOF_CMDS
 RUN

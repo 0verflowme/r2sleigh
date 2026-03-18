@@ -3,7 +3,7 @@
 //! These tests invoke radare2 with the r2sleigh plugin and validate output.
 //! Run with: `cargo test -p r2sleigh-e2e-tests`
 
-use e2e::{r2_at_func, r2_cmd_timeout, require_binary, vuln_test_binary};
+use e2e::{r2_cmd, r2_cmd_timeout, release_plugin_path, require_binary, vuln_test_binary};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
@@ -128,12 +128,12 @@ mod cli_run {
 
     #[test]
     fn plugin_sla_json_still_valid_after_refactor() {
-        if !Path::new("target/release/libr2sleigh_plugin.so").exists() {
+        if !Path::new(release_plugin_path()).exists() {
             eprintln!("Skipping: plugin not built");
             return;
         }
         setup();
-        let result = r2_at_func(vuln_test_binary(), "main", "a:sla.json");
+        let result = r2_cmd(vuln_test_binary(), "s entry0; a:sla.json");
         result.assert_ok();
         let parsed: Value = serde_json::from_str(result.stdout.trim()).expect("valid JSON");
         assert!(

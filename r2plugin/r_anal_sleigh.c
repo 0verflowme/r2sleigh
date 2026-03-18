@@ -962,6 +962,25 @@ static RAnalFunction *resolve_function_target_by_name(RAnal *anal, const char *t
 	return fcn;
 }
 
+static RAnalFunction *resolve_function_target(RCore *core, RAnal *anal, const char *target_arg) {
+	ut64 target_addr = 0;
+	RAnalFunction *fcn;
+
+	if (!core || !anal || !target_arg || !*target_arg) {
+		return NULL;
+	}
+
+	fcn = resolve_function_target_by_name (anal, target_arg);
+	if (fcn) {
+		return fcn;
+	}
+
+	if (!parse_sym_target_expr (core, target_arg, &target_addr)) {
+		return NULL;
+	}
+	return r_anal_get_fcn_in (anal, target_addr, R_ANAL_FCN_TYPE_ANY);
+}
+
 static char *build_sym_symbol_map_json(RCore *core) {
 	if (!core) {
 		return strdup ("{}");
@@ -4329,12 +4348,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		const char *target_arg = skip_cmd_spaces (cmd + 7);
 		RAnalFunction *fcn = NULL;
 		if (target_arg && *target_arg) {
-			ut64 target_addr = 0;
-			if (parse_sym_target_expr (core, target_arg, &target_addr)) {
-				fcn = r_anal_get_fcn_in (anal, target_addr, R_ANAL_FCN_TYPE_ANY);
-			} else {
-				fcn = resolve_function_target_by_name (anal, target_arg);
-			}
+			fcn = resolve_function_target (core, anal, target_arg);
 		} else {
 			fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
 		}

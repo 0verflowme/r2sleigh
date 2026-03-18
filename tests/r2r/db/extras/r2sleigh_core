@@ -16,7 +16,7 @@ EXPECT=<<EOF_EXPECT
 ["IntAdd","Copy","Store"]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+4
+s `is~check_secret[2]`+0x4 >/dev/null
 a:sla.json | jq -c 'map(keys[0])'
 EOF_CMDS
 RUN
@@ -28,7 +28,7 @@ EXPECT=<<EOF_EXPECT
 {"read":["EDI","RBP"],"write":[]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+4
+s `is~check_secret[2]`+0x4 >/dev/null
 a:sla.regs | jq -c '{read:(.read|sort),write:(.write|sort)}'
 EOF_CMDS
 RUN
@@ -40,7 +40,7 @@ EXPECT=<<EOF_EXPECT
 [{"type":"store","size":4,"memory_class":"stack","stack_base":"RBP","stack_offset":-8}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+4
+s `is~check_secret[2]`+0x4 >/dev/null
 a:sla.mem | jq -c 'map({type,size,memory_class,stack_base,stack_offset})'
 EOF_CMDS
 RUN
@@ -52,7 +52,7 @@ EXPECT=<<EOF_EXPECT
 {"space_counts":[{"space":"const","count":1},{"space":"register","count":2},{"space":"unique","count":2}],"reg_names":["EDI","RBP"]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+4
+s `is~check_secret[2]`+0x4 >/dev/null
 a:sla.vars | jq -c '{space_counts:(sort_by(.space)|group_by(.space)|map({space:.[0].space,count:length})), reg_names:(map(select(.space=="register")|.name)|sort)}'
 EOF_CMDS
 RUN
@@ -64,7 +64,7 @@ EXPECT=<<EOF_EXPECT
 ["IntAdd","Load","Copy","IntLess","IntSBorrow","IntSub","IntSLess","IntEqual","IntAnd","PopCount","IntAnd","IntEqual"]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.json | jq -c 'map(keys[0])'
 EOF_CMDS
 RUN
@@ -76,7 +76,7 @@ EXPECT=<<EOF_EXPECT
 {"read":["RBP"],"write":["CF","OF","PF","SF","ZF"]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.regs | jq -c '{read:(.read|sort),write:(.write|sort)}'
 EOF_CMDS
 RUN
@@ -88,7 +88,7 @@ EXPECT=<<EOF_EXPECT
 [{"type":"load","size":4,"memory_class":"stack","stack_base":"RBP","stack_offset":-8}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.mem | jq -c 'map({type,size,memory_class,stack_base,stack_offset})'
 EOF_CMDS
 RUN
@@ -100,7 +100,7 @@ EXPECT=<<EOF_EXPECT
 {"space_counts":[{"space":"const","count":4},{"space":"register","count":6},{"space":"unique","count":7}],"reg_names":["CF","OF","PF","RBP","SF","ZF"]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+7
+s `is~check_secret[2]`+0x7 >/dev/null
 a:sla.vars | jq -c '{space_counts:(sort_by(.space)|group_by(.space)|map({space:.[0].space,count:length})), reg_names:(map(select(.space=="register")|.name)|sort)}'
 EOF_CMDS
 RUN
@@ -112,7 +112,7 @@ EXPECT=<<EOF_EXPECT
 ["BoolNot","CBranch"]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0xe
+s `is~check_secret[2]`+0xe >/dev/null
 a:sla.json | jq -c 'map(keys[0])'
 EOF_CMDS
 RUN
@@ -124,7 +124,7 @@ EXPECT=<<EOF_EXPECT
 {"read":["ZF"],"write":[]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0xe
+s `is~check_secret[2]`+0xe >/dev/null
 a:sla.regs | jq -c '{read:(.read|sort),write:(.write|sort)}'
 EOF_CMDS
 RUN
@@ -136,7 +136,7 @@ EXPECT=<<EOF_EXPECT
 []
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0xe
+s `is~check_secret[2]`+0xe >/dev/null
 a:sla.mem | jq -c 'map({type,size,memory_class,stack_base,stack_offset})'
 EOF_CMDS
 RUN
@@ -148,7 +148,7 @@ EXPECT=<<EOF_EXPECT
 {"space_counts":[{"space":"register","count":1}],"reg_names":["ZF"]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0xe
+s `is~check_secret[2]`+0xe >/dev/null
 a:sla.vars | jq -c '{space_counts:(sort_by(.space)|group_by(.space)|map({space:.[0].space,count:length})), reg_names:(map(select(.space=="register")|.name)|sort)}'
 EOF_CMDS
 RUN
@@ -157,10 +157,10 @@ NAME=sla_json_copy_ops_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-["IntAdd","Load","Copy","IntZExt"]
+["IntAdd","Copy","Store"]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0x20
+s `is~check_secret[2]`+0x10 >/dev/null
 a:sla.json | jq -c 'map(keys[0])'
 EOF_CMDS
 RUN
@@ -169,10 +169,10 @@ NAME=sla_regs_copy_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"read":["EAX","RBP"],"write":["EAX","RAX"]}
+{"read":["RBP"],"write":[]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0x20
+s `is~check_secret[2]`+0x10 >/dev/null
 a:sla.regs | jq -c '{read:(.read|sort),write:(.write|sort)}'
 EOF_CMDS
 RUN
@@ -181,10 +181,10 @@ NAME=sla_mem_copy_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"type":"load","size":4,"memory_class":"stack","stack_base":"RBP","stack_offset":-4}]
+[{"type":"store","size":4,"memory_class":"stack","stack_base":"RBP","stack_offset":-4}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0x20
+s `is~check_secret[2]`+0x10 >/dev/null
 a:sla.mem | jq -c 'map({type,size,memory_class,stack_base,stack_offset})'
 EOF_CMDS
 RUN
@@ -193,10 +193,10 @@ NAME=sla_vars_copy_shape_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"space_counts":[{"space":"const","count":1},{"space":"register","count":3},{"space":"unique","count":2}],"reg_names":["EAX","RAX","RBP"]}
+{"space_counts":[{"space":"const","count":2},{"space":"register","count":1},{"space":"unique","count":2}],"reg_names":["RBP"]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s sym._check_secret+0x20
+s `is~check_secret[2]`+0x10 >/dev/null
 a:sla.vars | jq -c '{space_counts:(sort_by(.space)|group_by(.space)|map({space:.[0].space,count:length})), reg_names:(map(select(.space=="register")|.name)|sort)}'
 EOF_CMDS
 RUN
