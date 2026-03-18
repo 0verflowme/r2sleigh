@@ -2,11 +2,18 @@ NAME=decompiler_bool_carrier_chain_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-true
+int64_t sym.test_bool_carrier_chain(intN_t arg1, intN_t arg2)
+{
+    if (arg1 != arg2) {
+        return arg1;
+    } else {
+        return arg2;
+    }
+}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-a:sla.dec sym.test_bool_carrier_chain | jq -Rs '((split("\n")[0] | test("^int64_t .*test_bool_carrier_chain\\((int32_t|int64_t) arg1, (int32_t|int64_t) arg2\\)$"))) and contains("if (arg1 != arg2)") and contains("return arg1;") and contains("return arg2;") and (contains("&var_")|not) and (contains("rbp")|not) and (contains("rsp")|not) and (contains("*(")|not) and (contains("var_4h =")|not) and (contains("var_8h")|not)'
+a:sla.dec sym.test_bool_carrier_chain | python3 normalize_snapshot.py decompiler
 EOF_CMDS
 RUN
 
@@ -14,10 +21,24 @@ NAME=decompiler_complex_check_stable_header_and_local_prefix
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-true
+int64_t sym.complex_check(intN_t arg1, intN_t arg2)
+{
+    if (arg1 + arg2 != 64) {
+        var_4h = 0;
+        var_4h = 0;
+        return 0;
+    } else {
+        var_4h = 1;
+        if (var_14h != 14) {
+            return 1;
+        }
+        var_4h = 1;
+        return 1;
+    }
+}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.dec sym.complex_check | jq -Rs '((split("\n")[0] | test("^int64_t .*complex_check\\((int32_t|int64_t) arg1, (int32_t|int64_t) arg2\\)$"))) and contains("var_4h = 0;") and contains("var_4h = 1;") and contains("return 0;") and contains("return 1;") and (contains("{\n    }\n")|not)'
+a:sla.dec sym.complex_check | python3 normalize_snapshot.py decompiler
 EOF_CMDS
 RUN

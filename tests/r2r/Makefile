@@ -17,6 +17,7 @@ ensure-tools:
 	@command -v r2 >/dev/null || { echo "r2 not found in PATH"; exit 1; }
 	@command -v r2r >/dev/null || { echo "r2r not found in PATH"; exit 1; }
 	@command -v jq >/dev/null || { echo "jq not found in PATH"; exit 1; }
+	@command -v python3 >/dev/null || { echo "python3 not found in PATH"; exit 1; }
 
 build-bins:
 	cd ../e2e && \

@@ -4,7 +4,7 @@
 
 ## Project Summary
 
-`r2sleigh` is a Sleigh-to-r2il pipeline for radare2.
+`r2sleigh` is the Sleigh-backed analysis and decompiler pipeline for radare2.
 
 ```text
 .sla (Ghidra) --> libsla --> P-code --> r2il --> ESIL
@@ -16,15 +16,48 @@
                                           +--> Plugin / CLI export surfaces
 ```
 
-The repository is no longer just "P-code to ESIL". A lot of current work lands in SSA, decompilation, symbolic execution, type inference, and radare2 integration layers.
+The repository is no longer just "P-code to ESIL". A lot of current work lands in SSA, symbolic execution, type inference, decompilation, and radare2 integration layers.
 
-## Read This First
+Treat this workspace and `../radare2` as one analysis system. `r2sleigh` is part of the radare2 analysis/decompiler stack, not a separate sidecar that should paper over missing library seams at the end of the pipeline.
 
-1. Default to `tests/r2r` for new plugin regressions and command-output checks.
-2. Do not add new snapshot-style plugin tests to `tests/e2e/integration_tests.rs` unless the case genuinely cannot be expressed in `r2r`.
-3. Build and run commands in this repo have drifted over time. Prefer the commands in this file over older examples.
-4. File paths below use the current `src/` layout. Older references like `r2plugin/lib.rs` are stale.
-5. Architecture feature support differs by crate. Check the relevant `Cargo.toml` before documenting or wiring a new arch.
+The opening sections are the operational rules. Later sections are reference material.
+
+## Fast Path Rules
+
+1. Find the canonical owner of a fact before editing code. Cross-crate cooperation is expected; duplicated policy is not.
+2. Treat this workspace and `../radare2` as one component boundary. If the right fix belongs in radare2, implement it there instead of patching around it in Rust.
+3. `r2plugin` is orchestration/FFI glue only. Do not fix missing semantics by reparsing command output or merging policy there.
+4. For decompiler/type context, do not add new plugin-side parsing of `afcfj`, `afvj`, or `tsj`. If the seam is wrong, fix it in `../radare2` and keep the plugin on the typed collector path.
+5. `r2types::FunctionTypeFacts` is the only canonical type/layout/signature contract on the decompiler path.
+6. Default to `tests/r2r` for new plugin regressions and command-output checks. Do not add new snapshot-style plugin tests to `tests/e2e/integration_tests.rs` unless `r2r` genuinely cannot express the case.
+7. Build and run commands in this repo have drifted over time. Prefer the commands in this file over older examples.
+8. File paths below use the current `src/` layout. Older references like `r2plugin/lib.rs` are stale.
+9. Architecture feature support differs by crate. Check the relevant `Cargo.toml` before documenting or wiring a new arch.
+10. When the current architecture blocks a clean design, rewrite the seam or crate API instead of adding end-stage hacks. Large refactors, FFI changes, and cross-repo redesigns are acceptable when they reduce long-term complexity.
+
+## Task-Start Protocol
+
+For any non-trivial change, follow this order:
+
+1. Identify the user-visible behavior or broken invariant.
+2. Decide which layer should own the fix: `../radare2`, lifting, SSA, symex, types, decompiler, export, CLI, or plugin glue.
+3. Look for an existing typed contract to extend before adding new JSON blobs, stringly maps, or parallel wrapper types.
+4. Push facts upstream to the canonical owner instead of reconstructing them downstream.
+5. Add the smallest deterministic test at the layer users actually exercise.
+6. If the seam crosses into `../radare2`, validate both repos before claiming the fix is complete.
+
+## Change Placement Guide
+
+Use this as the default "where should this logic live?" map:
+
+- `../radare2`: core analysis facts, typed collectors, and library seams that should exist for radare2 consumers generally.
+- `crates/r2sleigh-lift`: Sleigh/P-code lifting, disassembly, register naming, text formatting, and ESIL formatting.
+- `crates/r2ssa`: SSA construction, phi handling, dominators, def-use, determinism, and SSA-local transforms.
+- `crates/r2sym`: symbolic execution, taint propagation, summaries, path exploration, and solver-facing symbolic policy.
+- `crates/r2types`: signature parsing, type inference, layout inference, external context normalization, and canonical merged type facts.
+- `crates/r2dec`: lowering, semantic interpretation, structuring, folding, and rendering.
+- `crates/r2sleigh-export` and `crates/r2sleigh-cli`: shared export plumbing and CLI surface behavior.
+- `r2plugin`: command dispatch, FFI, serialization, and radare2 integration glue only.
 
 ## Workspace Layout
 
@@ -43,6 +76,76 @@ tests/
 ├── r2r/              # Preferred snapshot and command regression suite
 └── e2e/              # Rust semantic/FFI/benchmark suite and fixture binaries
 ```
+
+## Whole-System Architecture Stance
+
+`r2il`, `r2sleigh-lift`, `r2ssa`, `r2sym`, `r2types`, `r2dec`, `r2sleigh-export`, `r2plugin`, and `../radare2` should be treated as one radare2 analysis/decompiler subsystem with explicit internal ownership.
+
+- Optimize for clean typed seams and correct ownership, not for preserving historical plugin boundaries.
+- `r2plugin` is an integration surface, not the place to recover missing semantics from downstream command output.
+- If a clean solution requires moving logic across crates or across the `../radare2` boundary, do it at the owning layer.
+- Prefer principled rewrites over incremental "fix it later in the plugin/decompiler/export path" patches.
+- Cross-component cooperation is required; cross-component policy duplication is not.
+
+## Ownership Boundaries
+
+These boundaries are the main architectural guardrail. The crates should work together as one pipeline, but each fact still needs one canonical owner. Most recent churn happened when multiple crates tried to "help" each other by owning the same policy.
+
+- `r2ssa` owns SSA construction, decompile-safe SSA preparation, determinism, and SSA-local transforms.
+- `r2sym` owns symbolic state modeling, taint propagation, summaries, path exploration, and solver-facing symbolic policy.
+- `r2types` owns signature parsing/normalization, type inference, layout inference, external context parsing, field lookup policy, and canonical merged type facts.
+- `r2dec` owns decompiler semantic facts, lowering, structuring, and rendering only.
+- `r2plugin` owns orchestration, JSON/FFI, command dispatch, and radare2 integration glue only.
+- `../radare2` owns core analysis facts, typed collectors, and library seams that should exist for radare2 consumers generally, not just this workspace.
+
+Do not put the same policy in two crates "temporarily". That temporary state lasted a long time and created most of the recent regressions.
+
+When multiple layers need the same fact, push that fact toward its canonical owner and expose it through a typed contract instead of rebuilding it independently in each crate.
+
+## Typed `radare2` Context Seam
+
+The plugin used to pull decompiler/type context by shelling out to radare2 commands and re-parsing JSON from `afcfj`, `afvj`, and `tsj`. That was convenient, but it created duplicate ownership and brittle parsing policy in the plugin.
+
+Current rule:
+
+- For decompiler/type analysis, use the typed function/base-type collector API in `../radare2`.
+- Keep user-visible commands like `afcfj`, `afvj`, and `tsj`, but do not use them as an internal plugin data source.
+- If the plugin lacks a typed field from radare2, add it to the `r_anal` API instead of layering more command parsing into `r2plugin`.
+- Prefer one consolidated external-context payload across the C/Rust FFI boundary rather than multiple partially overlapping JSON blobs.
+- Treat `../radare2` as available for coordinated changes. If the right fix needs new FFI, collector APIs, or analysis metadata, add them there and wire them through cleanly.
+
+This seam exists to keep `r2plugin` orchestration-only and to keep type/signature/layout policy out of the plugin.
+
+## Canonical Type Contract
+
+`r2types::FunctionTypeFacts` is the only canonical type/layout/signature artifact for the decompiler path.
+
+- `r2types` may consume local inference artifacts, radare2 external context, and decompiler-emitted semantic field-access facts.
+- `r2dec` should consume `FunctionTypeFacts` only. Do not add back public `TypeInference`, duplicate `FunctionType`, or decompiler-side external-signature / stack-var setters.
+- `r2plugin` may gather inputs and serialize outputs, but it must not own signature merge policy, external/local struct reconciliation, or layout query policy.
+
+If a caller needs more type information, extend `FunctionTypeFacts` or the `r2types` query contract instead of creating a second type wrapper layer elsewhere.
+
+## Rewrite Bias
+
+When the current architecture blocks correctness, composability, or maintainability:
+
+- Prefer rewriting the seam, contract, or owning crate over adding compensating logic at the end of the pipeline.
+- It is acceptable to redesign APIs, move logic across crates, reshape FFI, or perform cross-repo refactors involving `../radare2`.
+- Do not preserve a bad abstraction just because it already exists.
+- The goal is a better end-to-end radare2 component, not the smallest possible diff.
+- Avoid plugin-side or decompiler-side "final fixups" that only exist to hide missing upstream semantics.
+
+## Rust Typing Rules For Rewrites
+
+Recent work went better once ownership seams stopped relying on stringly maps and implicit conventions.
+
+- Prefer enums, newtypes, named structs, and small typed input structs over raw `HashMap<String, ...>` plus comments.
+- Use traits at crate seams where the contract matters, for example layout queries or semantic fact access.
+- Use `BTreeMap` / `BTreeSet` whenever iteration order can affect decompiler output, local naming, snapshots, or SSA determinism.
+- Use `From` / `TryFrom` for typed boundary conversions instead of ad hoc parsing spread across crates.
+- Keep JSON-only types at the JSON boundary. Internal analysis code should use typed Rust models first and serialize late.
+- Avoid boolean mode flags when there are more than two semantic states; use enums instead.
 
 ## Core Types and Entry Points
 
@@ -102,6 +205,7 @@ Notes:
 - `cargo run --features x86 -- ...` is stale at the workspace root; use `-p r2sleigh-cli --bin r2sleigh`.
 - `cargo install-plugin` is defined in `.cargo/config.toml` and wraps `r2plugin/src/bin/r2sleigh-plugin-install.rs`.
 - x86/x86-64 disassembly still needs at least 16 bytes of input; pad with zeros.
+- If you touch the typed radare2 seam in `r2plugin/r_anal_sleigh.c`, plan to build and test `../radare2` too. Fix the library seam there instead of adding more plugin-side command parsing.
 
 ## Architecture Support
 
@@ -134,7 +238,8 @@ r2 -qc 'a:sla.arch x86-64; a:sla.arch' /bin/ls
 Use `tests/r2r` for new regressions involving:
 
 - plugin commands such as `a:sla.*`, `a:sym.*`, `pdd`, `pdD`
-- JSON/text/ESIL/CFG/SSA/def-use/type payload shape
+- stable JSON/text/ESIL outputs that are worth exact normalized snapshots
+- CFG/SSA/def-use/type payload shape when structural assertions are the better fit
 - command UX, help text, error text, and normalized decompiler output
 - radare2 integration behavior that is best expressed as command snapshots
 
@@ -166,6 +271,36 @@ Keep Rust E2E tests for:
 4. Run `make -C tests/r2r run`.
 5. If the change also affects CLI semantics, FFI, or benchmark-style behavior, run `cargo e2e-test` or a focused `tests/e2e` module.
 
+### Required validation for ownership / seam changes
+
+If you touch `r2ssa`, `r2sym`, `r2types`, `r2dec`, `r2plugin`, or the typed `../radare2` context seam, the minimum validation bar is:
+
+```bash
+cargo test -p r2ssa
+cargo test -p r2sym
+cargo test -p r2types
+cargo test -p r2dec
+cargo test -p r2sleigh-plugin
+cargo clippy -p r2ssa --all-targets -- -D warnings
+cargo clippy -p r2sym --all-targets -- -D warnings
+cargo clippy -p r2types --all-targets -- -D warnings
+cargo clippy -p r2dec --all-targets -- -D warnings
+cargo clippy -p r2sleigh-plugin --features all-archs -- -D warnings
+make -C r2plugin RUST_FEATURES=all-archs install
+make -C tests/r2r run
+```
+
+During local iteration, a focused subset is fine. Do not mark an ownership or seam change complete until the full relevant validation bar is green.
+
+If you also changed `../radare2`, add:
+
+```bash
+make -C ../radare2 -j4
+cd ../radare2/test && r2r -L -o results.json db/cmd/cmd_af db/json/json1
+```
+
+Do not claim the seam is fixed without both sides being green.
+
 ### Where to put new `r2r` cases
 
 `tests/r2r/db/extras/r2sleigh_core`
@@ -182,8 +317,9 @@ Keep Rust E2E tests for:
 
 ### `r2r` test authoring tips
 
-- Normalize output with `jq -c`, `grep`, `head`, `tail`, or boolean expressions.
-- Prefer structural assertions over brittle full-output matches when formatting is likely to evolve.
+- Prefer exact full-output snapshots for stable user-facing surfaces after normalization.
+- Use `tests/r2r/normalize_snapshot.py` or `jq -S -c` to canonicalize stable output before snapshotting.
+- Prefer structural assertions only when ordering, naming, or formatting is expected to evolve, especially for SSA, symex, taint, and large CFG/DOM payloads.
 - Keep these args unless you have a reason not to:
 
 ```text
@@ -196,15 +332,15 @@ Keep Rust E2E tests for:
 Minimal `r2r` example:
 
 ```text
-NAME=instruction_json_nonempty
-FILE=bins/vuln_test
+NAME=instruction_regs_snapshot
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-true
+{"read":["EDI","RBP"],"write":[]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s 0x401281
-a:sla.json | jq -c 'length>0'
+s `is~check_secret[2]`+0x4 >/dev/null
+a:sla.regs | python3 normalize_snapshot.py regs
 EOF_CMDS
 RUN
 ```
@@ -246,6 +382,15 @@ When you add a fixture function:
 1. Add lowering in `crates/r2dec/src/analysis/lower.rs` if needed.
 2. Add fold/codegen support under `crates/r2dec/src/fold/`.
 3. Test through `a:sla.dec` snapshots and add direct Rust tests when local folding behavior is easier to assert there.
+
+### Change the type / decompiler seam
+
+1. Start by deciding which crate should own the policy. If the answer is "more than one", the design is wrong.
+2. Extend `r2types` contracts first when the change affects signatures, layouts, or external context.
+3. Keep `r2dec` on semantic facts and rendering. If decompiler code needs to rediscover type/layout policy from rendered expressions, stop and move that logic upstream.
+4. If the plugin needs more context from radare2, extend the typed `r_anal` seam in `../radare2` instead of parsing more command JSON.
+5. If the existing seam is fundamentally wrong, redesign it across both repos instead of layering more adapters on top.
+6. Add or update `r2r` coverage before broad snapshot churn. The right fix is usually a stronger semantic assertion, not a bigger snapshot.
 
 ### Add or change a plugin command
 
@@ -337,10 +482,14 @@ When writing direct decompiler tests, build `FunctionSSABlock` values directly r
 | `crates/r2ssa/src/defuse.rs` | changing def-use analysis |
 | `crates/r2sym/src/` | changing symbolic execution or taint internals |
 | `crates/r2types/src/` | changing type inference |
+| `crates/r2types/src/context.rs` | changing typed external context imported from radare2 |
 | `crates/r2dec/src/fold/` | changing decompiler folding and lowering |
 | `crates/r2dec/src/codegen.rs` | changing C output formatting |
 | `r2plugin/src/lib.rs` | changing plugin-side Rust logic and JSON payloads |
 | `r2plugin/r_anal_sleigh.c` | changing radare2 callbacks, command help, dispatch |
+| `../radare2/libr/include/r_anal.h` | changing the typed function/base-type collector API used by the plugin |
+| `../radare2/libr/anal/fcn.c` | implementing typed function-context collection |
+| `../radare2/libr/anal/type.c` | implementing typed base-type collection / parity with `tsj` |
 | `tests/r2r/Makefile` | changing r2r harness setup or fixture linking |
 | `tests/r2r/db/extras/` | adding or updating snapshot regressions |
 | `tests/e2e/README.md` | checking when to use Rust E2E vs `r2r` |
@@ -359,6 +508,8 @@ When writing direct decompiler tests, build `FunctionSSABlock` values directly r
 9. Use `r2dec/address.rs::parse_address_from_var_name()` for consistent `const:` / `ram:` parsing.
 10. Taint summaries intentionally filter noisy stack/frame-pointer labels.
 11. If you add a new fixture binary, remember both the build step and the `tests/r2r/bins/` symlink step.
+12. If output stability matters, assume hash-order nondeterminism is a bug. Use deterministic ordering in SSA facts, decompiler facts, and local naming.
+13. On the decompiler/type path, tests may now see `r2types::CTypeLike` rather than a local `r2dec` type wrapper. Do not reintroduce `r2dec` type ownership just to make an old test compile.
 
 ## Useful References
 
