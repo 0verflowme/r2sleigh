@@ -59,8 +59,9 @@ install-plugin:
 
 run: ensure-tools link-bins
 	@rm -rf "$(R2R_TMPDIR)"
-	@mkdir -p "$(R2R_TMPDIR)" "$(R2R_PLUGIN_DIR)"
+	@mkdir -p "$(R2R_TMPDIR)" "$(R2R_PLUGIN_DIR)" "$(R2R_TMPDIR)/xdg-data"
 	@$(MAKE) install-plugin R2R_PLUGIN_DIR="$(R2R_PLUGIN_DIR)"
 	TMPDIR="$(R2R_TMPDIR)" TMP="$(R2R_TMPDIR)" TEMP="$(R2R_TMPDIR)" \
-		R2_USER_PLUGINS="$(abspath $(R2R_PLUGIN_DIR))" \
+		XDG_DATA_HOME="$(abspath $(R2R_TMPDIR)/xdg-data)" \
+		R2_LIBR_PLUGINS="$(abspath $(R2R_PLUGIN_DIR))" \
 		r2r -t $(R2R_TIMEOUT) -j $(R2R_JOBS) -L db/extras

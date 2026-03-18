@@ -26,7 +26,7 @@ ifeq ($(UNAME),Darwin)
 else
   RUST_LIB_EXT = so
   PLUGIN_EXT = so
-  LDFLAGS_OS = -Wl,-rpath,'$$ORIGIN'
+  LDFLAGS_OS = -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,'$$ORIGIN/$(RUST_RUNTIME_SUBDIR)'
 endif
 
 # radare2 configuration
