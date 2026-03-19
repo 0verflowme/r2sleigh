@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use r2ssa::{SSABlock, SSAOp, SSAVar};
 
 use crate::context::{
-    ExternalStackVarSpec, ParsedExternalContext, apply_main_signature_override, is_c_main_function,
-    is_generic_arg_name,
+    ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, ParsedExternalContext,
+    StackSlotKey, apply_main_signature_override, is_c_main_function, is_generic_arg_name,
 };
 use crate::convert::CTypeLike;
 use crate::external::{
@@ -207,6 +207,7 @@ struct VarTypeCandidateContext<'a> {
     current_context_maps: &'a SignatureContextMaps,
     merged_signature: Option<&'a FunctionSignatureSpec>,
     slot_type_overrides: &'a HashMap<usize, String>,
+    stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     existing_types: &'a HashMap<String, String>,
     ptr_bits: u32,
@@ -259,6 +260,7 @@ pub fn build_type_writeback_analysis(
         &mut local_structs.struct_decls,
         &mut local_structs.slot_type_overrides,
         &mut local_structs.slot_field_profiles,
+        input.ptr_bits,
     );
 
     let struct_decls = dedup_struct_decls(
@@ -285,6 +287,7 @@ pub fn build_type_writeback_analysis(
         merged_signature: merged_signature.clone(),
         known_function_signatures: input.parsed_context.known_function_signatures.clone(),
         register_params: input.parsed_context.register_params.clone(),
+        stack_slots: input.parsed_context.stack_slots.clone(),
         external_stack_vars: input.parsed_context.external_stack_vars.clone(),
         external_type_db: type_db,
         slot_type_overrides: local_structs.slot_type_overrides.clone(),
@@ -295,12 +298,13 @@ pub fn build_type_writeback_analysis(
     .build();
 
     let existing_types =
-        parse_existing_var_types_from_specs(&input.parsed_context.external_stack_vars);
+        parse_existing_var_types_from_specs(&input.parsed_context.stack_slots, input.ptr_bits);
     let is_main_signature = is_c_main_function(input.function_name);
     let var_type_ctx = VarTypeCandidateContext {
         current_context_maps: &current_context_maps,
         merged_signature: merged_signature.as_ref(),
         slot_type_overrides: &local_structs.slot_type_overrides,
+        stack_slots: &input.parsed_context.stack_slots,
         external_stack_vars: &input.parsed_context.external_stack_vars,
         existing_types: &existing_types,
         ptr_bits: input.ptr_bits,
@@ -311,6 +315,7 @@ pub fn build_type_writeback_analysis(
     let var_rename_candidates = build_var_rename_candidates(
         input.recovered_vars,
         &current_context_maps.param_names,
+        &input.parsed_context.stack_slots,
         &input.parsed_context.external_stack_vars,
     );
     let global_type_links = score_global_type_links(
@@ -521,6 +526,39 @@ fn collect_recovered_arg_types(
     out
 }
 
+fn stack_base_for_recovered_var_kind(kind: &str) -> Option<ExternalStackBase> {
+    match kind {
+        "b" => Some(ExternalStackBase::FramePointer),
+        "s" => Some(ExternalStackBase::StackPointer),
+        _ => None,
+    }
+}
+
+fn stack_slot_key_for_recovered_var(var: &RecoveredVariable) -> Option<StackSlotKey> {
+    Some(StackSlotKey {
+        base: stack_base_for_recovered_var_kind(&var.kind)?,
+        offset: var.delta,
+    })
+}
+
+fn slot_role_is_hidden(role: ExternalStackSlotRole) -> bool {
+    matches!(
+        role,
+        ExternalStackSlotRole::ParamHome
+            | ExternalStackSlotRole::SavedReg
+            | ExternalStackSlotRole::SavedFp
+    )
+}
+
+fn slot_role_allows_external_local_identity(role: ExternalStackSlotRole) -> bool {
+    matches!(
+        role,
+        ExternalStackSlotRole::Local
+            | ExternalStackSlotRole::StackArg
+            | ExternalStackSlotRole::Unknown
+    )
+}
+
 fn build_var_type_candidates(
     vars: &[RecoveredVariable],
     ctx: &VarTypeCandidateContext<'_>,
@@ -528,6 +566,15 @@ fn build_var_type_candidates(
 ) -> Vec<VarTypeCandidate> {
     let mut out = Vec::with_capacity(vars.len());
     for var in vars {
+        let slot_key = stack_slot_key_for_recovered_var(var);
+        let slot_spec = slot_key
+            .as_ref()
+            .and_then(|key| ctx.stack_slots.get(key))
+            .or_else(|| ctx.external_stack_vars.get(&var.delta));
+        if slot_spec.is_some_and(|spec| slot_role_is_hidden(spec.role)) {
+            continue;
+        }
+
         let mut source = WritebackSource::LocalInferred;
         let mut confidence = if var.var_type.contains('*') {
             92
@@ -593,9 +640,9 @@ fn build_var_type_candidates(
             }
         }
 
-        if (var.kind == "b" || var.kind == "s")
-            && let Some(ext) = ctx.external_stack_vars.get(&var.delta)
+        if let Some(ext) = slot_spec
             && let Some(ext_ty) = ext.ty.as_ref()
+            && slot_role_allows_external_local_identity(ext.role)
         {
             let ext_ty_str = render_signature_type(ext_ty, ctx.ptr_bits);
             if !is_generic_type_string(&ext_ty_str) && is_generic_type_string(&chosen_type) {
@@ -626,17 +673,24 @@ fn build_var_type_candidates(
 fn build_var_rename_candidates(
     vars: &[RecoveredVariable],
     param_names: &HashMap<usize, String>,
+    stack_slots: &BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     external_stack_vars: &HashMap<i64, ExternalStackVarSpec>,
 ) -> Vec<VarRenameCandidate> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
 
     for var in vars {
-        if (var.kind == "b" || var.kind == "s")
-            && let Some(ext) = external_stack_vars.get(&var.delta)
+        let slot_key = stack_slot_key_for_recovered_var(var);
+        let slot_spec = slot_key
+            .as_ref()
+            .and_then(|key| stack_slots.get(key))
+            .or_else(|| external_stack_vars.get(&var.delta));
+
+        if let Some(ext) = slot_spec
             && ext.name != var.name
             && is_low_quality_stack_name(&var.name)
             && !is_low_quality_stack_name(&ext.name)
+            && slot_role_allows_external_local_identity(ext.role)
         {
             let target_name = sanitize_c_identifier(&ext.name).unwrap_or_else(|| ext.name.clone());
             let edge = format!("{}->{target_name}", var.name);
@@ -647,6 +701,25 @@ fn build_var_rename_candidates(
                     confidence: 94,
                     source: WritebackSource::ExternalTypeDb,
                     evidence: vec![WritebackEvidence::ExternalStackName],
+                });
+            }
+        }
+
+        if let Some(ext) = slot_spec
+            && matches!(ext.role, ExternalStackSlotRole::StackArg)
+            && let Some(param_name) = ext.param_name.as_ref()
+            && is_low_quality_stack_name(&var.name)
+        {
+            let target_name =
+                sanitize_c_identifier(param_name).unwrap_or_else(|| param_name.clone());
+            let edge = format!("{}->{target_name}", var.name);
+            if !target_name.is_empty() && target_name != var.name && seen.insert(edge) {
+                out.push(VarRenameCandidate {
+                    name: var.name.clone(),
+                    target_name,
+                    confidence: 95,
+                    source: WritebackSource::SignatureRegistry,
+                    evidence: vec![WritebackEvidence::ExternalParamName],
                 });
             }
         }
@@ -778,6 +851,25 @@ fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
     }
 }
 
+fn signature_param_allows_local_struct_override(
+    param: Option<&FunctionParamSpec>,
+    ptr_bits: u32,
+) -> bool {
+    let Some(param) = param else {
+        return true;
+    };
+
+    if is_generic_signature_type(param.ty.as_ref()) {
+        return true;
+    }
+
+    is_generic_arg_name(&param.name)
+        && matches!(
+            param.ty.as_ref(),
+            Some(CTypeLike::Int { bits, .. }) if *bits == ptr_bits
+        )
+}
+
 fn merge_slot_type_overrides_into_signature(
     mut signature: Option<FunctionSignatureSpec>,
     slot_type_overrides: &HashMap<usize, String>,
@@ -802,7 +894,7 @@ fn merge_slot_type_overrides_into_signature(
             continue;
         };
         let param = &mut sig.params[*slot];
-        if is_generic_signature_type(param.ty.as_ref()) {
+        if signature_param_allows_local_struct_override(Some(param), ptr_bits) {
             param.ty = Some(parsed);
         }
     }
@@ -813,19 +905,18 @@ fn merge_slot_type_overrides_into_signature(
 fn signature_param_blocks_local_struct_override(
     signature: &Option<FunctionSignatureSpec>,
     slot: usize,
+    ptr_bits: u32,
 ) -> bool {
-    let Some(ty) = signature
-        .as_ref()
-        .and_then(|sig| sig.params.get(slot))
-        .and_then(|param| param.ty.as_ref())
-    else {
+    let Some(param) = signature.as_ref().and_then(|sig| sig.params.get(slot)) else {
         return false;
     };
-
-    if matches!(ty, CTypeLike::Unknown | CTypeLike::Void) {
+    if signature_param_allows_local_struct_override(Some(param), ptr_bits) {
         return false;
     }
 
+    let Some(ty) = param.ty.as_ref() else {
+        return false;
+    };
     match ty {
         CTypeLike::Pointer(inner) => !matches!(
             inner.as_ref(),
@@ -840,11 +931,14 @@ fn prune_conflicting_local_struct_overrides(
     struct_decls: &mut Vec<StructDeclCandidate>,
     slot_type_overrides: &mut HashMap<usize, String>,
     slot_field_profiles: &mut HashMap<usize, BTreeMap<u64, String>>,
+    ptr_bits: u32,
 ) {
     let blocked_slots = slot_type_overrides
         .keys()
         .copied()
-        .filter(|slot| signature_param_blocks_local_struct_override(merged_signature, *slot))
+        .filter(|slot| {
+            signature_param_blocks_local_struct_override(merged_signature, *slot, ptr_bits)
+        })
         .collect::<Vec<_>>();
     if blocked_slots.is_empty() {
         return;
@@ -910,40 +1004,65 @@ fn collect_external_struct_candidates_from_db(
 fn merge_local_structs_into_type_db(db: &mut ExternalTypeDb, struct_decls: &[StructDeclCandidate]) {
     for decl in struct_decls {
         let key = decl.name.to_ascii_lowercase();
-        db.structs.entry(key).or_insert_with(|| {
-            let mut fields = BTreeMap::new();
-            for field in &decl.fields {
-                fields.insert(
-                    field.offset,
-                    ExternalField {
-                        name: field.name.clone(),
-                        offset: field.offset,
-                        ty: Some(field.field_type.clone()),
-                    },
-                );
+        let mut fields = BTreeMap::new();
+        for field in &decl.fields {
+            fields.insert(
+                field.offset,
+                ExternalField {
+                    name: field.name.clone(),
+                    offset: field.offset,
+                    ty: Some(field.field_type.clone()),
+                },
+            );
+        }
+        let candidate = ExternalStruct {
+            name: decl.name.clone(),
+            fields,
+        };
+        match db.structs.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
             }
-            ExternalStruct {
-                name: decl.name.clone(),
-                fields,
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if decl.source == StructDeclSource::LocalInferred
+                    && is_generated_local_struct_name(&decl.name)
+                {
+                    entry.insert(candidate);
+                }
             }
-        });
+        }
     }
 }
 
 fn dedup_struct_decls(mut decls: Vec<StructDeclCandidate>) -> Vec<StructDeclCandidate> {
-    let mut seen = HashSet::new();
-    let mut merged = Vec::new();
     decls.sort_by(|a, b| {
         a.name
             .to_ascii_lowercase()
             .cmp(&b.name.to_ascii_lowercase())
     });
+    let mut merged: Vec<StructDeclCandidate> = Vec::new();
     for decl in decls {
-        if seen.insert(decl.name.to_ascii_lowercase()) {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.name.eq_ignore_ascii_case(&decl.name))
+        {
+            if should_replace_struct_decl(existing, &decl) {
+                *existing = decl;
+            }
+        } else {
             merged.push(decl);
         }
     }
     merged
+}
+
+fn should_replace_struct_decl(
+    existing: &StructDeclCandidate,
+    candidate: &StructDeclCandidate,
+) -> bool {
+    candidate.source == StructDeclSource::LocalInferred
+        && is_generated_local_struct_name(&candidate.name)
+        && existing.name.eq_ignore_ascii_case(&candidate.name)
 }
 
 fn struct_fields_signature(fields: &[StructFieldCandidate]) -> Vec<(u64, String)> {
@@ -1480,12 +1599,17 @@ struct InferredGlobalFieldEvidence {
 }
 
 fn parse_existing_var_types_from_specs(
-    stack_vars: &HashMap<i64, ExternalStackVarSpec>,
+    stack_vars: &BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    ptr_bits: u32,
 ) -> HashMap<String, String> {
     stack_vars
         .values()
+        .filter(|var| slot_role_allows_external_local_identity(var.role))
         .filter_map(|var| {
-            let ty = var.ty.as_ref().map(|ty| render_signature_type(ty, 64))?;
+            let ty = var
+                .ty
+                .as_ref()
+                .map(|ty| render_signature_type(ty, ptr_bits))?;
             Some((var.name.clone(), normalize_external_type_name(&ty)))
         })
         .collect()
@@ -1682,6 +1806,13 @@ fn is_opaque_placeholder_type_name(name: &str) -> bool {
         .trim_start_matches("union ")
         .trim_start_matches("enum ");
     stripped.starts_with("anon_") || stripped.starts_with("type_0x") || lower.contains(" type_0x")
+}
+
+fn is_generated_local_struct_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower
+        .trim_start_matches("struct ")
+        .starts_with("sla_struct_")
 }
 
 fn is_unmaterialized_aggregate_name(name: &str) -> bool {
@@ -1982,16 +2113,27 @@ mod tests {
     #[test]
     fn stack_var_preference_renames_and_types_generic_stack_slots() {
         let mut parsed_context = ParsedExternalContext::default();
-        parsed_context.external_stack_vars.insert(
-            -0x10,
-            ExternalStackVarSpec {
-                name: "count".to_string(),
-                ty: Some(CTypeLike::Int {
-                    bits: 32,
-                    signedness: Signedness::Signed,
-                }),
-                base: Some("bp".to_string()),
+        let spec = ExternalStackVarSpec {
+            name: "count".to_string(),
+            ty: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            base: ExternalStackBase::FramePointer,
+            role: ExternalStackSlotRole::Local,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
+        };
+        parsed_context
+            .external_stack_vars
+            .insert(-0x10, spec.clone());
+        parsed_context.stack_slots.insert(
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -0x10,
             },
+            spec,
         );
         let vars = [RecoveredVariable {
             name: "var_10h".to_string(),
@@ -2022,6 +2164,69 @@ mod tests {
         });
         assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
         assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
+    }
+
+    #[test]
+    fn param_home_slots_do_not_surface_as_visible_local_writeback_candidates() {
+        let mut parsed_context = ParsedExternalContext::default();
+        let spec = ExternalStackVarSpec {
+            name: "arr_home".to_string(),
+            ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
+            base: ExternalStackBase::FramePointer,
+            role: ExternalStackSlotRole::ParamHome,
+            param_index: Some(0),
+            param_name: Some("arr".to_string()),
+            source_reg: Some("rdi".to_string()),
+        };
+        parsed_context
+            .external_stack_vars
+            .insert(0x10, spec.clone());
+        parsed_context.stack_slots.insert(
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: 0x10,
+            },
+            spec,
+        );
+
+        let vars = [RecoveredVariable {
+            name: "var_10h".to_string(),
+            kind: "b".to_string(),
+            delta: 0x10,
+            var_type: "void *".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.f",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.f".to_string(),
+                signature: "void sym.f ()".to_string(),
+                ret_type: "void".to_string(),
+                params: Vec::new(),
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert!(
+            analysis.plan.var_type_candidates.is_empty(),
+            "param-home slots should not emit visible local type candidates: {:?}",
+            analysis.plan.var_type_candidates
+        );
+        assert!(
+            analysis.plan.var_rename_candidates.is_empty(),
+            "param-home slots should not emit visible local rename candidates: {:?}",
+            analysis.plan.var_rename_candidates
+        );
     }
 
     #[test]
@@ -2110,6 +2315,247 @@ mod tests {
                 .get(&0)
                 .map(String::as_str),
             Some("struct node *")
+        );
+    }
+
+    #[test]
+    fn local_generated_struct_replaces_stale_generated_external_layout() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.external_type_db.structs.insert(
+            "sla_struct_420703e08f70f00e".to_string(),
+            ExternalStruct {
+                name: "sla_struct_420703e08f70f00e".to_string(),
+                fields: BTreeMap::from([
+                    (
+                        0,
+                        ExternalField {
+                            name: "_pad_0".to_string(),
+                            offset: 0,
+                            ty: Some("uint8_t".to_string()),
+                        },
+                    ),
+                    (
+                        4,
+                        ExternalField {
+                            name: "f_8".to_string(),
+                            offset: 4,
+                            ty: Some("int32_t".to_string()),
+                        },
+                    ),
+                    (
+                        8,
+                        ExternalField {
+                            name: "_pad_c".to_string(),
+                            offset: 8,
+                            ty: Some("uint8_t".to_string()),
+                        },
+                    ),
+                    (
+                        12,
+                        ExternalField {
+                            name: "f_34".to_string(),
+                            offset: 12,
+                            ty: Some("int32_t".to_string()),
+                        },
+                    ),
+                ]),
+            },
+        );
+        parsed_context.current_signature = Some(FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "arr".to_string(),
+                ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
+            }],
+        });
+
+        let local_structs = LocalStructArtifacts {
+            struct_decls: vec![StructDeclCandidate {
+                name: "sla_struct_420703e08f70f00e".to_string(),
+                decl: "struct sla_struct_420703e08f70f00e { int32_t f_8; int32_t f_34; };"
+                    .to_string(),
+                confidence: 95,
+                source: StructDeclSource::LocalInferred,
+                fields: vec![
+                    StructFieldCandidate {
+                        name: "f_8".to_string(),
+                        offset: 8,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                    StructFieldCandidate {
+                        name: "f_34".to_string(),
+                        offset: 0x34,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                ],
+            }],
+            slot_type_overrides: HashMap::from([(
+                0usize,
+                "struct sla_struct_420703e08f70f00e *".to_string(),
+            )]),
+            slot_field_profiles: HashMap::from([(
+                0usize,
+                BTreeMap::from([
+                    (8u64, "int32_t".to_string()),
+                    (0x34u64, "int32_t".to_string()),
+                ]),
+            )]),
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.test_struct_array_index",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.test_struct_array_index".to_string(),
+                signature: "int32_t sym.test_struct_array_index (void * arr)".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "arr".to_string(),
+                    param_type: "void *".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 90,
+                callconv_confidence: 90,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        let struct_entry = analysis
+            .type_facts
+            .external_type_db
+            .structs
+            .get("sla_struct_420703e08f70f00e")
+            .expect("expected merged local struct entry");
+        assert_eq!(
+            struct_entry.fields.get(&8).map(|field| field.name.as_str()),
+            Some("f_8")
+        );
+        assert_eq!(
+            struct_entry
+                .fields
+                .get(&0x34)
+                .map(|field| field.name.as_str()),
+            Some("f_34")
+        );
+        assert!(
+            !struct_entry.fields.contains_key(&4) && !struct_entry.fields.contains_key(&12),
+            "stale generated external layout should be replaced, got {:?}",
+            struct_entry.fields
+        );
+        assert!(
+            analysis
+                .plan
+                .struct_decls
+                .iter()
+                .find(|decl| decl.name == "sla_struct_420703e08f70f00e")
+                .is_some_and(|decl| decl.source == StructDeclSource::LocalInferred),
+            "expected plan to keep the current local synthetic struct"
+        );
+    }
+
+    #[test]
+    fn local_struct_override_replaces_weak_generic_ptr_sized_integer_param() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.current_signature = Some(FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                }),
+            }],
+        });
+        parsed_context.merged_signature = parsed_context.current_signature.clone();
+
+        let local_structs = LocalStructArtifacts {
+            struct_decls: vec![StructDeclCandidate {
+                name: "sla_struct_deadbeef".to_string(),
+                decl: "struct sla_struct_deadbeef { int32_t f_8; int32_t f_34; };".to_string(),
+                confidence: 95,
+                source: StructDeclSource::LocalInferred,
+                fields: vec![
+                    StructFieldCandidate {
+                        name: "f_8".to_string(),
+                        offset: 8,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                    StructFieldCandidate {
+                        name: "f_34".to_string(),
+                        offset: 52,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                ],
+            }],
+            slot_type_overrides: HashMap::from([(
+                0usize,
+                "struct sla_struct_deadbeef *".to_string(),
+            )]),
+            slot_field_profiles: HashMap::from([(
+                0usize,
+                BTreeMap::from([
+                    (8u64, "int32_t".to_string()),
+                    (52u64, "int32_t".to_string()),
+                ]),
+            )]),
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.test_struct_array_index",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.test_struct_array_index".to_string(),
+                signature: "int32_t sym.test_struct_array_index (int64_t arg1)".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "arg1".to_string(),
+                    param_type: "int64_t".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(
+            analysis
+                .type_facts
+                .slot_type_overrides
+                .get(&0)
+                .map(String::as_str),
+            Some("struct sla_struct_deadbeef *")
+        );
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|sig| sig.params.first())
+                .and_then(|param| param.ty.as_ref()),
+            Some(&CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                "sla_struct_deadbeef".to_string(),
+            ))))
         );
     }
 }

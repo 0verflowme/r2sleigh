@@ -192,21 +192,22 @@ impl<'a> FoldingContext<'a> {
     fn semantic_return_candidate_for_name(&self, name: &str) -> Option<CExpr> {
         let context = self.return_context_for_name(name);
         let lower = name.to_ascii_lowercase();
-        if self.inputs.arch.is_return_register_name(&lower)
+        let mut best = if self.inputs.arch.is_return_register_name(&lower)
             && let Some(block_addr) = self.current_block_addr.get()
-            && let Some(merged) = self.merged_return_candidate_for_current_block(block_addr)
         {
-            return Some(merged);
-        }
+            self.merged_return_candidate_for_current_block(block_addr)
+        } else {
+            None
+        };
 
         if let Some(candidate) =
             self.scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
         {
-            return Some(candidate);
+            best = self.preferred_return_candidate_in_context(best, Some(candidate), context);
         }
 
         if let Some(candidate) = self.scalar_context_root_candidate_for_name(name, context) {
-            return Some(candidate);
+            best = self.preferred_return_candidate_in_context(best, Some(candidate), context);
         }
 
         let merged = self
@@ -218,13 +219,15 @@ impl<'a> FoldingContext<'a> {
                     self.merged_return_candidate_for_block_slot(block_addr, slot.offset)
                 })
             });
-        if merged.is_some() {
-            return merged;
-        }
+        best = self.preferred_return_candidate_in_context(best, merged, context);
 
         let mut semantic_visited = HashSet::new();
-        self.render_semantic_value_by_name(name, 0, &mut semantic_visited)
-            .map(|candidate| self.refine_low_signal_semantic_candidate(name, candidate))
+        self.preferred_return_candidate_in_context(
+            best,
+            self.render_semantic_value_by_name(name, 0, &mut semantic_visited)
+                .map(|candidate| self.refine_low_signal_semantic_candidate(name, candidate)),
+            context,
+        )
     }
 
     pub(super) fn resolve_return_candidate(&self, expr: &CExpr) -> CExpr {

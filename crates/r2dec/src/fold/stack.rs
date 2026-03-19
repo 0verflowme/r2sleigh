@@ -20,7 +20,7 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn is_reserved_param_alias_name(&self, name: &str) -> bool {
+    pub(super) fn is_reserved_param_alias_name(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         self.inputs
             .param_register_aliases
@@ -277,7 +277,11 @@ impl<'a> FoldingContext<'a> {
             if var.name.is_empty() {
                 continue;
             }
-            let base_lower = var.base.as_deref().unwrap_or_default().to_ascii_lowercase();
+            let base_lower = var
+                .base
+                .legacy_name()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             let is_frame_based = self.inputs.arch.is_frame_pointer_name(&base_lower);
             if is_frame_based
                 && -*ext_offset == offset
@@ -294,7 +298,7 @@ impl<'a> FoldingContext<'a> {
         let offset = if name == "saved_fp" {
             Some(0)
         } else if let Some(suffix) = name.strip_prefix("local_") {
-            i64::from_str_radix(suffix, 16).ok()
+            i64::from_str_radix(suffix, 16).ok().map(|v| -v)
         } else if let Some(suffix) = name.strip_prefix("stack_") {
             i64::from_str_radix(suffix, 16).ok()
         } else if let Some(suffix) = name.strip_prefix("arg_") {

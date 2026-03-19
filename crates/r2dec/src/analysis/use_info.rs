@@ -2572,16 +2572,14 @@ fn semantic_addr_from_add_sub(
 
     if let Some((index, scale)) = recover_scaled_index_from_var(info, producers, b, env, 0) {
         let signed_scale = if is_sub { scale.checked_neg()? } else { scale };
-        let base =
-            semantic_addr_for_var(info, a, env).unwrap_or_else(|| normalized_addr_from_base_var(a));
+        let base = indexed_addr_base_for_var(info, a, env)?;
         return compose_indexed_addr(base, index, signed_scale);
     }
 
     if !is_sub
         && let Some((index, scale)) = recover_scaled_index_from_var(info, producers, a, env, 0)
     {
-        let base =
-            semantic_addr_for_var(info, b, env).unwrap_or_else(|| normalized_addr_from_base_var(b));
+        let base = indexed_addr_base_for_var(info, b, env)?;
         return compose_indexed_addr(base, index, scale);
     }
 
@@ -2625,7 +2623,11 @@ fn recover_scaled_index_from_var(
     env: &PassEnv<'_>,
     depth: u32,
 ) -> Option<(SSAVar, i64)> {
-    if depth > 8 || var.is_const() || semantic_var_is_pointer_like(info, var, env) {
+    if depth > 8
+        || var.is_const()
+        || semantic_var_is_pointer_like(info, var, env)
+        || semantic_var_resolves_to_ptr_sized_entry_arg_root(info, var, env, depth)
+    {
         return None;
     }
 
@@ -2641,12 +2643,12 @@ fn recover_scaled_index_from_var(
             recover_scaled_index_from_var(info, producers, src, env, depth + 1)
         }
         Some(SSAOp::IntMult { a, b, .. }) => {
-            if let Some(scale) = utils::parse_const_offset(a) {
+            if let Some(scale) = recover_const_offset_from_var(info, producers, a, depth + 1) {
                 let (inner, inner_scale) =
                     recover_scaled_index_from_var(info, producers, b, env, depth + 1)?;
                 return inner_scale.checked_mul(scale).map(|s| (inner, s));
             }
-            if let Some(scale) = utils::parse_const_offset(b) {
+            if let Some(scale) = recover_const_offset_from_var(info, producers, b, depth + 1) {
                 let (inner, inner_scale) =
                     recover_scaled_index_from_var(info, producers, a, env, depth + 1)?;
                 return inner_scale.checked_mul(scale).map(|s| (inner, s));
@@ -2654,7 +2656,10 @@ fn recover_scaled_index_from_var(
             None
         }
         Some(SSAOp::IntLeft { a, b, .. }) => {
-            let shift = utils::parse_const_offset(b)?;
+            let shift = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            if !(0..=62).contains(&shift) {
+                return None;
+            }
             let scale = 1_i64.checked_shl(shift as u32)?;
             let (inner, inner_scale) =
                 recover_scaled_index_from_var(info, producers, a, env, depth + 1)?;
@@ -2696,6 +2701,117 @@ fn recover_scaled_index_from_var(
         }
         _ => Some((var.clone(), 1)),
     }
+}
+
+fn recover_const_offset_from_var(
+    info: &UseInfo,
+    producers: &HashMap<String, SSAOp>,
+    var: &SSAVar,
+    depth: u32,
+) -> Option<i64> {
+    if depth > 8 {
+        return None;
+    }
+
+    if let Some(offset) = utils::parse_const_offset(var) {
+        return Some(offset);
+    }
+
+    let key = var.display_name();
+    match producers.get(&key) {
+        Some(SSAOp::Copy { src, .. })
+        | Some(SSAOp::IntZExt { src, .. })
+        | Some(SSAOp::IntSExt { src, .. })
+        | Some(SSAOp::Trunc { src, .. })
+        | Some(SSAOp::Cast { src, .. })
+        | Some(SSAOp::Subpiece { src, .. }) => {
+            recover_const_offset_from_var(info, producers, src, depth + 1)
+        }
+        Some(SSAOp::IntAnd { a, b, .. }) => {
+            let left = recover_const_offset_from_var(info, producers, a, depth + 1)?;
+            let right = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            Some(left & right)
+        }
+        Some(SSAOp::IntOr { a, b, .. }) => {
+            let left = recover_const_offset_from_var(info, producers, a, depth + 1)?;
+            let right = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            Some(left | right)
+        }
+        Some(SSAOp::IntXor { a, b, .. }) => {
+            let left = recover_const_offset_from_var(info, producers, a, depth + 1)?;
+            let right = recover_const_offset_from_var(info, producers, b, depth + 1)?;
+            Some(left ^ right)
+        }
+        _ => match semantic_source_value_for_var(info, var) {
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(value)))) => Some(value),
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::UIntLit(value)))) => {
+                i64::try_from(value).ok()
+            }
+            _ => None,
+        },
+    }
+}
+
+fn var_is_ptr_sized_entry_arg_root(var: &SSAVar, env: &PassEnv<'_>) -> bool {
+    let ptr_bytes = env.ptr_size.div_ceil(8).max(1);
+    var.version == 0
+        && var.size == ptr_bytes
+        && env
+            .arg_regs
+            .iter()
+            .any(|reg_name| reg_name.eq_ignore_ascii_case(&var.name))
+}
+
+fn resolve_ptr_sized_entry_arg_root_var(
+    info: &UseInfo,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+    depth: u32,
+) -> Option<SSAVar> {
+    if depth > 8 {
+        return None;
+    }
+
+    if var_is_ptr_sized_entry_arg_root(var, env) {
+        return Some(var.clone());
+    }
+
+    let key = var.display_name();
+    if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_values.get(&key)
+        && root.var != *var
+        && let Some(entry_root) =
+            resolve_ptr_sized_entry_arg_root_var(info, &root.var, env, depth + 1)
+    {
+        return Some(entry_root);
+    }
+
+    if let Some(prov) = info.forwarded_values.get(&key)
+        && let Some(source_var) = &prov.source_var
+        && source_var != var
+        && let Some(entry_root) =
+            resolve_ptr_sized_entry_arg_root_var(info, source_var, env, depth + 1)
+    {
+        return Some(entry_root);
+    }
+
+    let copy_root = resolve_copy_root_name(info, &key);
+    if copy_root != key
+        && let Some(root_var) = ssa_var_from_display_name(&copy_root, var.size)
+        && root_var != *var
+    {
+        return resolve_ptr_sized_entry_arg_root_var(info, &root_var, env, depth + 1);
+    }
+
+    None
+}
+
+fn semantic_var_resolves_to_ptr_sized_entry_arg_root(
+    info: &UseInfo,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+    depth: u32,
+) -> bool {
+    resolve_ptr_sized_entry_arg_root_var(info, var, env, depth).is_some()
 }
 
 fn semantic_var_resolves_to_zero(
@@ -2846,6 +2962,22 @@ fn normalized_addr_from_base_var(var: &SSAVar) -> NormalizedAddr {
     }
 }
 
+fn indexed_addr_base_for_var(
+    info: &UseInfo,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+) -> Option<NormalizedAddr> {
+    if let Some(addr) = semantic_addr_for_var(info, var, env)
+        && !matches!(addr.base, BaseRef::Raw(_))
+    {
+        return Some(addr);
+    }
+
+    (semantic_var_is_pointer_like(info, var, env)
+        || semantic_var_resolves_to_ptr_sized_entry_arg_root(info, var, env, 0))
+    .then(|| normalized_addr_from_base_var(var))
+}
+
 fn semantic_addr_has_meaningful_base(addr: &NormalizedAddr) -> bool {
     match &addr.base {
         BaseRef::StackSlot(_) => true,
@@ -2907,24 +3039,18 @@ fn semantic_addr_for_var_with_depth(
             offset_bytes: 0,
         });
     }
-    let is_ptr_sized_entry_arg_root = |root: &SSAVar| {
-        root.version == 0
-            && root.size == ptr_bytes
-            && env
-                .param_register_aliases
-                .contains_key(&root.name.to_ascii_lowercase())
-    };
-
     if let Some(SemanticValue::Address(addr)) = info.semantic_values.get(&key) {
         return Some(addr.clone());
     }
 
     if let Some(SemanticValue::Scalar(ScalarValue::Root(root))) = info.semantic_values.get(&key)
         && (semantic_var_is_pointer_like(info, &root.var, env)
-            || is_ptr_sized_entry_arg_root(&root.var))
+            || resolve_ptr_sized_entry_arg_root_var(info, &root.var, env, depth + 1).is_some())
     {
-        return semantic_addr_for_var_with_depth(info, &root.var, env, depth + 1)
-            .or_else(|| Some(normalized_addr_from_base_var(&root.var)));
+        let root_base = resolve_ptr_sized_entry_arg_root_var(info, &root.var, env, depth + 1)
+            .unwrap_or_else(|| root.var.clone());
+        return semantic_addr_for_var_with_depth(info, &root_base, env, depth + 1)
+            .or_else(|| Some(normalized_addr_from_base_var(&root_base)));
     }
     if let Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(alias)))) =
         info.semantic_values.get(&key)
@@ -2943,14 +3069,14 @@ fn semantic_addr_for_var_with_depth(
     if let Some(prov) = info.forwarded_values.get(&key)
         && let Some(source_var) = &prov.source_var
     {
-        let lower = source_var.name.to_ascii_lowercase();
-        let is_ptr_sized_entry_arg_root = prov.stack_slot.is_some()
-            && is_ptr_sized_entry_arg_root(source_var)
-            && var.size == ptr_bytes
-            && env.param_register_aliases.contains_key(&lower);
+        let entry_root = (prov.stack_slot.is_some() && var.size == ptr_bytes)
+            .then(|| resolve_ptr_sized_entry_arg_root_var(info, source_var, env, depth + 1))
+            .flatten();
+        let base_var = entry_root.as_ref().unwrap_or(source_var);
+        let is_ptr_sized_entry_arg_root = entry_root.is_some();
         if semantic_var_is_pointer_like(info, source_var, env) || is_ptr_sized_entry_arg_root {
-            return semantic_addr_for_var_with_depth(info, source_var, env, depth + 1)
-                .or_else(|| Some(normalized_addr_from_base_var(source_var)));
+            return semantic_addr_for_var_with_depth(info, base_var, env, depth + 1)
+                .or_else(|| Some(normalized_addr_from_base_var(base_var)));
         }
     }
 
@@ -4303,6 +4429,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                             canonicalize_call_arg_binding_to_negative_stack_load(
                                 &scratch.info,
                                 &mut binding,
+                                Some(dst),
                                 dst.size,
                             )
                             .is_some();
@@ -5215,6 +5342,7 @@ fn collect_immediate_stack_call_args(
                         canonicalize_call_arg_binding_to_negative_stack_load(
                             info,
                             &mut binding,
+                            Some(val),
                             val.size,
                         )
                         .is_some();
@@ -5318,6 +5446,7 @@ fn preserved_input_binding_from_stack_home(
     canonicalize_call_arg_binding_to_negative_stack_load(
         query.info,
         &mut binding,
+        Some(&preserved_input),
         preserved_input.size,
     );
     Some(binding)
@@ -5390,7 +5519,8 @@ fn preferred_stack_input_call_arg(
     expr: &CExpr,
     env: &PassEnv<'_>,
 ) -> SemanticCallArg {
-    info.semantic_values
+    let arg = info
+        .semantic_values
         .get(&var.display_name())
         .filter(|value| match value {
             SemanticValue::Load { addr, .. } | SemanticValue::Address(addr) => {
@@ -5400,7 +5530,10 @@ fn preferred_stack_input_call_arg(
         })
         .cloned()
         .map(SemanticCallArg::semantic)
-        .unwrap_or_else(|| semantic_call_arg_for_var(info, var, expr.clone(), env))
+        .unwrap_or_else(|| semantic_call_arg_for_var(info, var, expr.clone(), env));
+    let mut binding = CallArgBinding::input(arg);
+    canonicalize_call_arg_binding_to_negative_stack_load(info, &mut binding, Some(var), var.size);
+    binding.arg
 }
 
 fn visible_call_arg_seed_expr(lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
@@ -6348,6 +6481,7 @@ fn stable_negative_stack_load_size(arg: &SemanticCallArg, default_size: u32) -> 
 fn canonicalize_call_arg_binding_to_negative_stack_load(
     info: &UseInfo,
     binding: &mut CallArgBinding,
+    source_var: Option<&SSAVar>,
     default_size: u32,
 ) -> Option<i64> {
     if binding.is_result() {
@@ -6355,8 +6489,21 @@ fn canonicalize_call_arg_binding_to_negative_stack_load(
     }
 
     let offset = call_arg_semantic_source_offset(info, &binding.arg, 0, &mut HashSet::new())
-        .filter(|offset| *offset < 0)?;
-    let size = stable_negative_stack_load_size(&binding.arg, default_size);
+        .filter(|offset| *offset < 0)
+        .or_else(|| {
+            source_var.and_then(|var| {
+                semantic_value_source_offset_by_name(
+                    info,
+                    &var.display_name(),
+                    0,
+                    &mut HashSet::new(),
+                )
+                .filter(|offset| *offset < 0)
+            })
+        })?;
+    let size = source_var
+        .map(|var| var.size.max(1))
+        .unwrap_or_else(|| stable_negative_stack_load_size(&binding.arg, default_size));
     binding.arg = SemanticCallArg::semantic(SemanticValue::Load {
         addr: NormalizedAddr {
             base: BaseRef::StackSlot(offset),
@@ -9001,6 +9148,152 @@ mod tests {
                 })) if value_ref.var == x0
             ),
             "field addr semantic value = {:?}",
+            info.semantic_values.get(&field_addr.display_name())
+        );
+    }
+
+    #[test]
+    fn stable_entry_stack_values_preserve_masked_x86_struct_array_index_root() {
+        let mut fixture = TestEnvFixture::new();
+        fixture
+            .param_register_aliases
+            .insert("rdi".to_string(), "arr".to_string());
+        fixture.type_hints.insert(
+            "arr".to_string(),
+            CType::ptr(CType::Struct("DemoStruct".to_string())),
+        );
+        let env = fixture.env();
+
+        let rsp0 = mk("RSP", 0, 8);
+        let rsp1 = mk("RSP", 1, 8);
+        let rbp0 = mk("RBP", 0, 8);
+        let rbp1 = mk("RBP", 1, 8);
+        let rdi0 = mk("RDI", 0, 8);
+        let esi0 = mk("ESI", 0, 4);
+        let edx0 = mk("EDX", 0, 4);
+        let slot_arr = mk("tmp:4700", 1, 8);
+        let slot_idx = mk("tmp:4700", 2, 8);
+        let slot_val = mk("tmp:4700", 3, 8);
+        let reloaded_idx = mk("tmp:11f00", 1, 4);
+        let sext_idx = mk("RDX", 1, 8);
+        let shift_1 = mk("tmp:6a800", 1, 8);
+        let scaled_1 = mk("RAX", 3, 8);
+        let scaled_2 = mk("RAX", 4, 8);
+        let shift_2 = mk("tmp:6a800", 2, 8);
+        let scaled_3 = mk("RAX", 5, 8);
+        let reloaded_arr = mk("tmp:11f80", 1, 8);
+        let indexed_base = mk("RDX", 3, 8);
+        let field_addr = mk("tmp:4700", 7, 8);
+
+        let block = single_block(vec![
+            SSAOp::IntSub {
+                dst: rsp1.clone(),
+                a: rsp0,
+                b: SSAVar::constant(8, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: rsp1.clone(),
+                val: rbp0,
+            },
+            SSAOp::Copy {
+                dst: rbp1.clone(),
+                src: rsp1.clone(),
+            },
+            SSAOp::IntAdd {
+                dst: slot_arr.clone(),
+                a: rbp1.clone(),
+                b: mk("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: slot_arr.clone(),
+                val: rdi0.clone(),
+            },
+            SSAOp::IntAdd {
+                dst: slot_idx.clone(),
+                a: rbp1.clone(),
+                b: mk("const:fffffffffffffff4", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: slot_idx.clone(),
+                val: esi0,
+            },
+            SSAOp::IntAdd {
+                dst: slot_val.clone(),
+                a: rbp1,
+                b: mk("const:fffffffffffffff0", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: slot_val,
+                val: edx0,
+            },
+            SSAOp::Load {
+                dst: reloaded_idx.clone(),
+                space: "ram".to_string(),
+                addr: slot_idx,
+            },
+            SSAOp::IntSExt {
+                dst: sext_idx.clone(),
+                src: reloaded_idx,
+            },
+            SSAOp::IntAnd {
+                dst: shift_1.clone(),
+                a: mk("const:3", 0, 8),
+                b: mk("const:63", 0, 8),
+            },
+            SSAOp::IntLeft {
+                dst: scaled_1.clone(),
+                a: sext_idx.clone(),
+                b: shift_1,
+            },
+            SSAOp::IntSub {
+                dst: scaled_2.clone(),
+                a: scaled_1,
+                b: sext_idx,
+            },
+            SSAOp::IntAnd {
+                dst: shift_2.clone(),
+                a: mk("const:3", 0, 8),
+                b: mk("const:63", 0, 8),
+            },
+            SSAOp::IntLeft {
+                dst: scaled_3.clone(),
+                a: scaled_2,
+                b: shift_2,
+            },
+            SSAOp::Load {
+                dst: reloaded_arr.clone(),
+                space: "ram".to_string(),
+                addr: slot_arr,
+            },
+            SSAOp::IntAdd {
+                dst: indexed_base.clone(),
+                a: scaled_3,
+                b: reloaded_arr,
+            },
+            SSAOp::IntAdd {
+                dst: field_addr.clone(),
+                a: indexed_base,
+                b: SSAVar::constant(8, 8),
+            },
+        ]);
+
+        let info = analyze(&[block], &env);
+
+        assert!(
+            matches!(
+                info.semantic_values.get(&field_addr.display_name()),
+                Some(SemanticValue::Address(NormalizedAddr {
+                    base: BaseRef::Value(value_ref),
+                    index: Some(_),
+                    scale_bytes: 0x38,
+                    offset_bytes: 8,
+                })) if value_ref.var == rdi0
+            ),
+            "masked x86 struct-array field addr semantic value = {:?}",
             info.semantic_values.get(&field_addr.display_name())
         );
     }

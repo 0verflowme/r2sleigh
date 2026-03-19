@@ -39,6 +39,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
+    pub(crate) function_return_type: Option<&'a CType>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +57,14 @@ pub struct FoldingContext<'a> {
     pub(crate) hide_stack_frame: bool,
     pub(crate) userop_names: HashMap<u32, String>,
     pub(crate) signature_registry: SignatureRegistry,
+    pub(crate) rendered_alias_lookup_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    pub(crate) preferred_entry_arg_lookup_cache:
+        std::cell::RefCell<HashMap<String, Option<String>>>,
+    pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
+    pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) value_render_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
 }
 
 impl FoldArchConfig {
@@ -121,6 +130,13 @@ impl<'a> FoldingContext<'a> {
             hide_stack_frame: true,
             userop_names: HashMap::new(),
             signature_registry: SignatureRegistry::from_embedded_json(),
+            rendered_alias_lookup_cache: std::cell::RefCell::new(HashMap::new()),
+            preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
+            forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
+            semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
+            value_render_in_progress: std::cell::RefCell::new(HashSet::new()),
+            definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
+            definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
         }
     }
 
@@ -152,6 +168,7 @@ impl<'a> FoldingContext<'a> {
             param_register_aliases: EMPTY_STRING_STRING.get_or_init(HashMap::new),
             type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),
             type_oracle: None,
+            function_return_type: None,
         };
 
         Self::from_inputs(inputs)

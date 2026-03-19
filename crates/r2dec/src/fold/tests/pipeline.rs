@@ -83,7 +83,20 @@ mod tests {
         ExternalStackVarSpec {
             name: name.to_string(),
             ty: ty.as_ref().map(crate::ctype_to_type_like),
-            base: base.map(str::to_string),
+            base: match base.map(|raw| raw.to_ascii_lowercase()) {
+                Some(raw) if raw == "rbp" || raw == "ebp" || raw == "bp" || raw == "fp" => {
+                    r2types::ExternalStackBase::FramePointer
+                }
+                Some(raw) if raw == "rsp" || raw == "esp" || raw == "sp" => {
+                    r2types::ExternalStackBase::StackPointer
+                }
+                Some(raw) => r2types::ExternalStackBase::Named(raw),
+                None => r2types::ExternalStackBase::default(),
+            },
+            role: r2types::ExternalStackSlotRole::Unknown,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
         }
     }
 
@@ -171,6 +184,7 @@ mod tests {
             param_register_aliases: empty_str,
             type_hints: empty_ty,
             type_oracle: None,
+            function_return_type: None,
         })
     }
 
@@ -206,6 +220,7 @@ mod tests {
             param_register_aliases: empty_str,
             type_hints: empty_ty,
             type_oracle: None,
+            function_return_type: None,
         })
     }
 
@@ -2427,6 +2442,202 @@ mod tests {
     }
 
     #[test]
+    fn test_render_memory_access_from_visible_expr_recovers_masked_x86_indexed_member() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+            [
+                ("rdi".to_string(), "arr".to_string()),
+                ("esi".to_string(), "idx".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        ctx.set_type_hints(
+            [
+                (
+                    "arr".to_string(),
+                    CType::ptr(CType::Struct("demo_layout".to_string())),
+                ),
+                ("idx".to_string(), CType::Int(32)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
+            structs: [(
+                "demo_layout".to_string(),
+                ExternalStruct {
+                    name: "demo_layout".to_string(),
+                    fields: [
+                        (
+                            8,
+                            ExternalField {
+                                name: "third".to_string(),
+                                offset: 8,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                        (
+                            0x34,
+                            ExternalField {
+                                name: "fourteenth".to_string(),
+                                offset: 0x34,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+
+        let shift_mask = CExpr::binary(BinaryOp::BitAnd, CExpr::IntLit(3), CExpr::IntLit(63));
+        let scaled_index = CExpr::binary(
+            BinaryOp::Shl,
+            CExpr::binary(
+                BinaryOp::Sub,
+                CExpr::binary(
+                    BinaryOp::Shl,
+                    CExpr::Var("idx".to_string()),
+                    shift_mask.clone(),
+                ),
+                CExpr::Var("idx".to_string()),
+            ),
+            shift_mask,
+        );
+        let addr = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("arr".to_string()),
+                scaled_index,
+            ),
+            CExpr::IntLit(0x34),
+        );
+
+        let shape = ctx
+            .normalized_addr_from_visible_expr(&addr, 0)
+            .expect("masked x86 raw pointer math should normalize to an indexed address");
+        assert_eq!(shape.offset_bytes, 0x34);
+        assert!(
+            shape.index.is_some() && shape.scale_bytes == 56,
+            "expected masked x86 index recovery, got {shape:?}"
+        );
+
+        let rendered = ctx
+            .debug_render_memory_access_from_visible_expr(&addr, 4)
+            .expect("masked x86 raw pointer math should render as member access");
+        let rendered_text = format!("{rendered:?}");
+        assert!(
+            matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
+            "expected indexed-member render, got {rendered:?}"
+        );
+        assert!(
+            rendered_text.contains("fourteenth") && rendered_text.contains("arr"),
+            "expected masked x86 member render rooted at arr, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_normalized_addr_prefers_pointer_definition_over_scalar_stack_home_hint() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+            [
+                ("rdi".to_string(), "arr".to_string()),
+                ("esi".to_string(), "idx".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        ctx.set_type_hints(
+            [
+                (
+                    "arr".to_string(),
+                    CType::ptr(CType::Struct("demo_layout".to_string())),
+                ),
+                ("idx".to_string(), CType::Int(32)),
+                ("local_c".to_string(), CType::Int(32)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
+            structs: [(
+                "demo_layout".to_string(),
+                ExternalStruct {
+                    name: "demo_layout".to_string(),
+                    fields: [
+                        (
+                            8,
+                            ExternalField {
+                                name: "third".to_string(),
+                                offset: 8,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                        (
+                            0x34,
+                            ExternalField {
+                                name: "fourteenth".to_string(),
+                                offset: 0x34,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            "local_c".to_string(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("arr".to_string()),
+                CExpr::binary(
+                    BinaryOp::Mul,
+                    CExpr::Var("idx".to_string()),
+                    CExpr::IntLit(56),
+                ),
+            ),
+        );
+
+        let addr = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::Var("local_c".to_string()),
+            CExpr::IntLit(0x34),
+        );
+        let shape = ctx
+            .normalized_addr_from_visible_expr(&addr, 0)
+            .expect("scalar stack-home alias should still resolve through pointer definition");
+        assert_eq!(shape.offset_bytes, 0x34);
+        assert!(
+            shape.index.is_some() && shape.scale_bytes == 56,
+            "expected pointer definition to win over scalar local hint, got {shape:?}"
+        );
+
+        let rendered = ctx
+            .debug_render_memory_access_from_visible_expr(&addr, 4)
+            .expect("resolved pointer definition should render as member access");
+        let rendered_text = format!("{rendered:?}");
+        assert!(
+            matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
+            "expected member render, got {rendered:?}"
+        );
+        assert!(
+            rendered_text.contains("fourteenth") && rendered_text.contains("arr"),
+            "expected resolved member render rooted at arr, got {rendered:?}"
+        );
+    }
+
+    #[test]
     fn test_plain_indexed_load_does_not_upgrade_from_unrelated_field_name_any() {
         struct FieldNameAnyOnlyOracle;
 
@@ -3082,6 +3293,20 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_stack_var_does_not_render_reserved_param_stack_home_alias() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.param_register_aliases =
+            Box::leak(Box::new(HashMap::from([("rdi".to_string(), "a".to_string())])));
+        ctx.state
+            .analysis_ctx
+            .stack_info
+            .stack_vars
+            .insert(-8, "a".to_string());
+
+        assert_eq!(ctx.resolve_stack_var(-8), Some("local_8".to_string()));
+    }
+
+    #[test]
     fn test_var_name_canonicalizes_stack_alias_from_external_offset_mirror() {
         let mut ctx = FoldingContext::new(64);
         ctx.state
@@ -3316,6 +3541,45 @@ mod tests {
     }
 
     #[test]
+    fn test_propagate_ephemeral_copies_inlines_autogenerated_stack_home_param_copy() {
+        let ctx = FoldingContext::new(64);
+        let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("local_10".to_string()),
+                CExpr::Var("v".to_string()),
+            )),
+            CStmt::Expr(CExpr::assign(
+                CExpr::Member {
+                    base: Box::new(CExpr::Subscript {
+                        base: Box::new(CExpr::Var("arr".to_string())),
+                        index: Box::new(CExpr::Var("idx".to_string())),
+                    }),
+                    member: "f_8".to_string(),
+                },
+                CExpr::Var("local_10".to_string()),
+            )),
+        ];
+
+        let propagated = ctx.propagate_ephemeral_copies(stmts);
+        let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            right,
+            ..
+        }) = &propagated[1]
+        else {
+            panic!("expected member assignment after propagation");
+        };
+        assert_eq!(
+            right.as_ref(),
+            &CExpr::Var("v".to_string()),
+            "autogenerated stack-home param copy should inline into the member store"
+        );
+
+        let pruned = ctx.prune_dead_temp_assignments(propagated);
+        assert_eq!(pruned.len(), 1, "inlined autogenerated stack-home copy should prune away");
+    }
+
+    #[test]
     fn test_prune_dead_temp_assignments_keeps_side_effecting_rhs() {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
@@ -3425,6 +3689,14 @@ mod tests {
     fn test_prune_dead_temp_assignments_removes_dead_stack_artifacts() {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("local_c".to_string()),
+                CExpr::Var("arg2".to_string()),
+            )),
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("local_10".to_string()),
+                CExpr::Var("arg3".to_string()),
+            )),
             CStmt::Expr(CExpr::assign(
                 CExpr::Var("stack_8".to_string()),
                 CExpr::Var("arg1".to_string()),
@@ -5112,7 +5384,7 @@ mod tests {
         let load_first = make_var("EAX", 1, 4);
         let load_second = make_var("tmp:11f00", 8, 4);
         let ret = make_var("EAX", 2, 4);
-        let mut ctx = FoldingContext::new(64);
+        let mut ctx = make_x86_64_ctx();
         ctx.inputs.param_register_aliases = Box::leak(Box::new(
             [
                 ("rdi".to_string(), "arg1".to_string()),
@@ -5205,6 +5477,356 @@ mod tests {
         assert!(
             matches!(expr, CExpr::Binary { op: BinaryOp::Add, .. }),
             "expected semantic return to stay a sum, got {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_fold_block_keeps_both_semantic_member_loads_in_return_sum() {
+        let base = make_var("RDI", 0, 8);
+        let idx = make_var("ESI", 0, 4);
+        let load_first = make_var("EAX", 1, 4);
+        let load_second = make_var("tmp:11f00", 8, 4);
+        let ret = make_var("EAX", 2, 4);
+        let rip = make_var("RIP", 0, 8);
+        let block = make_block(vec![
+            SSAOp::IntAdd {
+                dst: ret.clone(),
+                a: load_first.clone(),
+                b: load_second.clone(),
+            },
+            SSAOp::Return {
+                target: rip,
+            },
+        ]);
+
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+            [
+                ("rdi".to_string(), "arg1".to_string()),
+                ("esi".to_string(), "arg2".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        ctx.set_type_hints(
+            [
+                (
+                    "arg1".to_string(),
+                    CType::ptr(CType::Struct("DemoStruct".to_string())),
+                ),
+                ("arg2".to_string(), CType::Int(32)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
+            structs: [(
+                "demostruct".to_string(),
+                ExternalStruct {
+                    name: "DemoStruct".to_string(),
+                    fields: [
+                        (
+                            8,
+                            ExternalField {
+                                name: "third".to_string(),
+                                offset: 8,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                        (
+                            0x34,
+                            ExternalField {
+                                name: "fourteenth".to_string(),
+                                offset: 0x34,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        ctx.analyze_block(&block);
+        ctx.state.analysis_ctx.use_info.semantic_values.insert(
+            load_first.display_name(),
+            crate::analysis::SemanticValue::Load {
+                addr: crate::analysis::NormalizedAddr {
+                    base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
+                        base.clone(),
+                    )),
+                    index: Some(crate::analysis::ValueRef::from(idx.clone())),
+                    scale_bytes: 0x38,
+                    offset_bytes: 8,
+                },
+                size: 4,
+            },
+        );
+        ctx.state.analysis_ctx.use_info.semantic_values.insert(
+            load_second.display_name(),
+            crate::analysis::SemanticValue::Load {
+                addr: crate::analysis::NormalizedAddr {
+                    base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(base)),
+                    index: Some(crate::analysis::ValueRef::from(idx)),
+                    scale_bytes: 0x38,
+                    offset_bytes: 0x34,
+                },
+                size: 4,
+            },
+        );
+        ctx.state.return_blocks.insert(block.addr);
+
+        let stmts = ctx.fold_block(&block, block.addr);
+        let Some(CStmt::Return(Some(expr))) = stmts.last() else {
+            panic!("expected return statement, got {stmts:?}");
+        };
+        let rendered = format!("{expr:?}");
+        assert!(
+            rendered.contains("third") && rendered.contains("fourteenth"),
+            "expected semantic member loads to survive tracked return emission, got {expr:?}"
+        );
+        assert!(
+            matches!(expr, CExpr::Binary { op: BinaryOp::Add, .. }),
+            "expected return to stay a sum, got {expr:?}"
+        );
+        assert!(
+            !rendered.contains("Deref") && !rendered.contains("IntLit(52)"),
+            "raw pointer math should not survive tracked return emission, got {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_observed_x86_struct_array_loads_render_as_indexed_members_before_return_selection() {
+        let block = make_block(vec![
+            SSAOp::IntSub {
+                dst: make_var("RSP", 1, 8),
+                a: make_var("RSP", 0, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("RSP", 1, 8),
+                val: make_var("RBP", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("RBP", 1, 8),
+                src: make_var("RSP", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 1, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 1, 8),
+                val: make_var("RDI", 0, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 2, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff4", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 2, 8),
+                val: make_var("ESI", 0, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 3, 8),
+                a: make_var("RBP", 1, 8),
+                b: make_var("const:fffffffffffffff0", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 3, 8),
+                val: make_var("EDX", 0, 4),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f00", 1, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 2, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("EAX", 1, 4),
+                src: make_var("tmp:11f00", 1, 4),
+            },
+            SSAOp::IntSExt {
+                dst: make_var("RDX", 1, 8),
+                src: make_var("EAX", 1, 4),
+            },
+            SSAOp::Copy {
+                dst: make_var("RAX", 1, 8),
+                src: make_var("RDX", 1, 8),
+            },
+            SSAOp::IntLeft {
+                dst: make_var("RAX", 2, 8),
+                a: make_var("RAX", 1, 8),
+                b: make_var("const:3", 0, 8),
+            },
+            SSAOp::IntSub {
+                dst: make_var("RAX", 3, 8),
+                a: make_var("RAX", 2, 8),
+                b: make_var("RDX", 1, 8),
+            },
+            SSAOp::IntLeft {
+                dst: make_var("RAX", 4, 8),
+                a: make_var("RAX", 3, 8),
+                b: make_var("const:3", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("RDX", 2, 8),
+                src: make_var("RAX", 4, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("tmp:11f80", 1, 8),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 1, 8),
+            },
+            SSAOp::Copy {
+                dst: make_var("RAX", 5, 8),
+                src: make_var("tmp:11f80", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("RDX", 3, 8),
+                a: make_var("RDX", 2, 8),
+                b: make_var("RAX", 5, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 4, 8),
+                a: make_var("RDX", 3, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 4, 8),
+                val: make_var("EDX", 0, 4),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 5, 8),
+                a: make_var("RDX", 3, 8),
+                b: make_var("const:8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("ECX", 1, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 5, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("tmp:4700", 6, 8),
+                a: make_var("RDX", 3, 8),
+                b: make_var("const:34", 0, 8),
+            },
+            SSAOp::Load {
+                dst: make_var("EAX", 2, 4),
+                space: "ram".to_string(),
+                addr: make_var("tmp:4700", 6, 8),
+            },
+            SSAOp::IntAdd {
+                dst: make_var("EAX", 3, 4),
+                a: make_var("EAX", 2, 4),
+                b: make_var("ECX", 1, 4),
+            },
+            SSAOp::Return {
+                target: make_var("RIP", 0, 8),
+            },
+        ]);
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+            [
+                ("rdi".to_string(), "arr".to_string()),
+                ("esi".to_string(), "idx".to_string()),
+                ("edx".to_string(), "v".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        ctx.set_type_hints(
+            [
+                (
+                    "arr".to_string(),
+                    CType::ptr(CType::Struct("DemoStruct".to_string())),
+                ),
+                ("idx".to_string(), CType::Int(32)),
+                ("v".to_string(), CType::Int(32)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
+            structs: [(
+                "demostruct".to_string(),
+                ExternalStruct {
+                    name: "DemoStruct".to_string(),
+                    fields: [
+                        (
+                            8,
+                            ExternalField {
+                                name: "third".to_string(),
+                                offset: 8,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                        (
+                            0x34,
+                            ExternalField {
+                                name: "fourteenth".to_string(),
+                                offset: 0x34,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+
+        ctx.analyze_block(&block);
+
+        let load_8 = {
+            let mut visited = HashSet::new();
+            ctx.render_semantic_value_by_name("ECX_1", 0, &mut visited)
+        };
+        let load_34 = {
+            let mut visited = HashSet::new();
+            ctx.render_semantic_value_by_name("EAX_2", 0, &mut visited)
+        };
+        let expr_8 = ctx.get_expr(&make_var("ECX", 1, 4));
+        let expr_34 = ctx.get_expr(&make_var("EAX", 2, 4));
+
+        assert!(
+            matches!(ctx.lookup_semantic_value("ECX_1"), Some(crate::analysis::SemanticValue::Load { .. })),
+            "expected semantic load for ECX_1, got {:?}",
+            ctx.lookup_semantic_value("ECX_1")
+        );
+        assert!(
+            matches!(ctx.lookup_semantic_value("EAX_2"), Some(crate::analysis::SemanticValue::Load { .. })),
+            "expected semantic load for EAX_2, got {:?}",
+            ctx.lookup_semantic_value("EAX_2")
+        );
+        assert!(
+            matches!(load_8, Some(CExpr::Member { .. } | CExpr::PtrMember { .. })),
+            "expected ECX_1 load to render as indexed member, got {load_8:?}"
+        );
+        assert!(
+            matches!(load_34, Some(CExpr::Member { .. } | CExpr::PtrMember { .. })),
+            "expected EAX_2 load to render as indexed member, got {load_34:?}"
+        );
+        assert!(
+            matches!(expr_8, CExpr::Member { .. } | CExpr::PtrMember { .. }),
+            "expected get_expr(ECX_1) to keep indexed member render, got {expr_8:?}; semantic={load_8:?}"
+        );
+        assert!(
+            matches!(expr_34, CExpr::Member { .. } | CExpr::PtrMember { .. }),
+            "expected get_expr(EAX_2) to keep indexed member render, got {expr_34:?}; semantic={load_34:?}"
         );
     }
 

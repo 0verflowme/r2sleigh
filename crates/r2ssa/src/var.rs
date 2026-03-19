@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// In SSA form, each assignment creates a new version of the variable.
 /// For example, if `RAX` is written twice, we get `RAX_0` and `RAX_1`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SSAVar {
     /// The base name of the variable (e.g., "RAX", "tmp:0x1000", "const:0x42").
     pub name: String,

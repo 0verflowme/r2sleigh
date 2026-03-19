@@ -2888,7 +2888,15 @@ fn parse_external_stack_vars(
                 .and_then(|raw| parse_external_type(raw, ptr_bits))
                 .as_ref()
                 .map(ctype_to_type_like),
-            base: Some(base),
+            base: match base.trim().to_ascii_lowercase().as_str() {
+                "bp" | "ebp" | "rbp" | "fp" => r2types::ExternalStackBase::FramePointer,
+                "sp" | "esp" | "rsp" => r2types::ExternalStackBase::StackPointer,
+                _ => r2types::ExternalStackBase::Named(base),
+            },
+            role: r2types::ExternalStackSlotRole::Unknown,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
         };
 
         match vars.get(&offset) {
@@ -4386,6 +4394,11 @@ fn infer_structs_from_ssa(
     use std::collections::HashMap;
 
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch, ptr_bits);
+    let arch_name =
+        crate::decompiler::normalize_sig_arch_name(arch).unwrap_or_else(|| "unknown".to_string());
+    let cfg = crate::decompiler::decompiler_config_for_arch_name(&arch_name, ptr_bits);
+    let sp_name = cfg.sp_name.to_ascii_lowercase();
+    let fp_name = cfg.fp_name.to_ascii_lowercase();
     let mut addr_exprs: HashMap<String, ArgAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), ArgAddrExpr> = HashMap::new();
@@ -4579,13 +4592,13 @@ fn infer_structs_from_ssa(
                     r2ssa::SSAOp::IntAdd { dst, a, b } => {
                         if let Some(off) = parse_ssa_const_offset(&b.name, ptr_bits) {
                             let a_lower = a.name.to_ascii_lowercase();
-                            if a_lower == "sp" || a_lower == "fp" {
+                            if a_lower == sp_name || a_lower == fp_name {
                                 changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
                             }
                         }
                         if let Some(off) = parse_ssa_const_offset(&a.name, ptr_bits) {
                             let b_lower = b.name.to_ascii_lowercase();
-                            if b_lower == "sp" || b_lower == "fp" {
+                            if b_lower == sp_name || b_lower == fp_name {
                                 changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
                             }
                         }
@@ -4648,7 +4661,7 @@ fn infer_structs_from_ssa(
                     r2ssa::SSAOp::IntSub { dst, a, b } => {
                         if let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits) {
                             let a_lower = a.name.to_ascii_lowercase();
-                            if a_lower == "sp" || a_lower == "fp" {
+                            if a_lower == sp_name || a_lower == fp_name {
                                 changed |= set_stack_slot(
                                     dst,
                                     delta.saturating_neg(),
@@ -6423,7 +6436,10 @@ mod tests {
         let vars = parse_external_stack_vars(json, 64);
         assert_eq!(vars.get(&-64).map(|v| v.name.as_str()), Some("buf"));
         assert_eq!(vars.get(&-72).map(|v| v.name.as_str()), Some("user_input"));
-        assert_eq!(vars.get(&80).map(|v| v.base.as_deref()), Some(Some("RSP")));
+        assert_eq!(
+            vars.get(&80).and_then(|v| v.base.legacy_name()),
+            Some("rsp".to_string())
+        );
     }
 
     #[test]
@@ -6555,6 +6571,107 @@ mod tests {
                 || output.contains("saved_fp"),
             "decompiler should keep decompilation stable with tsj context, got: {}",
             output
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn r2dec_function_with_context_keeps_live_x86_struct_array_member_shape() {
+        let arch = CString::new("x86-64").expect("valid arch string");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let bytes = [
+            0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0x7d, 0xf8, 0x89, 0x75,
+            0xf4, 0x89, 0x55, 0xf0, 0x8b, 0x45, 0xf4, 0x48, 0x63, 0xd0, 0x48, 0x89, 0xd0, 0x48,
+            0xc1, 0xe0, 0x03, 0x48, 0x29, 0xd0, 0x48, 0xc1, 0xe0, 0x03, 0x48, 0x89, 0xc2, 0x48,
+            0x8b, 0x45, 0xf8, 0x48, 0x01, 0xc2, 0x8b, 0x45, 0xf0, 0x89, 0x42, 0x08, 0x8b, 0x45,
+            0xf4, 0x48, 0x63, 0xd0, 0x48, 0x89, 0xd0, 0x48, 0xc1, 0xe0, 0x03, 0x48, 0x29, 0xd0,
+            0x48, 0xc1, 0xe0, 0x03, 0x48, 0x89, 0xc2, 0x48, 0x8b, 0x45, 0xf8, 0x48, 0x01, 0xd0,
+            0x8b, 0x48, 0x08, 0x8b, 0x45, 0xf4, 0x48, 0x63, 0xd0, 0x48, 0x89, 0xd0, 0x48, 0xc1,
+            0xe0, 0x03, 0x48, 0x29, 0xd0, 0x48, 0xc1, 0xe0, 0x03, 0x48, 0x89, 0xc2, 0x48, 0x8b,
+            0x45, 0xf8, 0x48, 0x01, 0xd0, 0x8b, 0x40, 0x34, 0x01, 0xc8, 0x5d, 0xc3,
+        ];
+        let block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x40182f, 124);
+        assert!(!block.is_null(), "function block should lift");
+
+        let blocks: [*const R2ILBlock; 1] = [block];
+        let func_name = CString::new("dbg.test_struct_array_index").expect("valid function name");
+        let empty_map = CString::new("{}").expect("valid empty json");
+        let external_context_json = CString::new(
+            r#"{
+                "signature": {
+                    "name": "dbg.test_struct_array_index",
+                    "ret": "int32_t",
+                    "callconv": "amd64",
+                    "params": [
+                        {"name": "arr", "type": "void *"},
+                        {"name": "idx", "type": "int32_t"},
+                        {"name": "v", "type": "int32_t"}
+                    ]
+                },
+                "vars": [
+                    {"kind":"register","name":"arg0","type":"void *","reg":"rdi"},
+                    {"kind":"register","name":"arg1","type":"int64_t","reg":"rsi"},
+                    {"kind":"register","name":"arg2","type":"void *","reg":"rdx"},
+                    {"kind":"stack","name":"var_8h","type":"void *","base":"rsp","offset":0},
+                    {"kind":"stack","name":"arr","type":"DemoStruct *","base":"rbp","offset":-8},
+                    {"kind":"stack","name":"var_ch","type":"int32_t","base":"rbp","offset":-12},
+                    {"kind":"stack","name":"var_10h","type":"int32_t","base":"rbp","offset":-16}
+                ],
+                "base_types": []
+            }"#,
+        )
+        .expect("valid external context");
+
+        let out = r2dec_function_with_context(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            func_name.as_ptr(),
+            empty_map.as_ptr(),
+            empty_map.as_ptr(),
+            empty_map.as_ptr(),
+            external_context_json.as_ptr(),
+        );
+        assert!(!out.is_null(), "decompilation output should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+
+        r2il_string_free(out);
+        r2il_block_free(block);
+        r2il_free(ctx);
+
+        assert!(
+            output.contains("[idx].f_8") || output.contains("[idx].third"),
+            "expected indexed-member store rendering in decompiled output, got:\n{output}"
+        );
+        assert!(
+            output.contains("[idx].f_34") || output.contains("[idx].fourteenth"),
+            "expected indexed-member load rendering in decompiled output, got:\n{output}"
+        );
+        assert!(
+            !output.contains("*(arr +") && !output.contains("((rax_"),
+            "expected semantic member rendering without raw pointer math, got:\n{output}"
+        );
+        let return_tail = output
+            .split_once("return")
+            .map(|(_, tail)| tail)
+            .unwrap_or_default();
+        assert!(
+            return_tail.contains('+')
+                && (return_tail.contains("[idx].f_34") || return_tail.contains("[idx].fourteenth"))
+                && (return_tail.contains("[idx].f_8")
+                    || return_tail.contains("[idx].third")
+                    || return_tail.contains(" v")),
+            "expected return expression to keep both struct-array terms, got:\n{output}"
+        );
+        assert!(
+            !output.contains("local_"),
+            "autogenerated stack-home locals should not leak through the live FFI decompile path, got:\n{output}"
+        );
+        assert!(
+            output.contains("arr[idx].f_8 = v;"),
+            "expected live FFI decompile path to inline the parameter store, got:\n{output}"
         );
     }
 
@@ -8349,6 +8466,638 @@ mod integration_tests {
         let fields = slot_fields.get(&0).expect("slot 0 field profile");
         assert!(fields.contains_key(&0x8), "expected offset 0x8 field");
         assert!(fields.contains_key(&0x34), "expected offset 0x34 field");
+    }
+
+    #[test]
+    fn infer_structs_from_semantic_accesses_recovers_observed_live_x86_struct_field_pattern() {
+        let block = r2ssa::SSABlock {
+            addr: 0x401667,
+            size: 42,
+            ops: vec![
+                r2ssa::SSAOp::IntSub {
+                    dst: r2ssa::SSAVar::new("RSP", 1, 8),
+                    a: r2ssa::SSAVar::new("RSP", 0, 8),
+                    b: r2ssa::SSAVar::new("const:8", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("RSP", 1, 8),
+                    val: r2ssa::SSAVar::new("RBP", 0, 8),
+                },
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("RBP", 1, 8),
+                    src: r2ssa::SSAVar::new("RSP", 1, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 1, 8),
+                    a: r2ssa::SSAVar::new("RBP", 1, 8),
+                    b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
+                    val: r2ssa::SSAVar::new("RDI", 0, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 2, 8),
+                    a: r2ssa::SSAVar::new("RBP", 1, 8),
+                    b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
+                    val: r2ssa::SSAVar::new("ESI", 0, 4),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
+                },
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("RAX", 1, 8),
+                    src: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
+                },
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("EDX", 1, 4),
+                    src: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 3, 8),
+                    a: r2ssa::SSAVar::new("RAX", 1, 8),
+                    b: r2ssa::SSAVar::new("const:30", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
+                    val: r2ssa::SSAVar::new("EDX", 1, 4),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f80", 2, 8),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
+                },
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("RAX", 2, 8),
+                    src: r2ssa::SSAVar::new("tmp:11f80", 2, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 4, 8),
+                    a: r2ssa::SSAVar::new("RAX", 2, 8),
+                    b: r2ssa::SSAVar::new("const:30", 0, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f00", 2, 4),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 4, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f00", 3, 4),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("RAX", 2, 8),
+                },
+            ],
+        };
+        let raw = r2il::R2ILBlock {
+            addr: block.addr,
+            size: block.size,
+            ops: vec![r2il::R2ILOp::Return {
+                target: r2il::Varnode::constant(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        };
+        let mut func = r2ssa::SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
+        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
+        func = func.with_name("sym.test_struct_field");
+
+        let mut diagnostics = TypeWritebackDiagnosticsJson::default();
+        let (struct_decls, slot_types, slot_fields) = infer_structs_from_semantic_accesses(
+            &func,
+            &r2dec::DecompilerConfig::x86_64(),
+            64,
+            &mut diagnostics,
+        );
+
+        assert!(
+            !struct_decls.is_empty(),
+            "expected x86 semantic access supplement to infer struct decls; diagnostics={diagnostics:?}"
+        );
+        assert!(slot_types.contains_key(&0), "expected arg0 slot override");
+        let fields = slot_fields.get(&0).expect("slot 0 field profile");
+        assert!(fields.contains_key(&0x0), "expected offset 0x0 field");
+        assert!(fields.contains_key(&0x30), "expected offset 0x30 field");
+    }
+
+    #[test]
+    fn infer_structs_from_semantic_accesses_recovers_observed_live_x86_struct_array_pattern() {
+        let block = r2ssa::SSABlock {
+            addr: 0x40182f,
+            size: 124,
+            ops: vec![
+                r2ssa::SSAOp::IntSub {
+                    dst: r2ssa::SSAVar::new("RSP", 1, 8),
+                    a: r2ssa::SSAVar::new("RSP", 0, 8),
+                    b: r2ssa::SSAVar::new("const:8", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("RSP", 1, 8),
+                    val: r2ssa::SSAVar::new("RBP", 0, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 1, 8),
+                    a: r2ssa::SSAVar::new("RSP", 1, 8),
+                    b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
+                    val: r2ssa::SSAVar::new("RDI", 0, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 2, 8),
+                    a: r2ssa::SSAVar::new("RSP", 1, 8),
+                    b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
+                },
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("tmp:6a80", 1, 4),
+                    src: r2ssa::SSAVar::new("ESI", 0, 4),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
+                    val: r2ssa::SSAVar::new("tmp:6a80", 1, 4),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 3, 8),
+                    a: r2ssa::SSAVar::new("RSP", 1, 8),
+                    b: r2ssa::SSAVar::new("const:fffffffffffffff0", 0, 8),
+                },
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("tmp:6a80", 2, 4),
+                    src: r2ssa::SSAVar::new("EDX", 0, 4),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
+                    val: r2ssa::SSAVar::new("tmp:6a80", 2, 4),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
+                },
+                r2ssa::SSAOp::IntSExt {
+                    dst: r2ssa::SSAVar::new("RDX", 1, 8),
+                    src: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
+                },
+                r2ssa::SSAOp::IntLeft {
+                    dst: r2ssa::SSAVar::new("RAX", 3, 8),
+                    a: r2ssa::SSAVar::new("RDX", 1, 8),
+                    b: r2ssa::SSAVar::new("const:3", 0, 8),
+                },
+                r2ssa::SSAOp::IntSub {
+                    dst: r2ssa::SSAVar::new("RAX", 4, 8),
+                    a: r2ssa::SSAVar::new("RAX", 3, 8),
+                    b: r2ssa::SSAVar::new("RDX", 1, 8),
+                },
+                r2ssa::SSAOp::IntLeft {
+                    dst: r2ssa::SSAVar::new("RAX", 5, 8),
+                    a: r2ssa::SSAVar::new("RAX", 4, 8),
+                    b: r2ssa::SSAVar::new("const:3", 0, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("RDX", 3, 8),
+                    a: r2ssa::SSAVar::new("RAX", 5, 8),
+                    b: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:11f00", 2, 4),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:4700", 7, 8),
+                    a: r2ssa::SSAVar::new("RDX", 3, 8),
+                    b: r2ssa::SSAVar::new("const:8", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:4700", 7, 8),
+                    val: r2ssa::SSAVar::new("tmp:11f00", 2, 4),
+                },
+            ],
+        };
+        let raw = r2il::R2ILBlock {
+            addr: block.addr,
+            size: block.size,
+            ops: vec![r2il::R2ILOp::Return {
+                target: r2il::Varnode::constant(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        };
+        let mut func = r2ssa::SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
+        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
+        func = func.with_name("sym.test_struct_array_index");
+
+        let mut diagnostics = TypeWritebackDiagnosticsJson::default();
+        let (struct_decls, slot_types, slot_fields) = infer_structs_from_semantic_accesses(
+            &func,
+            &r2dec::DecompilerConfig::x86_64(),
+            64,
+            &mut diagnostics,
+        );
+
+        assert!(
+            !struct_decls.is_empty(),
+            "expected x86 semantic access supplement to infer struct decls; diagnostics={diagnostics:?}"
+        );
+        assert!(slot_types.contains_key(&0), "expected arg0 slot override");
+        let fields = slot_fields.get(&0).expect("slot 0 field profile");
+        assert!(fields.contains_key(&0x8), "expected offset 0x8 field");
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lifted_x86_struct_array_analysis_artifact_surfaces_local_struct_override() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa554889e548897df88975f48955f08b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801c28b45f08942088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b48088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b403401c85dc3",
+        );
+        let block = disasm
+            .lift_block(&bytes, 0x40182f, 124)
+            .expect("lifted block");
+        let pattern_ssa_func =
+            r2ssa::SSAFunction::from_blocks_for_patterns(std::slice::from_ref(&block), Some(&arch))
+                .expect("pattern ssa")
+                .with_name("dbg.test_struct_array_index");
+        let pattern_ssa_blocks: Vec<r2ssa::SSABlock> = pattern_ssa_func
+            .blocks()
+            .map(|block| r2ssa::SSABlock {
+                addr: block.addr,
+                size: block.size,
+                ops: block.ops.clone(),
+            })
+            .collect();
+        let mut semantic_diagnostics = TypeWritebackDiagnosticsJson::default();
+        let semantic_structs = infer_structs_from_semantic_accesses(
+            &pattern_ssa_func,
+            &r2dec::DecompilerConfig::x86_64(),
+            64,
+            &mut semantic_diagnostics,
+        );
+        let mut raw_diagnostics = TypeWritebackDiagnosticsJson::default();
+        let raw_structs =
+            infer_structs_from_ssa(&pattern_ssa_blocks, Some(&arch), 64, &mut raw_diagnostics);
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.test_struct_array_index",
+            Some(&arch),
+            64,
+            false,
+            &std::collections::HashMap::new(),
+            "{}",
+        )
+        .expect("analysis artifact");
+
+        let rendered = artifact
+            .type_facts
+            .merged_signature
+            .as_ref()
+            .and_then(|sig| sig.params.first())
+            .and_then(|param| param.ty.as_ref())
+            .map(type_like_to_ctype)
+            .map(|ty| ty.to_string())
+            .unwrap_or_default();
+        let compact = rendered.replace(' ', "");
+        assert!(
+            compact.starts_with("struct")
+                && compact.ends_with('*')
+                && !compact.eq_ignore_ascii_case("void*"),
+            "expected lifted-byte x86 artifact to override arg0 to a struct pointer, got signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}, semantic_structs={:?}, semantic_diagnostics={:?}, raw_structs={:?}, raw_diagnostics={:?}, pattern_ssa_blocks={:?}",
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs,
+            semantic_structs,
+            semantic_diagnostics,
+            raw_structs,
+            raw_diagnostics,
+            pattern_ssa_blocks
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lifted_x86_struct_array_detached_artifact_with_live_context_keeps_struct_override() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa554889e548897df88975f48955f08b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801c28b45f08942088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b48088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b403401c85dc3",
+        );
+        let block = disasm
+            .lift_block(&bytes, 0x40182f, 124)
+            .expect("lifted block");
+        let reg_type_hints =
+            crate::types::collect_register_type_hints(std::slice::from_ref(&block), &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.test_struct_array_index",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "arr", "type": "void *"},
+                    {"name": "idx", "type": "int32_t"},
+                    {"name": "v", "type": "int32_t"}
+                ]
+            },
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.test_struct_array_index",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        assert_eq!(
+            artifact
+                .type_facts
+                .slot_type_overrides
+                .get(&0)
+                .map(String::as_str),
+            Some("struct sla_struct_420703e08f70f00e *"),
+            "expected live-context detached artifact to keep the local struct override, got merged_signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}",
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lifted_x86_struct_array_detached_artifact_keeps_sparse_field_offsets() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa554889e548897df88975f48955f08b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801c28b45f08942088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b48088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b403401c85dc3",
+        );
+        let block = disasm
+            .lift_block(&bytes, 0x40182f, 124)
+            .expect("lifted block");
+        let reg_type_hints =
+            crate::types::collect_register_type_hints(std::slice::from_ref(&block), &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.test_struct_array_index",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "arr", "type": "void *"},
+                    {"name": "idx", "type": "int32_t"},
+                    {"name": "v", "type": "int32_t"}
+                ]
+            },
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.test_struct_array_index",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let struct_decl = artifact
+            .writeback_plan
+            .struct_decls
+            .iter()
+            .find(|decl| decl.name == "sla_struct_420703e08f70f00e")
+            .expect("expected local struct decl");
+        let field_offsets = struct_decl
+            .fields
+            .iter()
+            .map(|field| (field.offset, field.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            field_offsets,
+            vec![(8, "f_8"), (0x34, "f_34")],
+            "expected sparse field offsets to survive writeback plan, got {:?}",
+            struct_decl.fields
+        );
+
+        let db_struct = artifact
+            .type_facts
+            .external_type_db
+            .structs
+            .get("sla_struct_420703e08f70f00e")
+            .expect("expected merged struct in type db");
+        assert_eq!(
+            db_struct.fields.keys().copied().collect::<Vec<_>>(),
+            vec![8, 0x34],
+            "expected sparse field offsets in merged type db, got {:?}",
+            db_struct.fields
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_struct_array_artifact_drives_member_load_return_rendering() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa554889e548897df88975f48955f08b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801c28b45f08942088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b48088b45f44863d04889d048c1e0034829d048c1e0034889c2488b45f84801d08b403401c85dc3",
+        );
+        let block = disasm
+            .lift_block(&bytes, 0x40182f, 124)
+            .expect("lifted block");
+        let reg_type_hints =
+            crate::types::collect_register_type_hints(std::slice::from_ref(&block), &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.test_struct_array_index",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "arr", "type": "void *"},
+                    {"name": "idx", "type": "int32_t"},
+                    {"name": "v", "type": "int32_t"}
+                ]
+            },
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.test_struct_array_index",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let tail_ops: Vec<_> = artifact
+            .pattern_ssa_blocks
+            .first()
+            .map(|block| block.ops.iter().rev().take(16).cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut raw = r2il::R2ILBlock::new(0x40182f, 124);
+        raw.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        let mut manual_func =
+            r2ssa::SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
+        manual_func
+            .get_block_mut(0x40182f)
+            .expect("entry block")
+            .ops = artifact.pattern_ssa_blocks[0].ops.clone();
+        manual_func = manual_func.with_name("dbg.test_struct_array_index");
+        let mut manual_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        manual_decompiler.set_type_facts(artifact.type_facts.clone());
+        let manual_output = manual_decompiler.decompile(&manual_func);
+
+        assert!(
+            output.contains("[idx].f_8"),
+            "expected detached artifact store rendering in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
+            artifact.type_facts.register_params,
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
+        assert!(
+            output.contains("[idx].f_34"),
+            "expected detached artifact load rendering in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
+            artifact.type_facts.register_params,
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
+        assert!(
+            output.contains("return arr[idx].f_8 + arr[idx].f_34;")
+                || output.contains("return arr[idx].f_34 + arr[idx].f_8;"),
+            "expected detached artifact return to preserve both member loads, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
+            artifact.type_facts.register_params,
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
+        assert!(
+            !output.contains("local_c ="),
+            "dead x86 stack-home index carrier should not leak into decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
+            artifact.type_facts.register_params,
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
+        assert!(
+            !output.contains("local_"),
+            "autogenerated x86 stack-home locals should not leak into decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
+            artifact.type_facts.register_params,
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
+        assert!(
+            output.contains("arr[idx].f_8 = v;"),
+            "expected detached artifact store to inline the parameter value, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
+            artifact.type_facts.register_params,
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
+        assert!(
+            !output.contains("(int64_t)arr[idx].f_34"),
+            "x86 scalar return should not widen the member load in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
+            artifact.type_facts.register_params,
+            artifact.type_facts.merged_signature,
+            artifact.type_facts.slot_type_overrides,
+            artifact.type_facts.slot_field_profiles,
+            artifact.type_facts.external_type_db.structs
+        );
     }
 
     #[test]

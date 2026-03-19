@@ -4,15 +4,15 @@
 //! produces `CTypeLike` results and type/layout facts for decompiler and plugin
 //! consumers; rendering-specific conversion belongs outside this crate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    CTypeLike, Constraint, ConstraintSource, ExternalStackVarSpec, ExternalStruct, ExternalTypeDb,
-    FunctionSignatureSpec, FunctionType, MemoryCapability, ResolvedFieldLayout, ResolvedSignature,
-    SignatureRegistry, Signedness, SolvedTypes, SolverConfig, Type, TypeArena, TypeId, TypeOracle,
-    TypeSolver, to_c_type_like,
+    CTypeLike, Constraint, ConstraintSource, ExternalStackBase, ExternalStackVarSpec,
+    ExternalStruct, ExternalTypeDb, FunctionSignatureSpec, FunctionType, MemoryCapability,
+    ResolvedFieldLayout, ResolvedSignature, SignatureRegistry, Signedness, SolvedTypes,
+    SolverConfig, StackSlotKey, Type, TypeArena, TypeId, TypeOracle, TypeSolver, to_c_type_like,
 };
-use r2ssa::{SSAFunction, SSAOp, SSAVar};
+use r2ssa::{DecompilePrepFacts, SSAFunction, SSAOp, SSAVar, StackAddressBase, StackAddressRoot};
 
 /// Type inference context.
 pub struct TypeInference {
@@ -34,6 +34,10 @@ pub struct TypeInference {
     external_signature: Option<FunctionSignatureSpec>,
     /// Optional externally recovered stack variables.
     external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
+    /// Canonical stack-slot facts keyed by structural slot identity.
+    external_stack_slots: BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    /// Proven SSA var -> stack-slot bindings from decompile prep.
+    ssa_stack_slots: BTreeMap<SSAVar, StackSlotKey>,
     /// Optional external host type database.
     external_type_db: ExternalTypeDb,
     /// Last solver output for this function inference pass.
@@ -88,6 +92,8 @@ impl TypeInference {
             signature_registry: SignatureRegistry::from_embedded_json(),
             external_signature: None,
             external_stack_vars: HashMap::new(),
+            external_stack_slots: BTreeMap::new(),
+            ssa_stack_slots: BTreeMap::new(),
             external_type_db: ExternalTypeDb::default(),
             solved_types: None,
         }
@@ -106,6 +112,26 @@ impl TypeInference {
     /// Set externally recovered stack variables.
     pub fn set_external_stack_vars(&mut self, stack_vars: HashMap<i64, ExternalStackVarSpec>) {
         self.external_stack_vars = stack_vars;
+    }
+
+    /// Set canonical externally recovered stack-slot facts.
+    pub fn set_external_stack_slots(
+        &mut self,
+        stack_slots: BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    ) {
+        self.external_stack_slots = stack_slots;
+    }
+
+    /// Set SSA -> stack-slot bindings from decompile prep facts.
+    pub fn set_decompile_prep_facts(&mut self, facts: Option<&DecompilePrepFacts>) {
+        self.ssa_stack_slots.clear();
+        let Some(facts) = facts else {
+            return;
+        };
+        for (var, root) in &facts.stack_address_roots {
+            self.ssa_stack_slots
+                .insert(var.clone(), stack_slot_key_from_root(*root));
+        }
     }
 
     /// Set externally recovered type database (from tsj payload).
@@ -200,16 +226,28 @@ impl TypeInference {
             }
         }
 
-        for stack_var in self.external_stack_vars.values() {
-            let Some(ty) = &stack_var.ty else {
+        for var in collect_vars(func) {
+            let Some(slot_spec) = self.stack_slot_spec_for_var(&var) else {
                 continue;
             };
-            if let Some(var) = reg0_map.get(&stack_var.name.to_ascii_lowercase()) {
-                overrides.insert(var.clone(), ty.clone());
-            }
+            let Some(ty) = &slot_spec.ty else {
+                continue;
+            };
+            overrides.insert(var, ty.clone());
         }
 
         overrides
+    }
+
+    fn stack_slot_spec_for_var(&self, var: &SSAVar) -> Option<&ExternalStackVarSpec> {
+        self.ssa_stack_slots
+            .get(var)
+            .and_then(|key| self.external_stack_slots.get(key))
+            .or_else(|| {
+                self.external_stack_vars
+                    .values()
+                    .find(|slot| slot.name.eq_ignore_ascii_case(&var.name))
+            })
     }
 
     fn emit_inferred_constraints(
@@ -826,12 +864,11 @@ impl TypeInference {
             }
         }
 
-        for stack_var in self.external_stack_vars.values() {
-            let Some(ty) = &stack_var.ty else {
+        for var in collect_vars(func) {
+            let Some(stack_var) = self.stack_slot_spec_for_var(&var) else {
                 continue;
             };
-            let key = stack_var.name.to_ascii_lowercase();
-            let Some(var) = reg0_map.get(&key).cloned() else {
+            let Some(ty) = &stack_var.ty else {
                 continue;
             };
             let (ty_id, struct_name) = self.type_like_to_typeid(ty, arena);
@@ -1177,6 +1214,16 @@ impl TypeInference {
             solved,
             external_type_db: &self.external_type_db,
         })
+    }
+}
+
+fn stack_slot_key_from_root(root: StackAddressRoot) -> StackSlotKey {
+    StackSlotKey {
+        base: match root.base {
+            StackAddressBase::FramePointer => ExternalStackBase::FramePointer,
+            StackAddressBase::StackPointer => ExternalStackBase::StackPointer,
+        },
+        offset: root.offset,
     }
 }
 

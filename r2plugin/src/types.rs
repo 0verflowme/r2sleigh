@@ -208,6 +208,7 @@ fn infer_signature_cc_from_analysis(
     var_recovery.recover(&analysis.ssa_func);
 
     let mut type_inference = r2types::TypeInference::new(env.cfg.ptr_size);
+    type_inference.set_decompile_prep_facts(analysis.ssa_func.decompile_prep_facts());
     type_inference.infer_function(&analysis.ssa_func);
 
     let mut inferred_params: Vec<InferredParam> = var_recovery
@@ -492,7 +493,6 @@ fn build_function_analysis_artifact_from_analysis(
         ),
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
-
     Some(FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_blocks: analysis.pattern_ssa_blocks,
@@ -536,6 +536,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
     let mut var_recovery = r2dec::VariableRecovery::new(&cfg.sp_name, &cfg.fp_name, cfg.ptr_size);
     var_recovery.recover(&analysis.ssa_func);
     let mut type_inference = r2types::TypeInference::new(cfg.ptr_size);
+    type_inference.set_decompile_prep_facts(analysis.ssa_func.decompile_prep_facts());
     type_inference.infer_function(&analysis.ssa_func);
 
     let mut inferred_params: Vec<InferredParam> = var_recovery
@@ -677,7 +678,6 @@ pub(crate) fn build_detached_function_analysis_artifact(
         ),
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
-
     Some(FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_blocks: analysis.pattern_ssa_blocks,

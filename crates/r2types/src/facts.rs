@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::context::{ExternalRegisterParamSpec, ExternalStackVarSpec};
+use crate::context::{
+    ExternalRegisterParamSpec, ExternalStackSlotSpec, ExternalStackVarSpec, StackSlotKey,
+};
 use crate::convert::CTypeLike;
 use crate::external::ExternalTypeDb;
 use crate::model::Signedness;
@@ -73,6 +75,8 @@ pub struct FunctionTypeFacts {
     pub merged_signature: Option<FunctionSignatureSpec>,
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
+    pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    // Compatibility view for offset-only decompiler consumers during the Wave 2A migration.
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
@@ -85,6 +89,7 @@ pub struct FunctionTypeFactInputs {
     pub merged_signature: Option<FunctionSignatureSpec>,
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
+    pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
@@ -103,6 +108,7 @@ impl FunctionTypeFacts {
         self.merged_signature.is_none()
             && self.known_function_signatures.is_empty()
             && self.register_params.is_empty()
+            && self.stack_slots.is_empty()
             && self.external_stack_vars.is_empty()
             && self.external_type_db.structs.is_empty()
             && self.external_type_db.unions.is_empty()
@@ -137,6 +143,7 @@ impl FunctionTypeFactsBuilder {
             merged_signature: self.inputs.merged_signature,
             known_function_signatures: self.inputs.known_function_signatures,
             register_params: self.inputs.register_params,
+            stack_slots: self.inputs.stack_slots,
             external_stack_vars: self.inputs.external_stack_vars,
             external_type_db: self.inputs.external_type_db,
             slot_type_overrides: self.inputs.slot_type_overrides,

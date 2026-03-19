@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 use r2ssa::{SSAFunction, SSAOp, SSAVar};
 use r2types::{CTypeLike, FunctionTypeFacts};
 
-use crate::ast::CType;
+use crate::analysis::utils;
+use crate::ast::{BinaryOp, CExpr, CType};
 
 fn type_like_to_ctype(ty: &CTypeLike) -> CType {
     match ty {
@@ -26,6 +27,25 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
         CTypeLike::Enum(name) => CType::Enum(name.clone()),
         CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
     }
+}
+
+fn parse_const_value(name: &str) -> Option<u64> {
+    let value = name.strip_prefix("const:")?;
+    let value = value.split('_').next().unwrap_or(value);
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if value.chars().all(|ch| ch.is_ascii_hexdigit())
+        && value
+            .chars()
+            .any(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_digit())
+    {
+        return u64::from_str_radix(value, 16).ok();
+    }
+    value.parse::<u64>().ok()
 }
 
 /// Variable information.
@@ -159,9 +179,39 @@ impl VariableRecovery {
         self.type_facts = type_facts;
     }
 
+    fn is_reserved_param_name(&self, name: &str) -> bool {
+        if self
+            .used_param_names
+            .iter()
+            .any(|used| used.eq_ignore_ascii_case(name))
+        {
+            return true;
+        }
+
+        let lower = name.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("arg")
+            && let Ok(idx) = rest.parse::<usize>()
+            && (1..=self.arg_regs.len()).contains(&idx)
+        {
+            return true;
+        }
+
+        self.type_facts
+            .merged_signature
+            .as_ref()
+            .map(|sig| {
+                sig.params
+                    .iter()
+                    .take(self.arg_regs.len())
+                    .any(|param| param.name.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or(false)
+    }
+
     fn external_stack_name_for_offset(&self, offset: i64) -> Option<String> {
         if let Some(var) = self.type_facts.external_stack_vars.get(&offset)
             && !var.name.is_empty()
+            && !self.is_reserved_param_name(&var.name)
         {
             return Some(var.name.clone());
         }
@@ -179,11 +229,12 @@ impl VariableRecovery {
             let Some(var) = self.type_facts.external_stack_vars.get(&ext_offset) else {
                 continue;
             };
-            if var.name.is_empty() {
+            if var.name.is_empty() || self.is_reserved_param_name(&var.name) {
                 continue;
             }
             let is_frame_based = var
                 .base
+                .legacy_name()
                 .as_deref()
                 .map(|base| base.eq_ignore_ascii_case("rbp") || base.eq_ignore_ascii_case("ebp"))
                 .unwrap_or(false);
@@ -334,18 +385,19 @@ impl VariableRecovery {
 
     /// Find stack variables (loads/stores relative to SP/FP).
     fn find_stack_variables(&mut self, func: &SSAFunction) {
+        let definitions = self.collect_definitions(func);
         for block in func.blocks() {
             for op in &block.ops {
                 match op {
                     SSAOp::Load { dst, addr, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr) {
+                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
                             let name = self.gen_stack_var_name(offset);
                             let ty = self.type_from_size(dst.size);
                             self.insert_var_info(dst.clone(), name, ty, VarAttrs::local(offset));
                         }
                     }
                     SSAOp::Store { addr, val, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr) {
+                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
                             let name = self.gen_stack_var_name(offset);
                             let ty = self.type_from_size(val.size);
                             self.insert_var_info(val.clone(), name, ty, VarAttrs::local(offset));
@@ -358,11 +410,53 @@ impl VariableRecovery {
     }
 
     /// Get stack offset from an address variable.
-    fn get_stack_offset(&self, addr: &SSAVar) -> Option<i64> {
-        if addr.name.contains(&self.sp_name) || addr.name.contains(&self.fp_name) {
-            return Some(0);
+    fn get_stack_offset(&self, addr: &SSAVar, definitions: &HashMap<String, CExpr>) -> Option<i64> {
+        utils::extract_stack_offset_from_var(addr, definitions, &self.fp_name, &self.sp_name)
+    }
+
+    fn collect_definitions(&self, func: &SSAFunction) -> HashMap<String, CExpr> {
+        let mut definitions = HashMap::new();
+        for block in func.blocks() {
+            for op in &block.ops {
+                match op {
+                    SSAOp::Copy { dst, src } => {
+                        definitions.insert(dst.display_name(), self.expr_for_ssa_var(src));
+                    }
+                    SSAOp::IntAdd { dst, a, b } => {
+                        definitions.insert(
+                            dst.display_name(),
+                            CExpr::binary(
+                                BinaryOp::Add,
+                                self.expr_for_ssa_var(a),
+                                self.expr_for_ssa_var(b),
+                            ),
+                        );
+                    }
+                    SSAOp::IntSub { dst, a, b } => {
+                        definitions.insert(
+                            dst.display_name(),
+                            CExpr::binary(
+                                BinaryOp::Sub,
+                                self.expr_for_ssa_var(a),
+                                self.expr_for_ssa_var(b),
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
         }
-        None
+        definitions
+    }
+
+    fn expr_for_ssa_var(&self, var: &SSAVar) -> CExpr {
+        if let Some(val) = parse_const_value(&var.name) {
+            if let Ok(signed) = i64::try_from(val) {
+                return CExpr::IntLit(signed);
+            }
+            return CExpr::UIntLit(val);
+        }
+        CExpr::Var(var.display_name())
     }
 
     /// Generate a name for a stack variable.
@@ -659,8 +753,11 @@ fn is_generic_arg_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use r2il::{R2ILBlock, R2ILOp, Varnode};
+    use r2ssa::SSAFunction;
     use r2types::{
-        ExternalStackVarSpec, FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFacts,
+        ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, FunctionParamSpec,
+        FunctionSignatureSpec, FunctionTypeFacts,
     };
 
     fn stack_var_spec_from_ctype(
@@ -671,7 +768,20 @@ mod tests {
         ExternalStackVarSpec {
             name: name.to_string(),
             ty: ty.as_ref().map(super::super::ctype_to_type_like),
-            base: base.map(str::to_string),
+            base: match base.map(|raw| raw.to_ascii_lowercase()) {
+                Some(raw) if raw == "rbp" || raw == "ebp" || raw == "bp" || raw == "fp" => {
+                    ExternalStackBase::FramePointer
+                }
+                Some(raw) if raw == "rsp" || raw == "esp" || raw == "sp" => {
+                    ExternalStackBase::StackPointer
+                }
+                Some(raw) => ExternalStackBase::Named(raw),
+                None => ExternalStackBase::default(),
+            },
+            role: ExternalStackSlotRole::Unknown,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
         }
     }
 
@@ -786,6 +896,25 @@ mod tests {
     }
 
     #[test]
+    fn test_external_stack_var_name_matching_param_alias_falls_back_to_generic_local() {
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(FunctionTypeFacts {
+            merged_signature: Some(signature_spec(vec![
+                ("a", Some(CType::Int(32))),
+                ("b", Some(CType::Int(32))),
+            ])),
+            external_stack_vars: HashMap::from([(
+                -8,
+                stack_var_spec_from_ctype("a", Some(CType::Int(32)), Some("RBP")),
+            )]),
+            ..FunctionTypeFacts::default()
+        });
+
+        let name = vr.gen_stack_var_name(8);
+        assert_eq!(name, "local_8");
+    }
+
+    #[test]
     fn test_external_signature_overrides_meaningful_param_name_and_type() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
         vr.set_type_facts(FunctionTypeFacts {
@@ -834,6 +963,52 @@ mod tests {
 
         assert_eq!(name, "count");
         assert_eq!(ty, CType::Int(64));
+    }
+
+    #[test]
+    fn test_recover_finds_stack_local_through_temp_frame_address() {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:addr", 1, 8),
+                a: SSAVar::new("RBP", 1, 8),
+                b: SSAVar::new("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: SSAVar::new("tmp:addr", 1, 8),
+                val: SSAVar::new("EAX", 1, 4),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("RIP", 1, 8),
+            },
+        ];
+
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(FunctionTypeFacts {
+            external_stack_vars: HashMap::from([(
+                -4,
+                stack_var_spec_from_ctype("sum", Some(CType::Int(32)), Some("RBP")),
+            )]),
+            ..FunctionTypeFacts::default()
+        });
+
+        vr.recover(&func);
+
+        let local_names: Vec<_> = vr
+            .locals()
+            .into_iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert!(
+            local_names.iter().any(|name| name == "sum"),
+            "expected temp-address store to recover named stack local, got {local_names:?}"
+        );
+        assert_eq!(vr.get_name(&SSAVar::new("EAX", 1, 4)), "sum");
     }
 
     #[test]

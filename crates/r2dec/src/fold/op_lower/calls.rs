@@ -149,6 +149,14 @@ impl<'a> FoldingContext<'a> {
             );
         match binding.arg {
             analysis::SemanticCallArg::Semantic(value) => {
+                if preserve_stable_input_slot
+                    && Self::semantic_value_has_negative_stack_slot(&value)
+                    && let Some(expr) = self
+                        .render_imported_semantic_arg_value(&value, !allow_string_like_resolution)
+                    && self.is_preservable_named_stack_slot_expr(&expr)
+                {
+                    return expr;
+                }
                 let expr = self
                     .render_imported_semantic_arg_value(&value, !allow_string_like_resolution)
                     .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(&value));
@@ -188,6 +196,14 @@ impl<'a> FoldingContext<'a> {
 
         match binding.arg {
             analysis::SemanticCallArg::Semantic(value) => {
+                if preserve_stable_input_slot
+                    && Self::semantic_value_has_negative_stack_slot(&value)
+                    && let Some(expr) = self
+                        .render_imported_semantic_arg_value(&value, !allow_string_like_resolution)
+                    && self.is_preservable_named_stack_slot_expr(&expr)
+                {
+                    return expr;
+                }
                 let expr = self
                     .render_imported_semantic_arg_value(&value, !allow_string_like_resolution)
                     .unwrap_or_else(|| self.expr_for_semantic_call_arg_fallback(&value));
@@ -268,6 +284,9 @@ impl<'a> FoldingContext<'a> {
             }) || self
                 .call_arg_contains_transient_name(&rendered_args[target_idx], 0)
                 || self.call_arg_contains_stack_placeholder(&rendered_args[target_idx], 0);
+            let should_replace = should_replace
+                || (self.is_direct_constish_visible_expr(&rendered_args[target_idx], 0)
+                    && self.is_preservable_named_stack_slot_expr(&source_arg));
             if should_replace {
                 rendered_args[target_idx] = source_arg;
             }
@@ -399,7 +418,13 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        let best = best.unwrap_or(rewritten);
+        let best = best.unwrap_or(rewritten.clone());
+        if preserve_stable_input_slot
+            && self.is_preservable_named_stack_slot_expr(&rewritten)
+            && self.is_direct_constish_visible_expr(&best, 0)
+        {
+            return rewritten;
+        }
         let rewritten_best = self.rewrite_stack_expr(best.clone());
         self.choose_preferred_imported_call_arg_expr(
             Some(best.clone()),
@@ -470,7 +495,14 @@ impl<'a> FoldingContext<'a> {
             preserve_stable_input_slot,
             preserve_explicit_call_expr,
         );
-        self.rewrite_stack_expr(best.unwrap_or(rewritten))
+        let best = best.unwrap_or(rewritten.clone());
+        if preserve_stable_input_slot
+            && self.is_preservable_named_stack_slot_expr(&rewritten)
+            && self.is_direct_constish_visible_expr(&best, 0)
+        {
+            return rewritten;
+        }
+        self.rewrite_stack_expr(best)
     }
 
     fn imported_input_binding_prefers_pointer_identity(
@@ -488,6 +520,15 @@ impl<'a> FoldingContext<'a> {
             }
             analysis::SemanticCallArg::FallbackExpr(expr) => {
                 self.call_arg_contains_stack_placeholder(expr, 0)
+            }
+            _ => false,
+        }
+    }
+
+    fn semantic_value_has_negative_stack_slot(value: &analysis::SemanticValue) -> bool {
+        match value {
+            analysis::SemanticValue::Load { addr, .. } | analysis::SemanticValue::Address(addr) => {
+                matches!(addr.base, analysis::BaseRef::StackSlot(offset) if offset < 0)
             }
             _ => false,
         }
