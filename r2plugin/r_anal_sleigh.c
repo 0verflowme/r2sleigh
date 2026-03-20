@@ -289,36 +289,29 @@ static const char *function_context_var_kind_name(bool is_register) {
 	return "stack";
 }
 
-static const char *function_context_stack_base_name(const RAnalFunctionContextStackBase *base) {
-	if (!base) {
-		return NULL;
+static const char *function_context_stack_base_name(RAnalFcnSlotBase base, const char *base_name) {
+	if (base_name) {
+		return base_name;
 	}
-	if (base->name) {
-		return base->name;
-	}
-	switch (base->kind) {
-	case R_ANAL_FUNCTION_CONTEXT_STACK_BASE_FRAME_POINTER:
+	switch (base) {
+	case R_ANAL_FCN_BASE_BP:
 		return "bp";
-	case R_ANAL_FUNCTION_CONTEXT_STACK_BASE_STACK_POINTER:
+	case R_ANAL_FCN_BASE_SP:
 		return "sp";
 	default:
 		return NULL;
 	}
 }
 
-static const char *function_context_stack_slot_role_name(RAnalFunctionContextStackSlotRole role) {
+static const char *function_context_stack_slot_role_name(RAnalFcnSlotRole role) {
 	switch (role) {
-	case R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_LOCAL:
+	case R_ANAL_FCN_SLOT_LOCAL:
 		return "local";
-	case R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_STACK_ARG:
+	case R_ANAL_FCN_SLOT_ARG:
 		return "stack_arg";
-	case R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_PARAM_HOME:
+	case R_ANAL_FCN_SLOT_HOME:
 		return "param_home";
-	case R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_SAVED_REG:
-		return "saved_reg";
-	case R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_SAVED_FP:
-		return "saved_fp";
-	case R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_UNKNOWN:
+	case R_ANAL_FCN_SLOT_UNKNOWN:
 	default:
 		return "unknown";
 	}
@@ -402,7 +395,7 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	if (!anal || !fcn) {
 		return strdup ("{}");
 	}
-	RAnalFunctionContext *ctx = r_anal_function_context_collect (anal, fcn);
+	RAnalFcnContext *ctx = r_anal_function_context_collect (anal, fcn);
 
 	PJ *pj = pj_new ();
 	if (!pj) {
@@ -416,21 +409,21 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	if (fcn->name) {
 		pj_ks (pj, "name", fcn->name);
 	}
-	if (ctx && ctx->ret_type) {
-		pj_ks (pj, "ret", ctx->ret_type);
+	if (ctx && ctx->signature && ctx->signature->ret_type) {
+		pj_ks (pj, "ret", ctx->signature->ret_type);
 	}
-	if (ctx && ctx->callconv) {
-		pj_ks (pj, "callconv", ctx->callconv);
+	if (ctx && ctx->signature && ctx->signature->callconv) {
+		pj_ks (pj, "callconv", ctx->signature->callconv);
 	}
-	if (ctx && ctx->noreturn) {
+	if (ctx && ctx->signature && ctx->signature->noreturn) {
 		pj_kb (pj, "noreturn", true);
 	}
 	pj_k (pj, "params");
 	pj_a (pj);
 	RListIter *iter;
-	RAnalFunctionContextParam *param;
-	if (ctx && ctx->params) {
-		r_list_foreach (ctx->params, iter, param) {
+	RAnalFunctionParam *param;
+	if (ctx && ctx->signature && ctx->signature->params) {
+		r_list_foreach (ctx->signature->params, iter, param) {
 			pj_o (pj);
 			if (param->name) {
 				pj_ks (pj, "name", param->name);
@@ -446,33 +439,33 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 
 	pj_k (pj, "vars");
 	pj_a (pj);
-	RAnalFunctionContextRegisterParam *reg_param;
-	if (ctx && ctx->register_params) {
-		r_list_foreach (ctx->register_params, iter, reg_param) {
+	RAnalFcnRegArg *reg_arg;
+	if (ctx && ctx->reg_args) {
+		r_list_foreach (ctx->reg_args, iter, reg_arg) {
 			pj_o (pj);
 			pj_ks (pj, "kind", function_context_var_kind_name (true));
-			if (reg_param->name) {
-				pj_ks (pj, "name", reg_param->name);
+			if (reg_arg->name) {
+				pj_ks (pj, "name", reg_arg->name);
 			}
-			if (reg_param->type) {
-				pj_ks (pj, "type", reg_param->type);
+			if (reg_arg->type) {
+				pj_ks (pj, "type", reg_arg->type);
 			}
-			if (reg_param->reg) {
-				pj_ks (pj, "reg", reg_param->reg);
+			if (reg_arg->reg) {
+				pj_ks (pj, "reg", reg_arg->reg);
 			}
-			if (reg_param->param_index >= 0) {
-				pj_ki (pj, "param_index", (ut64)reg_param->param_index);
+			if (reg_arg->arg_index >= 0) {
+				pj_ki (pj, "param_index", (ut64)reg_arg->arg_index);
 				pj_kb (pj, "is_arg", true);
 			}
 			pj_end (pj);
 		}
 	}
-	RAnalFunctionContextStackSlot *slot;
-	if (ctx && ctx->stack_slots) {
-		r_list_foreach (ctx->stack_slots, iter, slot) {
-			const char *base = function_context_stack_base_name (&slot->base);
-			const bool is_arg = slot->role == R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_STACK_ARG
-				|| slot->role == R_ANAL_FUNCTION_CONTEXT_STACK_SLOT_ROLE_PARAM_HOME;
+	RAnalFcnSlot *slot;
+	if (ctx && ctx->slots) {
+		r_list_foreach (ctx->slots, iter, slot) {
+			const char *base = function_context_stack_base_name (slot->base, slot->base_name);
+			const bool is_arg = slot->role == R_ANAL_FCN_SLOT_ARG
+				|| slot->role == R_ANAL_FCN_SLOT_HOME;
 		pj_o (pj);
 			pj_ks (pj, "kind", function_context_var_kind_name (false));
 			if (slot->name) {
@@ -487,14 +480,14 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 			pj_ks (pj, "role", function_context_stack_slot_role_name (slot->role));
 			pj_kb (pj, "is_arg", is_arg);
 			pj_ki (pj, "offset", slot->offset);
-			if (slot->param_index >= 0) {
-				pj_ki (pj, "param_index", (ut64)slot->param_index);
+			if (slot->arg_index >= 0) {
+				pj_ki (pj, "param_index", (ut64)slot->arg_index);
 			}
-			if (slot->param_name) {
-				pj_ks (pj, "param_name", slot->param_name);
+			if (slot->arg_name) {
+				pj_ks (pj, "param_name", slot->arg_name);
 			}
-			if (slot->source_reg) {
-				pj_ks (pj, "source_reg", slot->source_reg);
+			if (slot->home_reg) {
+				pj_ks (pj, "source_reg", slot->home_reg);
 			}
 			pj_end (pj);
 		}
