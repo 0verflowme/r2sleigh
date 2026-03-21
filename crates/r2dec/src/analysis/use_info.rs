@@ -79,11 +79,13 @@ fn analyze_with_definition_overrides_mode(
 
     analyze_call_args(&mut scratch, blocks, env);
     bind_single_use_call_result_definitions(&mut scratch, blocks, env);
+    propagate_call_result_aliases(&mut scratch.info);
     rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
     if matches!(mode, UseInfoAnalysisMode::Full) {
         coalesce_variables(&mut scratch, blocks, env);
         build_formatted_defs(&mut scratch, env);
     }
+    scratch.info.producers = scratch.producers.clone();
 
     scratch.info
 }
@@ -102,6 +104,7 @@ fn rerun_semantic_call_analysis_after_result_binding(
     refresh_semantic_values(scratch, blocks, env);
     analyze_call_args(scratch, blocks, env);
     bind_single_use_call_result_definitions(scratch, blocks, env);
+    propagate_call_result_aliases(&mut scratch.info);
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +192,24 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
             info.call_args.insert(*key, args.clone());
         }
     }
+    for (source_call, aliases) in &baseline.call_result_aliases {
+        info.call_result_aliases
+            .entry(*source_call)
+            .or_default()
+            .extend(aliases.iter().cloned());
+    }
+    for (source_call, expr) in &baseline.call_result_exprs {
+        info.call_result_exprs
+            .entry(*source_call)
+            .or_insert_with(|| expr.clone());
+    }
+    for (alias, source_call) in &baseline.call_result_source_by_alias {
+        info.call_result_source_by_alias
+            .entry(alias.clone())
+            .or_insert(*source_call);
+    }
+    info.direct_call_result_aliases
+        .extend(baseline.direct_call_result_aliases.iter().cloned());
 
     info.consumed_by_call
         .extend(baseline.consumed_by_call.iter().cloned());
@@ -216,6 +237,31 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
             .and_modify(|existing| *existing = existing.merge(*value))
             .or_insert(*value);
     }
+}
+
+fn record_call_result_alias(info: &mut UseInfo, source_call: (u64, usize), alias: &str) {
+    if alias.is_empty() {
+        return;
+    }
+    info.call_result_aliases
+        .entry(source_call)
+        .or_default()
+        .insert(alias.to_string());
+    info.call_result_source_by_alias
+        .insert(alias.to_string(), source_call);
+}
+
+fn record_direct_call_result_alias(info: &mut UseInfo, alias: &str) {
+    if alias.is_empty() {
+        return;
+    }
+    info.direct_call_result_aliases.insert(alias.to_string());
+}
+
+fn record_call_result_expr(info: &mut UseInfo, source_call: (u64, usize), expr: &CExpr) {
+    info.call_result_exprs
+        .entry(source_call)
+        .or_insert_with(|| expr.clone());
 }
 
 fn preserve_semantic_fact_map<K>(
@@ -1903,6 +1949,7 @@ fn collect_definitions(
                 &scratch.info,
                 &addr_shape,
                 forwarded_semantic.as_ref(),
+                addr,
                 dst,
                 env,
             );
@@ -1917,26 +1964,28 @@ fn collect_definitions(
                     .insert(dst.display_name(), StackSlotProvenance::new(offset));
             }
 
-            if let Some(stored_val) = block_stack_values
-                .get(&offset)
-                .cloned()
-                .or_else(|| preserved_positive_stack_values.get(&offset).cloned())
-            {
-                scratch
-                    .info
-                    .copy_sources
-                    .insert(dst.display_name(), stored_val.display_name());
-                scratch.info.forwarded_values.insert(
-                    dst.display_name(),
-                    ValueProvenance {
-                        source: stored_val.display_name(),
-                        source_var: Some(stored_val),
-                        stack_slot: Some(offset),
-                    },
-                );
-            }
-            if let Some(value) = forwarded_semantic {
-                insert_semantic_value(&mut scratch.info, dst.display_name(), value);
+            if should_tag_loaded_value_as_stack_slot {
+                if let Some(stored_val) = block_stack_values
+                    .get(&offset)
+                    .cloned()
+                    .or_else(|| preserved_positive_stack_values.get(&offset).cloned())
+                {
+                    scratch
+                        .info
+                        .copy_sources
+                        .insert(dst.display_name(), stored_val.display_name());
+                    scratch.info.forwarded_values.insert(
+                        dst.display_name(),
+                        ValueProvenance {
+                            source: stored_val.display_name(),
+                            source_var: Some(stored_val),
+                            stack_slot: Some(offset),
+                        },
+                    );
+                }
+                if let Some(value) = forwarded_semantic {
+                    insert_semantic_value(&mut scratch.info, dst.display_name(), value);
+                }
             }
         }
 
@@ -2141,7 +2190,8 @@ fn should_tag_loaded_value_as_stack_slot(
     info: &UseInfo,
     addr_shape: &Option<NormalizedAddr>,
     forwarded_semantic: Option<&SemanticValue>,
-    dst: &SSAVar,
+    addr: &SSAVar,
+    _dst: &SSAVar,
     env: &PassEnv<'_>,
 ) -> bool {
     if let Some(shape) = addr_shape
@@ -2150,15 +2200,19 @@ fn should_tag_loaded_value_as_stack_slot(
         return false;
     }
 
-    match forwarded_semantic {
-        Some(SemanticValue::Address(_)) | Some(SemanticValue::Load { .. }) => false,
-        Some(SemanticValue::Scalar(ScalarValue::Root(root)))
-            if semantic_var_is_pointer_like(info, &root.var, env) =>
-        {
-            false
-        }
-        _ => !semantic_var_is_pointer_like(info, dst, env),
+    let addr_name = addr.display_name();
+    let addr_copy_root = resolve_copy_root_name(info, &addr_name);
+    if stack_reloaded_value_slot_for_name(info, &addr_name).is_some()
+        || (addr_copy_root != addr_name
+            && stack_reloaded_value_slot_for_name(info, &addr_copy_root).is_some())
+    {
+        return false;
     }
+
+    !matches!(
+        forwarded_semantic,
+        Some(SemanticValue::Address(_)) | Some(SemanticValue::Load { .. })
+    )
 }
 
 fn merged_slot_store_value_for_pred(
@@ -2386,6 +2440,12 @@ fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'
             );
         }
         SSAOp::Load { dst, addr, .. } => {
+            let should_preserve_rooted_indirect_load_shape = |value: &SemanticValue| {
+                matches!(
+                    value,
+                    SemanticValue::Scalar(ScalarValue::Root(root)) if root.var.size > dst.size
+                )
+            };
             if let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env)
                 && let Some(key) = frame_object_field_key(&scratch.info, &shape, env, 0)
                 && let Some(value) = scratch.info.frame_object_field_roots.get(&key).cloned()
@@ -2414,6 +2474,7 @@ fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'
                         .map(|slot| slot.offset)
                 })
                 && let Some(value) = scratch.info.stable_stack_values.get(&offset).cloned()
+                && !should_preserve_rooted_indirect_load_shape(&value)
             {
                 scratch
                     .info
@@ -2424,6 +2485,7 @@ fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'
             if let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env)
                 && let Some(offset) = normalized_stack_slot_offset(&shape)
                 && let Some(value) = scratch.info.stable_stack_values.get(&offset).cloned()
+                && !should_preserve_rooted_indirect_load_shape(&value)
             {
                 scratch
                     .info
@@ -2587,11 +2649,26 @@ fn semantic_addr_from_add_sub(
 }
 
 fn stack_slot_offset_for_addr(info: &UseInfo, addr: &SSAVar, env: &PassEnv<'_>) -> Option<i64> {
-    semantic_addr_for_var(info, addr, env)
-        .and_then(|shape| normalized_stack_slot_offset(&shape))
-        .or_else(|| {
-            utils::extract_stack_offset_from_var(addr, &info.definitions, env.fp_name, env.sp_name)
-        })
+    if let Some(shape) = semantic_addr_for_var(info, addr, env) {
+        if let Some(offset) = normalized_stack_slot_offset(&shape) {
+            return Some(offset);
+        }
+        if semantic_addr_has_meaningful_base(&shape) {
+            return None;
+        }
+    }
+
+    let key = addr.display_name();
+    let copy_root = resolve_copy_root_name(info, &key);
+    if typed_pointer_stack_slot_for_name(info, &key, env).is_some()
+        || (copy_root != key && typed_pointer_stack_slot_for_name(info, &copy_root, env).is_some())
+        || stack_reloaded_value_slot_for_name(info, &key).is_some()
+        || (copy_root != key && stack_reloaded_value_slot_for_name(info, &copy_root).is_some())
+    {
+        return None;
+    }
+
+    utils::extract_stack_offset_from_var(addr, &info.definitions, env.fp_name, env.sp_name)
 }
 
 fn stack_slot_offset_from_add_sub(
@@ -2762,6 +2839,36 @@ fn var_is_ptr_sized_entry_arg_root(var: &SSAVar, env: &PassEnv<'_>) -> bool {
             .any(|reg_name| reg_name.eq_ignore_ascii_case(&var.name))
 }
 
+fn entry_arg_root_type_hint_allows_pointer_base(
+    info: &UseInfo,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+) -> bool {
+    let mut saw_type_hint = false;
+    for name in semantic_type_hint_names(info, var, env) {
+        let hint = info
+            .type_hints
+            .get(&name)
+            .or_else(|| info.type_hints.get(&name.to_ascii_lowercase()))
+            .or_else(|| env.type_hints.get(&name))
+            .or_else(|| env.type_hints.get(&name.to_ascii_lowercase()));
+        let Some(hint) = hint else {
+            continue;
+        };
+        saw_type_hint = true;
+        if matches!(
+            hint,
+            crate::ast::CType::Pointer(_)
+                | crate::ast::CType::Struct(_)
+                | crate::ast::CType::Array(_, _)
+        ) {
+            return true;
+        }
+    }
+
+    !saw_type_hint
+}
+
 fn resolve_ptr_sized_entry_arg_root_var(
     info: &UseInfo,
     var: &SSAVar,
@@ -2772,7 +2879,9 @@ fn resolve_ptr_sized_entry_arg_root_var(
         return None;
     }
 
-    if var_is_ptr_sized_entry_arg_root(var, env) {
+    if var_is_ptr_sized_entry_arg_root(var, env)
+        && entry_arg_root_type_hint_allows_pointer_base(info, var, env)
+    {
         return Some(var.clone());
     }
 
@@ -2912,6 +3021,40 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
         .unwrap_or(false)
 }
 
+fn stack_slot_offset_has_pointer_type_hint(info: &UseInfo, offset: i64, env: &PassEnv<'_>) -> bool {
+    info.stack_slots.iter().any(|(name, slot)| {
+        slot.offset == offset
+            && info
+                .type_hints
+                .get(name)
+                .or_else(|| info.type_hints.get(&name.to_ascii_lowercase()))
+                .or_else(|| env.type_hints.get(name))
+                .or_else(|| env.type_hints.get(&name.to_ascii_lowercase()))
+                .is_some_and(|ty| {
+                    matches!(
+                        ty,
+                        crate::ast::CType::Pointer(_)
+                            | crate::ast::CType::Struct(_)
+                            | crate::ast::CType::Array(_, _)
+                    )
+                })
+    })
+}
+
+fn typed_pointer_stack_slot_for_name(info: &UseInfo, name: &str, env: &PassEnv<'_>) -> Option<i64> {
+    info.forwarded_values
+        .get(name)
+        .and_then(|prov| prov.stack_slot)
+        .or_else(|| info.stack_slots.get(name).map(|slot| slot.offset))
+        .filter(|offset| stack_slot_offset_has_pointer_type_hint(info, *offset, env))
+}
+
+fn stack_reloaded_value_slot_for_name(info: &UseInfo, name: &str) -> Option<i64> {
+    info.forwarded_values
+        .get(name)
+        .and_then(|prov| prov.stack_slot)
+}
+
 fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> Vec<String> {
     let mut names = Vec::new();
     let push_unique = |names: &mut Vec<String>, name: String| {
@@ -2922,10 +3065,27 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
             names.push(name);
         }
     };
+    let push_stack_slot_names = |names: &mut Vec<String>, offset: i64| {
+        for (slot_name, slot) in &info.stack_slots {
+            if slot.offset == offset {
+                push_unique(names, slot_name.clone());
+                push_unique(names, slot_name.to_ascii_lowercase());
+            }
+        }
+    };
 
     let key = var.display_name();
     push_unique(&mut names, key.clone());
     push_unique(&mut names, key.to_ascii_lowercase());
+
+    if let Some(offset) = info
+        .forwarded_values
+        .get(&key)
+        .and_then(|prov| prov.stack_slot)
+        .or_else(|| info.stack_slots.get(&key).map(|slot| slot.offset))
+    {
+        push_stack_slot_names(&mut names, offset);
+    }
 
     if let Some(alias) = info.var_aliases.get(&key) {
         push_unique(&mut names, alias.clone());
@@ -2944,6 +3104,14 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
     if root != key {
         push_unique(&mut names, root.clone());
         push_unique(&mut names, root.to_ascii_lowercase());
+        if let Some(offset) = info
+            .forwarded_values
+            .get(&root)
+            .and_then(|prov| prov.stack_slot)
+            .or_else(|| info.stack_slots.get(&root).map(|slot| slot.offset))
+        {
+            push_stack_slot_names(&mut names, offset);
+        }
         if let Some(alias) = info.var_aliases.get(&root) {
             push_unique(&mut names, alias.clone());
             push_unique(&mut names, alias.to_ascii_lowercase());
@@ -3081,6 +3249,16 @@ fn semantic_addr_for_var_with_depth(
     }
 
     let copy_root = resolve_copy_root_name(info, &key);
+    if var.size == ptr_bytes
+        && (typed_pointer_stack_slot_for_name(info, &key, env).is_some()
+            || (copy_root != key
+                && typed_pointer_stack_slot_for_name(info, &copy_root, env).is_some())
+            || stack_reloaded_value_slot_for_name(info, &key).is_some()
+            || (copy_root != key && stack_reloaded_value_slot_for_name(info, &copy_root).is_some()))
+    {
+        return Some(normalized_addr_from_base_var(var));
+    }
+
     if copy_root != key
         && let Some(root_var) = ssa_var_from_display_name(&copy_root, var.size)
         && root_var != *var
@@ -3118,7 +3296,12 @@ fn semantic_addr_for_var_with_depth(
         return add_addr_offset(base, *offset);
     }
 
-    if (copy_root != key || key.starts_with("tmp:"))
+    let has_non_address_semantic = matches!(
+        info.semantic_values.get(&key),
+        Some(SemanticValue::Scalar(_)) | Some(SemanticValue::Load { .. })
+    );
+    if !has_non_address_semantic
+        && (copy_root != key || key.starts_with("tmp:"))
         && let Some(offset) =
             utils::extract_stack_offset_from_var(var, &info.definitions, env.fp_name, env.sp_name)
     {
@@ -4398,6 +4581,18 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                     } else {
                         let dst_key = dst.display_name();
                         let expr = lower.expr_for_ssa_name(&dst_key);
+                        let (input_var, input_expr) = match prev_op {
+                            SSAOp::Copy { src, .. }
+                            | SSAOp::IntZExt { src, .. }
+                            | SSAOp::IntSExt { src, .. }
+                            | SSAOp::Trunc { src, .. }
+                            | SSAOp::Cast { src, .. }
+                            | SSAOp::Subpiece { src, .. } => {
+                                let source_expr = lower.expr_for_ssa_name(&src.display_name());
+                                (src, source_expr)
+                            }
+                            _ => (dst, expr.clone()),
+                        };
                         let result_candidate =
                             call_result_expr_for_post_call_source(&post_call_query, i, dst)
                                 .or_else(|| {
@@ -4420,17 +4615,18 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                             .unwrap_or_else(|| {
                                 CallArgBinding::input(semantic_call_arg_for_var(
                                     &scratch.info,
-                                    dst,
-                                    expr.clone(),
+                                    input_var,
+                                    input_expr.clone(),
                                     env,
                                 ))
+                                .with_source_var(input_var)
                             });
                         let binding_has_stable_negative_source =
                             canonicalize_call_arg_binding_to_negative_stack_load(
                                 &scratch.info,
                                 &mut binding,
-                                Some(dst),
-                                dst.size,
+                                Some(input_var),
+                                input_var.size,
                             )
                             .is_some();
                         if !binding.is_result()
@@ -4452,23 +4648,38 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                                     ))
                                     || semantic_call_arg_score(
                                         &scratch.info,
-                                        dst,
+                                        input_var,
                                         &family_arg,
-                                        &expr,
+                                        &input_expr,
                                         env,
                                     ) > semantic_call_arg_score(
                                         &scratch.info,
-                                        dst,
+                                        input_var,
                                         &binding.arg,
-                                        &expr,
+                                        &input_expr,
                                         env,
                                     );
                             if should_replace {
                                 binding.arg = family_arg;
                             }
                         }
-                        let score =
-                            semantic_call_arg_score(&scratch.info, dst, &binding.arg, &expr, env);
+                        if !binding.is_result() && !binding_has_stable_negative_source {
+                            improve_call_arg_binding_from_copy_root(
+                                &scratch.info,
+                                &mut binding,
+                                input_var,
+                                &input_expr,
+                                &lower,
+                                env,
+                            );
+                        }
+                        let score = semantic_call_arg_score(
+                            &scratch.info,
+                            input_var,
+                            &binding.arg,
+                            &input_expr,
+                            env,
+                        );
                         Some((dst_base, binding, score, i, dst_key))
                     }
                 } else {
@@ -4528,9 +4739,10 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                         && !phi.dst.name.eq_ignore_ascii_case(env.fp_name)
                 }) {
                     let dst_key = phi.dst.display_name();
-                    args.push(CallArgBinding::input(SemanticCallArg::value_root(
-                        phi.dst.clone(),
-                    )));
+                    args.push(
+                        CallArgBinding::input(SemanticCallArg::value_root(phi.dst.clone()))
+                            .with_source_var(&phi.dst),
+                    );
                     consumed_keys.push(dst_key);
                 } else {
                     break;
@@ -4593,6 +4805,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 let call_expr =
                     call_result_expr_for_call_at(&scratch.info, &lower, block.addr, call_idx, op);
                 if let Some(call_expr) = call_expr {
+                    record_call_result_expr(&mut scratch.info, (block.addr, call_idx), &call_expr);
                     bind_call_result_alias_definitions(
                         &mut scratch.info,
                         block,
@@ -4676,6 +4889,7 @@ fn bind_single_use_call_result_definitions(
                 continue;
             };
 
+            record_call_result_expr(&mut scratch.info, (block.addr, op_idx), &call_expr);
             bind_call_result_alias_definitions(
                 &mut scratch.info,
                 block,
@@ -4747,6 +4961,8 @@ fn bind_call_result_alias_definitions(
                     .unwrap_or(0)
                     > 0
             {
+                record_call_result_alias(info, (block.addr, call_idx), &dst.display_name());
+                record_direct_call_result_alias(info, &dst.display_name());
                 info.definitions
                     .insert(dst.display_name(), call_expr.clone());
                 if let Some(call_result_defs) = call_result_defs.as_deref_mut() {
@@ -4756,7 +4972,122 @@ fn bind_call_result_alias_definitions(
                 }
             }
         }
+
+        for src in next_op.sources() {
+            let src_key = src.display_name();
+            let uses_current_call_result = {
+                let lower = LowerCtx {
+                    definitions: &info.definitions,
+                    semantic_values: &info.semantic_values,
+                    use_counts: &info.use_counts,
+                    condition_vars: &info.condition_vars,
+                    pinned: &info.pinned,
+                    var_aliases: &info.var_aliases,
+                    param_register_aliases: env.param_register_aliases,
+                    type_hints: &info.type_hints,
+                    ptr_arith: &info.ptr_arith,
+                    stack_slots: &info.stack_slots,
+                    forwarded_values: &info.forwarded_values,
+                    function_names: env.function_names,
+                    strings: env.strings,
+                    symbols: env.symbols,
+                    type_oracle: env.type_oracle,
+                };
+                let query = PostCallResultQuery {
+                    info,
+                    lower: &lower,
+                    block_addr: block.addr,
+                    ops: &block.ops,
+                    producers: producer_map,
+                    env,
+                };
+                call_result_expr_for_post_call_source(&query, next_idx, src)
+                    .is_some_and(|(result_call_idx, _)| result_call_idx == call_idx)
+            };
+            if !uses_current_call_result || info.use_counts.get(&src_key).copied().unwrap_or(0) == 0
+            {
+                continue;
+            }
+
+            record_call_result_alias(info, (block.addr, call_idx), &src_key);
+            record_direct_call_result_alias(info, &src_key);
+            info.definitions.insert(src_key.clone(), call_expr.clone());
+            info.inlined_call_results.insert((block.addr, call_idx));
+            if let Some(call_result_defs) = call_result_defs.as_deref_mut() {
+                call_result_defs.insert(src_key.clone(), call_expr.clone());
+                call_result_defs.insert(src_key.to_ascii_lowercase(), call_expr.clone());
+            }
+        }
         next_idx += 1;
+    }
+}
+
+fn call_result_source_for_alias(info: &UseInfo, alias: &str) -> Option<(u64, usize)> {
+    info.call_result_source_by_alias
+        .get(alias)
+        .copied()
+        .or_else(|| {
+            info.call_result_source_by_alias
+                .get(&alias.to_ascii_lowercase())
+                .copied()
+        })
+}
+
+fn propagate_call_result_aliases(info: &mut UseInfo) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for (dst, src) in info.copy_sources.clone() {
+            let Some(source_call) = call_result_source_for_alias(info, &src) else {
+                continue;
+            };
+            if call_result_source_for_alias(info, &dst).is_none() {
+                record_call_result_alias(info, source_call, &dst);
+                changed = true;
+            }
+        }
+
+        for (dst, prov) in info.forwarded_values.clone() {
+            let source_call = call_result_source_for_alias(info, &prov.source).or_else(|| {
+                prov.source_var.as_ref().and_then(|source_var| {
+                    call_result_source_for_alias(info, &source_var.display_name())
+                })
+            });
+            let Some(source_call) = source_call else {
+                continue;
+            };
+            if call_result_source_for_alias(info, &dst).is_none() {
+                record_call_result_alias(info, source_call, &dst);
+                changed = true;
+            }
+        }
+
+        for (name, value) in info.semantic_values.clone() {
+            let source_alias = match value {
+                SemanticValue::Scalar(ScalarValue::Root(root)) => Some(root.display_name()),
+                SemanticValue::Scalar(ScalarValue::Expr(expr)) => {
+                    lowered_var_alias_from_expr(&expr, 0).map(|alias| alias.display_name())
+                }
+                SemanticValue::Address(NormalizedAddr {
+                    base: BaseRef::Value(root),
+                    index: None,
+                    scale_bytes: 0,
+                    offset_bytes: 0,
+                }) => Some(root.display_name()),
+                _ => None,
+            };
+            let Some(source_alias) = source_alias else {
+                continue;
+            };
+            let Some(source_call) = call_result_source_for_alias(info, &source_alias) else {
+                continue;
+            };
+            if call_result_source_for_alias(info, &name).is_none() {
+                record_call_result_alias(info, source_call, &name);
+                changed = true;
+            }
+        }
     }
 }
 
@@ -5170,6 +5501,7 @@ fn rewrite_call_result_binding(
         role: CallArgRole::Result,
         stack_offset: binding.stack_offset,
         source_call: binding.source_call,
+        source_var_name: binding.source_var_name.clone(),
     })
 }
 
@@ -5335,6 +5667,7 @@ fn collect_immediate_stack_call_args(
                                     CallArgBinding::input(preferred_stack_input_call_arg(
                                         info, val, &expr, env,
                                     ))
+                                    .with_source_var(val)
                                 })
                         })
                         .with_stack_offset(offset);
@@ -5363,6 +5696,16 @@ fn collect_immediate_stack_call_args(
                         if should_replace {
                             binding.arg = family_arg;
                         }
+                    }
+                    if !binding.is_result() && !binding_has_stable_negative_source {
+                        improve_call_arg_binding_from_copy_root(
+                            info,
+                            &mut binding,
+                            val,
+                            &expr,
+                            lower,
+                            env,
+                        );
                     }
                     args.push((offset, binding, key, addr.display_name()));
                 }
@@ -5442,6 +5785,7 @@ fn preserved_input_binding_from_stack_home(
         &expr,
         query.env,
     ))
+    .with_source_var(&preserved_input)
     .with_stack_offset(printf_stack_offset);
     canonicalize_call_arg_binding_to_negative_stack_load(
         query.info,
@@ -5531,9 +5875,84 @@ fn preferred_stack_input_call_arg(
         .cloned()
         .map(SemanticCallArg::semantic)
         .unwrap_or_else(|| semantic_call_arg_for_var(info, var, expr.clone(), env));
-    let mut binding = CallArgBinding::input(arg);
+    let mut binding = CallArgBinding::input(arg).with_source_var(var);
     canonicalize_call_arg_binding_to_negative_stack_load(info, &mut binding, Some(var), var.size);
     binding.arg
+}
+
+fn semantic_call_arg_is_transient_register_fallback(
+    arg: &SemanticCallArg,
+    env: &PassEnv<'_>,
+) -> bool {
+    match arg {
+        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
+            let lower = name.to_ascii_lowercase();
+            is_call_arg_placeholder_name(&lower)
+                || is_call_arg_transient_name(&lower)
+                || env.param_register_aliases.contains_key(&lower)
+        }
+        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
+        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
+            semantic_call_arg_is_transient_register_fallback(
+                &SemanticCallArg::FallbackExpr((**inner).clone()),
+                env,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn improve_call_arg_binding_from_copy_root(
+    info: &UseInfo,
+    binding: &mut CallArgBinding,
+    var: &SSAVar,
+    expr: &CExpr,
+    lower: &LowerCtx<'_>,
+    env: &PassEnv<'_>,
+) {
+    if binding.is_result() {
+        return;
+    }
+
+    let key = var.display_name();
+    let copy_root = resolve_copy_root_name(info, &key);
+    if copy_root == key {
+        return;
+    }
+
+    let Some(root_var) = ssa_var_from_display_name(&copy_root, var.size) else {
+        return;
+    };
+    if root_var == *var {
+        return;
+    }
+
+    let root_expr = visible_call_arg_seed_expr(lower, &root_var);
+    let mut root_binding = CallArgBinding::input(semantic_call_arg_for_var(
+        info,
+        &root_var,
+        root_expr.clone(),
+        env,
+    ))
+    .with_source_var(&root_var);
+    let root_has_stable_negative_source = canonicalize_call_arg_binding_to_negative_stack_load(
+        info,
+        &mut root_binding,
+        Some(&root_var),
+        root_var.size,
+    )
+    .is_some();
+    let current_score = semantic_call_arg_score(info, var, &binding.arg, expr, env);
+    let root_score = semantic_call_arg_score(info, &root_var, &root_binding.arg, &root_expr, env);
+    let current_is_transient = semantic_call_arg_is_transient_register_fallback(&binding.arg, env)
+        || semantic_call_arg_is_generic_entry_root(&binding.arg, env);
+
+    if root_has_stable_negative_source
+        || (current_is_transient && root_score >= current_score)
+        || root_score > current_score
+    {
+        binding.arg = root_binding.arg;
+    }
 }
 
 fn visible_call_arg_seed_expr(lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
@@ -6031,13 +6450,35 @@ fn semantic_value_source_offset(
 
     match value {
         SemanticValue::Load { addr, .. } | SemanticValue::Address(addr) => {
-            normalized_stack_slot_offset(addr)
+            semantic_addr_source_offset(info, addr, depth + 1, visited)
         }
         SemanticValue::Scalar(ScalarValue::Root(root)) => {
             semantic_value_source_offset_by_name(info, &root.display_name(), depth + 1, visited)
         }
         _ => None,
     }
+}
+
+fn semantic_addr_source_offset(
+    info: &UseInfo,
+    addr: &NormalizedAddr,
+    depth: u32,
+    visited: &mut HashSet<String>,
+) -> Option<i64> {
+    if let Some(offset) = normalized_stack_slot_offset(addr) {
+        return Some(offset);
+    }
+
+    if addr.index.is_some() {
+        return None;
+    }
+
+    let BaseRef::Value(root) = &addr.base else {
+        return None;
+    };
+
+    semantic_value_source_offset_by_name(info, &root.display_name(), depth + 1, visited)
+        .and_then(|base| base.checked_add(addr.offset_bytes))
 }
 
 fn semantic_value_source_offset_by_name(
@@ -6065,6 +6506,11 @@ fn semantic_value_source_offset_by_name(
                 .get(name)
                 .map(|slot| slot.offset)
                 .filter(|offset| *offset < 0)
+        })
+        .or_else(|| {
+            info.copy_sources
+                .get(name)
+                .and_then(|src| semantic_value_source_offset_by_name(info, src, depth + 1, visited))
         })
         .or_else(|| unique_negative_stack_slot_for_stored_value(info, name));
     visited.remove(name);
@@ -6265,6 +6711,7 @@ fn expr_preserves_pointer_identity_for_call_arg(expr: &CExpr, env: &PassEnv<'_>)
         CExpr::Var(name) => {
             !is_call_arg_placeholder_name(name)
                 && !is_call_arg_transient_name(name)
+                && !is_call_arg_low_quality_name(name)
                 && !is_generic_entry_arg_name(name)
                 && !env
                     .param_register_aliases
@@ -6359,25 +6806,53 @@ fn semantic_call_arg_prefers_expr_over_stack_reload(
     normalized_stack_slot_offset(addr).is_some()
         && !call_arg_expr_contains_stack_placeholder(expr, 0)
         && !call_arg_expr_contains_transient_name(expr, 0)
-        && expr_is_meaningful_stack_reload_fallback(expr)
+        && expr_is_meaningful_stack_reload_fallback(expr, env)
         && call_arg_expr_score(expr, env) > 0
 }
 
-fn expr_is_meaningful_stack_reload_fallback(expr: &CExpr) -> bool {
+fn expr_is_meaningful_stack_reload_fallback(expr: &CExpr, env: &PassEnv<'_>) -> bool {
     match expr {
         CExpr::Var(name) => {
+            let lower = name.to_ascii_lowercase();
             !name.eq_ignore_ascii_case("argc")
                 && !name.eq_ignore_ascii_case("argv")
                 && !name.eq_ignore_ascii_case("envp")
-                && !name.starts_with("arg")
+                && !is_call_arg_placeholder_name(&lower)
+                && !is_call_arg_transient_name(&lower)
+                && !is_call_arg_low_quality_name(&lower)
+                && !is_generic_entry_arg_name(&lower)
+                && !env.param_register_aliases.contains_key(&lower)
         }
         CExpr::Subscript { .. }
         | CExpr::Member { .. }
         | CExpr::PtrMember { .. }
         | CExpr::StringLit(_)
         | CExpr::Call { .. } => true,
+        CExpr::Unary { operand, .. } => expr_is_meaningful_stack_reload_fallback(operand, env),
+        CExpr::Binary { left, right, .. } => {
+            let left_meaningful = expr_is_meaningful_stack_reload_fallback(left, env);
+            let right_meaningful = expr_is_meaningful_stack_reload_fallback(right, env);
+            let left_constish = matches!(
+                left.as_ref(),
+                CExpr::IntLit(_)
+                    | CExpr::UIntLit(_)
+                    | CExpr::FloatLit(_)
+                    | CExpr::CharLit(_)
+                    | CExpr::SizeofType(_)
+            );
+            let right_constish = matches!(
+                right.as_ref(),
+                CExpr::IntLit(_)
+                    | CExpr::UIntLit(_)
+                    | CExpr::FloatLit(_)
+                    | CExpr::CharLit(_)
+                    | CExpr::SizeofType(_)
+            );
+            (left_meaningful && (right_meaningful || right_constish))
+                || (right_meaningful && left_constish)
+        }
         CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            expr_is_meaningful_stack_reload_fallback(inner)
+            expr_is_meaningful_stack_reload_fallback(inner, env)
         }
         _ => false,
     }
@@ -6478,6 +6953,101 @@ fn stable_negative_stack_load_size(arg: &SemanticCallArg, default_size: u32) -> 
     }
 }
 
+fn exact_negative_stack_offset_for_addr(addr: &NormalizedAddr) -> Option<i64> {
+    match addr.base {
+        BaseRef::StackSlot(base) if addr.index.is_none() && addr.offset_bytes == 0 && base < 0 => {
+            Some(base)
+        }
+        _ => None,
+    }
+}
+
+fn exact_negative_stack_offset_for_value(
+    info: &UseInfo,
+    value: &SemanticValue,
+    depth: u32,
+    visited: &mut HashSet<String>,
+) -> Option<i64> {
+    if depth > 8 {
+        return None;
+    }
+
+    match value {
+        SemanticValue::Load { addr, .. } | SemanticValue::Address(addr) => {
+            exact_negative_stack_offset_for_addr(addr)
+        }
+        SemanticValue::Scalar(ScalarValue::Root(root)) => {
+            exact_negative_stack_offset_by_name(info, &root.display_name(), depth + 1, visited)
+        }
+        _ => None,
+    }
+}
+
+fn exact_negative_stack_offset_by_name(
+    info: &UseInfo,
+    name: &str,
+    depth: u32,
+    visited: &mut HashSet<String>,
+) -> Option<i64> {
+    if depth > 8 || !visited.insert(name.to_string()) {
+        return None;
+    }
+
+    let offset = info
+        .semantic_values
+        .get(name)
+        .and_then(|value| exact_negative_stack_offset_for_value(info, value, depth + 1, visited))
+        .or_else(|| {
+            info.forwarded_values
+                .get(name)
+                .and_then(|prov| prov.stack_slot)
+                .filter(|offset| *offset < 0)
+        })
+        .or_else(|| {
+            info.stack_slots
+                .get(name)
+                .map(|slot| slot.offset)
+                .filter(|offset| *offset < 0)
+        })
+        .or_else(|| {
+            info.copy_sources
+                .get(name)
+                .and_then(|src| exact_negative_stack_offset_by_name(info, src, depth + 1, visited))
+        });
+    visited.remove(name);
+    offset
+}
+
+fn exact_negative_stack_offset_for_call_arg(
+    info: &UseInfo,
+    arg: &SemanticCallArg,
+    depth: u32,
+    visited: &mut HashSet<String>,
+) -> Option<i64> {
+    if depth > 8 {
+        return None;
+    }
+
+    match arg {
+        SemanticCallArg::Semantic(value) => {
+            exact_negative_stack_offset_for_value(info, value, depth + 1, visited)
+        }
+        SemanticCallArg::FallbackExpr(CExpr::Var(name)) => {
+            exact_negative_stack_offset_by_name(info, name, depth + 1, visited)
+        }
+        SemanticCallArg::FallbackExpr(CExpr::Paren(inner))
+        | SemanticCallArg::FallbackExpr(CExpr::Cast { expr: inner, .. }) => {
+            exact_negative_stack_offset_for_call_arg(
+                info,
+                &SemanticCallArg::FallbackExpr((**inner).clone()),
+                depth + 1,
+                visited,
+            )
+        }
+        _ => None,
+    }
+}
+
 fn canonicalize_call_arg_binding_to_negative_stack_load(
     info: &UseInfo,
     binding: &mut CallArgBinding,
@@ -6488,19 +7058,20 @@ fn canonicalize_call_arg_binding_to_negative_stack_load(
         return None;
     }
 
-    let offset = call_arg_semantic_source_offset(info, &binding.arg, 0, &mut HashSet::new())
-        .filter(|offset| *offset < 0)
-        .or_else(|| {
-            source_var.and_then(|var| {
-                semantic_value_source_offset_by_name(
-                    info,
-                    &var.display_name(),
-                    0,
-                    &mut HashSet::new(),
-                )
-                .filter(|offset| *offset < 0)
-            })
-        })?;
+    let offset =
+        exact_negative_stack_offset_for_call_arg(info, &binding.arg, 0, &mut HashSet::new())
+            .filter(|offset| *offset < 0)
+            .or_else(|| {
+                source_var.and_then(|var| {
+                    exact_negative_stack_offset_by_name(
+                        info,
+                        &var.display_name(),
+                        0,
+                        &mut HashSet::new(),
+                    )
+                    .filter(|offset| *offset < 0)
+                })
+            })?;
     let size = source_var
         .map(|var| var.size.max(1))
         .unwrap_or_else(|| stable_negative_stack_load_size(&binding.arg, default_size));
@@ -7047,6 +7618,9 @@ fn call_arg_expr_score(expr: &CExpr, env: &PassEnv<'_>) -> i32 {
     if call_arg_expr_contains_transient_name(expr, 0) {
         score -= 20;
     }
+    if call_arg_expr_contains_low_quality_name(expr, 0) {
+        score -= 30;
+    }
     score
 }
 
@@ -7077,6 +7651,8 @@ fn call_arg_expr_semantic_weight(expr: &CExpr, depth: u32) -> i32 {
         CExpr::Var(name) => {
             if is_call_arg_placeholder_name(name) {
                 -20
+            } else if is_call_arg_low_quality_name(name) {
+                -15
             } else if is_call_arg_transient_name(name) {
                 -10
             } else {
@@ -7208,6 +7784,56 @@ fn call_arg_expr_contains_transient_name(expr: &CExpr, depth: u32) -> bool {
     }
 }
 
+fn call_arg_expr_contains_low_quality_name(expr: &CExpr, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match expr {
+        CExpr::Var(name) => is_call_arg_low_quality_name(name),
+        CExpr::Deref(inner)
+        | CExpr::AddrOf(inner)
+        | CExpr::Paren(inner)
+        | CExpr::Cast { expr: inner, .. }
+        | CExpr::Unary { operand: inner, .. }
+        | CExpr::Sizeof(inner) => call_arg_expr_contains_low_quality_name(inner, depth + 1),
+        CExpr::Binary { left, right, .. } => {
+            call_arg_expr_contains_low_quality_name(left, depth + 1)
+                || call_arg_expr_contains_low_quality_name(right, depth + 1)
+        }
+        CExpr::Subscript { base, index } => {
+            call_arg_expr_contains_low_quality_name(base, depth + 1)
+                || call_arg_expr_contains_low_quality_name(index, depth + 1)
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            call_arg_expr_contains_low_quality_name(base, depth + 1)
+        }
+        CExpr::Call { func, args } => {
+            call_arg_expr_contains_low_quality_name(func, depth + 1)
+                || args
+                    .iter()
+                    .any(|arg| call_arg_expr_contains_low_quality_name(arg, depth + 1))
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            call_arg_expr_contains_low_quality_name(cond, depth + 1)
+                || call_arg_expr_contains_low_quality_name(then_expr, depth + 1)
+                || call_arg_expr_contains_low_quality_name(else_expr, depth + 1)
+        }
+        CExpr::Comma(items) => items
+            .iter()
+            .any(|item| call_arg_expr_contains_low_quality_name(item, depth + 1)),
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::SizeofType(_) => false,
+    }
+}
+
 fn call_arg_expr_resolves_to_literal(expr: &CExpr, env: &PassEnv<'_>, depth: u32) -> bool {
     if depth > 8 {
         return false;
@@ -7282,6 +7908,14 @@ fn call_arg_expr_literal_value(expr: &CExpr, depth: u32) -> Option<u64> {
 fn is_call_arg_placeholder_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_")
+}
+
+fn is_call_arg_low_quality_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("var_")
+        || lower == "saved_fp"
+        || lower.starts_with("stack_")
+        || is_generic_entry_arg_name(&lower)
 }
 
 fn is_call_arg_transient_name(name: &str) -> bool {
@@ -7413,6 +8047,32 @@ mod tests {
     fn analyze_info(blocks: Vec<SSABlock>) -> UseInfo {
         let fixture = TestEnvFixture::new();
         analyze(&blocks, &fixture.env())
+    }
+
+    #[test]
+    fn low_quality_stack_spill_names_do_not_preserve_call_arg_pointer_identity() {
+        let fixture = TestEnvFixture::new();
+        let env = fixture.env();
+
+        assert!(!expr_preserves_pointer_identity_for_call_arg(
+            &CExpr::Var("var_20h".to_string()),
+            &env
+        ));
+        assert!(expr_preserves_pointer_identity_for_call_arg(
+            &CExpr::Var("buf".to_string()),
+            &env
+        ));
+    }
+
+    #[test]
+    fn call_arg_expr_score_penalizes_low_quality_stack_spills() {
+        let fixture = TestEnvFixture::new();
+        let env = fixture.env();
+
+        assert!(
+            call_arg_expr_score(&CExpr::Var("len".to_string()), &env)
+                > call_arg_expr_score(&CExpr::Var("var_20h".to_string()), &env)
+        );
     }
 
     fn single_block(ops: Vec<SSAOp>) -> SSABlock {

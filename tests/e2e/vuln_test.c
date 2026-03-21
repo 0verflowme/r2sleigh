@@ -423,21 +423,21 @@ typedef struct {
 } TypeChainObj;
 
 // Test 39: Leaf in a multi-hop caller/callee chain with struct field accesses.
-int test_type_leaf(TypeChainObj *obj, int v) {
+__attribute__((noinline)) int test_type_leaf(TypeChainObj *obj, int v) {
     obj->tag = v;
     obj->len = v + 1;
     return obj->tag + obj->len;
 }
 
 // Test 40: Mid-level call propagates and adds another field write.
-int test_type_mid(TypeChainObj *obj, int v) {
+__attribute__((noinline)) int test_type_mid(TypeChainObj *obj, int v) {
     int acc = test_type_leaf(obj, v);
     obj->marker = (long)&global_counter;
     return acc + (int)(obj->marker != 0);
 }
 
 // Test 41: Top-level caller used to validate multi-hop interproc propagation.
-int test_type_top(int v) {
+__attribute__((noinline)) int test_type_top(int v) {
     TypeChainObj obj = {0};
     return test_type_mid(&obj, v) + obj.tag;
 }

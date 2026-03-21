@@ -52,8 +52,8 @@ use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2types::{
-    CTypeLike, ExternalRegisterParamSpec, ExternalStackVarSpec, ExternalTypeDb,
-    FunctionSignatureSpec, FunctionType, FunctionTypeFacts, TypeInference, TypeOracle,
+    CTypeLike, ExternalRegisterParamSpec, ExternalTypeDb, FunctionSignatureSpec, FunctionType,
+    FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding, VisibleBindingKind,
 };
 use std::collections::HashSet;
 
@@ -446,6 +446,53 @@ pub struct DecompilerContext {
     pub type_facts: FunctionTypeFacts,
 }
 
+impl DecompilerContext {
+    pub fn with_function_names(
+        mut self,
+        function_names: std::collections::HashMap<u64, String>,
+    ) -> Self {
+        self.function_names = function_names;
+        self
+    }
+
+    pub fn with_strings(mut self, strings: std::collections::HashMap<u64, String>) -> Self {
+        self.strings = strings;
+        self
+    }
+
+    pub fn with_symbols(mut self, symbols: std::collections::HashMap<u64, String>) -> Self {
+        self.symbols = symbols;
+        self
+    }
+
+    pub fn with_type_facts(mut self, type_facts: FunctionTypeFacts) -> Self {
+        self.type_facts = type_facts.canonicalized();
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecompilerInput {
+    pub prepared_ssa: r2ssa::PreparedFunctionSSA,
+    pub context: DecompilerContext,
+}
+
+impl DecompilerInput {
+    pub fn new(prepared_ssa: r2ssa::PreparedFunctionSSA, mut context: DecompilerContext) -> Self {
+        context.type_facts = context.type_facts.canonicalized();
+        Self {
+            prepared_ssa,
+            context,
+        }
+    }
+
+    pub fn with_context(mut self, mut context: DecompilerContext) -> Self {
+        context.type_facts = context.type_facts.canonicalized();
+        self.context = context;
+        self
+    }
+}
+
 /// The main decompiler.
 pub struct Decompiler {
     config: DecompilerConfig,
@@ -462,7 +509,8 @@ impl Decompiler {
     }
 
     /// Set external context (function names, strings, symbols).
-    pub fn with_context(mut self, context: DecompilerContext) -> Self {
+    pub fn with_context(mut self, mut context: DecompilerContext) -> Self {
+        context.type_facts = context.type_facts.canonicalized();
         self.context = context;
         self
     }
@@ -502,7 +550,7 @@ impl Decompiler {
 
     /// Set externally recovered type facts.
     pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
-        self.context.type_facts = type_facts;
+        self.context.type_facts = type_facts.canonicalized();
     }
 
     /// Decompile an SSA function to C code.
@@ -513,6 +561,18 @@ impl Decompiler {
         // Generate code
         let mut codegen = CodeGenerator::new(self.config.codegen.clone());
         codegen.generate_function(&c_func)
+    }
+
+    /// Decompile a prepared function with an explicit typed context payload.
+    pub fn decompile_input(&self, input: &DecompilerInput) -> String {
+        let decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
+        decompiler.decompile(input.prepared_ssa.function())
+    }
+
+    /// Build a C function from a prepared function + typed context payload.
+    pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction {
+        let decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
+        decompiler.build_function(input.prepared_ssa.function())
     }
 
     fn stmt_has_content(stmt: &CStmt) -> bool {
@@ -585,7 +645,6 @@ impl Decompiler {
             type_inference.add_function_type(name, signature.clone());
         }
         type_inference.set_external_stack_slots(self.context.type_facts.stack_slots.clone());
-        type_inference.set_external_stack_vars(self.context.type_facts.external_stack_vars.clone());
         if !self.context.type_facts.external_type_db.structs.is_empty()
             || !self.context.type_facts.external_type_db.unions.is_empty()
             || !self.context.type_facts.external_type_db.enums.is_empty()
@@ -684,7 +743,10 @@ impl Decompiler {
             strings: &self.context.strings,
             symbols: &self.context.symbols,
             known_function_signatures: &known_function_signatures,
+            stack_slots: &self.context.type_facts.stack_slots,
+            #[cfg(test)]
             external_stack_vars: &self.context.type_facts.external_stack_vars,
+            visible_bindings: &self.context.type_facts.visible_bindings,
             external_type_db: &self.context.type_facts.external_type_db,
             param_register_aliases: &param_register_aliases,
             type_hints: &type_hints,
@@ -776,10 +838,22 @@ impl Decompiler {
                     .contains(&alias.to_ascii_lowercase())
                     .then_some(*offset)
             })
+            .chain(
+                self.context
+                    .type_facts
+                    .visible_bindings
+                    .iter()
+                    .filter_map(|binding| {
+                        matches!(binding.kind, VisibleBindingKind::HiddenHome)
+                            .then(|| binding.stack_slot.as_ref().map(|slot| slot.offset))
+                            .flatten()
+                    }),
+            )
             .collect::<HashSet<_>>();
         let body_visible_stack_offsets = collect_visible_stack_offsets(
             &body_visible_names,
-            &self.context.type_facts.external_stack_vars,
+            &self.context.type_facts.visible_bindings,
+            &self.context.type_facts.stack_slots,
             &param_name_set,
         );
 
@@ -850,7 +924,14 @@ impl Decompiler {
             }
             post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
         }
-        rewrite_reserved_param_stack_home_uses(&mut c_function, fold_ctx.stack_arg_aliases_map());
+        rewrite_reserved_param_stack_home_uses(
+            &mut c_function,
+            fold_ctx.stack_arg_aliases_map(),
+            fold_ctx.stack_vars_map(),
+            fold_ctx.inputs.visible_bindings,
+            fold_ctx.inputs.stack_slots,
+        );
+        prune_unused_pure_locals(&mut c_function);
 
         c_function
     }
@@ -1055,7 +1136,8 @@ fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<String> {
 
 fn parse_visible_stack_offset(
     name: &str,
-    external_stack_vars: &std::collections::HashMap<i64, ExternalStackVarSpec>,
+    visible_bindings: &[VisibleBinding],
+    stack_slots: &std::collections::BTreeMap<StackSlotKey, r2types::ExternalStackSlotSpec>,
     param_names: &HashSet<String>,
 ) -> Option<i64> {
     let lower = name.trim().to_ascii_lowercase();
@@ -1080,20 +1162,29 @@ fn parse_visible_stack_offset(
             return i64::from_str_radix(trimmed, 16).ok().map(|v| -v);
         }
     }
-    external_stack_vars
+    visible_bindings
         .iter()
-        .find(|(_, spec)| spec.name.eq_ignore_ascii_case(name))
-        .map(|(offset, _)| *offset)
+        .find(|binding| binding.name.eq_ignore_ascii_case(name))
+        .and_then(|binding| binding.stack_slot.as_ref().map(|slot| slot.offset))
+        .or_else(|| {
+            stack_slots
+                .iter()
+                .find(|(_, slot_spec)| slot_spec.name.eq_ignore_ascii_case(name))
+                .map(|(slot_key, _)| slot_key.offset)
+        })
 }
 
 fn collect_visible_stack_offsets(
     names: &HashSet<String>,
-    external_stack_vars: &std::collections::HashMap<i64, ExternalStackVarSpec>,
+    visible_bindings: &[VisibleBinding],
+    stack_slots: &std::collections::BTreeMap<StackSlotKey, r2types::ExternalStackSlotSpec>,
     param_names: &HashSet<String>,
 ) -> HashSet<i64> {
     names
         .iter()
-        .filter_map(|name| parse_visible_stack_offset(name, external_stack_vars, param_names))
+        .filter_map(|name| {
+            parse_visible_stack_offset(name, visible_bindings, stack_slots, param_names)
+        })
         .collect()
 }
 
@@ -1105,28 +1196,76 @@ fn generic_stack_home_name_for_offset(offset: i64) -> String {
     }
 }
 
+fn is_low_quality_stack_home_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower == "saved_fp"
+        || lower.starts_with("local_")
+        || lower.starts_with("stack_")
+        || lower.starts_with("arg_")
+        || lower.starts_with("var_")
+}
+
+fn stack_slot_matches_rewrite_offset(slot: &StackSlotKey, offset: i64) -> bool {
+    if slot.offset == offset {
+        return true;
+    }
+    matches!(slot.base, r2types::ExternalStackBase::FramePointer) && -slot.offset == offset
+}
+
 fn rewrite_reserved_param_stack_home_uses(
     func: &mut CFunction,
     stack_arg_aliases: &std::collections::HashMap<i64, String>,
+    stack_vars: &std::collections::HashMap<i64, String>,
+    visible_bindings: &[VisibleBinding],
+    stack_slots: &std::collections::BTreeMap<StackSlotKey, r2types::ExternalStackSlotSpec>,
 ) {
     let param_names = func
         .params
         .iter()
         .map(|param| param.name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    let rename_map = stack_arg_aliases
-        .iter()
-        .filter_map(|(offset, alias)| {
-            let target = alias.trim();
-            if target.is_empty() || !param_names.contains(&target.to_ascii_lowercase()) {
-                return None;
+    let mut rename_map = std::collections::HashMap::new();
+    for (offset, alias) in stack_arg_aliases {
+        let target = alias.trim();
+        if target.is_empty() || !param_names.contains(&target.to_ascii_lowercase()) {
+            continue;
+        }
+
+        rename_map.insert(
+            generic_stack_home_name_for_offset(*offset),
+            target.to_string(),
+        );
+
+        if let Some(stack_name) = stack_vars.get(offset)
+            && is_low_quality_stack_home_name(stack_name)
+        {
+            rename_map.insert(stack_name.to_ascii_lowercase(), target.to_string());
+        }
+
+        for binding in visible_bindings {
+            if !binding
+                .stack_slot
+                .as_ref()
+                .is_some_and(|slot| stack_slot_matches_rewrite_offset(slot, *offset))
+            {
+                continue;
             }
-            Some((
-                generic_stack_home_name_for_offset(*offset),
-                target.to_string(),
-            ))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
+            let name = binding.name.trim();
+            if !name.is_empty() && is_low_quality_stack_home_name(name) {
+                rename_map.insert(name.to_ascii_lowercase(), target.to_string());
+            }
+        }
+
+        for (slot_key, slot_spec) in stack_slots {
+            if !stack_slot_matches_rewrite_offset(slot_key, *offset) {
+                continue;
+            }
+            let name = slot_spec.name.trim();
+            if !name.is_empty() && is_low_quality_stack_home_name(name) {
+                rename_map.insert(name.to_ascii_lowercase(), target.to_string());
+            }
+        }
+    }
 
     if rename_map.is_empty() {
         return;
@@ -1240,7 +1379,14 @@ fn rewrite_expr_reserved_param_stack_homes(
         | CExpr::Sizeof(operand) => {
             rewrite_expr_reserved_param_stack_homes(operand, rename_map, allow_plain_var_rewrite);
         }
-        CExpr::AddrOf(operand) | CExpr::Deref(operand) => {
+        CExpr::AddrOf(operand) => {
+            rewrite_expr_reserved_param_stack_homes(operand, rename_map, false);
+        }
+        CExpr::Deref(operand) => {
+            if let Some(target) = reserved_param_stack_home_target_name(operand, rename_map) {
+                *expr = CExpr::Var(target);
+                return;
+            }
             rewrite_expr_reserved_param_stack_homes(operand, rename_map, false);
         }
         CExpr::Binary { left, right, .. } => {
@@ -1281,6 +1427,296 @@ fn rewrite_expr_reserved_param_stack_homes(
         | CExpr::CharLit(_)
         | CExpr::SizeofType(_)
         | CExpr::Var(_) => {}
+    }
+}
+
+fn reserved_param_stack_home_target_name(
+    expr: &CExpr,
+    rename_map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    match expr {
+        CExpr::Var(name) => rename_map.get(&name.to_ascii_lowercase()).cloned(),
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+            reserved_param_stack_home_target_name(inner, rename_map)
+        }
+        _ => None,
+    }
+}
+
+fn prune_unused_pure_locals(func: &mut CFunction) {
+    loop {
+        let live_reads = collect_function_local_reads(func);
+        let dead_locals = func
+            .locals
+            .iter()
+            .map(|local| local.name.to_ascii_lowercase())
+            .filter(|name| !live_reads.contains(name))
+            .collect::<HashSet<_>>();
+
+        if dead_locals.is_empty() {
+            break;
+        }
+
+        func.locals
+            .retain(|local| !dead_locals.contains(&local.name.to_ascii_lowercase()));
+        prune_unused_pure_local_stmts(&mut func.body, &dead_locals);
+    }
+}
+
+fn collect_function_local_reads(func: &CFunction) -> HashSet<String> {
+    let mut reads = HashSet::new();
+    for stmt in &func.body {
+        collect_stmt_local_reads(stmt, &mut reads);
+    }
+    reads
+}
+
+fn collect_stmt_local_reads(stmt: &CStmt, reads: &mut HashSet<String>) {
+    match stmt {
+        CStmt::Empty
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+        CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) => {
+            if !matches!(left.as_ref(), CExpr::Var(_)) {
+                collect_expr_local_reads(left, reads);
+            }
+            collect_expr_local_reads(right, reads);
+        }
+        CStmt::Expr(expr) => collect_expr_local_reads(expr, reads),
+        CStmt::Decl { init, .. } => {
+            if let Some(init) = init {
+                collect_expr_local_reads(init, reads);
+            }
+        }
+        CStmt::Block(stmts) => {
+            for stmt in stmts {
+                collect_stmt_local_reads(stmt, reads);
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            collect_expr_local_reads(cond, reads);
+            collect_stmt_local_reads(then_body, reads);
+            if let Some(else_body) = else_body {
+                collect_stmt_local_reads(else_body, reads);
+            }
+        }
+        CStmt::While { cond, body } => {
+            collect_expr_local_reads(cond, reads);
+            collect_stmt_local_reads(body, reads);
+        }
+        CStmt::DoWhile { body, cond } => {
+            collect_stmt_local_reads(body, reads);
+            collect_expr_local_reads(cond, reads);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                collect_stmt_local_reads(init, reads);
+            }
+            if let Some(cond) = cond {
+                collect_expr_local_reads(cond, reads);
+            }
+            if let Some(update) = update {
+                collect_expr_local_reads(update, reads);
+            }
+            collect_stmt_local_reads(body, reads);
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            collect_expr_local_reads(expr, reads);
+            for case in cases {
+                collect_expr_local_reads(&case.value, reads);
+                for stmt in &case.body {
+                    collect_stmt_local_reads(stmt, reads);
+                }
+            }
+            if let Some(default) = default {
+                for stmt in default {
+                    collect_stmt_local_reads(stmt, reads);
+                }
+            }
+        }
+        CStmt::Return(Some(expr)) => collect_expr_local_reads(expr, reads),
+        CStmt::Return(None) => {}
+    }
+}
+
+fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
+    match expr {
+        CExpr::Var(name) => {
+            reads.insert(name.to_ascii_lowercase());
+        }
+        CExpr::Paren(inner)
+        | CExpr::AddrOf(inner)
+        | CExpr::Deref(inner)
+        | CExpr::Cast { expr: inner, .. }
+        | CExpr::Unary { operand: inner, .. }
+        | CExpr::Sizeof(inner) => collect_expr_local_reads(inner, reads),
+        CExpr::Binary { left, right, .. } => {
+            collect_expr_local_reads(left, reads);
+            collect_expr_local_reads(right, reads);
+        }
+        CExpr::Subscript { base, index } => {
+            collect_expr_local_reads(base, reads);
+            collect_expr_local_reads(index, reads);
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            collect_expr_local_reads(base, reads);
+        }
+        CExpr::Call { func, args } => {
+            collect_expr_local_reads(func, reads);
+            for arg in args {
+                collect_expr_local_reads(arg, reads);
+            }
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_local_reads(cond, reads);
+            collect_expr_local_reads(then_expr, reads);
+            collect_expr_local_reads(else_expr, reads);
+        }
+        CExpr::Comma(items) => {
+            for item in items {
+                collect_expr_local_reads(item, reads);
+            }
+        }
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::SizeofType(_) => {}
+    }
+}
+
+fn prune_unused_pure_local_stmts(stmts: &mut Vec<CStmt>, dead_locals: &HashSet<String>) {
+    for stmt in stmts.iter_mut() {
+        prune_unused_pure_local_stmt(stmt, dead_locals);
+    }
+    stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
+}
+
+fn prune_unused_pure_local_stmt(stmt: &mut CStmt, dead_locals: &HashSet<String>) {
+    match stmt {
+        CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) => {
+            if let CExpr::Var(name) = left.as_ref()
+                && dead_locals.contains(&name.to_ascii_lowercase())
+                && expr_is_pure_for_dead_local_prune(right)
+            {
+                *stmt = CStmt::Empty;
+            }
+        }
+        CStmt::Decl { name, init, .. } => {
+            if dead_locals.contains(&name.to_ascii_lowercase()) {
+                match init.take() {
+                    Some(expr) if !expr_is_pure_for_dead_local_prune(&expr) => {
+                        *stmt = CStmt::Expr(expr);
+                    }
+                    _ => {
+                        *stmt = CStmt::Empty;
+                    }
+                }
+            }
+        }
+        CStmt::Block(stmts) => prune_unused_pure_local_stmts(stmts, dead_locals),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            prune_unused_pure_local_stmt(then_body, dead_locals);
+            if let Some(else_body) = else_body {
+                prune_unused_pure_local_stmt(else_body, dead_locals);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            prune_unused_pure_local_stmt(body, dead_locals);
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                prune_unused_pure_local_stmt(init, dead_locals);
+            }
+            prune_unused_pure_local_stmt(body, dead_locals);
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                prune_unused_pure_local_stmts(&mut case.body, dead_locals);
+            }
+            if let Some(default) = default {
+                prune_unused_pure_local_stmts(default, dead_locals);
+            }
+        }
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
+fn expr_is_pure_for_dead_local_prune(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::SizeofType(_)
+        | CExpr::Var(_) => true,
+        CExpr::Paren(inner)
+        | CExpr::AddrOf(inner)
+        | CExpr::Deref(inner)
+        | CExpr::Cast { expr: inner, .. }
+        | CExpr::Unary { operand: inner, .. }
+        | CExpr::Sizeof(inner) => expr_is_pure_for_dead_local_prune(inner),
+        CExpr::Binary { left, right, .. } => {
+            expr_is_pure_for_dead_local_prune(left) && expr_is_pure_for_dead_local_prune(right)
+        }
+        CExpr::Subscript { base, index } => {
+            expr_is_pure_for_dead_local_prune(base) && expr_is_pure_for_dead_local_prune(index)
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            expr_is_pure_for_dead_local_prune(base)
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_is_pure_for_dead_local_prune(cond)
+                && expr_is_pure_for_dead_local_prune(then_expr)
+                && expr_is_pure_for_dead_local_prune(else_expr)
+        }
+        CExpr::Comma(items) => items.iter().all(expr_is_pure_for_dead_local_prune),
+        CExpr::Call { .. } => false,
     }
 }
 
@@ -1353,6 +1789,16 @@ mod tests {
         }
         SSAFunction::from_blocks_with_arch(&[block], Some(arch))
             .expect("SSA function should build")
+            .with_name("stable_demo")
+    }
+
+    fn prepared_from_ops(ops: Vec<R2ILOp>, arch: &ArchSpec) -> r2ssa::PreparedFunctionSSA {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        for op in ops {
+            block.push(op);
+        }
+        r2ssa::PreparedFunctionSSA::for_decompile(&[block], Some(arch))
+            .expect("prepared SSA should build")
             .with_name("stable_demo")
     }
 
@@ -1431,6 +1877,107 @@ mod tests {
         assert_eq!(config.ptr_size, 64);
         assert_eq!(config.sp_name, "sp");
         assert_eq!(config.fp_name, "s0");
+    }
+
+    #[test]
+    fn reserved_param_stack_home_deref_rewrites_to_param_and_prunes_dead_pure_locals() {
+        let mut func = CFunction {
+            name: "dbg.test_bool_carrier_chain".to_string(),
+            ret_type: CType::Int(32),
+            params: vec![
+                ast::CParam {
+                    ty: CType::Int(32),
+                    name: "x".to_string(),
+                },
+                ast::CParam {
+                    ty: CType::Int(32),
+                    name: "y".to_string(),
+                },
+            ],
+            locals: vec![
+                ast::CLocal {
+                    ty: CType::Int(32),
+                    name: "local_14".to_string(),
+                    stack_offset: Some(-0x14),
+                },
+                ast::CLocal {
+                    ty: CType::Int(32),
+                    name: "local_18".to_string(),
+                    stack_offset: Some(-0x18),
+                },
+                ast::CLocal {
+                    ty: CType::UInt(32),
+                    name: "neq".to_string(),
+                    stack_offset: Some(-0x4),
+                },
+                ast::CLocal {
+                    ty: CType::Int(64),
+                    name: "widened".to_string(),
+                    stack_offset: Some(-0x10),
+                },
+            ],
+            body: vec![
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::Assign,
+                    CExpr::Var("neq".to_string()),
+                    CExpr::binary(
+                        BinaryOp::Ne,
+                        CExpr::Var("x".to_string()),
+                        CExpr::Var("y".to_string()),
+                    ),
+                )),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::Assign,
+                    CExpr::Var("widened".to_string()),
+                    CExpr::binary(
+                        BinaryOp::Ne,
+                        CExpr::Var("x".to_string()),
+                        CExpr::Var("y".to_string()),
+                    ),
+                )),
+                CStmt::If {
+                    cond: CExpr::binary(
+                        BinaryOp::Ne,
+                        CExpr::Var("x".to_string()),
+                        CExpr::Var("y".to_string()),
+                    ),
+                    then_body: Box::new(CStmt::Return(Some(CExpr::Deref(Box::new(CExpr::Var(
+                        "local_14".to_string(),
+                    )))))),
+                    else_body: Some(Box::new(CStmt::Return(Some(CExpr::Deref(Box::new(
+                        CExpr::Var("local_18".to_string()),
+                    )))))),
+                },
+            ],
+        };
+
+        rewrite_reserved_param_stack_home_uses(
+            &mut func,
+            &std::collections::HashMap::from([(-0x14, "x".to_string()), (-0x18, "y".to_string())]),
+            &std::collections::HashMap::new(),
+            &[],
+            &std::collections::BTreeMap::new(),
+        );
+        prune_unused_pure_locals(&mut func);
+
+        assert!(func.locals.is_empty(), "{func:?}");
+        assert_eq!(func.body.len(), 1, "{func:?}");
+        let CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &func.body[0]
+        else {
+            panic!("expected final if body, got {:?}", func.body);
+        };
+        assert_eq!(
+            **then_body,
+            CStmt::Return(Some(CExpr::Var("x".to_string())))
+        );
+        assert_eq!(
+            **else_body.as_ref().expect("else branch"),
+            CStmt::Return(Some(CExpr::Var("y".to_string())))
+        );
     }
 
     #[test]
@@ -1637,6 +2184,50 @@ mod tests {
             !first.contains("zf_"),
             "decompiled predicate should not leak flag temporaries"
         );
+    }
+
+    #[test]
+    fn decompile_input_matches_context_driven_decompile() {
+        let arch = test_arch_for_decompile();
+        let ops = vec![
+            R2ILOp::Load {
+                dst: Varnode::unique(0x10, 8),
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x20, 8),
+            },
+            R2ILOp::IntAdd {
+                dst: Varnode::register(0x00, 8),
+                a: Varnode::unique(0x10, 8),
+                b: Varnode::register(0x18, 8),
+            },
+            R2ILOp::Return {
+                target: Varnode::register(0x00, 8),
+            },
+        ];
+        let func = ssa_from_ops(ops.clone(), &arch);
+        let prepared = prepared_from_ops(ops, &arch);
+        let type_facts = FunctionTypeFacts {
+            merged_signature: Some(signature_spec(
+                Some(CType::Int(64)),
+                vec![
+                    ("arg1", Some(CType::Int(64))),
+                    ("arg2", Some(CType::Int(64))),
+                ],
+            )),
+            ..FunctionTypeFacts::default()
+        };
+        let context = DecompilerContext::default().with_type_facts(type_facts);
+
+        let mut legacy = Decompiler::new(DecompilerConfig::x86_64());
+        legacy.set_type_facts(context.type_facts.clone());
+        let input = DecompilerInput::new(prepared, context);
+        let typed = Decompiler::new(DecompilerConfig::x86_64());
+
+        assert_eq!(
+            legacy.build_function(&func),
+            typed.build_function_from_input(&input)
+        );
+        assert_eq!(legacy.decompile(&func), typed.decompile_input(&input));
     }
 
     #[test]
@@ -2767,8 +3358,6 @@ mod tests {
         type_inference
             .set_external_signature(decompiler.context.type_facts.merged_signature.clone());
         type_inference.set_external_stack_slots(decompiler.context.type_facts.stack_slots.clone());
-        type_inference
-            .set_external_stack_vars(decompiler.context.type_facts.external_stack_vars.clone());
         type_inference.set_external_type_db(decompiler.context.type_facts.external_type_db.clone());
         type_inference.set_decompile_prep_facts(func.decompile_prep_facts());
         type_inference.infer_function(func);
@@ -2850,7 +3439,10 @@ mod tests {
             strings: &decompiler.context.strings,
             symbols: &decompiler.context.symbols,
             known_function_signatures: &known_function_signatures,
+            stack_slots: &decompiler.context.type_facts.stack_slots,
+            #[cfg(test)]
             external_stack_vars: &decompiler.context.type_facts.external_stack_vars,
+            visible_bindings: &decompiler.context.type_facts.visible_bindings,
             external_type_db: &decompiler.context.type_facts.external_type_db,
             param_register_aliases: &param_register_aliases,
             type_hints: &type_hints,

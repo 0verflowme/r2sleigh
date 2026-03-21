@@ -86,7 +86,6 @@ extern int r2sym_merge_is_enabled(void);
 extern void r2sym_merge_set_enabled(int enabled);
 
 /* Decompiler */
-extern char *r2dec_function(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks, const char *func_name);
 extern char *r2dec_function_with_context(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
                                           const char *func_name, const char *func_names_json,
                                           const char *strings_json, const char *symbols_json,
@@ -109,6 +108,9 @@ extern char *r2sleigh_infer_type_writeback_json(const R2ILContext *ctx, const R2
 extern char *r2sleigh_infer_type_writeback_json_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
 	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json);
+extern int r2sleigh_alias_function_analysis_artifact_cache(const R2ILContext *ctx, const R2ILBlock **blocks,
+	size_t num_blocks, unsigned long long fcn_addr, const char *fcn_name,
+	const char *source_external_context_json, const char *target_external_context_json);
 /* Per-architecture context (lazy init)
  *
  * WARNING: These globals are NOT thread-safe. This plugin assumes
@@ -129,8 +131,6 @@ typedef struct {
 } SymStateCache;
 
 static SymStateCache sym_state_cache = {0};
-static bool sleigh_pdd_core_plugin_registered = false;
-static RCore *sleigh_pdd_core_plugin_core = NULL;
 static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn);
 static int collect_data_refs_from_json(RAnal *anal, RAnalFunction *fcn, const char *json, RVecAnalRef *refs, bool apply_to_anal);
 
@@ -797,126 +797,6 @@ static const char *skip_cmd_spaces(const char *s) {
 		s++;
 	}
 	return s;
-}
-
-static bool sleigh_parse_pdd_alias(const char *input, const char **alias_name, const char **suffix) {
-	if (!input || !alias_name || !suffix) {
-		return false;
-	}
-	if (r_str_startswith (input, "pdd")) {
-		*alias_name = "pdd";
-		*suffix = input + 3;
-		return true;
-	}
-	if (r_str_startswith (input, "pdD")) {
-		*alias_name = "pdD";
-		*suffix = input + 3;
-		return true;
-	}
-	return false;
-}
-
-static bool sleigh_pdd_core_cmd(RCorePluginSession *cps, const char *input) {
-	const char *alias_name = NULL;
-	const char *suffix = NULL;
-	const char *target_arg = NULL;
-	char *anal_cmd = NULL;
-	char *res;
-	RCore *core;
-
-	if (!cps || !input) {
-		return false;
-	}
-	core = cps->core;
-	if (!core || !core->anal) {
-		return false;
-	}
-	if (!sleigh_parse_pdd_alias (input, &alias_name, &suffix)) {
-		return false;
-	}
-
-	if (*suffix == '\0') {
-		target_arg = NULL;
-	} else if (*suffix == '?') {
-		if (suffix[1] != '\0') {
-			return false;
-		}
-		if (core->cons) {
-			r_cons_println (core->cons, "| pdd [name|addr] - Alias for a:sla.dec [name|addr]");
-			r_cons_println (core->cons, "| pdD [name|addr] - Alias for a:sla.dec [name|addr]");
-		}
-		return true;
-	} else if (*suffix == ' ') {
-		suffix = skip_cmd_spaces (suffix);
-		if (!*suffix) {
-			target_arg = NULL;
-		} else if (*suffix == '?' && suffix[1] == '\0') {
-			if (core->cons) {
-				r_cons_println (core->cons, "| pdd [name|addr] - Alias for a:sla.dec [name|addr]");
-				r_cons_println (core->cons, "| pdD [name|addr] - Alias for a:sla.dec [name|addr]");
-			}
-			return true;
-		} else {
-			target_arg = suffix;
-		}
-	} else {
-		return false;
-	}
-
-	if (target_arg && *target_arg) {
-		anal_cmd = r_str_newf ("sla.dec %s", target_arg);
-	} else {
-		anal_cmd = strdup ("sla.dec");
-	}
-	if (!anal_cmd) {
-		R_LOG_ERROR ("r2sleigh: failed to allocate %s alias command", alias_name);
-		return false;
-	}
-
-	res = r_anal_cmd (core->anal, anal_cmd);
-	free (anal_cmd);
-	if (res) {
-		free (res);
-		return true;
-	}
-	return false;
-}
-
-static RCorePlugin r_core_plugin_sleigh_pdd = {
-	.meta = {
-		.name = "sleigh.pdd",
-		.desc = "r2sleigh transparent pdd/pdD alias",
-		.license = "LGPL3",
-		.author = "r2sleigh project",
-	},
-	.call = sleigh_pdd_core_cmd,
-};
-
-static void ensure_sleigh_pdd_core_plugin(RAnal *anal) {
-	RCore *core;
-
-	if (sleigh_pdd_core_plugin_registered || !anal) {
-		return;
-	}
-	core = anal->coreb.core;
-	if (!core || !core->rcmd) {
-		return;
-	}
-	if (r_core_plugin_add (core->rcmd, &r_core_plugin_sleigh_pdd)) {
-		sleigh_pdd_core_plugin_registered = true;
-		sleigh_pdd_core_plugin_core = core;
-	}
-}
-
-static void cleanup_sleigh_pdd_core_plugin(void) {
-	if (!sleigh_pdd_core_plugin_registered) {
-		return;
-	}
-	if (sleigh_pdd_core_plugin_core && sleigh_pdd_core_plugin_core->rcmd) {
-		(void)r_core_plugin_remove (sleigh_pdd_core_plugin_core->rcmd, &r_core_plugin_sleigh_pdd);
-	}
-	sleigh_pdd_core_plugin_registered = false;
-	sleigh_pdd_core_plugin_core = NULL;
 }
 
 static bool parse_sym_target_expr(RCore *core, const char *expr, ut64 *target) {
@@ -3517,7 +3397,6 @@ R2ILContext *get_context(RAnal *anal) {
 }
 
 int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAnalOpMask mask) {
-	ensure_sleigh_pdd_core_plugin (anal);
 	R_RETURN_VAL_IF_FAIL (anal && op && data, -1);
 
 	R2ILContext *ctx = get_context (anal);
@@ -3590,7 +3469,6 @@ static bool sleigh_init(RAnal *anal) {
 
 static bool sleigh_fini(RAnal *anal) {
 	(void)anal;
-	cleanup_sleigh_pdd_core_plugin ();
 	if (sleigh_ctx) {
 		r2il_free (sleigh_ctx);
 		sleigh_ctx = NULL;
@@ -3604,8 +3482,77 @@ static bool sleigh_fini(RAnal *anal) {
 	return true;
 }
 
+static void append_pszj_string_to_pj(RCore *core, PJ *pj, ut64 addr) {
+	if (!core || !pj || !addr) {
+		return;
+	}
+	if (!r_io_map_get_at (core->io, addr)) {
+		return;
+	}
+
+	char *pszj = r_core_cmd_strf (core, "pszj @ 0x%"PFMT64x, addr);
+	if (!pszj || pszj[0] != '{') {
+		free (pszj);
+		return;
+	}
+
+	RJson *root = r_json_parse (pszj);
+	if (root && root->type == R_JSON_OBJECT) {
+		const RJson *str = r_json_get (root, "string");
+		const RJson *len = r_json_get (root, "length");
+		const RJson *section = r_json_get (root, "section");
+		if (str && len
+			&& str->type == R_JSON_STRING
+			&& len->type == R_JSON_INTEGER
+			&& str->str_value
+			&& section
+			&& section->type == R_JSON_STRING
+			&& section->str_value
+			&& strcmp (section->str_value, "unknown")
+			&& len->num.u_value > 0) {
+			char addr_str[32];
+			snprintf (addr_str, sizeof (addr_str), "0x%llx", (unsigned long long)addr);
+			pj_ks (pj, addr_str, str->str_value);
+		}
+		r_json_free (root);
+	}
+
+	free (pszj);
+}
+
+static void extend_string_map_with_function_ptr_strings(RCore *core, RAnalFunction *fcn, PJ *pj) {
+	if (!core || !fcn || !pj) {
+		return;
+	}
+
+	char *pdfj = r_core_cmd_strf (core, "pdfj @ 0x%"PFMT64x, fcn->addr);
+	if (!pdfj || pdfj[0] != '{') {
+		free (pdfj);
+		return;
+	}
+
+	RJson *root = r_json_parse (pdfj);
+	if (root && root->type == R_JSON_OBJECT) {
+		const RJson *ops = r_json_get (root, "ops");
+		if (ops && ops->type == R_JSON_ARRAY) {
+			RJson *elem;
+			for (elem = ops->children.first; elem; elem = elem->next) {
+				if (elem->type != R_JSON_OBJECT) {
+					continue;
+				}
+				const RJson *ptr = r_json_get (elem, "ptr");
+				if (ptr && ptr->type == R_JSON_INTEGER && ptr->num.u_value) {
+					append_pszj_string_to_pj (core, pj, (ut64)ptr->num.u_value);
+				}
+			}
+		}
+		r_json_free (root);
+	}
+
+	free (pdfj);
+}
+
 static char *sleigh_cmd(RAnal *anal, const char *cmd) {
-	ensure_sleigh_pdd_core_plugin (anal);
 	bool is_sla_ns = r_str_startswith (cmd, "sla");
 	bool is_sym_ns = r_str_startswith (cmd, "sym");
 	if (!is_sla_ns && !is_sym_ns) {
@@ -3638,7 +3585,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sla.sym.merge [on|off] - Toggle symbolic state merging");
 			r_cons_println (cons, "| a:sla.taint  - Taint analysis for current function");
 			r_cons_println (cons, "| a:sla.dec [name|addr] - Decompile function (current by default)");
-			r_cons_println (cons, "| pdd/pdD [name|addr] - Alias for a:sla.dec [name|addr]");
 			r_cons_println (cons, "| a:sla.cfg    - Show ASCII CFG for current function");
 			r_cons_println (cons, "| a:sla.cfg.json - Show CFG as JSON for current function");
 			r_cons_println (cons, "| a:sym.explore <target> - Explore symbolic paths reaching target");
@@ -4453,14 +4399,19 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 						const RJson *vaddr = r_json_get (elem, "vaddr");
 						const RJson *str = r_json_get (elem, "string");
 						if (vaddr && str && vaddr->type == R_JSON_INTEGER && str->type == R_JSON_STRING) {
+							ut64 addr = (ut64)vaddr->num.u_value;
+							if (!r_io_is_valid_offset (core->io, addr, 0)) {
+								continue;
+							}
 							char addr_str[32];
-							snprintf (addr_str, sizeof(addr_str), "0x%llx", (unsigned long long)vaddr->num.u_value);
+							snprintf (addr_str, sizeof(addr_str), "0x%llx", (unsigned long long)addr);
 							pj_ks (pj, addr_str, str->str_value);
 						}
 					}
 				}
 				r_json_free (root);
 			}
+			extend_string_map_with_function_ptr_strings (core, fcn, pj);
 			pj_end (pj);
 			strings_json = pj_drain (pj);
 		}
@@ -4583,7 +4534,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 /* Called after function analysis completes */
 static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
-	ensure_sleigh_pdd_core_plugin (anal);
 	if (!fcn || !anal) {
 		return false;
 	}
@@ -4636,7 +4586,6 @@ static void var_prot_free(void *ptr) {
 
 /* Called during variable recovery (afva) */
 static RList *sleigh_recover_vars(RAnal *anal, RAnalFunction *fcn) {
-	ensure_sleigh_pdd_core_plugin (anal);
 	if (!fcn || !anal) {
 		return NULL;
 	}
@@ -4893,7 +4842,6 @@ static int collect_data_refs_from_json(
 
 /* Called during reference analysis (aar) */
 static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn) {
-	ensure_sleigh_pdd_core_plugin (anal);
 	if (!fcn || !anal) {
 		return NULL;
 	}
@@ -6707,7 +6655,6 @@ static int sleigh_eligible(RAnal *anal) {
 
 /* Called at end of aaaa for global post-analysis passes */
 static bool sleigh_post_analysis(RAnal *anal) {
-	ensure_sleigh_pdd_core_plugin (anal);
 	R2ILContext *ctx = get_context (anal);
 	RCore *core;
 	int xrefs_added = 0;
@@ -7364,6 +7311,18 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						if (type_writeback_cache_put (fcn->addr, cache_key, dep_hash, payload_hash, applied_hash)) {
 							type_wb.cache_updates++;
 						}
+					}
+					if (signature_applied || cc_applied || type_payload_changed) {
+						char *post_external_context_json = sleigh_collect_external_context_json (anal, fcn);
+						if (!post_external_context_json || (post_external_context_json[0] != '{' && post_external_context_json[0] != '[')) {
+							free (post_external_context_json);
+							post_external_context_json = strdup ("{}");
+						}
+						r2sleigh_alias_function_analysis_artifact_cache (ctx,
+							(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+							external_context_json? external_context_json: "{}",
+							post_external_context_json? post_external_context_json: "{}");
+						free (post_external_context_json);
 					}
 					r_json_free (payload_root);
 					r2il_string_free (payload_json);

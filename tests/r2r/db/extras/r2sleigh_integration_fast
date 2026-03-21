@@ -54,7 +54,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.json | jq -c 'length>0 and (([..|objects|select((.space? | strings | ascii_downcase)=="register" and (.name? | strings | length>0))]|length) > 0)'
 EOF_CMDS
 RUN
@@ -66,7 +66,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.regs | jq -c '(.read|type=="array") and (.write|type=="array")'
 EOF_CMDS
 RUN
@@ -78,7 +78,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.vars | jq -c 'length>0 and (.[0] | has("name") and has("space") and has("offset") and has("size"))'
 EOF_CMDS
 RUN
@@ -90,7 +90,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.ssa | jq -c 'length>0 and (.[0]|has("op")) and (tostring|contains("RBP_"))'
 EOF_CMDS
 RUN
@@ -102,7 +102,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.defuse | jq -c 'has("inputs") and has("outputs") and has("live")'
 EOF_CMDS
 RUN
@@ -114,7 +114,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x4 >/dev/null
+s `is~check_secret[2]`+0x8 >/dev/null
 a:sla.mem | jq -c 'length>0 and (.[0]|has("addr") and has("size") and has("write")) and ((map(select(.stack==true))|length)>0) and ((map(select(.stack==true and ((.stack_offset|type)=="number")))|length)>0)'
 EOF_CMDS
 RUN
@@ -126,7 +126,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.opvals | jq -c '((.srcs|index("RBP")) != null) and ((.dsts|index("ZF")) != null)'
 EOF_CMDS
 RUN
@@ -138,7 +138,7 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~test_cpuid[2]`+0x2 >/dev/null
+s `is~test_cpuid[2]`+0x6 >/dev/null
 a:sla.json | jq -c '([.[] | .CallOther?.userop_name? | strings | select(length>0)] | length) > 0'
 EOF_CMDS
 RUN

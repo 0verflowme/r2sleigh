@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::context::{
     ExternalRegisterParamSpec, ExternalStackSlotSpec, ExternalStackVarSpec, StackSlotKey,
+    legacy_external_stack_vars_from_slots, stack_slots_from_legacy_external_stack_vars,
 };
 use crate::convert::CTypeLike;
 use crate::external::ExternalTypeDb;
@@ -70,13 +71,34 @@ pub struct FunctionSignatureSpec {
     pub params: Vec<FunctionParamSpec>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibleBindingKind {
+    Param,
+    Local,
+    StackObject,
+    HiddenHome,
+    HiddenSaved,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleBinding {
+    pub name: String,
+    pub ty: Option<CTypeLike>,
+    pub kind: VisibleBindingKind,
+    pub stack_slot: Option<StackSlotKey>,
+    pub param_index: Option<usize>,
+    pub source_reg: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionTypeFacts {
     pub merged_signature: Option<FunctionSignatureSpec>,
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    // Compatibility view for offset-only decompiler consumers during the Wave 2A migration.
+    pub visible_bindings: Vec<VisibleBinding>,
+    // Legacy compatibility view derived from canonical stack_slots when available.
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
@@ -90,6 +112,7 @@ pub struct FunctionTypeFactInputs {
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    pub visible_bindings: Vec<VisibleBinding>,
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
@@ -109,6 +132,7 @@ impl FunctionTypeFacts {
             && self.known_function_signatures.is_empty()
             && self.register_params.is_empty()
             && self.stack_slots.is_empty()
+            && self.visible_bindings.is_empty()
             && self.external_stack_vars.is_empty()
             && self.external_type_db.structs.is_empty()
             && self.external_type_db.unions.is_empty()
@@ -117,6 +141,23 @@ impl FunctionTypeFacts {
             && self.slot_type_overrides.is_empty()
             && self.slot_field_profiles.is_empty()
             && self.diagnostics.is_empty()
+    }
+
+    pub fn canonicalized(self) -> Self {
+        FunctionTypeFacts::builder(FunctionTypeFactInputs {
+            merged_signature: self.merged_signature,
+            known_function_signatures: self.known_function_signatures,
+            register_params: self.register_params,
+            stack_slots: self.stack_slots,
+            visible_bindings: self.visible_bindings,
+            external_stack_vars: self.external_stack_vars,
+            external_type_db: self.external_type_db,
+            slot_type_overrides: self.slot_type_overrides,
+            slot_field_profiles: self.slot_field_profiles,
+            local_field_accesses: Vec::new(),
+            diagnostics: self.diagnostics,
+        })
+        .build()
     }
 
     pub fn builder(inputs: FunctionTypeFactInputs) -> FunctionTypeFactsBuilder {
@@ -135,19 +176,44 @@ impl FunctionTypeFactsBuilder {
             &self.inputs.local_field_accesses,
         );
 
-        let mut diagnostics = self.inputs.diagnostics;
-        diagnostics.extend(self.inputs.external_type_db.diagnostics.iter().cloned());
+        let FunctionTypeFactInputs {
+            merged_signature,
+            known_function_signatures,
+            register_params,
+            mut stack_slots,
+            visible_bindings,
+            external_stack_vars,
+            external_type_db,
+            slot_type_overrides,
+            slot_field_profiles,
+            diagnostics,
+            ..
+        } = self.inputs;
+
+        if stack_slots.is_empty() && !external_stack_vars.is_empty() {
+            stack_slots = stack_slots_from_legacy_external_stack_vars(&external_stack_vars);
+        }
+
+        let external_stack_vars = if stack_slots.is_empty() {
+            external_stack_vars
+        } else {
+            legacy_external_stack_vars_from_slots(&stack_slots)
+        };
+
+        let mut diagnostics = diagnostics;
+        diagnostics.extend(external_type_db.diagnostics.iter().cloned());
         dedup_preserving_order(&mut diagnostics);
 
         FunctionTypeFacts {
-            merged_signature: self.inputs.merged_signature,
-            known_function_signatures: self.inputs.known_function_signatures,
-            register_params: self.inputs.register_params,
-            stack_slots: self.inputs.stack_slots,
-            external_stack_vars: self.inputs.external_stack_vars,
-            external_type_db: self.inputs.external_type_db,
-            slot_type_overrides: self.inputs.slot_type_overrides,
-            slot_field_profiles: self.inputs.slot_field_profiles,
+            merged_signature,
+            known_function_signatures,
+            register_params,
+            stack_slots,
+            visible_bindings,
+            external_stack_vars,
+            external_type_db,
+            slot_type_overrides,
+            slot_field_profiles,
             diagnostics,
         }
     }
@@ -194,6 +260,28 @@ pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
     while let Some(rest) = ty.strip_suffix('*') {
         ptr_count += 1;
         ty = rest.trim_end();
+    }
+    let qualifier_filtered = ty
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                token.to_ascii_lowercase().as_str(),
+                "const"
+                    | "volatile"
+                    | "restrict"
+                    | "__restrict"
+                    | "__restrict__"
+                    | "__const"
+                    | "__const__"
+                    | "__volatile"
+                    | "__volatile__"
+            )
+        })
+        .collect::<Vec<_>>();
+    let qualifier_filtered_storage = (qualifier_filtered.len() != ty.split_whitespace().count())
+        .then(|| qualifier_filtered.join(" "));
+    if let Some(filtered) = qualifier_filtered_storage.as_deref() {
+        ty = filtered.trim();
     }
 
     let normalize_base = |raw: &str| {
@@ -293,6 +381,7 @@ pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ExternalStackBase, ExternalStackSlotRole};
 
     #[test]
     fn builder_merges_local_field_accesses_into_slot_profiles() {
@@ -371,5 +460,95 @@ mod tests {
             facts.diagnostics,
             vec!["warning".to_string(), "local".to_string()]
         );
+    }
+
+    #[test]
+    fn builder_derives_legacy_stack_var_view_from_canonical_slots() {
+        let spec = ExternalStackSlotSpec {
+            name: "count".to_string(),
+            ty: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            base: ExternalStackBase::FramePointer,
+            role: ExternalStackSlotRole::Local,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
+        };
+        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+            stack_slots: BTreeMap::from([(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: -0x10,
+                },
+                spec.clone(),
+            )]),
+            external_stack_vars: HashMap::from([(
+                -0x10,
+                ExternalStackSlotSpec {
+                    name: "stale".to_string(),
+                    ..spec.clone()
+                },
+            )]),
+            ..FunctionTypeFactInputs::default()
+        })
+        .build();
+
+        assert_eq!(
+            facts
+                .external_stack_vars
+                .get(&-0x10)
+                .map(|slot| slot.name.as_str()),
+            Some("count")
+        );
+    }
+
+    #[test]
+    fn builder_canonicalizes_stack_slots_from_legacy_input() {
+        let spec = ExternalStackSlotSpec {
+            name: "count".to_string(),
+            ty: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            base: ExternalStackBase::FramePointer,
+            role: ExternalStackSlotRole::Local,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
+        };
+        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+            external_stack_vars: HashMap::from([(-0x10, spec)]),
+            ..FunctionTypeFactInputs::default()
+        })
+        .build();
+
+        assert_eq!(
+            facts.stack_slots.get(&StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -0x10,
+            }),
+            facts.external_stack_vars.get(&-0x10)
+        );
+    }
+
+    #[test]
+    fn parse_type_like_spec_accepts_const_qualified_pointers() {
+        let signed_char_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Int {
+            bits: 8,
+            signedness: Signedness::Signed,
+        }));
+        let void_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+
+        assert_eq!(
+            parse_type_like_spec("char const *", 64),
+            Some(signed_char_ptr.clone())
+        );
+        assert_eq!(
+            parse_type_like_spec("const char *", 64),
+            Some(signed_char_ptr)
+        );
+        assert_eq!(parse_type_like_spec("void const *", 64), Some(void_ptr));
     }
 }

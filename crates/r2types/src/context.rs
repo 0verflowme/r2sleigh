@@ -36,7 +36,7 @@ pub struct ParsedExternalContext {
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    // Compatibility view for offset-only decompiler consumers during the Wave 2A migration.
+    // Legacy compatibility view derived from canonical stack_slots.
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub diagnostics: Vec<String>,
@@ -329,11 +329,10 @@ pub fn parse_external_context_json(json_str: &str, ptr_bits: u32) -> ParsedExter
         parsed.noreturn = signature.noreturn;
     }
 
-    let (register_params, stack_slots, external_stack_vars) =
-        parse_external_vars(&raw.vars, ptr_bits);
+    let (register_params, stack_slots) = parse_external_vars(&raw.vars, ptr_bits);
     parsed.register_params = register_params;
     parsed.stack_slots = stack_slots;
-    parsed.external_stack_vars = external_stack_vars;
+    parsed.external_stack_vars = legacy_external_stack_vars_from_slots(&parsed.stack_slots);
     parsed.external_type_db = external_type_db_from_base_types(&raw.base_types, ptr_bits);
     parsed.known_function_signatures = parse_known_signatures(&raw.known_signatures, ptr_bits);
     parsed.merged_signature = merge_signature_with_register_params(
@@ -396,11 +395,9 @@ fn parse_external_vars(
 ) -> (
     Vec<ExternalRegisterParamSpec>,
     BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    HashMap<i64, ExternalStackVarSpec>,
 ) {
     let mut register_params = Vec::new();
     let mut stack_slots = BTreeMap::new();
-    let mut stack_vars = HashMap::new();
     let mut used_names = HashSet::new();
 
     for (idx, var) in vars.iter().enumerate() {
@@ -447,12 +444,11 @@ fn parse_external_vars(
                 };
                 let key = StackSlotKey { base, offset };
                 merge_stack_slot_candidate(&mut stack_slots, key, candidate.clone());
-                merge_legacy_stack_slot(&mut stack_vars, offset, candidate);
             }
         }
     }
 
-    (register_params, stack_slots, stack_vars)
+    (register_params, stack_slots)
 }
 
 fn parse_external_stack_base(raw: Option<&str>) -> ExternalStackBase {
@@ -539,6 +535,33 @@ fn merge_legacy_stack_slot(
         }
         _ => {}
     }
+}
+
+pub(crate) fn legacy_external_stack_vars_from_slots(
+    stack_slots: &BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+) -> HashMap<i64, ExternalStackVarSpec> {
+    let mut legacy = HashMap::new();
+    for (slot_key, slot_spec) in stack_slots {
+        merge_legacy_stack_slot(&mut legacy, slot_key.offset, slot_spec.clone());
+    }
+    legacy
+}
+
+pub(crate) fn stack_slots_from_legacy_external_stack_vars(
+    legacy_stack_vars: &HashMap<i64, ExternalStackVarSpec>,
+) -> BTreeMap<StackSlotKey, ExternalStackSlotSpec> {
+    let mut stack_slots = BTreeMap::new();
+    for (offset, slot_spec) in legacy_stack_vars {
+        merge_stack_slot_candidate(
+            &mut stack_slots,
+            StackSlotKey {
+                base: slot_spec.base.clone(),
+                offset: *offset,
+            },
+            slot_spec.clone(),
+        );
+    }
+    stack_slots
 }
 
 fn parse_known_signatures(

@@ -425,6 +425,19 @@ impl<'a> LowerCtx<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
+        if shape.index.is_none()
+            && shape.offset_bytes == 0
+            && let BaseRef::StackSlot(offset) = shape.base
+            && let Some(name) = self.stack_slot_name_for_offset(offset)
+            && (matches!(
+                self.lookup_type_hint(&name),
+                Some(CType::Pointer(_)) | Some(CType::Array(_, _))
+            ) || (elem_size < self.ptr_bytes()
+                && self.stack_slot_has_pointer_backed_source(offset, elem_size)))
+        {
+            return Some(CExpr::Deref(Box::new(CExpr::Var(name))));
+        }
+
         if let Some(index) = &shape.index {
             let scale = shape.scale_bytes.unsigned_abs() as u32;
             if scale == elem_size && shape.offset_bytes == 0 {
@@ -500,6 +513,36 @@ impl<'a> LowerCtx<'a> {
             BaseRef::Value(base) => self.render_value_ref(base, depth + 1, visited),
             BaseRef::Raw(expr) => Some(expr.clone()),
         }
+    }
+
+    fn stack_slot_name_for_offset(&self, offset: i64) -> Option<String> {
+        self.stack_slots
+            .iter()
+            .filter(|(_, slot)| slot.offset == offset)
+            .map(|(name, _)| name.clone())
+            .min_by_key(|name| {
+                let generic = name.starts_with("local_") || name.starts_with("stack_");
+                let synthetic = name.starts_with("tmp:") || name.contains(':');
+                (generic, synthetic, name.clone())
+            })
+    }
+
+    fn ptr_bytes(&self) -> u32 {
+        self.stack_slots
+            .keys()
+            .find_map(|name| self.lookup_type_hint(name).and_then(|ty| ty.bits()))
+            .map(|bits| bits.div_ceil(8).max(1))
+            .unwrap_or(8)
+    }
+
+    fn stack_slot_has_pointer_backed_source(&self, offset: i64, elem_size: u32) -> bool {
+        self.forwarded_values.values().any(|prov| {
+            prov.stack_slot == Some(offset)
+                && prov
+                    .source_var
+                    .as_ref()
+                    .is_some_and(|var| var.size > elem_size && var.size >= self.ptr_bytes())
+        })
     }
 
     fn render_value_ref(

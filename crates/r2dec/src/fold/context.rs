@@ -1,11 +1,16 @@
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::CType;
 use r2ssa::{FunctionSSABlock, SSAVar};
-use r2types::{ExternalStackVarSpec, ExternalTypeDb, FunctionType, SignatureRegistry, TypeOracle};
+#[cfg(test)]
+use r2types::ExternalStackVarSpec;
+use r2types::{
+    ExternalStackSlotSpec, ExternalTypeDb, FunctionType, SignatureRegistry, StackSlotKey,
+    TypeOracle, VisibleBinding,
+};
 
 pub(crate) type SSABlock = FunctionSSABlock;
 
@@ -34,7 +39,10 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) strings: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
+    pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    #[cfg(test)]
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
+    pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) external_type_db: &'a ExternalTypeDb,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
@@ -61,6 +69,14 @@ pub struct FoldingContext<'a> {
     pub(crate) preferred_entry_arg_lookup_cache:
         std::cell::RefCell<HashMap<String, Option<String>>>,
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
+    pub(crate) call_result_owner_name_cache:
+        std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
+    pub(crate) call_result_owner_expr_cache:
+        std::cell::RefCell<HashMap<String, Option<crate::ast::CExpr>>>,
+    pub(crate) non_variadic_call_arity_cache: std::cell::RefCell<HashMap<String, Option<usize>>>,
+    pub(crate) authoritative_source_args_cache:
+        std::cell::RefCell<BTreeMap<(u64, usize), Vec<crate::ast::CExpr>>>,
+    pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
     pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) value_render_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
@@ -133,6 +149,11 @@ impl<'a> FoldingContext<'a> {
             rendered_alias_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
+            call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
+            call_result_owner_expr_cache: std::cell::RefCell::new(HashMap::new()),
+            non_variadic_call_arity_cache: std::cell::RefCell::new(HashMap::new()),
+            authoritative_source_args_cache: std::cell::RefCell::new(BTreeMap::new()),
+            owned_call_visible_names_cache: std::cell::RefCell::new(None),
             semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
             value_render_in_progress: std::cell::RefCell::new(HashSet::new()),
             definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
@@ -143,7 +164,11 @@ impl<'a> FoldingContext<'a> {
     /// Test convenience constructor.
     pub fn new(ptr_size: u32) -> Self {
         static EMPTY_U64_STRING: OnceLock<HashMap<u64, String>> = OnceLock::new();
+        static EMPTY_STACK_SLOTS: OnceLock<BTreeMap<StackSlotKey, ExternalStackSlotSpec>> =
+            OnceLock::new();
+        #[cfg(test)]
         static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
+        static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
         static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
         static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
         static EMPTY_STRING_FNTY: OnceLock<HashMap<String, FunctionType>> = OnceLock::new();
@@ -163,7 +188,10 @@ impl<'a> FoldingContext<'a> {
             strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
             symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             known_function_signatures: EMPTY_STRING_FNTY.get_or_init(HashMap::new),
+            stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
+            #[cfg(test)]
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
+            visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
             external_type_db: EMPTY_TYPE_DB.get_or_init(ExternalTypeDb::default),
             param_register_aliases: EMPTY_STRING_STRING.get_or_init(HashMap::new),
             type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),

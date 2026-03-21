@@ -1,23 +1,74 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use r2il::{ArchSpec, SpaceId, Varnode, select_register_name};
 
 pub type RegisterNameMap = HashMap<(u64, u32), String>;
 
-pub fn build_register_name_map(arch: &ArchSpec) -> RegisterNameMap {
-    let mut candidates: HashMap<(u64, u32), Vec<String>> = HashMap::new();
-    for reg in &arch.registers {
-        let key = (reg.offset, reg.size);
-        candidates.entry(key).or_default().push(reg.name.clone());
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ArchCacheTag {
+    name: String,
+    variant: String,
+    addr_size: u32,
+    register_layout_hash: u64,
+}
 
-    let mut map = HashMap::new();
-    for (key, names) in candidates {
-        if let Some(name) = select_register_name(names.iter().map(String::as_str)) {
-            map.insert(key, name.to_lowercase());
+impl ArchCacheTag {
+    pub(crate) fn from_arch(arch: &ArchSpec) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for reg in &arch.registers {
+            reg.name.hash(&mut hasher);
+            reg.offset.hash(&mut hasher);
+            reg.size.hash(&mut hasher);
+        }
+        Self {
+            name: arch.name.clone(),
+            variant: arch.variant.clone(),
+            addr_size: arch.addr_size,
+            register_layout_hash: hasher.finish(),
         }
     }
+}
 
+fn register_name_map_cache() -> &'static RwLock<HashMap<ArchCacheTag, Arc<RegisterNameMap>>> {
+    static CACHE: OnceLock<RwLock<HashMap<ArchCacheTag, Arc<RegisterNameMap>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn build_register_name_map_uncached(arch: &ArchSpec) -> RegisterNameMap {
+    let mut names_by_key: HashMap<(u64, u32), Vec<&str>> =
+        HashMap::with_capacity(arch.registers.len());
+    for reg in &arch.registers {
+        names_by_key
+            .entry((reg.offset, reg.size))
+            .or_default()
+            .push(reg.name.as_str());
+    }
+
+    names_by_key
+        .into_iter()
+        .filter_map(|(key, names)| select_register_name(names).map(|name| (key, name)))
+        .collect()
+}
+
+pub(crate) fn cached_register_name_map(arch: &ArchSpec) -> Arc<RegisterNameMap> {
+    let cache_tag = ArchCacheTag::from_arch(arch);
+
+    if let Some(cached) = register_name_map_cache()
+        .read()
+        .expect("register name cache read lock poisoned")
+        .get(&cache_tag)
+        .cloned()
+    {
+        return cached;
+    }
+
+    let map = Arc::new(build_register_name_map_uncached(arch));
+    register_name_map_cache()
+        .write()
+        .expect("register name cache write lock poisoned")
+        .insert(cache_tag, map.clone());
     map
 }
 

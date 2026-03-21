@@ -24,9 +24,7 @@ EXPECT=<<EOF_EXPECT
 int32_t dbg.complex_check(int32_t a, int32_t b)
 {
     int32_t diff;
-    int32_t sum;
 
-    sum = b + a;
     diff = a - b;
     {
         if (b + a != 64) {

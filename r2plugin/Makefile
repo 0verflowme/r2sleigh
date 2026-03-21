@@ -107,7 +107,7 @@ endif
 
 $(RUST_LIB_LOCAL): $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	mkdir -p $(RUST_RUNTIME_SUBDIR)
-	rm -f $(RUST_LIB).$(RUST_LIB_EXT)
+	rm -f $@
 	cp $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) $@
 ifeq ($(UNAME),Darwin)
 	@codesign --force --sign - $@ >/dev/null
@@ -118,7 +118,7 @@ install: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 	@mkdir -p $(R2_PLUGIN_DIR)
 	@mkdir -p $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)
 	rm -f $(R2_PLUGIN_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-	cp $(RUST_LIB_LOCAL) $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)/
+	cp $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) $(R2_PLUGIN_DIR)/$(RUST_RUNTIME_SUBDIR)/
 	cp $(ANAL_PLUGIN_SO) $(R2_PLUGIN_DIR)/
 	cp $(ARCH_PLUGIN_SO) $(R2_PLUGIN_DIR)/
 ifeq ($(UNAME),Darwin)

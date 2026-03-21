@@ -32,8 +32,6 @@ pub struct TypeInference {
     signature_registry: SignatureRegistry,
     /// Optional externally recovered function signature.
     external_signature: Option<FunctionSignatureSpec>,
-    /// Optional externally recovered stack variables.
-    external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     /// Canonical stack-slot facts keyed by structural slot identity.
     external_stack_slots: BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     /// Proven SSA var -> stack-slot bindings from decompile prep.
@@ -91,7 +89,6 @@ impl TypeInference {
             ret_regs,
             signature_registry: SignatureRegistry::from_embedded_json(),
             external_signature: None,
-            external_stack_vars: HashMap::new(),
             external_stack_slots: BTreeMap::new(),
             ssa_stack_slots: BTreeMap::new(),
             external_type_db: ExternalTypeDb::default(),
@@ -111,7 +108,14 @@ impl TypeInference {
 
     /// Set externally recovered stack variables.
     pub fn set_external_stack_vars(&mut self, stack_vars: HashMap<i64, ExternalStackVarSpec>) {
-        self.external_stack_vars = stack_vars;
+        for (offset, spec) in stack_vars {
+            self.external_stack_slots
+                .entry(StackSlotKey {
+                    base: spec.base.clone(),
+                    offset,
+                })
+                .or_insert(spec);
+        }
     }
 
     /// Set canonical externally recovered stack-slot facts.
@@ -243,11 +247,6 @@ impl TypeInference {
         self.ssa_stack_slots
             .get(var)
             .and_then(|key| self.external_stack_slots.get(key))
-            .or_else(|| {
-                self.external_stack_vars
-                    .values()
-                    .find(|slot| slot.name.eq_ignore_ascii_case(&var.name))
-            })
     }
 
     fn emit_inferred_constraints(
@@ -2061,6 +2060,45 @@ mod tests {
             set_type_count >= 2,
             "Subpiece should emit at least 2 SetType constraints (dst+src), got {}",
             set_type_count
+        );
+    }
+
+    #[test]
+    fn test_legacy_external_stack_vars_are_canonicalized_without_name_fallback() {
+        let mut ti = TypeInference::new(64);
+        let slot_var = SSAVar::new("tmp:stack", 1, 8);
+        ti.set_external_stack_vars(HashMap::from([(
+            -8,
+            ExternalStackVarSpec {
+                name: "count".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+                base: ExternalStackBase::FramePointer,
+                role: crate::ExternalStackSlotRole::Local,
+                param_index: None,
+                param_name: None,
+                source_reg: None,
+            },
+        )]));
+        ti.ssa_stack_slots.insert(
+            slot_var.clone(),
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -8,
+            },
+        );
+
+        assert_eq!(
+            ti.stack_slot_spec_for_var(&slot_var)
+                .map(|slot| slot.name.as_str()),
+            Some("count")
+        );
+        assert!(
+            ti.stack_slot_spec_for_var(&SSAVar::new("count", 1, 8))
+                .is_none(),
+            "legacy offset-only metadata must not bind unrelated SSA vars by name"
         );
     }
 }

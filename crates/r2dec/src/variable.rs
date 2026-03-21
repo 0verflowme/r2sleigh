@@ -6,12 +6,15 @@
 use std::collections::{HashMap, HashSet};
 
 use r2ssa::{SSAFunction, SSAOp, SSAVar};
-use r2types::{CTypeLike, FunctionTypeFacts};
+use r2types::{
+    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionTypeFacts, StackSlotKey,
+    VisibleBinding, VisibleBindingKind,
+};
 
 use crate::analysis::utils;
 use crate::ast::{BinaryOp, CExpr, CType};
 
-fn type_like_to_ctype(ty: &CTypeLike) -> CType {
+pub(crate) fn type_like_to_ctype(ty: &CTypeLike) -> CType {
     match ty {
         CTypeLike::Void => CType::Void,
         CTypeLike::Bool => CType::Bool,
@@ -176,7 +179,16 @@ impl VariableRecovery {
 
     /// Set externally recovered type/layout facts.
     pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
-        self.type_facts = type_facts;
+        self.type_facts = type_facts.canonicalized();
+    }
+
+    fn is_visible_external_stack_name_role(role: ExternalStackSlotRole) -> bool {
+        matches!(
+            role,
+            ExternalStackSlotRole::Local
+                | ExternalStackSlotRole::StackArg
+                | ExternalStackSlotRole::Unknown
+        )
     }
 
     fn is_reserved_param_name(&self, name: &str) -> bool {
@@ -197,53 +209,77 @@ impl VariableRecovery {
         }
 
         self.type_facts
-            .merged_signature
-            .as_ref()
-            .map(|sig| {
-                sig.params
-                    .iter()
-                    .take(self.arg_regs.len())
-                    .any(|param| param.name.eq_ignore_ascii_case(name))
-            })
-            .unwrap_or(false)
+            .visible_bindings
+            .iter()
+            .filter(|binding| matches!(binding.kind, VisibleBindingKind::Param))
+            .any(|binding| binding.name.eq_ignore_ascii_case(name))
+            || self
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .map(|sig| {
+                    sig.params
+                        .iter()
+                        .take(self.arg_regs.len())
+                        .any(|param| param.name.eq_ignore_ascii_case(name))
+                })
+                .unwrap_or(false)
+    }
+
+    fn visible_param_binding(&self, index: usize) -> Option<&VisibleBinding> {
+        self.type_facts.visible_bindings.iter().find(|binding| {
+            matches!(binding.kind, VisibleBindingKind::Param) && binding.param_index == Some(index)
+        })
+    }
+
+    fn visible_stack_binding_for_offset(&self, offset: i64) -> Option<&VisibleBinding> {
+        self.type_facts.visible_bindings.iter().find(|binding| {
+            !matches!(
+                binding.kind,
+                VisibleBindingKind::Param
+                    | VisibleBindingKind::HiddenHome
+                    | VisibleBindingKind::HiddenSaved
+            ) && binding
+                .stack_slot
+                .as_ref()
+                .is_some_and(|slot| Self::stack_slot_matches_offset(slot, offset))
+        })
+    }
+
+    fn stack_slot_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
+        if slot.offset == offset {
+            return true;
+        }
+        matches!(slot.base, ExternalStackBase::FramePointer) && -slot.offset == offset
     }
 
     fn external_stack_name_for_offset(&self, offset: i64) -> Option<String> {
-        if let Some(var) = self.type_facts.external_stack_vars.get(&offset)
-            && !var.name.is_empty()
-            && !self.is_reserved_param_name(&var.name)
+        if let Some(binding) = self.visible_stack_binding_for_offset(offset)
+            && !binding.name.is_empty()
+            && !self.is_reserved_param_name(&binding.name)
         {
-            return Some(var.name.clone());
+            return Some(binding.name.clone());
         }
 
-        // r2 external metadata may encode RBP locals as negative offsets while
-        // internal recovery tracks locals as positive deltas from frame base.
-        let mut mirrored_offsets: Vec<_> = self
-            .type_facts
-            .external_stack_vars
-            .keys()
-            .copied()
-            .collect();
-        mirrored_offsets.sort_unstable();
-        for ext_offset in mirrored_offsets {
-            let Some(var) = self.type_facts.external_stack_vars.get(&ext_offset) else {
-                continue;
-            };
-            if var.name.is_empty() || self.is_reserved_param_name(&var.name) {
+        for (slot_key, slot_spec) in &self.type_facts.stack_slots {
+            if !Self::stack_slot_matches_offset(slot_key, offset) {
                 continue;
             }
-            let is_frame_based = var
-                .base
-                .legacy_name()
-                .as_deref()
-                .map(|base| base.eq_ignore_ascii_case("rbp") || base.eq_ignore_ascii_case("ebp"))
-                .unwrap_or(false);
-            if is_frame_based && -ext_offset == offset {
-                return Some(var.name.clone());
+            if !slot_spec.name.is_empty()
+                && Self::is_visible_external_stack_name_role(slot_spec.role)
+                && !self.is_reserved_param_name(&slot_spec.name)
+            {
+                return Some(slot_spec.name.clone());
             }
         }
 
         None
+    }
+
+    fn visible_stack_type_for_offset(&self, offset: i64) -> Option<CType> {
+        self.visible_stack_binding_for_offset(offset)
+            .and_then(|binding| binding.ty.as_ref())
+            .map(type_like_to_ctype)
     }
 
     /// Recover variables from an SSA function.
@@ -392,14 +428,18 @@ impl VariableRecovery {
                     SSAOp::Load { dst, addr, .. } => {
                         if let Some(offset) = self.get_stack_offset(addr, &definitions) {
                             let name = self.gen_stack_var_name(offset);
-                            let ty = self.type_from_size(dst.size);
+                            let ty = self
+                                .visible_stack_type_for_offset(offset)
+                                .unwrap_or_else(|| self.type_from_size(dst.size));
                             self.insert_var_info(dst.clone(), name, ty, VarAttrs::local(offset));
                         }
                     }
                     SSAOp::Store { addr, val, .. } => {
                         if let Some(offset) = self.get_stack_offset(addr, &definitions) {
                             let name = self.gen_stack_var_name(offset);
-                            let ty = self.type_from_size(val.size);
+                            let ty = self
+                                .visible_stack_type_for_offset(offset)
+                                .unwrap_or_else(|| self.type_from_size(val.size));
                             self.insert_var_info(val.clone(), name, ty, VarAttrs::local(offset));
                         }
                     }
@@ -551,6 +591,15 @@ impl VariableRecovery {
     }
 
     fn apply_external_param_override(&self, index: usize, name: &mut String, ty: &mut CType) {
+        if let Some(binding) = self.visible_param_binding(index) {
+            if !is_generic_arg_name(&binding.name) {
+                *name = binding.name.clone();
+            }
+            if let Some(binding_ty) = binding.ty.as_ref() {
+                *ty = type_like_to_ctype(binding_ty);
+            }
+        }
+
         let Some(signature) = self.type_facts.merged_signature.as_ref() else {
             return;
         };
@@ -757,7 +806,7 @@ mod tests {
     use r2ssa::SSAFunction;
     use r2types::{
         ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, FunctionParamSpec,
-        FunctionSignatureSpec, FunctionTypeFacts,
+        FunctionSignatureSpec, FunctionTypeFacts, StackSlotKey, VisibleBinding, VisibleBindingKind,
     };
 
     fn stack_var_spec_from_ctype(
@@ -795,6 +844,36 @@ mod tests {
                     ty: ty.as_ref().map(super::super::ctype_to_type_like),
                 })
                 .collect(),
+        }
+    }
+
+    fn visible_stack_binding(name: &str, ty: Option<CType>, offset: i64) -> VisibleBinding {
+        VisibleBinding {
+            name: name.to_string(),
+            ty: ty.as_ref().map(super::super::ctype_to_type_like),
+            kind: VisibleBindingKind::Local,
+            stack_slot: Some(StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset,
+            }),
+            param_index: None,
+            source_reg: None,
+        }
+    }
+
+    fn visible_param_binding(
+        name: &str,
+        ty: Option<CType>,
+        index: usize,
+        reg: &str,
+    ) -> VisibleBinding {
+        VisibleBinding {
+            name: name.to_string(),
+            ty: ty.as_ref().map(super::super::ctype_to_type_like),
+            kind: VisibleBindingKind::Param,
+            stack_slot: None,
+            param_index: Some(index),
+            source_reg: Some(reg.to_string()),
         }
     }
 
@@ -837,6 +916,11 @@ mod tests {
     fn test_external_stack_var_name_preferred() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
         vr.set_type_facts(FunctionTypeFacts {
+            visible_bindings: vec![visible_stack_binding(
+                "user_input",
+                Some(CType::ptr(CType::Int(8))),
+                -8,
+            )],
             external_stack_vars: HashMap::from([(
                 8,
                 stack_var_spec_from_ctype("user_input", None, Some("RBP")),
@@ -918,6 +1002,12 @@ mod tests {
     fn test_external_signature_overrides_meaningful_param_name_and_type() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
         vr.set_type_facts(FunctionTypeFacts {
+            visible_bindings: vec![visible_param_binding(
+                "user_input",
+                Some(CType::ptr(CType::Int(8))),
+                0,
+                "rdi",
+            )],
             merged_signature: Some(signature_spec(vec![(
                 "user_input",
                 Some(CType::ptr(CType::Int(8))),
@@ -931,6 +1021,46 @@ mod tests {
 
         assert_eq!(name, "user_input");
         assert_eq!(ty, CType::ptr(CType::Int(8)));
+    }
+
+    #[test]
+    fn visible_binding_type_and_name_drive_stack_local_recovery() {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:addr", 1, 8),
+                a: SSAVar::new("RBP", 1, 8),
+                b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: SSAVar::new("tmp:len", 1, 8),
+                space: "ram".to_string(),
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("tmp:len", 1, 8),
+            },
+        ];
+
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(FunctionTypeFacts {
+            visible_bindings: vec![visible_stack_binding("len", Some(CType::UInt(64)), -8)],
+            ..FunctionTypeFacts::default()
+        });
+
+        vr.recover(&func);
+
+        let local = vr
+            .locals()
+            .into_iter()
+            .find(|info| info.name == "len")
+            .expect("visible stack local");
+        assert_eq!(local.name, "len");
+        assert_eq!(local.ty, CType::UInt(64));
     }
 
     #[test]

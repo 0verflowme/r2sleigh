@@ -40,18 +40,20 @@ impl<'a> FoldingContext<'a> {
         addr: &SSAVar,
         elem_ty: CType,
     ) -> CExpr {
+        let pointee_load = dst.size < addr.size;
         let fallback_addr_expr = self
             .lookup_definition(&addr.display_name())
             .or_else(|| self.definitions_map().get(&addr.display_name()).cloned())
             .unwrap_or_else(|| self.get_expr(addr));
         let mut semantic_visited = HashSet::new();
-        let mut best = self.choose_preferred_visible_expr(
-            self.render_authoritative_memory_access_by_name(
-                &dst.display_name(),
-                dst.size,
-                0,
-                &mut semantic_visited,
-            ),
+        let mut best = self.render_authoritative_memory_access_by_name(
+            &dst.display_name(),
+            dst.size,
+            0,
+            &mut semantic_visited,
+        );
+        best = self.choose_preferred_visible_expr(
+            best,
             self.render_authoritative_memory_access_by_name(
                 &addr.display_name(),
                 dst.size,
@@ -65,9 +67,25 @@ impl<'a> FoldingContext<'a> {
             0,
             &mut semantic_visited,
         );
+        if let Some(fallback_structured) = fallback_rendered
+            .as_ref()
+            .filter(|expr| Self::expr_is_structured_memory_candidate(expr))
+            .cloned()
+            && !best
+                .as_ref()
+                .is_some_and(Self::expr_is_structured_memory_candidate)
+        {
+            best = Some(fallback_structured);
+        }
         best = self.choose_preferred_visible_expr(best, fallback_rendered);
         if let Some(expr) = best {
             return expr;
+        }
+
+        if pointee_load {
+            let ptr_ty = CType::ptr(elem_ty.clone());
+            let casted = self.cast_addr_expr_to_ptr_if_needed(addr, self.get_expr(addr), &ptr_ty);
+            return CExpr::Deref(Box::new(casted));
         }
 
         if addr.name.starts_with("ram:")
@@ -84,7 +102,9 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        if let Some(stack_var) = self.stack_var_for_addr_var(addr) {
+        if dst.size >= addr.size
+            && let Some(stack_var) = self.stack_var_for_addr_var(addr)
+        {
             return CExpr::Var(stack_var);
         }
 
@@ -125,6 +145,16 @@ impl<'a> FoldingContext<'a> {
             0,
             &mut semantic_visited,
         );
+        if let Some(fallback_structured) = fallback_rendered
+            .as_ref()
+            .filter(|expr| Self::expr_is_structured_memory_candidate(expr))
+            .cloned()
+            && !best
+                .as_ref()
+                .is_some_and(Self::expr_is_structured_memory_candidate)
+        {
+            best = Some(fallback_structured);
+        }
         best = self.choose_preferred_visible_expr(best, fallback_rendered);
         if let Some(expr) = best {
             return expr;

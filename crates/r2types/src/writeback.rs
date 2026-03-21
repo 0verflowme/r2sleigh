@@ -5,6 +5,7 @@ use r2ssa::{SSABlock, SSAOp, SSAVar};
 use crate::context::{
     ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, ParsedExternalContext,
     StackSlotKey, apply_main_signature_override, is_c_main_function, is_generic_arg_name,
+    legacy_external_stack_vars_from_slots, stack_slots_from_legacy_external_stack_vars,
 };
 use crate::convert::CTypeLike;
 use crate::external::{
@@ -12,7 +13,7 @@ use crate::external::{
 };
 use crate::facts::{
     FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts,
-    parse_type_like_spec,
+    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
 use crate::model::Signedness;
 
@@ -208,10 +209,15 @@ struct VarTypeCandidateContext<'a> {
     merged_signature: Option<&'a FunctionSignatureSpec>,
     slot_type_overrides: &'a HashMap<usize, String>,
     stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackVarSpec>,
-    external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     existing_types: &'a HashMap<String, String>,
     ptr_bits: u32,
     is_main_signature: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum VisibleBindingKey {
+    Param(usize),
+    Stack(StackSlotKey),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +230,17 @@ struct GlobalAddrExpr {
 pub fn build_type_writeback_analysis(
     mut input: TypeWritebackAnalysisInput<'_>,
 ) -> TypeWritebackAnalysis {
+    if input.parsed_context.stack_slots.is_empty()
+        && !input.parsed_context.external_stack_vars.is_empty()
+    {
+        input.parsed_context.stack_slots =
+            stack_slots_from_legacy_external_stack_vars(&input.parsed_context.external_stack_vars);
+    }
+    if !input.parsed_context.stack_slots.is_empty() {
+        input.parsed_context.external_stack_vars =
+            legacy_external_stack_vars_from_slots(&input.parsed_context.stack_slots);
+    }
+
     let mut merged_signature = merge_local_signature_into_merged_signature(
         input.parsed_context.merged_signature.clone(),
         inferred_signature_to_spec(&input.inferred_signature, input.ptr_bits),
@@ -283,20 +300,6 @@ pub fn build_type_writeback_analysis(
         merged_signature.as_ref(),
         input.ptr_bits,
     );
-    let type_facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
-        merged_signature: merged_signature.clone(),
-        known_function_signatures: input.parsed_context.known_function_signatures.clone(),
-        register_params: input.parsed_context.register_params.clone(),
-        stack_slots: input.parsed_context.stack_slots.clone(),
-        external_stack_vars: input.parsed_context.external_stack_vars.clone(),
-        external_type_db: type_db,
-        slot_type_overrides: local_structs.slot_type_overrides.clone(),
-        slot_field_profiles: local_structs.slot_field_profiles.clone(),
-        diagnostics: diagnostics.solver_warnings.clone(),
-        ..FunctionTypeFactInputs::default()
-    })
-    .build();
-
     let existing_types =
         parse_existing_var_types_from_specs(&input.parsed_context.stack_slots, input.ptr_bits);
     let is_main_signature = is_c_main_function(input.function_name);
@@ -305,7 +308,6 @@ pub fn build_type_writeback_analysis(
         merged_signature: merged_signature.as_ref(),
         slot_type_overrides: &local_structs.slot_type_overrides,
         stack_slots: &input.parsed_context.stack_slots,
-        external_stack_vars: &input.parsed_context.external_stack_vars,
         existing_types: &existing_types,
         ptr_bits: input.ptr_bits,
         is_main_signature,
@@ -316,8 +318,30 @@ pub fn build_type_writeback_analysis(
         input.recovered_vars,
         &current_context_maps.param_names,
         &input.parsed_context.stack_slots,
-        &input.parsed_context.external_stack_vars,
     );
+    let visible_bindings = build_visible_bindings(
+        merged_signature.as_ref(),
+        &input.parsed_context.register_params,
+        &input.parsed_context.stack_slots,
+        input.recovered_vars,
+        &var_type_candidates,
+        &var_rename_candidates,
+        input.ptr_bits,
+    );
+    let type_facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+        merged_signature: merged_signature.clone(),
+        known_function_signatures: input.parsed_context.known_function_signatures.clone(),
+        register_params: input.parsed_context.register_params.clone(),
+        stack_slots: input.parsed_context.stack_slots.clone(),
+        visible_bindings,
+        external_stack_vars: input.parsed_context.external_stack_vars.clone(),
+        external_type_db: type_db,
+        slot_type_overrides: local_structs.slot_type_overrides.clone(),
+        slot_field_profiles: local_structs.slot_field_profiles.clone(),
+        diagnostics: diagnostics.solver_warnings.clone(),
+        ..FunctionTypeFactInputs::default()
+    })
+    .build();
     let global_type_links = score_global_type_links(
         input.ssa_blocks,
         &struct_decls,
@@ -369,6 +393,8 @@ fn merge_local_signature_into_merged_signature(
         (Some(signature), None) => Some(signature),
         (None, Some(signature)) => Some(signature),
         (Some(mut external), Some(local)) => {
+            let external_param_count_is_authoritative =
+                signature_param_count_is_authoritative(&external);
             if local_signature_should_override_external(
                 local.ret_type.as_ref(),
                 external.ret_type.as_ref(),
@@ -378,7 +404,8 @@ fn merge_local_signature_into_merged_signature(
                 external.ret_type = local.ret_type.or(external.ret_type);
             }
 
-            if external.params.len() < local.params.len() {
+            if !external_param_count_is_authoritative && external.params.len() < local.params.len()
+            {
                 external
                     .params
                     .resize_with(local.params.len(), || FunctionParamSpec {
@@ -388,6 +415,9 @@ fn merge_local_signature_into_merged_signature(
             }
 
             for (idx, local_param) in local.params.into_iter().enumerate() {
+                if idx >= external.params.len() {
+                    continue;
+                }
                 let target = &mut external.params[idx];
                 if target.name.is_empty() {
                     target.name = format!("arg{}", idx + 1);
@@ -470,7 +500,8 @@ fn merge_recovered_arg_types_into_signature(
 
     let max_slot = local_arg_types.keys().copied().max()?;
     let sig = signature.get_or_insert_with(Default::default);
-    while sig.params.len() <= max_slot {
+    let allow_param_count_extension = !signature_param_count_is_authoritative(sig);
+    while allow_param_count_extension && sig.params.len() <= max_slot {
         let idx = sig.params.len();
         sig.params.push(FunctionParamSpec {
             name: format!("arg{}", idx + 1),
@@ -479,6 +510,9 @@ fn merge_recovered_arg_types_into_signature(
     }
 
     for (slot, local_ty) in local_arg_types {
+        if slot >= sig.params.len() {
+            continue;
+        }
         let param = &mut sig.params[slot];
         if param.name.is_empty() {
             param.name = format!("arg{}", slot + 1);
@@ -541,6 +575,16 @@ fn stack_slot_key_for_recovered_var(var: &RecoveredVariable) -> Option<StackSlot
     })
 }
 
+fn slot_spec_for_recovered_var<'a>(
+    var: &RecoveredVariable,
+    stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+) -> Option<&'a ExternalStackVarSpec> {
+    if let Some(slot_key) = stack_slot_key_for_recovered_var(var) {
+        return stack_slots.get(&slot_key);
+    }
+    None
+}
+
 fn slot_role_is_hidden(role: ExternalStackSlotRole) -> bool {
     matches!(
         role,
@@ -559,6 +603,209 @@ fn slot_role_allows_external_local_identity(role: ExternalStackSlotRole) -> bool
     )
 }
 
+fn visible_binding_kind_for_slot_role(role: ExternalStackSlotRole) -> VisibleBindingKind {
+    match role {
+        ExternalStackSlotRole::Local => VisibleBindingKind::Local,
+        ExternalStackSlotRole::StackArg => VisibleBindingKind::Param,
+        ExternalStackSlotRole::ParamHome => VisibleBindingKind::HiddenHome,
+        ExternalStackSlotRole::SavedReg | ExternalStackSlotRole::SavedFp => {
+            VisibleBindingKind::HiddenSaved
+        }
+        ExternalStackSlotRole::Unknown => VisibleBindingKind::Unknown,
+    }
+}
+
+fn visible_binding_key_for_recovered_var(var: &RecoveredVariable) -> Option<VisibleBindingKey> {
+    if let Some(slot_key) = stack_slot_key_for_recovered_var(var) {
+        return Some(VisibleBindingKey::Stack(slot_key));
+    }
+    if var.isarg {
+        return var
+            .name
+            .strip_prefix("arg")
+            .and_then(|idx| idx.parse::<usize>().ok())
+            .map(VisibleBindingKey::Param);
+    }
+    None
+}
+
+fn name_is_low_signal_binding(name: &str) -> bool {
+    is_low_quality_stack_name(name) || is_generic_arg_name(name)
+}
+
+fn binding_type_is_unknown(ty: Option<&CTypeLike>) -> bool {
+    matches!(ty, None | Some(CTypeLike::Unknown))
+}
+
+fn merge_visible_binding(existing: &mut VisibleBinding, candidate: VisibleBinding) {
+    let VisibleBinding {
+        name,
+        ty,
+        kind,
+        stack_slot,
+        param_index,
+        source_reg,
+    } = candidate;
+    let existing_low_signal = name_is_low_signal_binding(&existing.name);
+    let candidate_low_signal = name_is_low_signal_binding(&name);
+    if existing.name.is_empty() || (existing_low_signal && !candidate_low_signal) {
+        existing.name = name;
+    }
+
+    if binding_type_is_unknown(existing.ty.as_ref()) && !binding_type_is_unknown(ty.as_ref()) {
+        existing.ty = ty;
+    }
+
+    if matches!(existing.kind, VisibleBindingKind::Unknown)
+        || (matches!(existing.kind, VisibleBindingKind::Local)
+            && matches!(kind, VisibleBindingKind::StackObject))
+    {
+        existing.kind = kind;
+    }
+
+    if existing.stack_slot.is_none() && stack_slot.is_some() {
+        existing.stack_slot = stack_slot;
+    }
+    if existing.param_index.is_none() && param_index.is_some() {
+        existing.param_index = param_index;
+    }
+    if existing.source_reg.is_none() && source_reg.is_some() {
+        existing.source_reg = source_reg;
+    }
+}
+
+fn build_visible_bindings(
+    merged_signature: Option<&FunctionSignatureSpec>,
+    register_params: &[crate::context::ExternalRegisterParamSpec],
+    stack_slots: &BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    recovered_vars: &[RecoveredVariable],
+    var_type_candidates: &[VarTypeCandidate],
+    var_rename_candidates: &[VarRenameCandidate],
+    ptr_bits: u32,
+) -> Vec<VisibleBinding> {
+    let mut bindings = BTreeMap::<VisibleBindingKey, VisibleBinding>::new();
+
+    for (idx, param) in merged_signature
+        .map(|sig| sig.params.iter().enumerate().collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        bindings.insert(
+            VisibleBindingKey::Param(idx),
+            VisibleBinding {
+                name: if is_generic_arg_name(&param.name) {
+                    format!("arg{}", idx + 1)
+                } else {
+                    param.name.clone()
+                },
+                ty: param.ty.clone(),
+                kind: VisibleBindingKind::Param,
+                stack_slot: None,
+                param_index: Some(idx),
+                source_reg: register_params.get(idx).map(|param| param.reg.clone()),
+            },
+        );
+    }
+
+    for (idx, reg_param) in register_params.iter().enumerate() {
+        let candidate = VisibleBinding {
+            name: if reg_param.name.is_empty() {
+                format!("arg{}", idx + 1)
+            } else {
+                reg_param.name.clone()
+            },
+            ty: reg_param.ty.clone(),
+            kind: VisibleBindingKind::Param,
+            stack_slot: None,
+            param_index: Some(idx),
+            source_reg: Some(reg_param.reg.clone()),
+        };
+        bindings
+            .entry(VisibleBindingKey::Param(idx))
+            .and_modify(|existing| merge_visible_binding(existing, candidate.clone()))
+            .or_insert(candidate);
+    }
+
+    let rename_map = var_rename_candidates
+        .iter()
+        .map(|candidate| (candidate.name.as_str(), candidate.target_name.clone()))
+        .collect::<HashMap<_, _>>();
+    let type_map = var_type_candidates
+        .iter()
+        .filter_map(|candidate| {
+            parse_type_like_spec(&candidate.var_type, ptr_bits)
+                .map(|ty| (candidate.name.as_str(), ty))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (slot_key, slot_spec) in stack_slots {
+        let key = slot_spec
+            .param_index
+            .filter(|_| matches!(slot_spec.role, ExternalStackSlotRole::StackArg))
+            .map(VisibleBindingKey::Param)
+            .unwrap_or_else(|| VisibleBindingKey::Stack(slot_key.clone()));
+        let candidate = VisibleBinding {
+            name: slot_spec
+                .param_name
+                .as_ref()
+                .filter(|_| matches!(slot_spec.role, ExternalStackSlotRole::StackArg))
+                .cloned()
+                .or_else(|| (!slot_spec.name.is_empty()).then(|| slot_spec.name.clone()))
+                .unwrap_or_else(|| match key {
+                    VisibleBindingKey::Param(idx) => format!("arg{}", idx + 1),
+                    VisibleBindingKey::Stack(_) => "local".to_string(),
+                }),
+            ty: slot_spec.ty.clone(),
+            kind: visible_binding_kind_for_slot_role(slot_spec.role),
+            stack_slot: Some(slot_key.clone()),
+            param_index: slot_spec.param_index,
+            source_reg: slot_spec.source_reg.clone(),
+        };
+        bindings
+            .entry(key)
+            .and_modify(|existing| merge_visible_binding(existing, candidate.clone()))
+            .or_insert(candidate);
+    }
+
+    for var in recovered_vars {
+        let Some(key) = visible_binding_key_for_recovered_var(var) else {
+            continue;
+        };
+        let candidate_name = rename_map
+            .get(var.name.as_str())
+            .cloned()
+            .unwrap_or_else(|| var.name.clone());
+        let candidate = VisibleBinding {
+            name: sanitize_c_identifier(&candidate_name).unwrap_or(candidate_name),
+            ty: type_map
+                .get(var.name.as_str())
+                .cloned()
+                .or_else(|| parse_type_like_spec(&var.var_type, ptr_bits)),
+            kind: if var.isarg {
+                VisibleBindingKind::Param
+            } else if matches!(key, VisibleBindingKey::Stack(_)) {
+                VisibleBindingKind::Local
+            } else {
+                VisibleBindingKind::Unknown
+            },
+            stack_slot: match &key {
+                VisibleBindingKey::Stack(slot_key) => Some(slot_key.clone()),
+                VisibleBindingKey::Param(_) => None,
+            },
+            param_index: match key {
+                VisibleBindingKey::Param(idx) => Some(idx),
+                VisibleBindingKey::Stack(_) => None,
+            },
+            source_reg: var.reg.clone(),
+        };
+        bindings
+            .entry(key)
+            .and_modify(|existing| merge_visible_binding(existing, candidate.clone()))
+            .or_insert(candidate);
+    }
+
+    bindings.into_values().collect()
+}
+
 fn build_var_type_candidates(
     vars: &[RecoveredVariable],
     ctx: &VarTypeCandidateContext<'_>,
@@ -566,11 +813,7 @@ fn build_var_type_candidates(
 ) -> Vec<VarTypeCandidate> {
     let mut out = Vec::with_capacity(vars.len());
     for var in vars {
-        let slot_key = stack_slot_key_for_recovered_var(var);
-        let slot_spec = slot_key
-            .as_ref()
-            .and_then(|key| ctx.stack_slots.get(key))
-            .or_else(|| ctx.external_stack_vars.get(&var.delta));
+        let slot_spec = slot_spec_for_recovered_var(var, ctx.stack_slots);
         if slot_spec.is_some_and(|spec| slot_role_is_hidden(spec.role)) {
             continue;
         }
@@ -645,7 +888,11 @@ fn build_var_type_candidates(
             && slot_role_allows_external_local_identity(ext.role)
         {
             let ext_ty_str = render_signature_type(ext_ty, ctx.ptr_bits);
-            if !is_generic_type_string(&ext_ty_str) && is_generic_type_string(&chosen_type) {
+            let external_should_override = !is_generic_type_string(&ext_ty_str)
+                && (is_generic_type_string(&chosen_type)
+                    || (matches!(source, WritebackSource::LocalInferred)
+                        && is_low_signal_storage_scalar_type(&chosen_type, ctx.ptr_bits)));
+            if external_should_override {
                 chosen_type = ext_ty_str;
                 confidence = 97;
                 source = WritebackSource::ExternalTypeDb;
@@ -674,17 +921,12 @@ fn build_var_rename_candidates(
     vars: &[RecoveredVariable],
     param_names: &HashMap<usize, String>,
     stack_slots: &BTreeMap<StackSlotKey, ExternalStackVarSpec>,
-    external_stack_vars: &HashMap<i64, ExternalStackVarSpec>,
 ) -> Vec<VarRenameCandidate> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
 
     for var in vars {
-        let slot_key = stack_slot_key_for_recovered_var(var);
-        let slot_spec = slot_key
-            .as_ref()
-            .and_then(|key| stack_slots.get(key))
-            .or_else(|| external_stack_vars.get(&var.delta));
+        let slot_spec = slot_spec_for_recovered_var(var, stack_slots);
 
         if let Some(ext) = slot_spec
             && ext.name != var.name
@@ -781,6 +1023,11 @@ fn apply_signature_context_overrides(
         return;
     };
 
+    let authoritative_param_count = signature_param_count_is_authoritative(signature);
+    if authoritative_param_count && signature_out.params.len() > signature.params.len() {
+        signature_out.params.truncate(signature.params.len());
+    }
+
     while signature_out.params.len() < signature.params.len() {
         let idx = signature_out.params.len();
         let param_type = signature
@@ -840,6 +1087,13 @@ fn signature_strength(signature: &FunctionSignatureSpec) -> u8 {
     }
 }
 
+fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec) -> bool {
+    if signature.params.is_empty() {
+        return false;
+    }
+    signature_strength(signature) >= 96
+}
+
 fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
     match ty {
         None => true,
@@ -881,7 +1135,8 @@ fn merge_slot_type_overrides_into_signature(
 
     let max_slot = slot_type_overrides.keys().copied().max()?;
     let sig = signature.get_or_insert_with(Default::default);
-    while sig.params.len() <= max_slot {
+    let allow_param_count_extension = !signature_param_count_is_authoritative(sig);
+    while allow_param_count_extension && sig.params.len() <= max_slot {
         let idx = sig.params.len();
         sig.params.push(FunctionParamSpec {
             name: format!("arg{}", idx + 1),
@@ -890,6 +1145,9 @@ fn merge_slot_type_overrides_into_signature(
     }
 
     for (slot, raw_ty) in slot_type_overrides {
+        if *slot >= sig.params.len() {
+            continue;
+        }
         let Some(parsed) = parse_type_like_spec(raw_ty, ptr_bits) else {
             continue;
         };
@@ -1852,6 +2110,10 @@ fn is_generic_type_string(ty: &str) -> bool {
     )
 }
 
+fn is_low_signal_storage_scalar_type(ty: &str, ptr_bits: u32) -> bool {
+    parse_type_like_spec(ty, ptr_bits).is_some_and(|parsed| matches!(parsed, CTypeLike::Int { .. }))
+}
+
 fn sanitize_c_identifier(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2111,6 +2373,107 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_external_signature_keeps_param_count_over_longer_local_signature() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.current_signature = Some(FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                bits: 8,
+                signedness: Signedness::Signed,
+            }))),
+            params: vec![
+                FunctionParamSpec {
+                    name: "src".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                        bits: 8,
+                        signedness: Signedness::Signed,
+                    }))),
+                },
+                FunctionParamSpec {
+                    name: "len".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 64,
+                        signedness: Signedness::Unsigned,
+                    }),
+                },
+            ],
+        });
+        parsed_context.merged_signature = parsed_context.current_signature.clone();
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.alloc_and_copy",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.alloc_and_copy".to_string(),
+                signature: "int8_t * sym.alloc_and_copy (int8_t * src, uint8_t len, int64_t arg3, int64_t arg4)".to_string(),
+                ret_type: "int8_t *".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "src".to_string(),
+                        param_type: "int8_t *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "len".to_string(),
+                        param_type: "uint8_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg3".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg4".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 90,
+                callconv_confidence: 90,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params.len(), 2);
+        assert_eq!(analysis.signature.params[0].name, "src");
+        assert_eq!(analysis.signature.params[1].name, "len");
+        assert!(
+            analysis
+                .type_facts
+                .visible_bindings
+                .iter()
+                .any(|binding| matches!(binding.kind, VisibleBindingKind::Param)
+                    && binding.param_index == Some(0)
+                    && binding.name == "src"),
+            "expected visible param binding for src, got {:?}",
+            analysis.type_facts.visible_bindings
+        );
+        assert!(
+            analysis
+                .type_facts
+                .visible_bindings
+                .iter()
+                .any(|binding| matches!(binding.kind, VisibleBindingKind::Param)
+                    && binding.param_index == Some(1)
+                    && binding.name == "len"),
+            "expected visible param binding for len, got {:?}",
+            analysis.type_facts.visible_bindings
+        );
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .expect("merged signature")
+                .params
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn stack_var_preference_renames_and_types_generic_stack_slots() {
         let mut parsed_context = ParsedExternalContext::default();
         let spec = ExternalStackVarSpec {
@@ -2164,6 +2527,21 @@ mod tests {
         });
         assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
         assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
+        assert!(
+            analysis
+                .type_facts
+                .visible_bindings
+                .iter()
+                .any(|binding| matches!(binding.kind, VisibleBindingKind::Local)
+                    && binding
+                        .stack_slot
+                        .as_ref()
+                        .is_some_and(|slot| slot.base == ExternalStackBase::FramePointer
+                            && slot.offset == -0x10)
+                    && binding.name == "count"),
+            "expected visible local binding for count, got {:?}",
+            analysis.type_facts.visible_bindings
+        );
     }
 
     #[test]
@@ -2226,6 +2604,205 @@ mod tests {
             analysis.plan.var_rename_candidates.is_empty(),
             "param-home slots should not emit visible local rename candidates: {:?}",
             analysis.plan.var_rename_candidates
+        );
+        assert!(
+            analysis
+                .type_facts
+                .visible_bindings
+                .iter()
+                .any(
+                    |binding| matches!(binding.kind, VisibleBindingKind::HiddenHome)
+                        && binding.name == "arr_home"
+                ),
+            "expected hidden param-home binding, got {:?}",
+            analysis.type_facts.visible_bindings
+        );
+    }
+
+    #[test]
+    fn writeback_does_not_cross_apply_frame_slots_to_stack_pointer_temps() {
+        let mut parsed_context = ParsedExternalContext::default();
+        let spec = ExternalStackVarSpec {
+            name: "len".to_string(),
+            ty: Some(CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Unsigned,
+            }),
+            base: ExternalStackBase::FramePointer,
+            role: ExternalStackSlotRole::Local,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
+        };
+        parsed_context.external_stack_vars.insert(-8, spec.clone());
+        parsed_context.stack_slots.insert(
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -8,
+            },
+            spec,
+        );
+
+        let vars = [RecoveredVariable {
+            name: "var_8h".to_string(),
+            kind: "s".to_string(),
+            delta: -8,
+            var_type: "void *".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.f",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.f".to_string(),
+                signature: "void sym.f ()".to_string(),
+                ret_type: "void".to_string(),
+                params: Vec::new(),
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.plan.var_type_candidates.len(), 1);
+        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "void *");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].source,
+            WritebackSource::LocalInferred
+        );
+        assert!(
+            analysis.plan.var_rename_candidates.is_empty(),
+            "stack-pointer temps must not inherit frame-slot names: {:?}",
+            analysis.plan.var_rename_candidates
+        );
+    }
+
+    #[test]
+    fn writeback_does_not_use_offset_only_legacy_slots_when_canonical_slots_exist() {
+        let mut parsed_context = ParsedExternalContext::default();
+        let spec = ExternalStackVarSpec {
+            name: "len".to_string(),
+            ty: Some(CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Unsigned,
+            }),
+            base: ExternalStackBase::FramePointer,
+            role: ExternalStackSlotRole::Local,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
+        };
+        parsed_context.external_stack_vars.insert(-8, spec.clone());
+        parsed_context.stack_slots.insert(
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -8,
+            },
+            spec,
+        );
+
+        let vars = [RecoveredVariable {
+            name: "var_8h".to_string(),
+            kind: "x".to_string(),
+            delta: -8,
+            var_type: "void *".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.f",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.f".to_string(),
+                signature: "void sym.f ()".to_string(),
+                ret_type: "void".to_string(),
+                params: Vec::new(),
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.plan.var_type_candidates.len(), 1);
+        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "void *");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].source,
+            WritebackSource::LocalInferred
+        );
+        assert!(
+            analysis.plan.var_rename_candidates.is_empty(),
+            "unknown-base recovered vars must not inherit names from offset-only legacy slots when canonical slots exist: {:?}",
+            analysis.plan.var_rename_candidates
+        );
+    }
+
+    #[test]
+    fn writeback_canonicalizes_legacy_only_stack_var_input() {
+        let mut parsed_context = ParsedExternalContext::default();
+        let spec = ExternalStackVarSpec {
+            name: "count".to_string(),
+            ty: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            base: ExternalStackBase::FramePointer,
+            role: ExternalStackSlotRole::Local,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
+        };
+        parsed_context.external_stack_vars.insert(-0x10, spec);
+
+        let vars = [RecoveredVariable {
+            name: "var_10h".to_string(),
+            kind: "b".to_string(),
+            delta: -0x10,
+            var_type: "byte[4]".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.f",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.f".to_string(),
+                signature: "void sym.f ()".to_string(),
+                ret_type: "void".to_string(),
+                params: Vec::new(),
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
+        assert!(
+            analysis.type_facts.stack_slots.contains_key(&StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -0x10,
+            }),
+            "legacy-only input should be canonicalized into stack_slots: {:?}",
+            analysis.type_facts.stack_slots
         );
     }
 

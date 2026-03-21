@@ -28,7 +28,7 @@ pub use external::{
 pub use facts::{
     FunctionParamSpec, FunctionSignatureSpec, FunctionType, FunctionTypeFactInputs,
     FunctionTypeFacts, FunctionTypeFactsBuilder, LocalFieldAccessFact, ResolvedFieldLayout,
-    parse_type_like_spec,
+    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

@@ -5,18 +5,22 @@
 //! and renamed operations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use r2il::{ArchSpec, R2ILBlock};
 use serde::{Deserialize, Serialize};
 
+use crate::block::SSABlock as LocalSSABlock;
 use crate::cfg::{CFG, CFGEdge};
 use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_slice_from_var};
 use crate::domtree::DomTree;
-use crate::naming::build_register_name_map;
+use crate::naming::{ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
 use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names};
 use crate::rename::{
-    CallBoundaryConfig, rename_function_with_names, rename_function_with_names_and_call_boundaries,
+    CallBoundaryConfig, CallBoundaryDef, rename_function_with_names,
+    rename_function_with_names_and_call_boundaries,
 };
 use crate::var::SSAVar;
 
@@ -52,6 +56,106 @@ pub struct StackAddressRoot {
 pub struct DecompilePrepFacts {
     pub canonical_value_roots: BTreeMap<SSAVar, SSAVar>,
     pub stack_address_roots: BTreeMap<SSAVar, StackAddressRoot>,
+}
+
+/// Typed preparation mode for downstream SSA consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionPrepareMode {
+    Generic,
+    Raw,
+    Decompile,
+    Patterns,
+    DataRefs,
+}
+
+/// Canonical prepared-SSA artifact consumed by downstream analysis layers.
+#[derive(Debug, Clone)]
+pub struct PreparedFunctionSSA {
+    function: SSAFunction,
+    mode: FunctionPrepareMode,
+}
+
+impl PreparedFunctionSSA {
+    pub fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
+        Some(Self {
+            function: SSAFunction::from_blocks_with_arch(blocks, arch)?,
+            mode: FunctionPrepareMode::Generic,
+        })
+    }
+
+    pub fn raw(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
+        Some(Self {
+            function: SSAFunction::from_blocks_raw(blocks, arch)?,
+            mode: FunctionPrepareMode::Raw,
+        })
+    }
+
+    pub fn for_decompile(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
+        Some(Self {
+            function: SSAFunction::from_blocks_for_decompile(blocks, arch)?,
+            mode: FunctionPrepareMode::Decompile,
+        })
+    }
+
+    pub fn for_patterns(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
+        Some(Self {
+            function: SSAFunction::from_blocks_for_patterns(blocks, arch)?,
+            mode: FunctionPrepareMode::Patterns,
+        })
+    }
+
+    pub fn for_data_refs(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
+        Some(Self {
+            function: SSAFunction::from_blocks_for_data_refs(blocks, arch)?,
+            mode: FunctionPrepareMode::DataRefs,
+        })
+    }
+
+    pub fn mode(&self) -> FunctionPrepareMode {
+        self.mode
+    }
+
+    pub fn function(&self) -> &SSAFunction {
+        &self.function
+    }
+
+    pub fn function_mut(&mut self) -> &mut SSAFunction {
+        &mut self.function
+    }
+
+    pub fn into_function(self) -> SSAFunction {
+        self.function
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.function = self.function.with_name(name);
+        self
+    }
+
+    pub fn local_ssa_blocks(&self) -> Vec<LocalSSABlock> {
+        self.function
+            .blocks()
+            .map(|block| LocalSSABlock {
+                addr: block.addr,
+                size: block.size,
+                ops: block.ops.clone(),
+            })
+            .collect()
+    }
+}
+
+impl Deref for PreparedFunctionSSA {
+    type Target = SSAFunction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.function
+    }
+}
+
+impl DerefMut for PreparedFunctionSSA {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.function
+    }
 }
 
 impl DecompilePrepFacts {
@@ -147,30 +251,381 @@ pub struct DefRef<'a> {
 fn decompile_call_boundary_config(arch: Option<&ArchSpec>) -> Option<CallBoundaryConfig> {
     let arch = arch?;
     let lower = arch.name.to_ascii_lowercase();
-    let defined_regs: Vec<String> = match lower.as_str() {
+    let defined_regs: Vec<CallBoundaryDef> = match lower.as_str() {
         "x86-64" | "x86_64" | "x64" | "amd64" => vec![
-            "rax", "eax", "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11",
+            CallBoundaryDef {
+                name: "rax".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "eax".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "rdi".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "rsi".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "rdx".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "rcx".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "r8".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "r9".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "r10".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "r11".to_string(),
+                size: 8,
+            },
         ],
-        "x86" | "x86-32" | "i386" | "i686" => vec!["eax", "ecx", "edx"],
-        "arm" if arch.addr_size == 4 => vec!["r0", "r1", "r2", "r3", "r12", "lr", "ip"],
+        "x86" | "x86-32" | "i386" | "i686" => vec![
+            CallBoundaryDef {
+                name: "eax".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "ecx".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "edx".to_string(),
+                size: 4,
+            },
+        ],
+        "arm" if arch.addr_size == 4 => vec![
+            CallBoundaryDef {
+                name: "r0".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "r1".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "r2".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "r3".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "r12".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "lr".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "ip".to_string(),
+                size: 4,
+            },
+        ],
         "aarch64" | "arm64" => vec![
-            "x0", "w0", "x1", "w1", "x2", "w2", "x3", "w3", "x4", "w4", "x5", "w5", "x6", "w6",
-            "x7", "w7", "x8", "w8", "x9", "w9", "x10", "w10", "x11", "w11", "x12", "w12", "x13",
-            "w13", "x14", "w14", "x15", "w15", "x16", "w16", "x17", "w17", "x30", "w30",
+            CallBoundaryDef {
+                name: "x0".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w0".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x1".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w1".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x2".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w2".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x3".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w3".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x4".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w4".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x5".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w5".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x6".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w6".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x7".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w7".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x8".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w8".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x9".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w9".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x10".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w10".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x11".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w11".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x12".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w12".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x13".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w13".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x14".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w14".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x15".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w15".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x16".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w16".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x17".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w17".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "x30".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "w30".to_string(),
+                size: 4,
+            },
         ],
         "riscv32" | "rv32" | "rv32gc" => vec![
-            "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3", "a4", "a5",
-            "a6", "a7",
+            CallBoundaryDef {
+                name: "ra".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "t0".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "t1".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "t2".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "t3".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "t4".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "t5".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "t6".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a0".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a1".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a2".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a3".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a4".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a5".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a6".to_string(),
+                size: 4,
+            },
+            CallBoundaryDef {
+                name: "a7".to_string(),
+                size: 4,
+            },
         ],
         "riscv64" | "rv64" | "rv64gc" => vec![
-            "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3", "a4", "a5",
-            "a6", "a7",
+            CallBoundaryDef {
+                name: "ra".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "t0".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "t1".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "t2".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "t3".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "t4".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "t5".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "t6".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a0".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a1".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a2".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a3".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a4".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a5".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a6".to_string(),
+                size: 8,
+            },
+            CallBoundaryDef {
+                name: "a7".to_string(),
+                size: 8,
+            },
         ],
         _ => Vec::new(),
-    }
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    };
 
     (!defined_regs.is_empty()).then_some(CallBoundaryConfig { defined_regs })
 }
@@ -242,6 +697,30 @@ impl SSAFunction {
         Some(func)
     }
 
+    /// Build SSA for data-reference recovery.
+    ///
+    /// This keeps memory reads intact and applies a single SCCP pass to
+    /// recover cross-block constant targets without paying the extra
+    /// subregister normalization and decompile-prep cost.
+    pub fn from_blocks_for_data_refs(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+    ) -> Option<Self> {
+        let mut func = Self::from_blocks_raw(blocks, arch)?;
+        let cfg = crate::optimize::OptimizationConfig {
+            max_iterations: 1,
+            enable_sccp: true,
+            enable_const_prop: false,
+            enable_inst_combine: false,
+            enable_copy_prop: false,
+            enable_cse: false,
+            enable_dce: false,
+            preserve_memory_reads: true,
+        };
+        func.optimize(&cfg);
+        Some(func)
+    }
+
     /// Build an SSA function from blocks without running optimization passes.
     ///
     /// This performs raw SSA construction:
@@ -278,8 +757,8 @@ impl SSAFunction {
         // Compute dominator tree
         let domtree = DomTree::compute(&cfg);
 
-        let reg_names = arch.map(build_register_name_map);
-        let reg_names_ref = reg_names.as_ref();
+        let reg_names = arch.map(cached_register_name_map);
+        let reg_names_ref = reg_names.as_deref();
 
         // Collect variable definitions and sizes
         let (defs, var_sizes) = collect_defs_from_cfg_with_names(&cfg, reg_names_ref);
@@ -654,7 +1133,7 @@ impl SSAFunction {
 
     fn normalize_subregister_sources_for_decompile(&mut self, arch: &ArchSpec) {
         self.decompile_prep_facts = None;
-        let family_info = RegisterFamilyInfo::from_arch(arch);
+        let family_info = cached_register_family_info(arch);
         if family_info.name_to_member.is_empty() {
             return;
         }
@@ -692,11 +1171,13 @@ impl SSAFunction {
     }
 
     fn collect_decompile_prep_facts(&self, arch: Option<&ArchSpec>) -> DecompilePrepFacts {
-        let family_info = arch.map(RegisterFamilyInfo::from_arch).unwrap_or_default();
+        let cached_family_info = arch.map(cached_register_family_info);
+        let empty_family_info = RegisterFamilyInfo::default();
+        let family_info = cached_family_info.as_deref().unwrap_or(&empty_family_info);
         let family_in_states = if family_info.name_to_member.is_empty() {
             HashMap::new()
         } else {
-            self.compute_decompile_family_in_states(&family_info)
+            self.compute_decompile_family_in_states(family_info)
         };
         let mut facts = DecompilePrepFacts::default();
 
@@ -718,7 +1199,7 @@ impl SSAFunction {
                                 src,
                                 &facts.canonical_value_roots,
                                 &family_state,
-                                &family_info,
+                                family_info,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -735,7 +1216,7 @@ impl SSAFunction {
                         &facts.canonical_value_roots,
                         &facts.stack_address_roots,
                         &family_state,
-                        &family_info,
+                        family_info,
                     ) {
                         changed |= insert_stack_root(
                             &mut facts.stack_address_roots,
@@ -744,7 +1225,7 @@ impl SSAFunction {
                         );
                     }
 
-                    apply_phi_family_effect(phi, &mut family_state, &family_info);
+                    apply_phi_family_effect(phi, &mut family_state, family_info);
                 }
 
                 for op in &block.ops {
@@ -756,7 +1237,7 @@ impl SSAFunction {
                                 src,
                                 &facts.canonical_value_roots,
                                 &family_state,
-                                &family_info,
+                                family_info,
                             );
                             changed |= insert_canonical_root(
                                 &mut facts.canonical_value_roots,
@@ -768,7 +1249,7 @@ impl SSAFunction {
                                 &facts.canonical_value_roots,
                                 &facts.stack_address_roots,
                                 &family_state,
-                                &family_info,
+                                family_info,
                             ) {
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
@@ -782,7 +1263,7 @@ impl SSAFunction {
                                 src,
                                 &facts.canonical_value_roots,
                                 &family_state,
-                                &family_info,
+                                family_info,
                             );
                             let adapted = adapt_family_root(&src_root, dst.size)
                                 .unwrap_or_else(|| src_root.clone());
@@ -799,7 +1280,7 @@ impl SSAFunction {
                                 &facts.canonical_value_roots,
                                 &facts.stack_address_roots,
                                 &family_state,
-                                &family_info,
+                                family_info,
                             ) {
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
@@ -815,7 +1296,7 @@ impl SSAFunction {
                                 &facts.canonical_value_roots,
                                 &facts.stack_address_roots,
                                 &family_state,
-                                &family_info,
+                                family_info,
                             ) {
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
@@ -829,7 +1310,7 @@ impl SSAFunction {
                     }
 
                     if let Some(dst) = op.dst() {
-                        apply_op_family_effect(op, &mut family_state, &family_info);
+                        apply_op_family_effect(op, &mut family_state, family_info);
                         changed |= ensure_value_root_identity(
                             &mut facts.canonical_value_roots,
                             dst.clone(),
@@ -1016,6 +1497,32 @@ struct RegisterFamilyInfo {
 
 type FamilyRootState = HashMap<RegisterFamilySlot, SSAVar>;
 
+fn register_family_info_cache() -> &'static RwLock<HashMap<ArchCacheTag, Arc<RegisterFamilyInfo>>> {
+    static CACHE: OnceLock<RwLock<HashMap<ArchCacheTag, Arc<RegisterFamilyInfo>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn cached_register_family_info(arch: &ArchSpec) -> Arc<RegisterFamilyInfo> {
+    let cache_tag = ArchCacheTag::from_arch(arch);
+
+    if let Some(cached) = register_family_info_cache()
+        .read()
+        .expect("register family cache read lock poisoned")
+        .get(&cache_tag)
+        .cloned()
+    {
+        return cached;
+    }
+
+    let info = Arc::new(RegisterFamilyInfo::from_arch(arch));
+    register_family_info_cache()
+        .write()
+        .expect("register family cache write lock poisoned")
+        .insert(cache_tag, info.clone());
+    info
+}
+
 impl RegisterFamilyInfo {
     fn from_arch(arch: &ArchSpec) -> Self {
         #[derive(Clone)]
@@ -1041,10 +1548,8 @@ impl RegisterFamilyInfo {
             }
         }
 
-        fn overlaps(a: &RangeReg, b: &RangeReg) -> bool {
-            let a_end = a.offset.saturating_add(a.size as u64);
-            let b_end = b.offset.saturating_add(b.size as u64);
-            a.offset < b_end && b.offset < a_end
+        fn range_end(reg: &RangeReg) -> u64 {
+            reg.offset.saturating_add(reg.size as u64)
         }
 
         let regs: Vec<RangeReg> = arch
@@ -1062,11 +1567,19 @@ impl RegisterFamilyInfo {
         }
 
         let mut parents: Vec<usize> = (0..regs.len()).collect();
-        for i in 0..regs.len() {
-            for j in (i + 1)..regs.len() {
-                if overlaps(&regs[i], &regs[j]) {
-                    union(&mut parents, i, j);
-                }
+        let mut sorted_indices: Vec<usize> = (0..regs.len()).collect();
+        sorted_indices.sort_unstable_by_key(|&idx| (regs[idx].offset, range_end(&regs[idx])));
+
+        let mut cluster_root = sorted_indices[0];
+        let mut cluster_end = range_end(&regs[cluster_root]);
+        for &idx in sorted_indices.iter().skip(1) {
+            let reg = &regs[idx];
+            if reg.offset < cluster_end {
+                union(&mut parents, cluster_root, idx);
+                cluster_end = cluster_end.max(range_end(reg));
+            } else {
+                cluster_root = idx;
+                cluster_end = range_end(reg);
             }
         }
 
@@ -1111,7 +1624,16 @@ impl RegisterFamilyInfo {
     }
 
     fn member_for(&self, var: &SSAVar) -> Option<RegisterFamilyMember> {
-        self.name_to_member.get(&var.name.to_lowercase()).copied()
+        if let Some(member) = self.name_to_member.get(var.name.as_str()) {
+            return Some(*member);
+        }
+        if var.name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return self
+                .name_to_member
+                .get(var.name.to_ascii_lowercase().as_str())
+                .copied();
+        }
+        None
     }
 }
 
@@ -1667,6 +2189,45 @@ mod tests {
         let entry = func.entry_block().unwrap();
         assert_eq!(entry.num_ops(), 2);
         assert!(!entry.has_phis());
+    }
+
+    #[test]
+    fn prepared_function_ssa_tracks_mode_and_keeps_named_blocks() {
+        let arch = make_x86_64_prep_arch();
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(1, 8),
+                },
+                R2ILOp::Return {
+                    target: make_reg(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let prepared = PreparedFunctionSSA::for_decompile(&blocks, Some(&arch))
+            .expect("prepared SSA should build")
+            .with_name("prepared_demo");
+
+        assert_eq!(prepared.mode(), FunctionPrepareMode::Decompile);
+        assert_eq!(prepared.name.as_deref(), Some("prepared_demo"));
+        assert!(
+            prepared.decompile_prep_facts().is_some(),
+            "decompile preparation should retain prep facts"
+        );
+
+        let local_blocks = prepared.local_ssa_blocks();
+        assert_eq!(local_blocks.len(), 1);
+        assert_eq!(local_blocks[0].addr, 0x1000);
+        assert_eq!(
+            local_blocks[0].ops,
+            prepared.blocks().next().expect("entry block").ops
+        );
     }
 
     #[test]

@@ -13,10 +13,10 @@ NAME=sla_json_store_ops_at_0x40127e
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"IntAdd":{"a":{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"Register"},"b":{"offset":18446744073709551608,"size":8,"space":"Const"},"dst":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"}}},{"Copy":{"dst":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"Unique"},"src":{"meta":{"storage_class":"register"},"name":"EDI","offset":56,"size":4,"space":"Register"}}},{"Store":{"addr":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"},"space":{"Custom":"space"},"val":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"Unique"}}}]
+[{"IntAdd":{"a":{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"Register"},"b":{"offset":18446744073709551612,"size":8,"space":"Const"},"dst":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"}}},{"Copy":{"dst":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"Unique"},"src":{"meta":{"storage_class":"register"},"name":"EDI","offset":56,"size":4,"space":"Register"}}},{"Store":{"addr":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"},"space":{"Custom":"space"},"val":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"Unique"}}}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x4 >/dev/null
+s `is~check_secret[2]`+0x8 >/dev/null
 a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
 EOF_CMDS
 RUN
@@ -28,7 +28,7 @@ EXPECT=<<EOF_EXPECT
 {"read":["EDI","RBP"],"write":[]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x4 >/dev/null
+s `is~check_secret[2]`+0x8 >/dev/null
 a:sla.regs | python3 normalize_snapshot.py regs
 EOF_CMDS
 RUN
@@ -37,10 +37,10 @@ NAME=sla_mem_store_at_0x40127e
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"addr":"tmp:0x4700","addr_detail":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"unique"},"memory_class":"stack","permissions":{"cacheable":true,"execute":false,"read":false,"volatile":false,"write":true},"size":4,"stack":true,"stack_base":"RBP","stack_offset":-8,"type":"store","value":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"unique"},"write":true}]
+[{"addr":"tmp:0x4700","addr_detail":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"unique"},"memory_class":"stack","permissions":{"cacheable":true,"execute":false,"read":false,"volatile":false,"write":true},"size":4,"stack":true,"stack_base":"RBP","stack_offset":-4,"type":"store","value":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"unique"},"write":true}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x4 >/dev/null
+s `is~check_secret[2]`+0x8 >/dev/null
 a:sla.mem | python3 normalize_snapshot.py json
 EOF_CMDS
 RUN
@@ -49,10 +49,10 @@ NAME=sla_vars_store_shape_at_0x40127e
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"name":"0xfffffffffffffff8","offset":18446744073709551608,"size":8,"space":"const"},{"meta":{"storage_class":"register"},"name":"EDI","offset":56,"size":4,"space":"register"},{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"register"},{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"name":"tmp:0x4700","offset":18176,"size":8,"space":"unique"},{"meta":{"storage_class":"register"},"name":"tmp:0x6a80","offset":27264,"size":4,"space":"unique"}]
+[{"name":"0xfffffffffffffffc","offset":18446744073709551612,"size":8,"space":"const"},{"meta":{"storage_class":"register"},"name":"EDI","offset":56,"size":4,"space":"register"},{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"register"},{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"name":"tmp:0x4700","offset":18176,"size":8,"space":"unique"},{"meta":{"storage_class":"register"},"name":"tmp:0x6a80","offset":27264,"size":4,"space":"unique"}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x4 >/dev/null
+s `is~check_secret[2]`+0x8 >/dev/null
 a:sla.vars | python3 normalize_snapshot.py vars
 EOF_CMDS
 RUN
@@ -61,10 +61,10 @@ NAME=sla_json_cmp_ops_at_0x401281
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"IntAdd":{"a":{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"Register"},"b":{"offset":18446744073709551608,"size":8,"space":"Const"},"dst":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"}}},{"Load":{"addr":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"},"dst":{"offset":73472,"size":4,"space":"Unique"},"space":{"Custom":"space"}}},{"Copy":{"dst":{"offset":255104,"size":4,"space":"Unique"},"src":{"offset":73472,"size":4,"space":"Unique"}}},{"IntLess":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"CF","offset":512,"size":1,"space":"Register"}}},{"IntSBorrow":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"meta":{"storage_class":"register"},"name":"OF","offset":523,"size":1,"space":"Register"}}},{"IntSub":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"offset":255360,"size":4,"space":"Unique"}}},{"IntSLess":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":0,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"SF","offset":519,"size":1,"space":"Register"}}},{"IntEqual":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":0,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"Register"}}},{"IntAnd":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":255,"size":4,"space":"Const"},"dst":{"offset":180736,"size":4,"space":"Unique"}}},{"PopCount":{"dst":{"offset":180864,"size":1,"space":"Unique"},"src":{"offset":180736,"size":4,"space":"Unique"}}},{"IntAnd":{"a":{"offset":180864,"size":1,"space":"Unique"},"b":{"offset":1,"size":1,"space":"Const"},"dst":{"offset":180992,"size":1,"space":"Unique"}}},{"IntEqual":{"a":{"offset":180992,"size":1,"space":"Unique"},"b":{"offset":0,"size":1,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"PF","offset":514,"size":1,"space":"Register"}}}]
+[{"IntAdd":{"a":{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"Register"},"b":{"offset":18446744073709551612,"size":8,"space":"Const"},"dst":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"}}},{"Load":{"addr":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"},"dst":{"offset":73472,"size":4,"space":"Unique"},"space":{"Custom":"space"}}},{"Copy":{"dst":{"offset":255104,"size":4,"space":"Unique"},"src":{"offset":73472,"size":4,"space":"Unique"}}},{"IntLess":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"CF","offset":512,"size":1,"space":"Register"}}},{"IntSBorrow":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"meta":{"storage_class":"register"},"name":"OF","offset":523,"size":1,"space":"Register"}}},{"IntSub":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"offset":255360,"size":4,"space":"Unique"}}},{"IntSLess":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":0,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"SF","offset":519,"size":1,"space":"Register"}}},{"IntEqual":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":0,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"Register"}}},{"IntAnd":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":255,"size":4,"space":"Const"},"dst":{"offset":180736,"size":4,"space":"Unique"}}},{"PopCount":{"dst":{"offset":180864,"size":1,"space":"Unique"},"src":{"offset":180736,"size":4,"space":"Unique"}}},{"IntAnd":{"a":{"offset":180864,"size":1,"space":"Unique"},"b":{"offset":1,"size":1,"space":"Const"},"dst":{"offset":180992,"size":1,"space":"Unique"}}},{"IntEqual":{"a":{"offset":180992,"size":1,"space":"Unique"},"b":{"offset":0,"size":1,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"PF","offset":514,"size":1,"space":"Register"}}}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
 EOF_CMDS
 RUN
@@ -76,7 +76,7 @@ EXPECT=<<EOF_EXPECT
 {"read":["RBP"],"write":["CF","OF","PF","SF","ZF"]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.regs | python3 normalize_snapshot.py regs
 EOF_CMDS
 RUN
@@ -85,10 +85,10 @@ NAME=sla_mem_cmp_at_0x401281
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"addr":"tmp:0x4700","addr_detail":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"unique"},"memory_class":"stack","permissions":{"cacheable":true,"execute":false,"read":true,"volatile":false,"write":false},"size":4,"stack":true,"stack_base":"RBP","stack_offset":-8,"type":"load","write":false}]
+[{"addr":"tmp:0x4700","addr_detail":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"unique"},"memory_class":"stack","permissions":{"cacheable":true,"execute":false,"read":true,"volatile":false,"write":false},"size":4,"stack":true,"stack_base":"RBP","stack_offset":-4,"type":"load","write":false}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.mem | python3 normalize_snapshot.py json
 EOF_CMDS
 RUN
@@ -97,10 +97,10 @@ NAME=sla_vars_cmp_shape_at_0x401281
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"name":"0x1","offset":1,"size":1,"space":"const"},{"name":"0xdead","offset":57005,"size":4,"space":"const"},{"name":"0xff","offset":255,"size":4,"space":"const"},{"name":"0xfffffffffffffff8","offset":18446744073709551608,"size":8,"space":"const"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"CF","offset":512,"size":1,"space":"register"},{"meta":{"storage_class":"register"},"name":"OF","offset":523,"size":1,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"PF","offset":514,"size":1,"space":"register"},{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"SF","offset":519,"size":1,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"register"},{"name":"tmp:0x11f00","offset":73472,"size":4,"space":"unique"},{"name":"tmp:0x2c200","offset":180736,"size":4,"space":"unique"},{"name":"tmp:0x2c280","offset":180864,"size":1,"space":"unique"},{"name":"tmp:0x2c300","offset":180992,"size":1,"space":"unique"},{"name":"tmp:0x3e480","offset":255104,"size":4,"space":"unique"},{"name":"tmp:0x3e580","offset":255360,"size":4,"space":"unique"},{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"name":"tmp:0x4700","offset":18176,"size":8,"space":"unique"}]
+[{"name":"0x1","offset":1,"size":1,"space":"const"},{"name":"0xdead","offset":57005,"size":4,"space":"const"},{"name":"0xff","offset":255,"size":4,"space":"const"},{"name":"0xfffffffffffffffc","offset":18446744073709551612,"size":8,"space":"const"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"CF","offset":512,"size":1,"space":"register"},{"meta":{"storage_class":"register"},"name":"OF","offset":523,"size":1,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"PF","offset":514,"size":1,"space":"register"},{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"SF","offset":519,"size":1,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"register"},{"name":"tmp:0x11f00","offset":73472,"size":4,"space":"unique"},{"name":"tmp:0x2c200","offset":180736,"size":4,"space":"unique"},{"name":"tmp:0x2c280","offset":180864,"size":1,"space":"unique"},{"name":"tmp:0x2c300","offset":180992,"size":1,"space":"unique"},{"name":"tmp:0x3e480","offset":255104,"size":4,"space":"unique"},{"name":"tmp:0x3e580","offset":255360,"size":4,"space":"unique"},{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"name":"tmp:0x4700","offset":18176,"size":8,"space":"unique"}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+s `is~check_secret[2]`+0xb >/dev/null
 a:sla.vars | python3 normalize_snapshot.py vars
 EOF_CMDS
 RUN
@@ -109,10 +109,10 @@ NAME=sla_json_branch_ops_at_0x401288
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"BoolNot":{"dst":{"meta":{"scalar_kind":"bool"},"offset":75776,"size":1,"space":"Unique"},"src":{"meta":{"storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"Register"}}},{"CBranch":{"cond":{"meta":{"scalar_kind":"bool"},"offset":75776,"size":1,"space":"Unique"},"target":{"offset":25,"size":8,"space":"Ram"}}}]
+[{"BoolNot":{"dst":{"meta":{"scalar_kind":"bool"},"offset":75776,"size":1,"space":"Unique"},"src":{"meta":{"storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"Register"}}},{"CBranch":{"cond":{"meta":{"scalar_kind":"bool"},"offset":75776,"size":1,"space":"Unique"},"target":{"offset":27,"size":8,"space":"Ram"}}}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xe >/dev/null
+s `is~check_secret[2]`+0x12 >/dev/null
 a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
 EOF_CMDS
 RUN
@@ -124,7 +124,7 @@ EXPECT=<<EOF_EXPECT
 {"read":["ZF"],"write":[]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xe >/dev/null
+s `is~check_secret[2]`+0x12 >/dev/null
 a:sla.regs | python3 normalize_snapshot.py regs
 EOF_CMDS
 RUN
@@ -136,7 +136,7 @@ EXPECT=<<EOF_EXPECT
 []
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xe >/dev/null
+s `is~check_secret[2]`+0x12 >/dev/null
 a:sla.mem | python3 normalize_snapshot.py json
 EOF_CMDS
 RUN
@@ -148,7 +148,7 @@ EXPECT=<<EOF_EXPECT
 [{"meta":{"storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"register"}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xe >/dev/null
+s `is~check_secret[2]`+0x12 >/dev/null
 a:sla.vars | python3 normalize_snapshot.py vars
 EOF_CMDS
 RUN
@@ -157,10 +157,10 @@ NAME=sla_json_copy_ops_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"IntAdd":{"a":{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"Register"},"b":{"offset":18446744073709551612,"size":8,"space":"Const"},"dst":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"}}},{"Copy":{"dst":{"offset":27264,"size":4,"space":"Unique"},"src":{"offset":1,"size":4,"space":"Const"}}},{"Store":{"addr":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"},"space":{"Custom":"space"},"val":{"offset":27264,"size":4,"space":"Unique"}}}]
+[{"Copy":{"dst":{"meta":{"storage_class":"register"},"name":"RAX","offset":0,"size":8,"space":"Register"},"src":{"offset":1,"size":8,"space":"Const"}}}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x10 >/dev/null
+s `is~check_secret[2]`+0x14 >/dev/null
 a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
 EOF_CMDS
 RUN
@@ -169,10 +169,10 @@ NAME=sla_regs_copy_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"read":["RBP"],"write":[]}
+{"read":[],"write":["RAX"]}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x10 >/dev/null
+s `is~check_secret[2]`+0x14 >/dev/null
 a:sla.regs | python3 normalize_snapshot.py regs
 EOF_CMDS
 RUN
@@ -181,10 +181,10 @@ NAME=sla_mem_copy_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"addr":"tmp:0x4700","addr_detail":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"unique"},"memory_class":"stack","permissions":{"cacheable":true,"execute":false,"read":false,"volatile":false,"write":true},"size":4,"stack":true,"stack_base":"RBP","stack_offset":-4,"type":"store","value":{"offset":27264,"size":4,"space":"unique"},"write":true}]
+[]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x10 >/dev/null
+s `is~check_secret[2]`+0x14 >/dev/null
 a:sla.mem | python3 normalize_snapshot.py json
 EOF_CMDS
 RUN
@@ -193,10 +193,10 @@ NAME=sla_vars_copy_shape_at_0x40128a
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"name":"0x1","offset":1,"size":4,"space":"const"},{"name":"0xfffffffffffffffc","offset":18446744073709551612,"size":8,"space":"const"},{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"register"},{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"name":"tmp:0x4700","offset":18176,"size":8,"space":"unique"},{"name":"tmp:0x6a80","offset":27264,"size":4,"space":"unique"}]
+[{"name":"0x1","offset":1,"size":8,"space":"const"},{"meta":{"storage_class":"register"},"name":"RAX","offset":0,"size":8,"space":"register"}]
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x10 >/dev/null
+s `is~check_secret[2]`+0x14 >/dev/null
 a:sla.vars | python3 normalize_snapshot.py vars
 EOF_CMDS
 RUN

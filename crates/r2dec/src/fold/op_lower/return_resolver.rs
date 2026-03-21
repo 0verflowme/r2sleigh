@@ -1,11 +1,78 @@
 use super::*;
 
 impl<'a> FoldingContext<'a> {
-    fn expr_is_structured_memory_candidate(expr: &CExpr) -> bool {
+    fn typed_integer_literal_expr_in_context(
+        &self,
+        value: u64,
+        context: VisibleExprContext,
+    ) -> CExpr {
+        if matches!(context, VisibleExprContext::ScalarReturn)
+            && let Some((is_signed, bits)) = self.function_return_int_meta()
+            && bits > 0
+            && bits <= 64
+        {
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let truncated = value & mask;
+            if is_signed {
+                let sign_bit = 1u64 << (bits - 1);
+                if truncated & sign_bit != 0 {
+                    return CExpr::IntLit((truncated | (!mask)) as i64);
+                }
+                return CExpr::IntLit(truncated as i64);
+            }
+            return if bits == 64 || truncated > 0x7fff_ffff {
+                CExpr::UIntLit(truncated)
+            } else {
+                CExpr::IntLit(truncated as i64)
+            };
+        }
+
+        if value > 0x7fffffff {
+            CExpr::UIntLit(value)
+        } else {
+            CExpr::IntLit(value as i64)
+        }
+    }
+
+    fn rewrite_typed_return_literal_expr(&self, expr: CExpr, context: VisibleExprContext) -> CExpr {
+        match expr {
+            CExpr::UIntLit(value) => self.typed_integer_literal_expr_in_context(value, context),
+            CExpr::IntLit(value) if value >= 0 => {
+                self.typed_integer_literal_expr_in_context(value as u64, context)
+            }
+            CExpr::Paren(inner) => CExpr::Paren(Box::new(
+                self.rewrite_typed_return_literal_expr(*inner, context),
+            )),
+            CExpr::Cast { ty, expr: inner } => CExpr::Cast {
+                ty,
+                expr: Box::new(self.rewrite_typed_return_literal_expr(*inner, context)),
+            },
+            other => other,
+        }
+    }
+
+    pub(super) fn expr_is_structured_memory_candidate(expr: &CExpr) -> bool {
         match expr {
             CExpr::Member { .. } | CExpr::PtrMember { .. } | CExpr::Subscript { .. } => true,
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 Self::expr_is_structured_memory_candidate(inner)
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn expr_is_scalar_memory_candidate(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Deref(_)
+            | CExpr::Subscript { .. }
+            | CExpr::Member { .. }
+            | CExpr::PtrMember { .. } => true,
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::expr_is_scalar_memory_candidate(inner)
             }
             _ => false,
         }
@@ -30,6 +97,13 @@ impl<'a> FoldingContext<'a> {
         let raw = self.lookup_definition_raw(name)?;
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(&raw, 0, &mut semantic_visited);
+        if (Self::expr_is_scalar_memory_candidate(&raw)
+            || Self::expr_is_structured_memory_candidate(&raw))
+            && !Self::expr_is_scalar_memory_candidate(&semanticized)
+            && !Self::expr_is_structured_memory_candidate(&semanticized)
+        {
+            return Some(raw);
+        }
         self.choose_preferred_visible_expr_in_context(Some(raw), Some(semanticized), context)
     }
 
@@ -51,6 +125,7 @@ impl<'a> FoldingContext<'a> {
             .any(|slot_offset| {
                 self.return_context_for_slot_offset(slot_offset) == VisibleExprContext::ScalarReturn
             })
+            || self.function_return_int_bits().is_some()
         {
             VisibleExprContext::ScalarReturn
         } else {
@@ -221,6 +296,10 @@ impl<'a> FoldingContext<'a> {
             });
         best = self.preferred_return_candidate_in_context(best, merged, context);
 
+        if let Some(candidate) = self.stable_owned_call_result_expr_for_name(name, true) {
+            best = self.preferred_return_candidate_in_context(best, Some(candidate), context);
+        }
+
         let mut semantic_visited = HashSet::new();
         self.preferred_return_candidate_in_context(
             best,
@@ -247,12 +326,21 @@ impl<'a> FoldingContext<'a> {
         }
         let mut has_semantic_root = false;
         if let CExpr::Var(name) = expr {
-            if matches!(context, VisibleExprContext::Generic)
-                && let Some(candidate) = self.semantic_deref_candidate_for_name(name)
-                && Self::expr_is_structured_memory_candidate(&candidate)
-                && !Self::expr_is_structured_memory_candidate(&best)
-            {
-                best = candidate;
+            if let Some(candidate) = self.semantic_deref_candidate_for_name(name) {
+                let should_promote = if matches!(context, VisibleExprContext::Generic) {
+                    Self::expr_is_structured_memory_candidate(&candidate)
+                        && !Self::expr_is_structured_memory_candidate(&best)
+                } else if matches!(context, VisibleExprContext::ScalarReturn) {
+                    Self::expr_is_scalar_memory_candidate(&candidate)
+                        && !self.expr_is_address_artifact_in_scalar_context(&candidate)
+                } else {
+                    false
+                };
+                if should_promote
+                    && self.prefers_visible_expr_in_context(&best, &candidate, context)
+                {
+                    best = candidate;
+                }
             }
             if let Some(candidate) = self
                 .scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
@@ -567,11 +655,7 @@ impl<'a> FoldingContext<'a> {
         match expr {
             CExpr::Var(name) => {
                 if let Some(val) = parse_const_value(name) {
-                    return if val > 0x7fffffff {
-                        CExpr::UIntLit(val)
-                    } else {
-                        CExpr::IntLit(val as i64)
-                    };
+                    return self.typed_integer_literal_expr_in_context(val, context);
                 }
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
@@ -759,19 +843,37 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn get_return_expr(&self, var: &SSAVar) -> CExpr {
         if var.is_const() {
-            return self.const_to_expr(var);
+            return self.rewrite_typed_return_literal_expr(
+                self.const_to_expr(var),
+                self.current_return_context(),
+            );
         }
 
         let mut visited = HashSet::new();
         let root_name = var.display_name();
         let context = self.return_context_for_name(&root_name);
         let unresolved = CExpr::Var(self.var_name(var));
-        let semantic_root = self.semantic_return_candidate_for_name(&root_name);
+        let raw_definition =
+            self.semanticized_raw_definition_candidate_in_context(&root_name, context);
+        let semantic_root = match (
+            self.semantic_return_candidate_for_name(&root_name),
+            raw_definition.clone(),
+        ) {
+            (Some(current), Some(raw))
+                if (Self::expr_is_scalar_memory_candidate(&raw)
+                    || Self::expr_is_structured_memory_candidate(&raw))
+                    && !Self::expr_is_scalar_memory_candidate(&current)
+                    && !Self::expr_is_structured_memory_candidate(&current) =>
+            {
+                Some(raw)
+            }
+            (current, _) => current,
+        };
         let base_root = if let Some(semantic_root) = semantic_root.clone() {
             let best = self
                 .preferred_return_candidate_in_context(
                     Some(semantic_root),
-                    self.semanticized_raw_definition_candidate_in_context(&root_name, context),
+                    raw_definition.clone(),
                     context,
                 )
                 .unwrap_or_else(|| unresolved.clone());
@@ -785,7 +887,7 @@ impl<'a> FoldingContext<'a> {
             let best = self
                 .preferred_return_candidate_in_context(
                     self.lookup_definition(&root_name),
-                    self.semanticized_raw_definition_candidate_in_context(&root_name, context),
+                    raw_definition.clone(),
                     context,
                 )
                 .and_then(|expr| {
@@ -823,13 +925,23 @@ impl<'a> FoldingContext<'a> {
         let root = self.resolve_predicate_rhs_for_var(var, root);
         let raw = self.expand_return_expr_in_context(&root, 0, &mut visited, context);
         let mut semantic_visited = HashSet::new();
-        let raw = self.semanticize_visible_expr(&raw, 0, &mut semantic_visited);
+        let semanticized = self.semanticize_visible_expr(&raw, 0, &mut semantic_visited);
+        let raw = if (Self::expr_is_scalar_memory_candidate(&raw)
+            || Self::expr_is_structured_memory_candidate(&raw))
+            && !Self::expr_is_scalar_memory_candidate(&semanticized)
+            && !Self::expr_is_structured_memory_candidate(&semanticized)
+        {
+            raw
+        } else {
+            semanticized
+        };
         let simplified = if self.is_predicate_like_expr(&raw) {
             self.simplify_condition_expr(raw)
         } else {
             raw
         };
-        self.sanitize_return_expr_in_context(simplified, root, unresolved, context)
+        let sanitized = self.sanitize_return_expr_in_context(simplified, root, unresolved, context);
+        self.rewrite_typed_return_literal_expr(sanitized, context)
     }
 
     #[cfg(test)]
@@ -925,6 +1037,7 @@ impl<'a> FoldingContext<'a> {
             Some(self.resolve_return_candidate_in_context(&expr, context)),
             context,
         )
+        .map(|expr| self.rewrite_typed_return_literal_expr(expr, context))
         .unwrap_or_else(|| CExpr::Var("return".to_string()))
     }
 

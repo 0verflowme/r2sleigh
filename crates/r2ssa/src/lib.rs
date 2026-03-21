@@ -35,8 +35,9 @@ pub use defuse::{
     BackwardSlice, DefUseInfo, SliceOpRef, backward_slice_from_op, backward_slice_from_var, def_use,
 };
 pub use function::{
-    CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, PhiNode, SSABlock as FunctionSSABlock,
-    SSAFunction, SourceRef, SourceSite, StackAddressBase, StackAddressRoot, SwitchInfo,
+    CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, FunctionPrepareMode, PhiNode,
+    PreparedFunctionSSA, SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite,
+    StackAddressBase, StackAddressRoot, SwitchInfo,
 };
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};

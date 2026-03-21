@@ -222,7 +222,7 @@ pub extern "C" fn r2il_addr_size(ctx: *const R2ILContext) -> u32 {
 
     unsafe {
         match &(*ctx).arch {
-            Some(arch) => arch.addr_size,
+            Some(arch) => helpers::effective_addr_size_bytes(arch),
             None => 0,
         }
     }
@@ -2412,30 +2412,6 @@ fn decompile_artifact_guard_fallback(func_name: &str, reason: &str) -> String {
     )
 }
 
-/// Decompile a function given its SSA representation.
-/// Returns C code as a string. Caller must free with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2dec_function(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    func_name: *const c_char,
-) -> *mut c_char {
-    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, 0, func_name) else {
-        return ptr::null_mut();
-    };
-    let output = match decompiler::decompile_blocks(
-        input.blocks.as_slice(),
-        &input.function_name,
-        input.ctx.arch,
-    ) {
-        Some(output) => output,
-        None => return ptr::null_mut(),
-    };
-
-    CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
 #[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct AfcfjArg {
@@ -2937,7 +2913,7 @@ pub extern "C" fn r2dec_function_with_context(
     };
 
     let func_name_str = helpers::resolve_function_name(0, func_name);
-    let ptr_bits = ctx_view.arch.map(|arch| arch.addr_size * 8).unwrap_or(64);
+    let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
     let max_blocks = decompiler_max_blocks();
     if block_slice.len() > max_blocks {
         let output = decompile_block_guard_fallback(&func_name_str, block_slice.len(), max_blocks);
@@ -2950,6 +2926,10 @@ pub extern "C" fn r2dec_function_with_context(
     let strings_str = helpers::cstr_or_default(strings_json, "{}");
     let symbols_str = helpers::cstr_or_default(symbols_json, "{}");
     let external_context_str = helpers::cstr_or_default(external_context_json, "{}");
+    let cached_artifact = types::build_function_input(ctx, blocks, num_blocks, 0, func_name)
+        .and_then(|input| {
+            types::get_cached_function_analysis_artifact(&input, &external_context_str)
+        });
     let semantic_metadata_enabled = ctx_view.semantic_metadata_enabled;
     let reg_type_hints = if semantic_metadata_enabled {
         types::collect_register_type_hints(block_slice.as_slice(), ctx_view.disasm)
@@ -2972,31 +2952,10 @@ pub extern "C" fn r2dec_function_with_context(
         strings_str,
         symbols_str,
         external_context_str,
+        cached_artifact,
     );
 
     CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
-/// Run just the decompiler (already-built SSA + decompiler) on a large-stack thread.
-fn run_decompile_on_large_stack(
-    decompiler: r2dec::Decompiler,
-    ssa_func: r2ssa::SSAFunction,
-) -> String {
-    const STACK_SIZE: usize = 128 * 1024 * 1024; // 128 MB
-
-    let handle = std::thread::Builder::new()
-        .stack_size(STACK_SIZE)
-        .spawn(move || decompiler.decompile(&ssa_func));
-
-    match handle {
-        Ok(h) => match h.join() {
-            Ok(output) => output,
-            Err(_) => "/* r2dec: decompilation panicked (internal error) */".to_string(),
-        },
-        Err(e) => {
-            format!("/* r2dec: failed to spawn decompiler thread: {} */", e)
-        }
-    }
 }
 
 /// Decompile a single basic block to C code.
@@ -3117,14 +3076,14 @@ impl TypeEvidence {
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct InferredParamJson {
     name: String,
     #[serde(rename = "type")]
     param_type: String,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct InferredSignatureCcJson {
     function_name: String,
     signature: String,
@@ -5510,11 +5469,14 @@ pub extern "C" fn r2sleigh_infer_signature_cc_json(
     else {
         return ptr::null_mut();
     };
-    let Some(artifact) = types::build_function_analysis_artifact(&input, "{}") else {
+    let Some(analysis) = types::build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
+    let Some(signature_cc) = types::infer_signature_cc_from_analysis(&input, &analysis) else {
         return ptr::null_mut();
     };
 
-    match serde_json::to_string(&artifact.signature_cc) {
+    match serde_json::to_string(&signature_cc) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
     }
@@ -5557,7 +5519,7 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
     else {
         return ptr::null_mut();
     };
-    let ssa_blocks = artifact.pattern_ssa_blocks;
+    let ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
     if ssa_blocks.is_empty() {
         return ptr::null_mut();
     }
@@ -5635,6 +5597,30 @@ pub extern "C" fn r2sleigh_infer_type_writeback_json_ex(
             scope_json: &scope,
         },
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_alias_function_analysis_artifact_cache(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    source_external_context_json: *const c_char,
+    target_external_context_json: *const c_char,
+) -> i32 {
+    let Some(function_input) =
+        types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return 0;
+    };
+    let source_external_context = cstr_or_default(source_external_context_json, "{}");
+    let target_external_context = cstr_or_default(target_external_context_json, "{}");
+    types::alias_cached_function_analysis_artifact(
+        &function_input,
+        &source_external_context,
+        &target_external_context,
+    ) as i32
 }
 
 /// Analyze a function and build SSA representation.
@@ -6512,6 +6498,11 @@ mod tests {
         let arch = CString::new("x86-64").expect("valid arch string");
         let ctx = r2il_arch_init(arch.as_ptr());
         assert!(!ctx.is_null(), "context should initialize");
+        assert_eq!(
+            r2il_addr_size(ctx),
+            8,
+            "x86-64 FFI context should report an 8-byte address size"
+        );
 
         // mov eax, [rdi + 0x30]
         let mut mov_bytes = vec![0x8b, 0x47, 0x30];
@@ -6572,6 +6563,22 @@ mod tests {
             "decompiler should keep decompilation stable with tsj context, got: {}",
             output
         );
+    }
+
+    #[test]
+    fn effective_ptr_bits_falls_back_to_default_space_when_arch_addr_size_is_degenerate() {
+        let arch_name = CString::new("x86-64").expect("valid arch string");
+        let ctx = r2il_arch_init(arch_name.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+        let mut arch = unsafe { (*ctx).arch.clone().expect("arch spec") };
+        r2il_free(ctx);
+        arch.addr_size = 1;
+        assert_eq!(
+            crate::helpers::effective_addr_size_bytes(&arch),
+            8,
+            "effective address size should recover from Sleigh word-sized addr_size"
+        );
+        assert_eq!(crate::helpers::effective_ptr_bits(&arch), 64);
     }
 
     #[test]
@@ -7088,7 +7095,6 @@ mod integration_tests {
         let profile = unsafe { CStr::from_ptr(profile_ptr).to_str().unwrap() };
         println!("Profile: {}", profile);
         assert!(profile.contains("=PC\tRIP"));
-        std::fs::write("/tmp/sleigh_profile.dr", profile).expect("Unable to write profile");
 
         r2il_string_free(profile_ptr);
         r2il_free(ctx_ptr);
@@ -9013,9 +9019,43 @@ mod integration_tests {
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([
+            (0x401140, "sym.imp.memcpy".to_string()),
+            (0x401150, "sym.imp.malloc".to_string()),
+        ]));
+        decompiler.set_known_function_signatures(HashMap::from([
+            (
+                "sym.imp.malloc".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    }],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.imp.memcpy".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Int {
+                            bits: 64,
+                            signedness: r2types::Signedness::Unsigned,
+                        },
+                    ],
+                    variadic: false,
+                },
+            ),
+        ]));
         let output = decompiler.decompile(&artifact.ssa_func);
+        let pattern_ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
         let tail_ops: Vec<_> = artifact
-            .pattern_ssa_blocks
+            .pattern_ssa_func
+            .local_ssa_blocks()
             .first()
             .map(|block| block.ops.iter().rev().take(16).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
@@ -9028,7 +9068,7 @@ mod integration_tests {
         manual_func
             .get_block_mut(0x40182f)
             .expect("entry block")
-            .ops = artifact.pattern_ssa_blocks[0].ops.clone();
+            .ops = pattern_ssa_blocks[0].ops.clone();
         manual_func = manual_func.with_name("dbg.test_struct_array_index");
         let mut manual_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         manual_decompiler.set_type_facts(artifact.type_facts.clone());
@@ -9097,6 +9137,1703 @@ mod integration_tests {
             artifact.type_facts.slot_type_overrides,
             artifact.type_facts.slot_field_profiles,
             artifact.type_facts.external_type_db.structs
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_alloc_and_copy_artifact_keeps_authoritative_two_param_signature() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa554889e54883ec2048897de8488975e0488b45e04883c0014889c7e87bfdffff488945f848837df8007507b800000000eb29488b55e0488b4de8488b45f84889ce4889c7e842fdffff488b55f8488b45e04801d0c60000488b45f8c9c3",
+        );
+        let block = disasm
+            .lift_block(&bytes, 0x4013b1, 97)
+            .expect("lifted block");
+        let reg_type_hints =
+            crate::types::collect_register_type_hints(std::slice::from_ref(&block), &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.alloc_and_copy",
+                "ret": "int8_t *",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "src", "type": "int8_t *"},
+                    {"name": "len", "type": "uint8_t"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"src","type":"int8_t *","reg":"rdi","param_index":0},
+                {"kind":"register","name":"len","type":"uint8_t","reg":"rsi","param_index":1},
+                {"kind":"stack","name":"src_home","type":"int8_t *","base":"rbp","offset":-24,"role":"param_home","param_index":0,"param_name":"src","source_reg":"rdi"},
+                {"kind":"stack","name":"len_home","type":"uint8_t","base":"rbp","offset":-32,"role":"param_home","param_index":1,"param_name":"len","source_reg":"rsi"},
+                {"kind":"stack","name":"buf","type":"int8_t *","base":"rbp","offset":-8,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.alloc_and_copy",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        assert_eq!(
+            artifact
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .expect("merged signature")
+                .params
+                .len(),
+            2,
+            "expected authoritative external signature to keep two params, got merged_signature={:?}",
+            artifact.type_facts.merged_signature
+        );
+        assert_eq!(
+            artifact.writeback_plan.signature.params.len(),
+            2,
+            "expected writeback signature to stay aligned with merged signature, got {:?}",
+            artifact.writeback_plan.signature.params
+        );
+        assert_eq!(
+            artifact.writeback_plan.signature.params[0].name, "src",
+            "expected first param name to come from external signature, got merged_signature={:?}, writeback_signature={:?}",
+            artifact.type_facts.merged_signature, artifact.writeback_plan.signature
+        );
+        assert_eq!(
+            artifact.writeback_plan.signature.params[1].name, "len",
+            "expected second param name to come from external signature, got merged_signature={:?}, writeback_signature={:?}",
+            artifact.type_facts.merged_signature, artifact.writeback_plan.signature
+        );
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([
+            (0x401140, "sym.imp.memcpy".to_string()),
+            (0x401150, "sym.imp.malloc".to_string()),
+        ]));
+        decompiler.set_known_function_signatures(HashMap::from([
+            (
+                "sym.imp.malloc".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    }],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.imp.memcpy".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Int {
+                            bits: 64,
+                            signedness: r2types::Signedness::Unsigned,
+                        },
+                    ],
+                    variadic: false,
+                },
+            ),
+        ]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let ssa_ops: Vec<String> = artifact
+            .ssa_func
+            .blocks()
+            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
+            .collect();
+        assert!(
+            output.contains("sym.imp.memcpy(buf, src, len);"),
+            "expected detached x86 alloc_and_copy to keep the malloc owner for memcpy, got:\n{output}\nssa_ops={ssa_ops:?}\nmerged_signature={:?}\nwriteback_signature={:?}",
+            artifact.type_facts.merged_signature,
+            artifact.writeback_plan.signature
+        );
+        assert!(
+            output.contains("buf[len] = 0;"),
+            "expected detached x86 alloc_and_copy to keep the malloc owner for the NUL store, got:\n{output}\nmerged_signature={:?}\nwriteback_signature={:?}",
+            artifact.type_facts.merged_signature,
+            artifact.writeback_plan.signature
+        );
+        assert!(
+            output.contains("return buf;"),
+            "expected detached x86 alloc_and_copy to return the owned malloc result, got:\n{output}\nmerged_signature={:?}\nwriteback_signature={:?}",
+            artifact.type_facts.merged_signature,
+            artifact.writeback_plan.signature
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_vuln_memcpy_artifact_keeps_authoritative_args() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![disasm
+            .lift_block(
+                &decode_hex(
+                    "f30f1efa554889e54883ec5048897db88975b48b45b44863d0488b4db8488d45c04889ce4889c7e84bfeffff488d45c04889c6488d05051d00004889c7b800000000e800feffff90c9c3",
+                ),
+                0x4012c9,
+                74,
+            )
+            .expect("vuln_memcpy block")];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.vuln_memcpy",
+                "ret": "int64_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "user_input", "type": "int8_t *"},
+                    {"name": "user_len", "type": "int32_t"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"user_input","type":"int8_t *","reg":"rdi","param_index":0},
+                {"kind":"register","name":"user_len","type":"int32_t","reg":"rsi","param_index":1},
+                {"kind":"stack","name":"user_input_home","type":"int8_t *","base":"rbp","offset":-72,"role":"param_home","param_index":0,"param_name":"user_input","source_reg":"rdi"},
+                {"kind":"stack","name":"user_len_home","type":"int32_t","base":"rbp","offset":-76,"role":"param_home","param_index":1,"param_name":"user_len","source_reg":"rsi"},
+                {"kind":"stack","name":"buf","type":"int8_t *","base":"rbp","offset":-64,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.vuln_memcpy",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([
+            (0x401110, "sym.imp.printf".to_string()),
+            (0x401140, "sym.imp.memcpy".to_string()),
+        ]));
+        decompiler.set_strings(HashMap::from([(0x403008, "Copied: %s\n".to_string())]));
+        decompiler.set_known_function_signatures(HashMap::from([
+            (
+                "sym.imp.memcpy".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        })),
+                        r2types::CTypeLike::Int {
+                            bits: 64,
+                            signedness: r2types::Signedness::Unsigned,
+                        },
+                    ],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.imp.printf".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    },
+                    params: vec![r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
+                    ))],
+                    variadic: true,
+                },
+            ),
+        ]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let ssa_ops: Vec<String> = artifact
+            .ssa_func
+            .blocks()
+            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
+            .collect();
+
+        assert!(
+            output.contains("sym.imp.memcpy(buf, user_input, user_len);"),
+            "expected detached vuln_memcpy to keep authoritative memcpy args, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("sym.imp.printf(\"Copied: %s\\n\", buf);"),
+            "expected detached vuln_memcpy to print the recovered buf local, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        for bad in [
+            "arg1",
+            "arg2",
+            "tmp:",
+            "*(rbp",
+            "sym.imp.memcpy(buf, user_len, user_len)",
+        ] {
+            assert!(
+                !output.contains(bad),
+                "detached vuln_memcpy should not regress to {bad:?}, got:\n{output}\nssa_ops={ssa_ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_authenticate_artifact_keeps_strcmp_condition_shape() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec1048897df8488b45f8488d15801c00004889d64889c7e891fdffff85c07507",
+                    ),
+                    0x401379,
+                    42,
+                )
+                .expect("authenticate entry"),
+            disasm
+                .lift_block(&decode_hex("b801000000eb05"), 0x4013a3, 7)
+                .expect("authenticate false arm"),
+            disasm
+                .lift_block(&decode_hex("b800000000"), 0x4013aa, 5)
+                .expect("authenticate true arm"),
+            disasm
+                .lift_block(&decode_hex("c9c3"), 0x4013af, 2)
+                .expect("authenticate exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.authenticate",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "password", "type": "int8_t *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"password","type":"int8_t *","reg":"rdi","param_index":0},
+                {"kind":"stack","name":"password_home","type":"int8_t *","base":"rbp","offset":-8,"role":"param_home","param_index":0,"param_name":"password","source_reg":"rdi"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.authenticate",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([(0x401130, "sym.imp.strcmp".to_string())]));
+        decompiler.set_strings(HashMap::from([(0x403014, "secret123".to_string())]));
+        decompiler.set_known_function_signatures(HashMap::from([(
+            "sym.imp.strcmp".to_string(),
+            r2types::FunctionType {
+                return_type: r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                },
+                params: vec![
+                    r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
+                    r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
+                ],
+                variadic: false,
+            },
+        )]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let ssa_ops: Vec<String> = artifact
+            .ssa_func
+            .blocks()
+            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
+            .collect();
+
+        assert!(
+            output.contains("sym.imp.strcmp(password, \"secret123\")"),
+            "expected detached authenticate to keep the strcmp call in the condition, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            !output.contains("0 != 0") && !output.contains("0 == 0"),
+            "authenticate condition should not collapse to a constant, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_check_secret_artifact_keeps_branch_return_values() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex("f30f1efa554889e5897dfc817dfcadde00007507"),
+                    0x401276,
+                    20,
+                )
+                .expect("check_secret entry"),
+            disasm
+                .lift_block(&decode_hex("b801000000eb05"), 0x40128a, 7)
+                .expect("check_secret then"),
+            disasm
+                .lift_block(&decode_hex("b800000000"), 0x401291, 5)
+                .expect("check_secret else"),
+            disasm
+                .lift_block(&decode_hex("5dc3"), 0x401296, 2)
+                .expect("check_secret exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.check_secret",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "x", "type": "int32_t"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"x","type":"int32_t","reg":"rdi","param_index":0},
+                {"kind":"stack","name":"var_8h","type":"void *","base":"rsp","offset":0,"role":"unknown"},
+                {"kind":"stack","name":"var_4h","type":"int32_t","base":"rbp","offset":-4,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.check_secret",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let then_ops: Vec<String> = artifact
+            .ssa_func
+            .get_block(0x40128a)
+            .expect("then block")
+            .ops
+            .iter()
+            .map(|op| format!("{op:?}"))
+            .collect();
+        let else_ops: Vec<String> = artifact
+            .ssa_func
+            .get_block(0x401291)
+            .expect("else block")
+            .ops
+            .iter()
+            .map(|op| format!("{op:?}"))
+            .collect();
+        let entry_ops: Vec<String> = artifact
+            .ssa_func
+            .get_block(0x401276)
+            .expect("entry block")
+            .ops
+            .iter()
+            .map(|op| format!("{op:?}"))
+            .collect();
+        let exit_block = artifact.ssa_func.get_block(0x401296).expect("exit block");
+        let exit_ops: Vec<String> = exit_block.ops.iter().map(|op| format!("{op:?}")).collect();
+        let exit_phis: Vec<String> = exit_block
+            .phis
+            .iter()
+            .map(|phi| format!("{phi:?}"))
+            .collect();
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let output_without_types =
+            r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64()).decompile(&artifact.ssa_func);
+
+        assert!(
+            then_ops
+                .iter()
+                .any(|op| op.contains("Copy") && op.contains("RAX") && op.contains("const:1")),
+            "prepared SSA should keep the then-arm return value, got then_ops={then_ops:?}"
+        );
+        assert!(
+            else_ops
+                .iter()
+                .any(|op| op.contains("Copy") && op.contains("RAX") && op.contains("const:0")),
+            "prepared SSA should keep the else-arm return value, got else_ops={else_ops:?}"
+        );
+        assert!(
+            output.contains("if") && output.contains("return 1;") && output.contains("return 0;"),
+            "expected detached check_secret to keep branch returns, got:\n{output}\noutput_without_types=\n{output_without_types}\nentry_ops={entry_ops:?}\nthen_ops={then_ops:?}\nelse_ops={else_ops:?}\nexit_ops={exit_ops:?}\nexit_phis={exit_phis:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_bool_carrier_artifact_keeps_branch_return_values() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e5897dec8975e88b45ec3b45e80f95c00fb6c08945fc8b45fc4898488945f048837df0007505",
+                    ),
+                    0x401b7f,
+                    45,
+                )
+                .expect("bool-carrier entry"),
+            disasm
+                .lift_block(&decode_hex("8b45e8eb03"), 0x401bac, 5)
+                .expect("bool-carrier else"),
+            disasm
+                .lift_block(&decode_hex("8b45ec"), 0x401bb1, 3)
+                .expect("bool-carrier then"),
+            disasm
+                .lift_block(&decode_hex("5dc3"), 0x401bb4, 2)
+                .expect("bool-carrier exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.test_bool_carrier_chain",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "x", "type": "int32_t"},
+                    {"name": "y", "type": "int32_t"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"arg0","type":"int32_t","reg":"rdi","param_index":0},
+                {"kind":"register","name":"arg1","type":"int32_t","reg":"rsi","param_index":1},
+                {"kind":"stack","name":"var_18h","type":"int32_t","base":"rbp","offset":-24,"role":"local"},
+                {"kind":"stack","name":"var_14h","type":"int32_t","base":"rbp","offset":-20,"role":"local"},
+                {"kind":"stack","name":"var_10h","type":"int64_t","base":"rbp","offset":-16,"role":"local"},
+                {"kind":"stack","name":"var_4h","type":"int32_t","base":"rbp","offset":-4,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.test_bool_carrier_chain",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let visible_bindings = artifact.type_facts.visible_bindings.clone();
+
+        assert!(
+            output.contains("if (x != y)")
+                && output.contains("return x;")
+                && output.contains("return y;")
+                && !output.contains("local_14")
+                && !output.contains("local_18")
+                && !output.contains("var_14h")
+                && !output.contains("var_18h"),
+            "expected detached bool-carrier decompilation to keep param returns, got:\n{output}\nvisible_bindings={visible_bindings:#?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_setlocale_artifact_keeps_owned_call_result() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec10488d059c1900004889c6bf06000000e8affaffff488945f848837df8007507",
+                    ),
+                    0x401691,
+                    43,
+                )
+                .expect("setlocale entry"),
+            disasm
+                .lift_block(&decode_hex("b800000000eb0a"), 0x4016bc, 7)
+                .expect("setlocale false arm"),
+            disasm
+                .lift_block(&decode_hex("488b45f80fb6000fbec0"), 0x4016c3, 10)
+                .expect("setlocale true arm"),
+            disasm
+                .lift_block(&decode_hex("c9c3"), 0x4016cd, 2)
+                .expect("setlocale exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.test_setlocale_wrapper",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": []
+            },
+            "vars": [
+                {"kind":"stack","name":"loc","type":"int8_t *","base":"rbp","offset":-8,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.test_setlocale_wrapper",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]));
+        decompiler.set_strings(HashMap::from([(0x403040, "C".to_string())]));
+        decompiler.set_known_function_signatures(HashMap::from([(
+            "sym.imp.setlocale".to_string(),
+            r2types::FunctionType {
+                return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                })),
+                params: vec![
+                    r2types::CTypeLike::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    },
+                    r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
+                ],
+                variadic: false,
+            },
+        )]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let ssa_ops: Vec<String> = artifact
+            .ssa_func
+            .blocks()
+            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
+            .collect();
+        let block_succs: Vec<(u64, Vec<u64>)> = artifact
+            .ssa_func
+            .blocks()
+            .map(|block| (block.addr, artifact.ssa_func.successors(block.addr)))
+            .collect();
+
+        assert!(
+            output.contains("loc = (int8_t*)sym.imp.setlocale(6, \"C\");")
+                || output.contains("loc = sym.imp.setlocale(6, \"C\");"),
+            "expected detached setlocale wrapper to assign the owned call result to loc, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            output.contains("if (loc != 0)") || output.contains("if (!loc)"),
+            "expected setlocale wrapper to branch on the owned loc value, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            !output.contains("loc = (int8_t*)loc;"),
+            "setlocale wrapper should not collapse to self-assignment, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            output.contains("return loc[0];")
+                || output.contains("return (int32_t)loc[0];")
+                || output.contains("return *loc;")
+                || output.contains("return (int32_t)*loc;"),
+            "expected detached setlocale wrapper to return the first character of loc, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_my_strdup_artifact_reuses_owned_call_results() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec2048897de8488b45e84889c7e8b2eeffff488945f8488b45f84883c0014889c7e8eeeeffff488945f048837df000741b",
+                    ),
+                    0x402272,
+                    59,
+                )
+                .expect("my_strdup entry"),
+            disasm
+                .lift_block(
+                    &decode_hex("488b45f8488d5001488b4de8488b45f04889ce4889c7e8a8eeffff"),
+                    0x4022ad,
+                    27,
+                )
+                .expect("my_strdup copy arm"),
+            disasm
+                .lift_block(&decode_hex("488b45f0c9c3"), 0x4022c8, 6)
+                .expect("my_strdup exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.my_strdup",
+                "ret": "int8_t *",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "s", "type": "int8_t *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"s","type":"int8_t *","reg":"rdi","param_index":0},
+                {"kind":"stack","name":"s_home","type":"int8_t *","base":"rbp","offset":-24,"role":"param_home","param_index":0,"param_name":"s","source_reg":"rdi"},
+                {"kind":"stack","name":"len","type":"uint64_t","base":"rbp","offset":-8,"role":"local"},
+                {"kind":"stack","name":"dup","type":"int8_t *","base":"rbp","offset":-16,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.my_strdup",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([
+            (0x401140, "sym.imp.strlen".to_string()),
+            (0x401170, "sym.imp.memcpy".to_string()),
+            (0x401190, "sym.imp.malloc".to_string()),
+        ]));
+        decompiler.set_known_function_signatures(HashMap::from([
+            (
+                "sym.imp.strlen".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    },
+                    params: vec![r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
+                    ))],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.imp.malloc".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    }],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.imp.memcpy".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Int {
+                            bits: 64,
+                            signedness: r2types::Signedness::Unsigned,
+                        },
+                    ],
+                    variadic: false,
+                },
+            ),
+        ]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let ssa_ops: Vec<String> = artifact
+            .ssa_func
+            .blocks()
+            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
+            .collect();
+        let block_succs: Vec<(u64, Vec<u64>)> = artifact
+            .ssa_func
+            .blocks()
+            .map(|block| (block.addr, artifact.ssa_func.successors(block.addr)))
+            .collect();
+
+        assert!(
+            output.contains("len = sym.imp.strlen(s);"),
+            "expected my_strdup to keep a single owned strlen result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            output.contains("dup = sym.imp.malloc(len + 1);"),
+            "expected my_strdup to assign the owned malloc result to dup, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            output.contains("if (dup == 0)") || output.contains("if (!dup)"),
+            "expected my_strdup null-check to reuse the owned dup result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            output.contains("sym.imp.memcpy(dup, s, len + 1);"),
+            "expected my_strdup to reuse dup and len in memcpy, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            output.contains("return dup;"),
+            "expected my_strdup to return the owned dup result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+        assert!(
+            !output.contains("sym.imp.malloc(sym.imp.strlen(")
+                && !output.contains("dup = rax;")
+                && !output.contains("return len;"),
+            "my_strdup should not replay helper calls or return the strlen result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_my_strdup_artifact_reuses_malloc_owner_with_generic_stack_local_name() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec2048897de8488b45e84889c7e8b2eeffff488945f8488b45f84883c0014889c7e8eeeeffff488945f048837df000741b",
+                    ),
+                    0x402272,
+                    59,
+                )
+                .expect("my_strdup entry"),
+            disasm
+                .lift_block(
+                    &decode_hex("488b45f8488d5001488b4de8488b45f04889ce4889c7e8a8eeffff"),
+                    0x4022ad,
+                    27,
+                )
+                .expect("my_strdup copy arm"),
+            disasm
+                .lift_block(&decode_hex("488b45f0c9c3"), 0x4022c8, 6)
+                .expect("my_strdup exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.my_strdup",
+                "ret": "char *",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "s", "type": "char const *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"arg0","type":"int64_t","reg":"rdi","param_index":0},
+                {"kind":"stack","name":"len","type":"size_t","base":"rbp","offset":-8,"role":"local"},
+                {"kind":"stack","name":"var_10h","type":"int64_t","base":"rbp","offset":-16,"role":"local"},
+                {"kind":"stack","name":"s_home","type":"char const *","base":"rbp","offset":-24,"role":"param_home","param_index":0,"param_name":"s","source_reg":"rdi"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.my_strdup",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([
+            (0x401140, "sym.imp.strlen".to_string()),
+            (0x401170, "sym.imp.memcpy".to_string()),
+            (0x401190, "sym.imp.malloc".to_string()),
+        ]));
+        decompiler.set_known_function_signatures(HashMap::from([
+            (
+                "sym.imp.strlen".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    },
+                    params: vec![r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
+                    ))],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.imp.malloc".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    }],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.imp.memcpy".to_string(),
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                    params: vec![
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                        r2types::CTypeLike::Int {
+                            bits: 64,
+                            signedness: r2types::Signedness::Unsigned,
+                        },
+                    ],
+                    variadic: false,
+                },
+            ),
+        ]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let ssa_ops: Vec<String> = artifact
+            .ssa_func
+            .blocks()
+            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
+            .collect();
+
+        assert!(
+            output.contains("len = sym.imp.strlen(s);"),
+            "expected my_strdup to keep a single owned strlen result, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("var_10h = sym.imp.malloc(len + 1);"),
+            "expected my_strdup to bind the malloc result to the stack local owner even with a generic local name, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("sym.imp.memcpy(var_10h, s, len + 1);"),
+            "expected my_strdup to reuse the generic stack local owner in memcpy, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("return var_10h;"),
+            "expected my_strdup to return the generic stack local owner instead of replaying malloc, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            !output.contains("sym.imp.malloc(len + 1)")
+                || output.matches("sym.imp.malloc(len + 1)").count() == 1,
+            "expected my_strdup to keep a single visible malloc call, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_process_string_artifact_keeps_strlen_owner_and_hex_constant_shape() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec2048897de8488b45e84889c7e8adfdffff488945f848837df8647607",
+                    ),
+                    0x401337,
+                    39,
+                )
+                .expect("process_string entry"),
+            disasm
+                .lift_block(&decode_hex("b8ffffffffeb12"), 0x40135e, 7)
+                .expect("process_string too_long"),
+            disasm
+                .lift_block(&decode_hex("48837df8047707"), 0x401365, 7)
+                .expect("process_string second_guard"),
+            disasm
+                .lift_block(&decode_hex("b8feffffffeb04"), 0x40136c, 7)
+                .expect("process_string too_short"),
+            disasm
+                .lift_block(&decode_hex("488b45f8"), 0x401373, 4)
+                .expect("process_string return_len"),
+            disasm
+                .lift_block(&decode_hex("c9c3"), 0x401377, 2)
+                .expect("process_string exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.process_string",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "s", "type": "int8_t *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"s","type":"int8_t *","reg":"rdi","param_index":0},
+                {"kind":"stack","name":"s_home","type":"int8_t *","base":"rbp","offset":-24,"role":"param_home","param_index":0,"param_name":"s","source_reg":"rdi"},
+                {"kind":"stack","name":"len","type":"uint64_t","base":"rbp","offset":-8,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.process_string",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
+        decompiler.set_known_function_signatures(HashMap::from([(
+            "sym.imp.strlen".to_string(),
+            r2types::FunctionType {
+                return_type: r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+                params: vec![r2types::CTypeLike::Pointer(Box::new(
+                    r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    },
+                ))],
+                variadic: false,
+            },
+        )]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+        let ssa_ops: Vec<String> = artifact
+            .ssa_func
+            .blocks()
+            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
+            .collect();
+
+        assert!(
+            output.contains("len = sym.imp.strlen(s);"),
+            "expected process_string to keep the strlen owner, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            !output.contains("sym.imp.strlen(s)")
+                || output.matches("sym.imp.strlen(s)").count() == 1,
+            "process_string should not replay strlen, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("if (len > 100)") || output.contains("if (len > 0x64)"),
+            "expected process_string to preserve the original 0x64/100 guard, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("return len;"),
+            "expected process_string to return the owned len on the success path, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("return -1;"),
+            "expected process_string to preserve the too-long return, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            output.contains("return -2;"),
+            "expected process_string to preserve the too-short return, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_process_string_artifact_accepts_size_t_external_local_type() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec2048897de8488b45e84889c7e8adfdffff488945f848837df8647607",
+                    ),
+                    0x401337,
+                    39,
+                )
+                .expect("process_string entry"),
+            disasm
+                .lift_block(&decode_hex("b8ffffffffeb12"), 0x40135e, 7)
+                .expect("process_string too_long"),
+            disasm
+                .lift_block(&decode_hex("48837df8047707"), 0x401365, 7)
+                .expect("process_string second_guard"),
+            disasm
+                .lift_block(&decode_hex("b8feffffffeb04"), 0x40136c, 7)
+                .expect("process_string too_short"),
+            disasm
+                .lift_block(&decode_hex("488b45f8"), 0x401373, 4)
+                .expect("process_string return_len"),
+            disasm
+                .lift_block(&decode_hex("c9c3"), 0x401377, 2)
+                .expect("process_string exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.process_string",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "s", "type": "int8_t *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"s","type":"int8_t *","reg":"rdi","param_index":0},
+                {"kind":"stack","name":"s_home","type":"int8_t *","base":"rbp","offset":-24,"role":"param_home","param_index":0,"param_name":"s","source_reg":"rdi"},
+                {"kind":"stack","name":"len","type":"size_t","base":"rbp","offset":-8,"role":"local"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.process_string",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
+        decompiler.set_known_function_signatures(HashMap::from([(
+            "sym.imp.strlen".to_string(),
+            r2types::FunctionType {
+                return_type: r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+                params: vec![r2types::CTypeLike::Pointer(Box::new(
+                    r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    },
+                ))],
+                variadic: false,
+            },
+        )]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+
+        assert!(
+            output.contains("len = sym.imp.strlen(s);"),
+            "expected process_string to keep the strlen owner with a size_t local, got:\n{output}"
+        );
+        assert!(
+            output.contains("if (len > 100)") || output.contains("if (len > 0x64)"),
+            "expected process_string to preserve the upper-bound guard with a size_t local, got:\n{output}"
+        );
+        assert!(
+            output.contains("return -1;"),
+            "expected process_string to preserve the too-long return with a size_t local, got:\n{output}"
+        );
+        assert!(
+            output.contains("return -2;"),
+            "expected process_string to preserve the too-short return with a size_t local, got:\n{output}"
+        );
+        assert!(
+            output.contains("return len;"),
+            "expected process_string to preserve the success return owner with a size_t local, got:\n{output}"
+        );
+        assert!(
+            !output.contains("uint8_t len") && !output.contains("\"\\x7f\""),
+            "size_t local metadata should not collapse process_string into a byte-typed artifact, got:\n{output}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_process_string_artifact_matches_live_external_slot_mix() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec2048897de8488b45e84889c7e8adfdffff488945f848837df8647607",
+                    ),
+                    0x401337,
+                    39,
+                )
+                .expect("process_string entry"),
+            disasm
+                .lift_block(&decode_hex("b8ffffffffeb12"), 0x40135e, 7)
+                .expect("process_string too_long"),
+            disasm
+                .lift_block(&decode_hex("48837df8047707"), 0x401365, 7)
+                .expect("process_string second_guard"),
+            disasm
+                .lift_block(&decode_hex("b8feffffffeb04"), 0x40136c, 7)
+                .expect("process_string too_short"),
+            disasm
+                .lift_block(&decode_hex("488b45f8"), 0x401373, 4)
+                .expect("process_string return_len"),
+            disasm
+                .lift_block(&decode_hex("c9c3"), 0x401377, 2)
+                .expect("process_string exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.process_string",
+                "ret": "int",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "s", "type": "char *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"arg0","type":"int64_t","reg":"RDI"},
+                {"kind":"stack","name":"s","type":"char *","base":"bp","role":"stack_arg","is_arg":true,"offset":-24},
+                {"kind":"stack","name":"len","type":"size_t","base":"bp","role":"local","is_arg":false,"offset":-8},
+                {"kind":"stack","name":"var_8h","type":"void *","base":"sp","role":"local","is_arg":false,"offset":32}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.process_string",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
+        decompiler.set_known_function_signatures(HashMap::from([(
+            "sym.imp.strlen".to_string(),
+            r2types::FunctionType {
+                return_type: r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+                params: vec![r2types::CTypeLike::Pointer(Box::new(
+                    r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    },
+                ))],
+                variadic: false,
+            },
+        )]));
+        let output = decompiler.decompile(&artifact.ssa_func);
+
+        assert!(
+            output.contains("return -1;")
+                && output.contains("return -2;")
+                && output.contains("return len;"),
+            "expected process_string to keep its signed return paths with the live external slot mix, got:\n{output}"
+        );
+        assert!(
+            !output.contains("uint8_t len"),
+            "live external slot mix should not narrow len to uint8_t, got:\n{output}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn r2dec_function_with_context_keeps_process_string_signed_return_paths() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let arch = CString::new("x86-64").expect("valid arch string");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let lifted = [
+            (
+                "f30f1efa554889e54883ec2048897de8488b45e84889c7e8adfdffff488945f848837df8647607",
+                0x401337,
+                39,
+            ),
+            ("b8ffffffffeb12", 0x40135e, 7),
+            ("48837df8047707", 0x401365, 7),
+            ("b8feffffffeb04", 0x40136c, 7),
+            ("488b45f8", 0x401373, 4),
+            ("c9c3", 0x401377, 2),
+        ];
+        let mut owned_blocks = Vec::new();
+        for (hex, addr, size) in lifted {
+            let bytes = decode_hex(hex);
+            let block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), addr, size);
+            assert!(
+                !block.is_null(),
+                "process_string block should lift at 0x{addr:x}"
+            );
+            owned_blocks.push(block);
+        }
+
+        let func_name = CString::new("dbg.process_string").expect("valid function name");
+        let empty_map = CString::new("{}").expect("valid empty json");
+        let external_context_json = CString::new(
+            r#"{
+                "signature": {
+                    "name": "dbg.process_string",
+                    "ret": "int32_t",
+                    "callconv": "amd64",
+                    "params": [
+                        {"name": "s", "type": "int8_t *"}
+                    ]
+                },
+                "vars": [
+                    {"kind":"register","name":"s","type":"int8_t *","reg":"rdi","param_index":0},
+                    {"kind":"stack","name":"s_home","type":"int8_t *","base":"rbp","offset":-24,"role":"param_home","param_index":0,"param_name":"s","source_reg":"rdi"},
+                    {"kind":"stack","name":"len","type":"uint64_t","base":"rbp","offset":-8,"role":"local"}
+                ],
+                "base_types": []
+            }"#,
+        )
+        .expect("valid process_string external context");
+
+        let out = r2dec_function_with_context(
+            ctx,
+            owned_blocks.as_ptr().cast(),
+            owned_blocks.len(),
+            func_name.as_ptr(),
+            empty_map.as_ptr(),
+            empty_map.as_ptr(),
+            empty_map.as_ptr(),
+            external_context_json.as_ptr(),
+        );
+        assert!(!out.is_null(), "decompilation output should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+
+        r2il_string_free(out);
+        for block in owned_blocks {
+            r2il_block_free(block);
+        }
+        r2il_free(ctx);
+
+        assert!(
+            output.contains("return -1;"),
+            "expected FFI decompile to keep the too-long signed return, got:\n{output}"
+        );
+        assert!(
+            output.contains("return -2;"),
+            "expected FFI decompile to keep the too-short signed return, got:\n{output}"
+        );
+        assert!(
+            output.contains("return len;"),
+            "expected FFI decompile to keep the success return owner, got:\n{output}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn r2dec_function_with_context_process_string_live_slot_mix_keeps_wide_len() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let arch = CString::new("x86-64").expect("valid arch string");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let lifted = [
+            (
+                "f30f1efa554889e54883ec2048897de8488b45e84889c7e8adfdffff488945f848837df8647607",
+                0x401337,
+                39,
+            ),
+            ("b8ffffffffeb12", 0x40135e, 7),
+            ("48837df8047707", 0x401365, 7),
+            ("b8feffffffeb04", 0x40136c, 7),
+            ("488b45f8", 0x401373, 4),
+            ("c9c3", 0x401377, 2),
+        ];
+        let mut owned_blocks = Vec::new();
+        for (hex, addr, size) in lifted {
+            let bytes = decode_hex(hex);
+            let block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), addr, size);
+            assert!(
+                !block.is_null(),
+                "process_string block should lift at 0x{addr:x}"
+            );
+            owned_blocks.push(block);
+        }
+
+        let func_name = CString::new("dbg.process_string").expect("valid function name");
+        let empty_map = CString::new("{}").expect("valid empty json");
+        let external_context_json = CString::new(
+            r#"{
+                "signature": {
+                    "name": "dbg.process_string",
+                    "ret": "int",
+                    "callconv": "amd64",
+                    "params": [
+                        {"name": "s", "type": "char *"}
+                    ]
+                },
+                "vars": [
+                    {"kind":"register","name":"arg0","type":"int64_t","reg":"RDI"},
+                    {"kind":"stack","name":"s","type":"char *","base":"bp","role":"stack_arg","is_arg":true,"offset":-24},
+                    {"kind":"stack","name":"len","type":"size_t","base":"bp","role":"local","is_arg":false,"offset":-8},
+                    {"kind":"stack","name":"var_8h","type":"void *","base":"sp","role":"local","is_arg":false,"offset":32}
+                ],
+                "base_types": []
+            }"#,
+        )
+        .expect("valid process_string external context");
+
+        let out = r2dec_function_with_context(
+            ctx,
+            owned_blocks.as_ptr().cast(),
+            owned_blocks.len(),
+            func_name.as_ptr(),
+            empty_map.as_ptr(),
+            empty_map.as_ptr(),
+            empty_map.as_ptr(),
+            external_context_json.as_ptr(),
+        );
+        assert!(!out.is_null(), "decompilation output should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+
+        r2il_string_free(out);
+        for block in owned_blocks {
+            r2il_block_free(block);
+        }
+        r2il_free(ctx);
+
+        assert!(
+            output.contains("return -1;")
+                && output.contains("return -2;")
+                && output.contains("return len;"),
+            "expected FFI decompile to keep signed return paths with the live slot mix, got:\n{output}"
+        );
+        assert!(
+            !output.contains("uint8_t len"),
+            "FFI decompile path should not narrow len to uint8_t with the live slot mix, got:\n{output}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn type_writeback_ffi_process_string_keeps_pointer_width_len_for_live_slot_mix() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let arch = CString::new("x86-64").expect("valid arch string");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let lifted = [
+            (
+                "f30f1efa554889e54883ec2048897de8488b45e84889c7e8adfdffff488945f848837df8647607",
+                0x401337,
+                39,
+            ),
+            ("b8ffffffffeb12", 0x40135e, 7),
+            ("48837df8047707", 0x401365, 7),
+            ("b8feffffffeb04", 0x40136c, 7),
+            ("488b45f8", 0x401373, 4),
+            ("c9c3", 0x401377, 2),
+        ];
+        let mut owned_blocks = Vec::new();
+        for (hex, addr, size) in lifted {
+            let bytes = decode_hex(hex);
+            let block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), addr, size);
+            assert!(
+                !block.is_null(),
+                "process_string block should lift at 0x{addr:x}"
+            );
+            owned_blocks.push(block);
+        }
+
+        let func_name = CString::new("dbg.process_string").expect("valid function name");
+        let external_context = CString::new(
+            r#"{
+                "signature": {
+                    "name": "dbg.process_string",
+                    "ret": "int",
+                    "callconv": "amd64",
+                    "params": [
+                        {"name": "s", "type": "char *"}
+                    ]
+                },
+                "vars": [
+                    {"kind":"register","name":"arg0","type":"int64_t","reg":"RDI"},
+                    {"kind":"stack","name":"s","type":"char *","base":"bp","role":"stack_arg","is_arg":true,"offset":-24},
+                    {"kind":"stack","name":"len","type":"size_t","base":"bp","role":"local","is_arg":false,"offset":-8},
+                    {"kind":"stack","name":"var_8h","type":"void *","base":"sp","role":"local","is_arg":false,"offset":32}
+                ],
+                "base_types": []
+            }"#,
+        )
+        .expect("valid process_string external context");
+
+        let out = r2sleigh_infer_type_writeback_json(
+            ctx,
+            owned_blocks.as_ptr().cast(),
+            owned_blocks.len(),
+            0,
+            func_name.as_ptr(),
+            external_context.as_ptr(),
+        );
+        assert!(!out.is_null(), "type writeback output should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+        let payload: serde_json::Value =
+            serde_json::from_str(&output).expect("type writeback payload should parse");
+        let parsed_context = r2types::parse_external_context_json(
+            external_context.to_str().expect("context str"),
+            64,
+        );
+        let parsed_len_slot = parsed_context.external_stack_vars.get(&-8).cloned();
+        let recovered_out = crate::types::r2sleigh_recover_vars(
+            ctx,
+            owned_blocks.as_ptr().cast(),
+            owned_blocks.len(),
+            0,
+        );
+        assert!(
+            !recovered_out.is_null(),
+            "recover vars output should not be null"
+        );
+        let recovered_output = unsafe { CStr::from_ptr(recovered_out) }
+            .to_string_lossy()
+            .to_string();
+
+        r2il_string_free(out);
+        r2il_string_free(recovered_out);
+        for block in owned_blocks {
+            r2il_block_free(block);
+        }
+        r2il_free(ctx);
+
+        let candidates = payload
+            .get("var_type_candidates")
+            .and_then(|value| value.as_array())
+            .expect("var_type_candidates array");
+        let len_candidate = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.get("delta").and_then(|value| value.as_i64()) == Some(-8)
+                    && candidate.get("target_name").is_none()
+            })
+            .expect("stack local candidate for len");
+        let len_type = len_candidate
+            .get("type")
+            .and_then(|value| value.as_str())
+            .expect("len type string");
+
+        assert_ne!(
+            len_type, "uint8_t",
+            "live FFI type writeback path should not narrow len to uint8_t: {output}\nrecovered_vars={recovered_output}\nparsed_len_slot={parsed_len_slot:?}"
         );
     }
 

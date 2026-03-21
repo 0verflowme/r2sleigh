@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::SSAVar;
 use r2types::TypeOracle;
@@ -10,11 +10,15 @@ use crate::fold::{PtrArith, SSABlock};
 // UseInfo -> (FlagInfo, StackInfo) -> PredicateSimplifier -> statement emit.
 pub(crate) mod flag_info;
 pub(crate) mod lower;
+pub(crate) mod ownership;
 pub(crate) mod predicate;
 pub(crate) mod stack_info;
 pub(crate) mod use_info;
 pub(crate) mod utils;
 
+pub(crate) use ownership::{
+    CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, SemanticOwnershipFacts,
+};
 pub(crate) use predicate::PredicateSimplifier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,7 @@ pub(crate) enum UseInfoAnalysisMode {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecompilerFacts {
     pub(crate) use_info: UseInfo,
+    pub(crate) ownership: SemanticOwnershipFacts,
     pub(crate) flag_info: FlagInfo,
     pub(crate) stack_info: StackInfo,
 }
@@ -46,6 +51,10 @@ impl DecompilerFacts {
 
     pub(crate) fn stack(&self) -> &StackInfo {
         &self.stack_info
+    }
+
+    pub(crate) fn ownership(&self) -> &SemanticOwnershipFacts {
+        &self.ownership
     }
 }
 
@@ -71,6 +80,7 @@ pub(crate) struct PassEnv<'a> {
 pub(crate) struct UseInfo {
     pub(crate) use_counts: HashMap<String, usize>,
     pub(crate) definitions: HashMap<String, CExpr>,
+    pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
     pub(crate) semantic_values: HashMap<String, SemanticValue>,
     pub(crate) frame_slot_merges: HashMap<String, FrameSlotMergeSummary>,
     pub(crate) frame_object_field_roots: HashMap<FrameObjectFieldKey, SemanticValue>,
@@ -83,6 +93,10 @@ pub(crate) struct UseInfo {
     pub(crate) condition_vars: HashSet<String>,
     pub(crate) pinned: HashSet<String>,
     pub(crate) call_args: HashMap<(u64, usize), Vec<CallArgBinding>>,
+    pub(crate) call_result_aliases: BTreeMap<(u64, usize), BTreeSet<String>>,
+    pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
+    pub(crate) call_result_source_by_alias: HashMap<String, (u64, usize)>,
+    pub(crate) direct_call_result_aliases: HashSet<String>,
     pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
     pub(crate) consumed_by_call: HashSet<String>,
     pub(crate) inlined_call_results: HashSet<(u64, usize)>,
@@ -116,6 +130,7 @@ pub(crate) struct CallArgBinding {
     pub(crate) role: CallArgRole,
     pub(crate) stack_offset: Option<i64>,
     pub(crate) source_call: Option<(u64, usize)>,
+    pub(crate) source_var_name: Option<String>,
 }
 
 impl CallArgBinding {
@@ -125,6 +140,7 @@ impl CallArgBinding {
             role,
             stack_offset,
             source_call: None,
+            source_var_name: None,
         }
     }
 
@@ -143,6 +159,11 @@ impl CallArgBinding {
 
     pub(crate) fn with_source_call(mut self, block_addr: u64, op_idx: usize) -> Self {
         self.source_call = Some((block_addr, op_idx));
+        self
+    }
+
+    pub(crate) fn with_source_var(mut self, source_var: &SSAVar) -> Self {
+        self.source_var_name = Some(source_var.display_name());
         self
     }
 
