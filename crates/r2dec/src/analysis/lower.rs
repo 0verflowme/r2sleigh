@@ -47,29 +47,62 @@ impl<'a> LowerCtx<'a> {
 
     fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
         self.definitions.get(name).or_else(|| {
-            self.use_info
-                .and_then(|info| info.definition_for_name(name))
+            self.use_info.and_then(|info| {
+                info.value_id_for_name(name)
+                    .and_then(|value_id| info.render_definition_for_value(value_id))
+                    .or_else(|| info.render_definition_for_name(name))
+            })
         })
+    }
+
+    fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
+        let key = var.display_name();
+        self.definitions
+            .get(&key)
+            .or_else(|| self.use_info.and_then(|info| info.definition_for_var(var)))
     }
 
     fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
         self.semantic_values.get(name).or_else(|| {
+            self.use_info.and_then(|info| {
+                info.value_id_for_name(name)
+                    .and_then(|value_id| info.render_semantic_value_for_value(value_id))
+                    .or_else(|| info.render_semantic_value_for_name(name))
+            })
+        })
+    }
+
+    fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
+        let key = var.display_name();
+        self.semantic_values.get(&key).or_else(|| {
             self.use_info
-                .and_then(|info| info.semantic_value_for_name(name))
+                .and_then(|info| info.semantic_value_for_var(var))
         })
     }
 
     fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
         self.forwarded_values.get(name).or_else(|| {
-            self.use_info
-                .and_then(|info| info.forwarded_value_for_name(name))
+            self.use_info.and_then(|info| {
+                info.value_id_for_name(name)
+                    .and_then(|value_id| info.render_forwarded_value_for_value(value_id))
+                    .or_else(|| info.render_forwarded_value_for_name(name))
+            })
         })
     }
 
-    fn ptr_arith_for_name(&self, name: &str) -> Option<&PtrArith> {
+    fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
+        let key = var.display_name();
+        self.forwarded_values.get(&key).or_else(|| {
+            self.use_info
+                .and_then(|info| info.forwarded_value_for_var(var))
+        })
+    }
+
+    fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
+        let key = var.display_name();
         self.ptr_arith
-            .get(name)
-            .or_else(|| self.use_info.and_then(|info| info.ptr_arith_for_name(name)))
+            .get(&key)
+            .or_else(|| self.use_info.and_then(|info| info.ptr_arith_for_var(var)))
     }
 
     fn use_count_for_name(&self, name: &str) -> usize {
@@ -165,19 +198,19 @@ impl<'a> LowerCtx<'a> {
         }
 
         let key = var.display_name();
-        if let Some(prov) = self.forwarded_value_for_name(&key)
+        if let Some(prov) = self.forwarded_value_for_var(var)
             && depth < 8
             && visited.insert(format!("prov:{key}"))
         {
             return self.expr_for_ssa_name_with_depth(&prov.source, depth + 1, visited);
         }
-        if let Some(expr) = self.render_semantic_value_by_name(&key, depth, visited) {
+        if let Some(expr) = self.render_semantic_value_for_var(var, depth, visited) {
             return expr;
         }
         if depth < 8
             && self.should_inline(&key)
             && visited.insert(key.clone())
-            && let Some(expr) = self.definition_for_name(&key)
+            && let Some(expr) = self.definition_for_var(var)
         {
             return expr.clone();
         }
@@ -247,9 +280,8 @@ impl<'a> LowerCtx<'a> {
         match op {
             SSAOp::Copy { src, .. } => self.get_expr(src),
             SSAOp::Load { dst, addr, .. } => {
-                let dst_key = dst.display_name();
                 let prefer_memory_access = matches!(
-                    self.semantic_value_for_name(&dst_key),
+                    self.semantic_value_for_var(dst),
                     Some(SemanticValue::Address(_))
                 );
                 if prefer_memory_access {
@@ -260,8 +292,7 @@ impl<'a> LowerCtx<'a> {
                         return member;
                     }
                 }
-                if let Some(expr) =
-                    self.render_semantic_value_by_name(&dst_key, 0, &mut HashSet::new())
+                if let Some(expr) = self.render_semantic_value_for_var(dst, 0, &mut HashSet::new())
                 {
                     expr
                 } else if let Some(sub) = self.try_subscript_from_var(addr, dst.size) {
@@ -416,7 +447,7 @@ impl<'a> LowerCtx<'a> {
                 index,
                 element_size,
             } => self
-                .render_semantic_value_by_name(&dst.display_name(), 0, &mut HashSet::new())
+                .render_semantic_value_for_var(dst, 0, &mut HashSet::new())
                 .unwrap_or_else(|| self.ptr_arith_expr(base, index, *element_size, false)),
             SSAOp::PtrSub {
                 dst,
@@ -424,7 +455,7 @@ impl<'a> LowerCtx<'a> {
                 index,
                 element_size,
             } => self
-                .render_semantic_value_by_name(&dst.display_name(), 0, &mut HashSet::new())
+                .render_semantic_value_for_var(dst, 0, &mut HashSet::new())
                 .unwrap_or_else(|| self.ptr_arith_expr(base, index, *element_size, true)),
             _ => {
                 if let Some(dst) = op.dst() {
@@ -447,8 +478,25 @@ impl<'a> LowerCtx<'a> {
         }
 
         let rendered = self
-            .semantic_values
-            .get(name)
+            .semantic_value_for_name(name)
+            .and_then(|value| self.render_semantic_value(value, depth + 1, visited));
+        visited.remove(&format!("sem:{name}"));
+        rendered
+    }
+
+    fn render_semantic_value_for_var(
+        &self,
+        var: &SSAVar,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> Option<CExpr> {
+        let name = var.display_name();
+        if depth > 8 || !visited.insert(format!("sem:{name}")) {
+            return None;
+        }
+
+        let rendered = self
+            .semantic_value_for_var(var)
             .and_then(|value| self.render_semantic_value(value, depth + 1, visited));
         visited.remove(&format!("sem:{name}"));
         rendered
@@ -607,7 +655,13 @@ impl<'a> LowerCtx<'a> {
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
         let name = value.display_name();
-        Some(self.expr_for_ssa_name_with_depth(&name, depth, visited))
+        let visit_key = format!("val:{name}");
+        if !visited.insert(visit_key.clone()) {
+            return None;
+        }
+        let expr = self.expr_for_ssa_name_with_depth(&name, depth, visited);
+        visited.remove(&visit_key);
+        Some(expr)
     }
 
     fn should_inline(&self, var_name: &str) -> bool {
@@ -806,7 +860,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn try_subscript_from_var(&self, addr: &SSAVar, elem_size: u32) -> Option<CExpr> {
-        if let Some(expr) = self.definition_for_name(&addr.display_name())
+        if let Some(expr) = self.definition_for_var(addr)
             && let Some(sub) = self.try_subscript_from_addr_expr(expr, elem_size)
         {
             return Some(sub);
@@ -815,14 +869,14 @@ impl<'a> LowerCtx<'a> {
         if let Some(sub) = self.try_subscript_from_addr_expr(&resolved, elem_size) {
             return Some(sub);
         }
-        if let Some(ptr) = self.ptr_arith_for_name(&addr.display_name()) {
+        if let Some(ptr) = self.ptr_arith_for_var(addr) {
             return self.ptr_subscript_expr(&ptr.base, &ptr.index, ptr.element_size, ptr.is_sub);
         }
         None
     }
 
     fn try_member_access_from_var(&self, addr: &SSAVar) -> Option<CExpr> {
-        if let Some(expr) = self.definition_for_name(&addr.display_name())
+        if let Some(expr) = self.definition_for_var(addr)
             && let Some(member) = self.try_member_access_from_addr_expr(Some(addr), expr)
         {
             return Some(member);

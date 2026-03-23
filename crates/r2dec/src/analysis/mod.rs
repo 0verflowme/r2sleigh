@@ -423,6 +423,23 @@ impl StackSlotProvenance {
     }
 }
 
+fn lookup_name_key<'a, T>(map: &'a HashMap<String, T>, name: &str) -> Option<&'a T> {
+    map.get(name)
+        .or_else(|| {
+            let lower = name.to_ascii_lowercase();
+            (lower != name).then(|| map.get(&lower)).flatten()
+        })
+        .or_else(|| {
+            name.rsplit_once('_').and_then(|(base, version)| {
+                let lower = format!("{}_{}", base.to_ascii_lowercase(), version);
+                map.get(&lower).or_else(|| {
+                    let upper = format!("{}_{}", base.to_ascii_uppercase(), version);
+                    (upper != lower).then(|| map.get(&upper)).flatten()
+                })
+            })
+        })
+}
+
 impl UseInfo {
     pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> Self {
         use_info::analyze(blocks, env)
@@ -454,42 +471,119 @@ impl UseInfo {
         self.vars_by_value_id
             .entry(value_id)
             .or_insert_with(|| var.clone());
+
+        if let Some(expr) = self
+            .definitions
+            .get(&display)
+            .or_else(|| self.definitions.get(&var.name))
+            .cloned()
+        {
+            self.definitions_by_value.insert(value_id, expr);
+        }
+        if let Some(value) = self
+            .semantic_values
+            .get(&display)
+            .or_else(|| self.semantic_values.get(&var.name))
+            .cloned()
+        {
+            self.semantic_values_by_value.insert(value_id, value);
+        }
+        if let Some(slot) = self
+            .stack_slots
+            .get(&display)
+            .or_else(|| self.stack_slots.get(&var.name))
+            .copied()
+        {
+            self.stack_slots_by_value.insert(value_id, slot);
+        }
+        if let Some(ptr) = self
+            .ptr_arith
+            .get(&display)
+            .or_else(|| self.ptr_arith.get(&var.name))
+            .cloned()
+        {
+            self.ptr_arith_by_value.insert(value_id, ptr);
+        }
+        if let Some(prov) = self
+            .forwarded_values
+            .get(&display)
+            .or_else(|| self.forwarded_values.get(&var.name))
+            .cloned()
+        {
+            self.forwarded_values_by_value.insert(value_id, prov);
+        }
+        if let Some(use_count) = self
+            .use_counts
+            .get(&display)
+            .or_else(|| self.use_counts.get(&var.name))
+            .copied()
+        {
+            self.use_counts_by_value.insert(value_id, use_count);
+        }
+        if self.condition_vars.contains(&display) || self.condition_vars.contains(&var.name) {
+            self.condition_values.insert(value_id);
+        }
+        if let Some(source_call) = self
+            .call_result_source_by_alias
+            .get(&display)
+            .or_else(|| self.call_result_source_by_alias.get(&var.name))
+            .copied()
+        {
+            self.call_result_source_by_value
+                .insert(value_id, source_call);
+        }
     }
 
     pub(crate) fn note_use_for_var(&mut self, var: &SSAVar) {
-        let display = var.display_name();
-        *self.use_counts.entry(display).or_insert(0) += 1;
-        if let Some(value_id) = self.value_id_for_var(var) {
+        self.note_use_for_name(&var.display_name());
+    }
+
+    pub(crate) fn note_use_for_name(&mut self, name: &str) {
+        *self.use_counts.entry(name.to_string()).or_insert(0) += 1;
+        if let Some(value_id) = self.value_id_for_name(name) {
             *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
         }
     }
 
     pub(crate) fn note_condition_var(&mut self, var: &SSAVar) {
-        self.condition_vars.insert(var.display_name());
-        if let Some(value_id) = self.value_id_for_var(var) {
+        self.note_condition_name(&var.display_name());
+    }
+
+    pub(crate) fn note_condition_name(&mut self, name: &str) {
+        self.condition_vars.insert(name.to_string());
+        if let Some(value_id) = self.value_id_for_name(name) {
             self.condition_values.insert(value_id);
         }
     }
 
     pub(crate) fn insert_definition_for_var(&mut self, var: &SSAVar, expr: CExpr) {
-        // Local analysis still derives visible-quality definitions through name-oriented
-        // collectors. Keep prepared/runtime id-backed definitions authoritative, but do
-        // not blindly promote local definitions into the value-id store yet.
-        self.definitions.insert(var.display_name(), expr);
+        let display = var.display_name();
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.definitions_by_value.insert(value_id, expr.clone());
+        }
+        self.definitions.insert(display, expr);
     }
 
     pub(crate) fn insert_stack_slot_for_var(&mut self, var: &SSAVar, slot: StackSlotProvenance) {
-        if let Some(value_id) = self.value_id_for_var(var) {
+        self.insert_stack_slot_for_name(&var.display_name(), slot);
+    }
+
+    pub(crate) fn insert_stack_slot_for_name(&mut self, name: &str, slot: StackSlotProvenance) {
+        if let Some(value_id) = self.value_id_for_name(name) {
             self.stack_slots_by_value.insert(value_id, slot);
         }
-        self.stack_slots.insert(var.display_name(), slot);
+        self.stack_slots.insert(name.to_string(), slot);
     }
 
     pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
-        if let Some(value_id) = self.value_id_for_var(var) {
+        self.insert_ptr_arith_for_name(&var.display_name(), ptr.clone());
+    }
+
+    pub(crate) fn insert_ptr_arith_for_name(&mut self, name: &str, ptr: PtrArith) {
+        if let Some(value_id) = self.value_id_for_name(name) {
             self.ptr_arith_by_value.insert(value_id, ptr.clone());
         }
-        self.ptr_arith.insert(var.display_name(), ptr);
+        self.ptr_arith.insert(name.to_string(), ptr);
     }
 
     pub(crate) fn insert_forwarded_value_for_var(
@@ -497,11 +591,27 @@ impl UseInfo {
         var: &SSAVar,
         provenance: ValueProvenance,
     ) {
-        if let Some(value_id) = self.value_id_for_var(var) {
+        self.insert_forwarded_value_for_name(&var.display_name(), provenance);
+    }
+
+    pub(crate) fn insert_forwarded_value_for_name(
+        &mut self,
+        name: &str,
+        provenance: ValueProvenance,
+    ) {
+        if let Some(value_id) = self.value_id_for_name(name) {
             self.forwarded_values_by_value
                 .insert(value_id, provenance.clone());
         }
-        self.forwarded_values.insert(var.display_name(), provenance);
+        self.forwarded_values.insert(name.to_string(), provenance);
+    }
+
+    pub(crate) fn insert_semantic_value_for_name(&mut self, name: &str, value: SemanticValue) {
+        if let Some(value_id) = self.value_id_for_name(name) {
+            self.semantic_values_by_value
+                .insert(value_id, value.clone());
+        }
+        self.semantic_values.insert(name.to_string(), value);
     }
 
     pub(crate) fn insert_call_result_source_alias(
@@ -532,6 +642,12 @@ impl UseInfo {
         self.vars_by_value_id.get(&value_id)
     }
 
+    pub(crate) fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.definitions_by_value.get(&value_id))
+            .or_else(|| self.definitions.get(&var.display_name()))
+    }
+
     pub(crate) fn display_name_for_value_id(&self, value_id: ValueId) -> Option<String> {
         self.var_for_value_id(value_id).map(SSAVar::display_name)
     }
@@ -539,31 +655,54 @@ impl UseInfo {
     pub(crate) fn use_count_for_name(&self, name: &str) -> usize {
         self.value_id_for_name(name)
             .and_then(|value_id| self.use_counts_by_value.get(&value_id).copied())
-            .or_else(|| self.use_counts.get(name).copied())
+            .or_else(|| lookup_name_key(&self.use_counts, name).copied())
             .unwrap_or(0)
     }
 
     pub(crate) fn definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
         self.definitions_by_value.get(&value_id).or_else(|| {
-            self.display_name_for_value_id(value_id)
-                .as_deref()
-                .and_then(|name| self.definitions.get(name))
+            self.var_for_value_id(value_id)
+                .and_then(|var| self.definitions.get(&var.display_name()))
         })
     }
 
+    pub(crate) fn render_definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
+        self.var_for_value_id(value_id)
+            .and_then(|var| lookup_name_key(&self.definitions, &var.display_name()))
+            .or_else(|| self.definition_for_value(value_id))
+    }
+
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        self.definitions.get(name).or_else(|| {
-            self.value_id_for_name(name)
-                .and_then(|value_id| self.definitions_by_value.get(&value_id))
+        self.value_id_for_name(name)
+            .and_then(|value_id| self.definitions_by_value.get(&value_id))
+            .or_else(|| self.definitions.get(name))
+    }
+
+    pub(crate) fn render_definition_for_name(&self, name: &str) -> Option<&CExpr> {
+        lookup_name_key(&self.definitions, name).or_else(|| self.definition_for_name(name))
+    }
+
+    pub(crate) fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
+        self.semantic_values.get(&var.display_name()).or_else(|| {
+            self.value_id_for_var(var)
+                .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
         })
     }
 
     pub(crate) fn semantic_value_for_value(&self, value_id: ValueId) -> Option<&SemanticValue> {
         self.semantic_values_by_value.get(&value_id).or_else(|| {
-            self.display_name_for_value_id(value_id)
-                .as_deref()
-                .and_then(|name| self.semantic_values.get(name))
+            self.var_for_value_id(value_id)
+                .and_then(|var| self.semantic_values.get(&var.display_name()))
         })
+    }
+
+    pub(crate) fn render_semantic_value_for_value(
+        &self,
+        value_id: ValueId,
+    ) -> Option<&SemanticValue> {
+        self.var_for_value_id(value_id)
+            .and_then(|var| lookup_name_key(&self.semantic_values, &var.display_name()))
+            .or_else(|| self.semantic_value_for_value(value_id))
     }
 
     pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
@@ -573,12 +712,31 @@ impl UseInfo {
         })
     }
 
+    pub(crate) fn render_semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
+        lookup_name_key(&self.semantic_values, name).or_else(|| self.semantic_value_for_name(name))
+    }
+
+    pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
+        self.forwarded_values.get(&var.display_name()).or_else(|| {
+            self.value_id_for_var(var)
+                .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
+        })
+    }
+
     pub(crate) fn forwarded_value_for_value(&self, value_id: ValueId) -> Option<&ValueProvenance> {
         self.forwarded_values_by_value.get(&value_id).or_else(|| {
-            self.display_name_for_value_id(value_id)
-                .as_deref()
-                .and_then(|name| self.forwarded_values.get(name))
+            self.var_for_value_id(value_id)
+                .and_then(|var| self.forwarded_values.get(&var.display_name()))
         })
+    }
+
+    pub(crate) fn render_forwarded_value_for_value(
+        &self,
+        value_id: ValueId,
+    ) -> Option<&ValueProvenance> {
+        self.var_for_value_id(value_id)
+            .and_then(|var| lookup_name_key(&self.forwarded_values, &var.display_name()))
+            .or_else(|| self.forwarded_value_for_value(value_id))
     }
 
     pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
@@ -588,19 +746,66 @@ impl UseInfo {
         })
     }
 
-    pub(crate) fn stack_slot_for_var(&self, var: &SSAVar) -> Option<StackSlotProvenance> {
-        self.stack_slots
-            .get(&var.display_name())
-            .copied()
-            .or_else(|| {
-                self.value_id_for_var(var)
-                    .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
+    pub(crate) fn render_forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
+        lookup_name_key(&self.forwarded_values, name)
+            .or_else(|| self.forwarded_value_for_name(name))
+    }
+
+    pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {
+        lookup_name_key(&self.copy_sources, name).cloned()
+    }
+
+    pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
+        lookup_name_key(&self.definitions, name).is_some()
+            || lookup_name_key(&self.semantic_values, name).is_some()
+            || lookup_name_key(&self.copy_sources, name).is_some()
+            || lookup_name_key(&self.var_aliases, name).is_some()
+            || self.value_id_for_name(name).is_some_and(|value_id| {
+                self.definitions_by_value.contains_key(&value_id)
+                    || self.semantic_values_by_value.contains_key(&value_id)
+                    || self.copy_sources_by_value.contains_key(&value_id)
             })
     }
 
-    pub(crate) fn ptr_arith_for_name(&self, name: &str) -> Option<&PtrArith> {
-        self.ptr_arith.get(name).or_else(|| {
-            self.value_id_for_name(name)
+    pub(crate) fn known_named_values(&self) -> Vec<String> {
+        let mut names = BTreeSet::new();
+        names.extend(self.definitions.keys().cloned());
+        names.extend(self.semantic_values.keys().cloned());
+        names.extend(self.copy_sources.keys().cloned());
+        names.extend(self.var_aliases.keys().cloned());
+        names.into_iter().collect()
+    }
+
+    pub(crate) fn stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
+        lookup_name_key(&self.stack_slots, name).copied()
+    }
+
+    pub(crate) fn stack_slots(&self) -> impl Iterator<Item = StackSlotProvenance> + '_ {
+        self.stack_slots.values().copied()
+    }
+
+    pub(crate) fn has_stack_slots(&self) -> bool {
+        !self.stack_slots.is_empty() || !self.stack_slots_by_value.is_empty()
+    }
+
+    pub(crate) fn has_definitions(&self) -> bool {
+        !self.definitions.is_empty() || !self.definitions_by_value.is_empty()
+    }
+
+    pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
+        self.stack_slot_for_name(name)
+    }
+
+    pub(crate) fn stack_slot_for_var(&self, var: &SSAVar) -> Option<StackSlotProvenance> {
+        self.stack_slot_for_name(&var.display_name()).or_else(|| {
+            self.value_id_for_var(var)
+                .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
+        })
+    }
+
+    pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
+        self.ptr_arith.get(&var.display_name()).or_else(|| {
+            self.value_id_for_var(var)
                 .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
         })
     }
@@ -612,8 +817,7 @@ impl UseInfo {
     }
 
     pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
-        self.call_result_source_by_alias
-            .get(name)
+        lookup_name_key(&self.call_result_source_by_alias, name)
             .copied()
             .or_else(|| {
                 self.value_id_for_name(name)

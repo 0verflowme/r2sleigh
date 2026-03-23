@@ -253,8 +253,7 @@ impl<'a> FoldingContext<'a> {
         if entry_arg_alias.is_none() {
             return false;
         }
-        self.stack_slots_map()
-            .get(&addr.display_name())
+        self.stack_slot_provenance_for_var(addr)
             .map(|slot| slot.offset)
             .or_else(|| self.extract_stack_offset_from_var(addr))
             .is_some()
@@ -511,15 +510,13 @@ impl<'a> FoldingContext<'a> {
             })
             .or_else(|| external_name.clone())
             .or_else(|| {
-                self.stack_slots_map()
-                    .values()
+                self.stack_slots()
                     .any(|slot| slot.offset == offset)
                     .then(|| Self::stack_synthetic_name(offset))
             })
             .or_else(|| {
-                (offset < 0
-                    && (!self.stack_slots_map().is_empty() || !self.definitions_map().is_empty()))
-                .then(|| Self::stack_synthetic_name(offset))
+                (offset < 0 && (self.has_stack_slots() || self.has_definitions()))
+                    .then(|| Self::stack_synthetic_name(offset))
             });
         resolved.map(|name| {
             if self.is_reserved_param_alias_name(&name) {
@@ -643,7 +640,7 @@ impl<'a> FoldingContext<'a> {
                     // Indirect: val is a temp, trace it back via copy_sources
                     if val.name.starts_with("tmp:") {
                         let val_key = val.display_name();
-                        if let Some(src_key) = self.copy_sources_map().get(&val_key) {
+                        if let Some(src_key) = self.render_copy_source_for_name(&val_key) {
                             let src_lower = src_key.to_lowercase();
                             if self.inputs.arch.is_callee_saved_name(&src_lower)
                                 || self.inputs.arch.is_frame_pointer_name(&src_lower)

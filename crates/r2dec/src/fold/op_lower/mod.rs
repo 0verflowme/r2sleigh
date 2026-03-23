@@ -320,9 +320,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn definitions_map(&self) -> &HashMap<String, CExpr> {
         &self.use_info().definitions
     }
-    pub(crate) fn semantic_values_map(&self) -> &HashMap<String, analysis::SemanticValue> {
-        &self.use_info().semantic_values
-    }
     pub(crate) fn frame_slot_merges_map(
         &self,
     ) -> &HashMap<String, analysis::FrameSlotMergeSummary> {
@@ -340,17 +337,14 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn ptr_members_map(&self) -> &HashMap<String, (SSAVar, i64)> {
         &self.use_info().ptr_members
     }
-    pub(crate) fn stack_slots_map(&self) -> &HashMap<String, analysis::StackSlotProvenance> {
-        &self.use_info().stack_slots
-    }
-    pub(crate) fn forwarded_values_map(&self) -> &HashMap<String, analysis::ValueProvenance> {
-        &self.use_info().forwarded_values
-    }
     pub(crate) fn definition_for_value_id(&self, value_id: r2ssa::ValueId) -> Option<&CExpr> {
         self.use_info().definition_for_value(value_id)
     }
+    pub(crate) fn value_id_for_name(&self, name: &str) -> Option<r2ssa::ValueId> {
+        self.use_info().value_id_for_name(name)
+    }
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        self.use_info().definition_for_name(name)
+        self.use_info().render_definition_for_name(name)
     }
     pub(crate) fn semantic_value_for_value_id(
         &self,
@@ -359,7 +353,7 @@ impl<'a> FoldingContext<'a> {
         self.use_info().semantic_value_for_value(value_id)
     }
     pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&analysis::SemanticValue> {
-        self.use_info().semantic_value_for_name(name)
+        self.use_info().render_semantic_value_for_name(name)
     }
     pub(crate) fn forwarded_value_for_value_id(
         &self,
@@ -371,7 +365,26 @@ impl<'a> FoldingContext<'a> {
         &self,
         name: &str,
     ) -> Option<&analysis::ValueProvenance> {
-        self.use_info().forwarded_value_for_name(name)
+        self.use_info().render_forwarded_value_for_name(name)
+    }
+
+    pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {
+        self.use_info().render_copy_source_for_name(name)
+    }
+    pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
+        self.use_info().has_renderable_named_fact(name)
+    }
+    pub(crate) fn known_named_values(&self) -> Vec<String> {
+        self.use_info().known_named_values()
+    }
+    pub(crate) fn has_stack_slots(&self) -> bool {
+        self.use_info().has_stack_slots()
+    }
+    pub(crate) fn has_definitions(&self) -> bool {
+        self.use_info().has_definitions()
+    }
+    pub(crate) fn stack_slots(&self) -> impl Iterator<Item = analysis::StackSlotProvenance> + '_ {
+        self.use_info().stack_slots()
     }
     pub(crate) fn condition_vars_set(&self) -> &HashSet<String> {
         &self.use_info().condition_vars
@@ -1011,8 +1024,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn stack_slot_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
-        self.stack_slots_map()
-            .get(&var.display_name())
+        self.stack_slot_provenance_for_var(var)
             .map(|slot| slot.offset)
             .or_else(|| {
                 analysis::utils::extract_stack_offset_from_var(
@@ -1028,7 +1040,7 @@ impl<'a> FoldingContext<'a> {
         let mut current = name.to_string();
         let mut seen = HashSet::new();
         while seen.insert(current.clone()) {
-            let Some(next) = self.copy_sources_map().get(&current).cloned() else {
+            let Some(next) = self.render_copy_source_for_name(&current) else {
                 break;
             };
             current = next;
@@ -1631,8 +1643,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn is_simple_inline_candidate(&self, var_name: &str) -> bool {
-        self.definitions_map()
-            .get(var_name)
+        self.definition_for_name(var_name)
             .map(|expr| self.is_simple_expr(expr, 0))
             .unwrap_or(false)
     }
@@ -1652,8 +1663,7 @@ impl<'a> FoldingContext<'a> {
                 if is_cpu_flag(&name.to_lowercase()) {
                     return true;
                 }
-                self.definitions_map()
-                    .get(name)
+                self.definition_for_name(name)
                     .map(|inner| self.is_simple_expr(inner, depth + 1))
                     .unwrap_or(true)
             }
@@ -1784,8 +1794,7 @@ impl<'a> FoldingContext<'a> {
             return load_expr;
         }
         if let Some(offset) = self
-            .forwarded_values_map()
-            .get(&key)
+            .forwarded_value_for_name(&key)
             .and_then(|prov| prov.stack_slot)
             && let Some(alias) = self.stack_arg_aliases_map().get(&offset)
             && !alias.trim().is_empty()
@@ -2111,20 +2120,13 @@ impl<'a> FoldingContext<'a> {
 
     fn lookup_semantic_value(&self, name: &str) -> Option<&analysis::SemanticValue> {
         self.semantic_value_for_name(name)
-            .or_else(|| self.semantic_values_map().get(&name.to_ascii_lowercase()))
-            .or_else(|| {
-                name.rsplit_once('_').and_then(|(base, version)| {
-                    self.semantic_values_map()
-                        .get(&format!("{}_{}", base.to_lowercase(), version))
-                        .or_else(|| {
-                            self.semantic_values_map().get(&format!(
-                                "{}_{}",
-                                base.to_uppercase(),
-                                version
-                            ))
-                        })
-                })
-            })
+    }
+
+    fn resolution_name_key(&self, prefix: &str, name: &str) -> String {
+        self.use_info()
+            .value_id_for_name(name)
+            .map(|value_id| format!("{prefix}:value:{}", value_id.0))
+            .unwrap_or_else(|| format!("{prefix}:name:{name}"))
     }
 
     fn phi_sources_for_name(&self, name: &str) -> Option<&Vec<SSAVar>> {
@@ -2156,7 +2158,7 @@ impl<'a> FoldingContext<'a> {
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return None;
         }
-        let visit_key = format!("phi-expr:{name}");
+        let visit_key = self.resolution_name_key("phi-expr", name);
         if !visited.insert(visit_key.clone()) {
             return None;
         }
@@ -2210,14 +2212,15 @@ impl<'a> FoldingContext<'a> {
         if !self.enter_resolution_guard(ResolutionPhase::Semantic, name) {
             return self.resolution_cycle_fallback(name);
         }
-        let visit_key = format!("sem:{name}");
+        let visit_key = self.resolution_name_key("sem", name);
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH || !visited.insert(visit_key.clone()) {
             self.leave_resolution_guard(ResolutionPhase::Semantic, name);
             return None;
         }
+        let in_progress_key = self.resolution_name_key("sem-progress", name);
         {
             let mut in_progress = self.semantic_render_in_progress.borrow_mut();
-            if !in_progress.insert(name.to_string()) {
+            if !in_progress.insert(in_progress_key.clone()) {
                 visited.remove(&visit_key);
                 self.leave_resolution_guard(ResolutionPhase::Semantic, name);
                 return None;
@@ -2236,7 +2239,9 @@ impl<'a> FoldingContext<'a> {
                     })
             })
             .or_else(|| self.resolve_expr_from_phi_sources(name, depth + 1, visited, false));
-        self.semantic_render_in_progress.borrow_mut().remove(name);
+        self.semantic_render_in_progress
+            .borrow_mut()
+            .remove(&in_progress_key);
         self.leave_resolution_guard(ResolutionPhase::Semantic, name);
         visited.remove(&visit_key);
         rendered
@@ -2617,24 +2622,8 @@ impl<'a> FoldingContext<'a> {
             return cached;
         }
 
-        let direct = || self.forwarded_value_for_name(name);
-        let lower = || self.forwarded_values_map().get(&name.to_ascii_lowercase());
-        let normalized = || {
-            name.rsplit_once('_').and_then(|(base, version)| {
-                self.forwarded_values_map()
-                    .get(&format!("{}_{}", base.to_ascii_lowercase(), version))
-                    .or_else(|| {
-                        self.forwarded_values_map().get(&format!(
-                            "{}_{}",
-                            base.to_ascii_uppercase(),
-                            version
-                        ))
-                    })
-            })
-        };
-        let resolved = direct()
-            .or_else(lower)
-            .or_else(normalized)
+        let resolved = self
+            .forwarded_value_for_name(name)
             .and_then(|prov| prov.source_var.clone())
             .filter(|src| src.display_name() != name);
         self.forwarded_source_cache
@@ -4166,7 +4155,7 @@ impl<'a> FoldingContext<'a> {
             {
                 return Some(var);
             }
-            if let Some(prov) = self.forwarded_values_map().get(&ssa_name)
+            if let Some(prov) = self.forwarded_value_for_name(&ssa_name)
                 && let Some(var) = &prov.source_var
             {
                 return Some(var.clone());
@@ -4176,7 +4165,7 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        if let Some(prov) = self.forwarded_values_map().get(name)
+        if let Some(prov) = self.forwarded_value_for_name(name)
             && let Some(var) = &prov.source_var
         {
             return Some(var.clone());
@@ -4554,17 +4543,11 @@ impl<'a> FoldingContext<'a> {
         &self,
         name: &str,
     ) -> Option<analysis::StackSlotProvenance> {
-        self.stack_slots_map()
-            .get(name)
-            .copied()
-            .or_else(|| {
-                self.stack_slots_map()
-                    .get(&name.to_ascii_lowercase())
-                    .copied()
-            })
+        self.use_info()
+            .render_stack_slot_for_name(name)
             .or_else(|| {
                 self.find_ssa_name_for_rendered_alias(name)
-                    .and_then(|ssa_name| self.stack_slots_map().get(&ssa_name).copied())
+                    .and_then(|ssa_name| self.use_info().render_stack_slot_for_name(&ssa_name))
             })
     }
 
@@ -4572,9 +4555,8 @@ impl<'a> FoldingContext<'a> {
         &self,
         var: &SSAVar,
     ) -> Option<analysis::StackSlotProvenance> {
-        self.stack_slots_map()
-            .get(&var.display_name())
-            .copied()
+        self.use_info()
+            .render_stack_slot_for_name(&var.display_name())
             .or_else(|| self.stack_slot_provenance_for_name(&var.display_name()))
     }
 
@@ -4599,8 +4581,7 @@ impl<'a> FoldingContext<'a> {
         };
 
         if let Some(offset) = self
-            .forwarded_values_map()
-            .get(name)
+            .forwarded_value_for_name(name)
             .and_then(|prov| prov.stack_slot)
             .or_else(|| {
                 self.stack_slot_provenance_for_name(name)
@@ -4618,8 +4599,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         if let Some(offset) = self
-            .forwarded_values_map()
-            .get(&root_name)
+            .forwarded_value_for_name(&root_name)
             .and_then(|prov| prov.stack_slot)
             .or_else(|| {
                 self.stack_slot_provenance_for_name(&root_name)
@@ -4714,8 +4694,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         if let Some(slot_name) = self
-            .forwarded_values_map()
-            .get(alias)
+            .forwarded_value_for_name(alias)
             .and_then(|prov| prov.stack_slot)
             .and_then(|offset| self.resolve_stack_var(offset))
         {
@@ -5222,13 +5201,11 @@ impl<'a> FoldingContext<'a> {
                 .semantic_stack_owner_name_for_alias(&resolved_name)
                 .is_some()
             || self
-                .forwarded_values_map()
-                .get(name)
+                .forwarded_value_for_name(name)
                 .and_then(|prov| prov.stack_slot)
                 .is_some()
             || self
-                .forwarded_values_map()
-                .get(&resolved_name)
+                .forwarded_value_for_name(&resolved_name)
                 .and_then(|prov| prov.stack_slot)
                 .is_some();
         if !is_direct_alias && !has_stack_owner_provenance {
@@ -6193,9 +6170,8 @@ impl<'a> FoldingContext<'a> {
 
     fn should_emit_return_slot_assignment(&self, offset: i64, value: &CExpr) -> bool {
         let is_scalar_return_slot = self
-            .stack_slots_map()
-            .values()
-            .copied()
+            .use_info()
+            .stack_slots()
             .any(|slot| slot.offset == offset && slot.is_scalar_return_carrier());
         let is_return_slot =
             is_scalar_return_slot || self.state.return_stack_slots.contains(&offset);
@@ -6242,26 +6218,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn direct_definition_expr(&self, name: &str) -> Option<CExpr> {
-        let mut best = self
-            .definition_for_name(name)
-            .cloned()
-            .map(Some)
-            .unwrap_or(None);
-        let lower = name.to_lowercase();
-        if let Some(expr) = self.definitions_map().get(&lower) {
-            best = self.choose_preferred_visible_expr(best, Some(expr.clone()));
-        }
-        if let Some((base, version)) = name.rsplit_once('_') {
-            let lower = format!("{}_{}", base.to_lowercase(), version);
-            if let Some(expr) = self.definitions_map().get(&lower) {
-                best = self.choose_preferred_visible_expr(best, Some(expr.clone()));
-            }
-            let upper = format!("{}_{}", base.to_uppercase(), version);
-            if let Some(expr) = self.definitions_map().get(&upper) {
-                best = self.choose_preferred_visible_expr(best, Some(expr.clone()));
-            }
-        }
-        best
+        self.use_info().render_definition_for_name(name).cloned()
     }
 
     fn lookup_definition_with_depth(
@@ -6270,13 +6227,14 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        let visit_key = format!("def:{name}");
+        let visit_key = self.resolution_name_key("def", name);
         if depth > MAX_SIMPLE_EXPR_DEPTH || !visited.insert(visit_key.clone()) {
             return None;
         }
+        let in_progress_key = self.resolution_name_key("def-progress", name);
         {
             let mut in_progress = self.definition_lookup_in_progress.borrow_mut();
-            if !in_progress.insert(name.to_string()) {
+            if !in_progress.insert(in_progress_key.clone()) {
                 visited.remove(&visit_key);
                 return self.direct_definition_expr(name);
             }
@@ -6318,7 +6276,7 @@ impl<'a> FoldingContext<'a> {
             (current, candidate) => self.choose_preferred_visible_expr(current, candidate),
         };
 
-        if let Some(prov) = self.forwarded_values_map().get(name) {
+        if let Some(prov) = self.forwarded_value_for_name(name) {
             let resolved = self
                 .lookup_definition_with_depth(&prov.source, depth + 1, visited)
                 .or_else(|| Some(self.expr_for_ssa_fallback_name(&prov.source)));
@@ -6329,7 +6287,9 @@ impl<'a> FoldingContext<'a> {
             .find_ssa_name_for_rendered_alias(name)
             .and_then(|ssa_name| self.lookup_definition_with_depth(&ssa_name, depth + 1, visited));
         best = self.choose_preferred_visible_expr(best, rendered);
-        self.definition_lookup_in_progress.borrow_mut().remove(name);
+        self.definition_lookup_in_progress
+            .borrow_mut()
+            .remove(&in_progress_key);
         visited.remove(&visit_key);
         best
     }
@@ -6349,13 +6309,14 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        let visit_key = format!("defraw:{name}");
+        let visit_key = self.resolution_name_key("defraw", name);
         if depth > MAX_ALIAS_REWRITE_DEPTH || !visited.insert(visit_key.clone()) {
             return None;
         }
+        let in_progress_key = self.resolution_name_key("defraw-progress", name);
         {
             let mut in_progress = self.definition_raw_in_progress.borrow_mut();
-            if !in_progress.insert(name.to_string()) {
+            if !in_progress.insert(in_progress_key.clone()) {
                 visited.remove(&visit_key);
                 return self.direct_definition_expr(name);
             }
@@ -6370,7 +6331,9 @@ impl<'a> FoldingContext<'a> {
                 self.lookup_definition_raw_with_depth(&ssa_name, depth + 1, visited),
             );
         }
-        self.definition_raw_in_progress.borrow_mut().remove(name);
+        self.definition_raw_in_progress
+            .borrow_mut()
+            .remove(&in_progress_key);
         visited.remove(&visit_key);
         best
     }
@@ -6398,10 +6361,8 @@ impl<'a> FoldingContext<'a> {
             });
             temp_matches.into_iter().next()
         } else if let Some(preferred) = self.preferred_entry_arg_ssa_name(name)
-            && (self.semantic_values_map().contains_key(&preferred)
-                || self.definitions_map().contains_key(&preferred)
-                || self.var_aliases_map().contains_key(&preferred)
-                || self.copy_sources_map().contains_key(&preferred))
+            && (self.has_renderable_named_fact(&preferred)
+                || self.var_aliases_map().contains_key(&preferred))
         {
             Some(preferred)
         } else {
@@ -6474,9 +6435,8 @@ impl<'a> FoldingContext<'a> {
         };
 
         let mut matches = self
-            .definitions_map()
-            .keys()
-            .chain(self.semantic_values_map().keys())
+            .known_named_values()
+            .into_iter()
             .filter(|ssa_name| {
                 let (base, ssa_version) = Self::ssa_name_parts(ssa_name);
                 let base_matches = if is_temp_alias {
@@ -6499,7 +6459,6 @@ impl<'a> FoldingContext<'a> {
                     name.starts_with('v')
                 }
             })
-            .cloned()
             .collect::<Vec<_>>();
         matches.sort();
         matches.dedup();

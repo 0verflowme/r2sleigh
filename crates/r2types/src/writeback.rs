@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::{
     FunctionSemanticSummary, InterprocSummarySet, SSABlock, SSAOp, SSAVar, SummaryArgEffect,
-    SummaryReturnRelation,
+    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryReturnRelation,
 };
 
 use crate::context::{
@@ -15,9 +15,10 @@ use crate::external::{
     ExternalField, ExternalStruct, ExternalTypeDb, normalize_external_type_name,
 };
 use crate::facts::{
-    CalleeArgEffect, CalleeFact, CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec,
-    FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics, VisibleBinding,
-    VisibleBindingKind, parse_type_like_spec,
+    CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
+    CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFactInputs,
+    FunctionTypeFacts, InterprocFactDiagnostics, VisibleBinding, VisibleBindingKind,
+    parse_type_like_spec,
 };
 use crate::model::Signedness;
 
@@ -252,6 +253,31 @@ fn summary_return_relation_to_callee(relation: &SummaryReturnRelation) -> Callee
     }
 }
 
+fn summary_memory_effect_to_callee(effect: &SummaryMemoryEffect) -> CalleeMemoryEffect {
+    let kind = match effect.kind {
+        SummaryMemoryEffectKind::Read => CalleeMemoryEffectKind::Read,
+        SummaryMemoryEffectKind::Write => CalleeMemoryEffectKind::Write,
+        SummaryMemoryEffectKind::Escape => CalleeMemoryEffectKind::Escape,
+        SummaryMemoryEffectKind::Free => CalleeMemoryEffectKind::Free,
+    };
+    let location = match effect.location {
+        SummaryMemoryLocation::Arg {
+            index,
+            offset,
+            width,
+        } => CalleeMemoryLocation::Arg {
+            index,
+            offset,
+            width,
+        },
+        SummaryMemoryLocation::Global { address, width } => {
+            CalleeMemoryLocation::Global { address, width }
+        }
+        SummaryMemoryLocation::Unknown => CalleeMemoryLocation::Unknown,
+    };
+    CalleeMemoryEffect { kind, location }
+}
+
 fn summary_to_callee_fact(summary: &FunctionSemanticSummary) -> CalleeFact {
     CalleeFact {
         function_id: summary.id.0,
@@ -263,6 +289,11 @@ fn summary_to_callee_fact(summary: &FunctionSemanticSummary) -> CalleeFact {
             .arg_effects
             .iter()
             .map(|(idx, effect)| (*idx, summary_arg_effect_to_callee(effect)))
+            .collect(),
+        memory_effects: summary
+            .memory_effects
+            .iter()
+            .map(summary_memory_effect_to_callee)
             .collect(),
         return_relation: summary_return_relation_to_callee(&summary.return_relation),
         reads_global_memory: summary.reads_global_memory,
@@ -294,6 +325,80 @@ fn infer_interproc_return_type(
     }
 }
 
+fn summary_suggests_pointer_param(summary: &FunctionSemanticSummary, idx: usize) -> bool {
+    summary
+        .arg_effects
+        .get(&idx)
+        .is_some_and(|effect| effect.read || effect.write || effect.escape || effect.free)
+        || summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect.location,
+                SummaryMemoryLocation::Arg { index, .. } if index == idx
+            )
+        })
+}
+
+fn maybe_upgrade_param_to_pointer(
+    summary: &FunctionSemanticSummary,
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    inferred_signature: &mut InferredSignature,
+    ptr_bits: u32,
+) {
+    let pointer_ty = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+
+    if merged_signature.is_none() {
+        *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
+    }
+
+    let Some(signature) = merged_signature.as_mut() else {
+        return;
+    };
+
+    for idx in 0..signature.params.len().max(inferred_signature.params.len()) {
+        if !summary_suggests_pointer_param(summary, idx) {
+            continue;
+        }
+
+        let merged_param = signature.params.get_mut(idx);
+        let inferred_param = inferred_signature.params.get_mut(idx);
+
+        let merged_is_generic = merged_param.as_ref().is_some_and(|param| {
+            param.ty.as_ref().is_none_or(|ty| {
+                is_generic_signature_type(Some(ty))
+                    || matches!(
+                        ty,
+                        CTypeLike::Int {
+                            bits,
+                            signedness: Signedness::Signed
+                                | Signedness::Unsigned
+                                | Signedness::Unknown,
+                        } if *bits == ptr_bits
+                    )
+            })
+        });
+
+        let inferred_is_generic = inferred_param.as_ref().is_some_and(|param| {
+            is_generic_type_string(&param.param_type)
+                || matches!(
+                    parse_type_like_spec(&param.param_type, ptr_bits),
+                    Some(CTypeLike::Int {
+                        bits,
+                        signedness: Signedness::Signed
+                            | Signedness::Unsigned
+                            | Signedness::Unknown,
+                    }) if bits == ptr_bits
+                )
+        });
+
+        if merged_is_generic && let Some(param) = merged_param {
+            param.ty = Some(pointer_ty.clone());
+        }
+        if inferred_is_generic && let Some(param) = inferred_param {
+            param.param_type = render_signature_type(&pointer_ty, ptr_bits);
+        }
+    }
+}
+
 fn apply_interproc_summary_to_signature(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
@@ -309,6 +414,7 @@ fn apply_interproc_summary_to_signature(
     let Some(summary) = summary_set.summaries.get(&root) else {
         return;
     };
+    maybe_upgrade_param_to_pointer(summary, merged_signature, inferred_signature, ptr_bits);
     let Some(ret_ty) = infer_interproc_return_type(
         summary,
         merged_signature.as_ref(),
@@ -2583,6 +2689,7 @@ mod tests {
                     callsite_count: 1,
                     has_unknown_calls: false,
                     arg_effects: BTreeMap::new(),
+                    memory_effects: Vec::new(),
                     return_relation: SummaryReturnRelation::HeapAlloc,
                     reads_global_memory: false,
                     writes_global_memory: false,
@@ -2640,6 +2747,7 @@ mod tests {
                         callsite_count: 1,
                         has_unknown_calls: false,
                         arg_effects: BTreeMap::new(),
+                        memory_effects: Vec::new(),
                         return_relation: SummaryReturnRelation::Arg(0),
                         reads_global_memory: false,
                         writes_global_memory: false,
@@ -2664,6 +2772,7 @@ mod tests {
                                 free: false,
                             },
                         )]),
+                        memory_effects: Vec::new(),
                         return_relation: SummaryReturnRelation::Arg(0),
                         reads_global_memory: false,
                         writes_global_memory: false,
@@ -3966,6 +4075,7 @@ mod tests {
                 callsite_count: 1,
                 has_unknown_calls: false,
                 arg_effects: BTreeMap::new(),
+                memory_effects: Vec::new(),
                 return_relation: r2ssa::SummaryReturnRelation::HeapAlloc,
                 reads_global_memory: false,
                 writes_global_memory: false,
@@ -4030,6 +4140,7 @@ mod tests {
                 callsite_count: 1,
                 has_unknown_calls: false,
                 arg_effects: BTreeMap::new(),
+                memory_effects: Vec::new(),
                 return_relation: r2ssa::SummaryReturnRelation::Unknown,
                 reads_global_memory: false,
                 writes_global_memory: false,
@@ -4065,6 +4176,24 @@ mod tests {
                         },
                     ),
                 ]),
+                memory_effects: vec![
+                    r2ssa::SummaryMemoryEffect {
+                        kind: r2ssa::SummaryMemoryEffectKind::Write,
+                        location: r2ssa::SummaryMemoryLocation::Arg {
+                            index: 0,
+                            offset: None,
+                            width: None,
+                        },
+                    },
+                    r2ssa::SummaryMemoryEffect {
+                        kind: r2ssa::SummaryMemoryEffectKind::Read,
+                        location: r2ssa::SummaryMemoryLocation::Arg {
+                            index: 1,
+                            offset: None,
+                            width: None,
+                        },
+                    },
+                ],
                 return_relation: r2ssa::SummaryReturnRelation::Arg(0),
                 reads_global_memory: false,
                 writes_global_memory: false,
@@ -4119,6 +4248,100 @@ mod tests {
                 .arg_effects
                 .get(&1)
                 .is_some_and(|effect| effect.read && !effect.write)
+        );
+        assert!(helper_fact.memory_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::facts::CalleeMemoryEffect {
+                    kind: crate::facts::CalleeMemoryEffectKind::Write,
+                    location: crate::facts::CalleeMemoryLocation::Arg { index: 0, .. },
+                }
+            )
+        }));
+        assert!(helper_fact.memory_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::facts::CalleeMemoryEffect {
+                    kind: crate::facts::CalleeMemoryEffectKind::Read,
+                    location: crate::facts::CalleeMemoryLocation::Arg { index: 1, .. },
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn interproc_memory_effect_summary_upgrades_generic_pointer_like_params() {
+        let root = r2ssa::InterprocFunctionId(0x401300);
+        let summary_set = InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(
+                root,
+                FunctionSemanticSummary {
+                    id: root,
+                    name: Some("sym.ptr_user".to_string()),
+                    arg_count_hint: Some(1),
+                    direct_callees: BTreeSet::new(),
+                    callsite_count: 0,
+                    has_unknown_calls: false,
+                    arg_effects: BTreeMap::from([(
+                        0,
+                        SummaryArgEffect {
+                            read: true,
+                            write: true,
+                            escape: false,
+                            free: false,
+                        },
+                    )]),
+                    memory_effects: vec![r2ssa::SummaryMemoryEffect {
+                        kind: r2ssa::SummaryMemoryEffectKind::Write,
+                        location: r2ssa::SummaryMemoryLocation::Arg {
+                            index: 0,
+                            offset: None,
+                            width: Some(8),
+                        },
+                    }],
+                    return_relation: SummaryReturnRelation::Void,
+                    reads_global_memory: false,
+                    writes_global_memory: false,
+                    touches_unknown_memory: false,
+                },
+            )]),
+            diagnostics: Default::default(),
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.ptr_user",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.ptr_user".to_string(),
+                signature: "void sym.ptr_user (int64_t p)".to_string(),
+                ret_type: "void".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "p".to_string(),
+                    param_type: "int64_t".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 70,
+                callconv_confidence: 70,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(summary_set),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params[0].param_type, "void*");
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|sig| sig.params.first())
+                .and_then(|param| param.ty.as_ref()),
+            Some(&CTypeLike::Pointer(Box::new(CTypeLike::Void)))
         );
     }
 }

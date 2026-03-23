@@ -27,15 +27,9 @@ impl<'a> FoldingContext<'a> {
         let result = if semantic.is_some() || self.has_authoritative_memory_semantics(name) {
             semantic
         } else {
-            self.lookup_definition(name)
-                .and_then(|expr| {
-                    self.render_memory_access_from_visible_expr(&expr, elem_size, depth, visited)
-                })
-                .or_else(|| {
-                    self.definitions_map().get(name).and_then(|expr| {
-                        self.render_memory_access_from_visible_expr(expr, elem_size, depth, visited)
-                    })
-                })
+            self.lookup_definition(name).and_then(|expr| {
+                self.render_memory_access_from_visible_expr(&expr, elem_size, depth, visited)
+            })
         };
 
         self.leave_resolution_guard(ResolutionPhase::Memory, name);
@@ -51,7 +45,7 @@ impl<'a> FoldingContext<'a> {
         let pointee_load = dst.size < addr.size;
         let fallback_addr_expr = self
             .lookup_definition(&addr.display_name())
-            .or_else(|| self.definitions_map().get(&addr.display_name()).cloned())
+            .or_else(|| self.definition_for_name(&addr.display_name()).cloned())
             .unwrap_or_else(|| self.get_expr(addr));
         let mut semantic_visited = HashSet::new();
         let mut best = self.render_authoritative_memory_access_by_name(
@@ -140,7 +134,7 @@ impl<'a> FoldingContext<'a> {
     ) -> CExpr {
         let fallback_addr_expr = self
             .lookup_definition(&addr.display_name())
-            .or_else(|| self.definitions_map().get(&addr.display_name()).cloned())
+            .or_else(|| self.definition_for_name(&addr.display_name()).cloned())
             .unwrap_or_else(|| self.get_expr(addr));
         let mut semantic_visited = HashSet::new();
         let mut best = self.render_authoritative_memory_access_by_name(

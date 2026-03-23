@@ -26,10 +26,11 @@ pub use external::{
     normalize_external_type_name,
 };
 pub use facts::{
-    CalleeArgEffect, CalleeFact, CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec,
-    FunctionType, FunctionTypeFactInputs, FunctionTypeFacts, FunctionTypeFactsBuilder,
-    InterprocFactDiagnostics, LocalFieldAccessFact, ResolvedFieldLayout, VisibleBinding,
-    VisibleBindingKind, parse_type_like_spec,
+    CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
+    CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec, FunctionType,
+    FunctionTypeFactInputs, FunctionTypeFacts, FunctionTypeFactsBuilder, InterprocFactDiagnostics,
+    LocalFieldAccessFact, ResolvedFieldLayout, VisibleBinding, VisibleBindingKind,
+    parse_type_like_spec,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

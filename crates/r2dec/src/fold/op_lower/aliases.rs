@@ -44,8 +44,8 @@ impl<'a> FoldingContext<'a> {
             return true;
         }
 
-        if let Some(copy_root) = self.copy_sources_map().get(name)
-            && self.semantic_var_requires_structured_candidate_inner(copy_root, visited)
+        if let Some(copy_root) = self.render_copy_source_for_name(name)
+            && self.semantic_var_requires_structured_candidate_inner(&copy_root, visited)
         {
             return true;
         }

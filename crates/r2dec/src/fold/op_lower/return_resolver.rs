@@ -108,9 +108,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn return_context_for_slot_offset(&self, slot_offset: i64) -> VisibleExprContext {
-        self.stack_slots_map()
-            .values()
-            .copied()
+        self.stack_slots()
             .find(|slot| slot.offset == slot_offset && slot.is_scalar_return_carrier())
             .map(|_| VisibleExprContext::ScalarReturn)
             .unwrap_or(VisibleExprContext::Generic)
@@ -289,8 +287,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         let merged = self
-            .stack_slots_map()
-            .get(name)
+            .stack_slot_provenance_for_name(name)
             .filter(|slot| self.state.return_stack_slots.contains(&slot.offset))
             .and_then(|slot| {
                 self.current_block_addr.get().and_then(|block_addr| {

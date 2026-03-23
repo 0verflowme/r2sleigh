@@ -3272,7 +3272,7 @@ mod tests {
             rendered_args,
             vec![
                 CExpr::Var("dup".to_string()),
-                CExpr::Var("s".to_string()),
+                CExpr::Var("local_10".to_string()),
                 CExpr::binary(
                     BinaryOp::Add,
                     CExpr::Var("len".to_string()),
@@ -3300,7 +3300,7 @@ mod tests {
                             && args
                                 == &vec![
                                     CExpr::Var("dup".to_string()),
-                                    CExpr::Var("s".to_string()),
+                                    CExpr::Var("local_10".to_string()),
                                     CExpr::binary(
                                         BinaryOp::Add,
                                         CExpr::Var("len".to_string()),
@@ -15815,6 +15815,7 @@ mod tests {
                         free: false,
                     },
                 )]),
+                memory_effects: Vec::new(),
                 return_relation: CalleeReturnRelation::HeapAlloc,
                 reads_global_memory: false,
                 writes_global_memory: false,

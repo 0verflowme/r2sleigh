@@ -156,11 +156,14 @@ fn rebuild_id_mirrors_from_name_maps(info: &mut UseInfo) {
         }
     }
 
-    // Local analysis still derives definitions and semantic expressions primarily from
-    // name-keyed collection paths. Do not promote those into canonical id-backed facts
-    // until the collectors themselves are fully id-native, or fold can recurse through
-    // low-quality cyclic mirrors. Prepared/runtime paths already seed these fields
-    // authoritatively.
+    info.semantic_values_by_value.clear();
+    for (value_id, var) in &info.vars_by_value_id {
+        let display = var.display_name();
+        if let Some(value) = info.semantic_values.get(&display) {
+            info.semantic_values_by_value
+                .insert(*value_id, value.clone());
+        }
+    }
 
     info.copy_sources_by_value.clear();
     for (dst, src) in &info.copy_sources {
@@ -2630,10 +2633,7 @@ fn collect_semantic_values_with_cache(
                 && let Some(key) = frame_object_field_key(&scratch.info, &shape, env, 0)
                 && let Some(value) = scratch.info.frame_object_field_roots.get(&key).cloned()
             {
-                scratch
-                    .info
-                    .semantic_values
-                    .insert(dst.display_name(), value);
+                replace_semantic_value(&mut scratch.info, dst.display_name(), value);
                 insert_semantic_value(
                     &mut scratch.info,
                     addr.display_name(),
@@ -2656,10 +2656,7 @@ fn collect_semantic_values_with_cache(
                 && let Some(value) = scratch.info.stable_stack_values.get(&offset).cloned()
                 && !should_preserve_rooted_indirect_load_shape(&value)
             {
-                scratch
-                    .info
-                    .semantic_values
-                    .insert(dst.display_name(), value);
+                replace_semantic_value(&mut scratch.info, dst.display_name(), value);
                 return;
             }
             if let Some(shape) = semantic_addr_for_var(&scratch.info, addr, env)
@@ -2667,10 +2664,7 @@ fn collect_semantic_values_with_cache(
                 && let Some(value) = scratch.info.stable_stack_values.get(&offset).cloned()
                 && !should_preserve_rooted_indirect_load_shape(&value)
             {
-                scratch
-                    .info
-                    .semantic_values
-                    .insert(dst.display_name(), value);
+                replace_semantic_value(&mut scratch.info, dst.display_name(), value);
                 insert_semantic_value(
                     &mut scratch.info,
                     addr.display_name(),
@@ -2697,10 +2691,7 @@ fn collect_semantic_values_with_cache(
                         },
                     );
                 } else {
-                    scratch
-                        .info
-                        .semantic_values
-                        .insert(dst.display_name(), value);
+                    replace_semantic_value(&mut scratch.info, dst.display_name(), value);
                 }
                 insert_semantic_value(
                     &mut scratch.info,
@@ -3753,9 +3744,13 @@ fn insert_semantic_value(info: &mut UseInfo, key: String, candidate: SemanticVal
                         .insert(value_id, candidate.clone());
                 }
             }
-            info.semantic_values.insert(key, candidate);
+            info.insert_semantic_value_for_name(&key, candidate);
         }
     }
+}
+
+fn replace_semantic_value(info: &mut UseInfo, key: String, candidate: SemanticValue) {
+    info.insert_semantic_value_for_name(&key, candidate);
 }
 
 fn resolve_stable_stack_load_semantic_value(
@@ -5351,14 +5346,12 @@ fn bind_call_result_alias_definitions(
 }
 
 fn call_result_source_for_alias(info: &UseInfo, alias: &str) -> Option<(u64, usize)> {
-    info.call_result_source_by_alias
-        .get(alias)
-        .copied()
-        .or_else(|| {
-            info.call_result_source_by_alias
-                .get(&alias.to_ascii_lowercase())
-                .copied()
-        })
+    info.call_result_source_for_name(alias).or_else(|| {
+        let lowered = alias.to_ascii_lowercase();
+        (lowered != alias)
+            .then(|| info.call_result_source_for_name(&lowered))
+            .flatten()
+    })
 }
 
 fn propagate_call_result_aliases(info: &mut UseInfo) {

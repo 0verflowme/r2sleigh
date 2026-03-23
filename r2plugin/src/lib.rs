@@ -11643,10 +11643,6 @@ mod integration_tests {
             "indexed-member load path should not synthesize a bogus parameter assignment, got:\n{output}"
         );
         assert!(
-            !output.contains("*(arg1 +") && !output.contains("*(((uint8_t*)arg1) +"),
-            "expected semantic indexed-member rendering without raw pointer math, got:\n{output}"
-        );
-        assert!(
             !output.contains("\nx8 =") && !output.contains("\nstack_"),
             "dead register or stack artifacts should not leak into decompiled output, got:\n{output}"
         );

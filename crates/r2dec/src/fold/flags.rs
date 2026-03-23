@@ -2626,8 +2626,7 @@ impl<'a> FoldingContext<'a> {
 
         // Look up the definition of this variable (try SSA key first, then formatted name)
         let def = self
-            .definitions_map()
-            .get(var_name)
+            .definition_for_name(var_name)
             .or_else(|| self.formatted_defs_map().get(var_name))?;
 
         match def {
@@ -2899,21 +2898,45 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn extract_sub_operands(&self, expr: &CExpr) -> Option<(CExpr, CExpr)> {
+        self.extract_sub_operands_with_seen(expr, 0, &mut HashSet::new())
+    }
+
+    fn extract_sub_operands_with_seen(
+        &self,
+        expr: &CExpr,
+        depth: u32,
+        seen: &mut HashSet<String>,
+    ) -> Option<(CExpr, CExpr)> {
+        if depth > 32 {
+            return None;
+        }
         match expr {
             CExpr::Binary {
                 op: BinaryOp::Sub,
                 left,
                 right,
             } => Some((left.as_ref().clone(), right.as_ref().clone())),
-            CExpr::Paren(inner) => self.extract_sub_operands(inner),
-            CExpr::Cast { expr: inner, .. } => self.extract_sub_operands(inner),
+            CExpr::Paren(inner) => self.extract_sub_operands_with_seen(inner, depth + 1, seen),
+            CExpr::Cast { expr: inner, .. } => {
+                self.extract_sub_operands_with_seen(inner, depth + 1, seen)
+            }
             CExpr::Var(name) => {
+                let visit_key = self
+                    .value_id_for_name(name)
+                    .map(|value_id| format!("sub:value:{}", value_id.0))
+                    .unwrap_or_else(|| format!("sub:name:{name}"));
+                if !seen.insert(visit_key.clone()) {
+                    return None;
+                }
                 if let Some(def) = self
                     .lookup_definition(name)
                     .or_else(|| self.formatted_defs_map().get(name).cloned())
                 {
-                    return self.extract_sub_operands(&def);
+                    let result = self.extract_sub_operands_with_seen(&def, depth + 1, seen);
+                    seen.remove(&visit_key);
+                    return result;
                 }
+                seen.remove(&visit_key);
                 None
             }
             _ => None,

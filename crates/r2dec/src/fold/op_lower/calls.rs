@@ -632,7 +632,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         let raw_expr = source_value_id
-            .and_then(|value_id| self.use_info().definitions_by_value.get(&value_id).cloned())
+            .and_then(|value_id| self.definition_for_value_id(value_id).cloned())
             .or_else(|| self.lookup_definition_raw(source_var_name))
             .map(|raw| {
                 let mut imported_visited = HashSet::new();
@@ -641,7 +641,11 @@ impl<'a> FoldingContext<'a> {
         best = prefer(best, raw_expr.clone());
 
         let visible_expr = source_value_id
-            .and_then(|value_id| self.use_info().definitions_by_value.get(&value_id).cloned())
+            .and_then(|value_id| {
+                self.use_info()
+                    .render_definition_for_value(value_id)
+                    .cloned()
+            })
             .or_else(|| self.lookup_definition(source_var_name))
             .map(|visible_def| {
                 let mut imported_visited = HashSet::new();
@@ -663,7 +667,7 @@ impl<'a> FoldingContext<'a> {
             best = prefer(
                 best,
                 source_value_id
-                    .and_then(|value_id| self.use_info().semantic_values_by_value.get(&value_id))
+                    .and_then(|value_id| self.use_info().render_semantic_value_for_value(value_id))
                     .and_then(|value| self.render_semantic_value(value, 0, &mut semantic_visited))
                     .or_else(|| {
                         self.render_semantic_value_by_name(

@@ -3,7 +3,7 @@
 //! This module implements the SSA renaming pass that assigns version numbers
 //! to variables, following the algorithm from Cytron et al.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::cfg::CFG;
 use crate::domtree::DomTree;
@@ -318,6 +318,7 @@ fn rename_block(
                     ctx,
                     &mut defined_vars,
                     boundary,
+                    reg_names,
                 );
             }
         }
@@ -354,16 +355,27 @@ fn append_call_boundary_defs(
     ctx: &mut RenameContext,
     defined_vars: &mut Vec<String>,
     call_boundaries: &CallBoundaryConfig,
+    reg_names: Option<&RegisterNameMap>,
 ) {
     let Some(block_ops) = blocks.get_mut(&block_addr) else {
         return;
     };
 
     for reg in &call_boundaries.defined_regs {
-        let mut actual_names = ctx.matching_var_names_ci(&reg.name);
+        let mut actual_names: BTreeSet<String> =
+            ctx.matching_var_names_ci(&reg.name).into_iter().collect();
+        if actual_names.is_empty()
+            && let Some(reg_names) = reg_names
+        {
+            for ((_, size), candidate) in reg_names {
+                if *size == reg.size && candidate.eq_ignore_ascii_case(&reg.name) {
+                    actual_names.insert(candidate.clone());
+                }
+            }
+        }
         if actual_names.is_empty() {
             ctx.init_var(&reg.name, reg.size);
-            actual_names.push(reg.name.clone());
+            actual_names.insert(reg.name.clone());
         }
         for actual_name in actual_names {
             let dst = ctx.write_var(&actual_name);

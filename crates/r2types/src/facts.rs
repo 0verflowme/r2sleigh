@@ -99,6 +99,34 @@ pub struct CalleeArgEffect {
     pub free: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeMemoryEffectKind {
+    Read,
+    Write,
+    Escape,
+    Free,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeMemoryLocation {
+    Arg {
+        index: usize,
+        offset: Option<i64>,
+        width: Option<u32>,
+    },
+    Global {
+        address: u64,
+        width: Option<u32>,
+    },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeMemoryEffect {
+    pub kind: CalleeMemoryEffectKind,
+    pub location: CalleeMemoryLocation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CalleeReturnRelation {
     Unknown,
@@ -117,6 +145,7 @@ pub struct CalleeFact {
     pub callsite_count: usize,
     pub has_unknown_calls: bool,
     pub arg_effects: BTreeMap<usize, CalleeArgEffect>,
+    pub memory_effects: Vec<CalleeMemoryEffect>,
     pub return_relation: CalleeReturnRelation,
     pub reads_global_memory: bool,
     pub writes_global_memory: bool,

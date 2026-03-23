@@ -19,6 +19,34 @@ use crate::{CallSiteId, SSAVar};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InterprocFunctionId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SummaryMemoryEffectKind {
+    Read,
+    Write,
+    Escape,
+    Free,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SummaryMemoryLocation {
+    Arg {
+        index: usize,
+        offset: Option<i64>,
+        width: Option<u32>,
+    },
+    Global {
+        address: u64,
+        width: Option<u32>,
+    },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SummaryMemoryEffect {
+    pub kind: SummaryMemoryEffectKind,
+    pub location: SummaryMemoryLocation,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryArgEffect {
     pub read: bool,
@@ -66,6 +94,8 @@ pub struct FunctionSemanticSummary {
     pub callsite_count: usize,
     pub has_unknown_calls: bool,
     pub arg_effects: BTreeMap<usize, SummaryArgEffect>,
+    #[serde(default)]
+    pub memory_effects: Vec<SummaryMemoryEffect>,
     pub return_relation: SummaryReturnRelation,
     pub reads_global_memory: bool,
     pub writes_global_memory: bool,
@@ -82,6 +112,7 @@ impl FunctionSemanticSummary {
             callsite_count: 0,
             has_unknown_calls: false,
             arg_effects: BTreeMap::new(),
+            memory_effects: Vec::new(),
             return_relation: SummaryReturnRelation::Unknown,
             reads_global_memory: false,
             writes_global_memory: false,
@@ -149,6 +180,7 @@ impl FunctionSemanticSummary {
             callsite_count: 0,
             has_unknown_calls: false,
             arg_effects,
+            memory_effects: Vec::new(),
             return_relation,
             reads_global_memory: false,
             writes_global_memory: false,
@@ -349,9 +381,7 @@ struct LocalSummaryFacts {
     callsite_count: usize,
     has_unknown_calls: bool,
     arg_effects: BTreeMap<usize, SummaryArgEffect>,
-    reads_global_memory: bool,
-    writes_global_memory: bool,
-    touches_unknown_memory: bool,
+    memory_effects: BTreeSet<SummaryMemoryEffect>,
     return_observations: Vec<SummaryValueObservation>,
     call_observations: BTreeMap<CallSiteId, CallObservation>,
 }
@@ -417,6 +447,8 @@ fn initial_summary(
     name: Option<String>,
     local: &LocalSummaryFacts,
 ) -> FunctionSemanticSummary {
+    let (reads_global_memory, writes_global_memory, touches_unknown_memory) =
+        summarize_memory_effect_flags(&local.memory_effects);
     FunctionSemanticSummary {
         id,
         name,
@@ -425,10 +457,11 @@ fn initial_summary(
         callsite_count: local.callsite_count,
         has_unknown_calls: local.has_unknown_calls,
         arg_effects: local.arg_effects.clone(),
+        memory_effects: local.memory_effects.iter().copied().collect(),
         return_relation: resolve_return_relation(&local.return_observations, &BTreeMap::new()),
-        reads_global_memory: local.reads_global_memory,
-        writes_global_memory: local.writes_global_memory,
-        touches_unknown_memory: local.touches_unknown_memory,
+        reads_global_memory,
+        writes_global_memory,
+        touches_unknown_memory,
     }
 }
 
@@ -439,6 +472,7 @@ fn resolve_summary(
     current: &BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
 ) -> FunctionSemanticSummary {
     let mut arg_effects = local.arg_effects.clone();
+    let mut memory_effects = local.memory_effects.clone();
     for call in local.call_observations.values() {
         let Some(callee) = current.get(&InterprocFunctionId(call.target)) else {
             continue;
@@ -455,7 +489,12 @@ fn resolve_summary(
                 .or_default()
                 .merge_from(effect);
         }
+        for effect in &callee.memory_effects {
+            memory_effects.insert(remap_memory_effect(effect, &call.args));
+        }
     }
+    let (reads_global_memory, writes_global_memory, touches_unknown_memory) =
+        summarize_memory_effect_flags(&memory_effects);
 
     FunctionSemanticSummary {
         id,
@@ -465,10 +504,66 @@ fn resolve_summary(
         callsite_count: local.callsite_count,
         has_unknown_calls: local.has_unknown_calls,
         arg_effects,
+        memory_effects: memory_effects.iter().copied().collect(),
         return_relation: resolve_return_relation(&local.return_observations, current),
-        reads_global_memory: local.reads_global_memory,
-        writes_global_memory: local.writes_global_memory,
-        touches_unknown_memory: local.touches_unknown_memory,
+        reads_global_memory,
+        writes_global_memory,
+        touches_unknown_memory,
+    }
+}
+
+fn summarize_memory_effect_flags(effects: &BTreeSet<SummaryMemoryEffect>) -> (bool, bool, bool) {
+    let mut reads_global_memory = false;
+    let mut writes_global_memory = false;
+    let mut touches_unknown_memory = false;
+    for effect in effects {
+        match (effect.kind, effect.location) {
+            (SummaryMemoryEffectKind::Read, SummaryMemoryLocation::Global { .. }) => {
+                reads_global_memory = true
+            }
+            (
+                SummaryMemoryEffectKind::Write
+                | SummaryMemoryEffectKind::Escape
+                | SummaryMemoryEffectKind::Free,
+                SummaryMemoryLocation::Global { .. },
+            ) => writes_global_memory = true,
+            (_, SummaryMemoryLocation::Unknown) => touches_unknown_memory = true,
+            _ => {}
+        }
+    }
+    (
+        reads_global_memory,
+        writes_global_memory,
+        touches_unknown_memory,
+    )
+}
+
+fn remap_memory_effect(
+    effect: &SummaryMemoryEffect,
+    args: &[SummaryOperand],
+) -> SummaryMemoryEffect {
+    let location = match effect.location {
+        SummaryMemoryLocation::Arg {
+            index,
+            offset,
+            width,
+        } => match args.get(index) {
+            Some(SummaryOperand::Arg(caller_idx)) => SummaryMemoryLocation::Arg {
+                index: *caller_idx,
+                offset,
+                width,
+            },
+            Some(SummaryOperand::Const(value)) => SummaryMemoryLocation::Global {
+                address: *value,
+                width,
+            },
+            _ => SummaryMemoryLocation::Unknown,
+        },
+        other => other,
+    };
+    SummaryMemoryEffect {
+        kind: effect.kind,
+        location,
     }
 }
 
@@ -523,9 +618,7 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
         callsite_count: prepared.call_sites().by_id.len(),
         has_unknown_calls: false,
         arg_effects: BTreeMap::new(),
-        reads_global_memory: false,
-        writes_global_memory: false,
-        touches_unknown_memory: false,
+        memory_effects: BTreeSet::new(),
         return_observations: Vec::new(),
         call_observations: BTreeMap::new(),
     };
@@ -541,33 +634,73 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                 out.call_observations
                     .insert(*call_id, CallObservation { target, args });
             }
-            None => out.has_unknown_calls = true,
+            None => {
+                out.has_unknown_calls = true;
+                if let Some(args) = state_by_call.get(call_id) {
+                    for actual in args {
+                        if let SummaryOperand::Arg(idx) = actual {
+                            let effect = out.arg_effects.entry(*idx).or_default();
+                            effect.mark_read();
+                            effect.mark_write();
+                            effect.escape = true;
+                            out.memory_effects.insert(SummaryMemoryEffect {
+                                kind: SummaryMemoryEffectKind::Read,
+                                location: SummaryMemoryLocation::Arg {
+                                    index: *idx,
+                                    offset: None,
+                                    width: None,
+                                },
+                            });
+                            out.memory_effects.insert(SummaryMemoryEffect {
+                                kind: SummaryMemoryEffectKind::Write,
+                                location: SummaryMemoryLocation::Arg {
+                                    index: *idx,
+                                    offset: None,
+                                    width: None,
+                                },
+                            });
+                            out.memory_effects.insert(SummaryMemoryEffect {
+                                kind: SummaryMemoryEffectKind::Escape,
+                                location: SummaryMemoryLocation::Arg {
+                                    index: *idx,
+                                    offset: None,
+                                    width: None,
+                                },
+                            });
+                        }
+                    }
+                }
+                out.memory_effects.insert(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: SummaryMemoryLocation::Unknown,
+                });
+                out.memory_effects.insert(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Write,
+                    location: SummaryMemoryLocation::Unknown,
+                });
+            }
         }
     }
 
     for uses in prepared.memory().uses_by_inst.values() {
         for fact in uses {
-            match prepared
-                .objects()
-                .object(fact.location.object)
-                .map(|object| &object.kind)
-            {
-                Some(ObjectKind::Global { .. }) => out.reads_global_memory = true,
-                Some(ObjectKind::EscapedUnknown) | None => out.touches_unknown_memory = true,
-                _ => {}
+            if let Some(effect) = summary_memory_effect_for_location(
+                prepared,
+                fact.location,
+                SummaryMemoryEffectKind::Read,
+            ) {
+                out.memory_effects.insert(effect);
             }
         }
     }
     for defs in prepared.memory().defs_by_inst.values() {
         for fact in defs {
-            match prepared
-                .objects()
-                .object(fact.location.object)
-                .map(|object| &object.kind)
-            {
-                Some(ObjectKind::Global { .. }) => out.writes_global_memory = true,
-                Some(ObjectKind::EscapedUnknown) | None => out.touches_unknown_memory = true,
-                _ => {}
+            if let Some(effect) = summary_memory_effect_for_location(
+                prepared,
+                fact.location,
+                SummaryMemoryEffectKind::Write,
+            ) {
+                out.memory_effects.insert(effect);
             }
         }
     }
@@ -587,17 +720,41 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                 | SSAOp::LoadLinked { addr, .. }
                 | SSAOp::LoadGuarded { addr, .. }
                 | SSAOp::AtomicCAS { addr, .. } => {
-                    if let SummaryOperand::Arg(idx) = classify_addr_operand(prepared, abi, addr, 0)
-                    {
+                    let operand = prepared
+                        .graph()
+                        .value_id_for_var(addr)
+                        .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
+                        .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
+                    if let SummaryOperand::Arg(idx) = operand {
                         out.arg_effects.entry(idx).or_default().mark_read();
+                        out.memory_effects.insert(SummaryMemoryEffect {
+                            kind: SummaryMemoryEffectKind::Read,
+                            location: SummaryMemoryLocation::Arg {
+                                index: idx,
+                                offset: None,
+                                width: None,
+                            },
+                        });
                     }
                 }
                 SSAOp::Store { addr, .. }
                 | SSAOp::StoreConditional { addr, .. }
                 | SSAOp::StoreGuarded { addr, .. } => {
-                    if let SummaryOperand::Arg(idx) = classify_addr_operand(prepared, abi, addr, 0)
-                    {
+                    let operand = prepared
+                        .graph()
+                        .value_id_for_var(addr)
+                        .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
+                        .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
+                    if let SummaryOperand::Arg(idx) = operand {
                         out.arg_effects.entry(idx).or_default().mark_write();
+                        out.memory_effects.insert(SummaryMemoryEffect {
+                            kind: SummaryMemoryEffectKind::Write,
+                            location: SummaryMemoryLocation::Arg {
+                                index: idx,
+                                offset: None,
+                                width: None,
+                            },
+                        });
                     }
                 }
                 SSAOp::Return { target } => {
@@ -619,19 +776,57 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
     out
 }
 
+fn summary_memory_effect_for_location(
+    prepared: &SsaArtifact,
+    location: crate::semantic::MemoryLocation,
+    kind: SummaryMemoryEffectKind,
+) -> Option<SummaryMemoryEffect> {
+    let object = prepared.objects().object(location.object)?;
+    let summary_location = match &object.kind {
+        ObjectKind::Global { address, .. } => SummaryMemoryLocation::Global {
+            address: *address,
+            width: Some(location.size),
+        },
+        ObjectKind::EscapedUnknown => SummaryMemoryLocation::Unknown,
+        _ => return None,
+    };
+    Some(SummaryMemoryEffect {
+        kind,
+        location: summary_location,
+    })
+}
+
 fn record_arg_count_hint(
     prepared: &SsaArtifact,
     abi: &AbiProfile,
     var: &SSAVar,
     hint: &mut Option<usize>,
 ) {
-    let SummaryOperand::Arg(idx) = classify_var_operand(prepared, abi, var, 0) else {
+    if let Some(value_id) = prepared.graph().value_id_for_var(var) {
+        record_arg_count_hint_value(prepared, abi, value_id, hint);
         return;
-    };
-    let count = idx.saturating_add(1);
-    match hint {
-        Some(current) => *current = (*current).max(count),
-        None => *hint = Some(count),
+    }
+    if let SummaryOperand::Arg(idx) = classify_var_operand(prepared, abi, var, 0) {
+        let count = idx.saturating_add(1);
+        match hint {
+            Some(current) => *current = (*current).max(count),
+            None => *hint = Some(count),
+        }
+    }
+}
+
+fn record_arg_count_hint_value(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    value_id: ValueId,
+    hint: &mut Option<usize>,
+) {
+    if let SummaryOperand::Arg(idx) = classify_value_operand(prepared, abi, value_id, 0) {
+        let count = idx.saturating_add(1);
+        match hint {
+            Some(current) => *current = (*current).max(count),
+            None => *hint = Some(count),
+        }
     }
 }
 
@@ -772,8 +967,26 @@ fn classify_return_target(
     target: &SSAVar,
     calls: &BTreeMap<CallSiteId, CallObservation>,
 ) -> SummaryValueObservation {
-    let rooted = canonical_root(prepared, target);
-    if is_instruction_pointer_like(&rooted.name)
+    if let Some(target_id) = prepared.graph().value_id_for_var(target) {
+        let rooted_id = canonical_root_value(prepared, target_id);
+        if prepared
+            .value_var(rooted_id)
+            .is_some_and(|rooted| is_instruction_pointer_like(&rooted.name))
+            && let Some(observation) = recover_return_observation_from_epilogue(
+                prepared,
+                function,
+                abi,
+                block_addr,
+                return_op_idx,
+                calls,
+            )
+        {
+            return observation;
+        }
+        return classify_value_observation(prepared, abi, rooted_id, calls);
+    }
+
+    if is_instruction_pointer_like(&target.name)
         && let Some(observation) = recover_return_observation_from_epilogue(
             prepared,
             function,
@@ -785,21 +998,10 @@ fn classify_return_target(
     {
         return observation;
     }
-    match classify_var_operand(prepared, abi, &rooted, 0) {
+    match classify_var_operand(prepared, abi, target, 0) {
         SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
         SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
-        SummaryOperand::Unknown => {
-            if let Some(value_id) = prepared.graph().value_id_for_var(&rooted)
-                && let Some(call_id) = return_call_site_for_value(prepared, abi, value_id)
-                && let Some(call) = calls.get(&call_id)
-            {
-                return SummaryValueObservation::Call(call.clone());
-            }
-            if let Some(address) = global_address_for_value(prepared, &rooted) {
-                return SummaryValueObservation::Global(address);
-            }
-            SummaryValueObservation::Unknown
-        }
+        SummaryOperand::Unknown => SummaryValueObservation::Unknown,
     }
 }
 
@@ -839,28 +1041,42 @@ fn recover_return_observation_from_epilogue(
                 if !abi.is_ret_name(&dst.name) {
                     continue;
                 }
-                let rooted = canonical_root(prepared, dst);
-                return Some(match classify_var_operand(prepared, abi, &rooted, 0) {
+                if let Some(dst_id) = prepared.graph().value_id_for_var(dst) {
+                    let rooted_id = canonical_root_value(prepared, dst_id);
+                    return Some(classify_value_observation(prepared, abi, rooted_id, calls));
+                }
+                return Some(match classify_var_operand(prepared, abi, dst, 0) {
                     SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
                     SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
-                    SummaryOperand::Unknown => {
-                        if let Some(value_id) = prepared.graph().value_id_for_var(&rooted)
-                            && let Some(call_id) =
-                                return_call_site_for_value(prepared, abi, value_id)
-                            && let Some(call) = calls.get(&call_id)
-                        {
-                            SummaryValueObservation::Call(call.clone())
-                        } else if let Some(address) = global_address_for_value(prepared, &rooted) {
-                            SummaryValueObservation::Global(address)
-                        } else {
-                            SummaryValueObservation::Unknown
-                        }
-                    }
+                    SummaryOperand::Unknown => SummaryValueObservation::Unknown,
                 });
             }
         }
     }
     None
+}
+
+fn classify_value_observation(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    value_id: ValueId,
+    calls: &BTreeMap<CallSiteId, CallObservation>,
+) -> SummaryValueObservation {
+    match classify_value_operand(prepared, abi, value_id, 0) {
+        SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
+        SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
+        SummaryOperand::Unknown => {
+            if let Some(call_id) = return_call_site_for_value(prepared, abi, value_id)
+                && let Some(call) = calls.get(&call_id)
+            {
+                SummaryValueObservation::Call(call.clone())
+            } else if let Some(address) = global_address_for_value_id(prepared, value_id) {
+                SummaryValueObservation::Global(address)
+            } else {
+                SummaryValueObservation::Unknown
+            }
+        }
+    }
 }
 
 fn return_call_site_for_value(
@@ -912,15 +1128,6 @@ fn return_call_site_for_value(
     single_call_site()
 }
 
-fn classify_addr_operand(
-    prepared: &SsaArtifact,
-    abi: &AbiProfile,
-    var: &SSAVar,
-    depth: u32,
-) -> SummaryOperand {
-    classify_var_operand(prepared, abi, var, depth)
-}
-
 fn classify_var_operand(
     prepared: &SsaArtifact,
     abi: &AbiProfile,
@@ -931,7 +1138,7 @@ fn classify_var_operand(
         return SummaryOperand::Unknown;
     }
     if var.is_const() {
-        return parse_const(var).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
+        return parse_const_name(&var.name).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
     }
     if let Some(idx) = abi.arg_index_for_name(&var.name) {
         return SummaryOperand::Arg(idx);
@@ -956,7 +1163,8 @@ fn classify_value_operand(
         return SummaryOperand::Unknown;
     };
     if root_var.is_const() {
-        return parse_const(root_var).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
+        return parse_const_name(&root_var.name)
+            .map_or(SummaryOperand::Unknown, SummaryOperand::Const);
     }
     if let Some(idx) = abi.arg_index_for_name(&root_var.name) {
         return SummaryOperand::Arg(idx);
@@ -1005,15 +1213,6 @@ fn classify_value_operand(
     }
 }
 
-fn canonical_root(prepared: &SsaArtifact, var: &SSAVar) -> SSAVar {
-    prepared
-        .graph()
-        .value_id_for_var(var)
-        .map(|value_id| canonical_root_value(prepared, value_id))
-        .and_then(|value_id| prepared.value_var(value_id).cloned())
-        .unwrap_or_else(|| var.clone())
-}
-
 fn canonical_root_value(prepared: &SsaArtifact, value_id: ValueId) -> ValueId {
     let Some(facts) = prepared.function().decompile_prep_facts() else {
         return value_id;
@@ -1039,11 +1238,6 @@ fn canonical_root_value(prepared: &SsaArtifact, value_id: ValueId) -> ValueId {
     current_id
 }
 
-fn global_address_for_value(prepared: &SsaArtifact, var: &SSAVar) -> Option<u64> {
-    let value_id = prepared.graph().value_id_for_var(var)?;
-    global_address_for_value_id(prepared, value_id)
-}
-
 fn global_address_for_value_id(prepared: &SsaArtifact, value_id: ValueId) -> Option<u64> {
     let object = prepared.objects().object_for_value(value_id)?;
     let object = prepared.objects().object(object)?;
@@ -1053,9 +1247,8 @@ fn global_address_for_value_id(prepared: &SsaArtifact, value_id: ValueId) -> Opt
     }
 }
 
-fn parse_const(var: &SSAVar) -> Option<u64> {
-    var.name
-        .strip_prefix("const:")
+fn parse_const_name(name: &str) -> Option<u64> {
+    name.strip_prefix("const:")
         .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
 }
 
