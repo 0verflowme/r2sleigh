@@ -41,6 +41,12 @@ fn parse_const_value(name: &str) -> Option<u64> {
     {
         return u64::from_str_radix(hex, 16).ok();
     }
+    if let Some(dec) = value
+        .strip_prefix("0d")
+        .or_else(|| value.strip_prefix("0D"))
+    {
+        return dec.parse::<u64>().ok();
+    }
     if value.chars().all(|ch| ch.is_ascii_hexdigit())
         && value
             .chars()

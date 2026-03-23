@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::SSAOp;
+use r2ssa::{CompareKind as PreparedCompareKind, PreparedFunctionSSA, SSAOp};
 
 use super::lower::LowerCtx;
 use super::{FlagCompareKind, FlagCompareProvenance, FlagInfo, PassEnv, UseInfo, utils};
@@ -40,42 +40,57 @@ pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>
     scratch.info
 }
 
-fn format_compare_operand(var_name: &str) -> String {
-    if let Some(val) = parse_compare_const_value(var_name) {
+#[allow(dead_code)]
+pub(crate) fn analyze_prepared_runtime(
+    blocks: &[SSABlock],
+    use_info: &UseInfo,
+    prepared: &PreparedFunctionSSA,
+) -> FlagInfo {
+    let mut scratch = FlagScratch::default();
+
+    for predicate in prepared.predicates().predicates.values() {
+        let Some(compare) = predicate.comparison.as_ref() else {
+            continue;
+        };
+        let lhs = traced_compare_operand_name(&compare.lhs, use_info);
+        let compare_width = compare.lhs.size.max(compare.rhs.size);
+        let rhs = if compare.rhs.is_const() {
+            format_compare_operand(&compare.rhs, compare_width)
+        } else {
+            traced_compare_operand_name(&compare.rhs, use_info)
+        };
+        let kind = match compare.kind {
+            PreparedCompareKind::Equal | PreparedCompareKind::NotEqual => FlagCompareKind::Equality,
+            PreparedCompareKind::Less | PreparedCompareKind::LessEqual => {
+                FlagCompareKind::UnsignedLess
+            }
+            PreparedCompareKind::SignedLess | PreparedCompareKind::SignedLessEqual => {
+                FlagCompareKind::SignedNegative
+            }
+        };
+        record_flag_compare_provenance(
+            &mut scratch,
+            predicate.condition.display_name(),
+            lhs,
+            rhs,
+            kind,
+        );
+    }
+
+    recompute_flag_only_values(&mut scratch, blocks);
+    scratch.info
+}
+
+fn format_compare_operand(var: &r2ssa::SSAVar, compare_width: u32) -> String {
+    if let Some(val) = utils::parse_compare_const_value_with_width(var, compare_width) {
         if (val > 255 && val % 10 != 0) || val > 0xffff {
             format!("0x{:x}", val)
         } else {
             format!("{}", val)
         }
     } else {
-        var_name.to_string()
+        var.name.clone()
     }
-}
-
-fn parse_compare_const_value(name: &str) -> Option<u64> {
-    let val_str = name.strip_prefix("const:")?;
-    let val_str = val_str.split('_').next().unwrap_or(val_str);
-
-    if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-
-    if !val_str.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return val_str.parse().ok();
-    }
-
-    if val_str.chars().any(|ch| ch.is_ascii_alphabetic()) || val_str.len() > 4 {
-        return u64::from_str_radix(val_str, 16).ok();
-    }
-
-    if val_str.len() > 1 {
-        return u64::from_str_radix(val_str, 16).ok();
-    }
-
-    val_str.parse().ok()
 }
 
 fn analyze_comparison_patterns(
@@ -221,13 +236,8 @@ fn analyze_comparison_patterns(
     }
 }
 
-fn const_expr_from_name(name: &str) -> Option<CExpr> {
-    let val = parse_compare_const_value(name)?;
-    Some(if val > 0x7fffffff {
-        CExpr::UIntLit(val)
-    } else {
-        CExpr::IntLit(val as i64)
-    })
+fn const_expr_from_var(var: &r2ssa::SSAVar) -> Option<CExpr> {
+    Some(utils::compare_const_to_expr(var))
 }
 
 fn predicate_passthrough_expr(src: &r2ssa::SSAVar, scratch: &FlagScratch) -> Option<CExpr> {
@@ -235,7 +245,7 @@ fn predicate_passthrough_expr(src: &r2ssa::SSAVar, scratch: &FlagScratch) -> Opt
         return Some(expr.clone());
     }
     if src.is_const() {
-        return const_expr_from_name(&src.name);
+        return const_expr_from_var(src);
     }
     if utils::is_cpu_flag(&src.name.to_lowercase()) {
         return Some(CExpr::Var(src.display_name()));
@@ -249,8 +259,9 @@ fn trace_compare_operands(
     use_info: &UseInfo,
 ) -> (String, String) {
     let a_name = traced_compare_operand_name(a, use_info);
+    let compare_width = a.size.max(b.size);
     let b_name = if b.is_const() {
-        format_compare_operand(&b.name)
+        format_compare_operand(b, compare_width)
     } else {
         traced_compare_operand_name(b, use_info)
     };
@@ -300,7 +311,7 @@ fn predicate_operand_expr(
 ) -> CExpr {
     predicate_passthrough_expr(src, scratch).unwrap_or_else(|| {
         if src.is_const() {
-            const_expr_from_name(&src.name).unwrap_or_else(|| CExpr::Var(src.display_name()))
+            const_expr_from_var(src).unwrap_or_else(|| CExpr::Var(src.display_name()))
         } else {
             let lowered = lower.get_expr(src);
             if matches!(lowered, CExpr::Call { .. })

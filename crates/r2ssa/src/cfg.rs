@@ -496,9 +496,23 @@ impl CFG {
 
     /// Replace the terminator for a block.
     pub fn set_terminator(&mut self, addr: u64, terminator: BlockTerminator) {
+        let Some(&node_idx) = self.addr_to_node.get(&addr) else {
+            return;
+        };
+
+        let outgoing: Vec<_> = self
+            .graph
+            .edges_directed(node_idx, Direction::Outgoing)
+            .map(|edge| edge.id())
+            .collect();
+        for edge in outgoing {
+            self.graph.remove_edge(edge);
+        }
+
         if let Some(block) = self.get_block_mut(addr) {
             block.terminator = terminator;
         }
+        self.add_edges_for_block(addr);
     }
 
     fn rebuild_addr_map(&mut self) {
@@ -829,6 +843,8 @@ mod tests {
             cfg.get_block(0x1000).map(|b| b.terminator.clone()),
             Some(BlockTerminator::Branch { target: 0x1004 })
         );
+        assert_eq!(cfg.successors(0x1000), vec![0x1004]);
+        assert_eq!(cfg.predecessors(0x1004), vec![0x1000]);
     }
 
     #[test]

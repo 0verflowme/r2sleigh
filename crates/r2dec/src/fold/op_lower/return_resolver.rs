@@ -309,7 +309,7 @@ impl<'a> FoldingContext<'a> {
         )
     }
 
-    pub(super) fn resolve_return_candidate(&self, expr: &CExpr) -> CExpr {
+    pub(crate) fn resolve_return_candidate(&self, expr: &CExpr) -> CExpr {
         self.resolve_return_candidate_in_context(expr, self.return_context_for_expr(expr))
     }
 
@@ -467,6 +467,37 @@ impl<'a> FoldingContext<'a> {
                 self.merged_return_candidate_for_block_slot(block_addr, *slot_offset),
             );
         }
+        best
+    }
+
+    pub(crate) fn merged_return_register_candidate_for_block(
+        &self,
+        block_addr: u64,
+    ) -> Option<CExpr> {
+        let func = self
+            .inputs
+            .prepared_ssa
+            .map(|prepared| prepared.function())?;
+        let block = func.get_block(block_addr)?;
+        let mut best = None;
+
+        for phi in &block.phis {
+            if !self
+                .inputs
+                .arch
+                .is_return_register_name(&phi.dst.name.to_ascii_lowercase())
+            {
+                continue;
+            }
+
+            let phi_name = phi.dst.display_name();
+            let mut visited = HashSet::new();
+            let candidate = self
+                .resolve_expr_from_phi_sources(&phi_name, 0, &mut visited, false)
+                .or_else(|| self.best_visible_definition(&phi_name));
+            best = self.preferred_return_candidate(best, candidate);
+        }
+
         best
     }
 

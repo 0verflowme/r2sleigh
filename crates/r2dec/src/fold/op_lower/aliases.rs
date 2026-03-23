@@ -552,4 +552,63 @@ impl<'a> FoldingContext<'a> {
         kept_rev.reverse();
         kept_rev
     }
+
+    pub(crate) fn prune_dead_temp_assignments_in_stmt(&self, stmt: CStmt) -> CStmt {
+        match stmt {
+            CStmt::Block(stmts) => CStmt::Block(self.prune_dead_temp_assignments_in_block(stmts)),
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => CStmt::If {
+                cond,
+                then_body: Box::new(self.prune_dead_temp_assignments_in_stmt(*then_body)),
+                else_body: else_body
+                    .map(|stmt| Box::new(self.prune_dead_temp_assignments_in_stmt(*stmt))),
+            },
+            CStmt::While { cond, body } => CStmt::While {
+                cond,
+                body: Box::new(self.prune_dead_temp_assignments_in_stmt(*body)),
+            },
+            CStmt::DoWhile { body, cond } => CStmt::DoWhile {
+                body: Box::new(self.prune_dead_temp_assignments_in_stmt(*body)),
+                cond,
+            },
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => CStmt::For {
+                init: init.map(|stmt| Box::new(self.prune_dead_temp_assignments_in_stmt(*stmt))),
+                cond,
+                update,
+                body: Box::new(self.prune_dead_temp_assignments_in_stmt(*body)),
+            },
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => CStmt::Switch {
+                expr,
+                cases: cases
+                    .into_iter()
+                    .map(|case| crate::ast::SwitchCase {
+                        value: case.value,
+                        body: self.prune_dead_temp_assignments_in_block(case.body),
+                    })
+                    .collect(),
+                default: default.map(|stmts| self.prune_dead_temp_assignments_in_block(stmts)),
+            },
+            other => other,
+        }
+    }
+
+    fn prune_dead_temp_assignments_in_block(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
+        let rewritten = stmts
+            .into_iter()
+            .map(|stmt| self.prune_dead_temp_assignments_in_stmt(stmt))
+            .collect();
+        self.prune_dead_temp_assignments(rewritten)
+    }
 }

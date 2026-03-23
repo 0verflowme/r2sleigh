@@ -7,14 +7,34 @@ R2R_TIMEOUT ?= 120
 R2R_TMPDIR ?= /tmp/r2sleigh-r2r-tmp
 R2R_PLUGIN_DIR ?= $(R2R_TMPDIR)/plugins
 R2R_RUST_FEATURES ?= all-archs
+R2R_PLUGIN_RUNTIME_SUBDIR ?= r2sleigh
+LOCAL_PLUGIN_DIR := $(abspath ../../r2plugin)
+LOCAL_PLUGIN_RUST_LIB := $(abspath ../../target/release/libr2sleigh_plugin.so)
+LOCAL_PLUGIN_ANAL_SO := $(LOCAL_PLUGIN_DIR)/anal_sleigh.so
+LOCAL_PLUGIN_ARCH_SO := $(LOCAL_PLUGIN_DIR)/arch_sleigh.so
+LOCAL_R2_DIR ?= ../../../radare2
+LOCAL_R2_ABS := $(abspath $(LOCAL_R2_DIR))
+LOCAL_R2_BIN := $(LOCAL_R2_ABS)/binr/radare2/radare2
+LOCAL_R2_ANAL_SO := $(LOCAL_R2_ABS)/libr/anal/libr_anal.so
+LOCAL_R2_LD_LIBRARY_PATH := $(shell find "$(LOCAL_R2_ABS)/libr" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | paste -sd: -)
 UNAME_S := $(shell uname -s)
+
+ifeq ($(wildcard $(LOCAL_R2_BIN)),$(LOCAL_R2_BIN))
+ifeq ($(wildcard $(LOCAL_R2_ANAL_SO)),$(LOCAL_R2_ANAL_SO))
+R2R_RADARE2 ?= $(LOCAL_R2_BIN)
+R2R_LD_LIBRARY_PATH ?= $(LOCAL_R2_LD_LIBRARY_PATH)
+endif
+endif
+
+R2R_RADARE2 ?= radare2
+R2R_LD_LIBRARY_PATH ?=
 
 .PHONY: all ensure-tools build-bins link-bins install-plugin run
 
 all: run
 
 ensure-tools:
-	@command -v r2 >/dev/null || { echo "r2 not found in PATH"; exit 1; }
+	@[ -x "$(R2R_RADARE2)" ] || command -v "$(R2R_RADARE2)" >/dev/null || { echo "radare2 not found: $(R2R_RADARE2)"; exit 1; }
 	@command -v r2r >/dev/null || { echo "r2r not found in PATH"; exit 1; }
 	@command -v jq >/dev/null || { echo "jq not found in PATH"; exit 1; }
 	@command -v python3 >/dev/null || { echo "python3 not found in PATH"; exit 1; }
@@ -56,13 +76,22 @@ link-bins: build-bins
 
 install-plugin:
 	@mkdir -p "$(R2R_PLUGIN_DIR)"
-	$(MAKE) -C ../../r2plugin RUST_FEATURES=$(R2R_RUST_FEATURES) R2_PLUGIN_DIR="$(abspath $(R2R_PLUGIN_DIR))" install
+	@mkdir -p "$(R2R_PLUGIN_DIR)/$(R2R_PLUGIN_RUNTIME_SUBDIR)"
+	@if [ -f "$(LOCAL_PLUGIN_RUST_LIB)" ] && [ -f "$(LOCAL_PLUGIN_ANAL_SO)" ] && [ -f "$(LOCAL_PLUGIN_ARCH_SO)" ]; then \
+		cp "$(LOCAL_PLUGIN_RUST_LIB)" "$(R2R_PLUGIN_DIR)/$(R2R_PLUGIN_RUNTIME_SUBDIR)/"; \
+		cp "$(LOCAL_PLUGIN_ANAL_SO)" "$(R2R_PLUGIN_DIR)/"; \
+		cp "$(LOCAL_PLUGIN_ARCH_SO)" "$(R2R_PLUGIN_DIR)/"; \
+	else \
+		$(MAKE) -C ../../r2plugin RUST_FEATURES=$(R2R_RUST_FEATURES) R2_PLUGIN_DIR="$(abspath $(R2R_PLUGIN_DIR))" install; \
+	fi
 
 run: ensure-tools link-bins
 	@rm -rf "$(R2R_TMPDIR)"
 	@mkdir -p "$(R2R_TMPDIR)" "$(R2R_PLUGIN_DIR)" "$(R2R_TMPDIR)/xdg-data"
 	@$(MAKE) install-plugin R2R_PLUGIN_DIR="$(R2R_PLUGIN_DIR)"
 	TMPDIR="$(R2R_TMPDIR)" TMP="$(R2R_TMPDIR)" TEMP="$(R2R_TMPDIR)" \
+		R2R_RADARE2="$(R2R_RADARE2)" \
 		XDG_DATA_HOME="$(abspath $(R2R_TMPDIR)/xdg-data)" \
 		R2_LIBR_PLUGINS="$(abspath $(R2R_PLUGIN_DIR))" \
+		LD_LIBRARY_PATH="$(R2R_LD_LIBRARY_PATH)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		r2r -t $(R2R_TIMEOUT) -j $(R2R_JOBS) -L db/extras

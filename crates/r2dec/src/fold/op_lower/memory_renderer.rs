@@ -78,6 +78,8 @@ impl<'a> FoldingContext<'a> {
             best = Some(fallback_structured);
         }
         best = self.choose_preferred_visible_expr(best, fallback_rendered);
+        best = self
+            .choose_preferred_visible_expr(best, self.prepared_named_memory_expr_for_current_op());
         if let Some(expr) = best {
             return expr;
         }
@@ -156,6 +158,10 @@ impl<'a> FoldingContext<'a> {
             best = Some(fallback_structured);
         }
         best = self.choose_preferred_visible_expr(best, fallback_rendered);
+        best = self.choose_preferred_visible_expr(
+            best,
+            self.prepared_named_memory_def_expr_for_current_op(),
+        );
         if let Some(expr) = best {
             return expr;
         }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
-use r2ssa::{SSAFunction, SSAOp, SSAVar};
+use r2ssa::{ObjectKind, PreparedFunctionSSA, SSAFunction, SSAOp, SSAVar};
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
@@ -9,7 +9,7 @@ use super::{
     StackSlotValueKind, UseInfo, UseInfoAnalysisMode, ValueProvenance, ValueRef, lower::LowerCtx,
     utils,
 };
-use crate::ast::{BinaryOp, CExpr};
+use crate::ast::{BinaryOp, CExpr, CType};
 use crate::fold::op_lower::parse_const_value;
 use crate::fold::{PtrArith, SSABlock};
 use crate::registers::register_family_name;
@@ -18,6 +18,27 @@ use crate::registers::register_family_name;
 pub(crate) struct UseScratch {
     pub(crate) info: UseInfo,
     producers: HashMap<String, SSAOp>,
+}
+
+#[derive(Debug, Default)]
+struct SemanticTypeHintCache {
+    names_by_var: HashMap<String, Vec<String>>,
+    stack_slot_names_by_offset: HashMap<i64, Vec<String>>,
+}
+
+impl SemanticTypeHintCache {
+    fn from_info(info: &UseInfo) -> Self {
+        let mut stack_slot_names_by_offset: HashMap<i64, Vec<String>> = HashMap::new();
+        for (slot_name, slot) in &info.stack_slots {
+            let entry = stack_slot_names_by_offset.entry(slot.offset).or_default();
+            push_unique_casefold(entry, slot_name.clone());
+            push_unique_casefold(entry, slot_name.to_ascii_lowercase());
+        }
+        Self {
+            names_by_var: HashMap::new(),
+            stack_slot_names_by_offset,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +51,46 @@ pub(crate) struct LocalStructFieldAccessProfile {
 
 pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     analyze_with_definition_overrides_mode(blocks, env, &HashMap::new(), UseInfoAnalysisMode::Full)
+}
+
+#[allow(dead_code)]
+pub(crate) fn analyze_prepared_runtime(
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    prepared: &PreparedFunctionSSA,
+    definition_overrides: &HashMap<String, CExpr>,
+) -> UseInfo {
+    let cfg_summary = prepared.function().cfg_risk_summary();
+    let mode = if cfg_summary.block_count >= 96
+        && cfg_summary.switch_block_count > 0
+        && cfg_summary.max_switch_cases >= 32
+        && cfg_summary.back_edge_count == 0
+    {
+        UseInfoAnalysisMode::PreparedDenseSwitch
+    } else {
+        UseInfoAnalysisMode::Full
+    };
+    let mut info = analyze_with_definition_overrides_mode(blocks, env, definition_overrides, mode);
+    overlay_prepared_runtime_facts(&mut info, prepared);
+    info
+}
+
+#[allow(dead_code)]
+pub(crate) fn apply_definition_overrides_fast(
+    baseline: &UseInfo,
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+    definition_overrides: &HashMap<String, CExpr>,
+) -> UseInfo {
+    let mut scratch = UseScratch {
+        info: baseline.clone(),
+        producers: baseline.producers.clone(),
+    };
+    scratch.info.type_hints = env.type_hints.clone();
+    rebuild_definitions(&mut scratch, blocks, env, definition_overrides);
+    build_formatted_defs(&mut scratch, env);
+    scratch.info.producers = scratch.producers.clone();
+    scratch.info
 }
 
 pub(crate) fn analyze_for_local_struct_accesses(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
@@ -71,16 +132,20 @@ fn analyze_with_definition_overrides_mode(
         collect_definitions(&mut scratch, block, env, definition_overrides);
     }
     refresh_semantic_values(&mut scratch, blocks, env);
-    populate_stable_stack_values(&mut scratch, blocks, env);
-    populate_frame_object_field_roots(&mut scratch, blocks, env);
-    populate_stable_memory_values(&mut scratch, blocks, env);
-    refresh_semantic_values(&mut scratch, blocks, env);
+    if !matches!(mode, UseInfoAnalysisMode::PreparedDenseSwitch) {
+        populate_stable_stack_values(&mut scratch, blocks, env);
+        populate_frame_object_field_roots(&mut scratch, blocks, env);
+        populate_stable_memory_values(&mut scratch, blocks, env);
+        refresh_semantic_values(&mut scratch, blocks, env);
+    }
     rebuild_definitions(&mut scratch, blocks, env, definition_overrides);
 
-    analyze_call_args(&mut scratch, blocks, env);
-    bind_single_use_call_result_definitions(&mut scratch, blocks, env);
-    propagate_call_result_aliases(&mut scratch.info);
-    rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
+    if !matches!(mode, UseInfoAnalysisMode::PreparedDenseSwitch) {
+        analyze_call_args(&mut scratch, blocks, env);
+        bind_single_use_call_result_definitions(&mut scratch, blocks, env);
+        propagate_call_result_aliases(&mut scratch.info);
+        rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
+    }
     if matches!(mode, UseInfoAnalysisMode::Full) {
         coalesce_variables(&mut scratch, blocks, env);
         build_formatted_defs(&mut scratch, env);
@@ -105,6 +170,67 @@ fn rerun_semantic_call_analysis_after_result_binding(
     analyze_call_args(scratch, blocks, env);
     bind_single_use_call_result_definitions(scratch, blocks, env);
     propagate_call_result_aliases(&mut scratch.info);
+}
+
+#[allow(dead_code)]
+fn overlay_prepared_runtime_facts(info: &mut UseInfo, prepared: &PreparedFunctionSSA) {
+    let canonical_root = |var: &SSAVar| {
+        let mut current = var.clone();
+        let Some(facts) = prepared.function().decompile_prep_facts() else {
+            return current;
+        };
+        for _ in 0..32 {
+            let Some(next) = facts.canonical_root_of(&current) else {
+                break;
+            };
+            if next == &current {
+                break;
+            }
+            current = next.clone();
+        }
+        current
+    };
+
+    for (value, object_id) in &prepared.objects().value_objects {
+        let Some(object) = prepared.objects().object(*object_id) else {
+            continue;
+        };
+        let (offset, value_kind) = match object.kind {
+            ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
+                (offset, StackSlotValueKind::AddressLike)
+            }
+            _ => continue,
+        };
+        let rooted = canonical_root(value);
+        info.stack_slots.insert(
+            rooted.display_name(),
+            StackSlotProvenance {
+                offset,
+                predicate_carrier: false,
+                return_carrier: false,
+                value_kind,
+            },
+        );
+        info.stack_slots.insert(
+            value.display_name(),
+            StackSlotProvenance {
+                offset,
+                predicate_carrier: false,
+                return_carrier: false,
+                value_kind,
+            },
+        );
+    }
+
+    for switch in prepared.predicates().switches.values() {
+        let Some(selector) = switch.selector.as_ref() else {
+            continue;
+        };
+        info.switch_selector_roots.insert(
+            switch.block_addr,
+            SemanticValue::Scalar(ScalarValue::Root(ValueRef::new(canonical_root(selector)))),
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +266,24 @@ struct StackHomeQuery<'a, 'b> {
     info: &'a UseInfo,
     lower: &'a LowerCtx<'b>,
     env: &'a PassEnv<'b>,
+}
+
+fn push_unique_casefold(names: &mut Vec<String>, name: String) {
+    if !names
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&name))
+    {
+        names.push(name);
+    }
+}
+
+fn lookup_type_hint<'a>(info: &'a UseInfo, env: &'a PassEnv<'_>, name: &str) -> Option<&'a CType> {
+    let lower = name.to_ascii_lowercase();
+    info.type_hints
+        .get(name)
+        .or_else(|| info.type_hints.get(&lower))
+        .or_else(|| env.type_hints.get(name))
+        .or_else(|| env.type_hints.get(&lower))
 }
 
 pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInfo) {
@@ -914,19 +1058,21 @@ fn populate_stable_memory_values(scratch: &mut UseScratch, blocks: &[SSABlock], 
 }
 
 fn refresh_semantic_values(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEnv<'_>) {
+    let mut cache = SemanticTypeHintCache::from_info(&scratch.info);
     for block in blocks {
         for phi in &block.phis {
-            collect_semantic_values(
+            collect_semantic_values_with_cache(
                 scratch,
                 &SSAOp::Phi {
                     dst: phi.dst.clone(),
                     sources: phi.sources.iter().map(|(_, src)| src.clone()).collect(),
                 },
                 env,
+                &mut cache,
             );
         }
         for op in &block.ops {
-            collect_semantic_values(scratch, op, env);
+            collect_semantic_values_with_cache(scratch, op, env, &mut cache);
         }
     }
 }
@@ -2316,9 +2462,21 @@ fn preserve_temp_copy_root_identity(
 }
 
 fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'_>) {
+    let mut cache = SemanticTypeHintCache::default();
+    collect_semantic_values_with_cache(scratch, op, env, &mut cache);
+}
+
+fn collect_semantic_values_with_cache(
+    scratch: &mut UseScratch,
+    op: &SSAOp,
+    env: &PassEnv<'_>,
+    cache: &mut SemanticTypeHintCache,
+) {
     match op {
         SSAOp::Copy { dst, src } => {
-            if !semantic_var_is_pointer_like(&scratch.info, src, env)
+            let src_is_pointer_like =
+                semantic_var_is_pointer_like_cached(&scratch.info, src, env, cache);
+            if !src_is_pointer_like
                 && let Some(value) = scalar_semantic_source_value_for_var(&scratch.info, src)
             {
                 insert_semantic_value(
@@ -2328,7 +2486,7 @@ fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'
                 );
                 return;
             }
-            if semantic_var_is_pointer_like(&scratch.info, src, env)
+            if src_is_pointer_like
                 && let Some(addr) = semantic_addr_for_var(&scratch.info, src, env)
                 && is_authoritative_addr(&addr)
             {
@@ -2352,13 +2510,15 @@ fn collect_semantic_values(scratch: &mut UseScratch, op: &SSAOp, env: &PassEnv<'
         | SSAOp::Trunc { dst, src }
         | SSAOp::Cast { dst, src }
         | SSAOp::Subpiece { dst, src, .. } => {
-            if !semantic_var_is_pointer_like(&scratch.info, src, env)
+            let src_is_pointer_like =
+                semantic_var_is_pointer_like_cached(&scratch.info, src, env, cache);
+            if !src_is_pointer_like
                 && let Some(value) = scalar_semantic_source_value_for_var(&scratch.info, src)
             {
                 insert_semantic_value(&mut scratch.info, dst.display_name(), value);
                 return;
             }
-            if semantic_var_is_pointer_like(&scratch.info, src, env)
+            if src_is_pointer_like
                 && let Some(addr) = semantic_addr_for_var(&scratch.info, src, env)
                 && is_authoritative_addr(&addr)
             {
@@ -2968,6 +3128,13 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
     if lower_name == env.fp_name || lower_name == env.sp_name {
         return true;
     }
+    if info
+        .stack_slots
+        .get(&key)
+        .is_some_and(|slot| slot.value_kind == StackSlotValueKind::AddressLike)
+    {
+        return true;
+    }
     if let Some(value) = info.semantic_values.get(&key) {
         match value {
             SemanticValue::Address(_) => return true,
@@ -3003,19 +3170,74 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
     }
     semantic_type_hint_names(info, var, env)
         .into_iter()
-        .find_map(|name| {
-            info.type_hints
-                .get(&name)
-                .or_else(|| info.type_hints.get(&name.to_ascii_lowercase()))
-                .or_else(|| env.type_hints.get(&name))
-                .or_else(|| env.type_hints.get(&name.to_ascii_lowercase()))
-        })
+        .find_map(|name| lookup_type_hint(info, env, &name))
         .map(|ty| {
             matches!(
                 ty,
-                crate::ast::CType::Pointer(_)
-                    | crate::ast::CType::Struct(_)
-                    | crate::ast::CType::Array(_, _)
+                CType::Pointer(_) | CType::Struct(_) | CType::Array(_, _)
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn semantic_var_is_pointer_like_cached(
+    info: &UseInfo,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+    cache: &mut SemanticTypeHintCache,
+) -> bool {
+    let key = var.display_name();
+    let lower_name = var.name.to_ascii_lowercase();
+    if lower_name == env.fp_name || lower_name == env.sp_name {
+        return true;
+    }
+    if info
+        .stack_slots
+        .get(&key)
+        .is_some_and(|slot| slot.value_kind == StackSlotValueKind::AddressLike)
+    {
+        return true;
+    }
+    if let Some(value) = info.semantic_values.get(&key) {
+        match value {
+            SemanticValue::Address(_) => return true,
+            SemanticValue::Scalar(ScalarValue::Root(root)) if root.var != *var => {
+                return semantic_var_is_pointer_like_cached(info, &root.var, env, cache);
+            }
+            _ => {}
+        }
+    }
+    if let Some(prov) = info.forwarded_values.get(&key)
+        && let Some(source_var) = &prov.source_var
+        && source_var != var
+        && semantic_var_is_pointer_like_cached(info, source_var, env, cache)
+    {
+        return true;
+    }
+    if info.ptr_arith.contains_key(&key) || info.ptr_members.contains_key(&key) {
+        return true;
+    }
+    let copy_root = resolve_copy_root_name(info, &key);
+    if copy_root != key
+        && let Some(root_var) = ssa_var_from_display_name(&copy_root, var.size)
+        && root_var != *var
+        && semantic_var_is_pointer_like_cached(info, &root_var, env, cache)
+    {
+        return true;
+    }
+    if let Some(oracle) = env.type_oracle {
+        let ty = oracle.type_of(var);
+        if oracle.is_pointer(ty) || oracle.is_array(ty) {
+            return true;
+        }
+    }
+    semantic_type_hint_names_cached(info, var, env, cache)
+        .into_iter()
+        .find_map(|name| lookup_type_hint(info, env, &name))
+        .map(|ty| {
+            matches!(
+                ty,
+                CType::Pointer(_) | CType::Struct(_) | CType::Array(_, _)
             )
         })
         .unwrap_or(false)
@@ -3024,20 +3246,12 @@ fn semantic_var_is_pointer_like(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>)
 fn stack_slot_offset_has_pointer_type_hint(info: &UseInfo, offset: i64, env: &PassEnv<'_>) -> bool {
     info.stack_slots.iter().any(|(name, slot)| {
         slot.offset == offset
-            && info
-                .type_hints
-                .get(name)
-                .or_else(|| info.type_hints.get(&name.to_ascii_lowercase()))
-                .or_else(|| env.type_hints.get(name))
-                .or_else(|| env.type_hints.get(&name.to_ascii_lowercase()))
-                .is_some_and(|ty| {
-                    matches!(
-                        ty,
-                        crate::ast::CType::Pointer(_)
-                            | crate::ast::CType::Struct(_)
-                            | crate::ast::CType::Array(_, _)
-                    )
-                })
+            && lookup_type_hint(info, env, name).is_some_and(|ty| {
+                matches!(
+                    ty,
+                    CType::Pointer(_) | CType::Struct(_) | CType::Array(_, _)
+                )
+            })
     })
 }
 
@@ -3057,26 +3271,18 @@ fn stack_reloaded_value_slot_for_name(info: &UseInfo, name: &str) -> Option<i64>
 
 fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> Vec<String> {
     let mut names = Vec::new();
-    let push_unique = |names: &mut Vec<String>, name: String| {
-        if !names
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&name))
-        {
-            names.push(name);
-        }
-    };
     let push_stack_slot_names = |names: &mut Vec<String>, offset: i64| {
         for (slot_name, slot) in &info.stack_slots {
             if slot.offset == offset {
-                push_unique(names, slot_name.clone());
-                push_unique(names, slot_name.to_ascii_lowercase());
+                push_unique_casefold(names, slot_name.clone());
+                push_unique_casefold(names, slot_name.to_ascii_lowercase());
             }
         }
     };
 
     let key = var.display_name();
-    push_unique(&mut names, key.clone());
-    push_unique(&mut names, key.to_ascii_lowercase());
+    push_unique_casefold(&mut names, key.clone());
+    push_unique_casefold(&mut names, key.to_ascii_lowercase());
 
     if let Some(offset) = info
         .forwarded_values
@@ -3088,22 +3294,22 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
     }
 
     if let Some(alias) = info.var_aliases.get(&key) {
-        push_unique(&mut names, alias.clone());
-        push_unique(&mut names, alias.to_ascii_lowercase());
+        push_unique_casefold(&mut names, alias.clone());
+        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
     }
 
     if let Some(alias) = env
         .param_register_aliases
         .get(&var.name.to_ascii_lowercase())
     {
-        push_unique(&mut names, alias.clone());
-        push_unique(&mut names, alias.to_ascii_lowercase());
+        push_unique_casefold(&mut names, alias.clone());
+        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
     }
 
     let root = resolve_copy_root_name(info, &key);
     if root != key {
-        push_unique(&mut names, root.clone());
-        push_unique(&mut names, root.to_ascii_lowercase());
+        push_unique_casefold(&mut names, root.clone());
+        push_unique_casefold(&mut names, root.to_ascii_lowercase());
         if let Some(offset) = info
             .forwarded_values
             .get(&root)
@@ -3113,11 +3319,98 @@ fn semantic_type_hint_names(info: &UseInfo, var: &SSAVar, env: &PassEnv<'_>) -> 
             push_stack_slot_names(&mut names, offset);
         }
         if let Some(alias) = info.var_aliases.get(&root) {
-            push_unique(&mut names, alias.clone());
-            push_unique(&mut names, alias.to_ascii_lowercase());
+            push_unique_casefold(&mut names, alias.clone());
+            push_unique_casefold(&mut names, alias.to_ascii_lowercase());
         }
     }
 
+    names
+}
+
+fn semantic_type_hint_names_cached(
+    info: &UseInfo,
+    var: &SSAVar,
+    env: &PassEnv<'_>,
+    cache: &mut SemanticTypeHintCache,
+) -> Vec<String> {
+    let ensure_stack_slot_names = |cache: &mut SemanticTypeHintCache, offset: i64| {
+        cache
+            .stack_slot_names_by_offset
+            .entry(offset)
+            .or_insert_with(|| {
+                let mut slot_names = Vec::new();
+                for (slot_name, slot) in &info.stack_slots {
+                    if slot.offset == offset {
+                        push_unique_casefold(&mut slot_names, slot_name.clone());
+                        push_unique_casefold(&mut slot_names, slot_name.to_ascii_lowercase());
+                    }
+                }
+                slot_names
+            });
+    };
+
+    let key = var.display_name();
+    if let Some(names) = cache.names_by_var.get(&key) {
+        return names.clone();
+    }
+
+    let mut names = Vec::new();
+    push_unique_casefold(&mut names, key.clone());
+    push_unique_casefold(&mut names, key.to_ascii_lowercase());
+
+    if let Some(offset) = info
+        .forwarded_values
+        .get(&key)
+        .and_then(|prov| prov.stack_slot)
+        .or_else(|| info.stack_slots.get(&key).map(|slot| slot.offset))
+    {
+        ensure_stack_slot_names(cache, offset);
+        let Some(slot_names) = cache.stack_slot_names_by_offset.get(&offset) else {
+            unreachable!("stack slot names cache should contain requested offset");
+        };
+        for slot_name in slot_names {
+            push_unique_casefold(&mut names, slot_name.clone());
+        }
+    }
+
+    if let Some(alias) = info.var_aliases.get(&key) {
+        push_unique_casefold(&mut names, alias.clone());
+        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
+    }
+
+    if let Some(alias) = env
+        .param_register_aliases
+        .get(&var.name.to_ascii_lowercase())
+    {
+        push_unique_casefold(&mut names, alias.clone());
+        push_unique_casefold(&mut names, alias.to_ascii_lowercase());
+    }
+
+    let root = resolve_copy_root_name(info, &key);
+    if root != key {
+        push_unique_casefold(&mut names, root.clone());
+        push_unique_casefold(&mut names, root.to_ascii_lowercase());
+        if let Some(offset) = info
+            .forwarded_values
+            .get(&root)
+            .and_then(|prov| prov.stack_slot)
+            .or_else(|| info.stack_slots.get(&root).map(|slot| slot.offset))
+        {
+            ensure_stack_slot_names(cache, offset);
+            let Some(slot_names) = cache.stack_slot_names_by_offset.get(&offset) else {
+                unreachable!("stack slot names cache should contain requested offset");
+            };
+            for slot_name in slot_names {
+                push_unique_casefold(&mut names, slot_name.clone());
+            }
+        }
+        if let Some(alias) = info.var_aliases.get(&root) {
+            push_unique_casefold(&mut names, alias.clone());
+            push_unique_casefold(&mut names, alias.to_ascii_lowercase());
+        }
+    }
+
+    cache.names_by_var.insert(key, names.clone());
     names
 }
 

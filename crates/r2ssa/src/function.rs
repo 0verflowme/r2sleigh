@@ -5,7 +5,7 @@
 //! and renamed operations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use r2il::{ArchSpec, R2ILBlock};
@@ -21,6 +21,9 @@ use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names};
 use crate::rename::{
     CallBoundaryConfig, CallBoundaryDef, rename_function_with_names,
     rename_function_with_names_and_call_boundaries,
+};
+use crate::semantic::{
+    CallSiteFacts, MemorySSAFacts, ObjectModel, PredicateFacts, PreparedFunctionFacts,
 };
 use crate::var::SSAVar;
 
@@ -66,6 +69,7 @@ pub enum FunctionPrepareMode {
     Decompile,
     Patterns,
     DataRefs,
+    Symbolic,
 }
 
 /// Canonical prepared-SSA artifact consumed by downstream analysis layers.
@@ -73,42 +77,58 @@ pub enum FunctionPrepareMode {
 pub struct PreparedFunctionSSA {
     function: SSAFunction,
     mode: FunctionPrepareMode,
+    facts: PreparedFunctionFacts,
 }
 
 impl PreparedFunctionSSA {
+    fn new(function: SSAFunction, mode: FunctionPrepareMode) -> Self {
+        let facts = PreparedFunctionFacts::collect(&function);
+        Self {
+            function,
+            mode,
+            facts,
+        }
+    }
+
     pub fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self {
-            function: SSAFunction::from_blocks_with_arch(blocks, arch)?,
-            mode: FunctionPrepareMode::Generic,
-        })
+        Some(Self::new(
+            SSAFunction::from_blocks_with_arch(blocks, arch)?,
+            FunctionPrepareMode::Generic,
+        ))
     }
 
     pub fn raw(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self {
-            function: SSAFunction::from_blocks_raw(blocks, arch)?,
-            mode: FunctionPrepareMode::Raw,
-        })
+        Some(Self::new(
+            SSAFunction::from_blocks_raw(blocks, arch)?,
+            FunctionPrepareMode::Raw,
+        ))
     }
 
     pub fn for_decompile(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self {
-            function: SSAFunction::from_blocks_for_decompile(blocks, arch)?,
-            mode: FunctionPrepareMode::Decompile,
-        })
+        Some(Self::new(
+            SSAFunction::from_blocks_for_decompile(blocks, arch)?,
+            FunctionPrepareMode::Decompile,
+        ))
     }
 
     pub fn for_patterns(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self {
-            function: SSAFunction::from_blocks_for_patterns(blocks, arch)?,
-            mode: FunctionPrepareMode::Patterns,
-        })
+        Some(Self::new(
+            SSAFunction::from_blocks_for_patterns(blocks, arch)?,
+            FunctionPrepareMode::Patterns,
+        ))
     }
 
     pub fn for_data_refs(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Some(Self {
-            function: SSAFunction::from_blocks_for_data_refs(blocks, arch)?,
-            mode: FunctionPrepareMode::DataRefs,
-        })
+        Some(Self::new(
+            SSAFunction::from_blocks_for_data_refs(blocks, arch)?,
+            FunctionPrepareMode::DataRefs,
+        ))
+    }
+
+    pub fn for_symbolic(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
+        let mut function = SSAFunction::from_blocks_raw(blocks, arch)?;
+        function.refresh_decompile_prep_facts(arch);
+        Some(Self::new(function, FunctionPrepareMode::Symbolic))
     }
 
     pub fn mode(&self) -> FunctionPrepareMode {
@@ -119,12 +139,28 @@ impl PreparedFunctionSSA {
         &self.function
     }
 
-    pub fn function_mut(&mut self) -> &mut SSAFunction {
-        &mut self.function
-    }
-
     pub fn into_function(self) -> SSAFunction {
         self.function
+    }
+
+    pub fn facts(&self) -> &PreparedFunctionFacts {
+        &self.facts
+    }
+
+    pub fn objects(&self) -> &ObjectModel {
+        &self.facts.objects
+    }
+
+    pub fn memory(&self) -> &MemorySSAFacts {
+        &self.facts.memory
+    }
+
+    pub fn predicates(&self) -> &PredicateFacts {
+        &self.facts.predicates
+    }
+
+    pub fn call_sites(&self) -> &CallSiteFacts {
+        &self.facts.call_sites
     }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -149,12 +185,6 @@ impl Deref for PreparedFunctionSSA {
 
     fn deref(&self) -> &Self::Target {
         &self.function
-    }
-}
-
-impl DerefMut for PreparedFunctionSSA {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.function
     }
 }
 
@@ -1254,7 +1284,7 @@ impl SSAFunction {
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
-                                    stack_root,
+                                    normalize_copied_stack_root_for_dst(dst, stack_root),
                                 );
                             }
                         }
@@ -1907,10 +1937,23 @@ fn resolve_stack_root(
 ) -> Option<StackAddressRoot> {
     let resolved = resolve_value_root(var, roots, family_state, family_info);
     stack_roots
-        .get(&resolved)
+        .get(var)
         .copied()
-        .or_else(|| stack_roots.get(var).copied())
+        .or_else(|| stack_roots.get(&resolved).copied())
         .or_else(|| stack_base_root_for_name(&resolved.name))
+}
+
+fn normalize_copied_stack_root_for_dst(dst: &SSAVar, root: StackAddressRoot) -> StackAddressRoot {
+    match stack_base_root_for_name(&dst.name) {
+        Some(StackAddressRoot {
+            base: StackAddressBase::FramePointer,
+            ..
+        }) => StackAddressRoot {
+            base: StackAddressBase::FramePointer,
+            offset: 0,
+        },
+        _ => root,
+    }
 }
 
 fn common_stack_root(
@@ -2228,6 +2271,323 @@ mod tests {
             local_blocks[0].ops,
             prepared.blocks().next().expect("entry block").ops
         );
+
+        let symbolic = PreparedFunctionSSA::for_symbolic(&blocks, Some(&arch))
+            .expect("symbolic prepared SSA should build");
+        assert_eq!(symbolic.mode(), FunctionPrepareMode::Symbolic);
+        assert!(
+            symbolic.decompile_prep_facts().is_some(),
+            "symbolic preparation should retain canonical prep facts for shared consumers"
+        );
+    }
+
+    #[test]
+    fn prepared_function_ssa_collects_object_memory_and_predicate_facts() {
+        let arch = make_x86_64_prep_arch();
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1100,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntSub {
+                        dst: Varnode {
+                            space: SpaceId::Unique,
+                            offset: 0x10,
+                            size: 8,
+                            meta: None,
+                        },
+                        a: make_reg(24, 8),
+                        b: make_const(0x20, 8),
+                    },
+                    R2ILOp::Load {
+                        dst: make_reg(0, 8),
+                        space: SpaceId::Ram,
+                        addr: Varnode {
+                            space: SpaceId::Unique,
+                            offset: 0x10,
+                            size: 8,
+                            meta: None,
+                        },
+                    },
+                    R2ILOp::Store {
+                        space: SpaceId::Ram,
+                        addr: make_const(0x4040, 8),
+                        val: make_reg(0, 8),
+                    },
+                    R2ILOp::IntEqual {
+                        dst: make_reg(8, 1),
+                        a: make_reg(0, 8),
+                        b: make_const(0, 8),
+                    },
+                    R2ILOp::CBranch {
+                        target: make_const(0x1108, 8),
+                        cond: make_reg(8, 1),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1104,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1108,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared = PreparedFunctionSSA::for_decompile(&blocks, Some(&arch))
+            .expect("prepared SSA should build");
+
+        assert!(
+            prepared
+                .objects()
+                .stack_objects
+                .contains_key(&StackAddressRoot {
+                    base: StackAddressBase::FramePointer,
+                    offset: -32,
+                }),
+            "stack-root-derived stack object should be materialized"
+        );
+        assert!(
+            prepared
+                .objects()
+                .global_objects
+                .iter()
+                .any(|(key, _)| key.address == 0x4040),
+            "constant RAM address should seed a global object"
+        );
+
+        let entry = prepared.get_block(0x1100).expect("entry block");
+        let load_ref = SliceOpRef::Op {
+            block_addr: 0x1100,
+            op_idx: 1,
+        };
+        let store_ref = SliceOpRef::Op {
+            block_addr: 0x1100,
+            op_idx: 2,
+        };
+        assert!(
+            prepared.memory().uses_by_op.contains_key(&load_ref),
+            "load should read through MemorySSA facts"
+        );
+        assert!(
+            prepared.memory().defs_by_op.contains_key(&store_ref),
+            "store should define a new memory version"
+        );
+        assert_eq!(entry.ops.len(), 5);
+
+        assert_eq!(prepared.predicates().predicates.len(), 1);
+        let predicate = prepared
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("branch predicate");
+        assert_eq!(predicate.block_addr, 0x1100);
+        assert_eq!(predicate.true_target, 0x1108);
+        assert_eq!(predicate.false_target, 0x1104);
+        assert_eq!(
+            predicate.comparison.as_ref().map(|cmp| cmp.kind),
+            Some(crate::semantic::CompareKind::Equal)
+        );
+        assert!(
+            prepared
+                .predicates()
+                .block_assumptions
+                .contains_key(&0x1104)
+        );
+        assert!(
+            prepared
+                .predicates()
+                .block_assumptions
+                .contains_key(&0x1108)
+        );
+    }
+
+    #[test]
+    fn prepared_function_ssa_collects_call_sites_and_memory_effects() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1200,
+                size: 4,
+                ops: vec![R2ILOp::Call {
+                    target: make_const(0x401000, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1204,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared = PreparedFunctionSSA::raw(&blocks, None).expect("prepared SSA should build");
+        let call = prepared
+            .call_sites()
+            .by_id
+            .values()
+            .next()
+            .expect("call site fact");
+        assert_eq!(call.direct_target, Some(0x401000));
+        assert_eq!(call.fallthrough, Some(0x1204));
+        assert_eq!(
+            call.memory_effect,
+            crate::semantic::CallMemoryEffect::Unknown
+        );
+
+        let call_ref = call.at;
+        let uses = prepared
+            .memory()
+            .uses_by_op
+            .get(&call_ref)
+            .expect("call memory use fact");
+        let defs = prepared
+            .memory()
+            .defs_by_op
+            .get(&call_ref)
+            .expect("call memory def fact");
+        assert_eq!(uses.len(), 1);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(uses[0].location.object, defs[0].location.object);
+        assert_eq!(
+            prepared
+                .objects()
+                .object(uses[0].location.object)
+                .map(|fact| &fact.kind),
+            Some(&crate::semantic::ObjectKind::EscapedUnknown)
+        );
+    }
+
+    #[test]
+    fn prepared_function_ssa_recovers_direct_call_target_from_ram_literal() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1300,
+                size: 4,
+                ops: vec![R2ILOp::Call {
+                    target: make_ram(0x401239, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1304,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared = PreparedFunctionSSA::raw(&blocks, None).expect("prepared SSA should build");
+        let call = prepared
+            .call_sites()
+            .by_id
+            .values()
+            .next()
+            .expect("call site fact");
+        assert_eq!(call.direct_target, Some(0x401239));
+        assert_eq!(call.fallthrough, Some(0x1304));
+    }
+
+    #[test]
+    fn prepared_function_ssa_builds_memory_phis_per_object() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1300,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1308, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1304,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Store {
+                        space: SpaceId::Ram,
+                        addr: make_const(0x5000, 8),
+                        val: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x130c, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1308,
+                size: 4,
+                ops: vec![R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: make_const(0x5000, 8),
+                    val: make_const(2, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x130c,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Load {
+                        dst: make_reg(0, 8),
+                        space: SpaceId::Ram,
+                        addr: make_const(0x5000, 8),
+                    },
+                    R2ILOp::Return {
+                        target: make_reg(0, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared = PreparedFunctionSSA::raw(&blocks, None).expect("prepared SSA should build");
+        let phis = prepared
+            .memory()
+            .phis_by_block
+            .get(&0x130c)
+            .expect("merge-block memory phi");
+        assert_eq!(phis.len(), 1);
+        assert_eq!(phis[0].inputs.len(), 2);
+
+        let load_ref = SliceOpRef::Op {
+            block_addr: 0x130c,
+            op_idx: 0,
+        };
+        let load_use = prepared
+            .memory()
+            .uses_by_op
+            .get(&load_ref)
+            .and_then(|facts| facts.first())
+            .expect("load use");
+        assert_eq!(load_use.version, phis[0].output_version);
     }
 
     #[test]
@@ -3049,6 +3409,60 @@ mod tests {
         assert_eq!(
             facts.canonical_root_of(&SSAVar::new("tmp:4", 1, 8)),
             Some(&SSAVar::new("tmp:3", 1, 8))
+        );
+    }
+
+    #[test]
+    fn test_frame_pointer_copy_rebases_stack_root_to_zero() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntSub {
+                dst: SSAVar::new("rsp", 1, 8),
+                a: SSAVar::new("rsp", 0, 8),
+                b: SSAVar::constant(8, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("rbp", 1, 8),
+                src: SSAVar::new("rsp", 1, 8),
+            },
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:fp_slot", 1, 8),
+                a: SSAVar::new("rbp", 1, 8),
+                b: SSAVar::constant(0xffffffffffffffe8, 8),
+            },
+        ];
+        func.refresh_decompile_prep_facts(None);
+
+        let facts = func.decompile_prep_facts().expect("prep facts");
+        assert_eq!(
+            facts.stack_address_root_of(&SSAVar::new("rsp", 1, 8)),
+            Some(&StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -8,
+            })
+        );
+        assert_eq!(
+            facts.stack_address_root_of(&SSAVar::new("rbp", 1, 8)),
+            Some(&StackAddressRoot {
+                base: StackAddressBase::FramePointer,
+                offset: 0,
+            })
+        );
+        assert_eq!(
+            facts.stack_address_root_of(&SSAVar::new("tmp:fp_slot", 1, 8)),
+            Some(&StackAddressRoot {
+                base: StackAddressBase::FramePointer,
+                offset: -24,
+            })
         );
     }
 }

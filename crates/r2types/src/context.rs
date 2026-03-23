@@ -332,7 +332,6 @@ pub fn parse_external_context_json(json_str: &str, ptr_bits: u32) -> ParsedExter
     let (register_params, stack_slots) = parse_external_vars(&raw.vars, ptr_bits);
     parsed.register_params = register_params;
     parsed.stack_slots = stack_slots;
-    parsed.external_stack_vars = legacy_external_stack_vars_from_slots(&parsed.stack_slots);
     parsed.external_type_db = external_type_db_from_base_types(&raw.base_types, ptr_bits);
     parsed.known_function_signatures = parse_known_signatures(&raw.known_signatures, ptr_bits);
     parsed.merged_signature = merge_signature_with_register_params(
@@ -817,8 +816,11 @@ mod tests {
             })
         );
         assert_eq!(
-            ctx.external_stack_vars
-                .get(&-16)
+            ctx.stack_slots
+                .get(&StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: -16,
+                })
                 .map(|var| var.name.as_str()),
             Some("local_10h")
         );
@@ -886,11 +888,7 @@ mod tests {
         assert_eq!(sp_local.role, ExternalStackSlotRole::Local);
         assert_eq!(sp_local.name, "sp_local");
 
-        let legacy = ctx
-            .external_stack_vars
-            .get(&16)
-            .expect("legacy offset-only view should still exist");
-        assert_eq!(legacy.name, "spill_arr");
+        assert!(ctx.external_stack_vars.is_empty());
     }
 
     #[test]

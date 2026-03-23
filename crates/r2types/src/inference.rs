@@ -12,7 +12,10 @@ use crate::{
     ResolvedFieldLayout, ResolvedSignature, SignatureRegistry, Signedness, SolvedTypes,
     SolverConfig, StackSlotKey, Type, TypeArena, TypeId, TypeOracle, TypeSolver, to_c_type_like,
 };
-use r2ssa::{DecompilePrepFacts, SSAFunction, SSAOp, SSAVar, StackAddressBase, StackAddressRoot};
+use r2ssa::{
+    DecompilePrepFacts, ObjectKind, PreparedFunctionSSA, SSAFunction, SSAOp, SSAVar,
+    StackAddressBase, StackAddressRoot,
+};
 
 /// Type inference context.
 pub struct TypeInference {
@@ -135,6 +138,32 @@ impl TypeInference {
         for (var, root) in &facts.stack_address_roots {
             self.ssa_stack_slots
                 .insert(var.clone(), stack_slot_key_from_root(*root));
+        }
+    }
+
+    /// Set SSA -> stack-slot bindings from the canonical prepared SSA artifact.
+    pub fn set_prepared_ssa(&mut self, prepared: &PreparedFunctionSSA) {
+        self.ssa_stack_slots.clear();
+
+        for (var, object) in &prepared.objects().value_objects {
+            let Some(object_fact) = prepared.objects().object(*object) else {
+                continue;
+            };
+            let root = match object_fact.kind {
+                ObjectKind::StackSlot { base, offset }
+                | ObjectKind::FrameObject { base, offset } => StackAddressRoot { base, offset },
+                _ => continue,
+            };
+            self.ssa_stack_slots
+                .insert(var.clone(), stack_slot_key_from_root(root));
+        }
+
+        if let Some(facts) = prepared.decompile_prep_facts() {
+            for (var, root) in &facts.stack_address_roots {
+                self.ssa_stack_slots
+                    .entry(var.clone())
+                    .or_insert_with(|| stack_slot_key_from_root(*root));
+            }
         }
     }
 
@@ -2099,6 +2128,67 @@ mod tests {
             ti.stack_slot_spec_for_var(&SSAVar::new("count", 1, 8))
                 .is_none(),
             "legacy offset-only metadata must not bind unrelated SSA vars by name"
+        );
+    }
+
+    #[test]
+    fn set_prepared_ssa_uses_canonical_stack_objects_for_slot_binding() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RBP", 0x20, 8));
+
+        let prepared = PreparedFunctionSSA::for_decompile(
+            &[R2ILBlock {
+                addr: 0x2000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntSub {
+                        dst: Varnode::unique(0x10, 8),
+                        a: Varnode::register(0x20, 8),
+                        b: Varnode::constant(0x10, 8),
+                    },
+                    R2ILOp::Return {
+                        target: Varnode::constant(0, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&arch),
+        )
+        .expect("prepared SSA");
+
+        let mut ti = TypeInference::new(64);
+        ti.set_external_stack_slots(BTreeMap::from([(
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -16,
+            },
+            ExternalStackVarSpec {
+                name: "slot".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+                base: ExternalStackBase::FramePointer,
+                role: crate::ExternalStackSlotRole::Local,
+                param_index: None,
+                param_name: None,
+                source_reg: None,
+            },
+        )]));
+        ti.set_prepared_ssa(&prepared);
+
+        let slot_var = prepared
+            .objects()
+            .value_objects
+            .keys()
+            .find(|var| var.name.starts_with("tmp:"))
+            .cloned()
+            .expect("stack-root value");
+        assert_eq!(
+            ti.stack_slot_spec_for_var(&slot_var)
+                .map(|slot| slot.name.as_str()),
+            Some("slot")
         );
     }
 }

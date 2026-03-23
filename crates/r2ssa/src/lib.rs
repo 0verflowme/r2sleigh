@@ -21,11 +21,13 @@ pub mod cfg;
 pub mod defuse;
 pub mod domtree;
 pub mod function;
+pub mod interproc;
 mod naming;
 pub mod op;
 pub mod optimize;
 pub mod phi;
 pub mod rename;
+pub mod semantic;
 pub mod taint;
 pub mod var;
 
@@ -39,7 +41,18 @@ pub use function::{
     PreparedFunctionSSA, SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite,
     StackAddressBase, StackAddressRoot, SwitchInfo,
 };
+pub use interproc::{
+    AbiProfile, FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput,
+    InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet, SummaryArgEffect,
+    SummaryReturnRelation, solve_interproc_summary_set,
+};
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};
+pub use semantic::{
+    BlockAssumption, CallMemoryEffect, CallSiteFact, CallSiteFacts, CallSiteId, CompareKind,
+    CompareProvenance, GlobalObjectKey, MemoryDefFact, MemoryLocation, MemoryPhiFact,
+    MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
+    PredicateFact, PredicateFacts, PredicateId, PreparedFunctionFacts, SwitchPredicateFact,
+};
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
 pub use var::SSAVar;

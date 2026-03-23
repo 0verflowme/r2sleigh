@@ -16,9 +16,9 @@
 //!
 //! ```ignore
 //! use r2sym::{ExploreConfig, PathExplorer, SymState};
-//! use r2ssa::SSAFunction;
+//! use r2ssa::PreparedFunctionSSA;
 //!
-//! let func = SSAFunction::from_blocks(&blocks).unwrap();
+//! let func = PreparedFunctionSSA::for_symbolic(&blocks, None).unwrap();
 //! let ctx = z3::Context::thread_local();
 //!
 //! let mut state = SymState::new(&ctx, func.entry);
@@ -37,6 +37,7 @@ pub mod executor;
 pub mod memory;
 pub mod path;
 pub mod r2api;
+pub mod runtime;
 pub mod sim;
 pub mod solver;
 pub mod state;
@@ -46,7 +47,10 @@ pub use executor::{CallHookResult, SymExecutor};
 pub use memory::SymMemory;
 pub use path::{ExploreConfig, PathExplorer, PathResult, SolvedPath};
 pub use r2api::{R2Api, R2Error};
-pub use sim::{CallConv, CallInfo, FunctionSummary, SummaryEffect, SummaryRegistry};
+pub use runtime::seed_default_state_for_arch;
+pub use sim::{
+    CallConv, CallInfo, FunctionSummary, SummaryEffect, SummaryInstallStats, SummaryRegistry,
+};
 pub use solver::{SatResult, SymModel, SymSolver};
 pub use state::{SymState, SymbolicMemoryRegion};
 pub use value::SymValue;

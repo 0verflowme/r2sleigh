@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use r2ssa::{CFGEdge, SSAFunction};
+use r2ssa::cfg::BlockTerminator;
 
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
@@ -78,6 +79,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn compute_safety_budget(num_blocks: usize) -> usize {
         num_blocks.saturating_mul(128).max(256)
+    }
+
+    fn is_unresolved_indirect_dispatch_block(&self, addr: u64) -> bool {
+        let Some(cfg_block) = self.func.cfg().get_block(addr) else {
+            return false;
+        };
+
+        matches!(
+            cfg_block.terminator,
+            r2ssa::cfg::BlockTerminator::IndirectBranch
+        ) && self.func.successors(addr).is_empty()
+            && self.func.switch_info(addr).is_none()
     }
 
     fn reset_safety_budget(&mut self) {
@@ -233,12 +246,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Get the switch expression from a block.
     fn get_switch_expression(&mut self, addr: u64) -> CExpr {
-        let block = match self.func.get_block(addr) {
+        let switch_addr = self.unique_switch_block().unwrap_or(addr);
+        let block = match self.func.get_block(switch_addr) {
             Some(b) => b,
             None => return CExpr::Var("switch_expr".to_string()),
         };
 
-        if let Some(expr) = self.fold_ctx.resolve_switch_expr_for_block(addr) {
+        if let Some(expr) = self.fold_ctx.resolve_switch_expr_for_block(switch_addr) {
+            return expr;
+        }
+
+        if let Some(expr) =
+            Self::selector_expr_from_condition(&self.get_branch_condition(switch_addr))
+        {
+            return expr;
+        }
+        if let Some(expr) = self.selector_expr_from_switch_predecessors(switch_addr) {
             return expr;
         }
 
@@ -249,11 +272,38 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         }
 
-        if let Some(expr) = Self::selector_expr_from_condition(&self.get_branch_condition(addr)) {
-            return expr;
-        }
-
         CExpr::Var("test".to_string())
+    }
+
+    fn unique_switch_block(&self) -> Option<u64> {
+        let mut switch_blocks = self
+            .func
+            .cfg()
+            .block_addrs()
+            .filter(|addr| {
+                self.func
+                    .cfg()
+                    .get_block(*addr)
+                    .is_some_and(|block| matches!(block.terminator, BlockTerminator::Switch { .. }))
+            });
+        let block = switch_blocks.next()?;
+        if switch_blocks.next().is_some() {
+            return None;
+        }
+        Some(block)
+    }
+
+    fn selector_expr_from_switch_predecessors(&mut self, addr: u64) -> Option<CExpr> {
+        let mut candidates = self
+            .func
+            .predecessors(addr)
+            .into_iter()
+            .filter_map(|pred| {
+                Self::selector_expr_from_condition(&self.get_branch_condition(pred))
+            })
+            .collect::<Vec<_>>();
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates.pop()).flatten()
     }
 
     fn selector_expr_from_condition(cond: &CExpr) -> Option<CExpr> {
@@ -262,7 +312,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 Self::selector_expr_from_condition(inner)
             }
             CExpr::Binary {
-                op: BinaryOp::Eq | BinaryOp::Ne,
+                op:
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge,
                 left,
                 right,
             } => {
@@ -479,6 +535,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Structure a single basic block.
     fn structure_block(&mut self, addr: u64) -> CStmt {
+        if self.is_unresolved_indirect_dispatch_block(addr) {
+            return CStmt::Empty;
+        }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
             None => return CStmt::Empty,
@@ -554,6 +613,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Emit statements for a block directly into an existing statement list
     /// (without wrapping in CStmt::Block). Used for loop body flattening.
     fn structure_block_stmts_into(&mut self, addr: u64, stmts: &mut Vec<CStmt>) {
+        if self.is_unresolved_indirect_dispatch_block(addr) {
+            return;
+        }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
             None => return,
@@ -596,6 +658,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Used for condition/switch header blocks where statements must appear before
     /// the structured control-flow construct.
     fn structure_block_prefix_stmts(&mut self, addr: u64) -> Vec<CStmt> {
+        if self.is_unresolved_indirect_dispatch_block(addr) {
+            return Vec::new();
+        }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
             None => return Vec::new(),
@@ -1194,11 +1259,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         };
 
         let lhs = CExpr::Var(local_name);
-        if lhs == *expr {
+        let resolved_expr = self.fold_ctx.resolve_return_candidate(expr);
+        if lhs == *expr || lhs == resolved_expr {
             return stmt;
         }
 
-        let assignment = CStmt::Expr(CExpr::assign(lhs, expr.clone()));
+        let assignment = CStmt::Expr(CExpr::assign(lhs, resolved_expr.clone()));
         if Self::stmt_starts_with_assignment(&stmt, &assignment) {
             return stmt;
         }

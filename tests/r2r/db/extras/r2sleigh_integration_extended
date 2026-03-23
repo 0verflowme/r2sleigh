@@ -759,6 +759,18 @@ a:sla.dec sym.process_string | jq -Rs '(contains("len = sym.imp.strlen(s);")) an
 EOF_CMDS
 RUN
 
+NAME=dec_process_string_prunes_dead_temps_after_predicate_rewrite
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.dec sym.process_string | jq -Rs '(contains("tmp:")|not) and (test("(^|[^A-Za-z0-9_])t[0-9a-f]+(_[0-9]+)?([^A-Za-z0-9_]|$)")|not)'
+EOF_CMDS
+RUN
+
 NAME=dec_authenticate_keeps_strcmp_condition_shape
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -807,6 +819,18 @@ a:sla.dec sym.vuln_memcpy | jq -Rs 'contains("sym.imp.memcpy(buf, user_input, us
 EOF_CMDS
 RUN
 
+NAME=dec_dbg_vuln_memcpy_keeps_debug_symbol_namespace
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.dec dbg.vuln_memcpy | jq -Rs 'contains("int64_t dbg.vuln_memcpy") and contains("sym.imp.memcpy(buf, user_input, user_len);") and contains("sym.imp.printf(\"Copied: %s\\n\", buf);") and (contains("r2dec fallback:")|not)'
+EOF_CMDS
+RUN
+
 NAME=dec_my_strdup_reuses_strlen_and_malloc_owner
 FILE=bins/stress_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -816,6 +840,42 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 a:sla.dec sym.my_strdup | jq -Rs 'contains("len = sym.imp.strlen(s);") and ((split("sym.imp.strlen(s)") | length) == 2) and ((contains("var_10h = sym.imp.malloc(len + 1);")) or contains("dup = sym.imp.malloc(len + 1);")) and ((contains("if (var_10h == 0)")) or contains("if (dup == 0)") or contains("if (!dup)")) and ((contains("sym.imp.memcpy(var_10h, s, len + 1);")) or contains("sym.imp.memcpy(dup, s, len + 1);")) and ((contains("return var_10h;")) or contains("return dup;")) and (contains("tmp:11f80")|not) and (contains("sym.imp.malloc(sym.imp")|not)'
+EOF_CMDS
+RUN
+
+NAME=dec_my_strdup_prunes_dead_register_artifacts
+FILE=bins/stress_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.dec sym.my_strdup | jq -Rs '(contains("rax =")|not) and (contains("tmp:")|not) and (contains("t3")|not)'
+EOF_CMDS
+RUN
+
+NAME=dec_vuln_test_main_aaa_structural_smoke
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.dec sym.main | jq -Rs 'contains("return 1;") and contains("switch (") and contains("check_secret") and contains("process_string") and contains("authenticate") and contains("alloc_and_copy") and (contains("r2dec fallback:")|not)'
+EOF_CMDS
+RUN
+
+NAME=dec_vuln_test_main_aaaa_structural_smoke
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaaa
+a:sla.dec sym.main | jq -Rs 'contains("return 1;") and contains("switch (") and contains("check_secret") and contains("process_string") and contains("authenticate") and contains("alloc_and_copy") and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 

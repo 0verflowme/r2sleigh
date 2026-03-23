@@ -8,7 +8,7 @@ use crate::{
     ArchSpec, Disassembler, InferredParam, InferredParamJson, InferredSignatureCcJson, R2ILBlock,
     R2ILContext,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
@@ -18,9 +18,18 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 const ANALYSIS_CACHE_LIMIT: usize = 256;
 
+fn should_reuse_decompile_ssa_for_pattern_analysis(prepared: &r2ssa::PreparedFunctionSSA) -> bool {
+    let summary = prepared.function().cfg_risk_summary();
+    summary.block_count >= 96
+        && summary.switch_block_count > 0
+        && summary.max_switch_cases >= 32
+        && summary.back_edge_count == 0
+}
+
 pub(crate) struct FunctionInput<'a> {
     pub(crate) ctx: PluginCtxView<'a>,
     pub(crate) blocks: BlockSlice,
+    pub(crate) function_addr: u64,
     pub(crate) function_name: String,
 }
 
@@ -36,6 +45,7 @@ pub(crate) struct FunctionAnalysisArtifact {
     pub(crate) pattern_ssa_func: r2ssa::PreparedFunctionSSA,
     pub(crate) type_facts: r2types::FunctionTypeFacts,
     pub(crate) writeback_plan: r2types::TypeWritebackPlan,
+    pub(crate) interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -49,6 +59,7 @@ struct FunctionArtifactCacheKey {
     analysis: FunctionAnalysisCacheKey,
     semantic_metadata_enabled: bool,
     external_context_hash: u64,
+    interproc_scope_hash: u64,
 }
 
 struct HasherWriter<'a, H: Hasher>(&'a mut H);
@@ -75,9 +86,9 @@ fn hash_optional_arch(arch: Option<&ArchSpec>) -> u64 {
     arch.and_then(hash_json_value).unwrap_or(0)
 }
 
-fn hash_external_context_json(external_context_json: &str) -> u64 {
+fn hash_string_payload(payload: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    external_context_json.hash(&mut hasher);
+    payload.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -98,11 +109,13 @@ fn function_artifact_cache_key_parts(
     blocks: &[R2ILBlock],
     semantic_metadata_enabled: bool,
     external_context_json: &str,
+    interproc_scope_json: &str,
 ) -> Option<FunctionArtifactCacheKey> {
     Some(FunctionArtifactCacheKey {
         analysis: function_analysis_cache_key_parts(function_name, arch, blocks)?,
         semantic_metadata_enabled,
-        external_context_hash: hash_external_context_json(external_context_json),
+        external_context_hash: hash_string_payload(external_context_json),
+        interproc_scope_hash: hash_string_payload(interproc_scope_json),
     })
 }
 
@@ -151,12 +164,14 @@ fn rename_function_analysis_artifact(
         pattern_ssa_func,
         type_facts,
         writeback_plan,
+        interproc_summary_set,
     } = artifact;
     FunctionAnalysisArtifact {
         ssa_func: ssa_func.with_name(function_name),
         pattern_ssa_func: pattern_ssa_func.with_name(function_name),
         type_facts,
         writeback_plan,
+        interproc_summary_set,
     }
 }
 
@@ -351,6 +366,7 @@ pub(crate) fn build_function_input<'a>(
     Some(FunctionInput {
         ctx,
         blocks,
+        function_addr: fcn_addr,
         function_name: resolve_function_name(fcn_addr, fcn_name),
     })
 }
@@ -358,6 +374,7 @@ pub(crate) fn build_function_input<'a>(
 fn function_artifact_cache_key(
     input: &FunctionInput<'_>,
     external_context_json: &str,
+    interproc_scope_json: &str,
 ) -> Option<FunctionArtifactCacheKey> {
     function_artifact_cache_key_parts(
         &input.function_name,
@@ -365,6 +382,7 @@ fn function_artifact_cache_key(
         input.blocks.as_slice(),
         input.ctx.semantic_metadata_enabled,
         external_context_json,
+        interproc_scope_json,
     )
 }
 
@@ -385,8 +403,11 @@ fn build_function_analysis_from_parts(
 
     let ssa_func =
         r2ssa::PreparedFunctionSSA::for_decompile(blocks, arch)?.with_name(function_name);
-    let pattern_ssa_func =
-        r2ssa::PreparedFunctionSSA::for_patterns(blocks, arch)?.with_name(function_name);
+    let pattern_ssa_func = if should_reuse_decompile_ssa_for_pattern_analysis(&ssa_func) {
+        ssa_func.clone()
+    } else {
+        r2ssa::PreparedFunctionSSA::for_patterns(blocks, arch)?.with_name(function_name)
+    };
     let analysis = FunctionAnalysis {
         ssa_func,
         pattern_ssa_func,
@@ -403,6 +424,99 @@ pub(crate) fn build_function_analysis(input: &FunctionInput<'_>) -> Option<Funct
     )
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct InterprocScopeSeedNameJson {
+    id: u64,
+    name: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct InterprocScopeInputJson {
+    #[serde(default)]
+    summaries: Vec<r2ssa::FunctionSemanticSummary>,
+    #[serde(default)]
+    seeds: Vec<InterprocScopeSeedNameJson>,
+    #[serde(default)]
+    payloads: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct InterprocScopeSignaturePayloadJson {
+    #[serde(default)]
+    function_name: String,
+    #[serde(default)]
+    params: Vec<serde_json::Value>,
+}
+
+fn parse_interproc_seed_summaries(
+    scope_json: &str,
+) -> BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary> {
+    let Ok(scope) = serde_json::from_str::<InterprocScopeInputJson>(scope_json) else {
+        return BTreeMap::new();
+    };
+    let mut seeds = BTreeMap::new();
+
+    for summary in scope.summaries {
+        seeds.insert(summary.id, summary);
+    }
+    for payload in scope.payloads {
+        let Some(interproc) = payload.get("interproc") else {
+            continue;
+        };
+        let Some(summary_value) = interproc.get("summary") else {
+            continue;
+        };
+        let Ok(mut summary) =
+            serde_json::from_value::<r2ssa::FunctionSemanticSummary>(summary_value.clone())
+        else {
+            continue;
+        };
+        if payload.get("params").is_some()
+            && let Ok(signature) =
+                serde_json::from_value::<InterprocScopeSignaturePayloadJson>(payload.clone())
+            && !signature.function_name.trim().is_empty()
+        {
+            summary.arg_count_hint = Some(signature.params.len());
+        }
+        seeds.insert(summary.id, summary);
+    }
+    for seed in scope.seeds {
+        let id = r2ssa::InterprocFunctionId(seed.id);
+        if let Some(summary) = r2ssa::FunctionSemanticSummary::seed_for_name(id, &seed.name) {
+            seeds.insert(id, summary);
+        } else {
+            seeds
+                .entry(id)
+                .or_insert_with(|| r2ssa::FunctionSemanticSummary::unknown(id, Some(seed.name)));
+        }
+    }
+
+    seeds
+}
+
+pub(crate) fn build_interproc_summary_set(
+    input: &FunctionInput<'_>,
+    analysis: &FunctionAnalysis,
+    scope_json: &str,
+    max_iterations: usize,
+) -> r2ssa::InterprocSummarySet {
+    let root = r2ssa::InterprocFunctionId(input.function_addr);
+    let seeds = parse_interproc_seed_summaries(scope_json);
+    r2ssa::solve_interproc_summary_set(
+        &[r2ssa::InterprocFunctionInput {
+            id: root,
+            name: Some(input.function_name.clone()),
+            prepared: &analysis.ssa_func,
+        }],
+        input.ctx.arch,
+        Some(root),
+        &seeds,
+        r2ssa::InterprocSolveConfig {
+            max_iterations: max_iterations.max(1),
+        },
+    )
+}
+
 pub(crate) fn infer_signature_cc_from_analysis(
     input: &FunctionInput<'_>,
     analysis: &FunctionAnalysis,
@@ -416,7 +530,7 @@ pub(crate) fn infer_signature_cc_from_analysis(
     var_recovery.recover(&analysis.ssa_func);
 
     let mut type_inference = r2types::TypeInference::new(env.cfg.ptr_size);
-    type_inference.set_decompile_prep_facts(analysis.ssa_func.decompile_prep_facts());
+    type_inference.set_prepared_ssa(&analysis.ssa_func);
     type_inference.infer_function(&analysis.ssa_func);
 
     let mut inferred_params: Vec<InferredParam> = var_recovery
@@ -641,10 +755,11 @@ fn signature_strength(signature: &r2types::FunctionSignatureSpec) -> u8 {
     }
 }
 
-fn build_function_analysis_artifact_from_analysis(
+pub(crate) fn build_function_analysis_artifact_from_analysis(
     input: &FunctionInput<'_>,
     analysis: FunctionAnalysis,
     external_context_json: &str,
+    interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
 ) -> Option<FunctionAnalysisArtifact> {
     let ptr_bits = input
         .ctx
@@ -696,6 +811,7 @@ fn build_function_analysis_artifact_from_analysis(
             slot_type_overrides,
             slot_field_profiles,
         ),
+        interproc_summary_set: interproc_summary_set.clone(),
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
     Some(FunctionAnalysisArtifact {
@@ -703,14 +819,19 @@ fn build_function_analysis_artifact_from_analysis(
         pattern_ssa_func: analysis.pattern_ssa_func,
         type_facts: writeback.type_facts,
         writeback_plan: writeback.plan,
+        interproc_summary_set,
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_function_analysis_artifact(
     input: &FunctionInput<'_>,
     external_context_json: &str,
+    interproc_scope_json: &str,
+    interproc_max_iterations: usize,
 ) -> Option<FunctionAnalysisArtifact> {
-    let cache_key = function_artifact_cache_key(input, external_context_json)?;
+    let cache_key =
+        function_artifact_cache_key(input, external_context_json, interproc_scope_json)?;
     if let Some(cached) = artifact_cache()
         .read()
         .expect("plugin cache read lock poisoned")
@@ -724,8 +845,18 @@ pub(crate) fn build_function_analysis_artifact(
     }
 
     let analysis = build_function_analysis(input)?;
-    let artifact =
-        build_function_analysis_artifact_from_analysis(input, analysis, external_context_json)?;
+    let interproc_summary_set = build_interproc_summary_set(
+        input,
+        &analysis,
+        interproc_scope_json,
+        interproc_max_iterations,
+    );
+    let artifact = build_function_analysis_artifact_from_analysis(
+        input,
+        analysis,
+        external_context_json,
+        Some(interproc_summary_set),
+    )?;
     cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
     Some(rename_function_analysis_artifact(
         artifact,
@@ -737,7 +868,7 @@ pub(crate) fn get_cached_function_analysis_artifact(
     input: &FunctionInput<'_>,
     external_context_json: &str,
 ) -> Option<FunctionAnalysisArtifact> {
-    let cache_key = function_artifact_cache_key(input, external_context_json)?;
+    let cache_key = function_artifact_cache_key(input, external_context_json, "{}")?;
     artifact_cache()
         .read()
         .expect("plugin cache read lock poisoned")
@@ -753,10 +884,12 @@ pub(crate) fn alias_cached_function_analysis_artifact(
     source_external_context_json: &str,
     target_external_context_json: &str,
 ) -> bool {
-    let Some(source_key) = function_artifact_cache_key(input, source_external_context_json) else {
+    let Some(source_key) = function_artifact_cache_key(input, source_external_context_json, "{}")
+    else {
         return false;
     };
-    let Some(target_key) = function_artifact_cache_key(input, target_external_context_json) else {
+    let Some(target_key) = function_artifact_cache_key(input, target_external_context_json, "{}")
+    else {
         return false;
     };
     let Some(cached) = artifact_cache()
@@ -787,6 +920,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
         blocks,
         semantic_metadata_enabled,
         external_context_json,
+        "{}",
     )?;
     if let Some(cached) = artifact_cache()
         .read()
@@ -809,7 +943,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
     let mut var_recovery = r2dec::VariableRecovery::new(&cfg.sp_name, &cfg.fp_name, cfg.ptr_size);
     var_recovery.recover(&analysis.ssa_func);
     let mut type_inference = r2types::TypeInference::new(cfg.ptr_size);
-    type_inference.set_decompile_prep_facts(analysis.ssa_func.decompile_prep_facts());
+    type_inference.set_prepared_ssa(&analysis.ssa_func);
     type_inference.infer_function(&analysis.ssa_func);
 
     let mut inferred_params: Vec<InferredParam> = var_recovery
@@ -944,6 +1078,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
             slot_type_overrides,
             slot_field_profiles,
         ),
+        interproc_summary_set: None,
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
     let artifact = FunctionAnalysisArtifact {
@@ -951,6 +1086,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
         pattern_ssa_func: analysis.pattern_ssa_func,
         type_facts: writeback.type_facts,
         writeback_plan: writeback.plan,
+        interproc_summary_set: None,
     };
     cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
     Some(rename_function_analysis_artifact(artifact, function_name))
@@ -2921,6 +3057,43 @@ mod tests {
             refs.iter()
                 .any(|r| { r.from == 0x401000 && r.to == 0xdeadbeef && r.ref_type == "d" }),
             "const add chain should emit DATA xref to the computed target"
+        );
+    }
+
+    #[test]
+    fn parse_interproc_seed_summaries_prefers_recognized_seed_over_payload_summary() {
+        let scope_json = serde_json::json!({
+            "payloads": [{
+                "interproc": {
+                    "summary": {
+                        "id": 0x2000u64,
+                        "name": "sym.imp.malloc",
+                        "direct_callees": [],
+                        "callsite_count": 0,
+                        "has_unknown_calls": false,
+                        "arg_effects": {},
+                        "return_relation": "Void",
+                        "reads_global_memory": false,
+                        "writes_global_memory": false,
+                        "touches_unknown_memory": false
+                    }
+                }
+            }],
+            "seeds": [{
+                "id": 0x2000u64,
+                "name": "sym.imp.malloc"
+            }]
+        })
+        .to_string();
+
+        let summaries = parse_interproc_seed_summaries(&scope_json);
+        let summary = summaries
+            .get(&r2ssa::InterprocFunctionId(0x2000))
+            .expect("seed summary should exist");
+
+        assert_eq!(
+            summary.return_relation,
+            r2ssa::SummaryReturnRelation::HeapAlloc
         );
     }
 

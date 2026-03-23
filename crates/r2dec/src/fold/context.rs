@@ -1,18 +1,36 @@
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::CType;
-use r2ssa::{FunctionSSABlock, SSAVar};
+use r2ssa::{
+    CallSiteFacts, FunctionSSABlock, InterprocSummarySet, MemorySSAFacts, ObjectModel,
+    PredicateFacts, PreparedFunctionSSA, SSAVar,
+};
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
 use r2types::{
-    ExternalStackSlotSpec, ExternalTypeDb, FunctionType, SignatureRegistry, StackSlotKey,
-    TypeOracle, VisibleBinding,
+    CalleeFact, ExternalStackSlotSpec, ExternalTypeDb, FunctionType, SignatureRegistry,
+    StackSlotKey, TypeOracle, VisibleBinding,
 };
 
 pub(crate) type SSABlock = FunctionSSABlock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ResolutionPhase {
+    Semantic,
+    Definition,
+    DefinitionRaw,
+    Visible,
+    ImportedArg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ResolutionGuardKey {
+    pub(crate) phase: ResolutionPhase,
+    pub(crate) name: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PtrArith {
@@ -39,6 +57,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) strings: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
+    pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
@@ -48,6 +67,14 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
+    pub(crate) prepared_ssa: Option<&'a PreparedFunctionSSA>,
+    pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
+    pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
+    pub(crate) prepared_objects: Option<&'a ObjectModel>,
+    #[allow(dead_code)]
+    pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
+    pub(crate) prepared_predicates: Option<&'a PredicateFacts>,
+    pub(crate) prepared_call_sites: Option<&'a CallSiteFacts>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +89,7 @@ pub struct FoldingContext<'a> {
     pub(crate) inputs: FoldInputs<'a>,
     pub(crate) state: FoldState,
     pub(crate) current_block_addr: Cell<Option<u64>>,
+    pub(crate) current_op_idx: Cell<Option<usize>>,
     pub(crate) hide_stack_frame: bool,
     pub(crate) userop_names: HashMap<u32, String>,
     pub(crate) signature_registry: SignatureRegistry,
@@ -77,10 +105,13 @@ pub struct FoldingContext<'a> {
     pub(crate) authoritative_source_args_cache:
         std::cell::RefCell<BTreeMap<(u64, usize), Vec<crate::ast::CExpr>>>,
     pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
+    pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
+    pub(crate) prepared_semantic_view_building: Cell<bool>,
     pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) value_render_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
 }
 
 impl FoldArchConfig {
@@ -143,6 +174,7 @@ impl<'a> FoldingContext<'a> {
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
+            current_op_idx: Cell::new(None),
             hide_stack_frame: true,
             userop_names: HashMap::new(),
             signature_registry: SignatureRegistry::from_embedded_json(),
@@ -154,10 +186,13 @@ impl<'a> FoldingContext<'a> {
             non_variadic_call_arity_cache: std::cell::RefCell::new(HashMap::new()),
             authoritative_source_args_cache: std::cell::RefCell::new(BTreeMap::new()),
             owned_call_visible_names_cache: std::cell::RefCell::new(None),
+            prepared_semantic_view_cache: OnceCell::new(),
+            prepared_semantic_view_building: Cell::new(false),
             semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
             value_render_in_progress: std::cell::RefCell::new(HashSet::new()),
             definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
             definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
+            resolution_guard: std::cell::RefCell::new(HashSet::new()),
         }
     }
 
@@ -172,6 +207,7 @@ impl<'a> FoldingContext<'a> {
         static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
         static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
         static EMPTY_STRING_FNTY: OnceLock<HashMap<String, FunctionType>> = OnceLock::new();
+        static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
         static EMPTY_STRING_CTYPE: OnceLock<HashMap<String, CType>> = OnceLock::new();
         static ARCH64: OnceLock<FoldArchConfig> = OnceLock::new();
         static ARCH32: OnceLock<FoldArchConfig> = OnceLock::new();
@@ -188,6 +224,7 @@ impl<'a> FoldingContext<'a> {
             strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
             symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             known_function_signatures: EMPTY_STRING_FNTY.get_or_init(HashMap::new),
+            callee_facts: EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new),
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
             #[cfg(test)]
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
@@ -197,6 +234,13 @@ impl<'a> FoldingContext<'a> {
             type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),
             type_oracle: None,
             function_return_type: None,
+            prepared_ssa: None,
+            interproc_summary_set: None,
+            prepared_semantic_view: None,
+            prepared_objects: None,
+            prepared_memory: None,
+            prepared_predicates: None,
+            prepared_call_sites: None,
         };
 
         Self::from_inputs(inputs)

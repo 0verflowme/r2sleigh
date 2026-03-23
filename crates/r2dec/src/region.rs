@@ -175,7 +175,22 @@ struct SwitchChainCase {
     match_when_true: bool,
 }
 
+type LocalSwitchTargets = (Vec<(u64, u64)>, Option<u64>);
+
 impl<'a> RegionAnalyzer<'a> {
+    fn filter_local_switch_targets(
+        &self,
+        cases: Vec<(u64, u64)>,
+        default: Option<u64>,
+    ) -> Option<LocalSwitchTargets> {
+        let cases = cases
+            .into_iter()
+            .filter(|(_, target)| self.func.cfg().get_block(*target).is_some())
+            .collect::<Vec<_>>();
+        let default = default.filter(|target| self.func.cfg().get_block(*target).is_some());
+        (!cases.is_empty()).then_some((cases, default))
+    }
+
     /// Create a new region analyzer.
     pub fn new(func: &'a SSAFunction) -> Self {
         let num_blocks = func.num_blocks();
@@ -468,7 +483,9 @@ impl<'a> RegionAnalyzer<'a> {
         }
 
         // Prefer explicit switch metadata from CFG terminators.
-        if let Some(switch_info) = self.normalized_switch_info(entry) {
+        if self.should_promote_nested_switch_metadata(entry)
+            && let Some(switch_info) = self.normalized_switch_info(entry)
+        {
             return self.analyze_switch_with_cases(entry, &switch_info.cases, switch_info.default);
         }
 
@@ -535,6 +552,14 @@ impl<'a> RegionAnalyzer<'a> {
         }
     }
 
+    fn should_promote_nested_switch_metadata(&self, entry: u64) -> bool {
+        if self.func.switch_info(entry).is_some() {
+            return true;
+        }
+
+        self.func.successors(entry).len() <= 1
+    }
+
     fn analyze_conditional(&mut self, cond: u64, true_target: u64, false_target: u64) -> Region {
         self.processed.insert(cond);
 
@@ -590,11 +615,13 @@ impl<'a> RegionAnalyzer<'a> {
         let mut common: Vec<u64> = true_reachable
             .into_iter()
             .filter(|block| false_reachable.contains(block))
+            .filter(|block| {
+                self.post_dominates(true_target, *block)
+                    && self.post_dominates(false_target, *block)
+            })
             .collect();
         common.sort_unstable_by_key(|block| {
             (
-                !self.post_dominates(true_target, *block)
-                    || !self.post_dominates(false_target, *block),
                 self.shortest_distance(true_target, *block)
                     .unwrap_or(usize::MAX),
                 self.shortest_distance(false_target, *block)
@@ -1019,6 +1046,7 @@ impl<'a> RegionAnalyzer<'a> {
 
     fn normalized_switch_info(&self, entry: u64) -> Option<NormalizedSwitchInfo> {
         if let Some((cases, default)) = self.func.switch_info(entry) {
+            let (cases, default) = self.filter_local_switch_targets(cases, default)?;
             let mut cases = self.filter_switch_case_outliers(&cases);
             let bias = self.estimate_switch_case_bias(entry, entry, &cases);
             if bias != 0 {
@@ -1057,7 +1085,8 @@ impl<'a> RegionAnalyzer<'a> {
         }
 
         let best = best?;
-        let mut cases = self.filter_switch_case_outliers(&best.cases);
+        let (cases, default) = self.filter_local_switch_targets(best.cases, best.default)?;
+        let mut cases = self.filter_switch_case_outliers(&cases);
         let bias = self.estimate_switch_case_bias(entry, best.block, &cases);
         if bias != 0 {
             for (value, _) in &mut cases {
@@ -1065,10 +1094,7 @@ impl<'a> RegionAnalyzer<'a> {
             }
         }
 
-        Some(NormalizedSwitchInfo {
-            cases,
-            default: best.default,
-        })
+        Some(NormalizedSwitchInfo { cases, default })
     }
 
     fn follow_branch_only_chain(&self, start: u64) -> u64 {
@@ -2731,7 +2757,6 @@ mod tests {
     fn normalized_switch_info_keeps_entry_switch_metadata_authoritative() {
         let func = build_switch_trampoline_cfg();
         let analyzer = RegionAnalyzer::new(&func);
-
         let info = analyzer
             .normalized_switch_info(0x1000)
             .expect("normalized switch info");
@@ -2847,6 +2872,27 @@ mod tests {
 
         assert_eq!(values, vec![1, 2, 3]);
         assert_eq!(info.default, Some(0x1040));
+    }
+
+    #[test]
+    fn normalized_switch_info_ignores_external_only_targets() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Nop);
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[entry]).expect("ssa function");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::Switch {
+                cases: vec![(0, 0x401000), (1, 0x401100)],
+                default: Some(0x401200),
+            },
+        );
+
+        let analyzer = RegionAnalyzer::new(&func);
+        assert!(
+            analyzer.normalized_switch_info(0x1000).is_none(),
+            "switch metadata with only out-of-function targets should not structure as a local switch"
+        );
     }
 
     fn build_equality_switch_chain_cfg() -> SSAFunction {
@@ -3135,6 +3181,73 @@ mod tests {
         func
     }
 
+    fn build_guarded_nested_switch_cfg() -> SSAFunction {
+        let mut guard0 = R2ILBlock::new(0x1000, 4);
+        guard0.push(R2ILOp::CBranch {
+            cond: Varnode::unique(0x10, 1),
+            target: Varnode::constant(0x1010, 8),
+        });
+        let mut guard1 = R2ILBlock::new(0x1004, 4);
+        guard1.push(R2ILOp::CBranch {
+            cond: Varnode::unique(0x11, 1),
+            target: Varnode::constant(0x1014, 8),
+        });
+        let mut switch_block = R2ILBlock::new(0x1008, 4);
+        switch_block.push(R2ILOp::Nop);
+        let mut early_ret = R2ILBlock::new(0x1010, 4);
+        early_ret.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+        let mut range_ret = R2ILBlock::new(0x1014, 4);
+        range_ret.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+        let mut case0 = R2ILBlock::new(0x1100, 4);
+        case0.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1200, 8),
+        });
+        let mut case1 = R2ILBlock::new(0x1110, 4);
+        case1.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1200, 8),
+        });
+        let mut case2 = R2ILBlock::new(0x1120, 4);
+        case2.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1200, 8),
+        });
+        let mut case3 = R2ILBlock::new(0x1130, 4);
+        case3.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1200, 8),
+        });
+        let mut merge = R2ILBlock::new(0x1200, 4);
+        merge.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[
+            guard0,
+            guard1,
+            switch_block,
+            early_ret,
+            range_ret,
+            case0,
+            case1,
+            case2,
+            case3,
+            merge,
+        ])
+        .expect("ssa function");
+
+        func.cfg_mut().set_terminator(
+            0x1008,
+            BlockTerminator::Switch {
+                cases: vec![(0, 0x1100), (1, 0x1110), (2, 0x1120), (3, 0x1130)],
+                default: Some(0x1014),
+            },
+        );
+
+        func
+    }
+
     #[test]
     fn detects_conditional_switch_chain_from_equality_ladder() {
         let func = build_equality_switch_chain_cfg();
@@ -3189,5 +3302,64 @@ mod tests {
         assert_eq!(values, vec![0, 1, 2, 3]);
         assert_eq!(default.map(|region| region.entry()), Some(0x1140));
         assert_eq!(merge_block, Some(0x1200));
+    }
+
+    #[test]
+    fn guarded_nested_switch_does_not_promote_entry_guard_to_switch() {
+        let func = build_guarded_nested_switch_cfg();
+        assert_eq!(func.successors(0x1000), vec![0x1010, 0x1004]);
+        assert_eq!(func.successors(0x1004), vec![0x1014, 0x1008]);
+        let mut analyzer = RegionAnalyzer::new(&func);
+
+        let region = analyzer.analyze_region_recursive(0x1000);
+        let Region::IfThenElse {
+            cond_block,
+            then_region,
+            else_region,
+            ..
+        } = region
+        else {
+            panic!("expected entry guard to stay conditional");
+        };
+        assert_eq!(cond_block, 0x1000);
+
+        let Some(other_region) = else_region else {
+            panic!("expected both entry-guard arms");
+        };
+        let (nested_guard, early_return) = if then_region.entry() == 0x1004 {
+            (then_region, other_region)
+        } else if other_region.entry() == 0x1004 {
+            (other_region, then_region)
+        } else {
+            panic!("expected one entry arm to continue into nested guard");
+        };
+        assert_eq!(early_return.entry(), 0x1010);
+
+        let Region::IfThenElse {
+            cond_block,
+            then_region,
+            else_region,
+            ..
+        } = *nested_guard
+        else {
+            panic!("expected nested range guard before switch");
+        };
+        assert_eq!(cond_block, 0x1004);
+        let Some(other_region) = else_region else {
+            panic!("expected both nested-guard arms");
+        };
+        let (switch_region, range_return) = if then_region.entry() == 0x1008 {
+            (then_region, other_region)
+        } else if other_region.entry() == 0x1008 {
+            (other_region, then_region)
+        } else {
+            panic!("expected one nested guard arm to continue into switch");
+        };
+        assert_eq!(range_return.entry(), 0x1014);
+
+        let Region::Switch { switch_block, .. } = *switch_region else {
+            panic!("expected real switch to stay anchored at the jump-table block");
+        };
+        assert_eq!(switch_block, 0x1008);
     }
 }

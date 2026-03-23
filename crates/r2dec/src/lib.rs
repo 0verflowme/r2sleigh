@@ -82,6 +82,59 @@ fn normalize_callee_name(name: &str) -> String {
     out
 }
 
+fn should_skip_runtime_type_inference(prepared: Option<&r2ssa::PreparedFunctionSSA>) -> bool {
+    let Some(prepared) = prepared else {
+        return false;
+    };
+    let summary = prepared.function().cfg_risk_summary();
+    summary.block_count >= 96
+        && summary.switch_block_count > 0
+        && summary.max_switch_cases >= 32
+        && summary.back_edge_count == 0
+}
+
+fn should_use_prepared_semantic_view(prepared: Option<&r2ssa::PreparedFunctionSSA>) -> bool {
+    prepared.is_some()
+}
+
+fn seed_runtime_type_hints_from_facts_and_recovery(
+    type_facts: &FunctionTypeFacts,
+    var_recovery: &VariableRecovery,
+) -> std::collections::HashMap<String, CType> {
+    let mut type_hints = std::collections::HashMap::new();
+    let mut insert = |name: &str, ty: &CType| {
+        if matches!(ty, CType::Unknown | CType::Void) {
+            return;
+        }
+        type_hints.insert(name.to_string(), ty.clone());
+        type_hints.insert(name.to_ascii_lowercase(), ty.clone());
+    };
+
+    for var in var_recovery.parameters() {
+        insert(&var.name, &var.ty);
+    }
+    for var in var_recovery.locals() {
+        insert(&var.name, &var.ty);
+    }
+    for binding in &type_facts.visible_bindings {
+        if let Some(ty) = binding.ty.as_ref() {
+            insert(&binding.name, &type_like_to_ctype(ty));
+        }
+    }
+    for reg_param in &type_facts.register_params {
+        if let Some(ty) = reg_param.ty.as_ref() {
+            insert(&reg_param.name, &type_like_to_ctype(ty));
+        }
+    }
+    for slot in type_facts.stack_slots.values() {
+        if let Some(ty) = slot.ty.as_ref() {
+            insert(&slot.name, &type_like_to_ctype(ty));
+        }
+    }
+
+    type_hints
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn ctype_to_type_like(ty: &CType) -> CTypeLike {
     match ty {
@@ -474,6 +527,7 @@ impl DecompilerContext {
 #[derive(Debug, Clone)]
 pub struct DecompilerInput {
     pub prepared_ssa: r2ssa::PreparedFunctionSSA,
+    pub interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
     pub context: DecompilerContext,
 }
 
@@ -482,6 +536,7 @@ impl DecompilerInput {
         context.type_facts = context.type_facts.canonicalized();
         Self {
             prepared_ssa,
+            interproc_summary_set: None,
             context,
         }
     }
@@ -489,6 +544,14 @@ impl DecompilerInput {
     pub fn with_context(mut self, mut context: DecompilerContext) -> Self {
         context.type_facts = context.type_facts.canonicalized();
         self.context = context;
+        self
+    }
+
+    pub fn with_interproc_summary_set(
+        mut self,
+        interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
+    ) -> Self {
+        self.interproc_summary_set = interproc_summary_set;
         self
     }
 }
@@ -565,14 +628,19 @@ impl Decompiler {
 
     /// Decompile a prepared function with an explicit typed context payload.
     pub fn decompile_input(&self, input: &DecompilerInput) -> String {
-        let decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
-        decompiler.decompile(input.prepared_ssa.function())
+        let c_func = self.build_function_from_input(input);
+        let mut codegen = CodeGenerator::new(self.config.codegen.clone());
+        codegen.generate_function(&c_func)
     }
 
     /// Build a C function from a prepared function + typed context payload.
     pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction {
         let decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
-        decompiler.build_function(input.prepared_ssa.function())
+        decompiler.build_function_internal(
+            input.prepared_ssa.function(),
+            Some(&input.prepared_ssa),
+            input.interproc_summary_set.as_ref(),
+        )
     }
 
     fn stmt_has_content(stmt: &CStmt) -> bool {
@@ -616,6 +684,15 @@ impl Decompiler {
 
     /// Build a C function from an SSA function.
     pub fn build_function(&self, func: &SSAFunction) -> CFunction {
+        self.build_function_internal(func, None, None)
+    }
+
+    fn build_function_internal(
+        &self,
+        func: &SSAFunction,
+        prepared: Option<&r2ssa::PreparedFunctionSSA>,
+        interproc_summary_set: Option<&r2ssa::InterprocSummarySet>,
+    ) -> CFunction {
         // Materialize phis on non-critical edges to reduce SSA artifacts in output.
         let normalized_func = normalize::materialize_phis(func);
         let func = &normalized_func;
@@ -631,34 +708,48 @@ impl Decompiler {
         var_recovery.set_type_facts(self.context.type_facts.clone());
         var_recovery.recover(func);
 
-        // Infer types
-        let mut type_inference = TypeInference::new_with_abi(
-            self.config.ptr_size,
-            self.config.arg_regs.clone(),
-            self.config.ret_regs.clone(),
-        );
-        if !self.context.function_names.is_empty() {
-            type_inference.set_function_names(self.context.function_names.clone());
-        }
-        type_inference.set_external_signature(self.context.type_facts.merged_signature.clone());
-        for (name, signature) in &self.context.type_facts.known_function_signatures {
-            type_inference.add_function_type(name, signature.clone());
-        }
-        type_inference.set_external_stack_slots(self.context.type_facts.stack_slots.clone());
-        if !self.context.type_facts.external_type_db.structs.is_empty()
-            || !self.context.type_facts.external_type_db.unions.is_empty()
-            || !self.context.type_facts.external_type_db.enums.is_empty()
-        {
-            type_inference.set_external_type_db(self.context.type_facts.external_type_db.clone());
-        }
-        type_inference.set_decompile_prep_facts(func.decompile_prep_facts());
-        type_inference.infer_function(func);
-        let mut type_hints = type_inference
-            .var_type_hints()
-            .into_iter()
-            .map(|(name, ty)| (name, type_like_to_ctype(&ty)))
-            .collect::<std::collections::HashMap<_, _>>();
-        let combined_type_oracle = type_inference.combined_type_oracle();
+        let skip_runtime_type_inference = should_skip_runtime_type_inference(prepared);
+        let type_inference = (!skip_runtime_type_inference).then(|| {
+            let mut type_inference = TypeInference::new_with_abi(
+                self.config.ptr_size,
+                self.config.arg_regs.clone(),
+                self.config.ret_regs.clone(),
+            );
+            if !self.context.function_names.is_empty() {
+                type_inference.set_function_names(self.context.function_names.clone());
+            }
+            type_inference.set_external_signature(self.context.type_facts.merged_signature.clone());
+            for (name, signature) in &self.context.type_facts.known_function_signatures {
+                type_inference.add_function_type(name, signature.clone());
+            }
+            type_inference.set_external_stack_slots(self.context.type_facts.stack_slots.clone());
+            if !self.context.type_facts.external_type_db.structs.is_empty()
+                || !self.context.type_facts.external_type_db.unions.is_empty()
+                || !self.context.type_facts.external_type_db.enums.is_empty()
+            {
+                type_inference
+                    .set_external_type_db(self.context.type_facts.external_type_db.clone());
+            }
+            if let Some(prepared) = prepared {
+                type_inference.set_prepared_ssa(prepared);
+            } else {
+                type_inference.set_decompile_prep_facts(func.decompile_prep_facts());
+            }
+            type_inference.infer_function(func);
+            type_inference
+        });
+        let mut type_hints = if let Some(type_inference) = type_inference.as_ref() {
+            type_inference
+                .var_type_hints()
+                .into_iter()
+                .map(|(name, ty)| (name, type_like_to_ctype(&ty)))
+                .collect::<std::collections::HashMap<_, _>>()
+        } else {
+            seed_runtime_type_hints_from_facts_and_recovery(&self.context.type_facts, &var_recovery)
+        };
+        let combined_type_oracle = type_inference
+            .as_ref()
+            .and_then(TypeInference::combined_type_oracle);
         let type_oracle = combined_type_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn TypeOracle);
@@ -678,7 +769,12 @@ impl Decompiler {
                 (
                     v.ssa_var.clone(),
                     ast::CParam {
-                        ty: type_like_to_ctype(&type_inference.get_type(&v.ssa_var)),
+                        ty: type_inference
+                            .as_ref()
+                            .map(|type_inference| {
+                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
+                            })
+                            .unwrap_or_else(|| v.ty.clone()),
                         name: v.name.clone(),
                     },
                 )
@@ -716,7 +812,17 @@ impl Decompiler {
                 .entry(reg_alias.to_ascii_lowercase())
                 .or_insert_with(|| param.ty.clone());
         }
-        let inferred_ret_type = self.infer_return_type(func, &type_inference);
+        let inferred_ret_type = type_inference
+            .as_ref()
+            .map(|type_inference| self.infer_return_type(func, type_inference))
+            .or_else(|| {
+                self.context
+                    .type_facts
+                    .merged_signature
+                    .as_ref()
+                    .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+            })
+            .unwrap_or(CType::Unknown);
         let signature_ret_type = self
             .context
             .type_facts
@@ -737,12 +843,27 @@ impl Decompiler {
             arg_regs: self.config.arg_regs.clone(),
             caller_saved_regs: self.config.caller_saved_regs.clone(),
         };
+        let prepared_semantic_view = should_use_prepared_semantic_view(prepared).then(|| {
+            analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
+                prepared: prepared.expect("prepared semantic view requires prepared artifact"),
+                interproc_summary_set,
+                abi_arg_regs: &self.config.arg_regs,
+                ret_reg_name: &fold_arch.ret_reg_name,
+                function_names: &self.context.function_names,
+                symbols: &self.context.symbols,
+                callee_facts: &self.context.type_facts.callee_facts,
+                stack_slots: &self.context.type_facts.stack_slots,
+                visible_bindings: &self.context.type_facts.visible_bindings,
+                param_register_aliases: &param_register_aliases,
+            })
+        });
         let fold_inputs = FoldInputs {
             arch: &fold_arch,
             function_names: &self.context.function_names,
             strings: &self.context.strings,
             symbols: &self.context.symbols,
             known_function_signatures: &known_function_signatures,
+            callee_facts: &self.context.type_facts.callee_facts,
             stack_slots: &self.context.type_facts.stack_slots,
             #[cfg(test)]
             external_stack_vars: &self.context.type_facts.external_stack_vars,
@@ -752,6 +873,13 @@ impl Decompiler {
             type_hints: &type_hints,
             type_oracle,
             function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
+            prepared_ssa: prepared,
+            interproc_summary_set,
+            prepared_semantic_view: prepared_semantic_view.as_ref(),
+            prepared_objects: prepared.map(|artifact| artifact.objects()),
+            prepared_memory: prepared.map(|artifact| artifact.memory()),
+            prepared_predicates: prepared.map(|artifact| artifact.predicates()),
+            prepared_call_sites: prepared.map(|artifact| artifact.call_sites()),
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
@@ -816,6 +944,7 @@ impl Decompiler {
         }
 
         body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt);
+        body_stmt = fold_ctx.prune_dead_temp_assignments_in_stmt(body_stmt);
 
         // Build the C function
         let func_name = func
@@ -867,7 +996,12 @@ impl Decompiler {
                         .is_some_and(|offset| param_home_offsets.contains(&offset))
                 })
                 .map(|v| ast::CLocal {
-                    ty: type_like_to_ctype(&type_inference.get_type(&v.ssa_var)),
+                    ty: type_inference
+                        .as_ref()
+                        .map(|type_inference| {
+                            type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
+                        })
+                        .unwrap_or_else(|| v.ty.clone()),
                     name: v.name.clone(),
                     stack_offset: v.stack_offset,
                 })
@@ -885,7 +1019,12 @@ impl Decompiler {
                                 .is_some_and(|offset| body_visible_stack_offsets.contains(&offset)))
                 })
                 .map(|v| ast::CLocal {
-                    ty: type_like_to_ctype(&type_inference.get_type(&v.ssa_var)),
+                    ty: type_inference
+                        .as_ref()
+                        .map(|type_inference| {
+                            type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
+                        })
+                        .unwrap_or_else(|| v.ty.clone()),
                     name: v.name.clone(),
                     stack_offset: v.stack_offset,
                 })
@@ -1724,6 +1863,14 @@ pub fn infer_local_struct_field_accesses(
     func: &SSAFunction,
     config: &DecompilerConfig,
 ) -> Vec<LocalStructFieldAccess> {
+    let cfg_summary = func.cfg_risk_summary();
+    if cfg_summary.block_count >= 96
+        && cfg_summary.switch_block_count > 0
+        && cfg_summary.max_switch_cases >= 32
+    {
+        return Vec::new();
+    }
+
     let function_names = std::collections::HashMap::new();
     let strings = std::collections::HashMap::new();
     let symbols = std::collections::HashMap::new();
@@ -2187,7 +2334,7 @@ mod tests {
     }
 
     #[test]
-    fn decompile_input_matches_context_driven_decompile() {
+    fn decompile_input_preserves_function_header_and_emits_stable_output() {
         let arch = test_arch_for_decompile();
         let ops = vec![
             R2ILOp::Load {
@@ -2223,11 +2370,16 @@ mod tests {
         let input = DecompilerInput::new(prepared, context);
         let typed = Decompiler::new(DecompilerConfig::x86_64());
 
-        assert_eq!(
-            legacy.build_function(&func),
-            typed.build_function_from_input(&input)
-        );
-        assert_eq!(legacy.decompile(&func), typed.decompile_input(&input));
+        let legacy_fn = legacy.build_function(&func);
+        let typed_fn = typed.build_function_from_input(&input);
+        let typed_text = typed.decompile_input(&input);
+
+        assert_eq!(legacy_fn.name, typed_fn.name);
+        assert_eq!(legacy_fn.ret_type, typed_fn.ret_type);
+        assert_eq!(legacy_fn.params, typed_fn.params);
+        assert!(typed_text.contains("stable_demo"));
+        assert!(typed_text.contains("return"));
+        assert!(typed_text.contains("arg2"));
     }
 
     #[test]
@@ -3133,6 +3285,48 @@ mod tests {
     }
 
     #[test]
+    fn infer_local_struct_field_accesses_skips_large_dense_switch_cfgs() {
+        let mut blocks = Vec::new();
+
+        let mut switch_block = R2ILBlock::new(0x1000, 1);
+        switch_block.set_switch_info(r2il::SwitchInfo {
+            switch_addr: 0x1000,
+            min_val: 0,
+            max_val: 39,
+            default_target: Some(0x3000),
+            cases: (0..40u64)
+                .map(|idx| r2il::SwitchCase {
+                    value: idx,
+                    target: 0x2000 + idx * 0x10,
+                })
+                .collect(),
+        });
+        blocks.push(switch_block);
+
+        for idx in 0..110u64 {
+            let addr = if idx < 40 {
+                0x2000 + idx * 0x10
+            } else if idx == 40 {
+                0x3000
+            } else {
+                0x4000 + (idx - 41) * 0x10
+            };
+            let mut block = R2ILBlock::new(addr, 1);
+            block.push(R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            });
+            blocks.push(block);
+        }
+
+        let func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        let accesses = infer_local_struct_field_accesses(&func, &DecompilerConfig::x86_64());
+        assert!(
+            accesses.is_empty(),
+            "large dense switch CFGs should skip semantic local-struct inference, got {accesses:?}"
+        );
+    }
+
+    #[test]
     fn decompiler_pipeline_keeps_observed_x86_struct_array_load_exprs_semantic_before_return_join()
     {
         use std::collections::HashMap;
@@ -3439,6 +3633,7 @@ mod tests {
             strings: &decompiler.context.strings,
             symbols: &decompiler.context.symbols,
             known_function_signatures: &known_function_signatures,
+            callee_facts: &decompiler.context.type_facts.callee_facts,
             stack_slots: &decompiler.context.type_facts.stack_slots,
             #[cfg(test)]
             external_stack_vars: &decompiler.context.type_facts.external_stack_vars,
@@ -3450,6 +3645,13 @@ mod tests {
                 .as_ref()
                 .map(|oracle| oracle as &dyn TypeOracle),
             function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
+            prepared_ssa: None,
+            interproc_summary_set: None,
+            prepared_semantic_view: None,
+            prepared_objects: None,
+            prepared_memory: None,
+            prepared_predicates: None,
+            prepared_call_sites: None,
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();

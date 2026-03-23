@@ -4,7 +4,7 @@
 //! with real SSA functions and Z3 constraint solving.
 
 use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
-use r2ssa::SSAFunction;
+use r2ssa::PreparedFunctionSSA;
 use r2sym::SymSolver;
 use r2sym::path::ExploreStrategy;
 use r2sym::sim::{
@@ -64,7 +64,8 @@ fn test_symbolic_execution_linear_block() {
         op_metadata: Default::default(),
     }];
 
-    let func = SSAFunction::from_blocks(&blocks).expect("Failed to build SSA function");
+    let func =
+        PreparedFunctionSSA::for_symbolic(&blocks, None).expect("Failed to build SSA function");
 
     let ctx = Context::thread_local();
 
@@ -106,7 +107,8 @@ fn test_symbolic_execution_with_symbolic_input() {
         op_metadata: Default::default(),
     }];
 
-    let func = SSAFunction::from_blocks(&blocks).expect("Failed to build SSA function");
+    let func =
+        PreparedFunctionSSA::for_symbolic(&blocks, None).expect("Failed to build SSA function");
 
     let ctx = Context::thread_local();
 
@@ -180,7 +182,8 @@ fn test_symbolic_execution_conditional_branch() {
         },
     ];
 
-    let func = SSAFunction::from_blocks(&blocks).expect("Failed to build SSA function");
+    let func =
+        PreparedFunctionSSA::for_symbolic(&blocks, None).expect("Failed to build SSA function");
 
     let ctx = Context::thread_local();
 
@@ -256,7 +259,8 @@ fn test_find_paths_to_collects_multiple_matches() {
         },
     ];
 
-    let func = SSAFunction::from_blocks(&blocks).expect("Failed to build SSA function");
+    let func =
+        PreparedFunctionSSA::for_symbolic(&blocks, None).expect("Failed to build SSA function");
     let ctx = Context::thread_local();
     let mut state = SymState::new(&ctx, 0x1000);
     state.make_symbolic("reg:56_0", 64);
@@ -283,7 +287,8 @@ fn test_find_paths_to_unreachable_returns_empty() {
         op_metadata: Default::default(),
     }];
 
-    let func = SSAFunction::from_blocks(&blocks).expect("Failed to build SSA function");
+    let func =
+        PreparedFunctionSSA::for_symbolic(&blocks, None).expect("Failed to build SSA function");
     let ctx = Context::thread_local();
     let state = SymState::new(&ctx, 0x1000);
     let mut explorer = PathExplorer::new(&ctx);
@@ -327,7 +332,8 @@ fn test_find_paths_to_honors_limits() {
         },
     ];
 
-    let func = SSAFunction::from_blocks(&blocks).expect("Failed to build SSA function");
+    let func =
+        PreparedFunctionSSA::for_symbolic(&blocks, None).expect("Failed to build SSA function");
     let ctx = Context::thread_local();
     let mut state = SymState::new(&ctx, 0x1000);
     state.make_symbolic("reg:56_0", 64);

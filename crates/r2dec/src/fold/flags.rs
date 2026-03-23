@@ -1,9 +1,12 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 
-use r2ssa::{FunctionSSABlock, SSAOp, SSAVar};
+use r2ssa::{
+    CompareKind as PreparedCompareKind, CompareProvenance, FunctionSSABlock, SSAOp, SSAVar,
+};
 
 use crate::analysis;
-use crate::analysis::{FlagCompareKind, FlagCompareProvenance};
+use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
 use super::context::FoldingContext;
@@ -32,7 +35,260 @@ impl<'a> FoldingContext<'a> {
         let expr = self.normalize_local_branch_expr(expr);
         let expr = self.rewrite_stack_expr(expr);
         let expr = self.rewrite_condition_stack_aliases(expr);
+        let expr = self.expand_generic_scalar_predicate_aliases(expr, 0);
+        let expr = self.rewrite_call_result_predicate_owners(expr, 0);
+        let expr = self.simplify_condition_expr(expr);
+        let expr = self.rewrite_call_result_predicate_owners(expr, 0);
         self.simplify_condition_expr(expr)
+    }
+
+    fn rewrite_call_result_predicate_owners(&self, expr: CExpr, depth: u32) -> CExpr {
+        if depth > MAX_PREDICATE_OPERAND_DEPTH {
+            return expr;
+        }
+
+        let owner_name_for_source = |ctx: &FoldingContext<'_>, source: (u64, usize)| {
+            ctx.stable_owned_call_result_name_for_source(source)
+                .filter(|name| {
+                    !ctx.is_low_signal_visible_name(name)
+                        && !ctx.is_transient_visible_name(name)
+                        && !name.ends_with("_home")
+                        && !name.starts_with("var_")
+                        && !name.starts_with("local_")
+                        && !name.starts_with("stack_")
+                        && !name.starts_with("arg_")
+                })
+        };
+
+        match expr {
+            CExpr::Var(name) => self
+                .call_result_source_for_ssa_name(&name)
+                .or_else(|| self.local_post_call_source_for_ssa_name(&name))
+                .and_then(|source| owner_name_for_source(self, source))
+                .map(CExpr::Var)
+                .unwrap_or(CExpr::Var(name)),
+            call @ CExpr::Call { .. } => self
+                .source_call_for_call_expr(&call)
+                .and_then(|source| owner_name_for_source(self, source))
+                .map(CExpr::Var)
+                .unwrap_or_else(|| {
+                    call.map_children(&mut |child| {
+                        self.rewrite_call_result_predicate_owners(child, depth + 1)
+                    })
+                }),
+            other => other.map_children(&mut |child| {
+                self.rewrite_call_result_predicate_owners(child, depth + 1)
+            }),
+        }
+    }
+
+    fn prepared_branch_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
+        self.prepared_predicate_view()
+            .and_then(|view| view.branch_expr_for_block(block_addr).cloned())
+    }
+
+    fn prepared_predicate_view(&self) -> Option<Cow<'_, analysis::PreparedSemanticView>> {
+        self.prepared_semantic_view().map(Cow::Borrowed)
+    }
+
+    fn structured_predicate_candidate_should_win(
+        &self,
+        current: &CExpr,
+        candidate: &CExpr,
+    ) -> bool {
+        fn lhs(expr: &CExpr) -> Option<&CExpr> {
+            match expr {
+                CExpr::Binary { left, .. } => Some(left.as_ref()),
+                _ => None,
+            }
+        }
+
+        fn is_simple_named_carrier(expr: &CExpr) -> bool {
+            matches!(expr, CExpr::Var(_))
+        }
+
+        fn is_structured_scalar_expr(expr: &CExpr) -> bool {
+            matches!(
+                expr,
+                CExpr::Binary {
+                    op: BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr,
+                    ..
+                }
+            )
+        }
+
+        fn strips_wrappers(expr: &CExpr) -> &CExpr {
+            match expr {
+                CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => strips_wrappers(inner),
+                _ => expr,
+            }
+        }
+
+        fn compare_operands(expr: &CExpr) -> Option<(&CExpr, &CExpr)> {
+            match strips_wrappers(expr) {
+                CExpr::Binary {
+                    op:
+                        BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge,
+                    left,
+                    right,
+                } => Some((left.as_ref(), right.as_ref())),
+                _ => None,
+            }
+        }
+
+        let is_semantic_operand = |expr: &CExpr| match strips_wrappers(expr) {
+            CExpr::Var(name) => {
+                !self.is_low_signal_visible_name(name) && !self.is_transient_visible_name(name)
+            }
+            CExpr::Binary { .. }
+            | CExpr::Member { .. }
+            | CExpr::PtrMember { .. }
+            | CExpr::Subscript { .. }
+            | CExpr::Call { .. } => !self.expr_is_address_artifact_in_scalar_context(expr),
+            _ => false,
+        };
+
+        let compare_to_zero_shape = |expr: &CExpr| {
+            compare_operands(expr).is_some_and(|(lhs, rhs)| {
+                (self.is_zero_expr(lhs) && is_semantic_operand(rhs))
+                    || (self.is_zero_expr(rhs) && is_semantic_operand(lhs))
+            })
+        };
+
+        let richer_compare_shape = |expr: &CExpr| {
+            compare_operands(expr).is_some_and(|(lhs, rhs)| {
+                !self.is_zero_expr(lhs)
+                    && !self.is_zero_expr(rhs)
+                    && is_semantic_operand(lhs)
+                    && is_semantic_operand(rhs)
+            })
+        };
+
+        let Some(current_lhs) = lhs(current) else {
+            return compare_to_zero_shape(current) && richer_compare_shape(candidate);
+        };
+        let Some(candidate_lhs) = lhs(candidate) else {
+            return false;
+        };
+
+        (is_simple_named_carrier(current_lhs)
+            && is_structured_scalar_expr(candidate_lhs)
+            && !self.expr_is_address_artifact_in_scalar_context(candidate))
+            || (compare_to_zero_shape(current) && richer_compare_shape(candidate))
+    }
+
+    fn prepared_candidate_needs_legacy_compare_help(&self, expr: &CExpr) -> bool {
+        fn strips_wrappers(expr: &CExpr) -> &CExpr {
+            match expr {
+                CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => strips_wrappers(inner),
+                CExpr::Unary {
+                    op: UnaryOp::Not,
+                    operand,
+                } => strips_wrappers(operand),
+                _ => expr,
+            }
+        }
+
+        fn compare_operands(expr: &CExpr) -> Option<(&CExpr, &CExpr)> {
+            match strips_wrappers(expr) {
+                CExpr::Binary {
+                    op:
+                        BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge,
+                    left,
+                    right,
+                } => Some((left.as_ref(), right.as_ref())),
+                _ => None,
+            }
+        }
+
+        let generic_scalar_expr = |expr: &CExpr| {
+            fn recurse(ctx: &FoldingContext<'_>, expr: &CExpr) -> bool {
+                match expr {
+                    CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => recurse(ctx, inner),
+                    CExpr::Unary { operand, .. } => recurse(ctx, operand),
+                    CExpr::Binary { left, right, .. } => recurse(ctx, left) && recurse(ctx, right),
+                    CExpr::Var(name) => {
+                        ctx.is_generic_stack_local_owner_name(name)
+                            || name.starts_with("local_")
+                            || name.starts_with("var_")
+                            || name.starts_with("stack_")
+                            || name.starts_with("arg_")
+                    }
+                    CExpr::IntLit(_)
+                    | CExpr::UIntLit(_)
+                    | CExpr::FloatLit(_)
+                    | CExpr::CharLit(_) => true,
+                    _ => false,
+                }
+            }
+
+            recurse(self, strips_wrappers(expr))
+        };
+
+        compare_operands(expr)
+            .is_some_and(|(lhs, rhs)| generic_scalar_expr(lhs) || generic_scalar_expr(rhs))
+    }
+
+    fn expand_generic_scalar_predicate_aliases(&self, expr: CExpr, depth: u32) -> CExpr {
+        if depth > MAX_PREDICATE_OPERAND_DEPTH {
+            return expr;
+        }
+
+        match expr {
+            CExpr::Var(name)
+                if self.is_generic_stack_local_owner_name(&name)
+                    || name.starts_with("local_")
+                    || name.starts_with("var_")
+                    || name.starts_with("stack_") =>
+            {
+                let resolved = self
+                    .lookup_definition(&name)
+                    .or_else(|| self.formatted_defs_map().get(&name).cloned());
+                if let Some(inner) = resolved
+                    && (self.is_predicate_like_expr(&inner)
+                        || matches!(
+                            inner,
+                            CExpr::Binary {
+                                op: BinaryOp::Add
+                                    | BinaryOp::Sub
+                                    | BinaryOp::Mul
+                                    | BinaryOp::Div
+                                    | BinaryOp::Mod
+                                    | BinaryOp::Shl
+                                    | BinaryOp::Shr
+                                    | BinaryOp::BitAnd
+                                    | BinaryOp::BitOr
+                                    | BinaryOp::BitXor,
+                                ..
+                            } | CExpr::Unary { .. }
+                        ))
+                    && !self.expr_is_address_artifact_in_scalar_context(&inner)
+                {
+                    return self.expand_generic_scalar_predicate_aliases(
+                        self.resolve_predicate_expr_tree(&inner),
+                        depth + 1,
+                    );
+                }
+                CExpr::Var(name)
+            }
+            other => other.map_children(&mut |child| {
+                self.expand_generic_scalar_predicate_aliases(child, depth + 1)
+            }),
+        }
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
@@ -46,23 +302,151 @@ impl<'a> FoldingContext<'a> {
                     SSAOp::CBranch { cond, .. } => Some((idx, cond)),
                     _ => None,
                 })?;
+        let prepared_branch_candidate = self.prepared_branch_condition_expr(block.addr);
+        let prepared_block_candidate =
+            self.prepared_predicate_candidate_for_branch_block(block.addr, cond);
+        let prepared_var_candidate = self.prepared_predicate_candidate_for_var(cond);
+        let allow_legacy_flag_provenance = ![
+            prepared_branch_candidate.as_ref(),
+            prepared_block_candidate.as_ref(),
+            prepared_var_candidate.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|expr| !self.prepared_candidate_needs_legacy_compare_help(expr));
 
-        if let Some(expr) = self.local_branch_condition_expr(block, branch_idx, cond, 0) {
-            let finalized = self.finalize_condition_expr(expr);
-            if !self.is_degenerate_constant_condition(&finalized) {
-                return Some(finalized);
+        let prev_block_addr = self.current_block_addr.replace(Some(block.addr));
+        let prev_op_idx = self.current_op_idx.replace(Some(branch_idx));
+
+        let mut result = None;
+        {
+            let mut consider = |candidate: Option<CExpr>| {
+                if let Some(expr) = candidate {
+                    let finalized = self.finalize_condition_expr(expr);
+                    if !self.is_degenerate_constant_condition(&finalized) {
+                        if let Some(current) = result.as_ref()
+                            && self.structured_predicate_candidate_should_win(current, &finalized)
+                        {
+                            result = Some(finalized);
+                            return;
+                        }
+                        result = self
+                            .choose_preferred_scalar_predicate_expr(result.take(), Some(finalized));
+                    }
+                }
+            };
+
+            consider(prepared_branch_candidate);
+            consider(prepared_block_candidate);
+            consider(prepared_var_candidate);
+        }
+        if result.is_some() && !allow_legacy_flag_provenance {
+            self.current_block_addr.set(prev_block_addr);
+            self.current_op_idx.set(prev_op_idx);
+            return result;
+        }
+        {
+            let mut consider = |candidate: Option<CExpr>| {
+                if let Some(expr) = candidate {
+                    let finalized = self.finalize_condition_expr(expr);
+                    if !self.is_degenerate_constant_condition(&finalized) {
+                        if let Some(current) = result.as_ref()
+                            && self.structured_predicate_candidate_should_win(current, &finalized)
+                        {
+                            result = Some(finalized);
+                            return;
+                        }
+                        result = self
+                            .choose_preferred_scalar_predicate_expr(result.take(), Some(finalized));
+                    }
+                }
+            };
+
+            consider(self.local_branch_condition_expr(block, branch_idx, cond, 0));
+            if allow_legacy_flag_provenance {
+                consider(self.branch_compare_provenance_expr(block, branch_idx, cond, 0));
+                let cond_name = cond.display_name();
+                if let Some(prov) = self.lookup_flag_compare_provenance(&cond_name) {
+                    consider(self.compare_provenance_expr_for_branch(&prov));
+                }
             }
         }
 
-        let cond_name = cond.display_name();
-        if let Some(prov) = self.lookup_flag_compare_provenance(&cond_name)
-            && let Some(expr) = self.compare_provenance_expr_for_branch(&prov)
-        {
-            return Some(self.finalize_condition_expr(expr));
+        let fallback = self.finalize_condition_expr(self.get_condition_expr(cond));
+        let result = match result {
+            Some(current) => {
+                if self.structured_predicate_candidate_should_win(&fallback, &current) {
+                    Some(current)
+                } else if self.structured_predicate_candidate_should_win(&current, &fallback) {
+                    Some(fallback)
+                } else {
+                    self.choose_preferred_scalar_predicate_expr(
+                        Some(current),
+                        Some(fallback.clone()),
+                    )
+                    .or(Some(fallback))
+                }
+            }
+            None => Some(fallback),
+        };
+
+        self.current_block_addr.set(prev_block_addr);
+        self.current_op_idx.set(prev_op_idx);
+        result
+    }
+
+    fn branch_compare_provenance_expr(
+        &self,
+        block: &FunctionSSABlock,
+        branch_idx: usize,
+        cond: &SSAVar,
+        depth: u32,
+    ) -> Option<CExpr> {
+        if depth > MAX_PREDICATE_OPERAND_DEPTH {
+            return None;
         }
 
-        let expr = self.get_condition_expr(cond);
-        Some(self.finalize_condition_expr(expr))
+        let cond_name = cond.display_name();
+        let allow_legacy_flag_provenance = self
+            .current_block_addr
+            .get()
+            .and_then(|block_addr| {
+                self.prepared_branch_condition_expr(block_addr)
+                    .or_else(|| {
+                        self.prepared_predicate_candidate_for_branch_block(block_addr, cond)
+                    })
+                    .or_else(|| self.prepared_predicate_candidate_for_var(cond))
+            })
+            .as_ref()
+            .map(|expr| self.prepared_candidate_needs_legacy_compare_help(expr))
+            .unwrap_or(true);
+        if allow_legacy_flag_provenance
+            && let Some(prov) = self.lookup_flag_compare_provenance(&cond_name)
+            && let Some(expr) = self.compare_provenance_expr_for_branch(&prov)
+        {
+            return Some(expr);
+        }
+
+        for (idx, op) in block.ops[..branch_idx].iter().enumerate().rev() {
+            if op.dst() != Some(cond) {
+                continue;
+            }
+
+            return match op {
+                SSAOp::Copy { src, .. }
+                | SSAOp::IntZExt { src, .. }
+                | SSAOp::IntSExt { src, .. }
+                | SSAOp::Subpiece { src, .. } => {
+                    self.branch_compare_provenance_expr(block, idx, src, depth + 1)
+                }
+                SSAOp::BoolNot { src, .. } => self
+                    .branch_compare_provenance_expr(block, idx, src, depth + 1)
+                    .map(|expr| CExpr::unary(UnaryOp::Not, expr)),
+                _ => None,
+            };
+        }
+
+        None
     }
 
     pub(super) fn normalize_assignment_predicate_rhs(&self, rhs: CExpr) -> CExpr {
@@ -124,7 +508,24 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn predicate_candidate_for_var(&self, var: &SSAVar) -> Option<CExpr> {
         let key = var.display_name();
-        self.lookup_predicate_expr(&key)
+        let prepared = self
+            .prepared_predicates()
+            .and_then(|facts| {
+                facts
+                    .predicates
+                    .values()
+                    .find(|predicate| predicate.condition == *var)
+                    .and_then(|predicate| self.prepared_branch_condition_expr(predicate.block_addr))
+            })
+            .map(|expr| self.resolve_predicate_expr_tree(&expr))
+            .or_else(|| {
+                self.prepared_predicate_view()
+                    .and_then(|view| view.predicate_expr_for_cond(var).cloned())
+                    .map(|expr| self.resolve_predicate_expr_tree(&expr))
+            })
+            .or_else(|| self.prepared_predicate_candidate_for_var(var));
+        let legacy = self
+            .lookup_predicate_expr(&key)
             .or_else(|| {
                 self.lookup_definition(&key)
                     .filter(|expr| self.is_assignment_predicate_expr(expr))
@@ -148,7 +549,8 @@ impl<'a> FoldingContext<'a> {
                         .filter(|expr| self.is_assignment_predicate_expr(expr))
                         .cloned()
                 })
-            })
+            });
+        self.choose_preferred_scalar_predicate_expr(prepared, legacy)
     }
 
     pub(super) fn resolve_predicate_rhs_for_var(&self, src: &SSAVar, fallback: CExpr) -> CExpr {
@@ -165,6 +567,222 @@ impl<'a> FoldingContext<'a> {
         }
 
         fallback_simplified
+    }
+
+    fn prepared_predicate_candidate_for_var(&self, var: &SSAVar) -> Option<CExpr> {
+        if let Some(expr) = self
+            .prepared_predicate_view()
+            .and_then(|view| view.predicate_expr_for_cond(var).cloned())
+        {
+            return Some(self.resolve_predicate_expr_tree(&expr));
+        }
+        if let Some(predicate) = self
+            .prepared_predicates()?
+            .predicates
+            .values()
+            .find(|predicate| predicate.condition == *var)
+            && let Some(expr) = self
+                .prepared_predicate_view()
+                .and_then(|view| view.branch_expr_for_block(predicate.block_addr).cloned())
+        {
+            return Some(self.resolve_predicate_expr_tree(&expr));
+        }
+        let compare = self
+            .prepared_predicates()?
+            .predicates
+            .values()
+            .find(|predicate| predicate.condition == *var)?
+            .comparison
+            .as_ref()?;
+        self.prepared_compare_provenance_expr(compare)
+    }
+
+    fn prepared_predicate_candidate_for_branch_block(
+        &self,
+        block_addr: u64,
+        var: &SSAVar,
+    ) -> Option<CExpr> {
+        if let Some(expr) = self
+            .prepared_predicate_view()
+            .and_then(|view| view.branch_expr_for_block(block_addr).cloned())
+        {
+            return Some(self.resolve_predicate_expr_tree(&expr));
+        }
+        let facts = self.prepared_predicates()?;
+        let compare = facts
+            .predicates
+            .values()
+            .find(|predicate| predicate.block_addr == block_addr && predicate.condition == *var)
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .or_else(|| {
+                facts
+                    .block_assumptions
+                    .values()
+                    .flat_map(|assumptions| assumptions.iter())
+                    .find(|assumption| assumption.predecessor == block_addr)
+                    .and_then(|assumption| facts.predicates.get(&assumption.predicate))
+                    .and_then(|predicate| predicate.comparison.as_ref())
+            })?;
+        self.prepared_compare_provenance_expr(compare)
+    }
+
+    fn prepared_compare_provenance_expr(&self, prov: &CompareProvenance) -> Option<CExpr> {
+        let compare_width = prov.lhs.size.max(prov.rhs.size);
+        let lhs = self.resolve_prepared_predicate_operand_with_width(&prov.lhs, compare_width);
+        let rhs = self.resolve_prepared_predicate_operand_with_width(&prov.rhs, compare_width);
+        match prov.kind {
+            PreparedCompareKind::Equal => Some(CExpr::binary(BinaryOp::Eq, lhs, rhs)),
+            PreparedCompareKind::NotEqual => Some(CExpr::binary(BinaryOp::Ne, lhs, rhs)),
+            PreparedCompareKind::Less | PreparedCompareKind::SignedLess => {
+                Some(CExpr::binary(BinaryOp::Lt, lhs, rhs))
+            }
+            PreparedCompareKind::LessEqual | PreparedCompareKind::SignedLessEqual => {
+                Some(CExpr::binary(BinaryOp::Le, lhs, rhs))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn resolve_prepared_predicate_operand(&self, var: &SSAVar) -> CExpr {
+        self.resolve_prepared_predicate_operand_with_width(var, var.size)
+    }
+
+    fn resolve_prepared_predicate_operand_with_width(
+        &self,
+        var: &SSAVar,
+        compare_width: u32,
+    ) -> CExpr {
+        let rooted = self
+            .prepared_canonical_value_root(var)
+            .unwrap_or_else(|| var.clone());
+        if rooted.is_const() {
+            return utils::compare_const_to_expr_with_width(
+                &rooted,
+                compare_width.max(rooted.size),
+            );
+        }
+        let original_name = var.display_name();
+        let rooted_name = rooted.display_name();
+        let mut best = None;
+
+        for candidate in [var, &rooted] {
+            let candidate_name = candidate.display_name();
+            best = self.choose_preferred_scalar_predicate_expr(
+                best,
+                self.prepared_predicate_view()
+                    .and_then(|view| view.owner_expr_for_var(candidate).cloned())
+                    .filter(|expr| {
+                        !self.expr_is_address_artifact_in_scalar_context(expr)
+                            && !matches!(
+                                expr,
+                                CExpr::Var(name)
+                                    if self.is_low_signal_visible_name(name)
+                                        || self.is_transient_visible_name(name)
+                                        || name.ends_with("_home")
+                                        || name.starts_with("var_")
+                                        || name.starts_with("local_")
+                                        || name.starts_with("stack_")
+                                        || name.starts_with("arg_")
+                            )
+                    }),
+            );
+            if let Some(alias) = self
+                .stack_slot_provenance_for_name(&candidate_name)
+                .filter(|slot| slot.is_scalar_predicate_carrier())
+                .map(|slot| slot.offset)
+                .and_then(|offset| self.resolve_stack_var(offset))
+                .filter(|alias| {
+                    !self.is_low_signal_visible_name(alias)
+                        && !self.is_transient_visible_name(alias)
+                })
+            {
+                best = self.choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(alias)));
+            }
+            best = self.choose_preferred_scalar_predicate_expr(
+                best,
+                self.call_result_source_for_ssa_name(&candidate_name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(&candidate_name))
+                    .and_then(|source| {
+                        self.stable_owned_call_result_name_for_source(source)
+                            .map(CExpr::Var)
+                            .or_else(|| self.stable_owned_call_result_expr_for_source(source))
+                            .or_else(|| self.synthesized_call_expr_for_source_call(source))
+                    }),
+            );
+            best = self.choose_preferred_scalar_predicate_expr(
+                best,
+                self.stack_slot_provenance_for_name(&candidate_name)
+                    .map(|slot| slot.offset)
+                    .or_else(|| self.extract_stack_offset_from_var(candidate))
+                    .and_then(|offset| self.resolve_stack_var(offset))
+                    .filter(|name| {
+                        !self.is_low_signal_visible_name(name)
+                            && !self.is_transient_visible_name(name)
+                            && !name.ends_with("_home")
+                            && !name.starts_with("var_")
+                            && !name.starts_with("local_")
+                            && !name.starts_with("stack_")
+                            && !name.starts_with("arg_")
+                    })
+                    .map(CExpr::Var),
+            );
+            if let Some(alias) = self.arg_alias_for_rendered_name(&candidate_name) {
+                best = self.choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(alias)));
+            }
+            let visible_name = self.var_name(candidate);
+            if !self.is_low_signal_visible_name(&visible_name)
+                && !self.is_transient_visible_name(&visible_name)
+                && !visible_name.eq_ignore_ascii_case(&candidate_name)
+            {
+                best = self
+                    .choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(visible_name)));
+            }
+            best = self.choose_preferred_scalar_predicate_expr(
+                best,
+                self.best_visible_definition(&candidate_name),
+            );
+        }
+        let resolved = self.resolve_predicate_operand(
+            &self.origin_name_to_expr(&rooted_name),
+            0,
+            &mut HashSet::new(),
+        );
+        if !original_name.eq_ignore_ascii_case(&rooted_name) {
+            let original_resolved = self.resolve_predicate_operand(
+                &self.origin_name_to_expr(&original_name),
+                0,
+                &mut HashSet::new(),
+            );
+            if let Some(current) = best.as_ref()
+                && self.structured_predicate_candidate_should_win(current, &original_resolved)
+            {
+                best = Some(original_resolved);
+            } else {
+                best = self.choose_preferred_scalar_predicate_expr(best, Some(original_resolved));
+            }
+        }
+        if let Some(current) = best.as_ref()
+            && self.structured_predicate_candidate_should_win(current, &resolved)
+        {
+            return resolved;
+        }
+        self.choose_preferred_scalar_predicate_expr(best, Some(resolved.clone()))
+            .unwrap_or(resolved)
+    }
+
+    fn resolve_predicate_expr_tree(&self, expr: &CExpr) -> CExpr {
+        self.resolve_predicate_expr_tree_with_visited(expr, &mut HashSet::new())
+    }
+
+    fn resolve_predicate_expr_tree_with_visited(
+        &self,
+        expr: &CExpr,
+        visited: &mut HashSet<String>,
+    ) -> CExpr {
+        let mut recurse =
+            |child: CExpr| self.resolve_predicate_expr_tree_with_visited(&child, visited);
+        let mapped = expr.clone().map_children(&mut recurse);
+        self.resolve_predicate_operand(&mapped, 0, visited)
     }
 
     pub(super) fn is_assignment_predicate_expr(&self, expr: &CExpr) -> bool {
@@ -200,6 +818,21 @@ impl<'a> FoldingContext<'a> {
     pub fn extract_condition(&self, op: &SSAOp) -> Option<CExpr> {
         match op {
             SSAOp::CBranch { cond, .. } => {
+                if let Some(expr) = self.prepared_predicate_candidate_for_var(cond) {
+                    let finalized = self.finalize_condition_expr(expr);
+                    if !self.prepared_candidate_needs_legacy_compare_help(&finalized) {
+                        return Some(finalized);
+                    }
+                    return Some(
+                        self.choose_preferred_scalar_predicate_expr(
+                            Some(finalized.clone()),
+                            self.lookup_flag_compare_provenance(&cond.display_name())
+                                .and_then(|prov| self.compare_provenance_expr_for_branch(&prov))
+                                .map(|expr| self.finalize_condition_expr(expr)),
+                        )
+                        .unwrap_or(finalized),
+                    );
+                }
                 let cond_name = cond.display_name();
                 if let Some(prov) = self.lookup_flag_compare_provenance(&cond_name)
                     && let Some(expr) = self.compare_provenance_expr_for_branch(&prov)
@@ -288,9 +921,24 @@ impl<'a> FoldingContext<'a> {
         rhs: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
-        let lhs = self.local_expr_for_var(block, op_idx, lhs, depth)?;
-        let rhs = self.local_expr_for_var(block, op_idx, rhs, depth)?;
+        let compare_width = lhs.size.max(rhs.size);
+        let lhs = self.local_compare_operand_expr(block, op_idx, lhs, depth, compare_width)?;
+        let rhs = self.local_compare_operand_expr(block, op_idx, rhs, depth, compare_width)?;
         Some(CExpr::binary(op, lhs, rhs))
+    }
+
+    fn local_compare_operand_expr(
+        &self,
+        block: &FunctionSSABlock,
+        op_idx: usize,
+        var: &SSAVar,
+        depth: u32,
+        compare_width: u32,
+    ) -> Option<CExpr> {
+        if var.is_const() {
+            return Some(utils::compare_const_to_expr_with_width(var, compare_width));
+        }
+        self.local_expr_for_var(block, op_idx, var, depth)
     }
 
     fn local_expr_for_var(
@@ -462,8 +1110,17 @@ impl<'a> FoldingContext<'a> {
         rhs: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
-        let lhs = self.local_expr_for_var(block, op_idx, lhs, depth)?;
-        let rhs = self.local_expr_for_var(block, op_idx, rhs, depth)?;
+        let compare_width = lhs.size.max(rhs.size);
+        let lhs = if lhs.is_const() {
+            Some(utils::compare_const_to_expr_with_width(lhs, compare_width))
+        } else {
+            self.local_expr_for_var(block, op_idx, lhs, depth)
+        }?;
+        let rhs = if rhs.is_const() {
+            Some(utils::compare_const_to_expr_with_width(rhs, compare_width))
+        } else {
+            self.local_expr_for_var(block, op_idx, rhs, depth)
+        }?;
         Some(CExpr::binary(op, lhs, rhs))
     }
 
@@ -515,7 +1172,9 @@ impl<'a> FoldingContext<'a> {
         };
 
         if self.is_predicate_like_expr(&normalized) {
-            self.simplify_condition_expr(normalized)
+            let simplified = self.simplify_condition_expr(normalized);
+            let rewritten = self.rewrite_call_result_predicate_owners(simplified, 0);
+            self.simplify_condition_expr(rewritten)
         } else {
             normalized
         }
@@ -604,9 +1263,15 @@ impl<'a> FoldingContext<'a> {
                                 })
                                 .map(CExpr::Var)
                         });
-                    return alias;
+                    if alias.is_some() {
+                        return alias;
+                    }
+                    continue;
                 }
-                return stored;
+                if let Some(stored) = stored {
+                    return Some(stored);
+                }
+                continue;
             }
         }
 
@@ -673,6 +1338,8 @@ impl<'a> FoldingContext<'a> {
             .unwrap_or_else(|| CExpr::Var(self.var_name(var)));
         let expr = self.rewrite_stack_expr(expr);
         let expr = self.rewrite_condition_stack_aliases(expr);
+        let expr = self.simplify_condition_expr(expr);
+        let expr = self.rewrite_call_result_predicate_owners(expr, 0);
         self.simplify_condition_expr(expr)
     }
 
@@ -715,6 +1382,15 @@ impl<'a> FoldingContext<'a> {
             .any(|candidate| candidate.eq_ignore_ascii_case(&name))
         {
             return CExpr::Var(name);
+        }
+
+        if let Some(alias) = self
+            .stack_slot_provenance_for_name(&name)
+            .map(|slot| slot.offset)
+            .and_then(|offset| self.resolve_stack_var(offset))
+            .filter(|alias| !alias.eq_ignore_ascii_case(&name))
+        {
+            return CExpr::Var(alias);
         }
 
         if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&CExpr::Var(name.clone()), 0)
@@ -940,6 +1616,10 @@ impl<'a> FoldingContext<'a> {
     pub(super) fn rewrite_le_from_lt_or_eq(&self, left: &CExpr, right: &CExpr) -> Option<CExpr> {
         let (lt_lhs, lt_rhs) = self.extract_cmp_operands(left, BinaryOp::Lt)?;
         let (eq_lhs, eq_rhs) = self.extract_cmp_operands(right, BinaryOp::Eq)?;
+        let lt_lhs = self.normalize_predicate_match_operand(&lt_lhs);
+        let lt_rhs = self.normalize_predicate_match_operand(&lt_rhs);
+        let eq_lhs = self.normalize_predicate_match_operand(&eq_lhs);
+        let eq_rhs = self.normalize_predicate_match_operand(&eq_rhs);
 
         if (lt_lhs == eq_lhs && lt_rhs == eq_rhs) || (lt_lhs == eq_rhs && lt_rhs == eq_lhs) {
             return Some(CExpr::binary(BinaryOp::Le, lt_lhs, lt_rhs));
@@ -963,6 +1643,93 @@ impl<'a> FoldingContext<'a> {
             CExpr::Cast { expr: inner, .. } => self.extract_cmp_operands(inner, op),
             _ => None,
         }
+    }
+
+    fn normalize_predicate_match_operand(&self, expr: &CExpr) -> CExpr {
+        match expr {
+            CExpr::Paren(inner) => self.normalize_predicate_match_operand(inner),
+            CExpr::Cast {
+                ty: CType::Bool | CType::Int(_) | CType::UInt(_),
+                expr: inner,
+            } => {
+                let normalized = self.normalize_predicate_match_operand(inner);
+                if matches!(
+                    normalized,
+                    CExpr::Var(_) | CExpr::IntLit(_) | CExpr::UIntLit(_)
+                ) {
+                    normalized
+                } else {
+                    CExpr::Cast {
+                        ty: match expr {
+                            CExpr::Cast { ty, .. } => ty.clone(),
+                            _ => unreachable!(),
+                        },
+                        expr: Box::new(normalized),
+                    }
+                }
+            }
+            CExpr::Cast { ty, expr: inner } => CExpr::Cast {
+                ty: ty.clone(),
+                expr: Box::new(self.normalize_predicate_match_operand(inner)),
+            },
+            CExpr::Var(name) => self
+                .normalize_compare_style_const_name(name)
+                .unwrap_or_else(|| CExpr::Var(name.clone())),
+            other => other.clone(),
+        }
+    }
+
+    fn normalize_compare_style_const_name(&self, name: &str) -> Option<CExpr> {
+        if let Some(expr) = self.compare_const_expr_from_name(name) {
+            return Some(expr);
+        }
+
+        fn lit_for_u64(value: u64) -> CExpr {
+            if value > 0x7fff_ffff {
+                CExpr::UIntLit(value)
+            } else {
+                CExpr::IntLit(value as i64)
+            }
+        }
+
+        if let Some(value) = parse_const_value(name) {
+            return Some(lit_for_u64(value));
+        }
+
+        if let Some(dec) = name.strip_prefix("0d").or_else(|| name.strip_prefix("0D")) {
+            return dec.parse::<u64>().ok().map(lit_for_u64);
+        }
+
+        if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+            return u64::from_str_radix(hex, 16).ok().map(lit_for_u64);
+        }
+
+        if name.len() > 1 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+            return u64::from_str_radix(name, 16).ok().map(lit_for_u64);
+        }
+
+        name.parse::<i64>().ok().map(CExpr::IntLit)
+    }
+
+    fn compare_const_expr_from_name(&self, name: &str) -> Option<CExpr> {
+        let raw = name.strip_prefix("const:")?;
+        let raw = raw.split('_').next().unwrap_or(raw);
+
+        let value = if let Some(dec) = raw.strip_prefix("0d").or_else(|| raw.strip_prefix("0D")) {
+            dec.parse::<u64>().ok()?
+        } else if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16).ok()?
+        } else if raw.len() > 1 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            u64::from_str_radix(raw, 16).ok()?
+        } else {
+            raw.parse::<u64>().ok()?
+        };
+
+        Some(if value > 0x7fff_ffff {
+            CExpr::UIntLit(value)
+        } else {
+            CExpr::IntLit(value as i64)
+        })
     }
 
     pub(super) fn extract_cmp_zero_operand(&self, expr: &CExpr, op: BinaryOp) -> Option<CExpr> {
@@ -1181,13 +1948,13 @@ impl<'a> FoldingContext<'a> {
             CExpr::IntLit(_) | CExpr::UIntLit(_) => Some(expr.clone()),
             CExpr::Paren(inner) => self.const_expr_for_comparison(inner),
             CExpr::Cast { expr: inner, .. } => self.const_expr_for_comparison(inner),
-            CExpr::Var(name) => {
+            CExpr::Var(name) => self.compare_const_expr_from_name(name).or_else(|| {
                 if let Some(val) = parse_const_value(name) {
-                    if val > 0x7fffffff {
-                        Some(CExpr::UIntLit(val))
+                    Some(if val > 0x7fffffff {
+                        CExpr::UIntLit(val)
                     } else {
-                        Some(CExpr::IntLit(val as i64))
-                    }
+                        CExpr::IntLit(val as i64)
+                    })
                 } else if let Some(hex) =
                     name.strip_prefix("0x").or_else(|| name.strip_prefix("0X"))
                 {
@@ -1201,7 +1968,7 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     None
                 }
-            }
+            }),
             _ => None,
         }
     }
@@ -1371,12 +2138,19 @@ impl<'a> FoldingContext<'a> {
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
                 }
-                if self.call_result_source_for_ssa_name(name).is_some()
-                    && let Some(inner @ CExpr::Call { .. }) = self
+                if let Some(source) = self
+                    .call_result_source_for_ssa_name(name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                {
+                    if let Some(inner @ CExpr::Call { .. }) = self
                         .lookup_definition(name)
                         .or_else(|| self.formatted_defs_map().get(name).cloned())
-                {
-                    return inner;
+                    {
+                        return inner;
+                    }
+                    if let Some(inner) = self.synthesized_call_expr_for_source_call(source) {
+                        return inner;
+                    }
                 }
                 if let Some(inner) = self.lookup_predicate_expr(name)
                     && inner != CExpr::Var(name.clone())
@@ -2213,12 +2987,22 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn parse_expr_from_name(&self, name: &str) -> Option<CExpr> {
+        if let Some(expr) = self.compare_const_expr_from_name(name) {
+            return Some(expr);
+        }
+
         if let Some(val) = parse_const_value(name) {
             return Some(if val > 0x7fffffff {
                 CExpr::UIntLit(val)
             } else {
                 CExpr::IntLit(val as i64)
             });
+        }
+
+        if let Some(dec) = name.strip_prefix("0d").or_else(|| name.strip_prefix("0D"))
+            && let Ok(val) = dec.parse::<i64>()
+        {
+            return Some(CExpr::IntLit(val));
         }
 
         if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X"))
@@ -2229,6 +3013,22 @@ impl<'a> FoldingContext<'a> {
             } else {
                 CExpr::IntLit(val as i64)
             });
+        }
+
+        if name.chars().all(|c| c.is_ascii_hexdigit()) {
+            let has_alpha = name.chars().any(|c| c.is_ascii_alphabetic());
+            let has_digit = name.chars().any(|c| c.is_ascii_digit());
+            if has_alpha && (has_digit || name.len() > 4) {
+                if let Ok(val) = u64::from_str_radix(name, 16) {
+                    return Some(if val > 0x7fffffff {
+                        CExpr::UIntLit(val)
+                    } else {
+                        CExpr::IntLit(val as i64)
+                    });
+                }
+            } else if let Ok(dec) = name.parse::<i64>() {
+                return Some(CExpr::IntLit(dec));
+            }
         }
 
         if let Ok(dec) = name.parse::<i64>() {
@@ -2264,32 +3064,70 @@ impl<'a> FoldingContext<'a> {
                 if let Some(parsed) = self.parse_expr_from_name(name) {
                     return parsed;
                 }
-                if let Some(slot) = self.stack_slot_provenance_for_name(name)
-                    && slot.offset < 0
-                    && let Some(stack_name) = self.resolve_stack_var(slot.offset)
+                if !visited.insert(name.clone()) {
+                    return CExpr::Var(name.clone());
+                }
+                let allow_stack_alias_fallback = |alias: &str| {
+                    !alias.ends_with("_home")
+                        && !self.is_reserved_param_alias_name(alias)
+                        && !alias.starts_with("var_")
+                        && !alias.starts_with("local_")
+                        && !alias.starts_with("stack_")
+                        && !alias.starts_with("arg_")
+                };
+                let stack_alias_fallback = self
+                    .stack_slot_provenance_for_name(name)
+                    .filter(|slot| slot.offset < 0)
+                    .and_then(|slot| {
+                        self.resolve_stack_var(slot.offset).map(|stack_name| {
+                            (slot.is_scalar_predicate_carrier(), CExpr::Var(stack_name))
+                        })
+                    });
+                if let Some((false, CExpr::Var(alias))) = stack_alias_fallback.as_ref()
+                    && allow_stack_alias_fallback(alias)
                 {
-                    return CExpr::Var(stack_name);
+                    return CExpr::Var(alias.clone());
                 }
                 if let Some(owner) = self.stable_owned_call_result_expr_for_name(name, true) {
                     return owner;
                 }
-                if self.call_result_source_for_ssa_name(name).is_some()
-                    && let Some(inner @ CExpr::Call { .. }) = self
+                if let Some(source) = self
+                    .call_result_source_for_ssa_name(name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                {
+                    if let Some(inner @ CExpr::Call { .. }) = self
                         .lookup_definition(name)
                         .or_else(|| self.formatted_defs_map().get(name).cloned())
-                {
-                    return inner;
+                    {
+                        return inner;
+                    }
+                    if let Some(inner) = self.synthesized_call_expr_for_source_call(source) {
+                        return inner;
+                    }
                 }
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
+                }
+                if let Some(prepared) = self.prepared_predicate_view() {
+                    if let Some(inner) = prepared
+                        .predicate_expr_for_name(name)
+                        .cloned()
+                        .filter(|inner| inner != &CExpr::Var(name.clone()))
+                    {
+                        return self.resolve_predicate_expr_tree_with_visited(&inner, visited);
+                    }
+                    if let Some(inner) =
+                        prepared.owner_expr_for_name(name).cloned().filter(|inner| {
+                            inner != &CExpr::Var(name.clone()) && !matches!(inner, CExpr::AddrOf(_))
+                        })
+                    {
+                        return self.resolve_predicate_expr_tree_with_visited(&inner, visited);
+                    }
                 }
                 if let Some(inner) = self.lookup_predicate_expr(name)
                     && inner != CExpr::Var(name.clone())
                 {
                     return self.resolve_predicate_operand(&inner, depth + 1, visited);
-                }
-                if !visited.insert(name.clone()) {
-                    return CExpr::Var(name.clone());
                 }
 
                 let resolved = self
@@ -2301,6 +3139,26 @@ impl<'a> FoldingContext<'a> {
                             CExpr::Var(stack_var)
                         } else if matches!(inner, CExpr::Call { .. }) {
                             inner
+                        } else if (self.is_predicate_like_expr(&inner)
+                            || matches!(
+                                inner,
+                                CExpr::Binary {
+                                    op: BinaryOp::Add
+                                        | BinaryOp::Sub
+                                        | BinaryOp::Mul
+                                        | BinaryOp::Div
+                                        | BinaryOp::Mod
+                                        | BinaryOp::Shl
+                                        | BinaryOp::Shr
+                                        | BinaryOp::BitAnd
+                                        | BinaryOp::BitOr
+                                        | BinaryOp::BitXor,
+                                    ..
+                                } | CExpr::Unary { .. }
+                            ))
+                            && !self.expr_is_address_artifact_in_scalar_context(&inner)
+                        {
+                            self.resolve_predicate_expr_tree_with_visited(&inner, visited)
                         } else if matches!(
                             inner,
                             CExpr::Var(_) | CExpr::Paren(_) | CExpr::Cast { .. } | CExpr::Deref(_)
@@ -2313,7 +3171,22 @@ impl<'a> FoldingContext<'a> {
                     .unwrap_or_else(|| CExpr::Var(name.clone()));
 
                 visited.remove(name);
-                resolved
+                if let Some((_, ref alias @ CExpr::Var(ref alias_name))) = stack_alias_fallback {
+                    if !allow_stack_alias_fallback(alias_name) {
+                        return resolved;
+                    }
+                    if self.structured_predicate_candidate_should_win(alias, &resolved) {
+                        resolved
+                    } else {
+                        self.choose_preferred_scalar_predicate_expr(
+                            Some(alias.clone()),
+                            Some(resolved.clone()),
+                        )
+                        .unwrap_or(resolved)
+                    }
+                } else {
+                    resolved
+                }
             }
             _ => expr.clone(),
         }

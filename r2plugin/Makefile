@@ -30,8 +30,31 @@ else
 endif
 
 # radare2 configuration
+LOCAL_R2_DIR ?= ../../radare2
+LOCAL_R2_ABS := $(abspath $(LOCAL_R2_DIR))
+LOCAL_R2_INCLUDE := $(LOCAL_R2_ABS)/libr/include
+LOCAL_R2_ANAL_LIB := $(LOCAL_R2_ABS)/libr/anal/libr_anal.so
+LOCAL_R2_LIB_FLAGS = \
+	-L$(LOCAL_R2_ABS)/libr/core \
+	-L$(LOCAL_R2_ABS)/libr/anal \
+	-L$(LOCAL_R2_ABS)/libr/arch \
+	-L$(LOCAL_R2_ABS)/libr/util \
+	-L$(LOCAL_R2_ABS)/libr/io \
+	-L$(LOCAL_R2_ABS)/libr/reg \
+	-L$(LOCAL_R2_ABS)/libr/esil \
+	-L$(LOCAL_R2_ABS)/libr/cons \
+	-L$(LOCAL_R2_ABS)/libr/flag \
+	-L$(LOCAL_R2_ABS)/libr/search \
+	-L$(LOCAL_R2_ABS)/libr/syscall \
+	-L$(LOCAL_R2_ABS)/libr/muta \
+	-lr_core -lr_anal -lr_arch -lr_util -lr_io -lr_reg -lr_esil -lr_cons -lr_flag -lr_search -lr_syscall -lr_muta
+ifeq ($(wildcard $(LOCAL_R2_INCLUDE)/r_anal.h)$(wildcard $(LOCAL_R2_ANAL_LIB)),)
 R2_CFLAGS := $(shell pkg-config --cflags r_anal r_arch r_core 2>/dev/null || echo "-I/usr/include/libr")
 R2_LDFLAGS := $(shell pkg-config --libs r_anal r_arch r_core 2>/dev/null || echo "-lr_core -lr_anal -lr_arch -lr_util -lr_io")
+else
+R2_CFLAGS := -I$(LOCAL_R2_INCLUDE)
+R2_LDFLAGS := $(LOCAL_R2_LIB_FLAGS)
+endif
 R2_PLUGIN_DIR := $(shell r2 -H R2_USER_PLUGINS 2>/dev/null || echo "$(HOME)/.local/share/radare2/plugins")
 
 # Compiler settings
@@ -45,6 +68,10 @@ ANAL_PLUGIN_SO = $(ANAL_PLUGIN_NAME).$(PLUGIN_EXT)
 ARCH_PLUGIN_SO = $(ARCH_PLUGIN_NAME).$(PLUGIN_EXT)
 
 .PHONY: all clean install uninstall rust rust-debug rust-release help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs
+
+RUST_MANIFESTS := $(shell find .. -maxdepth 2 \( -name Cargo.toml -o -path '../.cargo/config.toml' \) -type f)
+RUST_SOURCES := $(shell find ../r2plugin/src ../crates -type f -name '*.rs')
+RUST_BUILD_PREREQS := $(RUST_MANIFESTS) $(RUST_SOURCES)
 
 all: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 
@@ -80,29 +107,21 @@ ifeq ($(UNAME),Darwin)
 	@codesign --force --sign - $@ >/dev/null
 endif
 
-# Build Rust library (release)
-rust-release:
-	cd .. && cargo build --release --features $(RUST_FEATURES) -p r2sleigh-plugin
-ifeq ($(UNAME),Darwin)
-	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-	@codesign --force --sign - $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
-endif
-
-# Build Rust library (debug)
-rust-debug:
-	cd .. && cargo build --features $(RUST_FEATURES) -p r2sleigh-plugin
-ifeq ($(UNAME),Darwin)
-	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-	@codesign --force --sign - $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
-endif
-
 # Default rust target
 ifeq ($(RUST_TARGET),release)
 rust: rust-release
-$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): rust-release
+rust-release: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): $(RUST_BUILD_PREREQS)
+	cd .. && cargo build --release --features $(RUST_FEATURES) -p r2sleigh-plugin
 else
 rust: rust-debug
-$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): rust-debug
+rust-debug: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): $(RUST_BUILD_PREREQS)
+	cd .. && cargo build --features $(RUST_FEATURES) -p r2sleigh-plugin
+endif
+ifeq ($(UNAME),Darwin)
+	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	@codesign --force --sign - $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
 endif
 
 $(RUST_LIB_LOCAL): $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)

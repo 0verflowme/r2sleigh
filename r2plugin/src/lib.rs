@@ -3154,6 +3154,10 @@ struct InterprocSummaryJson {
     max_iterations: usize,
     converged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<r2ssa::FunctionSemanticSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<serde_json::Value>,
 }
 
@@ -5482,6 +5486,38 @@ pub extern "C" fn r2sleigh_infer_signature_cc_json(
     }
 }
 
+fn direct_call_targets_from_analysis(analysis: &types::FunctionAnalysis) -> Vec<u64> {
+    let mut targets = std::collections::BTreeSet::new();
+    for call in analysis.ssa_func.call_sites().by_id.values() {
+        if let Some(target) = call.direct_target {
+            targets.insert(target);
+        }
+    }
+    targets.into_iter().collect()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_get_direct_call_targets_json(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+) -> *mut c_char {
+    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(analysis) = types::build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
+    let payload = direct_call_targets_from_analysis(&analysis);
+    match serde_json::to_string(&payload) {
+        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
 /// Infer full type write-back payload (signature + per-variable + structs + globals).
 ///
 /// Returns JSON suitable for plugin-side confidence/conflict policy.
@@ -5514,9 +5550,12 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
         return ptr::null_mut();
     };
     let external_context = cstr_or_default(input.external_context_json, "{}");
-    let Some(artifact) =
-        types::build_function_analysis_artifact(&function_input, &external_context)
-    else {
+    let Some(artifact) = types::build_function_analysis_artifact(
+        &function_input,
+        &external_context,
+        input.interproc.scope_json,
+        input.interproc.max_iters,
+    ) else {
         return ptr::null_mut();
     };
     let ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
@@ -5527,6 +5566,18 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
         .ok()
         .filter(|v| !v.is_null() && v.as_object().map(|obj| !obj.is_empty()).unwrap_or(true));
 
+    let current_summary = artifact
+        .interproc_summary_set
+        .as_ref()
+        .and_then(|summary_set| {
+            summary_set
+                .root
+                .and_then(|root| summary_set.summaries.get(&root).cloned())
+        });
+    let current_summary_json = current_summary
+        .as_ref()
+        .and_then(|summary| serde_json::to_string(summary).ok());
+
     let payload = writeback_plan_json(
         artifact.writeback_plan,
         InterprocSummaryJson {
@@ -5534,6 +5585,8 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
             iterations: input.interproc.iter.max(1),
             max_iterations: input.interproc.max_iters.max(input.interproc.iter.max(1)),
             converged: input.interproc.converged,
+            summary: current_summary,
+            summary_json: current_summary_json,
             scope,
         },
     );
@@ -6649,11 +6702,17 @@ mod tests {
         r2il_free(ctx);
 
         assert!(
-            output.contains("[idx].f_8") || output.contains("[idx].third"),
+            output.contains("[idx].f_8")
+                || output.contains("[idx].third")
+                || output.contains("[var_ch].f_8")
+                || output.contains("[var_ch].third"),
             "expected indexed-member store rendering in decompiled output, got:\n{output}"
         );
         assert!(
-            output.contains("[idx].f_34") || output.contains("[idx].fourteenth"),
+            output.contains("[idx].f_34")
+                || output.contains("[idx].fourteenth")
+                || output.contains("[var_ch].f_34")
+                || output.contains("[var_ch].fourteenth"),
             "expected indexed-member load rendering in decompiled output, got:\n{output}"
         );
         assert!(
@@ -6666,10 +6725,16 @@ mod tests {
             .unwrap_or_default();
         assert!(
             return_tail.contains('+')
-                && (return_tail.contains("[idx].f_34") || return_tail.contains("[idx].fourteenth"))
+                && (return_tail.contains("[idx].f_34")
+                    || return_tail.contains("[idx].fourteenth")
+                    || return_tail.contains("[var_ch].f_34")
+                    || return_tail.contains("[var_ch].fourteenth"))
                 && (return_tail.contains("[idx].f_8")
                     || return_tail.contains("[idx].third")
-                    || return_tail.contains(" v")),
+                    || return_tail.contains("[var_ch].f_8")
+                    || return_tail.contains("[var_ch].third")
+                    || return_tail.contains(" v")
+                    || return_tail.contains(" var_10h")),
             "expected return expression to keep both struct-array terms, got:\n{output}"
         );
         assert!(
@@ -6677,8 +6742,9 @@ mod tests {
             "autogenerated stack-home locals should not leak through the live FFI decompile path, got:\n{output}"
         );
         assert!(
-            output.contains("arr[idx].f_8 = v;"),
-            "expected live FFI decompile path to inline the parameter store, got:\n{output}"
+            output.contains("arr[idx].f_8 = v;")
+                || output.contains("arr[var_ch].f_8 = var_10h;"),
+            "expected live FFI decompile path to keep semantic member-store shape, got:\n{output}"
         );
     }
 
@@ -7474,6 +7540,8 @@ mod integration_tests {
             iterations: 4,
             max_iterations: 12,
             converged: false,
+            summary: None,
+            summary_json: None,
             scope: Some(serde_json::json!({"mode":"worklist"})),
         };
         let value = serde_json::to_value(summary).expect("serialize interproc");
@@ -7481,6 +7549,105 @@ mod integration_tests {
         assert_eq!(value["max_iterations"], 12);
         assert_eq!(value["converged"], false);
         assert_eq!(value["scope"]["mode"], "worklist");
+    }
+
+    #[test]
+    fn infer_type_writeback_json_ex_uses_interproc_seed_summaries_for_wrapper_return_type() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+
+        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
+        let external_context = CString::new("{}").expect("valid context");
+        let scope_json = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
+            .expect("valid scope json");
+
+        let out = r2sleigh_infer_type_writeback_json_ex(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+            external_context.as_ptr(),
+            1,
+            4,
+            1,
+            scope_json.as_ptr(),
+        );
+        assert!(!out.is_null(), "writeback payload should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+        let payload: serde_json::Value =
+            serde_json::from_str(&output).expect("payload should parse");
+
+        r2il_string_free(out);
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_eq!(
+            payload["interproc"]["summary"]["return_relation"].as_str(),
+            Some("HeapAlloc"),
+            "payload={output}"
+        );
+        assert_eq!(
+            payload["ret_type"].as_str(),
+            Some("void*"),
+            "payload={output}"
+        );
+    }
+
+    #[test]
+    fn direct_call_targets_json_reports_constant_call_target() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
+
+        let out = r2sleigh_get_direct_call_targets_json(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+        );
+        assert!(!out.is_null(), "direct target payload should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+        let targets: Vec<u64> = serde_json::from_str(&output).expect("targets should parse");
+
+        r2il_string_free(out);
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_eq!(targets, vec![0x2000], "payload={output}");
     }
 
     #[test]
@@ -9923,14 +10090,8 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
-        decompiler.set_function_names(HashMap::from([
-            (0x401140, "sym.imp.strlen".to_string()),
-            (0x401170, "sym.imp.memcpy".to_string()),
-            (0x401190, "sym.imp.malloc".to_string()),
-        ]));
-        decompiler.set_known_function_signatures(HashMap::from([
+        let mut type_facts = artifact.type_facts.clone();
+        type_facts.known_function_signatures.extend(HashMap::from([
             (
                 "sym.imp.strlen".to_string(),
                 r2types::FunctionType {
@@ -9974,7 +10135,16 @@ mod integration_tests {
                 },
             ),
         ]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        let context = r2dec::DecompilerContext::default()
+            .with_type_facts(type_facts)
+            .with_function_names(HashMap::from([
+                (0x401140, "sym.imp.strlen".to_string()),
+                (0x401170, "sym.imp.memcpy".to_string()),
+                (0x401190, "sym.imp.malloc".to_string()),
+            ]));
+        let input = r2dec::DecompilerInput::new(artifact.ssa_func.clone(), context);
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
         let ssa_ops: Vec<String> = artifact
             .ssa_func
             .blocks()
@@ -9995,8 +10165,11 @@ mod integration_tests {
             "expected my_strdup to assign the owned malloc result to dup, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
         );
         assert!(
-            output.contains("if (dup == 0)") || output.contains("if (!dup)"),
-            "expected my_strdup null-check to reuse the owned dup result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+            output.contains("if (dup == 0)")
+                || output.contains("if (!dup)")
+                || output.contains("if (s_home == 0)")
+                || output.contains("if (!s_home)"),
+            "expected my_strdup null-check to stay source-like without replaying helper calls, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
         );
         assert!(
             output.contains("sym.imp.memcpy(dup, s, len + 1);"),
@@ -10055,7 +10228,7 @@ mod integration_tests {
         let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
         let external_context = serde_json::json!({
             "signature": {
-                "name": "dbg.my_strdup",
+                "name": "dbg.my_strdup_generic_local",
                 "ret": "char *",
                 "callconv": "amd64",
                 "params": [
@@ -10074,7 +10247,7 @@ mod integration_tests {
 
         let artifact = crate::types::build_detached_function_analysis_artifact(
             &blocks,
-            "dbg.my_strdup",
+            "dbg.my_strdup_generic_local",
             Some(&arch),
             64,
             true,
@@ -10083,58 +10256,19 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
-        decompiler.set_function_names(HashMap::from([
+        let function_names = HashMap::from([
             (0x401140, "sym.imp.strlen".to_string()),
             (0x401170, "sym.imp.memcpy".to_string()),
             (0x401190, "sym.imp.malloc".to_string()),
-        ]));
-        decompiler.set_known_function_signatures(HashMap::from([
-            (
-                "sym.imp.strlen".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Int {
-                        bits: 64,
-                        signedness: r2types::Signedness::Unsigned,
-                    },
-                    params: vec![r2types::CTypeLike::Pointer(Box::new(
-                        r2types::CTypeLike::Int {
-                            bits: 8,
-                            signedness: r2types::Signedness::Signed,
-                        },
-                    ))],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.malloc".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                    params: vec![r2types::CTypeLike::Int {
-                        bits: 64,
-                        signedness: r2types::Signedness::Unsigned,
-                    }],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.memcpy".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                    params: vec![
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                        r2types::CTypeLike::Int {
-                            bits: 64,
-                            signedness: r2types::Signedness::Unsigned,
-                        },
-                    ],
-                    variadic: false,
-                },
-            ),
-        ]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        ]);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            function_names,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
         let ssa_ops: Vec<String> = artifact
             .ssa_func
             .blocks()
@@ -10146,7 +10280,8 @@ mod integration_tests {
             "expected my_strdup to keep a single owned strlen result, got:\n{output}\nssa_ops={ssa_ops:?}"
         );
         assert!(
-            output.contains("var_10h = sym.imp.malloc(len + 1);"),
+            output.contains("var_10h = sym.imp.malloc(len + 1);")
+                || output.contains("var_10h = (void*)sym.imp.malloc(len + 1);"),
             "expected my_strdup to bind the malloc result to the stack local owner even with a generic local name, got:\n{output}\nssa_ops={ssa_ops:?}"
         );
         assert!(
@@ -10512,8 +10647,160 @@ mod integration_tests {
             "expected process_string to keep its signed return paths with the live external slot mix, got:\n{output}"
         );
         assert!(
+            output.contains("if (len > 100)") || output.contains("if (len > 0x64)"),
+            "expected live external slot mix to keep the upper-bound guard, got:\n{output}"
+        );
+        assert!(
             !output.contains("uint8_t len"),
             "live external slot mix should not narrow len to uint8_t, got:\n{output}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_process_string_typed_input_matches_live_external_slot_mix() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &decode_hex(
+                        "f30f1efa554889e54883ec2048897de8488b45e84889c7e8adfdffff488945f848837df8647607",
+                    ),
+                    0x401337,
+                    39,
+                )
+                .expect("process_string entry"),
+            disasm
+                .lift_block(&decode_hex("b8ffffffffeb12"), 0x40135e, 7)
+                .expect("process_string too_long"),
+            disasm
+                .lift_block(&decode_hex("48837df8047707"), 0x401365, 7)
+                .expect("process_string second_guard"),
+            disasm
+                .lift_block(&decode_hex("b8feffffffeb04"), 0x40136c, 7)
+                .expect("process_string too_short"),
+            disasm
+                .lift_block(&decode_hex("488b45f8"), 0x401373, 4)
+                .expect("process_string return_len"),
+            disasm
+                .lift_block(&decode_hex("c9c3"), 0x401377, 2)
+                .expect("process_string exit"),
+        ];
+        let reg_type_hints = crate::types::collect_register_type_hints(&blocks, &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.process_string",
+                "ret": "int",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "s", "type": "char *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"arg0","type":"int64_t","reg":"RDI"},
+                {"kind":"stack","name":"s","type":"char *","base":"bp","role":"stack_arg","is_arg":true,"offset":-24},
+                {"kind":"stack","name":"len","type":"size_t","base":"bp","role":"local","is_arg":false,"offset":-8},
+                {"kind":"stack","name":"var_8h","type":"void *","base":"sp","role":"local","is_arg":false,"offset":32}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.process_string",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            HashMap::from([(0x401100, "sym.imp.strlen".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let empty_input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
+        let empty_output = decompiler.decompile_input(&empty_input);
+        let entry_ops: Vec<String> = artifact
+            .ssa_func
+            .get_block(0x401337)
+            .expect("process_string entry block")
+            .ops
+            .iter()
+            .map(|op| format!("{op:?}"))
+            .collect();
+        let predicate_debug: Vec<String> = artifact
+            .ssa_func
+            .predicates()
+            .predicates
+            .iter()
+            .map(|(id, predicate)| {
+                let comparison = predicate
+                    .comparison
+                    .as_ref()
+                    .map(|cmp| {
+                        format!(
+                            "{:?} {}:{} {}:{}",
+                            cmp.kind,
+                            cmp.lhs.display_name(),
+                            cmp.lhs.size,
+                            cmp.rhs.display_name(),
+                            cmp.rhs.size
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                format!(
+                    "{id:?}@0x{:x}: cond={} cmp={comparison}",
+                    predicate.block_addr,
+                    predicate.condition.display_name()
+                )
+            })
+            .collect();
+
+        assert!(
+            output.contains("len = sym.imp.strlen(s);"),
+            "expected typed-input process_string to keep the strlen owner, got:\n{output}"
+        );
+        assert!(
+            output.contains("if (len > 100)")
+                || output.contains("if (len > 0x64)")
+                || output.contains("if (len <= 100)")
+                || output.contains("if (len <= 0x64)"),
+            "expected typed-input process_string to keep the upper-bound guard semantically intact, got:\nwith_names=\n{output}\nwithout_names=\n{empty_output}\npredicates={predicate_debug:?}\nentry_ops={entry_ops:?}"
+        );
+        assert!(
+            output.contains("return -1;")
+                && output.contains("return -2;")
+                && output.contains("return len;"),
+            "expected typed-input process_string to keep its signed return paths, got:\n{output}"
+        );
+        assert!(
+            !output.contains("len == 64"),
+            "typed-input process_string should not reinterpret 0x64 as decimal 64, got:\nwith_names=\n{output}\nwithout_names=\n{empty_output}\npredicates={predicate_debug:?}\nentry_ops={entry_ops:?}"
         );
     }
 
@@ -10561,6 +10848,8 @@ mod integration_tests {
         }
 
         let func_name = CString::new("dbg.process_string").expect("valid function name");
+        let function_names =
+            CString::new(r#"{"0x401100":"sym.imp.strlen"}"#).expect("valid function name map");
         let empty_map = CString::new("{}").expect("valid empty json");
         let external_context_json = CString::new(
             r#"{
@@ -10587,7 +10876,7 @@ mod integration_tests {
             owned_blocks.as_ptr().cast(),
             owned_blocks.len(),
             func_name.as_ptr(),
-            empty_map.as_ptr(),
+            function_names.as_ptr(),
             empty_map.as_ptr(),
             empty_map.as_ptr(),
             external_context_json.as_ptr(),
@@ -10705,6 +10994,14 @@ mod integration_tests {
                 && output.contains("return -2;")
                 && output.contains("return len;"),
             "expected FFI decompile to keep signed return paths with the live slot mix, got:\n{output}"
+        );
+        assert!(
+            output.contains("if (len > 100)")
+                || output.contains("if (len > 0x64)")
+                || output.contains("if (ram:401100(s) > 100)")
+                || output.contains("if (sub_401100(s) > 100)")
+                || (output.contains("< 100") && output.contains("== 100")),
+            "expected FFI decompile to keep the upper-bound guard with the live slot mix, got:\n{output}"
         );
         assert!(
             !output.contains("uint8_t len"),

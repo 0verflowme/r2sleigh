@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use r2ssa::SSAVar;
-use r2types::TypeOracle;
+use r2ssa::{PreparedFunctionSSA, SSAVar};
+use r2types::{ExternalStackSlotSpec, StackSlotKey, TypeOracle, VisibleBinding};
 
 use crate::ast::{CExpr, CType};
 use crate::fold::{PtrArith, SSABlock};
@@ -12,6 +12,7 @@ pub(crate) mod flag_info;
 pub(crate) mod lower;
 pub(crate) mod ownership;
 pub(crate) mod predicate;
+pub(crate) mod prepared_semantic;
 pub(crate) mod stack_info;
 pub(crate) mod use_info;
 pub(crate) mod utils;
@@ -20,11 +21,17 @@ pub(crate) use ownership::{
     CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, SemanticOwnershipFacts,
 };
 pub(crate) use predicate::PredicateSimplifier;
+pub(crate) use prepared_semantic::{
+    PreparedCallView, PreparedSemanticView, PreparedSemanticViewInputs,
+    build_prepared_runtime_facts,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UseInfoAnalysisMode {
     Full,
     LocalStructAccesses,
+    #[allow(dead_code)]
+    PreparedDenseSwitch,
 }
 
 #[allow(dead_code)]
@@ -386,6 +393,16 @@ impl UseInfo {
         use_info::analyze(blocks, env)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn analyze_prepared_runtime(
+        blocks: &[SSABlock],
+        env: &PassEnv<'_>,
+        prepared: &PreparedFunctionSSA,
+        definition_overrides: &HashMap<String, CExpr>,
+    ) -> Self {
+        use_info::analyze_prepared_runtime(blocks, env, prepared, definition_overrides)
+    }
+
     pub(crate) fn analyze_for_local_struct_accesses(
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
@@ -401,6 +418,16 @@ impl UseInfo {
         use_info::analyze_with_definition_overrides(blocks, env, definition_overrides)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn apply_definition_overrides_fast(
+        baseline: &UseInfo,
+        blocks: &[SSABlock],
+        env: &PassEnv<'_>,
+        definition_overrides: &HashMap<String, CExpr>,
+    ) -> Self {
+        use_info::apply_definition_overrides_fast(baseline, blocks, env, definition_overrides)
+    }
+
     pub(crate) fn preserve_authoritative_facts_from(&mut self, baseline: &UseInfo) {
         use_info::preserve_authoritative_facts(self, baseline);
     }
@@ -410,10 +437,30 @@ impl FlagInfo {
     pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
         flag_info::analyze(blocks, use_info, env)
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn analyze_prepared_runtime(
+        blocks: &[SSABlock],
+        use_info: &UseInfo,
+        prepared: &PreparedFunctionSSA,
+    ) -> Self {
+        flag_info::analyze_prepared_runtime(blocks, use_info, prepared)
+    }
 }
 
 impl StackInfo {
     pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
         stack_info::analyze(blocks, use_info, env)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn analyze_prepared_runtime(
+        blocks: &[SSABlock],
+        prepared: &PreparedFunctionSSA,
+        stack_slots: &BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+        visible_bindings: &[VisibleBinding],
+        env: &PassEnv<'_>,
+    ) -> Self {
+        stack_info::analyze_prepared_runtime(blocks, prepared, stack_slots, visible_bindings, env)
     }
 }

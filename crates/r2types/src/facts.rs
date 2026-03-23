@@ -92,17 +92,59 @@ pub struct VisibleBinding {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CalleeArgEffect {
+    pub read: bool,
+    pub write: bool,
+    pub escape: bool,
+    pub free: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalleeReturnRelation {
+    Unknown,
+    Void,
+    Arg(usize),
+    Const(u64),
+    HeapAlloc,
+    Global(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalleeFact {
+    pub function_id: u64,
+    pub name: Option<String>,
+    pub direct_callees: Vec<u64>,
+    pub callsite_count: usize,
+    pub has_unknown_calls: bool,
+    pub arg_effects: BTreeMap<usize, CalleeArgEffect>,
+    pub return_relation: CalleeReturnRelation,
+    pub reads_global_memory: bool,
+    pub writes_global_memory: bool,
+    pub touches_unknown_memory: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InterprocFactDiagnostics {
+    pub iterations: usize,
+    pub max_iterations: usize,
+    pub converged: bool,
+    pub scope_size: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionTypeFacts {
     pub merged_signature: Option<FunctionSignatureSpec>,
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub visible_bindings: Vec<VisibleBinding>,
+    pub callee_facts: BTreeMap<u64, CalleeFact>,
     // Legacy compatibility view derived from canonical stack_slots when available.
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
+    pub interproc_diagnostics: InterprocFactDiagnostics,
     pub diagnostics: Vec<String>,
 }
 
@@ -113,11 +155,13 @@ pub struct FunctionTypeFactInputs {
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub visible_bindings: Vec<VisibleBinding>,
+    pub callee_facts: BTreeMap<u64, CalleeFact>,
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub local_field_accesses: Vec<LocalFieldAccessFact>,
+    pub interproc_diagnostics: InterprocFactDiagnostics,
     pub diagnostics: Vec<String>,
 }
 
@@ -133,6 +177,7 @@ impl FunctionTypeFacts {
             && self.register_params.is_empty()
             && self.stack_slots.is_empty()
             && self.visible_bindings.is_empty()
+            && self.callee_facts.is_empty()
             && self.external_stack_vars.is_empty()
             && self.external_type_db.structs.is_empty()
             && self.external_type_db.unions.is_empty()
@@ -140,6 +185,7 @@ impl FunctionTypeFacts {
             && self.external_type_db.diagnostics.is_empty()
             && self.slot_type_overrides.is_empty()
             && self.slot_field_profiles.is_empty()
+            && self.interproc_diagnostics == InterprocFactDiagnostics::default()
             && self.diagnostics.is_empty()
     }
 
@@ -150,11 +196,13 @@ impl FunctionTypeFacts {
             register_params: self.register_params,
             stack_slots: self.stack_slots,
             visible_bindings: self.visible_bindings,
+            callee_facts: self.callee_facts,
             external_stack_vars: self.external_stack_vars,
             external_type_db: self.external_type_db,
             slot_type_overrides: self.slot_type_overrides,
             slot_field_profiles: self.slot_field_profiles,
             local_field_accesses: Vec::new(),
+            interproc_diagnostics: self.interproc_diagnostics,
             diagnostics: self.diagnostics,
         })
         .build()
@@ -182,10 +230,12 @@ impl FunctionTypeFactsBuilder {
             register_params,
             mut stack_slots,
             visible_bindings,
+            callee_facts,
             external_stack_vars,
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
+            interproc_diagnostics,
             diagnostics,
             ..
         } = self.inputs;
@@ -210,10 +260,12 @@ impl FunctionTypeFactsBuilder {
             register_params,
             stack_slots,
             visible_bindings,
+            callee_facts,
             external_stack_vars,
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
+            interproc_diagnostics,
             diagnostics,
         }
     }

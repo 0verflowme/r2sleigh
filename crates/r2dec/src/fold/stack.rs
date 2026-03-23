@@ -1,9 +1,10 @@
-use r2ssa::{SSAOp, SSAVar};
+use r2ssa::{ObjectKind, SSAOp, SSAVar};
 use r2types::{
     ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
     VisibleBindingKind,
 };
 
+use crate::analysis::prepared_semantic::StackAliasView;
 use crate::analysis::utils;
 use crate::ast::{BinaryOp, CExpr};
 
@@ -17,6 +18,44 @@ use super::{MAX_STACK_ALIAS_DEPTH, MAX_STACK_OFFSET_DEPTH};
 const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
 
 impl<'a> FoldingContext<'a> {
+    fn preferred_prepared_stack_alias_name(&self, alias: &StackAliasView) -> Option<String> {
+        let visible = alias.visible_name.trim();
+        alias
+            .arg_alias
+            .as_ref()
+            .filter(|arg_alias| {
+                !arg_alias.is_empty()
+                    && (visible.is_empty()
+                        || visible.ends_with("_home")
+                        || visible.starts_with("var_")
+                        || visible.starts_with("local_")
+                        || visible.starts_with("stack_")
+                        || visible.starts_with("arg_"))
+            })
+            .cloned()
+            .or_else(|| (!visible.is_empty()).then(|| visible.to_string()))
+            .or_else(|| alias.arg_alias.clone())
+    }
+
+    fn prepared_stack_alias_view(&self) -> Option<&crate::analysis::PreparedSemanticView> {
+        self.prepared_semantic_view()
+    }
+
+    fn prepared_stack_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
+        let objects = self.prepared_objects()?;
+        let object = objects.object_for_value(var).or_else(|| {
+            self.prepared_canonical_value_root(var)
+                .and_then(|root| objects.object_for_value(&root))
+        })?;
+        let fact = objects.object(object)?;
+        match fact.kind {
+            ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
+                Some(offset)
+            }
+            _ => None,
+        }
+    }
+
     fn is_visible_external_stack_name_role(role: ExternalStackSlotRole) -> bool {
         matches!(
             role,
@@ -60,6 +99,16 @@ impl<'a> FoldingContext<'a> {
 
     /// Try to extract a stack offset from a variable name or its definition.
     pub(crate) fn extract_stack_offset_from_var(&self, var: &SSAVar) -> Option<i64> {
+        if let Some(offset) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_offset_for_var(var))
+        {
+            return Some(offset);
+        }
+        if let Some(offset) = self.prepared_stack_offset_for_var(var) {
+            return Some(offset);
+        }
+
         let name_lower = var.name.to_lowercase();
 
         // Direct fp/sp reference
@@ -287,6 +336,20 @@ impl<'a> FoldingContext<'a> {
         }
     }
     pub(crate) fn stack_var_for_addr_var(&self, addr: &SSAVar) -> Option<String> {
+        if let Some(expr) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.owner_expr_for_var(addr))
+        {
+            match expr {
+                CExpr::Var(name) => return Some(name.clone()),
+                CExpr::AddrOf(inner) => {
+                    if let CExpr::Var(name) = inner.as_ref() {
+                        return Some(name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
         let addr_key = addr.display_name();
         if let Some(alias) =
             self.resolve_stack_alias_from_addr_expr(&CExpr::Var(addr_key.clone()), 0)
@@ -303,6 +366,13 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn external_stack_name_for_offset(&self, offset: i64) -> Option<String> {
+        if let Some(alias_name) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_alias_for_offset(offset))
+            .and_then(|alias| self.preferred_prepared_stack_alias_name(alias))
+        {
+            return Some(alias_name);
+        }
         if let Some(binding) = self.visible_stack_binding_for_offset(offset) {
             match binding.kind {
                 VisibleBindingKind::Param
@@ -415,6 +485,13 @@ impl<'a> FoldingContext<'a> {
 
     /// Resolve a stack variable name by signed stack offset.
     pub fn resolve_stack_var(&self, offset: i64) -> Option<String> {
+        if let Some(alias_name) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_alias_for_offset(offset))
+            .and_then(|alias| self.preferred_prepared_stack_alias_name(alias))
+        {
+            return Some(alias_name);
+        }
         let external_name = self.external_stack_name_for_offset(offset);
         let resolved = self
             .stack_vars_map()

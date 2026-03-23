@@ -299,3 +299,17 @@ af
 a:sla.slice ZF_1 | jq -c '.sink_var == "ZF_1"'
 EOF_CMDS
 RUN
+
+NAME=types_interproc_wrapper_uses_cached_callee_payload
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaaa
+s sym.alloc_wrapper2 >/dev/null
+af
+a:sla.types | jq -c '(.ret_type == "void *" or .ret_type == "void*") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
+EOF_CMDS
+RUN

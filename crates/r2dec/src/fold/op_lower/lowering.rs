@@ -36,20 +36,36 @@ impl<'a> FoldingContext<'a> {
                 if frame.with_call_args {
                     match op {
                         SSAOp::Call { target } => {
-                            let func_expr = self.resolve_call_target(target);
+                            let func_expr = self.resolve_call_target_for_site(
+                                frame.block_addr,
+                                frame.op_idx,
+                                target,
+                            );
                             let raw_args = self
                                 .call_args_map()
                                 .get(&(frame.block_addr, frame.op_idx))
                                 .cloned()
                                 .unwrap_or_default();
-                            let mut args = self.render_call_args_for_callee(&func_expr, raw_args);
+                            let mut args = self
+                                .prepared_call_args_for_site(
+                                    frame.block_addr,
+                                    frame.op_idx,
+                                    &func_expr,
+                                )
+                                .unwrap_or_else(|| {
+                                    self.render_call_args_for_callee(&func_expr, raw_args)
+                                });
                             if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
                                 args.truncate(max_arity);
                             }
                             return LoweredOp::Expr(CExpr::call(func_expr, args));
                         }
                         SSAOp::CallInd { target } => {
-                            let resolved_target = self.resolve_call_target(target);
+                            let resolved_target = self.resolve_call_target_for_site(
+                                frame.block_addr,
+                                frame.op_idx,
+                                target,
+                            );
                             let func_expr = match resolved_target {
                                 CExpr::Var(_) => resolved_target,
                                 other => CExpr::Deref(Box::new(other)),
@@ -59,7 +75,15 @@ impl<'a> FoldingContext<'a> {
                                 .get(&(frame.block_addr, frame.op_idx))
                                 .cloned()
                                 .unwrap_or_default();
-                            let mut args = self.render_call_args_for_callee(&func_expr, raw_args);
+                            let mut args = self
+                                .prepared_call_args_for_site(
+                                    frame.block_addr,
+                                    frame.op_idx,
+                                    &func_expr,
+                                )
+                                .unwrap_or_else(|| {
+                                    self.render_call_args_for_callee(&func_expr, raw_args)
+                                });
                             if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
                                 args.truncate(max_arity);
                             }

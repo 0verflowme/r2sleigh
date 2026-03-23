@@ -7,6 +7,15 @@ use r2il::{ArchSpec, SpaceId, Varnode, select_register_name};
 pub type RegisterNameMap = HashMap<(u64, u32), String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ArchLayoutHashKey {
+    ptr_id: usize,
+    name: String,
+    variant: String,
+    addr_size: u32,
+    register_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ArchCacheTag {
     name: String,
     variant: String,
@@ -16,19 +25,50 @@ pub(crate) struct ArchCacheTag {
 
 impl ArchCacheTag {
     pub(crate) fn from_arch(arch: &ArchSpec) -> Self {
+        let cache_key = ArchLayoutHashKey {
+            ptr_id: arch as *const ArchSpec as usize,
+            name: arch.name.clone(),
+            variant: arch.variant.clone(),
+            addr_size: arch.addr_size,
+            register_count: arch.registers.len(),
+        };
+        if let Some(register_layout_hash) = arch_layout_hash_cache()
+            .read()
+            .expect("arch layout hash cache read lock poisoned")
+            .get(&cache_key)
+            .copied()
+        {
+            return Self {
+                name: cache_key.name,
+                variant: cache_key.variant,
+                addr_size: cache_key.addr_size,
+                register_layout_hash,
+            };
+        }
+
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for reg in &arch.registers {
             reg.name.hash(&mut hasher);
             reg.offset.hash(&mut hasher);
             reg.size.hash(&mut hasher);
         }
+        let register_layout_hash = hasher.finish();
+        arch_layout_hash_cache()
+            .write()
+            .expect("arch layout hash cache write lock poisoned")
+            .insert(cache_key.clone(), register_layout_hash);
         Self {
-            name: arch.name.clone(),
-            variant: arch.variant.clone(),
-            addr_size: arch.addr_size,
-            register_layout_hash: hasher.finish(),
+            name: cache_key.name,
+            variant: cache_key.variant,
+            addr_size: cache_key.addr_size,
+            register_layout_hash,
         }
     }
+}
+
+fn arch_layout_hash_cache() -> &'static RwLock<HashMap<ArchLayoutHashKey, u64>> {
+    static CACHE: OnceLock<RwLock<HashMap<ArchLayoutHashKey, u64>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn register_name_map_cache() -> &'static RwLock<HashMap<ArchCacheTag, Arc<RegisterNameMap>>> {

@@ -1,19 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use r2ssa::{SSABlock, SSAOp, SSAVar};
+use r2ssa::{
+    FunctionSemanticSummary, InterprocSummarySet, SSABlock, SSAOp, SSAVar, SummaryArgEffect,
+    SummaryReturnRelation,
+};
 
 use crate::context::{
     ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, ParsedExternalContext,
     StackSlotKey, apply_main_signature_override, is_c_main_function, is_generic_arg_name,
-    legacy_external_stack_vars_from_slots, stack_slots_from_legacy_external_stack_vars,
+    stack_slots_from_legacy_external_stack_vars,
 };
 use crate::convert::CTypeLike;
 use crate::external::{
     ExternalField, ExternalStruct, ExternalTypeDb, normalize_external_type_name,
 };
 use crate::facts::{
-    FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts,
-    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    CalleeArgEffect, CalleeFact, CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec,
+    FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics, VisibleBinding,
+    VisibleBindingKind, parse_type_like_spec,
 };
 use crate::model::Signedness;
 
@@ -195,6 +199,7 @@ pub struct TypeWritebackAnalysisInput<'a> {
     pub ssa_blocks: &'a [SSABlock],
     pub parsed_context: ParsedExternalContext,
     pub local_structs: LocalStructArtifacts,
+    pub interproc_summary_set: Option<InterprocSummarySet>,
     pub diagnostics: TypeWritebackDiagnostics,
 }
 
@@ -227,6 +232,132 @@ struct GlobalAddrExpr {
     confidence: u8,
 }
 
+fn summary_arg_effect_to_callee(effect: &SummaryArgEffect) -> CalleeArgEffect {
+    CalleeArgEffect {
+        read: effect.read,
+        write: effect.write,
+        escape: effect.escape,
+        free: effect.free,
+    }
+}
+
+fn summary_return_relation_to_callee(relation: &SummaryReturnRelation) -> CalleeReturnRelation {
+    match relation {
+        SummaryReturnRelation::Unknown => CalleeReturnRelation::Unknown,
+        SummaryReturnRelation::Void => CalleeReturnRelation::Void,
+        SummaryReturnRelation::Arg(idx) => CalleeReturnRelation::Arg(*idx),
+        SummaryReturnRelation::Const(value) => CalleeReturnRelation::Const(*value),
+        SummaryReturnRelation::HeapAlloc => CalleeReturnRelation::HeapAlloc,
+        SummaryReturnRelation::Global(address) => CalleeReturnRelation::Global(*address),
+    }
+}
+
+fn summary_to_callee_fact(summary: &FunctionSemanticSummary) -> CalleeFact {
+    CalleeFact {
+        function_id: summary.id.0,
+        name: summary.name.clone(),
+        direct_callees: summary.direct_callees.iter().copied().collect(),
+        callsite_count: summary.callsite_count,
+        has_unknown_calls: summary.has_unknown_calls,
+        arg_effects: summary
+            .arg_effects
+            .iter()
+            .map(|(idx, effect)| (*idx, summary_arg_effect_to_callee(effect)))
+            .collect(),
+        return_relation: summary_return_relation_to_callee(&summary.return_relation),
+        reads_global_memory: summary.reads_global_memory,
+        writes_global_memory: summary.writes_global_memory,
+        touches_unknown_memory: summary.touches_unknown_memory,
+    }
+}
+
+fn infer_interproc_return_type(
+    summary: &FunctionSemanticSummary,
+    merged_signature: Option<&FunctionSignatureSpec>,
+    inferred_signature: &InferredSignature,
+    ptr_bits: u32,
+) -> Option<CTypeLike> {
+    match summary.return_relation {
+        SummaryReturnRelation::HeapAlloc => Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
+        SummaryReturnRelation::Arg(idx) => merged_signature
+            .and_then(|signature| signature.params.get(idx))
+            .and_then(|param| param.ty.clone())
+            .filter(|ty| !is_generic_signature_type(Some(ty)))
+            .or_else(|| {
+                inferred_signature
+                    .params
+                    .get(idx)
+                    .and_then(|param| parse_type_like_spec(&param.param_type, ptr_bits))
+                    .filter(|ty| !is_generic_signature_type(Some(ty)))
+            }),
+        _ => None,
+    }
+}
+
+fn apply_interproc_summary_to_signature(
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    inferred_signature: &mut InferredSignature,
+    summary_set: Option<&InterprocSummarySet>,
+    ptr_bits: u32,
+) {
+    let Some(summary_set) = summary_set else {
+        return;
+    };
+    let Some(root) = summary_set.root else {
+        return;
+    };
+    let Some(summary) = summary_set.summaries.get(&root) else {
+        return;
+    };
+    let Some(ret_ty) = infer_interproc_return_type(
+        summary,
+        merged_signature.as_ref(),
+        inferred_signature,
+        ptr_bits,
+    ) else {
+        return;
+    };
+
+    let should_override = merged_signature
+        .as_ref()
+        .and_then(|signature| signature.ret_type.as_ref())
+        .is_none_or(|ty| {
+            is_generic_signature_type(Some(ty))
+                || matches!(
+                    (&ret_ty, ty),
+                    (
+                        CTypeLike::Pointer(_),
+                        CTypeLike::Int {
+                            bits,
+                            signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+                        }
+                    ) if *bits == ptr_bits
+                )
+        });
+    if !should_override {
+        return;
+    }
+
+    if merged_signature.is_none() {
+        *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
+    }
+    if let Some(signature) = merged_signature.as_mut() {
+        signature.ret_type = Some(ret_ty.clone());
+    }
+
+    if is_generic_type_string(&inferred_signature.ret_type)
+        || matches!(
+            parse_type_like_spec(&inferred_signature.ret_type, ptr_bits),
+            Some(CTypeLike::Int {
+                bits,
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+            }) if bits == ptr_bits
+        )
+    {
+        inferred_signature.ret_type = render_signature_type(&ret_ty, ptr_bits);
+    }
+}
+
 pub fn build_type_writeback_analysis(
     mut input: TypeWritebackAnalysisInput<'_>,
 ) -> TypeWritebackAnalysis {
@@ -236,14 +367,17 @@ pub fn build_type_writeback_analysis(
         input.parsed_context.stack_slots =
             stack_slots_from_legacy_external_stack_vars(&input.parsed_context.external_stack_vars);
     }
-    if !input.parsed_context.stack_slots.is_empty() {
-        input.parsed_context.external_stack_vars =
-            legacy_external_stack_vars_from_slots(&input.parsed_context.stack_slots);
-    }
 
     let mut merged_signature = merge_local_signature_into_merged_signature(
         input.parsed_context.merged_signature.clone(),
         inferred_signature_to_spec(&input.inferred_signature, input.ptr_bits),
+    );
+    canonicalize_param_home_stack_slots(
+        merged_signature.as_ref(),
+        &input.parsed_context.register_params,
+        &mut input.parsed_context.stack_slots,
+        input.ssa_blocks,
+        input.ptr_bits,
     );
     apply_main_signature_override(input.function_name, &mut merged_signature);
     merged_signature = merge_recovered_arg_types_into_signature(
@@ -251,6 +385,12 @@ pub fn build_type_writeback_analysis(
         input.recovered_vars,
         input.ptr_bits,
         input.function_name,
+    );
+    apply_interproc_summary_to_signature(
+        &mut merged_signature,
+        &mut input.inferred_signature,
+        input.interproc_summary_set.as_ref(),
+        input.ptr_bits,
     );
 
     let mut diagnostics = input.diagnostics;
@@ -334,10 +474,36 @@ pub fn build_type_writeback_analysis(
         register_params: input.parsed_context.register_params.clone(),
         stack_slots: input.parsed_context.stack_slots.clone(),
         visible_bindings,
-        external_stack_vars: input.parsed_context.external_stack_vars.clone(),
+        callee_facts: input
+            .interproc_summary_set
+            .as_ref()
+            .map(|summary_set| {
+                summary_set
+                    .summaries
+                    .iter()
+                    .filter(|(id, _)| Some(**id) != summary_set.root)
+                    .map(|(id, summary)| (id.0, summary_to_callee_fact(summary)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        external_stack_vars: if input.parsed_context.stack_slots.is_empty() {
+            input.parsed_context.external_stack_vars.clone()
+        } else {
+            HashMap::new()
+        },
         external_type_db: type_db,
         slot_type_overrides: local_structs.slot_type_overrides.clone(),
         slot_field_profiles: local_structs.slot_field_profiles.clone(),
+        interproc_diagnostics: input
+            .interproc_summary_set
+            .as_ref()
+            .map(|summary_set| InterprocFactDiagnostics {
+                iterations: summary_set.diagnostics.iterations,
+                max_iterations: summary_set.diagnostics.max_iterations,
+                converged: summary_set.diagnostics.converged,
+                scope_size: summary_set.diagnostics.scope_size,
+            })
+            .unwrap_or_default(),
         diagnostics: diagnostics.solver_warnings.clone(),
         ..FunctionTypeFactInputs::default()
     })
@@ -363,6 +529,130 @@ pub fn build_type_writeback_analysis(
         type_facts,
         plan,
     }
+}
+
+fn canonicalize_param_home_stack_slots(
+    merged_signature: Option<&FunctionSignatureSpec>,
+    register_params: &[crate::context::ExternalRegisterParamSpec],
+    stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    ssa_blocks: &[SSABlock],
+    ptr_bits: u32,
+) {
+    if register_params.is_empty() || stack_slots.is_empty() || ssa_blocks.is_empty() {
+        return;
+    }
+
+    let mut slot_addr_by_var = HashMap::<String, StackSlotKey>::new();
+    for block in ssa_blocks {
+        for op in &block.ops {
+            match op {
+                SSAOp::IntAdd { dst, a, b } => {
+                    if let Some(slot_key) = stack_slot_key_from_add_sub(a, b, false, ptr_bits) {
+                        slot_addr_by_var.insert(dst.display_name(), slot_key);
+                    }
+                }
+                SSAOp::IntSub { dst, a, b } => {
+                    if let Some(slot_key) = stack_slot_key_from_add_sub(a, b, true, ptr_bits) {
+                        slot_addr_by_var.insert(dst.display_name(), slot_key);
+                    }
+                }
+                SSAOp::Store { addr, val, .. } => {
+                    let Some(slot_key) = slot_addr_by_var.get(&addr.display_name()).cloned() else {
+                        continue;
+                    };
+                    let Some((param_index, param_reg)) =
+                        register_params.iter().enumerate().find_map(|(idx, param)| {
+                            register_family_matches(&param.reg, &val.name)
+                                .then_some((idx, param.reg.clone()))
+                        })
+                    else {
+                        continue;
+                    };
+                    if val.version != 0 {
+                        continue;
+                    }
+                    let Some(slot) = stack_slots.get_mut(&slot_key) else {
+                        continue;
+                    };
+                    if !matches!(
+                        slot.role,
+                        ExternalStackSlotRole::Unknown | ExternalStackSlotRole::Local
+                    ) {
+                        continue;
+                    }
+                    let param_name = merged_signature
+                        .and_then(|sig| sig.params.get(param_index))
+                        .map(|param| param.name.clone())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| format!("arg{}", param_index + 1));
+                    slot.role = ExternalStackSlotRole::ParamHome;
+                    slot.param_index = Some(param_index);
+                    slot.param_name = Some(param_name.clone());
+                    slot.source_reg = Some(param_reg);
+                    if is_low_quality_stack_name(&slot.name) || slot.name.is_empty() {
+                        slot.name = format!("{param_name}_home");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn stack_slot_key_from_add_sub(
+    a: &SSAVar,
+    b: &SSAVar,
+    is_sub: bool,
+    ptr_bits: u32,
+) -> Option<StackSlotKey> {
+    let base = stack_base_from_var(a)?;
+    let raw = parse_const_value(&b.name)?;
+    let offset = signed_offset_from_const(raw, ptr_bits);
+    Some(StackSlotKey {
+        base,
+        offset: if is_sub { -offset } else { offset },
+    })
+}
+
+fn stack_base_from_var(var: &SSAVar) -> Option<ExternalStackBase> {
+    let lower = var.name.to_ascii_lowercase();
+    match lower.as_str() {
+        "rbp" | "ebp" | "bp" | "fp" => Some(ExternalStackBase::FramePointer),
+        "rsp" | "esp" | "sp" => Some(ExternalStackBase::StackPointer),
+        _ => None,
+    }
+}
+
+fn register_family_matches(expected: &str, actual: &str) -> bool {
+    let expected = expected.to_ascii_lowercase();
+    let actual = actual.to_ascii_lowercase();
+    if expected == actual {
+        return true;
+    }
+
+    fn family(name: &str) -> Option<&str> {
+        match name {
+            "rax" | "eax" | "ax" | "al" | "ah" => Some("ax"),
+            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some("bx"),
+            "rcx" | "ecx" | "cx" | "cl" | "ch" => Some("cx"),
+            "rdx" | "edx" | "dx" | "dl" | "dh" => Some("dx"),
+            "rsi" | "esi" | "si" | "sil" => Some("si"),
+            "rdi" | "edi" | "di" | "dil" => Some("di"),
+            "rbp" | "ebp" | "bp" | "bpl" => Some("bp"),
+            "rsp" | "esp" | "sp" | "spl" => Some("sp"),
+            "r8" | "r8d" | "r8w" | "r8b" => Some("8"),
+            "r9" | "r9d" | "r9w" | "r9b" => Some("9"),
+            "r10" | "r10d" | "r10w" | "r10b" => Some("10"),
+            "r11" | "r11d" | "r11w" | "r11b" => Some("11"),
+            "r12" | "r12d" | "r12w" | "r12b" => Some("12"),
+            "r13" | "r13d" | "r13w" | "r13b" => Some("13"),
+            "r14" | "r14d" | "r14w" | "r14b" => Some("14"),
+            "r15" | "r15d" | "r15w" | "r15b" => Some("15"),
+            _ => None,
+        }
+    }
+
+    family(&expected) == family(&actual)
 }
 
 fn inferred_signature_to_spec(
@@ -2222,6 +2512,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         };
         let analysis = build_type_writeback_analysis(input);
@@ -2238,6 +2529,146 @@ mod tests {
                 .name,
             "argv"
         );
+    }
+
+    #[test]
+    fn interproc_heap_alloc_summary_upgrades_pointer_sized_scalar_return() {
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let summary_set = InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(
+                root,
+                FunctionSemanticSummary {
+                    id: root,
+                    name: Some("sym.alloc_wrapper".to_string()),
+                    arg_count_hint: Some(1),
+                    direct_callees: BTreeSet::from([0x5000]),
+                    callsite_count: 1,
+                    has_unknown_calls: false,
+                    arg_effects: BTreeMap::new(),
+                    return_relation: SummaryReturnRelation::HeapAlloc,
+                    reads_global_memory: false,
+                    writes_global_memory: false,
+                    touches_unknown_memory: false,
+                },
+            )]),
+            diagnostics: Default::default(),
+        };
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.alloc_wrapper",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.alloc_wrapper".to_string(),
+                signature: "int64_t sym.alloc_wrapper ()".to_string(),
+                ret_type: "int64_t".to_string(),
+                params: Vec::new(),
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(summary_set),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "void*");
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|sig| sig.ret_type.clone()),
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Void)))
+        );
+    }
+
+    #[test]
+    fn interproc_returned_arg_summary_propagates_param_type_and_callee_facts() {
+        let root = r2ssa::InterprocFunctionId(0x401100);
+        let helper = r2ssa::InterprocFunctionId(0x401200);
+        let summary_set = InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([
+                (
+                    root,
+                    FunctionSemanticSummary {
+                        id: root,
+                        name: Some("sym.identity".to_string()),
+                        arg_count_hint: Some(1),
+                        direct_callees: BTreeSet::from([helper.0]),
+                        callsite_count: 1,
+                        has_unknown_calls: false,
+                        arg_effects: BTreeMap::new(),
+                        return_relation: SummaryReturnRelation::Arg(0),
+                        reads_global_memory: false,
+                        writes_global_memory: false,
+                        touches_unknown_memory: false,
+                    },
+                ),
+                (
+                    helper,
+                    FunctionSemanticSummary {
+                        id: helper,
+                        name: Some("sym.helper".to_string()),
+                        arg_count_hint: Some(1),
+                        direct_callees: BTreeSet::new(),
+                        callsite_count: 0,
+                        has_unknown_calls: false,
+                        arg_effects: BTreeMap::from([(
+                            0,
+                            SummaryArgEffect {
+                                read: true,
+                                write: false,
+                                escape: false,
+                                free: false,
+                            },
+                        )]),
+                        return_relation: SummaryReturnRelation::Arg(0),
+                        reads_global_memory: false,
+                        writes_global_memory: false,
+                        touches_unknown_memory: false,
+                    },
+                ),
+            ]),
+            diagnostics: Default::default(),
+        };
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.identity",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.identity".to_string(),
+                signature: "int64_t sym.identity (char * src)".to_string(),
+                ret_type: "int64_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "src".to_string(),
+                    param_type: "char *".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(summary_set),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "int8_t*");
+        let callee = analysis
+            .type_facts
+            .callee_facts
+            .get(&helper.0)
+            .expect("helper callee fact");
+        assert_eq!(callee.name.as_deref(), Some("sym.helper"));
+        assert!(callee.arg_effects.get(&0).is_some_and(|effect| effect.read));
+        assert_eq!(callee.return_relation, CalleeReturnRelation::Arg(0));
     }
 
     #[test]
@@ -2287,6 +2718,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -2353,6 +2785,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -2433,6 +2866,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -2523,6 +2957,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
         assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
@@ -2592,6 +3027,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -2617,6 +3053,165 @@ mod tests {
             "expected hidden param-home binding, got {:?}",
             analysis.type_facts.visible_bindings
         );
+    }
+
+    #[test]
+    fn generic_unknown_param_home_slots_are_canonicalized_from_entry_stores() {
+        let mut parsed_context = ParsedExternalContext {
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+                params: vec![
+                    FunctionParamSpec {
+                        name: "arr".to_string(),
+                        ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Unknown))),
+                    },
+                    FunctionParamSpec {
+                        name: "idx".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 32,
+                            signedness: Signedness::Signed,
+                        }),
+                    },
+                    FunctionParamSpec {
+                        name: "v".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 32,
+                            signedness: Signedness::Signed,
+                        }),
+                    },
+                ],
+            }),
+            register_params: vec![
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Unknown))),
+                    reg: "rdi".to_string(),
+                },
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg2".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    reg: "rsi".to_string(),
+                },
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg3".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    reg: "rdx".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        for (offset, name) in [(-8, "arr"), (-12, "var_ch"), (-16, "var_10h")] {
+            parsed_context.stack_slots.insert(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset,
+                },
+                ExternalStackVarSpec {
+                    name: name.to_string(),
+                    ty: None,
+                    base: ExternalStackBase::FramePointer,
+                    role: ExternalStackSlotRole::Unknown,
+                    param_index: None,
+                    param_name: None,
+                    source_reg: None,
+                },
+            );
+        }
+
+        let ssa_blocks = [SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 1, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 1, 8),
+                    val: SSAVar::new("RDI", 0, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 2, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 2, 8),
+                    val: SSAVar::new("ESI", 0, 4),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 3, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 3, 8),
+                    val: SSAVar::new("EDX", 0, 4),
+                },
+            ],
+        }];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.test_struct_array_index",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.test_struct_array_index".to_string(),
+                signature: "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
+                    .to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arr".to_string(),
+                        param_type: "void *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "idx".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "v".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 90,
+                callconv_confidence: 90,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &ssa_blocks,
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        for (offset, expected_name, expected_idx) in [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)] {
+            let slot = analysis
+                .type_facts
+                .stack_slots
+                .get(&StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset,
+                })
+                .expect("canonicalized slot");
+            assert_eq!(slot.role, ExternalStackSlotRole::ParamHome);
+            assert_eq!(slot.param_index, Some(expected_idx));
+            assert_eq!(slot.param_name.as_deref(), Some(expected_name));
+        }
     }
 
     #[test]
@@ -2668,6 +3263,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -2733,6 +3329,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -2791,6 +3388,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -2883,6 +3481,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs,
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
         assert_eq!(
@@ -3004,6 +3603,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs,
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -3112,6 +3712,7 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs,
+            interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
@@ -3133,6 +3734,177 @@ mod tests {
             Some(&CTypeLike::Pointer(Box::new(CTypeLike::Struct(
                 "sla_struct_deadbeef".to_string(),
             ))))
+        );
+    }
+
+    #[test]
+    fn interproc_heap_alloc_summary_upgrades_generic_return_type() {
+        let mut summary_set = r2ssa::InterprocSummarySet::default();
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        summary_set.root = Some(root);
+        summary_set.summaries.insert(
+            root,
+            r2ssa::FunctionSemanticSummary {
+                id: root,
+                name: Some("sym.alloc_wrapper".to_string()),
+                arg_count_hint: Some(1),
+                direct_callees: BTreeSet::new(),
+                callsite_count: 1,
+                has_unknown_calls: false,
+                arg_effects: BTreeMap::new(),
+                return_relation: r2ssa::SummaryReturnRelation::HeapAlloc,
+                reads_global_memory: false,
+                writes_global_memory: false,
+                touches_unknown_memory: false,
+            },
+        );
+        summary_set.diagnostics = r2ssa::InterprocSummaryDiagnostics {
+            iterations: 2,
+            max_iterations: 8,
+            converged: true,
+            scope_size: 1,
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.alloc_wrapper",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.alloc_wrapper".to_string(),
+                signature: "void * sym.alloc_wrapper (int64_t n)".to_string(),
+                ret_type: "unknown_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "n".to_string(),
+                    param_type: "int64_t".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(summary_set),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|sig| sig.ret_type.as_ref()),
+            Some(&CTypeLike::Pointer(Box::new(CTypeLike::Void)))
+        );
+        assert_eq!(analysis.type_facts.interproc_diagnostics.scope_size, 1);
+    }
+
+    #[test]
+    fn interproc_returned_arg_summary_exports_callee_facts() {
+        let mut summary_set = r2ssa::InterprocSummarySet::default();
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let helper = r2ssa::InterprocFunctionId(0x401080);
+        summary_set.root = Some(root);
+        summary_set.summaries.insert(
+            root,
+            r2ssa::FunctionSemanticSummary {
+                id: root,
+                name: Some("sym.wrapper_user".to_string()),
+                arg_count_hint: Some(2),
+                direct_callees: BTreeSet::from([helper.0]),
+                callsite_count: 1,
+                has_unknown_calls: false,
+                arg_effects: BTreeMap::new(),
+                return_relation: r2ssa::SummaryReturnRelation::Unknown,
+                reads_global_memory: false,
+                writes_global_memory: false,
+                touches_unknown_memory: false,
+            },
+        );
+        summary_set.summaries.insert(
+            helper,
+            r2ssa::FunctionSemanticSummary {
+                id: helper,
+                name: Some("sym.memcpy_like".to_string()),
+                arg_count_hint: Some(2),
+                direct_callees: BTreeSet::new(),
+                callsite_count: 1,
+                has_unknown_calls: false,
+                arg_effects: BTreeMap::from([
+                    (
+                        0,
+                        r2ssa::SummaryArgEffect {
+                            read: false,
+                            write: true,
+                            escape: true,
+                            free: false,
+                        },
+                    ),
+                    (
+                        1,
+                        r2ssa::SummaryArgEffect {
+                            read: true,
+                            write: false,
+                            escape: false,
+                            free: false,
+                        },
+                    ),
+                ]),
+                return_relation: r2ssa::SummaryReturnRelation::Arg(0),
+                reads_global_memory: false,
+                writes_global_memory: false,
+                touches_unknown_memory: false,
+            },
+        );
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.wrapper_user",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.wrapper_user".to_string(),
+                signature: "void * sym.wrapper_user (void * dst, void * src)".to_string(),
+                ret_type: "void *".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "dst".to_string(),
+                        param_type: "void *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "src".to_string(),
+                        param_type: "void *".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 85,
+                callconv_confidence: 85,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(summary_set),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        let helper_fact = analysis
+            .type_facts
+            .callee_facts
+            .get(&helper.0)
+            .expect("helper callee fact");
+        assert_eq!(helper_fact.return_relation, CalleeReturnRelation::Arg(0));
+        assert!(
+            helper_fact
+                .arg_effects
+                .get(&0)
+                .is_some_and(|effect| effect.write && effect.escape)
+        );
+        assert!(
+            helper_fact
+                .arg_effects
+                .get(&1)
+                .is_some_and(|effect| effect.read && !effect.write)
         );
     }
 }
