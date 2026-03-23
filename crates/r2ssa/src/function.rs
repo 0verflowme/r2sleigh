@@ -15,6 +15,7 @@ use crate::block::SSABlock as LocalSSABlock;
 use crate::cfg::{CFG, CFGEdge};
 use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_slice_from_var};
 use crate::domtree::DomTree;
+use crate::graph::SsaGraph;
 use crate::naming::{ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
 use crate::phi::{PhiPlacement, collect_defs_from_cfg_with_names};
@@ -23,7 +24,8 @@ use crate::rename::{
     rename_function_with_names_and_call_boundaries,
 };
 use crate::semantic::{
-    CallSiteFacts, MemorySSAFacts, ObjectModel, PredicateFacts, PreparedFunctionFacts,
+    CallSiteFacts, MemoryDefFact, MemorySSAFacts, MemoryUseFact, ObjectId, ObjectModel,
+    PredicateFacts, PreparedFunctionFacts,
 };
 use crate::var::SSAVar;
 
@@ -72,19 +74,22 @@ pub enum FunctionPrepareMode {
     Symbolic,
 }
 
-/// Canonical prepared-SSA artifact consumed by downstream analysis layers.
+/// Canonical SSA artifact consumed by downstream analysis layers.
 #[derive(Debug, Clone)]
-pub struct PreparedFunctionSSA {
+pub struct SsaArtifact {
     function: SSAFunction,
+    graph: SsaGraph,
     mode: FunctionPrepareMode,
     facts: PreparedFunctionFacts,
 }
 
-impl PreparedFunctionSSA {
+impl SsaArtifact {
     fn new(function: SSAFunction, mode: FunctionPrepareMode) -> Self {
-        let facts = PreparedFunctionFacts::collect(&function);
+        let graph = SsaGraph::from_function(&function);
+        let facts = PreparedFunctionFacts::collect(&function, &graph);
         Self {
             function,
+            graph,
             mode,
             facts,
         }
@@ -139,6 +144,10 @@ impl PreparedFunctionSSA {
         &self.function
     }
 
+    pub fn graph(&self) -> &SsaGraph {
+        &self.graph
+    }
+
     pub fn into_function(self) -> SSAFunction {
         self.function
     }
@@ -163,6 +172,42 @@ impl PreparedFunctionSSA {
         &self.facts.call_sites
     }
 
+    pub fn value_var(&self, value_id: crate::graph::ValueId) -> Option<&SSAVar> {
+        self.graph.value(value_id).map(|value| &value.var)
+    }
+
+    pub fn inst_op_site(&self, inst_id: crate::graph::InstId) -> Option<(u64, usize)> {
+        self.graph.op_site_for_inst(inst_id)
+    }
+
+    pub fn object_for_var(&self, var: &SSAVar) -> Option<ObjectId> {
+        self.graph
+            .value_id_for_var(var)
+            .and_then(|value_id| self.objects().object_for_value(value_id))
+    }
+
+    pub fn memory_uses_for_op_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<&[MemoryUseFact]> {
+        self.graph
+            .inst_id_for_op_site(block_addr, op_idx)
+            .and_then(|inst_id| self.memory().uses_by_inst.get(&inst_id))
+            .map(|facts| facts.as_slice())
+    }
+
+    pub fn memory_defs_for_op_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<&[MemoryDefFact]> {
+        self.graph
+            .inst_id_for_op_site(block_addr, op_idx)
+            .and_then(|inst_id| self.memory().defs_by_inst.get(&inst_id))
+            .map(|facts| facts.as_slice())
+    }
+
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.function = self.function.with_name(name);
         self
@@ -180,7 +225,7 @@ impl PreparedFunctionSSA {
     }
 }
 
-impl Deref for PreparedFunctionSSA {
+impl Deref for SsaArtifact {
     type Target = SSAFunction;
 
     fn deref(&self) -> &Self::Target {
@@ -202,7 +247,7 @@ impl DecompilePrepFacts {
 ///
 /// This is the main entry point for function-level SSA analysis.
 /// It contains the CFG, dominator tree, and SSA operations for all blocks.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SSAFunction {
     /// The function's name (if known).
     pub name: Option<String>,
@@ -218,6 +263,29 @@ pub struct SSAFunction {
     block_order: Vec<u64>,
     /// Optional decompiler-prep fact snapshot for the current SSA state.
     decompile_prep_facts: Option<DecompilePrepFacts>,
+    /// Structural def/use index for repeated SSA queries.
+    query_index: RwLock<Option<SsaQueryIndex>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SsaQueryIndex {
+    defs: HashMap<SSAVar, (u64, DefLocation)>,
+    uses: HashMap<SSAVar, Vec<(u64, UseLocation)>>,
+}
+
+impl Clone for SSAFunction {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            entry: self.entry,
+            cfg: self.cfg.clone(),
+            domtree: self.domtree.clone(),
+            blocks: self.blocks.clone(),
+            block_order: self.block_order.clone(),
+            decompile_prep_facts: self.decompile_prep_facts.clone(),
+            query_index: RwLock::new(None),
+        }
+    }
 }
 
 /// A basic block in SSA form.
@@ -859,6 +927,7 @@ impl SSAFunction {
             blocks: ssa_blocks,
             block_order: renamed.block_order,
             decompile_prep_facts: None,
+            query_index: RwLock::new(None),
         })
     }
 
@@ -885,6 +954,8 @@ impl SSAFunction {
 
     /// Get a mutable block by address.
     pub fn get_block_mut(&mut self, addr: u64) -> Option<&mut SSABlock> {
+        self.invalidate_query_index();
+        self.decompile_prep_facts = None;
         self.blocks.get_mut(&addr)
     }
 
@@ -912,6 +983,8 @@ impl SSAFunction {
 
     /// Get mutable access to the CFG.
     pub fn cfg_mut(&mut self) -> &mut CFG {
+        self.invalidate_query_index();
+        self.decompile_prep_facts = None;
         &mut self.cfg
     }
 
@@ -990,6 +1063,7 @@ impl SSAFunction {
         self.block_order.retain(|&a| a != addr);
         self.cfg.remove_block(addr);
         self.decompile_prep_facts = None;
+        self.invalidate_query_index();
     }
 
     /// Remove phi sources for a specific predecessor edge.
@@ -1000,6 +1074,7 @@ impl SSAFunction {
             }
         }
         self.decompile_prep_facts = None;
+        self.invalidate_query_index();
     }
 
     /// Recompute cached metadata after CFG mutation.
@@ -1009,6 +1084,7 @@ impl SSAFunction {
         self.block_order = self.cfg.reverse_postorder();
         self.domtree = DomTree::compute(&self.cfg);
         self.decompile_prep_facts = None;
+        self.invalidate_query_index();
     }
 
     /// Iterate over all SSA operations in the function.
@@ -1065,46 +1141,25 @@ impl SSAFunction {
     ///
     /// Returns the block address and operation index where the variable is defined.
     pub fn find_def(&self, var: &SSAVar) -> Option<(u64, DefLocation)> {
-        for (&addr, block) in &self.blocks {
-            // Check phi nodes
-            for (i, phi) in block.phis.iter().enumerate() {
-                if &phi.dst == var {
-                    return Some((addr, DefLocation::Phi(i)));
-                }
-            }
-
-            // Check operations
-            for (i, op) in block.ops.iter().enumerate() {
-                if op.dst() == Some(var) {
-                    return Some((addr, DefLocation::Op(i)));
-                }
-            }
-        }
-        None
+        self.ensure_query_index();
+        self.query_index
+            .read()
+            .expect("SSA query index lock poisoned")
+            .as_ref()
+            .and_then(|index| index.defs.get(var).copied())
     }
 
     /// Find all uses of a variable.
     ///
     /// Returns a list of (block address, use location) pairs.
     pub fn find_uses(&self, var: &SSAVar) -> Vec<(u64, UseLocation)> {
-        let mut uses = Vec::new();
-
-        for (&addr, block) in &self.blocks {
-            block.for_each_source(|src| {
-                if src.var != var {
-                    return;
-                }
-                let use_loc = match src.site {
-                    SourceSite::Phi {
-                        phi_idx, src_idx, ..
-                    } => UseLocation::Phi { phi_idx, src_idx },
-                    SourceSite::Op { op_idx, src_idx } => UseLocation::Op { op_idx, src_idx },
-                };
-                uses.push((addr, use_loc));
-            });
-        }
-
-        uses
+        self.ensure_query_index();
+        self.query_index
+            .read()
+            .expect("SSA query index lock poisoned")
+            .as_ref()
+            .and_then(|index| index.uses.get(var).cloned())
+            .unwrap_or_default()
     }
 
     /// Iterate over all source uses in all blocks.
@@ -1148,6 +1203,7 @@ impl SSAFunction {
         config: &crate::optimize::OptimizationConfig,
     ) -> crate::optimize::OptimizationStats {
         self.decompile_prep_facts = None;
+        self.invalidate_query_index();
         crate::optimize::optimize_function(self, config)
     }
 
@@ -1163,6 +1219,7 @@ impl SSAFunction {
 
     fn normalize_subregister_sources_for_decompile(&mut self, arch: &ArchSpec) {
         self.decompile_prep_facts = None;
+        self.invalidate_query_index();
         let family_info = cached_register_family_info(arch);
         if family_info.name_to_member.is_empty() {
             return;
@@ -1409,6 +1466,175 @@ impl SSAFunction {
         }
 
         state
+    }
+
+    /// Get the switch-selector SSA value that drives a switch block, if recoverable.
+    pub fn infer_switch_selector_var(&self, block_addr: u64) -> Option<SSAVar> {
+        let block = self.get_block(block_addr)?;
+        let target = block.ops.iter().rev().find_map(|op| match op {
+            SSAOp::BranchInd { target } => Some(target),
+            _ => None,
+        })?;
+        self.infer_switch_selector_var_from_value(target, 0)
+    }
+
+    fn ensure_query_index(&self) {
+        if self
+            .query_index
+            .read()
+            .expect("SSA query index lock poisoned")
+            .is_some()
+        {
+            return;
+        }
+        let index = SsaQueryIndex::build(self);
+        *self
+            .query_index
+            .write()
+            .expect("SSA query index lock poisoned") = Some(index);
+    }
+
+    fn invalidate_query_index(&self) {
+        *self
+            .query_index
+            .write()
+            .expect("SSA query index lock poisoned") = None;
+    }
+
+    fn infer_switch_selector_var_from_value(&self, var: &SSAVar, depth: u32) -> Option<SSAVar> {
+        if depth > 16 {
+            return None;
+        }
+
+        let (block_addr, DefLocation::Op(op_idx)) = self.find_def(var)? else {
+            return None;
+        };
+        let block = self.get_block(block_addr)?;
+        let op = block.ops.get(op_idx)?;
+        match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Trunc { src, .. }
+            | SSAOp::Cast { src, .. }
+            | SSAOp::Subpiece { src, .. } => {
+                self.infer_switch_selector_var_from_value(src, depth + 1)
+            }
+            SSAOp::Load { addr, .. } => {
+                if self.is_stack_slot_address_var(addr, depth + 1) {
+                    Some(var.clone())
+                } else {
+                    self.infer_switch_selector_var_from_address(addr, depth + 1)
+                }
+            }
+            SSAOp::IntAdd { a, b, .. } | SSAOp::IntSub { a, b, .. } => {
+                self.infer_switch_selector_var_from_sum(a, b, depth + 1)
+            }
+            SSAOp::IntMult { a, b, .. } => {
+                self.infer_switch_selector_var_from_scaled(a, b, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_switch_selector_var_from_address(&self, addr: &SSAVar, depth: u32) -> Option<SSAVar> {
+        if depth > 16 {
+            return None;
+        }
+
+        let (block_addr, DefLocation::Op(op_idx)) = self.find_def(addr)? else {
+            return None;
+        };
+        let block = self.get_block(block_addr)?;
+        let op = block.ops.get(op_idx)?;
+        match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Trunc { src, .. }
+            | SSAOp::Cast { src, .. }
+            | SSAOp::Subpiece { src, .. } => {
+                self.infer_switch_selector_var_from_address(src, depth + 1)
+            }
+            SSAOp::IntAdd { a, b, .. } | SSAOp::IntSub { a, b, .. } => {
+                self.infer_switch_selector_var_from_sum(a, b, depth + 1)
+            }
+            SSAOp::IntMult { a, b, .. } => {
+                self.infer_switch_selector_var_from_scaled(a, b, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_switch_selector_var_from_sum(
+        &self,
+        a: &SSAVar,
+        b: &SSAVar,
+        depth: u32,
+    ) -> Option<SSAVar> {
+        if Self::is_constish_switch_value(a) {
+            return self.infer_switch_selector_var_from_value(b, depth);
+        }
+        if Self::is_constish_switch_value(b) {
+            return self.infer_switch_selector_var_from_value(a, depth);
+        }
+        self.infer_switch_selector_var_from_scaled(a, b, depth)
+            .or_else(|| self.infer_switch_selector_var_from_scaled(b, a, depth))
+    }
+
+    fn infer_switch_selector_var_from_scaled(
+        &self,
+        a: &SSAVar,
+        b: &SSAVar,
+        depth: u32,
+    ) -> Option<SSAVar> {
+        if Self::is_constish_switch_value(a) {
+            return self.infer_switch_selector_var_from_value(b, depth);
+        }
+        if Self::is_constish_switch_value(b) {
+            return self.infer_switch_selector_var_from_value(a, depth);
+        }
+        None
+    }
+
+    fn is_stack_slot_address_var(&self, var: &SSAVar, depth: u32) -> bool {
+        if depth > 16 {
+            return false;
+        }
+
+        let lower = var.name.to_ascii_lowercase();
+        let base = lower.split('_').next().unwrap_or(lower.as_str());
+        if matches!(base, "rbp" | "rsp" | "ebp" | "esp" | "bp" | "sp") {
+            return true;
+        }
+
+        let Some((block_addr, DefLocation::Op(op_idx))) = self.find_def(var) else {
+            return false;
+        };
+        let Some(block) = self.get_block(block_addr) else {
+            return false;
+        };
+        let Some(op) = block.ops.get(op_idx) else {
+            return false;
+        };
+        match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Trunc { src, .. }
+            | SSAOp::Cast { src, .. }
+            | SSAOp::Subpiece { src, .. } => self.is_stack_slot_address_var(src, depth + 1),
+            SSAOp::IntAdd { a, b, .. } | SSAOp::IntSub { a, b, .. } => {
+                (self.is_stack_slot_address_var(a, depth + 1) && Self::is_constish_switch_value(b))
+                    || (self.is_stack_slot_address_var(b, depth + 1)
+                        && Self::is_constish_switch_value(a))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_constish_switch_value(var: &SSAVar) -> bool {
+        var.is_const() || var.name.starts_with("ram:")
     }
 
     /// Print the function in a human-readable format.
@@ -2062,6 +2288,37 @@ pub enum UseLocation {
     Op { op_idx: usize, src_idx: usize },
 }
 
+impl SsaQueryIndex {
+    fn build(function: &SSAFunction) -> Self {
+        let mut defs = HashMap::new();
+        let mut uses: HashMap<SSAVar, Vec<(u64, UseLocation)>> = HashMap::new();
+
+        for block in function.blocks() {
+            for (phi_idx, phi) in block.phis.iter().enumerate() {
+                defs.insert(phi.dst.clone(), (block.addr, DefLocation::Phi(phi_idx)));
+                for (src_idx, (_, src)) in phi.sources.iter().enumerate() {
+                    uses.entry(src.clone())
+                        .or_default()
+                        .push((block.addr, UseLocation::Phi { phi_idx, src_idx }));
+                }
+            }
+
+            for (op_idx, op) in block.ops.iter().enumerate() {
+                if let Some(dst) = op.dst() {
+                    defs.insert(dst.clone(), (block.addr, DefLocation::Op(op_idx)));
+                }
+                for (src_idx, src) in op.sources().into_iter().enumerate() {
+                    uses.entry(src.clone())
+                        .or_default()
+                        .push((block.addr, UseLocation::Op { op_idx, src_idx }));
+                }
+            }
+        }
+
+        Self { defs, uses }
+    }
+}
+
 impl SSABlock {
     /// Visit all phi source variables in deterministic index order.
     pub fn for_each_phi_source<F: FnMut(SourceRef<'_>)>(&self, mut f: F) {
@@ -2253,7 +2510,7 @@ mod tests {
             op_metadata: Default::default(),
         }];
 
-        let prepared = PreparedFunctionSSA::for_decompile(&blocks, Some(&arch))
+        let prepared = SsaArtifact::for_decompile(&blocks, Some(&arch))
             .expect("prepared SSA should build")
             .with_name("prepared_demo");
 
@@ -2272,7 +2529,7 @@ mod tests {
             prepared.blocks().next().expect("entry block").ops
         );
 
-        let symbolic = PreparedFunctionSSA::for_symbolic(&blocks, Some(&arch))
+        let symbolic = SsaArtifact::for_symbolic(&blocks, Some(&arch))
             .expect("symbolic prepared SSA should build");
         assert_eq!(symbolic.mode(), FunctionPrepareMode::Symbolic);
         assert!(
@@ -2347,8 +2604,8 @@ mod tests {
             },
         ];
 
-        let prepared = PreparedFunctionSSA::for_decompile(&blocks, Some(&arch))
-            .expect("prepared SSA should build");
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
 
         assert!(
             prepared
@@ -2378,12 +2635,20 @@ mod tests {
             block_addr: 0x1100,
             op_idx: 2,
         };
+        let load_inst = prepared
+            .graph()
+            .inst_id_for_op_site(load_ref.block_addr(), 1)
+            .expect("load inst");
+        let store_inst = prepared
+            .graph()
+            .inst_id_for_op_site(store_ref.block_addr(), 2)
+            .expect("store inst");
         assert!(
-            prepared.memory().uses_by_op.contains_key(&load_ref),
+            prepared.memory().uses_by_inst.contains_key(&load_inst),
             "load should read through MemorySSA facts"
         );
         assert!(
-            prepared.memory().defs_by_op.contains_key(&store_ref),
+            prepared.memory().defs_by_inst.contains_key(&store_inst),
             "store should define a new memory version"
         );
         assert_eq!(entry.ops.len(), 5);
@@ -2417,6 +2682,89 @@ mod tests {
     }
 
     #[test]
+    fn ssa_artifact_exposes_typed_graph_queries() {
+        let arch = make_x86_64_prep_arch();
+        let blocks = vec![R2ILBlock {
+            addr: 0x1080,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(0x33, 8),
+                },
+                R2ILOp::Return {
+                    target: make_reg(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let artifact = SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("artifact");
+        let graph = artifact.graph();
+        let value = artifact
+            .blocks()
+            .next()
+            .and_then(|block| block.ops.first())
+            .and_then(|op| op.dst())
+            .cloned()
+            .expect("destination value");
+        let value_id = graph.value_id_for_var(&value).expect("value id");
+        let def_inst = graph.def_inst(value_id).expect("definition");
+        let use_sites = graph.use_sites(value_id);
+
+        assert_eq!(
+            graph.value(value_id).expect("value").var,
+            value,
+            "graph should retain render metadata for each typed value"
+        );
+        assert_eq!(
+            graph.inst(def_inst).expect("inst").output,
+            Some(value_id),
+            "def_of should point back to the defining instruction"
+        );
+        assert_eq!(
+            use_sites.len(),
+            1,
+            "return should consume the copied value once"
+        );
+    }
+
+    #[test]
+    fn ssa_artifact_graph_ids_are_deterministic() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1200,
+                size: 4,
+                ops: vec![R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(1, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1204,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let first = SsaArtifact::raw(&blocks, None).expect("first artifact");
+        let second = SsaArtifact::raw(&blocks, None).expect("second artifact");
+
+        assert_eq!(
+            first.graph(),
+            second.graph(),
+            "graph ids should be stable across builds"
+        );
+    }
+
+    #[test]
     fn prepared_function_ssa_collects_call_sites_and_memory_effects() {
         let blocks = vec![
             R2ILBlock {
@@ -2439,7 +2787,7 @@ mod tests {
             },
         ];
 
-        let prepared = PreparedFunctionSSA::raw(&blocks, None).expect("prepared SSA should build");
+        let prepared = SsaArtifact::raw(&blocks, None).expect("prepared SSA should build");
         let call = prepared
             .call_sites()
             .by_id
@@ -2456,12 +2804,12 @@ mod tests {
         let call_ref = call.at;
         let uses = prepared
             .memory()
-            .uses_by_op
+            .uses_by_inst
             .get(&call_ref)
             .expect("call memory use fact");
         let defs = prepared
             .memory()
-            .defs_by_op
+            .defs_by_inst
             .get(&call_ref)
             .expect("call memory def fact");
         assert_eq!(uses.len(), 1);
@@ -2499,7 +2847,7 @@ mod tests {
             },
         ];
 
-        let prepared = PreparedFunctionSSA::raw(&blocks, None).expect("prepared SSA should build");
+        let prepared = SsaArtifact::raw(&blocks, None).expect("prepared SSA should build");
         let call = prepared
             .call_sites()
             .by_id
@@ -2568,7 +2916,7 @@ mod tests {
             },
         ];
 
-        let prepared = PreparedFunctionSSA::raw(&blocks, None).expect("prepared SSA should build");
+        let prepared = SsaArtifact::raw(&blocks, None).expect("prepared SSA should build");
         let phis = prepared
             .memory()
             .phis_by_block
@@ -2581,10 +2929,14 @@ mod tests {
             block_addr: 0x130c,
             op_idx: 0,
         };
+        let load_inst = prepared
+            .graph()
+            .inst_id_for_op_site(load_ref.block_addr(), 0)
+            .expect("load inst");
         let load_use = prepared
             .memory()
-            .uses_by_op
-            .get(&load_ref)
+            .uses_by_inst
+            .get(&load_inst)
             .and_then(|facts| facts.first())
             .expect("load use");
         assert_eq!(load_use.version, phis[0].output_version);

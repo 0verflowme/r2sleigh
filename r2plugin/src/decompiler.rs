@@ -75,11 +75,17 @@ pub(crate) fn decompiler_input_from_artifact(
     strings: HashMap<u64, String>,
     symbols: HashMap<u64, String>,
 ) -> r2dec::DecompilerInput {
+    let FunctionAnalysisArtifact {
+        ssa_func,
+        type_facts,
+        interproc_summary_set,
+        ..
+    } = artifact;
     r2dec::DecompilerInput::new(
-        artifact.ssa_func,
-        build_decompiler_context(artifact.type_facts, function_names, strings, symbols),
+        ssa_func,
+        build_decompiler_context(type_facts, function_names, strings, symbols),
     )
-    .with_interproc_summary_set(artifact.interproc_summary_set)
+    .with_interproc_summary_set(interproc_summary_set)
 }
 
 #[allow(clippy::too_many_arguments)]

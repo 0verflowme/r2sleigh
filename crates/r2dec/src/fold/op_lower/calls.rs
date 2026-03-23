@@ -2,6 +2,10 @@ use super::*;
 use r2types::FunctionType;
 
 impl<'a> FoldingContext<'a> {
+    fn prepared_call_target_var(&self, target: r2ssa::ValueId) -> Option<&SSAVar> {
+        self.inputs.prepared_ssa?.value_var(target)
+    }
+
     fn prepared_constish_target_addr(&self, target: &SSAVar) -> Option<u64> {
         extract_call_address(&target.name)
             .or_else(|| {
@@ -25,9 +29,10 @@ impl<'a> FoldingContext<'a> {
 
     fn prepared_direct_call_target(&self, block_addr: u64, op_idx: usize) -> Option<u64> {
         let call_site = self.prepared_call_site_for_op(block_addr, op_idx)?;
-        call_site
-            .direct_target
-            .or_else(|| self.prepared_constish_target_addr(&call_site.target))
+        call_site.direct_target.or_else(|| {
+            self.prepared_call_target_var(call_site.target)
+                .and_then(|target| self.prepared_constish_target_addr(target))
+        })
     }
 
     pub(super) fn resolve_call_target_for_site(
@@ -548,10 +553,11 @@ impl<'a> FoldingContext<'a> {
         source_call: (u64, usize),
     ) -> Vec<CExpr> {
         if let Some(call_site) = self.prepared_call_site_for_op(source_call.0, source_call.1)
+            && let Some(target) = self.prepared_call_target_var(call_site.target)
             && let Some(args) = self.prepared_call_args_for_site(
                 source_call.0,
                 source_call.1,
-                &self.resolve_call_target_for_site(source_call.0, source_call.1, &call_site.target),
+                &self.resolve_call_target_for_site(source_call.0, source_call.1, target),
             )
         {
             return args;
@@ -584,7 +590,16 @@ impl<'a> FoldingContext<'a> {
         &self,
         binding: &analysis::CallArgBinding,
     ) -> Option<CExpr> {
-        let source_var_name = binding.source_var_name.as_deref()?;
+        let source_value_id = binding.source_value_id.or_else(|| {
+            binding
+                .source_var_name
+                .as_deref()
+                .and_then(|name| self.use_info().value_id_for_name(name))
+        });
+        let source_var_name = binding.source_var_name.clone().or_else(|| {
+            source_value_id.and_then(|value_id| self.use_info().display_name_for_value_id(value_id))
+        })?;
+        let source_var_name = source_var_name.as_str();
         let preserve_stable_input_slot = binding.role == analysis::CallArgRole::Input;
         let prefer = |current: Option<CExpr>, candidate: Option<CExpr>| {
             self.choose_preferred_imported_call_arg_expr(
@@ -598,8 +613,9 @@ impl<'a> FoldingContext<'a> {
         let prepared_expr = self
             .prepared_semantic_view()
             .and_then(|prepared| {
-                prepared
-                    .owner_expr_for_name(source_var_name)
+                source_value_id
+                    .and_then(|value_id| prepared.owner_expr_for_value_id(value_id))
+                    .or_else(|| prepared.owner_expr_for_name(source_var_name))
                     .or_else(|| {
                         self.find_ssa_name_for_rendered_alias(source_var_name)
                             .as_deref()
@@ -615,16 +631,22 @@ impl<'a> FoldingContext<'a> {
             return Some(owner);
         }
 
-        let raw_expr = self.lookup_definition_raw(source_var_name).map(|raw| {
-            let mut imported_visited = HashSet::new();
-            self.resolve_imported_call_arg_expr(&raw, 0, &mut imported_visited)
-        });
+        let raw_expr = source_value_id
+            .and_then(|value_id| self.use_info().definitions_by_value.get(&value_id).cloned())
+            .or_else(|| self.lookup_definition_raw(source_var_name))
+            .map(|raw| {
+                let mut imported_visited = HashSet::new();
+                self.resolve_imported_call_arg_expr(&raw, 0, &mut imported_visited)
+            });
         best = prefer(best, raw_expr.clone());
 
-        let visible_expr = self.lookup_definition(source_var_name).map(|visible_def| {
-            let mut imported_visited = HashSet::new();
-            self.resolve_imported_call_arg_expr(&visible_def, 0, &mut imported_visited)
-        });
+        let visible_expr = source_value_id
+            .and_then(|value_id| self.use_info().definitions_by_value.get(&value_id).cloned())
+            .or_else(|| self.lookup_definition(source_var_name))
+            .map(|visible_def| {
+                let mut imported_visited = HashSet::new();
+                self.resolve_imported_call_arg_expr(&visible_def, 0, &mut imported_visited)
+            });
         best = prefer(best, visible_expr.clone());
 
         best = prefer(best, self.best_visible_definition(source_var_name));
@@ -640,7 +662,16 @@ impl<'a> FoldingContext<'a> {
             let mut semantic_visited = HashSet::new();
             best = prefer(
                 best,
-                self.render_semantic_value_by_name(source_var_name, 0, &mut semantic_visited),
+                source_value_id
+                    .and_then(|value_id| self.use_info().semantic_values_by_value.get(&value_id))
+                    .and_then(|value| self.render_semantic_value(value, 0, &mut semantic_visited))
+                    .or_else(|| {
+                        self.render_semantic_value_by_name(
+                            source_var_name,
+                            0,
+                            &mut semantic_visited,
+                        )
+                    }),
             );
         } else if best.is_none() {
             best = prefer(best, prepared_expr.clone());
@@ -765,19 +796,20 @@ impl<'a> FoldingContext<'a> {
 
         let final_result_idx = rendered_args.len().saturating_sub(1);
         let sibling_inputs = rendered_args[1..final_result_idx].to_vec();
-        let should_rebuild_final_result = rendered_args
-            .get(final_result_idx)
-            .is_some_and(|expr| {
-                self.call_arg_contains_transient_name(expr, 0)
-                    || self.call_arg_contains_stack_placeholder(expr, 0)
-                    || self.call_arg_contains_low_quality_name(expr, 0)
-                    || !matches!(expr, CExpr::Call { .. })
-            });
+        let should_rebuild_final_result = rendered_args.get(final_result_idx).is_some_and(|expr| {
+            self.call_arg_contains_transient_name(expr, 0)
+                || self.call_arg_contains_stack_placeholder(expr, 0)
+                || self.call_arg_contains_low_quality_name(expr, 0)
+                || !matches!(expr, CExpr::Call { .. })
+        });
         if should_rebuild_final_result
             && let Some(rebuilt) = self
                 .synthesized_call_expr_for_source_call((source_block_addr, source_op_idx))
                 .or_else(|| {
-                    self.stable_owned_call_result_expr_for_source((source_block_addr, source_op_idx))
+                    self.stable_owned_call_result_expr_for_source((
+                        source_block_addr,
+                        source_op_idx,
+                    ))
                 })
         {
             rendered_args[final_result_idx] = rebuilt;

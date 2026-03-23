@@ -13,8 +13,8 @@ use crate::{
     SolverConfig, StackSlotKey, Type, TypeArena, TypeId, TypeOracle, TypeSolver, to_c_type_like,
 };
 use r2ssa::{
-    DecompilePrepFacts, ObjectKind, PreparedFunctionSSA, SSAFunction, SSAOp, SSAVar,
-    StackAddressBase, StackAddressRoot,
+    DecompilePrepFacts, ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact, StackAddressBase,
+    StackAddressRoot,
 };
 
 /// Type inference context.
@@ -142,11 +142,14 @@ impl TypeInference {
     }
 
     /// Set SSA -> stack-slot bindings from the canonical prepared SSA artifact.
-    pub fn set_prepared_ssa(&mut self, prepared: &PreparedFunctionSSA) {
+    pub fn set_prepared_ssa(&mut self, prepared: &SsaArtifact) {
         self.ssa_stack_slots.clear();
 
-        for (var, object) in &prepared.objects().value_objects {
+        for (&value_id, object) in &prepared.objects().value_objects {
             let Some(object_fact) = prepared.objects().object(*object) else {
+                continue;
+            };
+            let Some(var) = prepared.graph().value(value_id).map(|value| &value.var) else {
                 continue;
             };
             let root = match object_fact.kind {
@@ -2136,7 +2139,7 @@ mod tests {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RBP", 0x20, 8));
 
-        let prepared = PreparedFunctionSSA::for_decompile(
+        let prepared = SsaArtifact::for_decompile(
             &[R2ILBlock {
                 addr: 0x2000,
                 size: 4,
@@ -2179,11 +2182,11 @@ mod tests {
         ti.set_prepared_ssa(&prepared);
 
         let slot_var = prepared
-            .objects()
-            .value_objects
-            .keys()
-            .find(|var| var.name.starts_with("tmp:"))
-            .cloned()
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.starts_with("tmp:"))
+            .map(|value| value.var.clone())
             .expect("stack-root value");
         assert_eq!(
             ti.stack_slot_spec_for_var(&slot_var)

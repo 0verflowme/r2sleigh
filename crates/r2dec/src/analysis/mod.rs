@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use r2ssa::{PreparedFunctionSSA, SSAVar};
-use r2types::{ExternalStackSlotSpec, StackSlotKey, TypeOracle, VisibleBinding};
+use r2ssa::{SSAVar, ValueId};
+use r2types::TypeOracle;
 
 use crate::ast::{CExpr, CType};
 use crate::fold::{PtrArith, SSABlock};
@@ -30,8 +30,6 @@ pub(crate) use prepared_semantic::{
 pub(crate) enum UseInfoAnalysisMode {
     Full,
     LocalStructAccesses,
-    #[allow(dead_code)]
-    PreparedDenseSwitch,
 }
 
 #[allow(dead_code)]
@@ -85,24 +83,33 @@ pub(crate) struct PassEnv<'a> {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct UseInfo {
+    pub(crate) value_ids_by_name: HashMap<String, ValueId>,
+    pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
     pub(crate) use_counts: HashMap<String, usize>,
+    pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
     pub(crate) definitions: HashMap<String, CExpr>,
+    pub(crate) definitions_by_value: BTreeMap<ValueId, CExpr>,
     pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
     pub(crate) semantic_values: HashMap<String, SemanticValue>,
+    pub(crate) semantic_values_by_value: BTreeMap<ValueId, SemanticValue>,
     pub(crate) frame_slot_merges: HashMap<String, FrameSlotMergeSummary>,
     pub(crate) frame_object_field_roots: HashMap<FrameObjectFieldKey, SemanticValue>,
     pub(crate) phi_sources: HashMap<String, Vec<SSAVar>>,
     pub(crate) formatted_defs: HashMap<String, CExpr>,
     pub(crate) copy_sources: HashMap<String, String>,
+    pub(crate) copy_sources_by_value: BTreeMap<ValueId, ValueId>,
     pub(crate) memory_stores: HashMap<String, String>,
     pub(crate) ptr_arith: HashMap<String, PtrArith>,
+    pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
     pub(crate) ptr_members: HashMap<String, (r2ssa::SSAVar, i64)>,
     pub(crate) condition_vars: HashSet<String>,
+    pub(crate) condition_values: BTreeSet<ValueId>,
     pub(crate) pinned: HashSet<String>,
     pub(crate) call_args: HashMap<(u64, usize), Vec<CallArgBinding>>,
     pub(crate) call_result_aliases: BTreeMap<(u64, usize), BTreeSet<String>>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
     pub(crate) call_result_source_by_alias: HashMap<String, (u64, usize)>,
+    pub(crate) call_result_source_by_value: BTreeMap<ValueId, (u64, usize)>,
     pub(crate) direct_call_result_aliases: HashSet<String>,
     pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
     pub(crate) consumed_by_call: HashSet<String>,
@@ -110,9 +117,12 @@ pub(crate) struct UseInfo {
     pub(crate) var_aliases: HashMap<String, String>,
     pub(crate) type_hints: HashMap<String, CType>,
     pub(crate) stack_slots: HashMap<String, StackSlotProvenance>,
+    pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
     pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
     pub(crate) stable_memory_values: HashMap<String, SemanticValue>,
+    pub(crate) stable_memory_values_by_value: BTreeMap<ValueId, SemanticValue>,
     pub(crate) forwarded_values: HashMap<String, ValueProvenance>,
+    pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
 }
 
 #[allow(dead_code)]
@@ -137,6 +147,7 @@ pub(crate) struct CallArgBinding {
     pub(crate) role: CallArgRole,
     pub(crate) stack_offset: Option<i64>,
     pub(crate) source_call: Option<(u64, usize)>,
+    pub(crate) source_value_id: Option<ValueId>,
     pub(crate) source_var_name: Option<String>,
 }
 
@@ -147,6 +158,7 @@ impl CallArgBinding {
             role,
             stack_offset,
             source_call: None,
+            source_value_id: None,
             source_var_name: None,
         }
     }
@@ -171,6 +183,12 @@ impl CallArgBinding {
 
     pub(crate) fn with_source_var(mut self, source_var: &SSAVar) -> Self {
         self.source_var_name = Some(source_var.display_name());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_source_value_id(mut self, value_id: ValueId) -> Self {
+        self.source_value_id = Some(value_id);
         self
     }
 
@@ -214,16 +232,32 @@ impl From<CExpr> for SemanticCallArg {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ValueRef {
+    pub(crate) value_id: Option<ValueId>,
     pub(crate) var: SSAVar,
 }
 
 impl ValueRef {
     pub(crate) fn new(var: SSAVar) -> Self {
-        Self { var }
+        Self {
+            value_id: None,
+            var,
+        }
+    }
+
+    pub(crate) fn with_value_id(value_id: ValueId, var: SSAVar) -> Self {
+        Self {
+            value_id: Some(value_id),
+            var,
+        }
     }
 
     pub(crate) fn display_name(&self) -> String {
         self.var.display_name()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn value_id(&self) -> Option<ValueId> {
+        self.value_id
     }
 }
 
@@ -345,6 +379,7 @@ pub(crate) struct StackSlotProvenance {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValueProvenance {
     pub(crate) source: String,
+    pub(crate) source_value_id: Option<ValueId>,
     pub(crate) source_var: Option<SSAVar>,
     pub(crate) stack_slot: Option<i64>,
 }
@@ -393,16 +428,6 @@ impl UseInfo {
         use_info::analyze(blocks, env)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn analyze_prepared_runtime(
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        prepared: &PreparedFunctionSSA,
-        definition_overrides: &HashMap<String, CExpr>,
-    ) -> Self {
-        use_info::analyze_prepared_runtime(blocks, env, prepared, definition_overrides)
-    }
-
     pub(crate) fn analyze_for_local_struct_accesses(
         blocks: &[SSABlock],
         env: &PassEnv<'_>,
@@ -418,18 +443,182 @@ impl UseInfo {
         use_info::analyze_with_definition_overrides(blocks, env, definition_overrides)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn apply_definition_overrides_fast(
-        baseline: &UseInfo,
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        definition_overrides: &HashMap<String, CExpr>,
-    ) -> Self {
-        use_info::apply_definition_overrides_fast(baseline, blocks, env, definition_overrides)
-    }
-
     pub(crate) fn preserve_authoritative_facts_from(&mut self, baseline: &UseInfo) {
         use_info::preserve_authoritative_facts(self, baseline);
+    }
+
+    pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) {
+        let display = var.display_name();
+        self.value_ids_by_name.insert(display.clone(), value_id);
+        self.value_ids_by_name.insert(var.name.clone(), value_id);
+        self.vars_by_value_id
+            .entry(value_id)
+            .or_insert_with(|| var.clone());
+    }
+
+    pub(crate) fn note_use_for_var(&mut self, var: &SSAVar) {
+        let display = var.display_name();
+        *self.use_counts.entry(display).or_insert(0) += 1;
+        if let Some(value_id) = self.value_id_for_var(var) {
+            *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
+        }
+    }
+
+    pub(crate) fn note_condition_var(&mut self, var: &SSAVar) {
+        self.condition_vars.insert(var.display_name());
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.condition_values.insert(value_id);
+        }
+    }
+
+    pub(crate) fn insert_definition_for_var(&mut self, var: &SSAVar, expr: CExpr) {
+        // Local analysis still derives visible-quality definitions through name-oriented
+        // collectors. Keep prepared/runtime id-backed definitions authoritative, but do
+        // not blindly promote local definitions into the value-id store yet.
+        self.definitions.insert(var.display_name(), expr);
+    }
+
+    pub(crate) fn insert_stack_slot_for_var(&mut self, var: &SSAVar, slot: StackSlotProvenance) {
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.stack_slots_by_value.insert(value_id, slot);
+        }
+        self.stack_slots.insert(var.display_name(), slot);
+    }
+
+    pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.ptr_arith_by_value.insert(value_id, ptr.clone());
+        }
+        self.ptr_arith.insert(var.display_name(), ptr);
+    }
+
+    pub(crate) fn insert_forwarded_value_for_var(
+        &mut self,
+        var: &SSAVar,
+        provenance: ValueProvenance,
+    ) {
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.forwarded_values_by_value
+                .insert(value_id, provenance.clone());
+        }
+        self.forwarded_values.insert(var.display_name(), provenance);
+    }
+
+    pub(crate) fn insert_call_result_source_alias(
+        &mut self,
+        alias: &str,
+        source_call: (u64, usize),
+    ) {
+        self.call_result_source_by_alias
+            .insert(alias.to_string(), source_call);
+        if let Some(value_id) = self.value_id_for_name(alias) {
+            self.call_result_source_by_value
+                .insert(value_id, source_call);
+        }
+    }
+
+    pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
+        self.value_ids_by_name
+            .get(&var.display_name())
+            .copied()
+            .or_else(|| self.value_ids_by_name.get(&var.name).copied())
+    }
+
+    pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
+        self.value_ids_by_name.get(name).copied()
+    }
+
+    pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
+        self.vars_by_value_id.get(&value_id)
+    }
+
+    pub(crate) fn display_name_for_value_id(&self, value_id: ValueId) -> Option<String> {
+        self.var_for_value_id(value_id).map(SSAVar::display_name)
+    }
+
+    pub(crate) fn use_count_for_name(&self, name: &str) -> usize {
+        self.value_id_for_name(name)
+            .and_then(|value_id| self.use_counts_by_value.get(&value_id).copied())
+            .or_else(|| self.use_counts.get(name).copied())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
+        self.definitions_by_value.get(&value_id).or_else(|| {
+            self.display_name_for_value_id(value_id)
+                .as_deref()
+                .and_then(|name| self.definitions.get(name))
+        })
+    }
+
+    pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
+        self.definitions.get(name).or_else(|| {
+            self.value_id_for_name(name)
+                .and_then(|value_id| self.definitions_by_value.get(&value_id))
+        })
+    }
+
+    pub(crate) fn semantic_value_for_value(&self, value_id: ValueId) -> Option<&SemanticValue> {
+        self.semantic_values_by_value.get(&value_id).or_else(|| {
+            self.display_name_for_value_id(value_id)
+                .as_deref()
+                .and_then(|name| self.semantic_values.get(name))
+        })
+    }
+
+    pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
+        self.semantic_values.get(name).or_else(|| {
+            self.value_id_for_name(name)
+                .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
+        })
+    }
+
+    pub(crate) fn forwarded_value_for_value(&self, value_id: ValueId) -> Option<&ValueProvenance> {
+        self.forwarded_values_by_value.get(&value_id).or_else(|| {
+            self.display_name_for_value_id(value_id)
+                .as_deref()
+                .and_then(|name| self.forwarded_values.get(name))
+        })
+    }
+
+    pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
+        self.forwarded_values.get(name).or_else(|| {
+            self.value_id_for_name(name)
+                .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
+        })
+    }
+
+    pub(crate) fn stack_slot_for_var(&self, var: &SSAVar) -> Option<StackSlotProvenance> {
+        self.stack_slots
+            .get(&var.display_name())
+            .copied()
+            .or_else(|| {
+                self.value_id_for_var(var)
+                    .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
+            })
+    }
+
+    pub(crate) fn ptr_arith_for_name(&self, name: &str) -> Option<&PtrArith> {
+        self.ptr_arith.get(name).or_else(|| {
+            self.value_id_for_name(name)
+                .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
+        })
+    }
+
+    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
+        self.value_id_for_name(name)
+            .is_some_and(|value_id| self.condition_values.contains(&value_id))
+            || self.condition_vars.contains(name)
+    }
+
+    pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
+        self.call_result_source_by_alias
+            .get(name)
+            .copied()
+            .or_else(|| {
+                self.value_id_for_name(name)
+                    .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
+            })
     }
 }
 
@@ -437,30 +626,10 @@ impl FlagInfo {
     pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
         flag_info::analyze(blocks, use_info, env)
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn analyze_prepared_runtime(
-        blocks: &[SSABlock],
-        use_info: &UseInfo,
-        prepared: &PreparedFunctionSSA,
-    ) -> Self {
-        flag_info::analyze_prepared_runtime(blocks, use_info, prepared)
-    }
 }
 
 impl StackInfo {
     pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
         stack_info::analyze(blocks, use_info, env)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn analyze_prepared_runtime(
-        blocks: &[SSABlock],
-        prepared: &PreparedFunctionSSA,
-        stack_slots: &BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-        visible_bindings: &[VisibleBinding],
-        env: &PassEnv<'_>,
-    ) -> Self {
-        stack_info::analyze_prepared_runtime(blocks, prepared, stack_slots, visible_bindings, env)
     }
 }

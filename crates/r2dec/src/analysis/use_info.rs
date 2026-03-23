@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
-use r2ssa::{ObjectKind, PreparedFunctionSSA, SSAFunction, SSAOp, SSAVar};
+use r2ssa::{SSAFunction, SSAOp, SSAVar, ValueId};
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
@@ -53,46 +53,6 @@ pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     analyze_with_definition_overrides_mode(blocks, env, &HashMap::new(), UseInfoAnalysisMode::Full)
 }
 
-#[allow(dead_code)]
-pub(crate) fn analyze_prepared_runtime(
-    blocks: &[SSABlock],
-    env: &PassEnv<'_>,
-    prepared: &PreparedFunctionSSA,
-    definition_overrides: &HashMap<String, CExpr>,
-) -> UseInfo {
-    let cfg_summary = prepared.function().cfg_risk_summary();
-    let mode = if cfg_summary.block_count >= 96
-        && cfg_summary.switch_block_count > 0
-        && cfg_summary.max_switch_cases >= 32
-        && cfg_summary.back_edge_count == 0
-    {
-        UseInfoAnalysisMode::PreparedDenseSwitch
-    } else {
-        UseInfoAnalysisMode::Full
-    };
-    let mut info = analyze_with_definition_overrides_mode(blocks, env, definition_overrides, mode);
-    overlay_prepared_runtime_facts(&mut info, prepared);
-    info
-}
-
-#[allow(dead_code)]
-pub(crate) fn apply_definition_overrides_fast(
-    baseline: &UseInfo,
-    blocks: &[SSABlock],
-    env: &PassEnv<'_>,
-    definition_overrides: &HashMap<String, CExpr>,
-) -> UseInfo {
-    let mut scratch = UseScratch {
-        info: baseline.clone(),
-        producers: baseline.producers.clone(),
-    };
-    scratch.info.type_hints = env.type_hints.clone();
-    rebuild_definitions(&mut scratch, blocks, env, definition_overrides);
-    build_formatted_defs(&mut scratch, env);
-    scratch.info.producers = scratch.producers.clone();
-    scratch.info
-}
-
 pub(crate) fn analyze_for_local_struct_accesses(blocks: &[SSABlock], env: &PassEnv<'_>) -> UseInfo {
     analyze_with_definition_overrides_mode(
         blocks,
@@ -123,6 +83,7 @@ fn analyze_with_definition_overrides_mode(
 ) -> UseInfo {
     let mut scratch = UseScratch::default();
     scratch.info.type_hints = env.type_hints.clone();
+    seed_local_value_ids(&mut scratch, blocks);
     seed_entry_param_aliases(&mut scratch, blocks, env);
 
     for block in blocks {
@@ -132,27 +93,127 @@ fn analyze_with_definition_overrides_mode(
         collect_definitions(&mut scratch, block, env, definition_overrides);
     }
     refresh_semantic_values(&mut scratch, blocks, env);
-    if !matches!(mode, UseInfoAnalysisMode::PreparedDenseSwitch) {
-        populate_stable_stack_values(&mut scratch, blocks, env);
-        populate_frame_object_field_roots(&mut scratch, blocks, env);
-        populate_stable_memory_values(&mut scratch, blocks, env);
-        refresh_semantic_values(&mut scratch, blocks, env);
-    }
+    populate_stable_stack_values(&mut scratch, blocks, env);
+    populate_frame_object_field_roots(&mut scratch, blocks, env);
+    populate_stable_memory_values(&mut scratch, blocks, env);
+    refresh_semantic_values(&mut scratch, blocks, env);
     rebuild_definitions(&mut scratch, blocks, env, definition_overrides);
 
-    if !matches!(mode, UseInfoAnalysisMode::PreparedDenseSwitch) {
-        analyze_call_args(&mut scratch, blocks, env);
-        bind_single_use_call_result_definitions(&mut scratch, blocks, env);
-        propagate_call_result_aliases(&mut scratch.info);
-        rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
-    }
+    analyze_call_args(&mut scratch, blocks, env);
+    bind_single_use_call_result_definitions(&mut scratch, blocks, env);
+    propagate_call_result_aliases(&mut scratch.info);
+    rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
     if matches!(mode, UseInfoAnalysisMode::Full) {
         coalesce_variables(&mut scratch, blocks, env);
         build_formatted_defs(&mut scratch, env);
     }
+    rebuild_id_mirrors_from_name_maps(&mut scratch.info);
     scratch.info.producers = scratch.producers.clone();
 
     scratch.info
+}
+
+fn seed_local_value_ids(scratch: &mut UseScratch, blocks: &[SSABlock]) {
+    let mut next_value = scratch
+        .info
+        .vars_by_value_id
+        .keys()
+        .next_back()
+        .map(|value_id| value_id.0 + 1)
+        .unwrap_or(0);
+    let mut maybe_bind = |var: &SSAVar, info: &mut UseInfo| {
+        if info.value_id_for_var(var).is_some() {
+            return;
+        }
+        let value_id = ValueId(next_value);
+        next_value += 1;
+        info.bind_value_id(var, value_id);
+    };
+
+    for block in blocks {
+        for phi in &block.phis {
+            maybe_bind(&phi.dst, &mut scratch.info);
+            for (_, src) in &phi.sources {
+                maybe_bind(src, &mut scratch.info);
+            }
+        }
+        for op in &block.ops {
+            if let Some(dst) = op.dst() {
+                maybe_bind(dst, &mut scratch.info);
+            }
+            for src in op.sources() {
+                maybe_bind(src, &mut scratch.info);
+            }
+        }
+    }
+}
+
+fn rebuild_id_mirrors_from_name_maps(info: &mut UseInfo) {
+    info.use_counts_by_value.clear();
+    for (name, count) in &info.use_counts {
+        if let Some(value_id) = info.value_id_for_name(name) {
+            info.use_counts_by_value.insert(value_id, *count);
+        }
+    }
+
+    // Local analysis still derives definitions and semantic expressions primarily from
+    // name-keyed collection paths. Do not promote those into canonical id-backed facts
+    // until the collectors themselves are fully id-native, or fold can recurse through
+    // low-quality cyclic mirrors. Prepared/runtime paths already seed these fields
+    // authoritatively.
+
+    info.copy_sources_by_value.clear();
+    for (dst, src) in &info.copy_sources {
+        if let (Some(dst_id), Some(src_id)) =
+            (info.value_id_for_name(dst), info.value_id_for_name(src))
+        {
+            info.copy_sources_by_value.insert(dst_id, src_id);
+        }
+    }
+
+    info.ptr_arith_by_value.clear();
+    for (name, ptr) in &info.ptr_arith {
+        if let Some(value_id) = info.value_id_for_name(name) {
+            info.ptr_arith_by_value.insert(value_id, ptr.clone());
+        }
+    }
+
+    info.condition_values.clear();
+    for name in &info.condition_vars {
+        if let Some(value_id) = info.value_id_for_name(name) {
+            info.condition_values.insert(value_id);
+        }
+    }
+
+    info.stack_slots_by_value.clear();
+    for (name, slot) in &info.stack_slots {
+        if let Some(value_id) = info.value_id_for_name(name) {
+            info.stack_slots_by_value.insert(value_id, *slot);
+        }
+    }
+
+    info.stable_memory_values_by_value.clear();
+    for (name, value) in &info.stable_memory_values {
+        if let Some(value_id) = info.value_id_for_name(name) {
+            info.stable_memory_values_by_value
+                .insert(value_id, value.clone());
+        }
+    }
+
+    info.forwarded_values_by_value.clear();
+    for (name, provenance) in &info.forwarded_values {
+        if let Some(value_id) = info.value_id_for_name(name) {
+            info.forwarded_values_by_value
+                .insert(value_id, provenance.clone());
+        }
+    }
+
+    info.call_result_source_by_value.clear();
+    for (name, site) in &info.call_result_source_by_alias {
+        if let Some(value_id) = info.value_id_for_name(name) {
+            info.call_result_source_by_value.insert(value_id, *site);
+        }
+    }
 }
 
 fn rerun_semantic_call_analysis_after_result_binding(
@@ -170,67 +231,6 @@ fn rerun_semantic_call_analysis_after_result_binding(
     analyze_call_args(scratch, blocks, env);
     bind_single_use_call_result_definitions(scratch, blocks, env);
     propagate_call_result_aliases(&mut scratch.info);
-}
-
-#[allow(dead_code)]
-fn overlay_prepared_runtime_facts(info: &mut UseInfo, prepared: &PreparedFunctionSSA) {
-    let canonical_root = |var: &SSAVar| {
-        let mut current = var.clone();
-        let Some(facts) = prepared.function().decompile_prep_facts() else {
-            return current;
-        };
-        for _ in 0..32 {
-            let Some(next) = facts.canonical_root_of(&current) else {
-                break;
-            };
-            if next == &current {
-                break;
-            }
-            current = next.clone();
-        }
-        current
-    };
-
-    for (value, object_id) in &prepared.objects().value_objects {
-        let Some(object) = prepared.objects().object(*object_id) else {
-            continue;
-        };
-        let (offset, value_kind) = match object.kind {
-            ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
-                (offset, StackSlotValueKind::AddressLike)
-            }
-            _ => continue,
-        };
-        let rooted = canonical_root(value);
-        info.stack_slots.insert(
-            rooted.display_name(),
-            StackSlotProvenance {
-                offset,
-                predicate_carrier: false,
-                return_carrier: false,
-                value_kind,
-            },
-        );
-        info.stack_slots.insert(
-            value.display_name(),
-            StackSlotProvenance {
-                offset,
-                predicate_carrier: false,
-                return_carrier: false,
-                value_kind,
-            },
-        );
-    }
-
-    for switch in prepared.predicates().switches.values() {
-        let Some(selector) = switch.selector.as_ref() else {
-            continue;
-        };
-        info.switch_selector_roots.insert(
-            switch.block_addr,
-            SemanticValue::Scalar(ScalarValue::Root(ValueRef::new(canonical_root(selector)))),
-        );
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -348,9 +348,9 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
             .or_insert_with(|| expr.clone());
     }
     for (alias, source_call) in &baseline.call_result_source_by_alias {
-        info.call_result_source_by_alias
-            .entry(alias.clone())
-            .or_insert(*source_call);
+        if !info.call_result_source_by_alias.contains_key(alias) {
+            info.insert_call_result_source_alias(alias, *source_call);
+        }
     }
     info.direct_call_result_aliases
         .extend(baseline.direct_call_result_aliases.iter().cloned());
@@ -361,9 +361,19 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
         .extend(baseline.inlined_call_results.iter().copied());
 
     for (key, value) in &baseline.forwarded_values {
-        info.forwarded_values
-            .entry(key.clone())
-            .or_insert_with(|| value.clone());
+        if !info.forwarded_values.contains_key(key) {
+            if let Some(var) = info
+                .value_id_for_name(key)
+                .and_then(|value_id| info.var_for_value_id(value_id))
+                .cloned()
+            {
+                info.insert_forwarded_value_for_var(&var, value.clone());
+            } else {
+                info.forwarded_values
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
     }
     for (key, value) in &baseline.type_hints {
         info.type_hints
@@ -376,10 +386,22 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
             .or_insert_with(|| value.clone());
     }
     for (key, value) in &baseline.stack_slots {
-        info.stack_slots
-            .entry(key.clone())
-            .and_modify(|existing| *existing = existing.merge(*value))
-            .or_insert(*value);
+        if let Some(var) = info
+            .value_id_for_name(key)
+            .and_then(|value_id| info.var_for_value_id(value_id))
+            .cloned()
+        {
+            let merged = info
+                .stack_slot_for_var(&var)
+                .map(|existing| existing.merge(*value))
+                .unwrap_or(*value);
+            info.insert_stack_slot_for_var(&var, merged);
+        } else {
+            info.stack_slots
+                .entry(key.clone())
+                .and_modify(|existing| *existing = existing.merge(*value))
+                .or_insert(*value);
+        }
     }
 }
 
@@ -391,8 +413,7 @@ fn record_call_result_alias(info: &mut UseInfo, source_call: (u64, usize), alias
         .entry(source_call)
         .or_default()
         .insert(alias.to_string());
-    info.call_result_source_by_alias
-        .insert(alias.to_string(), source_call);
+    info.insert_call_result_source_alias(alias, source_call);
 }
 
 fn record_direct_call_result_alias(info: &mut UseInfo, alias: &str) {
@@ -2005,12 +2026,11 @@ fn seed_entry_param_aliases(scratch: &mut UseScratch, blocks: &[SSABlock], env: 
 fn count_uses_and_conditions(scratch: &mut UseScratch, block: &SSABlock) {
     for op in &block.ops {
         for src in op.sources() {
-            let key = src.display_name();
-            *scratch.info.use_counts.entry(key).or_insert(0) += 1;
+            scratch.info.note_use_for_var(src);
         }
 
         if let SSAOp::CBranch { cond, .. } = op {
-            scratch.info.condition_vars.insert(cond.display_name());
+            scratch.info.note_condition_var(cond);
         }
     }
 }
@@ -2062,8 +2082,7 @@ fn collect_definitions(
                     .insert(addr_key, val.display_name());
                 scratch
                     .info
-                    .stack_slots
-                    .insert(addr.display_name(), StackSlotProvenance::new(offset));
+                    .insert_stack_slot_for_var(addr, StackSlotProvenance::new(offset));
                 block_stack_values.insert(offset, val.clone());
                 if let Some(value) = semantic_stack_store_value(&scratch.info, val, env) {
                     block_stack_semantic_values.insert(offset, value);
@@ -2101,13 +2120,11 @@ fn collect_definitions(
             );
             scratch
                 .info
-                .stack_slots
-                .insert(addr.display_name(), StackSlotProvenance::new(offset));
+                .insert_stack_slot_for_var(addr, StackSlotProvenance::new(offset));
             if should_tag_loaded_value_as_stack_slot {
                 scratch
                     .info
-                    .stack_slots
-                    .insert(dst.display_name(), StackSlotProvenance::new(offset));
+                    .insert_stack_slot_for_var(dst, StackSlotProvenance::new(offset));
             }
 
             if should_tag_loaded_value_as_stack_slot {
@@ -2120,10 +2137,11 @@ fn collect_definitions(
                         .info
                         .copy_sources
                         .insert(dst.display_name(), stored_val.display_name());
-                    scratch.info.forwarded_values.insert(
-                        dst.display_name(),
+                    scratch.info.insert_forwarded_value_for_var(
+                        dst,
                         ValueProvenance {
                             source: stored_val.display_name(),
+                            source_value_id: scratch.info.value_id_for_var(&stored_val),
                             source_var: Some(stored_val),
                             stack_slot: Some(offset),
                         },
@@ -2142,8 +2160,8 @@ fn collect_definitions(
             element_size,
         } = op
         {
-            scratch.info.ptr_arith.insert(
-                dst.display_name(),
+            scratch.info.insert_ptr_arith_for_var(
+                dst,
                 PtrArith {
                     base: base.clone(),
                     index: index.clone(),
@@ -2160,8 +2178,8 @@ fn collect_definitions(
             element_size,
         } = op
         {
-            scratch.info.ptr_arith.insert(
-                dst.display_name(),
+            scratch.info.insert_ptr_arith_for_var(
+                dst,
                 PtrArith {
                     base: base.clone(),
                     index: index.clone(),
@@ -2199,10 +2217,11 @@ fn collect_definitions(
         if let Some(dst) = op.dst() {
             let key = dst.display_name();
             if let Some(expr) = definition_overrides.get(&key).cloned() {
-                scratch.info.definitions.insert(key, expr);
+                scratch.info.insert_definition_for_var(dst, expr);
             } else {
                 let expr = {
                     let lower = LowerCtx {
+                        use_info: None,
                         definitions: &scratch.info.definitions,
                         semantic_values: &scratch.info.semantic_values,
                         use_counts: &scratch.info.use_counts,
@@ -2225,7 +2244,7 @@ fn collect_definitions(
                         lower.op_to_expr(op)
                     }
                 };
-                scratch.info.definitions.insert(key, expr);
+                scratch.info.insert_definition_for_var(dst, expr);
             }
         }
 
@@ -2279,6 +2298,7 @@ fn rebuild_definitions(
                 expr
             } else {
                 let lower = LowerCtx {
+                    use_info: None,
                     definitions: &rebuilt,
                     semantic_values: &scratch.info.semantic_values,
                     use_counts: &scratch.info.use_counts,
@@ -3721,6 +3741,18 @@ fn insert_semantic_value(info: &mut UseInfo, key: String, candidate: SemanticVal
     match info.semantic_values.get(&key) {
         Some(current) if semantic_value_rank(current) > semantic_value_rank(&candidate) => {}
         _ => {
+            if let Some(value_id) = info.value_id_for_name(&key) {
+                let replace_by_value = match info.semantic_values_by_value.get(&value_id) {
+                    Some(current) => {
+                        semantic_value_rank(current) <= semantic_value_rank(&candidate)
+                    }
+                    None => true,
+                };
+                if replace_by_value {
+                    info.semantic_values_by_value
+                        .insert(value_id, candidate.clone());
+                }
+            }
             info.semantic_values.insert(key, candidate);
         }
     }
@@ -4832,6 +4864,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 .filter_map(|(idx, op)| op.dst().map(|dst| (dst.display_name(), idx)))
                 .collect::<HashMap<_, _>>();
             let lower = LowerCtx {
+                use_info: None,
                 definitions: &scratch.info.definitions,
                 semantic_values: &scratch.info.semantic_values,
                 use_counts: &scratch.info.use_counts,
@@ -5079,6 +5112,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
 
             if let Some(ret_family) = ret_family.as_deref() {
                 let lower = LowerCtx {
+                    use_info: None,
                     definitions: &scratch.info.definitions,
                     semantic_values: &scratch.info.semantic_values,
                     use_counts: &scratch.info.use_counts,
@@ -5160,6 +5194,7 @@ fn bind_single_use_call_result_definitions(
             .collect::<HashMap<_, _>>();
         for (op_idx, op) in block.ops.iter().enumerate() {
             let lower = LowerCtx {
+                use_info: None,
                 definitions: &scratch.info.definitions,
                 semantic_values: &scratch.info.semantic_values,
                 use_counts: &scratch.info.use_counts,
@@ -5256,8 +5291,7 @@ fn bind_call_result_alias_definitions(
             {
                 record_call_result_alias(info, (block.addr, call_idx), &dst.display_name());
                 record_direct_call_result_alias(info, &dst.display_name());
-                info.definitions
-                    .insert(dst.display_name(), call_expr.clone());
+                info.insert_definition_for_var(dst, call_expr.clone());
                 if let Some(call_result_defs) = call_result_defs.as_deref_mut() {
                     call_result_defs.insert(dst.display_name(), call_expr.clone());
                     call_result_defs
@@ -5270,6 +5304,7 @@ fn bind_call_result_alias_definitions(
             let src_key = src.display_name();
             let uses_current_call_result = {
                 let lower = LowerCtx {
+                    use_info: None,
                     definitions: &info.definitions,
                     semantic_values: &info.semantic_values,
                     use_counts: &info.use_counts,
@@ -5304,7 +5339,7 @@ fn bind_call_result_alias_definitions(
 
             record_call_result_alias(info, (block.addr, call_idx), &src_key);
             record_direct_call_result_alias(info, &src_key);
-            info.definitions.insert(src_key.clone(), call_expr.clone());
+            info.insert_definition_for_var(src, call_expr.clone());
             info.inlined_call_results.insert((block.addr, call_idx));
             if let Some(call_result_defs) = call_result_defs.as_deref_mut() {
                 call_result_defs.insert(src_key.clone(), call_expr.clone());
@@ -5794,6 +5829,7 @@ fn rewrite_call_result_binding(
         role: CallArgRole::Result,
         stack_offset: binding.stack_offset,
         source_call: binding.source_call,
+        source_value_id: binding.source_value_id,
         source_var_name: binding.source_var_name.clone(),
     })
 }
@@ -9208,6 +9244,7 @@ mod tests {
 
         let info = analyze(std::slice::from_ref(&block), &env);
         let lower = LowerCtx {
+            use_info: None,
             definitions: &info.definitions,
             semantic_values: &info.semantic_values,
             use_counts: &info.use_counts,
@@ -9287,6 +9324,7 @@ mod tests {
             info.forwarded_values.get(&loaded.display_name()),
             Some(&ValueProvenance {
                 source: stored.display_name(),
+                source_value_id: info.value_id_for_var(&stored),
                 source_var: Some(stored),
                 stack_slot: Some(0x150),
             })
@@ -9576,6 +9614,7 @@ mod tests {
             info.forwarded_values.get(&loaded.display_name()),
             Some(&ValueProvenance {
                 source: stored.display_name(),
+                source_value_id: info.value_id_for_var(&stored),
                 source_var: Some(stored.clone()),
                 stack_slot: Some(-12),
             })
@@ -9942,6 +9981,7 @@ mod tests {
             loaded.display_name(),
             ValueProvenance {
                 source: src.display_name(),
+                source_value_id: None,
                 source_var: Some(src.clone()),
                 stack_slot: Some(8),
             },

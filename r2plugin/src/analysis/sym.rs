@@ -227,8 +227,8 @@ fn path_info_from_result<'ctx>(
 fn build_symbolic_prepared(
     blocks: &[R2ILBlock],
     arch: Option<&ArchSpec>,
-) -> Option<r2ssa::PreparedFunctionSSA> {
-    r2ssa::PreparedFunctionSSA::for_symbolic(blocks, arch)
+) -> Option<r2ssa::SsaArtifact> {
+    r2ssa::SsaArtifact::for_symbolic(blocks, arch)
 }
 
 fn symbol_map_snapshot() -> HashMap<u64, String> {

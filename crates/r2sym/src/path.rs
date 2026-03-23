@@ -6,7 +6,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use r2ssa::{BlockTerminator, PreparedFunctionSSA};
+use r2ssa::{BlockTerminator, SsaArtifact};
 use z3::Context;
 
 use crate::executor::SymExecutor;
@@ -261,7 +261,7 @@ impl<'ctx> PathExplorer<'ctx> {
     /// Explore all paths in a function.
     pub fn explore(
         &mut self,
-        func: &PreparedFunctionSSA,
+        func: &SsaArtifact,
         initial_state: SymState<'ctx>,
     ) -> Vec<PathResult<'ctx>> {
         let start_time = Instant::now();
@@ -360,7 +360,7 @@ impl<'ctx> PathExplorer<'ctx> {
         results
     }
 
-    fn fallthrough_target(&self, func: &PreparedFunctionSSA, block_addr: u64) -> Option<u64> {
+    fn fallthrough_target(&self, func: &SsaArtifact, block_addr: u64) -> Option<u64> {
         let block = func.cfg().get_block(block_addr)?;
         match block.terminator {
             BlockTerminator::Fallthrough { next } => Some(next),
@@ -395,7 +395,7 @@ impl<'ctx> PathExplorer<'ctx> {
     /// Explore paths to find inputs that reach a target address.
     pub fn find_path_to(
         &mut self,
-        func: &PreparedFunctionSSA,
+        func: &SsaArtifact,
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Option<PathResult<'ctx>> {
@@ -471,7 +471,7 @@ impl<'ctx> PathExplorer<'ctx> {
     /// Explore paths to collect all feasible states that reach a target address.
     pub fn find_paths_to(
         &mut self,
-        func: &PreparedFunctionSSA,
+        func: &SsaArtifact,
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Vec<PathResult<'ctx>> {
@@ -554,7 +554,7 @@ impl<'ctx> PathExplorer<'ctx> {
     /// Explore paths to find inputs that avoid a target address.
     pub fn find_path_avoiding(
         &mut self,
-        func: &PreparedFunctionSSA,
+        func: &SsaArtifact,
         initial_state: SymState<'ctx>,
         avoid_addrs: &[u64],
     ) -> Option<PathResult<'ctx>> {

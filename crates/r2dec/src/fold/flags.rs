@@ -508,13 +508,14 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn predicate_candidate_for_var(&self, var: &SSAVar) -> Option<CExpr> {
         let key = var.display_name();
+        let prepared_value_id = self.prepared_value_id_for_var(var);
         let prepared = self
             .prepared_predicates()
             .and_then(|facts| {
                 facts
                     .predicates
                     .values()
-                    .find(|predicate| predicate.condition == *var)
+                    .find(|predicate| Some(predicate.condition) == prepared_value_id)
                     .and_then(|predicate| self.prepared_branch_condition_expr(predicate.block_addr))
             })
             .map(|expr| self.resolve_predicate_expr_tree(&expr))
@@ -580,7 +581,7 @@ impl<'a> FoldingContext<'a> {
             .prepared_predicates()?
             .predicates
             .values()
-            .find(|predicate| predicate.condition == *var)
+            .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))
             && let Some(expr) = self
                 .prepared_predicate_view()
                 .and_then(|view| view.branch_expr_for_block(predicate.block_addr).cloned())
@@ -591,7 +592,7 @@ impl<'a> FoldingContext<'a> {
             .prepared_predicates()?
             .predicates
             .values()
-            .find(|predicate| predicate.condition == *var)?
+            .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))?
             .comparison
             .as_ref()?;
         self.prepared_compare_provenance_expr(compare)
@@ -612,7 +613,10 @@ impl<'a> FoldingContext<'a> {
         let compare = facts
             .predicates
             .values()
-            .find(|predicate| predicate.block_addr == block_addr && predicate.condition == *var)
+            .find(|predicate| {
+                predicate.block_addr == block_addr
+                    && Some(predicate.condition) == self.prepared_value_id_for_var(var)
+            })
             .and_then(|predicate| predicate.comparison.as_ref())
             .or_else(|| {
                 facts
@@ -627,9 +631,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn prepared_compare_provenance_expr(&self, prov: &CompareProvenance) -> Option<CExpr> {
-        let compare_width = prov.lhs.size.max(prov.rhs.size);
-        let lhs = self.resolve_prepared_predicate_operand_with_width(&prov.lhs, compare_width);
-        let rhs = self.resolve_prepared_predicate_operand_with_width(&prov.rhs, compare_width);
+        let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
+        let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
+        let compare_width = lhs_var.size.max(rhs_var.size);
+        let lhs = self.resolve_prepared_predicate_operand_with_width(lhs_var, compare_width);
+        let rhs = self.resolve_prepared_predicate_operand_with_width(rhs_var, compare_width);
         match prov.kind {
             PreparedCompareKind::Equal => Some(CExpr::binary(BinaryOp::Eq, lhs, rhs)),
             PreparedCompareKind::NotEqual => Some(CExpr::binary(BinaryOp::Ne, lhs, rhs)),
@@ -1240,7 +1246,7 @@ impl<'a> FoldingContext<'a> {
         addr: &SSAVar,
         depth: u32,
     ) -> Option<CExpr> {
-        let slot = self.stack_slots_map().get(&addr.display_name()).copied();
+        let slot = self.stack_slot_provenance_for_var(addr);
         for (store_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
             if let SSAOp::Store {
                 addr: store_addr,

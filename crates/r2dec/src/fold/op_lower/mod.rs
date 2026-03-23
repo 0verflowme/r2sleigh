@@ -24,9 +24,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use r2ssa::{
     CallSiteFact, CallSiteFacts, DecompilePrepFacts, FunctionSemanticSummary, InterprocSummarySet,
-    MemoryDefFact, MemoryLocation, MemorySSAFacts, MemoryUseFact, ObjectKind, ObjectModel,
-    PredicateFacts, PreparedFunctionFacts, PreparedFunctionSSA, SSAFunction, SSAOp, SSAVar,
-    SliceOpRef,
+    MemoryDefFact, MemoryLocation, MemoryUseFact, ObjectKind, ObjectModel, PredicateFacts,
+    PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar, SsaArtifact,
 };
 #[cfg(test)]
 use r2types::StackSlotKey;
@@ -39,7 +38,7 @@ use crate::analysis;
 use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
 use crate::registers::register_family_name;
 
-use super::context::{FoldingContext, PtrArith, SSABlock};
+use super::context::{FoldingContext, SSABlock};
 use super::context::{ResolutionGuardKey, ResolutionPhase};
 use super::flags::is_cpu_flag;
 use super::{
@@ -153,7 +152,7 @@ impl<'a> FoldingContext<'a> {
         self.state.analysis_ctx.ownership()
     }
 
-    fn prepared_ssa(&self) -> Option<&PreparedFunctionSSA> {
+    fn prepared_ssa(&self) -> Option<&SsaArtifact> {
         self.inputs.prepared_ssa
     }
 
@@ -191,19 +190,13 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn prepared_facts(&self) -> Option<&PreparedFunctionFacts> {
-        self.prepared_ssa().map(PreparedFunctionSSA::facts)
+        self.prepared_ssa().map(SsaArtifact::facts)
     }
 
     pub(crate) fn prepared_objects(&self) -> Option<&ObjectModel> {
         self.prepared_facts()
             .map(|facts| &facts.objects)
             .or(self.inputs.prepared_objects)
-    }
-
-    pub(crate) fn prepared_memory(&self) -> Option<&MemorySSAFacts> {
-        self.prepared_facts()
-            .map(|facts| &facts.memory)
-            .or(self.inputs.prepared_memory)
     }
 
     pub(crate) fn prepared_predicates(&self) -> Option<&PredicateFacts> {
@@ -247,20 +240,15 @@ impl<'a> FoldingContext<'a> {
             .or_else(|| Some(self.expr_for_ssa_fallback_name(name)))
     }
 
-    pub(crate) fn prepared_current_op_ref(&self) -> Option<SliceOpRef> {
-        Some(SliceOpRef::Op {
-            block_addr: self.current_block_addr.get()?,
-            op_idx: self.current_op_idx.get()?,
-        })
-    }
-
     pub(crate) fn prepared_call_site_for_op(
         &self,
         block_addr: u64,
         op_idx: usize,
     ) -> Option<&CallSiteFact> {
+        let prepared = self.inputs.prepared_ssa?;
         let facts = self.prepared_call_sites()?;
-        let id = facts.by_op.get(&SliceOpRef::Op { block_addr, op_idx })?;
+        let inst_id = prepared.graph().inst_id_for_op_site(block_addr, op_idx)?;
+        let id = facts.by_inst.get(&inst_id)?;
         facts.by_id.get(id)
     }
 
@@ -290,19 +278,25 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(crate) fn prepared_memory_uses_for_current_op(&self) -> Option<&[MemoryUseFact]> {
-        let op_ref = self.prepared_current_op_ref()?;
-        self.prepared_memory()?
-            .uses_by_op
-            .get(&op_ref)
-            .map(Vec::as_slice)
+        let prepared = self.inputs.prepared_ssa?;
+        let block_addr = self.current_block_addr.get()?;
+        let op_idx = self.current_op_idx.get()?;
+        prepared.memory_uses_for_op_site(block_addr, op_idx)
     }
 
     pub(crate) fn prepared_memory_defs_for_current_op(&self) -> Option<&[MemoryDefFact]> {
-        let op_ref = self.prepared_current_op_ref()?;
-        self.prepared_memory()?
-            .defs_by_op
-            .get(&op_ref)
-            .map(Vec::as_slice)
+        let prepared = self.inputs.prepared_ssa?;
+        let block_addr = self.current_block_addr.get()?;
+        let op_idx = self.current_op_idx.get()?;
+        prepared.memory_defs_for_op_site(block_addr, op_idx)
+    }
+
+    pub(crate) fn prepared_var_for_value_id(&self, value_id: r2ssa::ValueId) -> Option<&SSAVar> {
+        self.inputs.prepared_ssa?.value_var(value_id)
+    }
+
+    pub(crate) fn prepared_value_id_for_var(&self, var: &SSAVar) -> Option<r2ssa::ValueId> {
+        self.inputs.prepared_ssa?.graph().value_id_for_var(var)
     }
 
     pub(crate) fn prepared_canonical_value_root(&self, var: &SSAVar) -> Option<SSAVar> {
@@ -343,10 +337,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn copy_sources_map(&self) -> &HashMap<String, String> {
         &self.use_info().copy_sources
     }
-    #[allow(dead_code)]
-    pub(crate) fn ptr_arith_map(&self) -> &HashMap<String, PtrArith> {
-        &self.use_info().ptr_arith
-    }
     pub(crate) fn ptr_members_map(&self) -> &HashMap<String, (SSAVar, i64)> {
         &self.use_info().ptr_members
     }
@@ -355,6 +345,33 @@ impl<'a> FoldingContext<'a> {
     }
     pub(crate) fn forwarded_values_map(&self) -> &HashMap<String, analysis::ValueProvenance> {
         &self.use_info().forwarded_values
+    }
+    pub(crate) fn definition_for_value_id(&self, value_id: r2ssa::ValueId) -> Option<&CExpr> {
+        self.use_info().definition_for_value(value_id)
+    }
+    pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
+        self.use_info().definition_for_name(name)
+    }
+    pub(crate) fn semantic_value_for_value_id(
+        &self,
+        value_id: r2ssa::ValueId,
+    ) -> Option<&analysis::SemanticValue> {
+        self.use_info().semantic_value_for_value(value_id)
+    }
+    pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&analysis::SemanticValue> {
+        self.use_info().semantic_value_for_name(name)
+    }
+    pub(crate) fn forwarded_value_for_value_id(
+        &self,
+        value_id: r2ssa::ValueId,
+    ) -> Option<&analysis::ValueProvenance> {
+        self.use_info().forwarded_value_for_value(value_id)
+    }
+    pub(crate) fn forwarded_value_for_name(
+        &self,
+        name: &str,
+    ) -> Option<&analysis::ValueProvenance> {
+        self.use_info().forwarded_value_for_name(name)
     }
     pub(crate) fn condition_vars_set(&self) -> &HashSet<String> {
         &self.use_info().condition_vars
@@ -1160,23 +1177,20 @@ impl<'a> FoldingContext<'a> {
         if let Some(prepared) = self.inputs.prepared_ssa {
             self.state.analysis_ctx.semantic_mut().type_hints = self.inputs.type_hints.clone();
             let env = self.to_pass_env();
-            let prepared_view = self
-                .prepared_semantic_view()
-                .cloned()
-                .unwrap_or_else(|| {
-                    analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
-                        prepared,
-                        interproc_summary_set: self.inputs.interproc_summary_set,
-                        abi_arg_regs: &self.inputs.arch.arg_regs,
-                        ret_reg_name: &self.inputs.arch.ret_reg_name,
-                        function_names: self.inputs.function_names,
-                        symbols: self.inputs.symbols,
-                        callee_facts: self.inputs.callee_facts,
-                        stack_slots: self.inputs.stack_slots,
-                        visible_bindings: self.inputs.visible_bindings,
-                        param_register_aliases: self.inputs.param_register_aliases,
-                    })
-                });
+            let prepared_view = self.prepared_semantic_view().cloned().unwrap_or_else(|| {
+                analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
+                    prepared,
+                    interproc_summary_set: self.inputs.interproc_summary_set,
+                    abi_arg_regs: &self.inputs.arch.arg_regs,
+                    ret_reg_name: &self.inputs.arch.ret_reg_name,
+                    function_names: self.inputs.function_names,
+                    symbols: self.inputs.symbols,
+                    callee_facts: self.inputs.callee_facts,
+                    stack_slots: self.inputs.stack_slots,
+                    visible_bindings: self.inputs.visible_bindings,
+                    param_register_aliases: self.inputs.param_register_aliases,
+                })
+            });
             self.state.analysis_ctx =
                 analysis::build_prepared_runtime_facts(blocks, &env, prepared, &prepared_view);
             self.state.analysis_ctx.ownership = self.build_semantic_ownership_facts();
@@ -1522,7 +1536,11 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<CExpr> {
         let (block_addr, op_idx) = source_call;
         let call_site = self.prepared_call_site_for_op(block_addr, op_idx)?;
-        let func = self.resolve_call_target_for_site(block_addr, op_idx, &call_site.target);
+        let func = self.resolve_call_target_for_site(
+            block_addr,
+            op_idx,
+            self.prepared_var_for_value_id(call_site.target)?,
+        );
         let args = self.render_authoritative_source_args_for_call(source_call);
         Some(self.normalize_final_call_expr_in_context(
             CExpr::call(func, args),
@@ -1710,7 +1728,7 @@ impl<'a> FoldingContext<'a> {
 
         // Eliminate explicit zeroing idioms when the value is never used
         // beyond setup/flag chains (e.g., eax = eax ^ eax).
-        if let Some(expr) = self.definitions_map().get(&key)
+        if let Some(expr) = self.definition_for_name(&key)
             && self.is_zeroing_expr(expr)
         {
             return true;
@@ -1814,7 +1832,7 @@ impl<'a> FoldingContext<'a> {
 
         // Try to inline if appropriate
         if self.should_inline(&key)
-            && let Some(expr) = self.definitions_map().get(&key)
+            && let Some(expr) = self.definition_for_name(&key)
         {
             return expr.clone();
         }
@@ -2092,8 +2110,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn lookup_semantic_value(&self, name: &str) -> Option<&analysis::SemanticValue> {
-        self.semantic_values_map()
-            .get(name)
+        self.semantic_value_for_name(name)
             .or_else(|| self.semantic_values_map().get(&name.to_ascii_lowercase()))
             .or_else(|| {
                 name.rsplit_once('_').and_then(|(base, version)| {
@@ -2242,7 +2259,8 @@ impl<'a> FoldingContext<'a> {
         if let Some(selector) = self
             .prepared_predicates()
             .and_then(|facts| facts.switches.get(&block_addr))
-            .and_then(|switch| switch.selector.as_ref())
+            .and_then(|switch| switch.selector)
+            .and_then(|selector| self.prepared_var_for_value_id(selector))
         {
             let rooted = self
                 .prepared_canonical_value_root(selector)
@@ -2269,7 +2287,8 @@ impl<'a> FoldingContext<'a> {
                         .switches
                         .values()
                         .next()
-                        .and_then(|switch| switch.selector.as_ref())
+                        .and_then(|switch| switch.selector)
+                        .and_then(|selector| self.prepared_var_for_value_id(selector))
                         .cloned()
                 })
                 .flatten()
@@ -2292,7 +2311,11 @@ impl<'a> FoldingContext<'a> {
                 .choose_preferred_visible_expr(Some(rendered), Some(semanticized))
                 .map(|expr| self.refine_switch_selector_expr(expr));
         }
-        if let Some(selector) = self.infer_switch_selector_var_from_branchind(block_addr) {
+        if let Some(selector) = self
+            .inputs
+            .prepared_ssa
+            .and_then(|prepared| prepared.function().infer_switch_selector_var(block_addr))
+        {
             let rooted = self
                 .prepared_canonical_value_root(&selector)
                 .unwrap_or(selector);
@@ -2354,7 +2377,9 @@ impl<'a> FoldingContext<'a> {
                     .and_then(|source| self.stable_owned_call_result_expr_for_source(source))
                     .or_else(|| self.stable_owned_call_result_expr_for_name(name, true))
                     .or_else(|| self.best_visible_definition(name))
-                    .map(|candidate| self.simplify_switch_selector_expr(self.rewrite_stack_expr(candidate)))
+                    .map(|candidate| {
+                        self.simplify_switch_selector_expr(self.rewrite_stack_expr(candidate))
+                    })
             }
             _ => None,
         };
@@ -2362,170 +2387,22 @@ impl<'a> FoldingContext<'a> {
             .unwrap_or(refined)
     }
 
-    fn infer_switch_selector_var_from_branchind(&self, block_addr: u64) -> Option<SSAVar> {
-        let prepared = self.inputs.prepared_ssa?;
-        let block = prepared.function().get_block(block_addr)?;
-        let target = block.ops.iter().rev().find_map(|op| match op {
-            SSAOp::BranchInd { target } => Some(target),
-            _ => None,
-        })?;
-        self.infer_switch_selector_var_from_value(target, 0)
-    }
-
     fn infer_unique_switch_selector_var(&self) -> Option<SSAVar> {
         let prepared = self.inputs.prepared_ssa?;
-        let mut switch_blocks = prepared
-            .function()
-            .cfg()
-            .block_addrs()
-            .filter(|addr| {
-                prepared
-                    .function()
-                    .cfg()
-                    .get_block(*addr)
-                    .is_some_and(|block| matches!(block.terminator, r2ssa::cfg::BlockTerminator::Switch { .. }))
-            });
+        let mut switch_blocks = prepared.function().cfg().block_addrs().filter(|addr| {
+            prepared
+                .function()
+                .cfg()
+                .get_block(*addr)
+                .is_some_and(|block| {
+                    matches!(block.terminator, r2ssa::cfg::BlockTerminator::Switch { .. })
+                })
+        });
         let block_addr = switch_blocks.next()?;
         if switch_blocks.next().is_some() {
             return None;
         }
-        self.infer_switch_selector_var_from_branchind(block_addr)
-    }
-
-    fn infer_switch_selector_var_from_value(&self, var: &SSAVar, depth: u32) -> Option<SSAVar> {
-        if depth > 16 {
-            return None;
-        }
-        let prepared = self.inputs.prepared_ssa?;
-        let (block_addr, r2ssa::function::DefLocation::Op(op_idx)) =
-            prepared.function().find_def(var)?
-        else {
-            return None;
-        };
-        let block = prepared.function().get_block(block_addr)?;
-        let op = block.ops.get(op_idx)?;
-        match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::Subpiece { src, .. } => self.infer_switch_selector_var_from_value(src, depth + 1),
-            SSAOp::Load { addr, .. } => {
-                if self.is_stack_slot_address_value(addr, depth + 1) {
-                    Some(var.clone())
-                } else {
-                    self.infer_switch_selector_var_from_address(addr, depth + 1)
-                }
-            }
-            SSAOp::IntAdd { a, b, .. } | SSAOp::IntSub { a, b, .. } => {
-                self.infer_switch_selector_var_from_sum(a, b, depth + 1)
-            }
-            SSAOp::IntMult { a, b, .. } => self.infer_switch_selector_var_from_scaled(a, b, depth + 1),
-            _ => None,
-        }
-    }
-
-    fn infer_switch_selector_var_from_address(&self, addr: &SSAVar, depth: u32) -> Option<SSAVar> {
-        if depth > 16 {
-            return None;
-        }
-        let prepared = self.inputs.prepared_ssa?;
-        let (block_addr, r2ssa::function::DefLocation::Op(op_idx)) =
-            prepared.function().find_def(addr)?
-        else {
-            return None;
-        };
-        let block = prepared.function().get_block(block_addr)?;
-        let op = block.ops.get(op_idx)?;
-        match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::Subpiece { src, .. } => self.infer_switch_selector_var_from_address(src, depth + 1),
-            SSAOp::IntAdd { a, b, .. } | SSAOp::IntSub { a, b, .. } => {
-                self.infer_switch_selector_var_from_sum(a, b, depth + 1)
-            }
-            SSAOp::IntMult { a, b, .. } => self.infer_switch_selector_var_from_scaled(a, b, depth + 1),
-            _ => None,
-        }
-    }
-
-    fn infer_switch_selector_var_from_sum(
-        &self,
-        a: &SSAVar,
-        b: &SSAVar,
-        depth: u32,
-    ) -> Option<SSAVar> {
-        if Self::is_constish_switch_value(a) {
-            return self.infer_switch_selector_var_from_value(b, depth);
-        }
-        if Self::is_constish_switch_value(b) {
-            return self.infer_switch_selector_var_from_value(a, depth);
-        }
-        self.infer_switch_selector_var_from_scaled(a, b, depth)
-            .or_else(|| self.infer_switch_selector_var_from_scaled(b, a, depth))
-    }
-
-    fn infer_switch_selector_var_from_scaled(
-        &self,
-        a: &SSAVar,
-        b: &SSAVar,
-        depth: u32,
-    ) -> Option<SSAVar> {
-        if Self::is_constish_switch_value(a) {
-            return self.infer_switch_selector_var_from_value(b, depth);
-        }
-        if Self::is_constish_switch_value(b) {
-            return self.infer_switch_selector_var_from_value(a, depth);
-        }
-        None
-    }
-
-    fn is_stack_slot_address_value(&self, var: &SSAVar, depth: u32) -> bool {
-        if depth > 16 {
-            return false;
-        }
-        let lower = var.name.to_ascii_lowercase();
-        let base = lower.split('_').next().unwrap_or(lower.as_str());
-        if matches!(base, "rbp" | "rsp" | "ebp" | "esp" | "bp" | "sp") {
-            return true;
-        }
-        let Some(prepared) = self.inputs.prepared_ssa else {
-            return false;
-        };
-        let Some((block_addr, r2ssa::function::DefLocation::Op(op_idx))) =
-            prepared.function().find_def(var)
-        else {
-            return false;
-        };
-        let Some(block) = prepared.function().get_block(block_addr) else {
-            return false;
-        };
-        let Some(op) = block.ops.get(op_idx) else {
-            return false;
-        };
-        match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::Subpiece { src, .. } => self.is_stack_slot_address_value(src, depth + 1),
-            SSAOp::IntAdd { a, b, .. } | SSAOp::IntSub { a, b, .. } => {
-                (self.is_stack_slot_address_value(a, depth + 1)
-                    && Self::is_constish_switch_value(b))
-                    || (self.is_stack_slot_address_value(b, depth + 1)
-                        && Self::is_constish_switch_value(a))
-            }
-            _ => false,
-        }
-    }
-
-    fn is_constish_switch_value(var: &SSAVar) -> bool {
-        var.is_const() || var.name.starts_with("ram:")
+        prepared.function().infer_switch_selector_var(block_addr)
     }
 
     fn simplify_switch_selector_expr(&self, expr: CExpr) -> CExpr {
@@ -2627,9 +2504,20 @@ impl<'a> FoldingContext<'a> {
             return Some(owner);
         }
 
-        let forwarded = self.forwarded_source_var(&name).and_then(|source| {
-            self.render_value_ref(&analysis::ValueRef::from(source), depth + 1, visited)
-        });
+        let forwarded = value
+            .value_id()
+            .and_then(|value_id| self.forwarded_value_for_value_id(value_id))
+            .and_then(|prov| {
+                prov.source_var.clone().map(|source| {
+                    self.render_value_ref(&analysis::ValueRef::from(source), depth + 1, visited)
+                })
+            })
+            .flatten()
+            .or_else(|| {
+                self.forwarded_source_var(&name).and_then(|source| {
+                    self.render_value_ref(&analysis::ValueRef::from(source), depth + 1, visited)
+                })
+            });
         let fallback = if value.var.is_const() {
             Some(self.const_to_expr(&value.var))
         } else {
@@ -2640,7 +2528,11 @@ impl<'a> FoldingContext<'a> {
                     .unwrap_or_else(|| CExpr::Var(rendered)),
             )
         };
-        let rendered = match self.lookup_semantic_value(&name) {
+        let rendered = match self.lookup_semantic_value(&name).or_else(|| {
+            value
+                .value_id()
+                .and_then(|value_id| self.semantic_value_for_value_id(value_id))
+        }) {
             Some(analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(expr))) => {
                 self.render_scalar_value_ref(value, expr.clone(), fallback.clone())
             }
@@ -2657,6 +2549,11 @@ impl<'a> FoldingContext<'a> {
                 .resolve_expr_from_phi_sources(&name, depth + 1, visited, false)
                 .or_else(|| {
                     self.lookup_definition_raw_with_depth(&name, depth + 1, visited)
+                        .or_else(|| {
+                            value.value_id().and_then(|value_id| {
+                                self.definition_for_value_id(value_id).cloned()
+                            })
+                        })
                         .map(|expr| {
                             let semanticized =
                                 self.semanticize_visible_expr(&expr, depth + 1, visited);
@@ -2681,7 +2578,7 @@ impl<'a> FoldingContext<'a> {
                         })
                 })
                 .or_else(|| {
-                    self.definitions_map().get(&name).and_then(|expr| {
+                    self.definition_for_name(&name).and_then(|expr| {
                         self.render_semantic_load_from_definition_expr(expr, depth + 1, visited)
                     })
                 }),
@@ -2720,7 +2617,7 @@ impl<'a> FoldingContext<'a> {
             return cached;
         }
 
-        let direct = || self.forwarded_values_map().get(name);
+        let direct = || self.forwarded_value_for_name(name);
         let lower = || self.forwarded_values_map().get(&name.to_ascii_lowercase());
         let normalized = || {
             name.rsplit_once('_').and_then(|(base, version)| {
@@ -2815,7 +2712,7 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     let rendered = self
                         .lookup_definition(&value.display_name())
-                        .or_else(|| self.definitions_map().get(&value.display_name()).cloned())?;
+                        .or_else(|| self.definition_for_name(&value.display_name()).cloned())?;
                     match &rendered {
                         CExpr::Var(name) => lookup_rendered_name_addr(name)
                             .or_else(|| self.evaluate_constish_call_arg_expr(&rendered, 0))?,
@@ -2911,10 +2808,10 @@ impl<'a> FoldingContext<'a> {
 
         match &addr.base {
             analysis::BaseRef::Value(base_ref) if addr.offset_bytes == 0 => {
-                let objects = self.prepared_objects()?;
-                let object = objects.object_for_value(&base_ref.var).or_else(|| {
+                let prepared = self.inputs.prepared_ssa?;
+                let object = prepared.object_for_var(&base_ref.var).or_else(|| {
                     self.prepared_canonical_value_root(&base_ref.var)
-                        .and_then(|root| objects.object_for_value(&root))
+                        .and_then(|root| prepared.object_for_var(&root))
                 })?;
                 self.prepared_named_expr_for_memory_location(&MemoryLocation {
                     object,
@@ -2924,6 +2821,25 @@ impl<'a> FoldingContext<'a> {
             }
             _ => None,
         }
+    }
+
+    fn allow_exact_named_object_expr_for_load_addr(&self, addr: &analysis::NormalizedAddr) -> bool {
+        let analysis::BaseRef::Value(base_ref) = &addr.base else {
+            return true;
+        };
+        if addr.index.is_some() || addr.offset_bytes != 0 {
+            return true;
+        }
+
+        let mut visited = HashSet::new();
+        let root = self
+            .semantic_root_var(&base_ref.var, 0, &mut visited)
+            .unwrap_or_else(|| base_ref.var.clone());
+        !matches!(
+            self.type_hint_for_var(&root)
+                .or_else(|| self.type_hint_for_var(&base_ref.var)),
+            Some(CType::Pointer(_)) | Some(CType::Array(_, _))
+        )
     }
 
     fn exact_named_object_expr_for_addr(&self, addr: &analysis::NormalizedAddr) -> Option<CExpr> {
@@ -3662,7 +3578,18 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        self.render_access_expr_from_addr(addr, elem_size, depth, visited)
+        let direct_access = if self.allow_exact_named_object_expr_for_load_addr(addr) {
+            self.render_access_expr_from_addr(addr, elem_size, depth, visited)
+        } else if let Some(probe) = self.exact_named_object_expr_for_addr(addr) {
+            let probe_base = self.render_base_ref_expr(&addr.base, false, depth + 1, visited);
+            (probe_base.as_ref() != Some(&probe))
+                .then(|| self.render_access_expr_from_addr(addr, elem_size, depth, visited))
+                .flatten()
+        } else {
+            self.render_access_expr_from_addr(addr, elem_size, depth, visited)
+        };
+
+        direct_access
             .or_else(|| {
                 if addr.index.is_some()
                     || addr.offset_bytes != 0
@@ -3968,7 +3895,7 @@ impl<'a> FoldingContext<'a> {
                 }
                 if let Some(def) = self
                     .lookup_definition(name)
-                    .or_else(|| self.definitions_map().get(name).cloned())
+                    .or_else(|| self.definition_for_name(name).cloned())
                     && !matches!(&def, CExpr::Var(inner) if inner == name)
                     && let Some(addr) = self.normalized_addr_from_visible_expr(&def, depth + 1)
                 {
@@ -4548,7 +4475,7 @@ impl<'a> FoldingContext<'a> {
                     !name.starts_with("const:")
                         && !name.starts_with("ram:")
                         && (!stack_placeholder
-                            && (self.stack_slots_map().get(name).is_none()
+                            && (self.stack_slot_provenance_for_name(name).is_none()
                                 || lower.starts_with("local_")
                                 || lower.starts_with("arg")))
                 }),
@@ -4571,7 +4498,7 @@ impl<'a> FoldingContext<'a> {
                 let lower = name.to_ascii_lowercase();
                 lower.contains("ptr")
                     || lower.contains("addr")
-                    || self.stack_slots_map().get(name).is_some()
+                    || self.stack_slot_provenance_for_name(name).is_some()
                     || self
                         .lookup_type_hint(name)
                         .map(|ty| matches!(ty, CType::Pointer(_) | CType::Struct(_)))
@@ -4639,6 +4566,16 @@ impl<'a> FoldingContext<'a> {
                 self.find_ssa_name_for_rendered_alias(name)
                     .and_then(|ssa_name| self.stack_slots_map().get(&ssa_name).copied())
             })
+    }
+
+    pub(super) fn stack_slot_provenance_for_var(
+        &self,
+        var: &SSAVar,
+    ) -> Option<analysis::StackSlotProvenance> {
+        self.stack_slots_map()
+            .get(&var.display_name())
+            .copied()
+            .or_else(|| self.stack_slot_provenance_for_name(&var.display_name()))
     }
 
     fn scalar_context_root_candidate_for_name(
@@ -5158,6 +5095,7 @@ impl<'a> FoldingContext<'a> {
         self.ownership()
             .source_for_alias(ssa_name)
             .map(Into::into)
+            .or_else(|| self.use_info().call_result_source_for_name(ssa_name))
             .or_else(|| {
                 self.prepared_semantic_view()
                     .and_then(|view| view.call_result_source_for_name(ssa_name))
@@ -5307,7 +5245,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn semantic_stack_owner_name_for_alias(&self, alias: &str) -> Option<String> {
-        match self.semantic_values_map().get(alias) {
+        match self.semantic_value_for_name(alias) {
             Some(analysis::SemanticValue::Load { addr, .. }) => {
                 self.stack_owner_name_for_addr(addr)
             }
@@ -5350,7 +5288,9 @@ impl<'a> FoldingContext<'a> {
                     })
             });
         let Some(owner_name) = owner_name else {
-            return self.direct_call_result_aliases_set().contains(&dst.display_name())
+            return self
+                .direct_call_result_aliases_set()
+                .contains(&dst.display_name())
                 && self.call_result_exprs_map().contains_key(&source_call)
                 && (self.is_low_signal_visible_name(&rendered)
                     || self.is_transient_visible_name(&rendered));
@@ -6302,10 +6242,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn direct_definition_expr(&self, name: &str) -> Option<CExpr> {
-        let mut best = None;
-        if let Some(expr) = self.definitions_map().get(name) {
-            best = self.choose_preferred_visible_expr(best, Some(expr.clone()));
-        }
+        let mut best = self
+            .definition_for_name(name)
+            .cloned()
+            .map(Some)
+            .unwrap_or(None);
         let lower = name.to_lowercase();
         if let Some(expr) = self.definitions_map().get(&lower) {
             best = self.choose_preferred_visible_expr(best, Some(expr.clone()));
@@ -6492,10 +6433,9 @@ impl<'a> FoldingContext<'a> {
 
     fn ssa_alias_preference_key(&self, ssa_name: &str) -> (bool, bool, VisibleExprQuality) {
         let candidate = self
-            .semantic_values_map()
-            .get(ssa_name)
+            .semantic_value_for_name(ssa_name)
             .and_then(|value| self.render_semantic_value(value, 0, &mut HashSet::new()))
-            .or_else(|| self.definitions_map().get(ssa_name).cloned());
+            .or_else(|| self.definition_for_name(ssa_name).cloned());
         match candidate {
             Some(expr) => (
                 self.is_direct_constish_visible_expr(&expr, 0),
@@ -7801,10 +7741,11 @@ impl<'a> FoldingContext<'a> {
                     .prepared_semantic_view()
                     .and_then(|view| view.call_result_source_for_name(name))
                     .or_else(|| {
-                        self.find_ssa_name_for_rendered_alias(name).and_then(|ssa_name| {
-                            self.prepared_semantic_view()
-                                .and_then(|view| view.call_result_source_for_name(&ssa_name))
-                        })
+                        self.find_ssa_name_for_rendered_alias(name)
+                            .and_then(|ssa_name| {
+                                self.prepared_semantic_view()
+                                    .and_then(|view| view.call_result_source_for_name(&ssa_name))
+                            })
                     })
                     && let Some(expr) = self
                         .stable_owned_call_result_expr_for_source(source_call)
@@ -8943,7 +8884,7 @@ impl<'a> FoldingContext<'a> {
                         && !self.is_transient_visible_name(&owner)
                 });
             if self.should_inline(&key)
-                && matches!(self.definitions_map().get(&key), Some(CExpr::Call { .. }))
+                && matches!(self.definition_for_name(&key), Some(CExpr::Call { .. }))
                 && has_stable_visible_owner
             {
                 return true;

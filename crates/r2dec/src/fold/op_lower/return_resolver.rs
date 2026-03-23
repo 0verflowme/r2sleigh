@@ -265,6 +265,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn semantic_return_candidate_for_name(&self, name: &str) -> Option<CExpr> {
+        if !self.enter_resolution_guard(ResolutionPhase::Return, name) {
+            return None;
+        }
         let context = self.return_context_for_name(name);
         let lower = name.to_ascii_lowercase();
         let mut best = if self.inputs.arch.is_return_register_name(&lower)
@@ -301,12 +304,14 @@ impl<'a> FoldingContext<'a> {
         }
 
         let mut semantic_visited = HashSet::new();
-        self.preferred_return_candidate_in_context(
+        let candidate = self.preferred_return_candidate_in_context(
             best,
             self.render_semantic_value_by_name(name, 0, &mut semantic_visited)
                 .map(|candidate| self.refine_low_signal_semantic_candidate(name, candidate)),
             context,
-        )
+        );
+        self.leave_resolution_guard(ResolutionPhase::Return, name);
+        candidate
     }
 
     pub(crate) fn resolve_return_candidate(&self, expr: &CExpr) -> CExpr {

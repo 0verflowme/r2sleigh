@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 const ANALYSIS_CACHE_LIMIT: usize = 256;
 
-fn should_reuse_decompile_ssa_for_pattern_analysis(prepared: &r2ssa::PreparedFunctionSSA) -> bool {
+fn should_reuse_decompile_ssa_for_pattern_analysis(prepared: &r2ssa::SsaArtifact) -> bool {
     let summary = prepared.function().cfg_risk_summary();
     summary.block_count >= 96
         && summary.switch_block_count > 0
@@ -35,14 +35,14 @@ pub(crate) struct FunctionInput<'a> {
 
 #[derive(Clone)]
 pub(crate) struct FunctionAnalysis {
-    pub(crate) ssa_func: r2ssa::PreparedFunctionSSA,
-    pub(crate) pattern_ssa_func: r2ssa::PreparedFunctionSSA,
+    pub(crate) ssa_func: r2ssa::SsaArtifact,
+    pub(crate) pattern_ssa_func: r2ssa::SsaArtifact,
 }
 
 #[derive(Clone)]
 pub(crate) struct FunctionAnalysisArtifact {
-    pub(crate) ssa_func: r2ssa::PreparedFunctionSSA,
-    pub(crate) pattern_ssa_func: r2ssa::PreparedFunctionSSA,
+    pub(crate) ssa_func: r2ssa::SsaArtifact,
+    pub(crate) pattern_ssa_func: r2ssa::SsaArtifact,
     pub(crate) type_facts: r2types::FunctionTypeFacts,
     pub(crate) writeback_plan: r2types::TypeWritebackPlan,
     pub(crate) interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
@@ -350,8 +350,16 @@ fn build_var_recovery_ssa_blocks(
     blocks: &[R2ILBlock],
     arch: Option<&ArchSpec>,
 ) -> Option<Vec<r2ssa::SSABlock>> {
-    let func = r2ssa::PreparedFunctionSSA::raw(blocks, arch)?;
-    Some(func.local_ssa_blocks())
+    let func = r2ssa::SSAFunction::from_blocks_raw(blocks, arch)?;
+    Some(
+        func.blocks()
+            .map(|block| r2ssa::SSABlock {
+                addr: block.addr,
+                size: block.size,
+                ops: block.ops.clone(),
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn build_function_input<'a>(
@@ -401,12 +409,11 @@ fn build_function_analysis_from_parts(
         return Some(rename_function_analysis((*cached).clone(), function_name));
     }
 
-    let ssa_func =
-        r2ssa::PreparedFunctionSSA::for_decompile(blocks, arch)?.with_name(function_name);
+    let ssa_func = r2ssa::SsaArtifact::for_decompile(blocks, arch)?.with_name(function_name);
     let pattern_ssa_func = if should_reuse_decompile_ssa_for_pattern_analysis(&ssa_func) {
         ssa_func.clone()
     } else {
-        r2ssa::PreparedFunctionSSA::for_patterns(blocks, arch)?.with_name(function_name)
+        r2ssa::SsaArtifact::for_patterns(blocks, arch)?.with_name(function_name)
     };
     let analysis = FunctionAnalysis {
         ssa_func,

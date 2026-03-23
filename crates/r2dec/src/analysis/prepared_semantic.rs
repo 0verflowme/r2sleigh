@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use r2ssa::function::DefLocation;
 use r2ssa::{
-    CompareKind, InterprocSummarySet, MemoryLocation, ObjectKind, PreparedFunctionSSA, SSAOp,
-    SSAVar, SliceOpRef,
+    CompareKind, InterprocSummarySet, MemoryLocation, ObjectKind, SSAOp, SSAVar, SsaArtifact,
+    ValueId,
 };
 use r2types::{
     CalleeFact, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
@@ -39,20 +39,22 @@ pub(crate) struct PreparedCallView {
 pub(crate) struct PreparedSemanticView {
     pub(crate) stack_aliases_by_offset: BTreeMap<i64, StackAliasView>,
     pub(crate) param_alias_by_reg: HashMap<String, String>,
-    pub(crate) owner_expr_by_var: HashMap<SSAVar, CExpr>,
+    pub(crate) value_id_by_var: HashMap<SSAVar, ValueId>,
+    pub(crate) var_by_value_id: HashMap<ValueId, SSAVar>,
+    pub(crate) owner_expr_by_value: HashMap<ValueId, CExpr>,
     pub(crate) owner_expr_by_name: HashMap<String, CExpr>,
-    pub(crate) stack_offset_by_var: HashMap<SSAVar, i64>,
-    pub(crate) predicate_expr_by_cond: HashMap<SSAVar, CExpr>,
+    pub(crate) stack_offset_by_value: HashMap<ValueId, i64>,
+    pub(crate) predicate_expr_by_value: HashMap<ValueId, CExpr>,
     pub(crate) predicate_expr_by_name: HashMap<String, CExpr>,
     pub(crate) branch_predicate_expr_by_block: BTreeMap<u64, CExpr>,
     pub(crate) call_view_by_site: BTreeMap<(u64, usize), PreparedCallView>,
-    pub(crate) call_result_source_by_var: HashMap<SSAVar, (u64, usize)>,
+    pub(crate) call_result_source_by_value: HashMap<ValueId, (u64, usize)>,
     pub(crate) call_result_source_by_name: HashMap<String, (u64, usize)>,
     pub(crate) switch_selector_expr_by_block: BTreeMap<u64, CExpr>,
 }
 
 pub(crate) struct PreparedSemanticViewInputs<'a> {
-    pub(crate) prepared: &'a PreparedFunctionSSA,
+    pub(crate) prepared: &'a SsaArtifact,
     pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
     pub(crate) abi_arg_regs: &'a [String],
     pub(crate) ret_reg_name: &'a str,
@@ -66,9 +68,11 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
 
 impl PreparedSemanticView {
     pub(crate) fn build(inputs: PreparedSemanticViewInputs<'_>) -> Self {
-        let mut view = Self::default();
-        let _ = inputs.interproc_summary_set;
-        view.param_alias_by_reg = inputs.param_register_aliases.clone();
+        let mut view = Self {
+            param_alias_by_reg: inputs.param_register_aliases.clone(),
+            ..Self::default()
+        };
+        view.init_value_indexes(inputs.prepared);
 
         populate_stack_aliases(&mut view, &inputs);
         populate_stack_offsets(&mut view, inputs.prepared);
@@ -76,12 +80,8 @@ impl PreparedSemanticView {
         populate_owner_exprs(&mut view, inputs.prepared);
         populate_call_result_sources(&mut view, inputs.prepared, inputs.ret_reg_name);
         populate_calls(&mut view, &inputs);
-        populate_owner_exprs(&mut view, inputs.prepared);
-        populate_predicates(&mut view, &inputs);
-        populate_owner_exprs(&mut view, inputs.prepared);
         populate_predicates(&mut view, &inputs);
         populate_switches(&mut view, &inputs);
-        populate_calls(&mut view, &inputs);
         refresh_name_indexes(&mut view);
 
         view
@@ -91,12 +91,28 @@ impl PreparedSemanticView {
         self.stack_aliases_by_offset.get(&offset)
     }
 
+    pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
+        self.value_id_by_var.get(var).copied()
+    }
+
+    pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
+        self.var_by_value_id.get(&value_id)
+    }
+
     pub(crate) fn stack_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
-        self.stack_offset_by_var.get(var).copied()
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.stack_offset_by_value.get(&value_id).copied())
     }
 
     pub(crate) fn owner_expr_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
-        self.owner_expr_by_var.get(var)
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.owner_expr_by_value.get(&value_id))
+            .or_else(|| self.owner_expr_by_name.get(&var.display_name()))
+            .or_else(|| self.owner_expr_by_name.get(&var.name))
+    }
+
+    pub(crate) fn owner_expr_for_value_id(&self, value_id: ValueId) -> Option<&CExpr> {
+        self.owner_expr_by_value.get(&value_id)
     }
 
     pub(crate) fn owner_expr_for_name(&self, name: &str) -> Option<&CExpr> {
@@ -104,7 +120,15 @@ impl PreparedSemanticView {
     }
 
     pub(crate) fn predicate_expr_for_cond(&self, var: &SSAVar) -> Option<&CExpr> {
-        self.predicate_expr_by_cond.get(var)
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.predicate_expr_by_value.get(&value_id))
+            .or_else(|| self.predicate_expr_by_name.get(&var.display_name()))
+            .or_else(|| self.predicate_expr_by_name.get(&var.name))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn predicate_expr_for_value_id(&self, value_id: ValueId) -> Option<&CExpr> {
+        self.predicate_expr_by_value.get(&value_id)
     }
 
     pub(crate) fn predicate_expr_for_name(&self, name: &str) -> Option<&CExpr> {
@@ -124,18 +148,88 @@ impl PreparedSemanticView {
     }
 
     pub(crate) fn call_result_source_for_var(&self, var: &SSAVar) -> Option<(u64, usize)> {
-        self.call_result_source_by_var.get(var).copied()
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
+            .or_else(|| {
+                self.call_result_source_by_name
+                    .get(&var.display_name())
+                    .copied()
+            })
+            .or_else(|| self.call_result_source_by_name.get(&var.name).copied())
     }
 
     pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
         self.call_result_source_by_name.get(name).copied()
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn call_result_source_for_value_id(
+        &self,
+        value_id: ValueId,
+    ) -> Option<(u64, usize)> {
+        self.call_result_source_by_value.get(&value_id).copied()
+    }
+
+    fn init_value_indexes(&mut self, prepared: &SsaArtifact) {
+        self.value_id_by_var.clear();
+        self.var_by_value_id.clear();
+        for value in &prepared.graph().values {
+            self.value_id_by_var.insert(value.var.clone(), value.id);
+            self.var_by_value_id.insert(value.id, value.var.clone());
+        }
+    }
+
+    fn insert_stack_offset(&mut self, var: &SSAVar, offset: i64) {
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.stack_offset_by_value.insert(value_id, offset);
+        }
+    }
+
+    fn insert_owner_expr(&mut self, var: &SSAVar, expr: CExpr) {
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.owner_expr_by_value.insert(value_id, expr);
+        }
+    }
+
+    fn insert_predicate_expr(&mut self, var: &SSAVar, expr: CExpr) {
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.predicate_expr_by_value.insert(value_id, expr);
+        }
+    }
+
+    fn insert_call_result_source(&mut self, var: &SSAVar, site: (u64, usize)) {
+        if let Some(value_id) = self.value_id_for_var(var) {
+            self.call_result_source_by_value.insert(value_id, site);
+        }
+    }
+
+    fn stack_offset_entries(&self) -> Vec<(SSAVar, i64)> {
+        self.stack_offset_by_value
+            .iter()
+            .filter_map(|(value_id, offset)| {
+                self.var_for_value_id(*value_id)
+                    .cloned()
+                    .map(|var| (var, *offset))
+            })
+            .collect()
+    }
+}
+
+fn prepared_var(prepared: &SsaArtifact, value_id: ValueId) -> Option<&SSAVar> {
+    prepared.value_var(value_id)
+}
+
+fn prepared_call_site_tuple(
+    prepared: &SsaArtifact,
+    inst_id: r2ssa::InstId,
+) -> Option<(u64, usize)> {
+    prepared.inst_op_site(inst_id)
 }
 
 pub(crate) fn build_prepared_runtime_facts(
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) -> DecompilerFacts {
     let mut use_info = UseInfo {
@@ -167,7 +261,10 @@ fn overlay_local_struct_semantics(use_info: &mut UseInfo, blocks: &[SSABlock], e
         let should_replace = match use_info.semantic_values.get(&name) {
             None => true,
             Some(SemanticValue::Address(_) | SemanticValue::Load { .. }) => false,
-            Some(_) => matches!(value, SemanticValue::Address(_) | SemanticValue::Load { .. }),
+            Some(_) => matches!(
+                value,
+                SemanticValue::Address(_) | SemanticValue::Load { .. }
+            ),
         };
         if should_replace {
             use_info.semantic_values.insert(name, value);
@@ -269,15 +366,30 @@ fn prepared_binding_arg_alias(
 
 fn refresh_name_indexes(view: &mut PreparedSemanticView) {
     view.owner_expr_by_name = view
-        .owner_expr_by_var
+        .owner_expr_by_value
         .iter()
-        .map(|(var, expr)| (var.display_name(), expr.clone()))
+        .filter_map(|(value_id, expr)| {
+            view.var_for_value_id(*value_id)
+                .map(|var| (var.display_name(), expr.clone()))
+        })
         .collect();
     view.predicate_expr_by_name = view
-        .predicate_expr_by_cond
+        .predicate_expr_by_value
         .iter()
-        .map(|(var, expr)| (var.display_name(), expr.clone()))
+        .filter_map(|(value_id, expr)| {
+            view.var_for_value_id(*value_id)
+                .map(|var| (var.display_name(), expr.clone()))
+        })
         .collect();
+    let mut call_result_source_by_name = HashMap::new();
+    for (value_id, site) in &view.call_result_source_by_value {
+        let Some(var) = view.var_for_value_id(*value_id) else {
+            continue;
+        };
+        call_result_source_by_name.insert(var.display_name(), *site);
+        call_result_source_by_name.insert(var.name.clone(), *site);
+    }
+    view.call_result_source_by_name = call_result_source_by_name;
 }
 
 fn overlay_param_home_stack_aliases(
@@ -313,29 +425,27 @@ fn overlay_param_home_stack_aliases(
     }
 }
 
-fn populate_stack_offsets(view: &mut PreparedSemanticView, prepared: &PreparedFunctionSSA) {
+fn populate_stack_offsets(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
     let Some(prep) = prepared.function().decompile_prep_facts() else {
         return;
     };
     for var in prep.stack_address_roots.keys() {
         if let Some(offset) = prep.stack_address_root_of(var).map(|root| root.offset) {
-            view.stack_offset_by_var.insert(var.clone(), offset);
+            view.insert_stack_offset(var, offset);
         }
     }
-    for (value, object_id) in &prepared.objects().value_objects {
-        if !is_prepared_stack_address_carrier(prepared, value) {
-            continue;
-        }
+    for (&value_id, object_id) in &prepared.objects().value_objects {
         if let Some(object) = prepared.objects().object(*object_id)
             && let Some(offset) = stack_offset_for_object_kind(&object.kind)
+            && let Some(value) = prepared_var(prepared, value_id)
         {
-            view.stack_offset_by_var.insert(value.clone(), offset);
+            view.insert_stack_offset(value, offset);
         }
     }
 }
 
-fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunctionSSA) {
-    for (value, offset) in view.stack_offset_by_var.clone() {
+fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
+    for (value, offset) in view.stack_offset_entries() {
         if !is_prepared_stack_address_carrier(prepared, &value) {
             continue;
         }
@@ -343,23 +453,14 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
             continue;
         };
         if !alias.is_empty() {
-            view.owner_expr_by_var.insert(
-                value.clone(),
-                CExpr::AddrOf(Box::new(CExpr::Var(alias.clone()))),
-            );
+            view.insert_owner_expr(&value, CExpr::AddrOf(Box::new(CExpr::Var(alias.clone()))));
         }
     }
 
     for block in prepared.function().blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
-            let op_ref = SliceOpRef::Op {
-                block_addr: block.addr,
-                op_idx,
-            };
             if let SSAOp::Load { dst, addr, .. } = op {
-                let derived = view
-                    .stack_offset_for_var(addr)
-                    .or_else(|| stack_offset_for_value(prepared, addr))
+                let derived = prepared_direct_stack_load_offset(prepared, view, addr)
                     .and_then(|offset| {
                         local_store_owner_expr_for_offset(view, prepared, block, op_idx, offset)
                             .map(|expr| (expr, Some(offset)))
@@ -371,9 +472,7 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
                     })
                     .or_else(|| {
                         prepared
-                            .memory()
-                            .uses_by_op
-                            .get(&op_ref)
+                            .memory_uses_for_op_site(block.addr, op_idx)
                             .and_then(|facts| facts.first())
                             .and_then(|fact| {
                                 alias_for_memory_location(view, fact.location)
@@ -387,11 +486,11 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
                 let Some((expr, offset)) = derived else {
                     continue;
                 };
-                view.owner_expr_by_var.insert(dst.clone(), expr);
-                if let Some(offset) = offset {
-                    view.stack_offset_by_var
-                        .entry(dst.clone())
-                        .or_insert(offset);
+                view.insert_owner_expr(dst, expr);
+                if let Some(offset) = offset
+                    && view.stack_offset_for_var(dst) != Some(offset)
+                {
+                    view.insert_stack_offset(dst, offset);
                 }
             }
         }
@@ -410,15 +509,15 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
                     | SSAOp::Cast { dst, src, .. }
                     | SSAOp::Subpiece { dst, src, .. } => {
                         if let Some(expr) = view.owner_expr_for_var(src).cloned()
-                            && view.owner_expr_by_var.get(dst) != Some(&expr)
+                            && view.owner_expr_for_var(dst) != Some(&expr)
                         {
-                            view.owner_expr_by_var.insert(dst.clone(), expr);
+                            view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                         if let Some(offset) = view.stack_offset_for_var(src)
-                            && view.stack_offset_by_var.get(dst).copied() != Some(offset)
+                            && view.stack_offset_for_var(dst) != Some(offset)
                         {
-                            view.stack_offset_by_var.insert(dst.clone(), offset);
+                            view.insert_stack_offset(dst, offset);
                             changed = true;
                         }
                     }
@@ -435,8 +534,8 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
                             continue;
                         };
                         let expr = CExpr::binary(BinaryOp::Sub, lhs, rhs);
-                        if view.owner_expr_by_var.get(dst) != Some(&expr) {
-                            view.owner_expr_by_var.insert(dst.clone(), expr);
+                        if view.owner_expr_for_var(dst) != Some(&expr) {
+                            view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                     }
@@ -450,8 +549,8 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
                             continue;
                         };
                         let expr = CExpr::binary(BinaryOp::Shl, lhs, rhs);
-                        if view.owner_expr_by_var.get(dst) != Some(&expr) {
-                            view.owner_expr_by_var.insert(dst.clone(), expr);
+                        if view.owner_expr_for_var(dst) != Some(&expr) {
+                            view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                     }
@@ -466,20 +565,24 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
                             continue;
                         };
                         let expr = CExpr::binary(BinaryOp::Mul, lhs, rhs);
-                        if view.owner_expr_by_var.get(dst) != Some(&expr) {
-                            view.owner_expr_by_var.insert(dst.clone(), expr);
+                        if view.owner_expr_for_var(dst) != Some(&expr) {
+                            view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                     }
                     SSAOp::IntAdd { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
                         let derived = prepared_address_owner_expr_for_value(view, a, compare_width)
-                            .zip(prepared_address_owner_expr_for_value(view, b, compare_width))
+                            .zip(prepared_address_owner_expr_for_value(
+                                view,
+                                b,
+                                compare_width,
+                            ))
                             .map(|(lhs, rhs)| CExpr::binary(BinaryOp::Add, lhs, rhs));
                         if let Some(expr) = derived
-                            && view.owner_expr_by_var.get(dst) != Some(&expr)
+                            && view.owner_expr_for_var(dst) != Some(&expr)
                         {
-                            view.owner_expr_by_var.insert(dst.clone(), expr);
+                            view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                     }
@@ -496,19 +599,13 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunc
     refine_load_owner_exprs(view, prepared);
 }
 
-fn refine_load_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedFunctionSSA) {
+fn refine_load_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
     for block in prepared.function().blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
             let SSAOp::Load { dst, addr, .. } = op else {
                 continue;
             };
-            let op_ref = SliceOpRef::Op {
-                block_addr: block.addr,
-                op_idx,
-            };
-            let candidate = view
-                .stack_offset_for_var(addr)
-                .or_else(|| stack_offset_for_value(prepared, addr))
+            let candidate = prepared_direct_stack_load_offset(prepared, view, addr)
                 .and_then(|offset| {
                     local_store_owner_expr_for_offset(view, prepared, block, op_idx, offset)
                         .map(|expr| (expr, Some(offset)))
@@ -520,9 +617,7 @@ fn refine_load_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedF
                 })
                 .or_else(|| {
                     prepared
-                        .memory()
-                        .uses_by_op
-                        .get(&op_ref)
+                        .memory_uses_for_op_site(block.addr, op_idx)
                         .and_then(|facts| facts.first())
                         .and_then(|fact| {
                             alias_for_memory_location(view, fact.location)
@@ -536,15 +631,15 @@ fn refine_load_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedF
             let Some((candidate_expr, candidate_offset)) = candidate else {
                 continue;
             };
-            let should_replace = view.owner_expr_by_var.get(dst).is_none_or(|current| {
+            let should_replace = view.owner_expr_for_var(dst).is_none_or(|current| {
                 prepared_load_owner_candidate_should_replace(current, &candidate_expr)
             });
             if should_replace {
-                view.owner_expr_by_var.insert(dst.clone(), candidate_expr);
-                if let Some(candidate_offset) = candidate_offset {
-                    view.stack_offset_by_var
-                        .entry(dst.clone())
-                        .or_insert(candidate_offset);
+                view.insert_owner_expr(dst, candidate_expr);
+                if let Some(candidate_offset) = candidate_offset
+                    && view.stack_offset_for_var(dst) != Some(candidate_offset)
+                {
+                    view.insert_stack_offset(dst, candidate_offset);
                 }
             }
         }
@@ -553,8 +648,10 @@ fn refine_load_owner_exprs(view: &mut PreparedSemanticView, prepared: &PreparedF
 
 fn prepared_load_owner_candidate_should_replace(current: &CExpr, candidate: &CExpr) -> bool {
     current != candidate
-        && prepared_expr_is_generic_scalar_alias(current)
-        && !prepared_expr_is_generic_scalar_alias(candidate)
+        && ((prepared_expr_is_generic_scalar_alias(current)
+            && !prepared_expr_is_generic_scalar_alias(candidate))
+            || (prepared_expr_is_plain_visible_alias(current)
+                && prepared_expr_is_structured_load_access(candidate)))
 }
 
 fn prepared_expr_is_generic_scalar_alias(expr: &CExpr) -> bool {
@@ -569,6 +666,50 @@ fn prepared_expr_is_generic_scalar_alias(expr: &CExpr) -> bool {
         }
         _ => false,
     }
+}
+
+fn prepared_expr_is_plain_visible_alias(expr: &CExpr) -> bool {
+    matches!(prepared_strip_expr_wrappers(expr), CExpr::Var(_))
+}
+
+fn prepared_expr_is_structured_load_access(expr: &CExpr) -> bool {
+    matches!(
+        prepared_strip_expr_wrappers(expr),
+        CExpr::Deref(_) | CExpr::Subscript { .. } | CExpr::Member { .. } | CExpr::PtrMember { .. }
+    )
+}
+
+fn prepared_strip_expr_wrappers(mut expr: &CExpr) -> &CExpr {
+    loop {
+        match expr {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => expr = inner,
+            _ => return expr,
+        }
+    }
+}
+
+fn prepared_expr_is_direct_stack_address(expr: &CExpr) -> bool {
+    matches!(prepared_strip_expr_wrappers(expr), CExpr::AddrOf(_))
+}
+
+fn prepared_direct_stack_load_offset(
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+    addr: &SSAVar,
+) -> Option<i64> {
+    let offset = view
+        .stack_offset_for_var(addr)
+        .or_else(|| stack_offset_for_value(prepared, addr))?;
+    prepared
+        .function()
+        .decompile_prep_facts()
+        .and_then(|facts| facts.stack_address_root_of(addr))
+        .map(|_| offset)
+        .or_else(|| {
+            view.owner_expr_for_var(addr)
+                .is_some_and(prepared_expr_is_direct_stack_address)
+                .then_some(offset)
+        })
 }
 
 fn prepared_load_access_expr_for_addr(
@@ -597,7 +738,9 @@ fn prepared_load_access_expr_from_visible_addr(expr: CExpr, elem_size: u32) -> O
 
     match expr {
         CExpr::AddrOf(inner) => Some(*inner),
-        CExpr::Paren(inner) => prepared_load_access_expr_from_visible_addr(*inner, elem_size as u32),
+        CExpr::Paren(inner) => {
+            prepared_load_access_expr_from_visible_addr(*inner, elem_size as u32)
+        }
         CExpr::Cast { expr: inner, .. } => {
             prepared_load_access_expr_from_visible_addr(*inner, elem_size as u32)
         }
@@ -654,10 +797,7 @@ fn record_call_result_source_alias(
     var: &SSAVar,
     site: (u64, usize),
 ) {
-    view.call_result_source_by_var.insert(var.clone(), site);
-    view.call_result_source_by_name
-        .insert(var.display_name(), site);
-    view.call_result_source_by_name.insert(var.name.clone(), site);
+    view.insert_call_result_source(var, site);
 }
 
 fn var_matches_return_register_family(var: &SSAVar, ret_reg_name: &str) -> bool {
@@ -669,13 +809,12 @@ fn var_matches_return_register_family(var: &SSAVar, ret_reg_name: &str) -> bool 
 
 fn populate_call_result_sources(
     view: &mut PreparedSemanticView,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     ret_reg_name: &str,
 ) {
     for call_site in prepared.call_sites().by_id.values() {
-        let (block_addr, op_idx) = match call_site.at {
-            SliceOpRef::Op { block_addr, op_idx } => (block_addr, op_idx),
-            SliceOpRef::Phi { .. } => continue,
+        let Some((block_addr, op_idx)) = prepared_call_site_tuple(prepared, call_site.at) else {
+            continue;
         };
         let Some(block) = prepared.function().get_block(block_addr) else {
             continue;
@@ -729,21 +868,27 @@ fn populate_call_result_sources(
 }
 
 fn populate_predicates(view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
-    view.predicate_expr_by_cond.clear();
+    view.predicate_expr_by_value.clear();
     view.branch_predicate_expr_by_block.clear();
 
     for predicate in inputs.prepared.predicates().predicates.values() {
         let Some(compare) = predicate.comparison.as_ref() else {
             continue;
         };
-        let compare_width = compare.lhs.size.max(compare.rhs.size);
-        let lhs =
-            expr_for_compare_operand_with_width(inputs, compare.lhs.clone(), view, compare_width);
-        let rhs =
-            expr_for_compare_operand_with_width(inputs, compare.rhs.clone(), view, compare_width);
+        let Some(lhs_var) = prepared_var(inputs.prepared, compare.lhs) else {
+            continue;
+        };
+        let Some(rhs_var) = prepared_var(inputs.prepared, compare.rhs) else {
+            continue;
+        };
+        let compare_width = lhs_var.size.max(rhs_var.size);
+        let lhs = expr_for_compare_operand_with_width(inputs, lhs_var.clone(), view, compare_width);
+        let rhs = expr_for_compare_operand_with_width(inputs, rhs_var.clone(), view, compare_width);
         let expr = CExpr::binary(binary_op_for_compare(compare.kind), lhs, rhs);
-        view.predicate_expr_by_cond
-            .insert(predicate.condition.clone(), expr.clone());
+        let Some(cond_var) = prepared_var(inputs.prepared, predicate.condition) else {
+            continue;
+        };
+        view.insert_predicate_expr(cond_var, expr.clone());
         view.branch_predicate_expr_by_block
             .insert(predicate.block_addr, expr);
     }
@@ -763,7 +908,7 @@ fn populate_derived_predicates(
                 let Some(dst) = op.dst() else {
                     continue;
                 };
-                if view.predicate_expr_by_cond.contains_key(dst) {
+                if view.predicate_expr_for_cond(dst).is_some() {
                     continue;
                 }
 
@@ -773,10 +918,9 @@ fn populate_derived_predicates(
                     | SSAOp::IntSExt { src, .. }
                     | SSAOp::Trunc { src, .. }
                     | SSAOp::Cast { src, .. }
-                    | SSAOp::Subpiece { src, .. } => view.predicate_expr_by_cond.get(src).cloned(),
+                    | SSAOp::Subpiece { src, .. } => view.predicate_expr_for_cond(src).cloned(),
                     SSAOp::BoolNot { src, .. } => view
-                        .predicate_expr_by_cond
-                        .get(src)
+                        .predicate_expr_for_cond(src)
                         .cloned()
                         .map(|expr| CExpr::unary(UnaryOp::Not, expr)),
                     SSAOp::BoolAnd { a, b, .. } => {
@@ -804,7 +948,7 @@ fn populate_derived_predicates(
                 };
 
                 if let Some(expr) = derived {
-                    view.predicate_expr_by_cond.insert(dst.clone(), expr);
+                    view.insert_predicate_expr(dst, expr);
                     changed = true;
                 }
             }
@@ -822,7 +966,7 @@ fn populate_derived_predicates(
         }) else {
             continue;
         };
-        if let Some(expr) = view.predicate_expr_by_cond.get(cond).cloned() {
+        if let Some(expr) = view.predicate_expr_for_cond(cond).cloned() {
             view.branch_predicate_expr_by_block.insert(block.addr, expr);
         }
     }
@@ -947,7 +1091,7 @@ fn predicate_expr_for_operand_with_depth(
         return None;
     }
 
-    if let Some(expr) = view.predicate_expr_by_cond.get(var).cloned() {
+    if let Some(expr) = view.predicate_expr_for_cond(var).cloned() {
         return Some(expr);
     }
     if var.is_const() {
@@ -973,13 +1117,11 @@ fn compare_def_expr_for_flag_operand(
         return None;
     }
 
-    let (block, op) = inputs.prepared.function().blocks().find_map(|block| {
-        block
-            .ops
-            .iter()
-            .find(|op| op.dst() == Some(var))
-            .map(|op| (block, op))
-    })?;
+    let (block_addr, DefLocation::Op(op_idx)) = inputs.prepared.function().find_def(var)? else {
+        return None;
+    };
+    let block = inputs.prepared.function().get_block(block_addr)?;
+    let op = block.ops.get(op_idx)?;
 
     match op {
         SSAOp::Copy { src, .. }
@@ -1028,8 +1170,11 @@ fn compare_def_expr_for_flag_operand(
 
 fn populate_switches(view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
     for (block_addr, switch) in &inputs.prepared.predicates().switches {
-        if let Some(selector) = &switch.selector {
-            let expr = expr_for_compare_operand(inputs, selector.clone(), view);
+        if let Some(selector) = switch
+            .selector
+            .and_then(|selector| prepared_var(inputs.prepared, selector).cloned())
+        {
+            let expr = expr_for_compare_operand(inputs, selector, view);
             view.switch_selector_expr_by_block.insert(*block_addr, expr);
         }
     }
@@ -1037,9 +1182,8 @@ fn populate_switches(view: &mut PreparedSemanticView, inputs: &PreparedSemanticV
 
 fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
     for call_site in inputs.prepared.call_sites().by_id.values() {
-        let site = match call_site.at {
-            SliceOpRef::Op { block_addr, op_idx } => (block_addr, op_idx),
-            SliceOpRef::Phi { .. } => continue,
+        let Some(site) = prepared_call_site_tuple(inputs.prepared, call_site.at) else {
+            continue;
         };
         let mut call_view = PreparedCallView {
             direct_target: call_site.direct_target,
@@ -1054,14 +1198,13 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
         {
             call_view.callee_name = lookup_callee_name(inputs, addr);
         }
-        call_view.result_owner =
-            infer_call_result_owner(
-                site,
-                inputs.prepared,
-                inputs.prepared.function(),
-                view,
-                inputs.ret_reg_name,
-            );
+        call_view.result_owner = infer_call_result_owner(
+            site,
+            inputs.prepared,
+            inputs.prepared.function(),
+            view,
+            inputs.ret_reg_name,
+        );
         if let Some(owner) = call_view.result_owner.clone() {
             assign_call_result_owner(
                 site,
@@ -1071,12 +1214,18 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
                 inputs.ret_reg_name,
             );
         }
+        let max_arity = call_site.direct_target.and_then(|target| {
+            inputs
+                .interproc_summary_set
+                .and_then(|set| set.summaries.get(&r2ssa::InterprocFunctionId(target)))
+                .and_then(|summary| summary.arg_count_hint)
+        });
         call_view.authoritative_args = infer_call_authoritative_args(
             site,
             inputs.prepared.function(),
             view,
             inputs.abi_arg_regs,
-            None,
+            max_arity,
         );
         view.call_view_by_site.insert(site, call_view);
     }
@@ -1159,7 +1308,7 @@ fn authoritative_scalar_expr_for_value(
     if let Some(expr) = compare_style_operand_expr(var, var.size) {
         return Some(expr);
     }
-    if let Some(expr) = view.predicate_expr_by_cond.get(var).cloned() {
+    if let Some(expr) = view.predicate_expr_for_cond(var).cloned() {
         return Some(expr);
     }
     if let Some(offset) = view.stack_offset_for_var(var)
@@ -1243,7 +1392,7 @@ fn prepared_result_expr_for_var(view: &PreparedSemanticView, var: &SSAVar) -> Op
 
 fn infer_call_result_owner(
     site: (u64, usize),
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     function: &r2ssa::SSAFunction,
     view: &PreparedSemanticView,
     ret_reg_name: &str,
@@ -1319,9 +1468,9 @@ fn assign_call_result_owner(
             SSAOp::CallDefine { dst } => {
                 saw_call_define = true;
                 tracked.insert(dst.clone());
-                view.owner_expr_by_var
-                    .entry(dst.clone())
-                    .or_insert_with(|| owner.clone());
+                if view.owner_expr_for_var(dst).is_none() {
+                    view.insert_owner_expr(dst, owner.clone());
+                }
             }
             SSAOp::Copy { dst, src }
             | SSAOp::IntZExt { dst, src }
@@ -1334,15 +1483,15 @@ fn assign_call_result_owner(
                     && var_matches_return_register_family(src, ret_reg_name)
                 {
                     tracked.insert(src.clone());
-                    view.owner_expr_by_var
-                        .entry(src.clone())
-                        .or_insert_with(|| owner.clone());
+                    if view.owner_expr_for_var(src).is_none() {
+                        view.insert_owner_expr(src, owner.clone());
+                    }
                 }
                 if tracked.contains(src) {
                     tracked.insert(dst.clone());
-                    view.owner_expr_by_var
-                        .entry(dst.clone())
-                        .or_insert_with(|| owner.clone());
+                    if view.owner_expr_for_var(dst).is_none() {
+                        view.insert_owner_expr(dst, owner.clone());
+                    }
                 }
             }
             SSAOp::Call { .. } if saw_call_define => break,
@@ -1361,13 +1510,13 @@ fn alias_for_memory_location(
     preferred_stack_alias_name(view, location.offset)
 }
 
-fn stack_offset_for_value(prepared: &PreparedFunctionSSA, value: &SSAVar) -> Option<i64> {
-    let object = prepared.objects().object_for_value(value).or_else(|| {
+fn stack_offset_for_value(prepared: &SsaArtifact, value: &SSAVar) -> Option<i64> {
+    let object = prepared.object_for_var(value).or_else(|| {
         prepared
             .function()
             .decompile_prep_facts()
             .and_then(|facts| facts.canonical_root_of(value))
-            .and_then(|root| prepared.objects().object_for_value(root))
+            .and_then(|root| prepared.object_for_var(root))
     })?;
     let fact = prepared.objects().object(object)?;
     stack_offset_for_object_kind(&fact.kind)
@@ -1448,8 +1597,8 @@ fn expr_for_compare_operand_with_width(
         return CExpr::Var(alias);
     }
 
-    if let Some(expr) = prepared_fallback_visible_expr(&root)
-        .or_else(|| prepared_fallback_visible_expr(&var))
+    if let Some(expr) =
+        prepared_fallback_visible_expr(&root).or_else(|| prepared_fallback_visible_expr(&var))
     {
         return expr;
     }
@@ -1548,7 +1697,7 @@ fn scalar_owner_expr_for_value(
                 })
                 .map(CExpr::Var)
         })
-        .or_else(|| view.predicate_expr_by_cond.get(var).cloned())
+        .or_else(|| view.predicate_expr_for_cond(var).cloned())
         .or_else(|| generic_prepared_owner_expr(view, var))
 }
 
@@ -1581,7 +1730,7 @@ fn prepared_scaled_index_owner_expr(
         .or_else(|| prepared_fallback_visible_expr(var))
 }
 
-fn is_prepared_stack_address_carrier(prepared: &PreparedFunctionSSA, value: &SSAVar) -> bool {
+fn is_prepared_stack_address_carrier(prepared: &SsaArtifact, value: &SSAVar) -> bool {
     if prepared
         .function()
         .decompile_prep_facts()
@@ -1591,18 +1740,10 @@ fn is_prepared_stack_address_carrier(prepared: &PreparedFunctionSSA, value: &SSA
         return true;
     }
 
-    prepared.function().blocks().any(|block| {
-        block.ops.iter().any(|op| match op {
-            SSAOp::Load { addr, .. }
-            | SSAOp::Store { addr, .. }
-            | SSAOp::LoadLinked { addr, .. }
-            | SSAOp::StoreConditional { addr, .. }
-            | SSAOp::AtomicCAS { addr, .. }
-            | SSAOp::LoadGuarded { addr, .. }
-            | SSAOp::StoreGuarded { addr, .. } => addr == value,
-            _ => false,
-        })
-    })
+    prepared
+        .object_for_var(value)
+        .and_then(|object_id| prepared.objects().object(object_id))
+        .is_some_and(|object| stack_offset_for_object_kind(&object.kind).is_some())
 }
 
 fn preferred_non_generic_stack_alias(view: &PreparedSemanticView, var: &SSAVar) -> Option<String> {
@@ -1625,8 +1766,7 @@ fn generic_prepared_owner_expr(view: &PreparedSemanticView, var: &SSAVar) -> Opt
 }
 
 fn non_generic_prepared_predicate_expr(view: &PreparedSemanticView, var: &SSAVar) -> Option<CExpr> {
-    view.predicate_expr_by_cond
-        .get(var)
+    view.predicate_expr_for_cond(var)
         .cloned()
         .filter(|expr| !prepared_expr_is_generic_scalar_alias(expr))
 }
@@ -1650,7 +1790,7 @@ fn prepared_fallback_visible_expr(var: &SSAVar) -> Option<CExpr> {
 
 fn local_store_owner_expr_for_offset(
     view: &PreparedSemanticView,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     block: &r2ssa::FunctionSSABlock,
     before_idx: usize,
     offset: i64,
@@ -1739,7 +1879,10 @@ fn seed_prepared_param_aliases(info: &mut UseInfo, blocks: &[SSABlock], env: &Pa
         if var.version != 0 {
             return;
         }
-        if let Some(alias) = env.param_register_aliases.get(&var.name.to_ascii_lowercase()) {
+        if let Some(alias) = env
+            .param_register_aliases
+            .get(&var.name.to_ascii_lowercase())
+        {
             info.var_aliases
                 .entry(var.display_name())
                 .or_insert_with(|| alias.clone());
@@ -1767,12 +1910,15 @@ fn seed_prepared_param_aliases(info: &mut UseInfo, blocks: &[SSABlock], env: &Pa
 fn seed_prepared_stack_facts(
     use_info: &mut UseInfo,
     stack_info: &mut StackInfo,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {
     for (offset, alias) in &view.stack_aliases_by_offset {
         if let Some(arg_alias) = alias.arg_alias.clone() {
-            stack_info.stack_arg_aliases.entry(*offset).or_insert(arg_alias);
+            stack_info
+                .stack_arg_aliases
+                .entry(*offset)
+                .or_insert(arg_alias);
         }
         if let Some(name) = preferred_stack_alias_name(view, *offset) {
             stack_info.stack_vars.entry(*offset).or_insert(name.clone());
@@ -1786,7 +1932,7 @@ fn seed_prepared_stack_facts(
                     StackSlotValueKind::Scalar
                 },
             };
-            merge_prepared_stack_slot(use_info, &name, provenance);
+            merge_prepared_stack_slot(use_info, &name, None, provenance);
             if *offset < 0 {
                 use_info
                     .stable_stack_values
@@ -1796,13 +1942,17 @@ fn seed_prepared_stack_facts(
         }
     }
 
-    for (value, object_id) in &prepared.objects().value_objects {
+    for (&value_id, object_id) in &prepared.objects().value_objects {
         let Some(object) = prepared.objects().object(*object_id) else {
             continue;
         };
         let Some(offset) = stack_offset_for_object_kind(&object.kind) else {
             continue;
         };
+        let Some(value) = prepared_var(prepared, value_id) else {
+            continue;
+        };
+        use_info.bind_value_id(value, value_id);
         let key = value.display_name();
         let provenance = StackSlotProvenance {
             offset,
@@ -1810,7 +1960,7 @@ fn seed_prepared_stack_facts(
             return_carrier: false,
             value_kind: StackSlotValueKind::AddressLike,
         };
-        merge_prepared_stack_slot(use_info, &key, provenance);
+        merge_prepared_stack_slot(use_info, &key, Some(value_id), provenance);
         if let Some(alias) = preferred_stack_alias_name(view, offset) {
             stack_info
                 .definition_overrides
@@ -1831,11 +1981,14 @@ fn collect_prepared_runtime_facts(
     flag_info: &mut FlagInfo,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {
     for block in blocks {
         for phi in &block.phis {
+            if let Some(value_id) = view.value_id_for_var(&phi.dst) {
+                use_info.bind_value_id(&phi.dst, value_id);
+            }
             let dst_key = phi.dst.display_name();
             use_info.phi_sources.insert(
                 dst_key.clone(),
@@ -1850,6 +2003,10 @@ fn collect_prepared_runtime_facts(
             );
             for (_, src) in &phi.sources {
                 *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
+                if let Some(value_id) = view.value_id_for_var(src) {
+                    use_info.bind_value_id(src, value_id);
+                    *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
+                }
             }
             seed_prepared_value_fact(use_info, &phi.dst, prepared, view);
         }
@@ -1857,13 +2014,24 @@ fn collect_prepared_runtime_facts(
         for op in &block.ops {
             for src in op.sources() {
                 *use_info.use_counts.entry(src.display_name()).or_insert(0) += 1;
+                if let Some(value_id) = view.value_id_for_var(src) {
+                    use_info.bind_value_id(src, value_id);
+                    *use_info.use_counts_by_value.entry(value_id).or_insert(0) += 1;
+                }
             }
             if let SSAOp::CBranch { cond, .. } = op {
                 use_info.condition_vars.insert(cond.display_name());
+                if let Some(value_id) = view.value_id_for_var(cond) {
+                    use_info.bind_value_id(cond, value_id);
+                    use_info.condition_values.insert(value_id);
+                }
             }
 
             if let Some(dst) = op.dst() {
                 let dst_key = dst.display_name();
+                if let Some(value_id) = view.value_id_for_var(dst) {
+                    use_info.bind_value_id(dst, value_id);
+                }
                 use_info.producers.insert(dst_key.clone(), op.clone());
                 if is_flag_like_name(&dst.name) || op_produces_predicate(op) {
                     flag_info.flag_only_values.insert(dst_key.clone());
@@ -1880,33 +2048,63 @@ fn collect_prepared_runtime_facts(
                 | SSAOp::Subpiece { dst, src, .. } => {
                     let dst_key = dst.display_name();
                     let src_key = src.display_name();
-                    use_info.copy_sources.insert(dst_key.clone(), src_key.clone());
-                    let source_prov =
-                        use_info
-                            .forwarded_values
-                            .get(&src_key)
-                            .cloned()
-                            .unwrap_or(ValueProvenance {
-                                source: src_key.clone(),
-                                source_var: Some(src.clone()),
-                                stack_slot: view
-                                    .stack_offset_for_var(src)
-                                    .or_else(|| stack_offset_for_value(prepared, src)),
-                            });
+                    use_info
+                        .copy_sources
+                        .insert(dst_key.clone(), src_key.clone());
+                    if let (Some(dst_id), Some(src_id)) =
+                        (view.value_id_for_var(dst), view.value_id_for_var(src))
+                    {
+                        use_info.bind_value_id(dst, dst_id);
+                        use_info.bind_value_id(src, src_id);
+                        use_info.copy_sources_by_value.insert(dst_id, src_id);
+                    }
+                    let source_prov = use_info.forwarded_values.get(&src_key).cloned().unwrap_or(
+                        ValueProvenance {
+                            source: src_key.clone(),
+                            source_value_id: view.value_id_for_var(src),
+                            source_var: Some(src.clone()),
+                            stack_slot: view
+                                .stack_offset_for_var(src)
+                                .or_else(|| stack_offset_for_value(prepared, src)),
+                        },
+                    );
                     use_info.forwarded_values.insert(
                         dst_key.clone(),
                         ValueProvenance {
                             source: source_prov.source.clone(),
-                            source_var: source_prov.source_var.or_else(|| Some(src.clone())),
+                            source_value_id: source_prov
+                                .source_value_id
+                                .or_else(|| view.value_id_for_var(src)),
+                            source_var: source_prov
+                                .source_var
+                                .clone()
+                                .or_else(|| Some(src.clone())),
                             stack_slot: source_prov
                                 .stack_slot
                                 .or_else(|| view.stack_offset_for_var(src))
                                 .or_else(|| stack_offset_for_value(prepared, src)),
                         },
                     );
+                    if let Some(dst_id) = view.value_id_for_var(dst) {
+                        use_info.forwarded_values_by_value.insert(
+                            dst_id,
+                            ValueProvenance {
+                                source: source_prov.source,
+                                source_value_id: source_prov
+                                    .source_value_id
+                                    .or_else(|| view.value_id_for_var(src)),
+                                source_var: source_prov.source_var.or_else(|| Some(src.clone())),
+                                stack_slot: source_prov
+                                    .stack_slot
+                                    .or_else(|| view.stack_offset_for_var(src))
+                                    .or_else(|| stack_offset_for_value(prepared, src)),
+                            },
+                        );
+                    }
                     if dst.version == 0
-                        && let Some(alias) =
-                            env.param_register_aliases.get(&dst.name.to_ascii_lowercase())
+                        && let Some(alias) = env
+                            .param_register_aliases
+                            .get(&dst.name.to_ascii_lowercase())
                     {
                         use_info
                             .var_aliases
@@ -1915,9 +2113,7 @@ fn collect_prepared_runtime_facts(
                     }
                 }
                 SSAOp::Load { dst, addr, .. } => {
-                    let Some(offset) = view
-                        .stack_offset_for_var(addr)
-                        .or_else(|| stack_offset_for_value(prepared, addr))
+                    let Some(offset) = prepared_direct_stack_load_offset(prepared, view, addr)
                     else {
                         continue;
                     };
@@ -1928,21 +2124,39 @@ fn collect_prepared_runtime_facts(
                         return_carrier: false,
                         value_kind: StackSlotValueKind::Scalar,
                     };
-                    merge_prepared_stack_slot(use_info, &key, provenance);
+                    merge_prepared_stack_slot(
+                        use_info,
+                        &key,
+                        view.value_id_for_var(dst),
+                        provenance,
+                    );
                     if let Some(alias) = preferred_stack_alias_name(view, offset) {
                         let expr = CExpr::Var(alias.clone());
                         use_info
                             .definitions
                             .entry(key.clone())
                             .or_insert_with(|| expr.clone());
+                        if let Some(value_id) = view.value_id_for_var(dst) {
+                            use_info
+                                .definitions_by_value
+                                .entry(value_id)
+                                .or_insert_with(|| expr.clone());
+                        }
                         use_info
                             .formatted_defs
                             .entry(key.clone())
                             .or_insert_with(|| expr.clone());
-                        use_info
-                            .semantic_values
-                            .entry(key)
-                            .or_insert_with(|| SemanticValue::Scalar(ScalarValue::Expr(expr)));
+                        use_info.semantic_values.entry(key).or_insert_with(|| {
+                            SemanticValue::Scalar(ScalarValue::Expr(expr.clone()))
+                        });
+                        if let Some(value_id) = view.value_id_for_var(dst) {
+                            use_info
+                                .semantic_values_by_value
+                                .entry(value_id)
+                                .or_insert_with(|| {
+                                    SemanticValue::Scalar(ScalarValue::Expr(expr.clone()))
+                                });
+                        }
                         if offset < 0 {
                             use_info
                                 .stable_stack_values
@@ -1963,7 +2177,7 @@ fn populate_prepared_call_runtime_facts(
     use_info: &mut UseInfo,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {
     for block in blocks {
@@ -1991,27 +2205,29 @@ fn populate_prepared_call_runtime_facts(
                 use_info.call_result_exprs.insert(site, call_expr.clone());
                 record_prepared_consumed_by_call(use_info, block, op_idx, env, prepared, view);
                 record_prepared_call_result_aliases(
-                    use_info,
-                    block,
-                    op_idx,
-                    prepared,
-                    view,
-                    env,
-                    &call_expr,
+                    use_info, block, op_idx, prepared, view, env, &call_expr,
                 );
             }
         }
     }
 }
 
-fn overlay_prepared_switch_roots(use_info: &mut UseInfo, prepared: &PreparedFunctionSSA) {
+fn overlay_prepared_switch_roots(use_info: &mut UseInfo, prepared: &SsaArtifact) {
     for switch in prepared.predicates().switches.values() {
-        let Some(selector) = switch.selector.as_ref() else {
+        let Some(selector) = switch
+            .selector
+            .and_then(|selector| prepared_var(prepared, selector))
+        else {
             continue;
         };
         use_info.switch_selector_roots.insert(
             switch.block_addr,
-            SemanticValue::Scalar(ScalarValue::Root(ValueRef::new(selector.clone()))),
+            SemanticValue::Scalar(ScalarValue::Root(
+                use_info
+                    .value_id_for_var(selector)
+                    .map(|value_id| ValueRef::with_value_id(value_id, selector.clone()))
+                    .unwrap_or_else(|| ValueRef::new(selector.clone())),
+            )),
         );
     }
 }
@@ -2031,13 +2247,10 @@ fn finalize_prepared_call_inlining(use_info: &mut UseInfo) {
         }
 
         if aliases.iter().any(|alias| {
-            use_info
-                .call_result_exprs
-                .get(site)
-                .is_some_and(|_| {
-                    !use_info.direct_call_result_aliases.contains(alias)
-                        && use_info.use_counts.get(alias).copied().unwrap_or(0) <= 1
-                })
+            use_info.call_result_exprs.get(site).is_some_and(|_| {
+                !use_info.direct_call_result_aliases.contains(alias)
+                    && use_info.use_counts.get(alias).copied().unwrap_or(0) <= 1
+            })
         }) {
             use_info.inlined_call_results.insert(*site);
         }
@@ -2047,6 +2260,7 @@ fn finalize_prepared_call_inlining(use_info: &mut UseInfo) {
 fn merge_prepared_stack_slot(
     use_info: &mut UseInfo,
     name: &str,
+    value_id: Option<ValueId>,
     provenance: StackSlotProvenance,
 ) {
     use_info
@@ -2054,14 +2268,24 @@ fn merge_prepared_stack_slot(
         .entry(name.to_string())
         .and_modify(|existing| *existing = existing.merge(provenance))
         .or_insert(provenance);
+    if let Some(value_id) = value_id {
+        use_info
+            .stack_slots_by_value
+            .entry(value_id)
+            .and_modify(|existing| *existing = existing.merge(provenance))
+            .or_insert(provenance);
+    }
 }
 
 fn seed_prepared_value_fact(
     use_info: &mut UseInfo,
     var: &SSAVar,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {
+    if let Some(value_id) = view.value_id_for_var(var) {
+        use_info.bind_value_id(var, value_id);
+    }
     let key = var.display_name();
     if let Some(expr) = view
         .predicate_expr_for_cond(var)
@@ -2072,6 +2296,12 @@ fn seed_prepared_value_fact(
             .definitions
             .entry(key.clone())
             .or_insert_with(|| expr.clone());
+        if let Some(value_id) = view.value_id_for_var(var) {
+            use_info
+                .definitions_by_value
+                .entry(value_id)
+                .or_insert_with(|| expr.clone());
+        }
         use_info
             .formatted_defs
             .entry(key.clone())
@@ -2080,6 +2310,12 @@ fn seed_prepared_value_fact(
             .semantic_values
             .entry(key.clone())
             .or_insert_with(|| semantic_value_for_prepared_expr(view, var, expr.clone()));
+        if let Some(value_id) = view.value_id_for_var(var) {
+            use_info
+                .semantic_values_by_value
+                .entry(value_id)
+                .or_insert_with(|| semantic_value_for_prepared_expr(view, var, expr.clone()));
+        }
         if let Some(offset) = view
             .stack_offset_for_var(var)
             .or_else(|| stack_offset_for_value(prepared, var))
@@ -2087,6 +2323,7 @@ fn seed_prepared_value_fact(
             merge_prepared_stack_slot(
                 use_info,
                 &key,
+                view.value_id_for_var(var),
                 StackSlotProvenance {
                     offset,
                     predicate_carrier: false,
@@ -2108,6 +2345,7 @@ fn seed_prepared_value_fact(
         merge_prepared_stack_slot(
             use_info,
             &key,
+            view.value_id_for_var(var),
             StackSlotProvenance {
                 offset,
                 predicate_carrier: false,
@@ -2160,9 +2398,7 @@ fn prepared_call_expr(
     let args = call_view
         .authoritative_args
         .iter()
-        .map(|arg| {
-            normalize_prepared_inline_expr(arg.clone(), view, env, 0, &mut HashSet::new())
-        })
+        .map(|arg| normalize_prepared_inline_expr(arg.clone(), view, env, 0, &mut HashSet::new()))
         .collect();
     Some(CExpr::Call {
         func: Box::new(callee),
@@ -2195,7 +2431,7 @@ fn record_prepared_consumed_by_call(
     block: &SSABlock,
     call_idx: usize,
     env: &PassEnv<'_>,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) {
     for op in block.ops[..call_idx].iter().rev() {
@@ -2245,7 +2481,7 @@ fn record_prepared_call_result_aliases(
     use_info: &mut UseInfo,
     block: &SSABlock,
     call_idx: usize,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     env: &PassEnv<'_>,
     call_expr: &CExpr,
@@ -2362,7 +2598,9 @@ fn record_prepared_call_alias(
         .call_result_source_by_alias
         .insert(alias.to_string(), site);
     if direct {
-        use_info.direct_call_result_aliases.insert(alias.to_string());
+        use_info
+            .direct_call_result_aliases
+            .insert(alias.to_string());
     }
 }
 

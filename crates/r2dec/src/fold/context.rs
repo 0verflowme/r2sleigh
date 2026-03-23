@@ -6,7 +6,7 @@ use crate::analysis;
 use crate::ast::CType;
 use r2ssa::{
     CallSiteFacts, FunctionSSABlock, InterprocSummarySet, MemorySSAFacts, ObjectModel,
-    PredicateFacts, PreparedFunctionSSA, SSAVar,
+    PredicateFacts, SSAVar, SsaArtifact,
 };
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
@@ -24,6 +24,8 @@ pub(crate) enum ResolutionPhase {
     DefinitionRaw,
     Visible,
     ImportedArg,
+    Memory,
+    Return,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -67,7 +69,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
-    pub(crate) prepared_ssa: Option<&'a PreparedFunctionSSA>,
+    pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
     pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
     pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
     pub(crate) prepared_objects: Option<&'a ObjectModel>,

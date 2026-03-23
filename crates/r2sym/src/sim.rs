@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use r2il::ArchSpec;
-use r2ssa::PreparedFunctionSSA;
+use r2ssa::SsaArtifact;
 use z3::ast::BV;
 
 use crate::executor::{CallHookResult, SymExecutor};
@@ -230,7 +230,7 @@ impl<'ctx> SummaryRegistry<'ctx> {
     pub fn install_known_symbols_for_function(
         &self,
         explorer: &mut PathExplorer<'ctx>,
-        prepared: &PreparedFunctionSSA,
+        prepared: &SsaArtifact,
         symbol_map: &HashMap<u64, String>,
     ) -> SummaryInstallStats {
         let mut stats = SummaryInstallStats::default();

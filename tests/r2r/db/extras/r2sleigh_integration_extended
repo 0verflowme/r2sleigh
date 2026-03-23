@@ -673,11 +673,11 @@ EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-aaa
+aaaa
 s `afl~test_struct_array_index$[0]` >/dev/null
 s `afl~test_struct_array_index$[0]` >/dev/null
 s `afl~test_struct_array_index$[0]` >/dev/null
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and (contains(".f_8") or contains(".third")) and (contains(".f_34") or contains(".fourteenth")) and test("return .*\\+ .*;") and (contains("local_")|not) and (contains("(int64_t)")|not) and (contains("saved_fp")|not) and (contains("return stack")|not) and (contains("rdx->")|not) and (contains("*(arg1 +")|not) and (contains("*(rbp")|not)'
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and (contains("arr[idx].f_8 = v;") or contains("arr[idx].third = v;")) and ((contains("return arr[idx].f_34 + arr[idx].f_8;")) or contains("return arr[idx].f_8 + arr[idx].f_34;") or contains("return arr[idx].fourteenth + arr[idx].third;") or contains("return arr[idx].third + arr[idx].fourteenth;")) and (contains("var_ch")|not) and (contains("var_10h")|not) and (contains("local_")|not) and (contains("(int64_t)")|not) and (contains("saved_fp")|not) and (contains("return stack")|not) and (contains("rdx->")|not) and (contains("*(arg1 +")|not) and (contains("*(rbp")|not)'
 EOF_CMDS
 RUN
 

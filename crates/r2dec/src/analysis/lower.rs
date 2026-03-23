@@ -5,14 +5,15 @@ use r2types::TypeOracle;
 
 use super::utils::{format_traced_name, parse_const_value};
 use super::{
-    BaseRef, NormalizedAddr, ScalarValue, SemanticValue, StackSlotProvenance, ValueProvenance,
-    ValueRef,
+    BaseRef, NormalizedAddr, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
+    ValueProvenance, ValueRef,
 };
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 use crate::fold::PtrArith;
 
 pub(crate) struct LowerCtx<'a> {
+    pub(crate) use_info: Option<&'a UseInfo>,
     pub(crate) definitions: &'a HashMap<String, CExpr>,
     pub(crate) semantic_values: &'a HashMap<String, SemanticValue>,
     pub(crate) use_counts: &'a HashMap<String, usize>,
@@ -32,9 +33,63 @@ pub(crate) struct LowerCtx<'a> {
 
 impl<'a> LowerCtx<'a> {
     fn lookup_type_hint(&self, name: &str) -> Option<&CType> {
-        self.type_hints
+        self.use_info
+            .map(|info| &info.type_hints)
+            .unwrap_or(self.type_hints)
             .get(name)
-            .or_else(|| self.type_hints.get(&name.to_ascii_lowercase()))
+            .or_else(|| {
+                self.use_info
+                    .map(|info| &info.type_hints)
+                    .unwrap_or(self.type_hints)
+                    .get(&name.to_ascii_lowercase())
+            })
+    }
+
+    fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
+        self.definitions.get(name).or_else(|| {
+            self.use_info
+                .and_then(|info| info.definition_for_name(name))
+        })
+    }
+
+    fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
+        self.semantic_values.get(name).or_else(|| {
+            self.use_info
+                .and_then(|info| info.semantic_value_for_name(name))
+        })
+    }
+
+    fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
+        self.forwarded_values.get(name).or_else(|| {
+            self.use_info
+                .and_then(|info| info.forwarded_value_for_name(name))
+        })
+    }
+
+    fn ptr_arith_for_name(&self, name: &str) -> Option<&PtrArith> {
+        self.ptr_arith
+            .get(name)
+            .or_else(|| self.use_info.and_then(|info| info.ptr_arith_for_name(name)))
+    }
+
+    fn use_count_for_name(&self, name: &str) -> usize {
+        self.use_info
+            .map(|info| info.use_count_for_name(name))
+            .unwrap_or_else(|| self.use_counts.get(name).copied().unwrap_or(0))
+    }
+
+    fn is_condition_name(&self, name: &str) -> bool {
+        self.use_info
+            .map(|info| info.is_condition_name(name))
+            .unwrap_or_else(|| self.condition_vars.contains(name))
+    }
+
+    fn var_alias_for_name(&self, name: &str) -> Option<&String> {
+        self.var_aliases.get(name)
+    }
+
+    fn stack_slot_name_map(&self) -> &HashMap<String, StackSlotProvenance> {
+        self.stack_slots
     }
 
     pub(crate) fn var_name(&self, var: &SSAVar) -> String {
@@ -56,7 +111,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         let display = var.display_name();
-        if let Some(alias) = self.var_aliases.get(&display) {
+        if let Some(alias) = self.var_alias_for_name(&display) {
             return alias.clone();
         }
 
@@ -110,7 +165,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         let key = var.display_name();
-        if let Some(prov) = self.forwarded_values.get(&key)
+        if let Some(prov) = self.forwarded_value_for_name(&key)
             && depth < 8
             && visited.insert(format!("prov:{key}"))
         {
@@ -122,7 +177,7 @@ impl<'a> LowerCtx<'a> {
         if depth < 8
             && self.should_inline(&key)
             && visited.insert(key.clone())
-            && let Some(expr) = self.definitions.get(&key)
+            && let Some(expr) = self.definition_for_name(&key)
         {
             return expr.clone();
         }
@@ -165,7 +220,7 @@ impl<'a> LowerCtx<'a> {
             return expr;
         }
 
-        if let Some(prov) = self.forwarded_values.get(name)
+        if let Some(prov) = self.forwarded_value_for_name(name)
             && visited.insert(format!("prov:{name}"))
         {
             return self.expr_for_ssa_name_with_depth(&prov.source, depth + 1, visited);
@@ -175,13 +230,13 @@ impl<'a> LowerCtx<'a> {
             return expr;
         }
 
-        if let Some(expr) = self.definitions.get(name)
+        if let Some(expr) = self.definition_for_name(name)
             && visited.insert(name.to_string())
         {
             return expr.clone();
         }
 
-        if let Some(alias) = self.var_aliases.get(name) {
+        if let Some(alias) = self.var_alias_for_name(name) {
             return CExpr::Var(alias.clone());
         }
 
@@ -194,7 +249,7 @@ impl<'a> LowerCtx<'a> {
             SSAOp::Load { dst, addr, .. } => {
                 let dst_key = dst.display_name();
                 let prefer_memory_access = matches!(
-                    self.semantic_values.get(&dst_key),
+                    self.semantic_value_for_name(&dst_key),
                     Some(SemanticValue::Address(_))
                 );
                 if prefer_memory_access {
@@ -516,7 +571,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn stack_slot_name_for_offset(&self, offset: i64) -> Option<String> {
-        self.stack_slots
+        self.stack_slot_name_map()
             .iter()
             .filter(|(_, slot)| slot.offset == offset)
             .map(|(name, _)| name.clone())
@@ -528,7 +583,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn ptr_bytes(&self) -> u32 {
-        self.stack_slots
+        self.stack_slot_name_map()
             .keys()
             .find_map(|name| self.lookup_type_hint(name).and_then(|ty| ty.bits()))
             .map(|bits| bits.div_ceil(8).max(1))
@@ -556,7 +611,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn should_inline(&self, var_name: &str) -> bool {
-        let use_count = self.use_counts.get(var_name).copied().unwrap_or(0);
+        let use_count = self.use_count_for_name(var_name);
         if use_count == 0 || use_count > 3 {
             return false;
         }
@@ -565,7 +620,7 @@ impl<'a> LowerCtx<'a> {
             return false;
         }
 
-        if self.condition_vars.contains(var_name) {
+        if self.is_condition_name(var_name) {
             return false;
         }
 
@@ -653,7 +708,7 @@ impl<'a> LowerCtx<'a> {
             return false;
         }
         if !matches!(
-            self.semantic_values.get(name),
+            self.semantic_value_for_name(name),
             Some(SemanticValue::Address(_))
         ) {
             return false;
@@ -751,7 +806,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn try_subscript_from_var(&self, addr: &SSAVar, elem_size: u32) -> Option<CExpr> {
-        if let Some(expr) = self.definitions.get(&addr.display_name())
+        if let Some(expr) = self.definition_for_name(&addr.display_name())
             && let Some(sub) = self.try_subscript_from_addr_expr(expr, elem_size)
         {
             return Some(sub);
@@ -760,14 +815,14 @@ impl<'a> LowerCtx<'a> {
         if let Some(sub) = self.try_subscript_from_addr_expr(&resolved, elem_size) {
             return Some(sub);
         }
-        if let Some(ptr) = self.ptr_arith.get(&addr.display_name()) {
+        if let Some(ptr) = self.ptr_arith_for_name(&addr.display_name()) {
             return self.ptr_subscript_expr(&ptr.base, &ptr.index, ptr.element_size, ptr.is_sub);
         }
         None
     }
 
     fn try_member_access_from_var(&self, addr: &SSAVar) -> Option<CExpr> {
-        if let Some(expr) = self.definitions.get(&addr.display_name())
+        if let Some(expr) = self.definition_for_name(&addr.display_name())
             && let Some(member) = self.try_member_access_from_addr_expr(Some(addr), expr)
         {
             return Some(member);
@@ -991,7 +1046,7 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some((expr.clone(), 1));
                 }
-                if let Some(inner) = self.definitions.get(name) {
+                if let Some(inner) = self.definition_for_name(name) {
                     self.extract_mul_const(inner, depth + 1)
                 } else if !self.is_non_index_pointer_expr(expr) && self.is_semantic_index_expr(expr)
                 {
@@ -1025,7 +1080,7 @@ impl<'a> LowerCtx<'a> {
                     !name.starts_with("const:")
                         && !name.starts_with("ram:")
                         && (!stack_placeholder
-                            && (!self.stack_slots.contains_key(name)
+                            && (!self.stack_slot_name_map().contains_key(name)
                                 || lower.starts_with("local_")
                                 || lower.starts_with("arg")))
                 }),
@@ -1075,7 +1130,7 @@ impl<'a> LowerCtx<'a> {
 
         match expr {
             CExpr::Var(name) => {
-                if let Some(inner) = self.definitions.get(name) {
+                if let Some(inner) = self.definition_for_name(name) {
                     return self.normalize_pointer_base_expr(inner, depth + 1);
                 }
                 let resolved = self.expr_for_ssa_name(name);
@@ -1115,7 +1170,7 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some(expr.clone());
                 }
-                if let Some(inner) = self.definitions.get(name)
+                if let Some(inner) = self.definition_for_name(name)
                     && let Some(normalized) = self.normalize_index_expr(inner, depth + 1)
                     && !self.is_non_index_pointer_expr(&normalized)
                 {
@@ -1128,7 +1183,7 @@ impl<'a> LowerCtx<'a> {
                 {
                     return Some(normalized);
                 }
-                if self.definitions.contains_key(name) {
+                if self.definition_for_name(name).is_some() {
                     return None;
                 }
                 if self.is_non_index_pointer_expr(expr) {
@@ -1158,7 +1213,7 @@ impl<'a> LowerCtx<'a> {
                 let lower = name.to_ascii_lowercase();
                 lower.contains("ptr")
                     || lower.contains("addr")
-                    || self.stack_slots.contains_key(name)
+                    || self.stack_slot_name_map().contains_key(name)
                     || self
                         .lookup_type_hint(name)
                         .map(|ty| matches!(ty, CType::Pointer(_) | CType::Struct(_)))
@@ -1196,7 +1251,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         if let CExpr::Var(name) = expr
-            && let Some(candidate) = self.definitions.get(name)
+            && let Some(candidate) = self.definition_for_name(name)
         {
             let normalized = self.normalize_pointer_base_expr(candidate, 0);
             if self.is_semantic_member_base(&normalized) {
@@ -1312,6 +1367,7 @@ mod tests {
         let semantic_values = Box::leak(Box::new(HashMap::new()));
         let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
+            use_info: None,
             definitions,
             semantic_values,
             use_counts,

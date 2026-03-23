@@ -21,6 +21,7 @@ pub mod cfg;
 pub mod defuse;
 pub mod domtree;
 pub mod function;
+pub mod graph;
 pub mod interproc;
 mod naming;
 pub mod op;
@@ -38,8 +39,11 @@ pub use defuse::{
 };
 pub use function::{
     CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, FunctionPrepareMode, PhiNode,
-    PreparedFunctionSSA, SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite,
+    SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite, SsaArtifact,
     StackAddressBase, StackAddressRoot, SwitchInfo,
+};
+pub use graph::{
+    BlockId, GraphBlock, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
 };
 pub use interproc::{
     AbiProfile, FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput,

@@ -43,9 +43,9 @@ impl<'a> FoldingContext<'a> {
 
     fn prepared_stack_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
         let objects = self.prepared_objects()?;
-        let object = objects.object_for_value(var).or_else(|| {
+        let object = self.inputs.prepared_ssa?.object_for_var(var).or_else(|| {
             self.prepared_canonical_value_root(var)
-                .and_then(|root| objects.object_for_value(&root))
+                .and_then(|root| self.inputs.prepared_ssa?.object_for_var(&root))
         })?;
         let fact = objects.object(object)?;
         match fact.kind {
@@ -116,13 +116,12 @@ impl<'a> FoldingContext<'a> {
             return Some(0);
         }
 
-        let key = var.display_name();
-        if let Some(slot) = self.stack_slots_map().get(&key) {
+        if let Some(slot) = self.stack_slot_provenance_for_var(var) {
             return Some(slot.offset);
         }
 
         // Check if this variable was defined as fp/sp + offset
-        if let Some(expr) = self.definitions_map().get(&key) {
+        if let Some(expr) = self.definition_for_name(&var.display_name()) {
             return self.extract_offset_from_expr(expr);
         }
 

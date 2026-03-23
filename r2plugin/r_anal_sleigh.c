@@ -2711,11 +2711,14 @@ static bool synthesize_switch_info_from_case_flags(
 		if (ncases >= capacity) {
 			size_t new_capacity = capacity ? (capacity * 2) : 8;
 			next_values = realloc (case_values, new_capacity * sizeof (unsigned long long));
-			next_targets = realloc (case_targets, new_capacity * sizeof (unsigned long long));
-			if (!next_values || !next_targets) {
-				free (next_values);
-				free (next_targets);
+			if (!next_values) {
 				free (case_values);
+				free (case_targets);
+				return false;
+			}
+			next_targets = realloc (case_targets, new_capacity * sizeof (unsigned long long));
+			if (!next_targets) {
+				free (next_values);
 				free (case_targets);
 				return false;
 			}
@@ -3125,6 +3128,32 @@ static RAnalBlock *find_best_switch_metadata_block(RAnal *anal, RAnalFunction *f
 	return best;
 }
 
+static bool block_belongs_to_function(RAnalBlock *bb, RAnalFunction *fcn) {
+	return bb && fcn && r_list_contains (bb->fcns, fcn);
+}
+
+static RAnalBlock *function_block_at_exact(RAnal *anal, RAnalFunction *fcn, ut64 addr) {
+	RAnalBlock *bb;
+	RListIter *iter;
+
+	if (!anal || !fcn || addr == UT64_MAX || !addr) {
+		return NULL;
+	}
+
+	bb = r_anal_get_block_at (anal, addr);
+	if (bb && block_belongs_to_function (bb, fcn)) {
+		return bb;
+	}
+
+	r_list_foreach (fcn->bbs, iter, bb) {
+		if (bb && bb->addr == addr) {
+			return bb;
+		}
+	}
+
+	return NULL;
+}
+
 static void split_missing_switch_case_targets(RAnal *anal, RAnalFunction *fcn) {
 	RListIter *iter;
 	RAnalBlock *bb;
@@ -3149,7 +3178,6 @@ static void split_missing_switch_case_targets(RAnal *anal, RAnalFunction *fcn) {
 			bool seen = false;
 			ut64 target = case_op ? case_op->jump : UT64_MAX;
 			size_t i;
-			ut64 *next;
 
 			if (target == UT64_MAX || !target) {
 				continue;
@@ -3165,7 +3193,7 @@ static void split_missing_switch_case_targets(RAnal *anal, RAnalFunction *fcn) {
 			}
 			if (ntargets >= capacity) {
 				size_t new_capacity = capacity ? (capacity * 2) : 32;
-				next = realloc (targets, new_capacity * sizeof (ut64));
+				ut64 *next = realloc (targets, new_capacity * sizeof (ut64));
 				if (!next) {
 					free (targets);
 					return;
@@ -3179,7 +3207,7 @@ static void split_missing_switch_case_targets(RAnal *anal, RAnalFunction *fcn) {
 
 	for (size_t i = 0; i < ntargets; i++) {
 		ut64 target = targets[i];
-		RAnalBlock *at = r_anal_function_bbget_at (anal, fcn, target);
+		RAnalBlock *at = function_block_at_exact (anal, fcn, target);
 		RAnalBlock *containing;
 		RAnalBlock *split;
 
@@ -3187,16 +3215,31 @@ static void split_missing_switch_case_targets(RAnal *anal, RAnalFunction *fcn) {
 			continue;
 		}
 
+		at = r_anal_get_block_at (anal, target);
+		if (at && !block_belongs_to_function (at, fcn)) {
+			r_anal_function_add_block (fcn, at);
+			continue;
+		}
+
 		containing = r_anal_get_block_at (anal, target);
 		if (!containing) {
 			containing = r_anal_bb_from_offset (anal, target);
 		}
-		if (!containing || containing->addr == target) {
+		if (!containing) {
+			continue;
+		}
+		if (containing->addr == target) {
+			if (!block_belongs_to_function (containing, fcn)) {
+				r_anal_function_add_block (fcn, containing);
+			}
 			continue;
 		}
 
 		split = r_anal_block_split (containing, target);
 		if (split) {
+			if (!block_belongs_to_function (split, fcn)) {
+				r_anal_function_add_block (fcn, split);
+			}
 			r_unref (split);
 		}
 	}
@@ -6394,7 +6437,7 @@ static ut64 compute_callee_dependency_hash(RCore *core, RAnal *anal, RAnalFuncti
 	if (type_writeback_cache_count == 0) {
 		return 0;
 	}
-	refs = get_function_call_refs (NULL, anal, fcn);
+	refs = get_function_call_refs (core, anal, fcn);
 	if (!refs) {
 		return 0;
 	}

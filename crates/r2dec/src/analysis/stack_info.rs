@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::{PreparedFunctionSSA, SSAOp, StackAddressBase};
-use r2types::{
-    ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding, VisibleBindingKind,
-};
+use r2ssa::SSAOp;
 
 use super::{PassEnv, StackInfo, UseInfo, lower::LowerCtx, utils};
 use crate::ast::CExpr;
@@ -20,105 +17,6 @@ pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>
     analyze_stack_vars(&mut scratch, blocks, use_info, env);
 
     scratch.info
-}
-
-#[allow(dead_code)]
-pub(crate) fn analyze_prepared_runtime(
-    blocks: &[SSABlock],
-    prepared: &PreparedFunctionSSA,
-    stack_slots: &std::collections::BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    visible_bindings: &[VisibleBinding],
-    env: &PassEnv<'_>,
-) -> StackInfo {
-    let mut info = StackInfo::default();
-
-    for binding in visible_bindings {
-        let Some(slot) = binding.stack_slot.as_ref() else {
-            continue;
-        };
-        match binding.kind {
-            VisibleBindingKind::Param | VisibleBindingKind::HiddenHome => {
-                let Some(alias) = prepared_binding_alias_name(binding, env) else {
-                    continue;
-                };
-                info.stack_arg_aliases
-                    .entry(slot.offset)
-                    .or_insert_with(|| alias.clone());
-                info.stack_vars.entry(slot.offset).or_insert(alias);
-            }
-            VisibleBindingKind::Local | VisibleBindingKind::StackObject => {
-                let name = binding.name.trim();
-                if name.is_empty() || is_reserved_param_alias_name(name, env) {
-                    continue;
-                }
-                info.stack_vars
-                    .entry(slot.offset)
-                    .or_insert_with(|| name.to_string());
-            }
-            VisibleBindingKind::HiddenSaved | VisibleBindingKind::Unknown => {}
-        }
-    }
-
-    for (slot_key, slot) in stack_slots {
-        if let Some(alias) = prepared_stack_alias_name(slot, env) {
-            info.stack_arg_aliases
-                .entry(slot_key.offset)
-                .or_insert(alias.clone());
-            info.stack_vars.entry(slot_key.offset).or_insert(alias);
-        }
-        if let Some(name) = prepared_stack_visible_name(slot, env) {
-            info.stack_vars.entry(slot_key.offset).or_insert(name);
-        }
-    }
-
-    for (value, object_id) in &prepared.objects().value_objects {
-        let Some(object) = prepared.objects().object(*object_id) else {
-            continue;
-        };
-        let Some(name) =
-            prepared_stack_owner_name_for_object(&object.kind, stack_slots, visible_bindings, env)
-        else {
-            continue;
-        };
-        info.definition_overrides.insert(
-            value.display_name(),
-            CExpr::AddrOf(Box::new(CExpr::Var(name))),
-        );
-    }
-
-    for block in blocks {
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            let op_ref = r2ssa::SliceOpRef::Op {
-                block_addr: block.addr,
-                op_idx,
-            };
-            let Some(fact) = prepared
-                .memory()
-                .uses_by_op
-                .get(&op_ref)
-                .and_then(|uses| uses.first())
-            else {
-                continue;
-            };
-            let Some(object) = prepared.objects().object(fact.location.object) else {
-                continue;
-            };
-            let Some(name) = prepared_stack_owner_name_for_object(
-                &object.kind,
-                stack_slots,
-                visible_bindings,
-                env,
-            ) else {
-                continue;
-            };
-            if let SSAOp::Load { dst, .. } = op {
-                info.definition_overrides
-                    .insert(dst.display_name(), CExpr::Var(name));
-            }
-        }
-    }
-
-    info
 }
 
 fn analyze_stack_vars(
@@ -259,94 +157,6 @@ fn is_reserved_param_alias_name(name: &str, env: &PassEnv<'_>) -> bool {
         .any(|alias| alias.eq_ignore_ascii_case(name))
 }
 
-#[allow(dead_code)]
-fn prepared_binding_alias_name(binding: &VisibleBinding, env: &PassEnv<'_>) -> Option<String> {
-    binding
-        .source_reg
-        .as_deref()
-        .and_then(|reg| env.param_register_aliases.get(reg))
-        .cloned()
-        .filter(|name| !is_reserved_param_alias_name(name, env))
-        .or_else(|| {
-            let name = binding.name.trim();
-            (!name.is_empty() && !is_reserved_param_alias_name(name, env)).then(|| name.to_string())
-        })
-}
-
-#[allow(dead_code)]
-fn prepared_stack_alias_name(slot: &ExternalStackSlotSpec, env: &PassEnv<'_>) -> Option<String> {
-    match slot.role {
-        ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome => slot
-            .param_name
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                slot.source_reg
-                    .as_deref()
-                    .and_then(|reg| env.param_register_aliases.get(reg))
-                    .cloned()
-            })
-            .filter(|name| !is_reserved_param_alias_name(name, env)),
-        _ => None,
-    }
-}
-
-#[allow(dead_code)]
-fn prepared_stack_visible_name(slot: &ExternalStackSlotSpec, env: &PassEnv<'_>) -> Option<String> {
-    if slot.name.trim().is_empty() {
-        return match slot.role {
-            ExternalStackSlotRole::SavedFp => Some("saved_fp".to_string()),
-            _ => None,
-        };
-    }
-    (!is_reserved_param_alias_name(&slot.name, env)).then(|| slot.name.clone())
-}
-
-#[allow(dead_code)]
-fn prepared_stack_owner_name_for_object(
-    kind: &r2ssa::ObjectKind,
-    stack_slots: &std::collections::BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    visible_bindings: &[VisibleBinding],
-    env: &PassEnv<'_>,
-) -> Option<String> {
-    let (base, offset) = match kind {
-        r2ssa::ObjectKind::StackSlot { base, offset }
-        | r2ssa::ObjectKind::FrameObject { base, offset } => (*base, *offset),
-        _ => return None,
-    };
-    let base = match base {
-        StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
-        StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
-    };
-    let key = StackSlotKey { base, offset };
-    visible_bindings
-        .iter()
-        .find_map(|binding| {
-            (binding.stack_slot.as_ref().is_some_and(|slot| *slot == key)
-                && matches!(
-                    binding.kind,
-                    VisibleBindingKind::Local | VisibleBindingKind::StackObject
-                )
-                && !binding.name.trim().is_empty()
-                && !is_reserved_param_alias_name(&binding.name, env))
-            .then(|| binding.name.clone())
-        })
-        .or_else(|| {
-            stack_slots.get(&key).and_then(|slot| {
-                if !matches!(
-                    slot.role,
-                    ExternalStackSlotRole::Local
-                        | ExternalStackSlotRole::Unknown
-                        | ExternalStackSlotRole::SavedFp
-                ) {
-                    return None;
-                }
-                prepared_stack_visible_name(slot, env)
-            })
-        })
-}
-
 fn generic_stack_var_name(offset: i64) -> String {
     if offset < 0 {
         format!("local_{:x}", (-offset) as u64)
@@ -460,6 +270,7 @@ fn stack_var_for_addr_var(
     let empty_ptrs: HashMap<String, crate::fold::PtrArith> = HashMap::new();
     let empty_semantic_values: HashMap<String, crate::analysis::SemanticValue> = HashMap::new();
     let lower = LowerCtx {
+        use_info: None,
         definitions: inputs.definitions,
         semantic_values: &empty_semantic_values,
         use_counts: &empty_counts,
@@ -653,6 +464,7 @@ fn forwarded_expr_for_value(
     let empty_names: HashSet<String> = HashSet::new();
     let empty_ptrs: HashMap<String, crate::fold::PtrArith> = HashMap::new();
     let lower = LowerCtx {
+        use_info: Some(use_info),
         definitions,
         semantic_values: &use_info.semantic_values,
         use_counts: &empty_counts,

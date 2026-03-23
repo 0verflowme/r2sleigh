@@ -16,9 +16,9 @@
 //!
 //! ```ignore
 //! use r2sym::{ExploreConfig, PathExplorer, SymState};
-//! use r2ssa::PreparedFunctionSSA;
+//! use r2ssa::SsaArtifact;
 //!
-//! let func = PreparedFunctionSSA::for_symbolic(&blocks, None).unwrap();
+//! let func = SsaArtifact::for_symbolic(&blocks, None).unwrap();
 //! let ctx = z3::Context::thread_local();
 //!
 //! let mut state = SymState::new(&ctx, func.entry);

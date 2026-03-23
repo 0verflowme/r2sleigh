@@ -1,7 +1,7 @@
 //! Interprocedural semantic summaries built on top of prepared SSA.
 //!
 //! This layer stays summary-based on purpose. It reuses the canonical
-//! intraprocedural facts in [`PreparedFunctionSSA`] and solves a deterministic
+//! intraprocedural facts in [`SsaArtifact`] and solves a deterministic
 //! fixpoint over direct-call reachable functions without introducing a second
 //! whole-program SSA graph.
 
@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use r2il::ArchSpec;
 use serde::{Deserialize, Serialize};
 
-use crate::function::{DefLocation, PreparedFunctionSSA, SSAFunction};
+use crate::function::{SSAFunction, SsaArtifact};
+use crate::graph::{InstPayload, ValueId};
 use crate::op::SSAOp;
 use crate::semantic::ObjectKind;
 use crate::{CallSiteId, SSAVar};
@@ -190,13 +191,13 @@ impl Default for InterprocSolveConfig {
 pub struct InterprocFunctionInput<'a> {
     pub id: InterprocFunctionId,
     pub name: Option<String>,
-    pub prepared: &'a PreparedFunctionSSA,
+    pub prepared: &'a SsaArtifact,
 }
 
 #[derive(Debug, Clone)]
 struct AbiSlot {
-    primary: String,
-    size: u32,
+    _primary: String,
+    _size: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,8 +288,8 @@ impl AbiProfile {
         let mut out = Self::default();
         for (idx, (primary, size, aliases)) in args.into_iter().enumerate() {
             out.args.push(AbiSlot {
-                primary: primary.to_string(),
-                size,
+                _primary: primary.to_string(),
+                _size: size,
             });
             out.alias_to_arg.insert(primary.to_string(), idx);
             for alias in aliases {
@@ -312,11 +313,6 @@ impl AbiProfile {
 
     fn is_ret_name(&self, name: &str) -> bool {
         self.alias_is_ret.contains(&name.to_ascii_lowercase())
-    }
-
-    fn default_arg_var(&self, idx: usize) -> Option<SSAVar> {
-        let slot = self.args.get(idx)?;
-        Some(SSAVar::initial(&slot.primary, slot.size))
     }
 
     fn arg_len(&self) -> usize {
@@ -518,10 +514,7 @@ fn resolve_return_relation(
     relation.unwrap_or(SummaryReturnRelation::Void)
 }
 
-fn collect_local_summary_facts(
-    prepared: &PreparedFunctionSSA,
-    abi: &AbiProfile,
-) -> LocalSummaryFacts {
+fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> LocalSummaryFacts {
     let function = prepared.function();
     let state_by_call = collect_call_arg_state(prepared, abi);
     let mut out = LocalSummaryFacts {
@@ -552,7 +545,7 @@ fn collect_local_summary_facts(
         }
     }
 
-    for uses in prepared.memory().uses_by_op.values() {
+    for uses in prepared.memory().uses_by_inst.values() {
         for fact in uses {
             match prepared
                 .objects()
@@ -565,7 +558,7 @@ fn collect_local_summary_facts(
             }
         }
     }
-    for defs in prepared.memory().defs_by_op.values() {
+    for defs in prepared.memory().defs_by_inst.values() {
         for fact in defs {
             match prepared
                 .objects()
@@ -582,20 +575,19 @@ fn collect_local_summary_facts(
     for block in function.blocks() {
         for phi in &block.phis {
             for (_, src) in &phi.sources {
-                record_arg_count_hint(prepared, function, abi, src, &mut out.arg_count_hint);
+                record_arg_count_hint(prepared, abi, src, &mut out.arg_count_hint);
             }
         }
         for (op_idx, op) in block.ops.iter().enumerate() {
             for src in op.sources() {
-                record_arg_count_hint(prepared, function, abi, src, &mut out.arg_count_hint);
+                record_arg_count_hint(prepared, abi, src, &mut out.arg_count_hint);
             }
             match op {
                 SSAOp::Load { addr, .. }
                 | SSAOp::LoadLinked { addr, .. }
                 | SSAOp::LoadGuarded { addr, .. }
                 | SSAOp::AtomicCAS { addr, .. } => {
-                    if let SummaryOperand::Arg(idx) =
-                        classify_addr_operand(prepared, function, abi, addr, 0)
+                    if let SummaryOperand::Arg(idx) = classify_addr_operand(prepared, abi, addr, 0)
                     {
                         out.arg_effects.entry(idx).or_default().mark_read();
                     }
@@ -603,8 +595,7 @@ fn collect_local_summary_facts(
                 SSAOp::Store { addr, .. }
                 | SSAOp::StoreConditional { addr, .. }
                 | SSAOp::StoreGuarded { addr, .. } => {
-                    if let SummaryOperand::Arg(idx) =
-                        classify_addr_operand(prepared, function, abi, addr, 0)
+                    if let SummaryOperand::Arg(idx) = classify_addr_operand(prepared, abi, addr, 0)
                     {
                         out.arg_effects.entry(idx).or_default().mark_write();
                     }
@@ -629,13 +620,12 @@ fn collect_local_summary_facts(
 }
 
 fn record_arg_count_hint(
-    prepared: &PreparedFunctionSSA,
-    function: &SSAFunction,
+    prepared: &SsaArtifact,
     abi: &AbiProfile,
     var: &SSAVar,
     hint: &mut Option<usize>,
 ) {
-    let SummaryOperand::Arg(idx) = classify_value_operand(prepared, function, abi, var, 0) else {
+    let SummaryOperand::Arg(idx) = classify_var_operand(prepared, abi, var, 0) else {
         return;
     };
     let count = idx.saturating_add(1);
@@ -646,12 +636,13 @@ fn record_arg_count_hint(
 }
 
 fn collect_call_arg_state(
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     abi: &AbiProfile,
 ) -> BTreeMap<CallSiteId, Vec<SummaryOperand>> {
     let function = prepared.function();
-    let mut in_states = BTreeMap::<u64, BTreeMap<usize, SSAVar>>::new();
-    let mut out_states = BTreeMap::<u64, BTreeMap<usize, SSAVar>>::new();
+    let graph = prepared.graph();
+    let mut in_states = BTreeMap::<u64, BTreeMap<usize, ValueId>>::new();
+    let mut out_states = BTreeMap::<u64, BTreeMap<usize, ValueId>>::new();
     let mut changed = true;
     let mut iterations = 0usize;
     while changed && iterations < 64 {
@@ -668,8 +659,10 @@ fn collect_call_arg_state(
                 continue;
             };
             for phi in &block.phis {
-                if let Some(idx) = abi.arg_index_for_name(&phi.dst.name) {
-                    state.insert(idx, phi.dst.clone());
+                if let Some(idx) = abi.arg_index_for_name(&phi.dst.name)
+                    && let Some(value_id) = graph.value_id_for_var(&phi.dst)
+                {
+                    state.insert(idx, value_id);
                 }
             }
             let old = in_states.insert(block_addr, state.clone());
@@ -680,8 +673,9 @@ fn collect_call_arg_state(
             for op in &block.ops {
                 if let Some(dst) = op.dst()
                     && let Some(idx) = abi.arg_index_for_name(&dst.name)
+                    && let Some(value_id) = graph.value_id_for_var(dst)
                 {
-                    state.insert(idx, dst.clone());
+                    state.insert(idx, value_id);
                 }
             }
             let new_state = state;
@@ -693,26 +687,30 @@ fn collect_call_arg_state(
     }
 
     let mut by_call = BTreeMap::new();
-    for (&call_id, call) in &function_call_site_map(function) {
-        let Some(block) = function.get_block(call.0) else {
+    for (&call_id, call) in &prepared.call_sites().by_id {
+        let Some((block_addr, call_op_idx)) = prepared.inst_op_site(call.at) else {
             continue;
         };
-        let mut state = in_states.get(&call.0).cloned().unwrap_or_default();
+        let Some(block) = function.get_block(block_addr) else {
+            continue;
+        };
+        let mut state = in_states.get(&block_addr).cloned().unwrap_or_default();
         for phi in &block.phis {
-            if let Some(idx) = abi.arg_index_for_name(&phi.dst.name) {
-                state.insert(idx, phi.dst.clone());
+            if let Some(idx) = abi.arg_index_for_name(&phi.dst.name)
+                && let Some(value_id) = graph.value_id_for_var(&phi.dst)
+            {
+                state.insert(idx, value_id);
             }
         }
         for (op_idx, op) in block.ops.iter().enumerate() {
-            if op_idx == call.1 {
+            if op_idx == call_op_idx {
                 let args = (0..abi.arg_len())
                     .map(|idx| {
                         state
                             .get(&idx)
                             .cloned()
-                            .or_else(|| abi.default_arg_var(idx))
-                            .map(|var| classify_value_operand(prepared, function, abi, &var, 0))
-                            .unwrap_or(SummaryOperand::Unknown)
+                            .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
+                            .unwrap_or(SummaryOperand::Arg(idx))
                     })
                     .collect::<Vec<_>>();
                 by_call.insert(call_id, args);
@@ -720,8 +718,9 @@ fn collect_call_arg_state(
             }
             if let Some(dst) = op.dst()
                 && let Some(idx) = abi.arg_index_for_name(&dst.name)
+                && let Some(value_id) = graph.value_id_for_var(dst)
             {
-                state.insert(idx, dst.clone());
+                state.insert(idx, value_id);
             }
         }
     }
@@ -729,27 +728,10 @@ fn collect_call_arg_state(
     by_call
 }
 
-fn function_call_site_map(function: &SSAFunction) -> BTreeMap<CallSiteId, (u64, usize)> {
-    let mut out = BTreeMap::new();
-    let mut next_id = 0u32;
-    for &block_addr in function.block_addrs() {
-        let Some(block) = function.get_block(block_addr) else {
-            continue;
-        };
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
-                out.insert(CallSiteId(next_id), (block_addr, op_idx));
-                next_id = next_id.saturating_add(1);
-            }
-        }
-    }
-    out
-}
-
 fn merge_pred_states(
-    in_states: &BTreeMap<u64, BTreeMap<usize, SSAVar>>,
+    in_states: &BTreeMap<u64, BTreeMap<usize, ValueId>>,
     preds: &[u64],
-) -> BTreeMap<usize, SSAVar> {
+) -> BTreeMap<usize, ValueId> {
     let mut out = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for pred in preds {
@@ -758,10 +740,13 @@ fn merge_pred_states(
         }
     }
     for key in keys {
-        let mut value: Option<&SSAVar> = None;
+        let mut value: Option<ValueId> = None;
         let mut same = true;
         for pred in preds {
-            let cur = in_states.get(pred).and_then(|state| state.get(&key));
+            let cur = in_states
+                .get(pred)
+                .and_then(|state| state.get(&key))
+                .copied();
             match (value, cur) {
                 (None, Some(cur)) => value = Some(cur),
                 (Some(existing), Some(cur)) if existing == cur => {}
@@ -772,14 +757,14 @@ fn merge_pred_states(
             }
         }
         if same && let Some(value) = value {
-            out.insert(key, value.clone());
+            out.insert(key, value);
         }
     }
     out
 }
 
 fn classify_return_target(
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     function: &SSAFunction,
     abi: &AbiProfile,
     block_addr: u64,
@@ -800,11 +785,12 @@ fn classify_return_target(
     {
         return observation;
     }
-    match classify_value_operand(prepared, function, abi, &rooted, 0) {
+    match classify_var_operand(prepared, abi, &rooted, 0) {
         SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
         SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
         SummaryOperand::Unknown => {
-            if let Some(call_id) = return_call_site_for_var(function, abi, &rooted)
+            if let Some(value_id) = prepared.graph().value_id_for_var(&rooted)
+                && let Some(call_id) = return_call_site_for_value(prepared, abi, value_id)
                 && let Some(call) = calls.get(&call_id)
             {
                 return SummaryValueObservation::Call(call.clone());
@@ -825,7 +811,7 @@ fn is_instruction_pointer_like(name: &str) -> bool {
 }
 
 fn recover_return_observation_from_epilogue(
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     function: &SSAFunction,
     abi: &AbiProfile,
     block_addr: u64,
@@ -837,10 +823,10 @@ fn recover_return_observation_from_epilogue(
         let op = block.ops.get(scan_idx)?;
         match op {
             SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                let call_site_map = function_call_site_map(function);
-                let call_id = call_site_map
-                    .into_iter()
-                    .find_map(|(id, site)| (site == (block_addr, scan_idx)).then_some(id))?;
+                let call_id = prepared
+                    .graph()
+                    .inst_id_for_op_site(block_addr, scan_idx)
+                    .and_then(|inst_id| prepared.call_sites().by_inst.get(&inst_id).copied())?;
                 return calls
                     .get(&call_id)
                     .cloned()
@@ -854,95 +840,89 @@ fn recover_return_observation_from_epilogue(
                     continue;
                 }
                 let rooted = canonical_root(prepared, dst);
-                return Some(
-                    match classify_value_operand(prepared, function, abi, &rooted, 0) {
-                        SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
-                        SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
-                        SummaryOperand::Unknown => {
-                            if let Some(call_id) = return_call_site_for_var(function, abi, &rooted)
-                                && let Some(call) = calls.get(&call_id)
-                            {
-                                SummaryValueObservation::Call(call.clone())
-                            } else if let Some(address) =
-                                global_address_for_value(prepared, &rooted)
-                            {
-                                SummaryValueObservation::Global(address)
-                            } else {
-                                SummaryValueObservation::Unknown
-                            }
+                return Some(match classify_var_operand(prepared, abi, &rooted, 0) {
+                    SummaryOperand::Arg(idx) => SummaryValueObservation::Arg(idx),
+                    SummaryOperand::Const(value) => SummaryValueObservation::Const(value),
+                    SummaryOperand::Unknown => {
+                        if let Some(value_id) = prepared.graph().value_id_for_var(&rooted)
+                            && let Some(call_id) =
+                                return_call_site_for_value(prepared, abi, value_id)
+                            && let Some(call) = calls.get(&call_id)
+                        {
+                            SummaryValueObservation::Call(call.clone())
+                        } else if let Some(address) = global_address_for_value(prepared, &rooted) {
+                            SummaryValueObservation::Global(address)
+                        } else {
+                            SummaryValueObservation::Unknown
                         }
-                    },
-                );
+                    }
+                });
             }
         }
     }
     None
 }
 
-fn return_call_site_for_var(
-    function: &SSAFunction,
+fn return_call_site_for_value(
+    prepared: &SsaArtifact,
     abi: &AbiProfile,
-    var: &SSAVar,
+    value_id: ValueId,
 ) -> Option<CallSiteId> {
-    fn single_call_site(function: &SSAFunction) -> Option<CallSiteId> {
-        let call_map = function_call_site_map(function);
-        (call_map.len() == 1)
-            .then(|| call_map.keys().next().copied())
+    let single_call_site = || {
+        (prepared.call_sites().by_id.len() == 1)
+            .then(|| prepared.call_sites().by_id.keys().next().copied())
             .flatten()
-    }
-
+    };
+    let graph = prepared.graph();
+    let var = prepared.value_var(value_id)?;
     if !abi.is_ret_name(&var.name) {
         return None;
     }
-    let Some((def_block_addr, def_site)) = function.find_def(var) else {
-        return single_call_site(function);
+
+    let Some(def_inst) = graph.def_inst(value_id) else {
+        return single_call_site();
     };
-    let DefLocation::Op(op_idx) = def_site else {
-        return single_call_site(function);
+    let Some(inst) = graph.inst(def_inst) else {
+        return single_call_site();
     };
-    let block = function.get_block(def_block_addr)?;
-    let mut call_idx = op_idx;
-    loop {
-        let op = block.ops.get(call_idx)?;
-        match op {
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } => break,
-            SSAOp::CallDefine { .. } if call_idx > 0 => {
-                call_idx -= 1;
-            }
-            _ => return single_call_site(function),
-        }
-    }
-    let mut next_id = 0u32;
-    for &block_addr in function.block_addrs() {
-        let Some(block) = function.get_block(block_addr) else {
+    let Some(block) = graph.blocks.get(inst.block.0 as usize) else {
+        return single_call_site();
+    };
+    let Some(inst_pos) = block.insts.iter().position(|id| *id == def_inst) else {
+        return single_call_site();
+    };
+
+    for scan_pos in (0..=inst_pos).rev() {
+        let scan_inst_id = block.insts[scan_pos];
+        let Some(scan_inst) = graph.inst(scan_inst_id) else {
             continue;
         };
-        for (idx, op) in block.ops.iter().enumerate() {
-            if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
-                let id = CallSiteId(next_id);
-                if block_addr == def_block_addr && idx == call_idx {
-                    return Some(id);
-                }
-                next_id = next_id.saturating_add(1);
+        let InstPayload::Op(op) = &scan_inst.payload else {
+            continue;
+        };
+        match op {
+            SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
+                return prepared.call_sites().by_inst.get(&scan_inst_id).copied();
             }
+            SSAOp::CallDefine { .. } => continue,
+            _ => break,
         }
     }
-    single_call_site(function)
+
+    single_call_site()
 }
 
 fn classify_addr_operand(
-    prepared: &PreparedFunctionSSA,
-    function: &SSAFunction,
+    prepared: &SsaArtifact,
     abi: &AbiProfile,
     var: &SSAVar,
     depth: u32,
 ) -> SummaryOperand {
-    classify_value_operand(prepared, function, abi, var, depth)
+    classify_var_operand(prepared, abi, var, depth)
 }
 
-fn classify_value_operand(
-    prepared: &PreparedFunctionSSA,
-    function: &SSAFunction,
+fn classify_var_operand(
+    prepared: &SsaArtifact,
     abi: &AbiProfile,
     var: &SSAVar,
     depth: u32,
@@ -950,43 +930,69 @@ fn classify_value_operand(
     if depth > 8 {
         return SummaryOperand::Unknown;
     }
-    let rooted = canonical_root(prepared, var);
-    if rooted.is_const() {
-        return parse_const(&rooted).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
+    if var.is_const() {
+        return parse_const(var).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
     }
-    if let Some(idx) = abi.arg_index_for_name(&rooted.name) {
+    if let Some(idx) = abi.arg_index_for_name(&var.name) {
+        return SummaryOperand::Arg(idx);
+    }
+    let Some(value_id) = prepared.graph().value_id_for_var(var) else {
+        return SummaryOperand::Unknown;
+    };
+    classify_value_operand(prepared, abi, value_id, depth)
+}
+
+fn classify_value_operand(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    value_id: ValueId,
+    depth: u32,
+) -> SummaryOperand {
+    if depth > 8 {
+        return SummaryOperand::Unknown;
+    }
+    let rooted = canonical_root_value(prepared, value_id);
+    let Some(root_var) = prepared.value_var(rooted) else {
+        return SummaryOperand::Unknown;
+    };
+    if root_var.is_const() {
+        return parse_const(root_var).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
+    }
+    if let Some(idx) = abi.arg_index_for_name(&root_var.name) {
         return SummaryOperand::Arg(idx);
     }
 
-    let Some((def_block_addr, def_site)) = function.find_def(&rooted) else {
+    let Some(def_inst) = prepared.graph().def_inst(rooted) else {
         return SummaryOperand::Unknown;
     };
-    let DefLocation::Op(op_idx) = def_site else {
+    let Some(inst) = prepared.graph().inst(def_inst) else {
         return SummaryOperand::Unknown;
     };
-    let Some(block) = function.get_block(def_block_addr) else {
-        return SummaryOperand::Unknown;
-    };
-    let Some(op) = block.ops.get(op_idx) else {
+    let InstPayload::Op(op) = &inst.payload else {
         return SummaryOperand::Unknown;
     };
     match op {
-        SSAOp::Copy { src, .. }
-        | SSAOp::IntZExt { src, .. }
-        | SSAOp::IntSExt { src, .. }
-        | SSAOp::Subpiece { src, .. } => {
-            classify_value_operand(prepared, function, abi, src, depth + 1)
-        }
-        SSAOp::IntAdd { a, b, .. }
-        | SSAOp::IntSub { a, b, .. }
-        | SSAOp::PtrAdd {
-            base: a, index: b, ..
-        }
-        | SSAOp::PtrSub {
-            base: a, index: b, ..
-        } => {
-            let left = classify_value_operand(prepared, function, abi, a, depth + 1);
-            let right = classify_value_operand(prepared, function, abi, b, depth + 1);
+        SSAOp::Copy { .. }
+        | SSAOp::IntZExt { .. }
+        | SSAOp::IntSExt { .. }
+        | SSAOp::Subpiece { .. } => inst
+            .inputs
+            .first()
+            .copied()
+            .map(|src| classify_value_operand(prepared, abi, src, depth + 1))
+            .unwrap_or(SummaryOperand::Unknown),
+        SSAOp::IntAdd { .. }
+        | SSAOp::IntSub { .. }
+        | SSAOp::PtrAdd { .. }
+        | SSAOp::PtrSub { .. } => {
+            let Some(&left_id) = inst.inputs.first() else {
+                return SummaryOperand::Unknown;
+            };
+            let Some(&right_id) = inst.inputs.get(1) else {
+                return SummaryOperand::Unknown;
+            };
+            let left = classify_value_operand(prepared, abi, left_id, depth + 1);
+            let right = classify_value_operand(prepared, abi, right_id, depth + 1);
             match (left, right) {
                 (SummaryOperand::Arg(idx), SummaryOperand::Const(_))
                 | (SummaryOperand::Const(_), SummaryOperand::Arg(idx)) => SummaryOperand::Arg(idx),
@@ -999,11 +1005,24 @@ fn classify_value_operand(
     }
 }
 
-fn canonical_root(prepared: &PreparedFunctionSSA, var: &SSAVar) -> SSAVar {
+fn canonical_root(prepared: &SsaArtifact, var: &SSAVar) -> SSAVar {
+    prepared
+        .graph()
+        .value_id_for_var(var)
+        .map(|value_id| canonical_root_value(prepared, value_id))
+        .and_then(|value_id| prepared.value_var(value_id).cloned())
+        .unwrap_or_else(|| var.clone())
+}
+
+fn canonical_root_value(prepared: &SsaArtifact, value_id: ValueId) -> ValueId {
     let Some(facts) = prepared.function().decompile_prep_facts() else {
-        return var.clone();
+        return value_id;
     };
-    let mut current = var.clone();
+    let Some(start) = prepared.value_var(value_id) else {
+        return value_id;
+    };
+    let mut current = start.clone();
+    let mut current_id = value_id;
     for _ in 0..32 {
         let Some(next) = facts.canonical_root_of(&current) else {
             break;
@@ -1011,13 +1030,22 @@ fn canonical_root(prepared: &PreparedFunctionSSA, var: &SSAVar) -> SSAVar {
         if next == &current {
             break;
         }
+        let Some(next_id) = prepared.graph().value_id_for_var(next) else {
+            break;
+        };
         current = next.clone();
+        current_id = next_id;
     }
-    current
+    current_id
 }
 
-fn global_address_for_value(prepared: &PreparedFunctionSSA, var: &SSAVar) -> Option<u64> {
-    let object = prepared.objects().object_for_value(var)?;
+fn global_address_for_value(prepared: &SsaArtifact, var: &SSAVar) -> Option<u64> {
+    let value_id = prepared.graph().value_id_for_var(var)?;
+    global_address_for_value_id(prepared, value_id)
+}
+
+fn global_address_for_value_id(prepared: &SsaArtifact, value_id: ValueId) -> Option<u64> {
+    let object = prepared.objects().object_for_value(value_id)?;
     let object = prepared.objects().object(object)?;
     match object.kind {
         ObjectKind::Global { address, .. } => Some(address),
@@ -1072,7 +1100,7 @@ fn normalize_seed_name(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PreparedFunctionSSA;
+    use crate::SsaArtifact;
     use r2il::{R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn x86_64_arch() -> ArchSpec {
@@ -1146,10 +1174,10 @@ mod tests {
             ],
         );
 
-        let alloc = PreparedFunctionSSA::for_decompile(&[alloc_block], Some(&arch))
+        let alloc = SsaArtifact::for_decompile(&[alloc_block], Some(&arch))
             .expect("alloc ssa")
             .with_name("alloc_wrapper");
-        let wrapper = PreparedFunctionSSA::for_decompile(&[wrapper_block], Some(&arch))
+        let wrapper = SsaArtifact::for_decompile(&[wrapper_block], Some(&arch))
             .expect("wrapper ssa")
             .with_name("wrapper");
 
@@ -1208,7 +1236,7 @@ mod tests {
             ],
         );
 
-        let alloc = PreparedFunctionSSA::for_decompile(&[alloc_block], Some(&arch))
+        let alloc = SsaArtifact::for_decompile(&[alloc_block], Some(&arch))
             .expect("alloc ssa")
             .with_name("alloc_wrapper");
 
@@ -1254,7 +1282,7 @@ mod tests {
                 R2ILOp::Return { target: c(0, 4) },
             ],
         );
-        let prepared = PreparedFunctionSSA::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
         let set = solve_interproc_summary_set(
             &[InterprocFunctionInput {
                 id: InterprocFunctionId(0x4000),

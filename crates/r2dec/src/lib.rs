@@ -82,7 +82,7 @@ fn normalize_callee_name(name: &str) -> String {
     out
 }
 
-fn should_skip_runtime_type_inference(prepared: Option<&r2ssa::PreparedFunctionSSA>) -> bool {
+fn should_skip_runtime_type_inference(prepared: Option<&r2ssa::SsaArtifact>) -> bool {
     let Some(prepared) = prepared else {
         return false;
     };
@@ -93,7 +93,7 @@ fn should_skip_runtime_type_inference(prepared: Option<&r2ssa::PreparedFunctionS
         && summary.back_edge_count == 0
 }
 
-fn should_use_prepared_semantic_view(prepared: Option<&r2ssa::PreparedFunctionSSA>) -> bool {
+fn should_use_prepared_semantic_view(prepared: Option<&r2ssa::SsaArtifact>) -> bool {
     prepared.is_some()
 }
 
@@ -526,13 +526,13 @@ impl DecompilerContext {
 
 #[derive(Debug, Clone)]
 pub struct DecompilerInput {
-    pub prepared_ssa: r2ssa::PreparedFunctionSSA,
+    pub prepared_ssa: r2ssa::SsaArtifact,
     pub interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
     pub context: DecompilerContext,
 }
 
 impl DecompilerInput {
-    pub fn new(prepared_ssa: r2ssa::PreparedFunctionSSA, mut context: DecompilerContext) -> Self {
+    pub fn new(prepared_ssa: r2ssa::SsaArtifact, mut context: DecompilerContext) -> Self {
         context.type_facts = context.type_facts.canonicalized();
         Self {
             prepared_ssa,
@@ -690,7 +690,7 @@ impl Decompiler {
     fn build_function_internal(
         &self,
         func: &SSAFunction,
-        prepared: Option<&r2ssa::PreparedFunctionSSA>,
+        prepared: Option<&r2ssa::SsaArtifact>,
         interproc_summary_set: Option<&r2ssa::InterprocSummarySet>,
     ) -> CFunction {
         // Materialize phis on non-critical edges to reduce SSA artifacts in output.
@@ -1939,12 +1939,12 @@ mod tests {
             .with_name("stable_demo")
     }
 
-    fn prepared_from_ops(ops: Vec<R2ILOp>, arch: &ArchSpec) -> r2ssa::PreparedFunctionSSA {
+    fn prepared_from_ops(ops: Vec<R2ILOp>, arch: &ArchSpec) -> r2ssa::SsaArtifact {
         let mut block = R2ILBlock::new(0x1000, 4);
         for op in ops {
             block.push(op);
         }
-        r2ssa::PreparedFunctionSSA::for_decompile(&[block], Some(arch))
+        r2ssa::SsaArtifact::for_decompile(&[block], Some(arch))
             .expect("prepared SSA should build")
             .with_name("stable_demo")
     }

@@ -542,6 +542,7 @@ fn canonicalize_param_home_stack_slots(
         return;
     }
 
+    let trivial_value_sources = collect_trivial_value_sources(ssa_blocks);
     let mut slot_addr_by_var = HashMap::<String, StackSlotKey>::new();
     for block in ssa_blocks {
         for op in &block.ops {
@@ -560,15 +561,16 @@ fn canonicalize_param_home_stack_slots(
                     let Some(slot_key) = slot_addr_by_var.get(&addr.display_name()).cloned() else {
                         continue;
                     };
+                    let rooted_val = resolve_trivial_value_root(&trivial_value_sources, val);
                     let Some((param_index, param_reg)) =
                         register_params.iter().enumerate().find_map(|(idx, param)| {
-                            register_family_matches(&param.reg, &val.name)
+                            register_family_matches(&param.reg, &rooted_val.name)
                                 .then_some((idx, param.reg.clone()))
                         })
                     else {
                         continue;
                     };
-                    if val.version != 0 {
+                    if rooted_val.version != 0 {
                         continue;
                     }
                     let Some(slot) = stack_slots.get_mut(&slot_key) else {
@@ -597,6 +599,41 @@ fn canonicalize_param_home_stack_slots(
             }
         }
     }
+}
+
+fn collect_trivial_value_sources(ssa_blocks: &[SSABlock]) -> HashMap<SSAVar, SSAVar> {
+    let mut trivial_value_sources = HashMap::new();
+    for block in ssa_blocks {
+        for op in &block.ops {
+            match op {
+                SSAOp::Copy { dst, src }
+                | SSAOp::IntZExt { dst, src }
+                | SSAOp::IntSExt { dst, src } => {
+                    trivial_value_sources.insert(dst.clone(), src.clone());
+                }
+                SSAOp::Subpiece { dst, src, offset } if *offset == 0 => {
+                    trivial_value_sources.insert(dst.clone(), src.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    trivial_value_sources
+}
+
+fn resolve_trivial_value_root(
+    trivial_value_sources: &HashMap<SSAVar, SSAVar>,
+    value: &SSAVar,
+) -> SSAVar {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+    while seen.insert(current.clone()) {
+        let Some(next) = trivial_value_sources.get(&current) else {
+            break;
+        };
+        current = next.clone();
+    }
+    current
 }
 
 fn stack_slot_key_from_add_sub(
@@ -3169,8 +3206,9 @@ mod tests {
             ptr_bits: 64,
             inferred_signature: InferredSignature {
                 function_name: "sym.test_struct_array_index".to_string(),
-                signature: "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
-                    .to_string(),
+                signature:
+                    "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
+                        .to_string(),
                 ret_type: "int32_t".to_string(),
                 params: vec![
                     InferredSignatureParam {
@@ -3199,7 +3237,183 @@ mod tests {
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
-        for (offset, expected_name, expected_idx) in [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)] {
+        for (offset, expected_name, expected_idx) in
+            [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
+        {
+            let slot = analysis
+                .type_facts
+                .stack_slots
+                .get(&StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset,
+                })
+                .expect("canonicalized slot");
+            assert_eq!(slot.role, ExternalStackSlotRole::ParamHome);
+            assert_eq!(slot.param_index, Some(expected_idx));
+            assert_eq!(slot.param_name.as_deref(), Some(expected_name));
+        }
+    }
+
+    #[test]
+    fn generic_unknown_param_home_slots_are_canonicalized_from_entry_store_copies() {
+        let mut parsed_context = ParsedExternalContext {
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+                params: vec![
+                    FunctionParamSpec {
+                        name: "arr".to_string(),
+                        ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Unknown))),
+                    },
+                    FunctionParamSpec {
+                        name: "idx".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 32,
+                            signedness: Signedness::Signed,
+                        }),
+                    },
+                    FunctionParamSpec {
+                        name: "v".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 32,
+                            signedness: Signedness::Signed,
+                        }),
+                    },
+                ],
+            }),
+            register_params: vec![
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Unknown))),
+                    reg: "rdi".to_string(),
+                },
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg2".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    reg: "rsi".to_string(),
+                },
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg3".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    reg: "rdx".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        for (offset, name) in [(-8, "arr"), (-12, "var_ch"), (-16, "var_10h")] {
+            parsed_context.stack_slots.insert(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset,
+                },
+                ExternalStackVarSpec {
+                    name: name.to_string(),
+                    ty: None,
+                    base: ExternalStackBase::FramePointer,
+                    role: ExternalStackSlotRole::Unknown,
+                    param_index: None,
+                    param_name: None,
+                    source_reg: None,
+                },
+            );
+        }
+
+        let ssa_blocks = [SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 1, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                },
+                SSAOp::Copy {
+                    dst: SSAVar::new("tmp:spill_arr", 1, 8),
+                    src: SSAVar::new("RDI", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 1, 8),
+                    val: SSAVar::new("tmp:spill_arr", 1, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 2, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                },
+                SSAOp::Copy {
+                    dst: SSAVar::new("tmp:spill_idx", 1, 4),
+                    src: SSAVar::new("ESI", 0, 4),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 2, 8),
+                    val: SSAVar::new("tmp:spill_idx", 1, 4),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("tmp:slot", 3, 8),
+                    a: SSAVar::new("RBP", 1, 8),
+                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                },
+                SSAOp::Copy {
+                    dst: SSAVar::new("tmp:spill_v", 1, 4),
+                    src: SSAVar::new("EDX", 0, 4),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("tmp:slot", 3, 8),
+                    val: SSAVar::new("tmp:spill_v", 1, 4),
+                },
+            ],
+        }];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.test_struct_array_index",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.test_struct_array_index".to_string(),
+                signature:
+                    "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
+                        .to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arr".to_string(),
+                        param_type: "void *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "idx".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "v".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 90,
+                callconv_confidence: 90,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &ssa_blocks,
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        for (offset, expected_name, expected_idx) in
+            [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
+        {
             let slot = analysis
                 .type_facts
                 .stack_slots

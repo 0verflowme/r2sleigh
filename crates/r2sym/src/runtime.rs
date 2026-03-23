@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
 use r2il::ArchSpec;
-use r2ssa::{PreparedFunctionSSA, SSAVar};
+use r2ssa::{SSAVar, SsaArtifact};
 
 use crate::state::SymState;
 
 pub fn seed_default_state_for_arch<'ctx>(
     state: &mut SymState<'ctx>,
-    prepared: &PreparedFunctionSSA,
+    prepared: &SsaArtifact,
     arch: Option<&ArchSpec>,
 ) {
     let Some(arch) = arch else {

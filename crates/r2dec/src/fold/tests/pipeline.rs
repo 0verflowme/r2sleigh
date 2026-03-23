@@ -18,6 +18,7 @@ mod tests {
         StackSlotKey, StructShape, TypeArena, TypeId, TypeOracle, VisibleBinding,
         VisibleBindingKind,
     };
+    use crate::fold::PtrArith;
 
     #[derive(Debug, Clone)]
     struct FunctionType {
@@ -65,8 +66,8 @@ mod tests {
     fn prepared_from_r2il_blocks(
         blocks: &[R2ILBlock],
         arch: &ArchSpec,
-    ) -> r2ssa::PreparedFunctionSSA {
-        r2ssa::PreparedFunctionSSA::for_decompile(blocks, Some(arch))
+    ) -> r2ssa::SsaArtifact {
+        r2ssa::SsaArtifact::for_decompile(blocks, Some(arch))
             .expect("prepared SSA should build")
     }
 
@@ -289,7 +290,7 @@ mod tests {
     }
 
     fn make_x86_64_ctx_with_prepared<'a>(
-        prepared_ssa: &'a r2ssa::PreparedFunctionSSA,
+        prepared_ssa: &'a r2ssa::SsaArtifact,
     ) -> FoldingContext<'a> {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
@@ -6254,6 +6255,7 @@ mod tests {
             "tmp:ret_1".to_string(),
             crate::analysis::ValueProvenance {
                 source: "src_1".to_string(),
+                source_value_id: None,
                 source_var: None,
                 stack_slot: None,
             },
@@ -8687,6 +8689,7 @@ mod tests {
             ret.display_name(),
             crate::analysis::ValueProvenance {
                 source: "resolved_1".to_string(),
+                source_value_id: None,
                 source_var: None,
                 stack_slot: None,
             },

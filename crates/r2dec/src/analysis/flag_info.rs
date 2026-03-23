@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::{CompareKind as PreparedCompareKind, PreparedFunctionSSA, SSAOp};
+use r2ssa::SSAOp;
 
 use super::lower::LowerCtx;
 use super::{FlagCompareKind, FlagCompareProvenance, FlagInfo, PassEnv, UseInfo, utils};
@@ -15,6 +15,7 @@ pub(crate) struct FlagScratch {
 pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> FlagInfo {
     let mut scratch = FlagScratch::default();
     let lower = LowerCtx {
+        use_info: Some(use_info),
         definitions: &use_info.definitions,
         semantic_values: &use_info.semantic_values,
         use_counts: &use_info.use_counts,
@@ -37,47 +38,6 @@ pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>
     }
     recompute_flag_only_values(&mut scratch, blocks);
 
-    scratch.info
-}
-
-#[allow(dead_code)]
-pub(crate) fn analyze_prepared_runtime(
-    blocks: &[SSABlock],
-    use_info: &UseInfo,
-    prepared: &PreparedFunctionSSA,
-) -> FlagInfo {
-    let mut scratch = FlagScratch::default();
-
-    for predicate in prepared.predicates().predicates.values() {
-        let Some(compare) = predicate.comparison.as_ref() else {
-            continue;
-        };
-        let lhs = traced_compare_operand_name(&compare.lhs, use_info);
-        let compare_width = compare.lhs.size.max(compare.rhs.size);
-        let rhs = if compare.rhs.is_const() {
-            format_compare_operand(&compare.rhs, compare_width)
-        } else {
-            traced_compare_operand_name(&compare.rhs, use_info)
-        };
-        let kind = match compare.kind {
-            PreparedCompareKind::Equal | PreparedCompareKind::NotEqual => FlagCompareKind::Equality,
-            PreparedCompareKind::Less | PreparedCompareKind::LessEqual => {
-                FlagCompareKind::UnsignedLess
-            }
-            PreparedCompareKind::SignedLess | PreparedCompareKind::SignedLessEqual => {
-                FlagCompareKind::SignedNegative
-            }
-        };
-        record_flag_compare_provenance(
-            &mut scratch,
-            predicate.condition.display_name(),
-            lhs,
-            rhs,
-            kind,
-        );
-    }
-
-    recompute_flag_only_values(&mut scratch, blocks);
     scratch.info
 }
 

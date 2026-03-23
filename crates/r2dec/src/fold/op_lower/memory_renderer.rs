@@ -19,19 +19,27 @@ impl<'a> FoldingContext<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-        let semantic = self.render_memory_access_by_name(name, elem_size, depth, visited);
-        if semantic.is_some() || self.has_authoritative_memory_semantics(name) {
-            return semantic;
+        if !self.enter_resolution_guard(ResolutionPhase::Memory, name) {
+            return None;
         }
-        self.lookup_definition(name)
-            .and_then(|expr| {
-                self.render_memory_access_from_visible_expr(&expr, elem_size, depth, visited)
-            })
-            .or_else(|| {
-                self.definitions_map().get(name).and_then(|expr| {
-                    self.render_memory_access_from_visible_expr(expr, elem_size, depth, visited)
+
+        let semantic = self.render_memory_access_by_name(name, elem_size, depth, visited);
+        let result = if semantic.is_some() || self.has_authoritative_memory_semantics(name) {
+            semantic
+        } else {
+            self.lookup_definition(name)
+                .and_then(|expr| {
+                    self.render_memory_access_from_visible_expr(&expr, elem_size, depth, visited)
                 })
-            })
+                .or_else(|| {
+                    self.definitions_map().get(name).and_then(|expr| {
+                        self.render_memory_access_from_visible_expr(expr, elem_size, depth, visited)
+                    })
+                })
+        };
+
+        self.leave_resolution_guard(ResolutionPhase::Memory, name);
+        result
     }
 
     pub(super) fn render_canonical_load_expr(

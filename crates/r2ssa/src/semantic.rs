@@ -5,12 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::FunctionSSABlock;
 use crate::cfg::BlockTerminator;
-use crate::defuse::SliceOpRef;
-use crate::function::{
-    DecompilePrepFacts, DefLocation, SSAFunction, StackAddressBase, StackAddressRoot,
-};
+use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
+use crate::graph::{InstId, SsaGraph, ValueId};
 use crate::op::SSAOp;
 use crate::var::SSAVar;
 
@@ -47,15 +44,21 @@ pub struct ObjectFact {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectModel {
     pub objects: BTreeMap<ObjectId, ObjectFact>,
-    pub value_objects: BTreeMap<SSAVar, ObjectId>,
+    pub value_objects: BTreeMap<ValueId, ObjectId>,
     pub stack_objects: BTreeMap<StackAddressRoot, ObjectId>,
     pub global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     pub escaped_unknown: Option<ObjectId>,
 }
 
 impl ObjectModel {
-    pub fn object_for_value(&self, value: &SSAVar) -> Option<ObjectId> {
-        self.value_objects.get(value).copied()
+    pub fn object_for_value(&self, value: ValueId) -> Option<ObjectId> {
+        self.value_objects.get(&value).copied()
+    }
+
+    pub fn object_for_var(&self, graph: &SsaGraph, value: &SSAVar) -> Option<ObjectId> {
+        graph
+            .value_id_for_var(value)
+            .and_then(|value_id| self.object_for_value(value_id))
     }
 
     pub fn object(&self, id: ObjectId) -> Option<&ObjectFact> {
@@ -102,8 +105,8 @@ pub struct MemoryPhiFact {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySSAFacts {
-    pub uses_by_op: BTreeMap<SliceOpRef, Vec<MemoryUseFact>>,
-    pub defs_by_op: BTreeMap<SliceOpRef, Vec<MemoryDefFact>>,
+    pub uses_by_inst: BTreeMap<InstId, Vec<MemoryUseFact>>,
+    pub defs_by_inst: BTreeMap<InstId, Vec<MemoryDefFact>>,
     pub phis_by_block: BTreeMap<u64, Vec<MemoryPhiFact>>,
 }
 
@@ -120,15 +123,15 @@ pub enum CompareKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompareProvenance {
     pub kind: CompareKind,
-    pub lhs: SSAVar,
-    pub rhs: SSAVar,
+    pub lhs: ValueId,
+    pub rhs: ValueId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PredicateFact {
     pub id: PredicateId,
     pub block_addr: u64,
-    pub condition: SSAVar,
+    pub condition: ValueId,
     pub comparison: Option<CompareProvenance>,
     pub true_target: u64,
     pub false_target: u64,
@@ -144,7 +147,7 @@ pub struct BlockAssumption {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchPredicateFact {
     pub block_addr: u64,
-    pub selector: Option<SSAVar>,
+    pub selector: Option<ValueId>,
     pub cases: Vec<(u64, u64)>,
     pub default: Option<u64>,
 }
@@ -169,8 +172,8 @@ pub enum CallMemoryEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSiteFact {
     pub id: CallSiteId,
-    pub at: SliceOpRef,
-    pub target: SSAVar,
+    pub at: InstId,
+    pub target: ValueId,
     pub direct_target: Option<u64>,
     pub fallthrough: Option<u64>,
     pub memory_effect: CallMemoryEffect,
@@ -179,7 +182,7 @@ pub struct CallSiteFact {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallSiteFacts {
     pub by_id: BTreeMap<CallSiteId, CallSiteFact>,
-    pub by_op: BTreeMap<SliceOpRef, CallSiteId>,
+    pub by_inst: BTreeMap<InstId, CallSiteId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -191,10 +194,10 @@ pub struct PreparedFunctionFacts {
 }
 
 impl PreparedFunctionFacts {
-    pub fn collect(function: &SSAFunction) -> Self {
-        let call_sites = collect_call_sites(function);
-        let (objects, memory) = collect_object_and_memory_facts(function, &call_sites);
-        let predicates = collect_predicate_facts(function);
+    pub fn collect(function: &SSAFunction, graph: &SsaGraph) -> Self {
+        let call_sites = collect_call_sites(function, graph);
+        let (objects, memory) = collect_object_and_memory_facts(function, graph, &call_sites);
+        let predicates = collect_predicate_facts(function, graph);
         Self {
             objects,
             memory,
@@ -208,7 +211,7 @@ impl PreparedFunctionFacts {
 struct ObjectModelBuilder<'a> {
     facts: Option<&'a DecompilePrepFacts>,
     objects: BTreeMap<ObjectId, ObjectFact>,
-    value_objects: BTreeMap<SSAVar, ObjectId>,
+    value_objects: BTreeMap<ValueId, ObjectId>,
     stack_objects: BTreeMap<StackAddressRoot, ObjectId>,
     global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     escaped_unknown: ObjectId,
@@ -237,7 +240,7 @@ impl<'a> ObjectModelBuilder<'a> {
         }
     }
 
-    fn build(mut self, function: &SSAFunction) -> ObjectModel {
+    fn build(mut self, function: &SSAFunction, graph: &SsaGraph) -> ObjectModel {
         if let Some(facts) = self.facts {
             let mut stack_roots: Vec<StackAddressRoot> =
                 facts.stack_address_roots.values().copied().collect();
@@ -247,7 +250,7 @@ impl<'a> ObjectModelBuilder<'a> {
                 self.ensure_stack_object(root);
             }
             for var in facts.stack_address_roots.keys() {
-                let _ = self.object_for_address_value(var, "ram");
+                let _ = self.object_for_address_value(graph, var, "ram");
             }
         }
 
@@ -261,7 +264,7 @@ impl<'a> ObjectModelBuilder<'a> {
                     | SSAOp::AtomicCAS { addr, space, .. }
                     | SSAOp::LoadGuarded { addr, space, .. }
                     | SSAOp::StoreGuarded { addr, space, .. } => {
-                        let _ = self.object_for_address_value(addr, space);
+                        let _ = self.object_for_address_value(graph, addr, space);
                     }
                     _ => {}
                 }
@@ -277,14 +280,22 @@ impl<'a> ObjectModelBuilder<'a> {
         }
     }
 
-    fn object_for_address_value(&mut self, value: &SSAVar, space: &str) -> ObjectId {
-        if let Some(object) = self.value_objects.get(value).copied() {
+    fn object_for_address_value(
+        &mut self,
+        graph: &SsaGraph,
+        value: &SSAVar,
+        space: &str,
+    ) -> ObjectId {
+        let Some(value_id) = graph.value_id_for_var(value) else {
+            return self.escaped_unknown;
+        };
+        if let Some(object) = self.value_objects.get(&value_id).copied() {
             return object;
         }
 
         if let Some(root) = resolve_stack_root(self.facts, value) {
             let object = self.ensure_stack_object(root);
-            self.value_objects.insert(value.clone(), object);
+            self.value_objects.insert(value_id, object);
             return object;
         }
 
@@ -293,12 +304,11 @@ impl<'a> ObjectModelBuilder<'a> {
                 space: space.to_string(),
                 address,
             });
-            self.value_objects.insert(value.clone(), object);
+            self.value_objects.insert(value_id, object);
             return object;
         }
 
-        self.value_objects
-            .insert(value.clone(), self.escaped_unknown);
+        self.value_objects.insert(value_id, self.escaped_unknown);
         self.escaped_unknown
     }
 
@@ -355,30 +365,32 @@ struct AccessSummary {
 
 fn collect_object_and_memory_facts(
     function: &SSAFunction,
+    graph: &SsaGraph,
     call_sites: &CallSiteFacts,
 ) -> (ObjectModel, MemorySSAFacts) {
     let facts = function.decompile_prep_facts();
     let builder = ObjectModelBuilder::new(facts);
-    let object_model = builder.build(function);
-    let access_summaries = collect_access_summaries(function, facts, &object_model, call_sites);
-    let memory = build_memory_ssa(function, &object_model, access_summaries);
+    let object_model = builder.build(function, graph);
+    let access_summaries =
+        collect_access_summaries(function, graph, facts, &object_model, call_sites);
+    let memory = build_memory_ssa(function, graph, &object_model, access_summaries);
     (object_model, memory)
 }
 
 fn collect_access_summaries(
     function: &SSAFunction,
+    graph: &SsaGraph,
     prep_facts: Option<&DecompilePrepFacts>,
     object_model: &ObjectModel,
     call_sites: &CallSiteFacts,
-) -> BTreeMap<SliceOpRef, AccessSummary> {
+) -> BTreeMap<InstId, AccessSummary> {
     let mut summaries = BTreeMap::new();
     let escaped_unknown = object_model.escaped_unknown_object().unwrap_or(ObjectId(0));
 
     for block in function.blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
-            let op_ref = SliceOpRef::Op {
-                block_addr: block.addr,
-                op_idx,
+            let Some(inst_id) = graph.inst_id_for_op_site(block.addr, op_idx) else {
+                continue;
             };
             let mut uses = Vec::new();
             let mut defs = Vec::new();
@@ -393,6 +405,7 @@ fn collect_access_summaries(
                     uses.push(memory_location_for_addr(
                         prep_facts,
                         object_model,
+                        graph,
                         addr,
                         space,
                         dst.size,
@@ -405,6 +418,7 @@ fn collect_access_summaries(
                     defs.push(memory_location_for_addr(
                         prep_facts,
                         object_model,
+                        graph,
                         addr,
                         space,
                         val.size,
@@ -413,8 +427,14 @@ fn collect_access_summaries(
                 SSAOp::StoreConditional {
                     addr, val, space, ..
                 } => {
-                    let location =
-                        memory_location_for_addr(prep_facts, object_model, addr, space, val.size);
+                    let location = memory_location_for_addr(
+                        prep_facts,
+                        object_model,
+                        graph,
+                        addr,
+                        space,
+                        val.size,
+                    );
                     uses.push(location);
                     defs.push(location);
                 }
@@ -428,6 +448,7 @@ fn collect_access_summaries(
                     let location = memory_location_for_addr(
                         prep_facts,
                         object_model,
+                        graph,
                         addr,
                         space,
                         expected.size.max(replacement.size),
@@ -436,7 +457,7 @@ fn collect_access_summaries(
                     defs.push(location);
                 }
                 SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                    if call_sites.by_op.contains_key(&op_ref) {
+                    if call_sites.by_inst.contains_key(&inst_id) {
                         let location = MemoryLocation {
                             object: escaped_unknown,
                             offset: 0,
@@ -449,7 +470,7 @@ fn collect_access_summaries(
                 _ => {}
             }
             if !uses.is_empty() || !defs.is_empty() {
-                summaries.insert(op_ref, AccessSummary { uses, defs });
+                summaries.insert(inst_id, AccessSummary { uses, defs });
             }
         }
     }
@@ -459,8 +480,9 @@ fn collect_access_summaries(
 
 fn build_memory_ssa(
     function: &SSAFunction,
+    graph: &SsaGraph,
     object_model: &ObjectModel,
-    access_summaries: BTreeMap<SliceOpRef, AccessSummary>,
+    access_summaries: BTreeMap<InstId, AccessSummary>,
 ) -> MemorySSAFacts {
     let mut phis_by_block = BTreeMap::new();
 
@@ -469,8 +491,8 @@ fn build_memory_ssa(
         next_version_by_object.insert(*object, 1);
     }
 
-    let mut def_versions = BTreeMap::<SliceOpRef, Vec<MemoryVersion>>::new();
-    for (op_ref, summary) in &access_summaries {
+    let mut def_versions = BTreeMap::<InstId, Vec<MemoryVersion>>::new();
+    for (inst_id, summary) in &access_summaries {
         if summary.defs.is_empty() {
             continue;
         }
@@ -487,7 +509,7 @@ fn build_memory_ssa(
                 version
             })
             .collect::<Vec<_>>();
-        def_versions.insert(*op_ref, versions);
+        def_versions.insert(*inst_id, versions);
     }
 
     let object_ids = object_model.objects.keys().copied().collect::<Vec<_>>();
@@ -495,10 +517,10 @@ fn build_memory_ssa(
     let mut out_states = BTreeMap::<u64, BTreeMap<ObjectId, MemoryVersion>>::new();
     let mut phi_versions = BTreeMap::<(u64, ObjectId), MemoryVersion>::new();
     let mut phi_inputs = BTreeMap::<(u64, ObjectId), Vec<(u64, MemoryVersion)>>::new();
-    let (uses_by_op, defs_by_op) = loop {
+    let (uses_by_inst, defs_by_inst) = loop {
         let mut changed = false;
-        let mut uses_by_op = BTreeMap::<SliceOpRef, Vec<MemoryUseFact>>::new();
-        let mut defs_by_op = BTreeMap::<SliceOpRef, Vec<MemoryDefFact>>::new();
+        let mut uses_by_inst = BTreeMap::<InstId, Vec<MemoryUseFact>>::new();
+        let mut defs_by_inst = BTreeMap::<InstId, Vec<MemoryDefFact>>::new();
         for &block_addr in function.block_addrs() {
             let preds = function.predecessors(block_addr);
             let mut in_state = BTreeMap::new();
@@ -554,8 +576,10 @@ fn build_memory_ssa(
                 continue;
             };
             for (op_idx, _) in block.ops.iter().enumerate() {
-                let op_ref = SliceOpRef::Op { block_addr, op_idx };
-                let Some(summary) = access_summaries.get(&op_ref) else {
+                let Some(inst_id) = graph.inst_id_for_op_site(block_addr, op_idx) else {
+                    continue;
+                };
+                let Some(summary) = access_summaries.get(&inst_id) else {
                     continue;
                 };
                 for location in &summary.uses {
@@ -566,12 +590,15 @@ fn build_memory_ssa(
                             object: location.object,
                             version: 0,
                         });
-                    uses_by_op.entry(op_ref).or_default().push(MemoryUseFact {
-                        location: *location,
-                        version,
-                    });
+                    uses_by_inst
+                        .entry(inst_id)
+                        .or_default()
+                        .push(MemoryUseFact {
+                            location: *location,
+                            version,
+                        });
                 }
-                if let Some(def_versions_for_op) = def_versions.get(&op_ref) {
+                if let Some(def_versions_for_op) = def_versions.get(&inst_id) {
                     for (location, next_version) in
                         summary.defs.iter().zip(def_versions_for_op.iter())
                     {
@@ -583,11 +610,14 @@ fn build_memory_ssa(
                                     object: location.object,
                                     version: 0,
                                 });
-                        defs_by_op.entry(op_ref).or_default().push(MemoryDefFact {
-                            location: *location,
-                            previous_version,
-                            next_version: *next_version,
-                        });
+                        defs_by_inst
+                            .entry(inst_id)
+                            .or_default()
+                            .push(MemoryDefFact {
+                                location: *location,
+                                previous_version,
+                                next_version: *next_version,
+                            });
                         state.insert(location.object, *next_version);
                     }
                 }
@@ -600,7 +630,7 @@ fn build_memory_ssa(
         }
 
         if !changed {
-            break (uses_by_op, defs_by_op);
+            break (uses_by_inst, defs_by_inst);
         }
     };
 
@@ -617,17 +647,17 @@ fn build_memory_ssa(
     }
 
     MemorySSAFacts {
-        uses_by_op,
-        defs_by_op,
+        uses_by_inst,
+        defs_by_inst,
         phis_by_block,
     }
 }
 
-fn collect_predicate_facts(function: &SSAFunction) -> PredicateFacts {
+fn collect_predicate_facts(function: &SSAFunction, graph: &SsaGraph) -> PredicateFacts {
     let mut predicates = BTreeMap::new();
     let mut block_assumptions = BTreeMap::<u64, Vec<BlockAssumption>>::new();
     let mut switches = BTreeMap::new();
-    let compare_defs = collect_compare_defs(function);
+    let compare_defs = collect_compare_defs(function, graph);
     let mut next_predicate_id = 0u32;
 
     for &block_addr in function.block_addrs() {
@@ -652,7 +682,9 @@ fn collect_predicate_facts(function: &SSAFunction) -> PredicateFacts {
                     PredicateFact {
                         id,
                         block_addr,
-                        condition: cond.clone(),
+                        condition: graph
+                            .value_id_for_var(cond)
+                            .expect("predicate condition in graph"),
                         comparison: compare_defs.get(cond).cloned(),
                         true_target: *true_target,
                         false_target: *false_target,
@@ -680,7 +712,9 @@ fn collect_predicate_facts(function: &SSAFunction) -> PredicateFacts {
                     block_addr,
                     SwitchPredicateFact {
                         block_addr,
-                        selector: infer_switch_selector(function, block),
+                        selector: function
+                            .infer_switch_selector_var(block.addr)
+                            .and_then(|selector| graph.value_id_for_var(&selector)),
                         cases: cases.clone(),
                         default: *default,
                     },
@@ -697,150 +731,9 @@ fn collect_predicate_facts(function: &SSAFunction) -> PredicateFacts {
     }
 }
 
-fn infer_switch_selector(function: &SSAFunction, block: &FunctionSSABlock) -> Option<SSAVar> {
-    let target = block.ops.iter().rev().find_map(|op| match op {
-        SSAOp::BranchInd { target } => Some(target),
-        _ => None,
-    })?;
-    infer_switch_selector_from_var(function, target, 0)
-}
-
-fn infer_switch_selector_from_var(
-    function: &SSAFunction,
-    var: &SSAVar,
-    depth: u32,
-) -> Option<SSAVar> {
-    if depth > 16 {
-        return None;
-    }
-
-    let (block_addr, DefLocation::Op(op_idx)) = function.find_def(var)? else {
-        return None;
-    };
-    let block = function.get_block(block_addr)?;
-    let op = block.ops.get(op_idx)?;
-    match op {
-        SSAOp::Copy { src, .. }
-        | SSAOp::IntZExt { src, .. }
-        | SSAOp::IntSExt { src, .. }
-        | SSAOp::Trunc { src, .. }
-        | SSAOp::Cast { src, .. }
-        | SSAOp::Subpiece { src, .. } => infer_switch_selector_from_var(function, src, depth + 1),
-        SSAOp::Load { addr, .. } => {
-            if is_stack_slot_address(function, addr, depth + 1) {
-                Some(var.clone())
-            } else {
-                infer_switch_selector_from_addr(function, addr, depth + 1)
-            }
-        }
-        SSAOp::IntAdd { a, b, .. } => infer_switch_selector_from_sum(function, a, b, depth + 1),
-        SSAOp::IntSub { a, b, .. } => infer_switch_selector_from_sum(function, a, b, depth + 1),
-        SSAOp::IntMult { a, b, .. } => infer_scaled_switch_selector(function, a, b, depth + 1),
-        _ => None,
-    }
-}
-
-fn infer_switch_selector_from_addr(
-    function: &SSAFunction,
-    addr: &SSAVar,
-    depth: u32,
-) -> Option<SSAVar> {
-    if depth > 16 {
-        return None;
-    }
-
-    let (block_addr, DefLocation::Op(op_idx)) = function.find_def(addr)? else {
-        return None;
-    };
-    let block = function.get_block(block_addr)?;
-    let op = block.ops.get(op_idx)?;
-    match op {
-        SSAOp::Copy { src, .. }
-        | SSAOp::IntZExt { src, .. }
-        | SSAOp::IntSExt { src, .. }
-        | SSAOp::Trunc { src, .. }
-        | SSAOp::Cast { src, .. }
-        | SSAOp::Subpiece { src, .. } => infer_switch_selector_from_addr(function, src, depth + 1),
-        SSAOp::IntAdd { a, b, .. } => infer_switch_selector_from_sum(function, a, b, depth + 1),
-        SSAOp::IntSub { a, b, .. } => infer_switch_selector_from_sum(function, a, b, depth + 1),
-        SSAOp::IntMult { a, b, .. } => infer_scaled_switch_selector(function, a, b, depth + 1),
-        _ => None,
-    }
-}
-
-fn infer_switch_selector_from_sum(
-    function: &SSAFunction,
-    a: &SSAVar,
-    b: &SSAVar,
-    depth: u32,
-) -> Option<SSAVar> {
-    if is_constish_var(a) {
-        return infer_switch_selector_from_var(function, b, depth);
-    }
-    if is_constish_var(b) {
-        return infer_switch_selector_from_var(function, a, depth);
-    }
-    infer_scaled_switch_selector(function, a, b, depth)
-        .or_else(|| infer_scaled_switch_selector(function, b, a, depth))
-}
-
-fn infer_scaled_switch_selector(
-    function: &SSAFunction,
-    a: &SSAVar,
-    b: &SSAVar,
-    depth: u32,
-) -> Option<SSAVar> {
-    if is_constish_var(a) {
-        return infer_switch_selector_from_var(function, b, depth);
-    }
-    if is_constish_var(b) {
-        return infer_switch_selector_from_var(function, a, depth);
-    }
-    None
-}
-
-fn is_constish_var(var: &SSAVar) -> bool {
-    var.is_const() || var.name.starts_with("ram:")
-}
-
-fn is_stack_slot_address(function: &SSAFunction, var: &SSAVar, depth: u32) -> bool {
-    if depth > 16 {
-        return false;
-    }
-
-    let base = var.name.to_ascii_lowercase();
-    let base = base.split('_').next().unwrap_or(base.as_str());
-    if matches!(base, "rbp" | "rsp" | "ebp" | "esp" | "bp" | "sp") {
-        return true;
-    }
-
-    let Some((block_addr, DefLocation::Op(op_idx))) = function.find_def(var) else {
-        return false;
-    };
-    let Some(block) = function.get_block(block_addr) else {
-        return false;
-    };
-    let Some(op) = block.ops.get(op_idx) else {
-        return false;
-    };
-    match op {
-        SSAOp::Copy { src, .. }
-        | SSAOp::IntZExt { src, .. }
-        | SSAOp::IntSExt { src, .. }
-        | SSAOp::Trunc { src, .. }
-        | SSAOp::Cast { src, .. }
-        | SSAOp::Subpiece { src, .. } => is_stack_slot_address(function, src, depth + 1),
-        SSAOp::IntAdd { a, b, .. } | SSAOp::IntSub { a, b, .. } => {
-            (is_stack_slot_address(function, a, depth + 1) && is_constish_var(b))
-                || (is_stack_slot_address(function, b, depth + 1) && is_constish_var(a))
-        }
-        _ => false,
-    }
-}
-
-fn collect_call_sites(function: &SSAFunction) -> CallSiteFacts {
+fn collect_call_sites(function: &SSAFunction, graph: &SsaGraph) -> CallSiteFacts {
     let mut by_id = BTreeMap::new();
-    let mut by_op = BTreeMap::new();
+    let mut by_inst = BTreeMap::new();
     let mut next_id = 0u32;
 
     for &block_addr in function.block_addrs() {
@@ -862,17 +755,22 @@ fn collect_call_sites(function: &SSAFunction) -> CallSiteFacts {
                 SSAOp::Call { target } | SSAOp::CallInd { target } => target.clone(),
                 _ => continue,
             };
+            let Some(inst_id) = graph.inst_id_for_op_site(block_addr, op_idx) else {
+                continue;
+            };
+            let Some(target_id) = graph.value_id_for_var(&target) else {
+                continue;
+            };
             let id = CallSiteId(next_id);
             next_id = next_id.saturating_add(1);
-            let op_ref = SliceOpRef::Op { block_addr, op_idx };
             let direct_target = resolve_const_value(None, &target);
-            by_op.insert(op_ref, id);
+            by_inst.insert(inst_id, id);
             by_id.insert(
                 id,
                 CallSiteFact {
                     id,
-                    at: op_ref,
-                    target,
+                    at: inst_id,
+                    target: target_id,
                     direct_target,
                     fallthrough: if op_idx + 1 == block.ops.len() {
                         fallthrough
@@ -885,22 +783,31 @@ fn collect_call_sites(function: &SSAFunction) -> CallSiteFacts {
         }
     }
 
-    CallSiteFacts { by_id, by_op }
+    CallSiteFacts { by_id, by_inst }
 }
 
-fn collect_compare_defs(function: &SSAFunction) -> BTreeMap<SSAVar, CompareProvenance> {
+fn collect_compare_defs(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+) -> BTreeMap<SSAVar, CompareProvenance> {
     let mut compare_defs = BTreeMap::new();
     for block in function.blocks() {
         for op in &block.ops {
             let Some((dst, kind, lhs, rhs)) = compare_components(op) else {
                 continue;
             };
+            let Some(lhs_id) = graph.value_id_for_var(lhs) else {
+                continue;
+            };
+            let Some(rhs_id) = graph.value_id_for_var(rhs) else {
+                continue;
+            };
             compare_defs.insert(
                 dst.clone(),
                 CompareProvenance {
                     kind,
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
+                    lhs: lhs_id,
+                    rhs: rhs_id,
                 },
             );
         }
@@ -923,12 +830,13 @@ fn compare_components(op: &SSAOp) -> Option<(&SSAVar, CompareKind, &SSAVar, &SSA
 fn memory_location_for_addr(
     prep_facts: Option<&DecompilePrepFacts>,
     object_model: &ObjectModel,
+    graph: &SsaGraph,
     addr: &SSAVar,
     space: &str,
     size: u32,
 ) -> MemoryLocation {
     let object = object_model
-        .object_for_value(addr)
+        .object_for_var(graph, addr)
         .or_else(|| {
             resolve_stack_root(prep_facts, addr)
                 .and_then(|root| object_model.stack_objects.get(&root).copied())

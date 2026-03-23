@@ -5,8 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::{CFGEdge, SSAFunction};
 use r2ssa::cfg::BlockTerminator;
+use r2ssa::{CFGEdge, SSAFunction};
 
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
@@ -276,16 +276,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn unique_switch_block(&self) -> Option<u64> {
-        let mut switch_blocks = self
-            .func
-            .cfg()
-            .block_addrs()
-            .filter(|addr| {
-                self.func
-                    .cfg()
-                    .get_block(*addr)
-                    .is_some_and(|block| matches!(block.terminator, BlockTerminator::Switch { .. }))
-            });
+        let mut switch_blocks = self.func.cfg().block_addrs().filter(|addr| {
+            self.func
+                .cfg()
+                .get_block(*addr)
+                .is_some_and(|block| matches!(block.terminator, BlockTerminator::Switch { .. }))
+        });
         let block = switch_blocks.next()?;
         if switch_blocks.next().is_some() {
             return None;
@@ -298,9 +294,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .func
             .predecessors(addr)
             .into_iter()
-            .filter_map(|pred| {
-                Self::selector_expr_from_condition(&self.get_branch_condition(pred))
-            })
+            .filter_map(|pred| Self::selector_expr_from_condition(&self.get_branch_condition(pred)))
             .collect::<Vec<_>>();
         candidates.dedup();
         (candidates.len() == 1).then(|| candidates.pop()).flatten()
