@@ -213,6 +213,7 @@ static size_t struct_decl_memo_capacity = 0;
 /* Minimum bytes to pass to libsla (it reads ahead for variable-length instructions) */
 #define SLEIGH_MIN_BYTES 16
 #define SLEIGH_LIFT_BLOCK_MAX_ALLOC (1024 * 1024)
+#define SLEIGH_LIFT_PREFIX_HEAL_MAX_TRIMS 64
 #define SLEIGH_TAINT_MAX_BLOCKS 200
 #define SLEIGH_SIG_WRITEBACK_MAX_BLOCKS 200
 #define SLEIGH_SIG_WRITEBACK_GLOBAL_MAX_FCNS 128
@@ -893,40 +894,49 @@ static bool read_block_bytes_for_lifting(
 	const RAnalBlock *bb,
 	ut8 **out_buf,
 	size_t *out_len,
-	size_t *out_bb_size
+	size_t *out_lift_size,
+	size_t *out_logical_size
 ) {
-	size_t bb_size;
+	size_t logical_size;
+	size_t lift_size;
 	size_t read_len;
 	ut8 *buf;
 
-	R_RETURN_VAL_IF_FAIL (anal && bb && out_buf && out_len && out_bb_size, false);
+	R_RETURN_VAL_IF_FAIL (
+		anal && bb && out_buf && out_len && out_lift_size && out_logical_size,
+		false
+	);
 
 	if (!bb->size) {
 		return false;
 	}
+	logical_size = (size_t)bb->size;
 	if ((ut64)bb->size > (ut64)SLEIGH_LIFT_BLOCK_MAX_ALLOC) {
-		R_LOG_ERROR (
-			"r2sleigh: refusing to allocate %"PFMT64u" bytes for block at 0x%"PFMT64x,
+		R_LOG_WARN (
+			"r2sleigh: capping block read/lift from %"PFMT64u" to %u bytes at 0x%"PFMT64x,
 			(ut64)bb->size,
+			(unsigned int)SLEIGH_LIFT_BLOCK_MAX_ALLOC,
 			bb->addr
 		);
-		return false;
+		lift_size = (size_t)SLEIGH_LIFT_BLOCK_MAX_ALLOC;
+	} else {
+		lift_size = logical_size;
 	}
 
-	bb_size = (size_t)bb->size;
-	read_len = R_MAX (bb_size, (size_t)SLEIGH_MIN_BYTES);
+	read_len = R_MAX (lift_size, (size_t)SLEIGH_MIN_BYTES);
 	buf = calloc (1, read_len);
 	if (!buf) {
 		return false;
 	}
-	if (!anal->iob.read_at (anal->iob.io, bb->addr, buf, bb_size)) {
+	if (!anal->iob.read_at (anal->iob.io, bb->addr, buf, lift_size)) {
 		free (buf);
 		return false;
 	}
 
 	*out_buf = buf;
 	*out_len = read_len;
-	*out_bb_size = bb_size;
+	*out_lift_size = lift_size;
+	*out_logical_size = logical_size;
 	return true;
 }
 
@@ -2885,7 +2895,8 @@ static ut64 find_switch_search_start(RAnalFunction *fcn, RAnalBlock *bb) {
 
 static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAnalBlock *bb) {
 	ut8 *buf = NULL;
-	size_t bb_size;
+	size_t lift_size;
+	size_t logical_size;
 	size_t to_read;
 	ut64 jmp_addr;
 	ut64 table_addr;
@@ -2901,9 +2912,10 @@ static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAn
 		return false;
 	}
 
-	if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &bb_size)) {
+	if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &lift_size, &logical_size)) {
 		return false;
 	}
+	(void)logical_size;
 
 	jmp_addr = find_last_block_op_addr (anal, bb, buf, to_read);
 	if (jmp_addr == UT64_MAX || jmp_addr < bb->addr) {
@@ -3376,17 +3388,23 @@ static R2ILBlock *try_lift_prefix_healed_block(
 	RAnalBlock *bb,
 	const ut8 *buf,
 	size_t to_read,
-	size_t bb_size
+	size_t lift_size,
+	size_t logical_size
 ) {
-	size_t logical_size;
-	size_t prefix_size = bb_size;
+	size_t healed_size;
+	size_t prefix_size;
+	size_t min_prefix_size;
 
-	if (!ctx || !bb || !buf || bb_size <= 4) {
+	if (!ctx || !bb || !buf || lift_size <= 4) {
 		return NULL;
 	}
 
-	logical_size = healed_layout_size (bb, bb_size);
-	while (prefix_size > 4) {
+	healed_size = healed_layout_size (bb, logical_size);
+	prefix_size = lift_size;
+	min_prefix_size = R_MAX ((size_t)5, lift_size > SLEIGH_LIFT_PREFIX_HEAL_MAX_TRIMS
+		? lift_size - SLEIGH_LIFT_PREFIX_HEAL_MAX_TRIMS
+		: (size_t)5);
+	while (prefix_size > min_prefix_size) {
 		R2ILBlock *candidate;
 		prefix_size--;
 		candidate = r2il_lift_block (ctx, buf, to_read, bb->addr, prefix_size);
@@ -3399,7 +3417,7 @@ static R2ILBlock *try_lift_prefix_healed_block(
 			r2il_block_free (candidate);
 			continue;
 		}
-		r2il_block_rewrite_layout (candidate, bb->addr, (unsigned int)logical_size);
+		r2il_block_rewrite_layout (candidate, bb->addr, (unsigned int)healed_size);
 		return candidate;
 	}
 
@@ -3411,18 +3429,19 @@ static R2ILBlock *try_lift_suffix_healed_block(
 	RAnalBlock *bb,
 	const ut8 *buf,
 	size_t to_read,
-	size_t bb_size
+	size_t lift_size,
+	size_t logical_size
 ) {
 	size_t delta;
 	size_t max_delta;
-	size_t logical_size;
+	size_t healed_size;
 
-	if (!ctx || !bb || !buf || bb_size < 2 || to_read < 2) {
+	if (!ctx || !bb || !buf || lift_size < 2 || to_read < 2) {
 		return NULL;
 	}
 
-	logical_size = healed_layout_size (bb, bb_size);
-	max_delta = R_MIN (bb_size - 1, 8);
+	healed_size = healed_layout_size (bb, logical_size);
+	max_delta = R_MIN (lift_size - 1, 8);
 	for (delta = 1; delta <= max_delta; delta++) {
 		R2ILBlock *candidate;
 		if (delta >= to_read) {
@@ -3433,7 +3452,7 @@ static R2ILBlock *try_lift_suffix_healed_block(
 			buf + delta,
 			to_read - delta,
 			bb->addr + delta,
-			(unsigned int)(bb_size - delta)
+			(unsigned int)(lift_size - delta)
 		);
 		if (!candidate) {
 			continue;
@@ -3444,7 +3463,7 @@ static R2ILBlock *try_lift_suffix_healed_block(
 			r2il_block_free (candidate);
 			continue;
 		}
-		r2il_block_rewrite_layout (candidate, bb->addr, (unsigned int)logical_size);
+		r2il_block_rewrite_layout (candidate, bb->addr, (unsigned int)healed_size);
 		return candidate;
 	}
 
@@ -3481,11 +3500,12 @@ static R2ILBlock *lift_function_block_healed(
 	RAnalBlock *bb,
 	const ut8 *buf,
 	size_t to_read,
-	size_t bb_size
+	size_t lift_size,
+	size_t logical_size
 ) {
 	R2ILBlock *block;
 
-	block = r2il_lift_block (ctx, buf, to_read, bb->addr, (unsigned int)bb_size);
+	block = r2il_lift_block (ctx, buf, to_read, bb->addr, (unsigned int)lift_size);
 	if (block && !lifted_block_needs_heal (bb, block)) {
 		return block;
 	}
@@ -3494,12 +3514,12 @@ static R2ILBlock *lift_function_block_healed(
 	}
 
 	if (block_has_linear_direct_jump (bb)) {
-		block = try_lift_prefix_healed_block (ctx, bb, buf, to_read, bb_size);
+		block = try_lift_prefix_healed_block (ctx, bb, buf, to_read, lift_size, logical_size);
 		if (block) {
 			return block;
 		}
 
-		block = try_lift_suffix_healed_block (ctx, bb, buf, to_read, bb_size);
+		block = try_lift_suffix_healed_block (ctx, bb, buf, to_read, lift_size, logical_size);
 		if (block) {
 			return block;
 		}
@@ -3526,16 +3546,26 @@ static bool lift_function_blocks(RAnal *anal, RAnalFunction *fcn, R2ILContext *c
 
 	r_list_foreach (fcn->bbs, iter, bb) {
 		ut8 *buf = NULL;
-		size_t bb_size = 0;
+		size_t lift_size = 0;
+		size_t logical_size = 0;
 		size_t to_read = 0;
 
-		if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &bb_size)) {
+		if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &lift_size, &logical_size)) {
 			R_LOG_ERROR ("r2sleigh: failed to read block at 0x%"PFMT64x, bb->addr);
 			continue;
 		}
 
 		/* Lift entire basic block (multiple instructions) */
-		R2ILBlock *block = lift_function_block_healed (anal, fcn, ctx, bb, buf, to_read, bb_size);
+		R2ILBlock *block = lift_function_block_healed (
+			anal,
+			fcn,
+			ctx,
+			bb,
+			buf,
+			to_read,
+			lift_size,
+			logical_size
+		);
 		if (block) {
 			/* Check if this block has switch info from radare2's analysis */
 			RAnalBlock *switch_bb = find_best_switch_metadata_block(anal, fcn, bb);
