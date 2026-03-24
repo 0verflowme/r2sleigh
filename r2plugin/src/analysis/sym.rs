@@ -2,6 +2,7 @@ use crate::blocks::BlockSlice;
 use crate::context::require_ctx_view;
 use crate::{ArchSpec, R2ILBlock, R2ILContext, parse_addr_name_map};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -107,6 +108,30 @@ fn sym_error_json(message: &str) -> *mut c_char {
 fn sym_symbol_map() -> &'static Mutex<HashMap<u64, String>> {
     static MAP: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_seed_interproc_summary_set(
+    prepared: &r2ssa::SsaArtifact,
+    symbol_map: &HashMap<u64, String>,
+) -> r2ssa::InterprocSummarySet {
+    let mut summaries = BTreeMap::new();
+    for call in prepared.call_sites().by_id.values() {
+        let Some(target) = call.direct_target else {
+            continue;
+        };
+        let Some(name) = symbol_map.get(&target) else {
+            continue;
+        };
+        let id = r2ssa::InterprocFunctionId(target);
+        if let Some(summary) = r2ssa::FunctionSemanticSummary::seed_for_name(id, name) {
+            summaries.insert(id, summary);
+        }
+    }
+    r2ssa::InterprocSummarySet {
+        root: None,
+        summaries,
+        diagnostics: r2ssa::InterprocSummaryDiagnostics::default(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -266,8 +291,15 @@ pub extern "C" fn r2sym_function(
         if let Some(arch) = ctx_view.arch
             && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
         {
+            let interproc = build_seed_interproc_summary_set(&prepared, &symbol_map);
             let _ =
                 registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+            let _ = registry.install_interproc_summaries_for_function(
+                &mut explorer,
+                &prepared,
+                &interproc,
+                &symbol_map,
+            );
         }
         let results = explorer.explore(&prepared, initial_state);
         let stats = explorer.stats().clone();
@@ -343,8 +375,15 @@ pub extern "C" fn r2sym_paths(
         if let Some(arch) = ctx_view.arch
             && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
         {
+            let interproc = build_seed_interproc_summary_set(&prepared, &symbol_map);
             let _ =
                 registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+            let _ = registry.install_interproc_summaries_for_function(
+                &mut explorer,
+                &prepared,
+                &interproc,
+                &symbol_map,
+            );
         }
         let results = explorer.explore(&prepared, initial_state);
         (results, explorer)
@@ -398,8 +437,15 @@ pub extern "C" fn r2sym_explore_to(
         if let Some(arch) = ctx_view.arch
             && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
         {
+            let interproc = build_seed_interproc_summary_set(&prepared, &symbol_map);
             let _ =
                 registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+            let _ = registry.install_interproc_summaries_for_function(
+                &mut explorer,
+                &prepared,
+                &interproc,
+                &symbol_map,
+            );
         }
         let matched = explorer.find_paths_to(&prepared, initial_state, target_addr);
         let stats = explorer.stats().clone();
@@ -465,8 +511,15 @@ pub extern "C" fn r2sym_solve_to(
         if let Some(arch) = ctx_view.arch
             && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
         {
+            let interproc = build_seed_interproc_summary_set(&prepared, &symbol_map);
             let _ =
                 registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+            let _ = registry.install_interproc_summaries_for_function(
+                &mut explorer,
+                &prepared,
+                &interproc,
+                &symbol_map,
+            );
         }
         let matched = explorer.find_paths_to(&prepared, initial_state, target_addr);
         let stats = explorer.stats().clone();

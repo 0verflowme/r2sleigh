@@ -113,6 +113,22 @@ struct VisibleExprQuality {
     node_penalty: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RenderCandidateSource {
+    ExactNameDefinition,
+    ValueDefinition,
+    SemanticValue,
+    ForwardedValue,
+    AliasDefinition,
+    RawDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RenderCandidate {
+    expr: CExpr,
+    source: RenderCandidateSource,
+}
+
 impl LowerFrame {
     fn for_expr() -> Self {
         Self {
@@ -6217,6 +6233,88 @@ impl<'a> FoldingContext<'a> {
         result
     }
 
+    fn render_candidate_rank(source: RenderCandidateSource) -> usize {
+        match source {
+            RenderCandidateSource::ExactNameDefinition => 0,
+            RenderCandidateSource::SemanticValue => 1,
+            RenderCandidateSource::ForwardedValue => 2,
+            RenderCandidateSource::ValueDefinition => 3,
+            RenderCandidateSource::AliasDefinition => 4,
+            RenderCandidateSource::RawDefinition => 5,
+        }
+    }
+
+    fn choose_preferred_render_candidate(
+        &self,
+        current: Option<RenderCandidate>,
+        candidate: Option<RenderCandidate>,
+        context: VisibleExprContext,
+    ) -> Option<RenderCandidate> {
+        match (current, candidate) {
+            (None, None) => None,
+            (Some(current), None) => Some(current),
+            (None, Some(candidate)) => Some(candidate),
+            (Some(current), Some(candidate)) => {
+                let chosen = self.choose_preferred_visible_expr_in_context(
+                    Some(current.expr.clone()),
+                    Some(candidate.expr.clone()),
+                    context,
+                );
+                match chosen {
+                    Some(expr) if expr == current.expr && expr != candidate.expr => Some(current),
+                    Some(expr) if expr == candidate.expr && expr != current.expr => Some(candidate),
+                    Some(_) => {
+                        if Self::render_candidate_rank(candidate.source)
+                            < Self::render_candidate_rank(current.source)
+                        {
+                            Some(candidate)
+                        } else {
+                            Some(current)
+                        }
+                    }
+                    None => None,
+                }
+            }
+        }
+    }
+
+    fn render_candidate_for_value_id_with_depth(
+        &self,
+        value_id: r2ssa::ValueId,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> Option<RenderCandidate> {
+        let mut best =
+            self.definition_for_value_id(value_id)
+                .cloned()
+                .map(|expr| RenderCandidate {
+                    expr,
+                    source: RenderCandidateSource::ValueDefinition,
+                });
+
+        let mut semantic_visited = visited.clone();
+        let semantic = self
+            .semantic_value_for_value_id(value_id)
+            .and_then(|value| self.render_semantic_value(value, depth, &mut semantic_visited))
+            .map(|expr| RenderCandidate {
+                expr,
+                source: RenderCandidateSource::SemanticValue,
+            });
+        best = self.choose_preferred_render_candidate(best, semantic, VisibleExprContext::Generic);
+
+        let forwarded = self
+            .forwarded_value_for_value_id(value_id)
+            .and_then(|prov| {
+                self.lookup_definition_with_depth(&prov.source, depth + 1, visited)
+                    .or_else(|| Some(self.expr_for_ssa_fallback_name(&prov.source)))
+            })
+            .map(|expr| RenderCandidate {
+                expr,
+                source: RenderCandidateSource::ForwardedValue,
+            });
+        self.choose_preferred_render_candidate(best, forwarded, VisibleExprContext::Generic)
+    }
+
     fn direct_definition_expr(&self, name: &str) -> Option<CExpr> {
         self.use_info().render_definition_for_name(name).cloned()
     }
@@ -6240,12 +6338,30 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        let mut best = self.render_semantic_value_by_name(name, depth, visited);
+        let mut best = self.value_id_for_name(name).and_then(|value_id| {
+            self.render_candidate_for_value_id_with_depth(value_id, depth, visited)
+        });
+
+        let exact = self
+            .direct_definition_expr(name)
+            .map(|expr| RenderCandidate {
+                expr,
+                source: RenderCandidateSource::ExactNameDefinition,
+            });
+        best = self.choose_preferred_render_candidate(best, exact, VisibleExprContext::Generic);
+
+        let semantic = self
+            .render_semantic_value_by_name(name, depth, visited)
+            .map(|expr| RenderCandidate {
+                expr,
+                source: RenderCandidateSource::SemanticValue,
+            });
+        best = self.choose_preferred_render_candidate(best, semantic, VisibleExprContext::Generic);
 
         let raw = self
             .lookup_definition_raw_with_depth(name, depth + 1, visited)
             .map(|expr| {
-                if matches!(&expr, CExpr::Var(raw_name) if self.should_preserve_address_like_visible_name(raw_name))
+                let expr = if matches!(&expr, CExpr::Var(raw_name) if self.should_preserve_address_like_visible_name(raw_name))
                     || matches!(&expr, CExpr::AddrOf(inner) if matches!(inner.as_ref(), CExpr::Var(raw_name) if !self.is_low_signal_visible_name(raw_name) && !self.is_transient_visible_name(raw_name)))
                 {
                     expr
@@ -6262,36 +6378,41 @@ impl<'a> FoldingContext<'a> {
                     } else {
                         expr
                     }
+                };
+                RenderCandidate {
+                    expr,
+                    source: RenderCandidateSource::RawDefinition,
                 }
             });
-        best = match (best, raw) {
-            (Some(current), Some(candidate))
-                if (Self::expr_is_scalar_memory_candidate(&candidate)
-                    || Self::expr_is_structured_memory_candidate(&candidate))
-                    && !Self::expr_is_scalar_memory_candidate(&current)
-                    && !Self::expr_is_structured_memory_candidate(&current) =>
-            {
-                Some(candidate)
-            }
-            (current, candidate) => self.choose_preferred_visible_expr(current, candidate),
-        };
+        best = self.choose_preferred_render_candidate(best, raw, VisibleExprContext::Generic);
 
         if let Some(prov) = self.forwarded_value_for_name(name) {
             let resolved = self
                 .lookup_definition_with_depth(&prov.source, depth + 1, visited)
                 .or_else(|| Some(self.expr_for_ssa_fallback_name(&prov.source)));
-            best = self.choose_preferred_visible_expr(best, resolved);
+            best = self.choose_preferred_render_candidate(
+                best,
+                resolved.map(|expr| RenderCandidate {
+                    expr,
+                    source: RenderCandidateSource::ForwardedValue,
+                }),
+                VisibleExprContext::Generic,
+            );
         }
 
         let rendered = self
             .find_ssa_name_for_rendered_alias(name)
-            .and_then(|ssa_name| self.lookup_definition_with_depth(&ssa_name, depth + 1, visited));
-        best = self.choose_preferred_visible_expr(best, rendered);
+            .and_then(|ssa_name| self.lookup_definition_with_depth(&ssa_name, depth + 1, visited))
+            .map(|expr| RenderCandidate {
+                expr,
+                source: RenderCandidateSource::AliasDefinition,
+            });
+        best = self.choose_preferred_render_candidate(best, rendered, VisibleExprContext::Generic);
         self.definition_lookup_in_progress
             .borrow_mut()
             .remove(&in_progress_key);
         visited.remove(&visit_key);
-        best
+        best.map(|candidate| candidate.expr)
     }
 
     pub(super) fn lookup_definition_raw(&self, name: &str) -> Option<CExpr> {
@@ -6322,20 +6443,42 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        let mut best = self.direct_definition_expr(name);
+        let mut best = self
+            .direct_definition_expr(name)
+            .map(|expr| RenderCandidate {
+                expr,
+                source: RenderCandidateSource::ExactNameDefinition,
+            });
+        if let Some(value_id) = self.value_id_for_name(name) {
+            best = self.choose_preferred_render_candidate(
+                best,
+                self.definition_for_value_id(value_id)
+                    .cloned()
+                    .map(|expr| RenderCandidate {
+                        expr,
+                        source: RenderCandidateSource::ValueDefinition,
+                    }),
+                VisibleExprContext::Generic,
+            );
+        }
         if let Some(ssa_name) = self.find_ssa_name_for_rendered_alias(name)
             && ssa_name != name
         {
-            best = self.choose_preferred_visible_expr(
+            best = self.choose_preferred_render_candidate(
                 best,
-                self.lookup_definition_raw_with_depth(&ssa_name, depth + 1, visited),
+                self.lookup_definition_raw_with_depth(&ssa_name, depth + 1, visited)
+                    .map(|expr| RenderCandidate {
+                        expr,
+                        source: RenderCandidateSource::AliasDefinition,
+                    }),
+                VisibleExprContext::Generic,
             );
         }
         self.definition_raw_in_progress
             .borrow_mut()
             .remove(&in_progress_key);
         visited.remove(&visit_key);
-        best
+        best.map(|candidate| candidate.expr)
     }
 
     pub(super) fn find_ssa_name_for_rendered_alias(&self, name: &str) -> Option<String> {

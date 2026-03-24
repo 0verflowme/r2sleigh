@@ -15816,6 +15816,8 @@ mod tests {
                     },
                 )]),
                 memory_effects: Vec::new(),
+                param_type_hints: BTreeMap::new(),
+                return_type_hint: None,
                 return_relation: CalleeReturnRelation::HeapAlloc,
                 reads_global_memory: false,
                 writes_global_memory: false,

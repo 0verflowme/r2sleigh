@@ -48,8 +48,8 @@ pub use graph::{
 pub use interproc::{
     AbiProfile, FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput,
     InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet, SummaryArgEffect,
-    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryReturnRelation,
-    solve_interproc_summary_set,
+    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange,
+    SummaryMemoryRegion, SummaryReturnRelation, solve_interproc_summary_set,
 };
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};

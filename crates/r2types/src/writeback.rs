@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::{
     FunctionSemanticSummary, InterprocSummarySet, SSABlock, SSAOp, SSAVar, SummaryArgEffect,
-    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryReturnRelation,
+    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryRegion, SummaryReturnRelation,
 };
 
 use crate::context::{
@@ -16,9 +16,9 @@ use crate::external::{
 };
 use crate::facts::{
     CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
-    CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFactInputs,
-    FunctionTypeFacts, InterprocFactDiagnostics, VisibleBinding, VisibleBindingKind,
-    parse_type_like_spec,
+    CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
+    FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics,
+    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
 use crate::model::Signedness;
 
@@ -260,25 +260,53 @@ fn summary_memory_effect_to_callee(effect: &SummaryMemoryEffect) -> CalleeMemory
         SummaryMemoryEffectKind::Escape => CalleeMemoryEffectKind::Escape,
         SummaryMemoryEffectKind::Free => CalleeMemoryEffectKind::Free,
     };
-    let location = match effect.location {
-        SummaryMemoryLocation::Arg {
-            index,
-            offset,
-            width,
-        } => CalleeMemoryLocation::Arg {
-            index,
-            offset,
-            width,
+    let location = CalleeMemoryLocation {
+        region: match effect.location.region {
+            SummaryMemoryRegion::Arg { index } => CalleeMemoryRegion::Arg { index },
+            SummaryMemoryRegion::Global { address } => CalleeMemoryRegion::Global { address },
+            SummaryMemoryRegion::HeapReturn => CalleeMemoryRegion::HeapReturn,
+            SummaryMemoryRegion::Unknown => CalleeMemoryRegion::Unknown,
         },
-        SummaryMemoryLocation::Global { address, width } => {
-            CalleeMemoryLocation::Global { address, width }
-        }
-        SummaryMemoryLocation::Unknown => CalleeMemoryLocation::Unknown,
+        range: effect.location.range.map(|range| CalleeMemoryRange {
+            offset_lo: range.offset_lo,
+            offset_hi: range.offset_hi,
+            width: range.width,
+        }),
     };
     CalleeMemoryEffect { kind, location }
 }
 
+fn summary_param_type_hints(summary: &FunctionSemanticSummary) -> BTreeMap<usize, CTypeLike> {
+    let pointer_ty = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+    let mut hints = BTreeMap::new();
+    let mut max_idx = summary.arg_effects.keys().copied().max().unwrap_or(0);
+    for effect in &summary.memory_effects {
+        if let SummaryMemoryRegion::Arg { index } = effect.location.region {
+            max_idx = max_idx.max(index);
+        }
+    }
+    for idx in 0..=max_idx {
+        if summary_suggests_pointer_param(summary, idx) {
+            hints.insert(idx, pointer_ty.clone());
+        }
+    }
+    hints
+}
+
+fn summary_return_type_hint(
+    summary: &FunctionSemanticSummary,
+    param_type_hints: &BTreeMap<usize, CTypeLike>,
+) -> Option<CTypeLike> {
+    match summary.return_relation {
+        SummaryReturnRelation::HeapAlloc => Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
+        SummaryReturnRelation::Arg(idx) => param_type_hints.get(&idx).cloned(),
+        _ => None,
+    }
+}
+
 fn summary_to_callee_fact(summary: &FunctionSemanticSummary) -> CalleeFact {
+    let param_type_hints = summary_param_type_hints(summary);
+    let return_type_hint = summary_return_type_hint(summary, &param_type_hints);
     CalleeFact {
         function_id: summary.id.0,
         name: summary.name.clone(),
@@ -295,6 +323,8 @@ fn summary_to_callee_fact(summary: &FunctionSemanticSummary) -> CalleeFact {
             .iter()
             .map(summary_memory_effect_to_callee)
             .collect(),
+        param_type_hints,
+        return_type_hint,
         return_relation: summary_return_relation_to_callee(&summary.return_relation),
         reads_global_memory: summary.reads_global_memory,
         writes_global_memory: summary.writes_global_memory,
@@ -331,10 +361,7 @@ fn summary_suggests_pointer_param(summary: &FunctionSemanticSummary, idx: usize)
         .get(&idx)
         .is_some_and(|effect| effect.read || effect.write || effect.escape || effect.free)
         || summary.memory_effects.iter().any(|effect| {
-            matches!(
-                effect.location,
-                SummaryMemoryLocation::Arg { index, .. } if index == idx
-            )
+            matches!(effect.location.region, SummaryMemoryRegion::Arg { index } if index == idx)
         })
 }
 
@@ -608,6 +635,8 @@ pub fn build_type_writeback_analysis(
                 max_iterations: summary_set.diagnostics.max_iterations,
                 converged: summary_set.diagnostics.converged,
                 scope_size: summary_set.diagnostics.scope_size,
+                scc_count: summary_set.diagnostics.scc_count,
+                max_scc_size: summary_set.diagnostics.max_scc_size,
             })
             .unwrap_or_default(),
         diagnostics: diagnostics.solver_warnings.clone(),
@@ -4087,6 +4116,8 @@ mod tests {
             max_iterations: 8,
             converged: true,
             scope_size: 1,
+            scc_count: 1,
+            max_scc_size: 1,
         };
 
         let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
@@ -4179,18 +4210,16 @@ mod tests {
                 memory_effects: vec![
                     r2ssa::SummaryMemoryEffect {
                         kind: r2ssa::SummaryMemoryEffectKind::Write,
-                        location: r2ssa::SummaryMemoryLocation::Arg {
-                            index: 0,
-                            offset: None,
-                            width: None,
+                        location: r2ssa::SummaryMemoryLocation {
+                            region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                            range: None,
                         },
                     },
                     r2ssa::SummaryMemoryEffect {
                         kind: r2ssa::SummaryMemoryEffectKind::Read,
-                        location: r2ssa::SummaryMemoryLocation::Arg {
-                            index: 1,
-                            offset: None,
-                            width: None,
+                        location: r2ssa::SummaryMemoryLocation {
+                            region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                            range: None,
                         },
                     },
                 ],
@@ -4254,7 +4283,10 @@ mod tests {
                 effect,
                 crate::facts::CalleeMemoryEffect {
                     kind: crate::facts::CalleeMemoryEffectKind::Write,
-                    location: crate::facts::CalleeMemoryLocation::Arg { index: 0, .. },
+                    location: crate::facts::CalleeMemoryLocation {
+                        region: crate::facts::CalleeMemoryRegion::Arg { index: 0 },
+                        ..
+                    },
                 }
             )
         }));
@@ -4263,7 +4295,10 @@ mod tests {
                 effect,
                 crate::facts::CalleeMemoryEffect {
                     kind: crate::facts::CalleeMemoryEffectKind::Read,
-                    location: crate::facts::CalleeMemoryLocation::Arg { index: 1, .. },
+                    location: crate::facts::CalleeMemoryLocation {
+                        region: crate::facts::CalleeMemoryRegion::Arg { index: 1 },
+                        ..
+                    },
                 }
             )
         }));
@@ -4294,10 +4329,13 @@ mod tests {
                     )]),
                     memory_effects: vec![r2ssa::SummaryMemoryEffect {
                         kind: r2ssa::SummaryMemoryEffectKind::Write,
-                        location: r2ssa::SummaryMemoryLocation::Arg {
-                            index: 0,
-                            offset: None,
-                            width: Some(8),
+                        location: r2ssa::SummaryMemoryLocation {
+                            region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                            range: Some(r2ssa::SummaryMemoryRange {
+                                offset_lo: 0,
+                                offset_hi: 7,
+                                width: Some(8),
+                            }),
                         },
                     }],
                     return_relation: SummaryReturnRelation::Void,
