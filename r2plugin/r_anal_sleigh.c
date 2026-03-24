@@ -445,9 +445,11 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 		return strdup ("{}");
 	}
 	RAnalFcnContext *ctx = sleigh_function_context_api.collect (anal, fcn);
+	RList *base_types = r_anal_types_baselist (anal);
 
 	PJ *pj = pj_new ();
 	if (!pj) {
+		r_list_free (base_types);
 		sleigh_function_context_api.free (ctx);
 		return strdup ("{}");
 	}
@@ -546,8 +548,8 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	pj_k (pj, "base_types");
 	pj_a (pj);
 	RAnalBaseType *type;
-	if (ctx && ctx->base_types) {
-		r_list_foreach (ctx->base_types, iter, type) {
+	if (base_types) {
+		r_list_foreach (base_types, iter, type) {
 			append_function_context_base_type (pj, type);
 		}
 	}
@@ -555,6 +557,7 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	pj_end (pj);
 
 	char *json = pj_drain (pj);
+	r_list_free (base_types);
 	sleigh_function_context_api.free (ctx);
 	return json? json: strdup ("{}");
 }
