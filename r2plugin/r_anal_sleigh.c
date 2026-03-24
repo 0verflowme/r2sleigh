@@ -212,7 +212,7 @@ static size_t struct_decl_memo_capacity = 0;
 
 /* Minimum bytes to pass to libsla (it reads ahead for variable-length instructions) */
 #define SLEIGH_MIN_BYTES 16
-#define SLEIGH_BLOCK_MAX_BYTES 256
+#define SLEIGH_LIFT_BLOCK_MAX_ALLOC (1024 * 1024)
 #define SLEIGH_TAINT_MAX_BLOCKS 200
 #define SLEIGH_SIG_WRITEBACK_MAX_BLOCKS 200
 #define SLEIGH_SIG_WRITEBACK_GLOBAL_MAX_FCNS 128
@@ -886,6 +886,48 @@ static const char *skip_cmd_spaces(const char *s) {
 		s++;
 	}
 	return s;
+}
+
+static bool read_block_bytes_for_lifting(
+	RAnal *anal,
+	const RAnalBlock *bb,
+	ut8 **out_buf,
+	size_t *out_len,
+	size_t *out_bb_size
+) {
+	size_t bb_size;
+	size_t read_len;
+	ut8 *buf;
+
+	R_RETURN_VAL_IF_FAIL (anal && bb && out_buf && out_len && out_bb_size, false);
+
+	if (!bb->size) {
+		return false;
+	}
+	if ((ut64)bb->size > (ut64)SLEIGH_LIFT_BLOCK_MAX_ALLOC) {
+		R_LOG_ERROR (
+			"r2sleigh: refusing to allocate %"PFMT64u" bytes for block at 0x%"PFMT64x,
+			(ut64)bb->size,
+			bb->addr
+		);
+		return false;
+	}
+
+	bb_size = (size_t)bb->size;
+	read_len = R_MAX (bb_size, (size_t)SLEIGH_MIN_BYTES);
+	buf = calloc (1, read_len);
+	if (!buf) {
+		return false;
+	}
+	if (!anal->iob.read_at (anal->iob.io, bb->addr, buf, bb_size)) {
+		free (buf);
+		return false;
+	}
+
+	*out_buf = buf;
+	*out_len = read_len;
+	*out_bb_size = bb_size;
+	return true;
 }
 
 static bool parse_sym_target_expr(RCore *core, const char *expr, ut64 *target) {
@@ -2842,7 +2884,7 @@ static ut64 find_switch_search_start(RAnalFunction *fcn, RAnalBlock *bb) {
 }
 
 static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAnalBlock *bb) {
-	ut8 buf[SLEIGH_BLOCK_MAX_BYTES];
+	ut8 *buf = NULL;
 	size_t bb_size;
 	size_t to_read;
 	ut64 jmp_addr;
@@ -2859,18 +2901,13 @@ static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAn
 		return false;
 	}
 
-	bb_size = R_MIN (bb->size, sizeof (buf));
-	to_read = bb_size;
-	if (!anal->iob.read_at (anal->iob.io, bb->addr, buf, to_read)) {
+	if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &bb_size)) {
 		return false;
-	}
-	if (to_read < SLEIGH_MIN_BYTES) {
-		memset (buf + to_read, 0, SLEIGH_MIN_BYTES - to_read);
-		to_read = SLEIGH_MIN_BYTES;
 	}
 
 	jmp_addr = find_last_block_op_addr (anal, bb, buf, to_read);
 	if (jmp_addr == UT64_MAX || jmp_addr < bb->addr) {
+		free (buf);
 		return false;
 	}
 
@@ -2884,6 +2921,7 @@ static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAn
 	);
 	if (jmp_len < 1) {
 		r_anal_op_fini (&jmp_op);
+		free (buf);
 		return false;
 	}
 
@@ -2891,11 +2929,13 @@ static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAn
 		const ut32 jmp_type = jmp_op.type & R_ANAL_OP_TYPE_MASK;
 		if (jmp_type != R_ANAL_OP_TYPE_RJMP && jmp_type != R_ANAL_OP_TYPE_UJMP) {
 			r_anal_op_fini (&jmp_op);
+			free (buf);
 			return false;
 		}
 	}
 	if (!recover_switch_table_addr_from_op (&jmp_op, &table_addr)) {
 		r_anal_op_fini (&jmp_op);
+		free (buf);
 		return false;
 	}
 
@@ -2925,6 +2965,7 @@ static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAn
 	}
 	if (!ok || !table_size || table_size > 0x1000) {
 		r_anal_op_fini (&jmp_op);
+		free (buf);
 		return false;
 	}
 
@@ -2943,6 +2984,7 @@ static bool recover_missing_delta_switch_op(RAnal *anal, RAnalFunction *fcn, RAn
 		false
 	);
 	r_anal_op_fini (&jmp_op);
+	free (buf);
 	return ok && block_has_usable_switch_op (bb) && bb->switch_op->cases;
 }
 
@@ -3483,19 +3525,13 @@ static bool lift_function_blocks(RAnal *anal, RAnalFunction *fcn, R2ILContext *c
 	split_missing_switch_case_targets (anal, fcn);
 
 	r_list_foreach (fcn->bbs, iter, bb) {
-		ut8 buf[SLEIGH_BLOCK_MAX_BYTES];
-		size_t bb_size = R_MIN (bb->size, sizeof (buf));
-		size_t to_read = bb_size;
+		ut8 *buf = NULL;
+		size_t bb_size = 0;
+		size_t to_read = 0;
 
-		if (!anal->iob.read_at (anal->iob.io, bb->addr, buf, to_read)) {
+		if (!read_block_bytes_for_lifting (anal, bb, &buf, &to_read, &bb_size)) {
 			R_LOG_ERROR ("r2sleigh: failed to read block at 0x%"PFMT64x, bb->addr);
 			continue;
-		}
-
-		/* Ensure minimum bytes for libsla (it reads ahead for variable-length instructions) */
-		if (to_read < SLEIGH_MIN_BYTES) {
-			memset (buf + to_read, 0, SLEIGH_MIN_BYTES - to_read);
-			to_read = SLEIGH_MIN_BYTES;
 		}
 
 		/* Lift entire basic block (multiple instructions) */
@@ -3562,10 +3598,12 @@ static bool lift_function_blocks(RAnal *anal, RAnalFunction *fcn, R2ILContext *c
 					R_LOG_ERROR ("r2sleigh: invalid block at 0x%"PFMT64x, bb->addr);
 				}
 				r2il_block_free (block);
+				free (buf);
 				continue;
 			}
 			block_array_push (out, block);
 		}
+		free (buf);
 		}
 
 	return out->count > 0;

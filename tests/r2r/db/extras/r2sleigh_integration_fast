@@ -313,3 +313,27 @@ af
 a:sla.types | jq -c '(.ret_type == "void *" or .ret_type == "void*") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
 EOF_CMDS
 RUN
+
+NAME=large_basic_block_function_keeps_cfg_and_ssa_connected
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaaa
+s sym.large_basic_block_guard >/dev/null
+af
+?v $$ > /dev/null
+a:sla.cfg.json > /tmp/r2sleigh_large_block_cfg.json
+a:sla.ssa.func > /tmp/r2sleigh_large_block_ssa.json
+jq -n -c \
+  --slurpfile cfg /tmp/r2sleigh_large_block_cfg.json \
+  --slurpfile ssa /tmp/r2sleigh_large_block_ssa.json \
+  '($cfg[0].blocks[0].size > 256)
+   and (($cfg[0].blocks[0].successors | length) > 0)
+   and ($cfg[0].num_blocks > 1)
+   and ($ssa[0].num_blocks > 1)
+   and (($ssa[0].blocks | length) > 1)'
+EOF_CMDS
+RUN
