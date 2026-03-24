@@ -1,23 +1,23 @@
 NAME=signature_struct_array_index_full_snapshot
-FILE=bins/vuln_test
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"addr":4200495,"name":"dbg.test_struct_array_index","size":124,"is-pure":"true","realsz":124,"noreturn":false,"recursive":false,"stackframe":8,"calltype":"amd64","cost":42,"cc":1,"bits":64,"file":"vuln_test.c","type":"fcn","nbbs":1,"tracecov":0,"is-lineal":true,"ninstrs":40,"edges":0,"ebbs":1,"signature":"int dbg.test_struct_array_index (DemoStruct *arr, int idx, int v);","minaddr":4200495,"maxaddr":4200619,"maxbbins":40,"midbbins":40.000,"ratbbins":1.000,"indegree":1,"outdegree":0,"nlocals":3,"nargs":4,"difftype":"new"}]
+{"calltype":"amd64","name":"dbg.test_struct_array_index","nargs":4,"nlocals":3,"signature":"int32_t dbg.test_struct_array_index (struct sla_struct_420703e08f70f00e *arr, int32_t idx, int32_t v);","size":124}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-afij @ sym.test_struct_array_index
+aflj | jq -c 'map(select(.name | test("(^sym\\._?|^dbg\\.)test_struct_array_index$")))[0] | {name,size,calltype,signature,nlocals,nargs}' | python3 normalize_snapshot.py signature-json
 EOF_CMDS
 RUN
 
 NAME=signature_array_index_full_snapshot
-FILE=bins/vuln_test
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"addr":4199799,"name":"dbg.test_array_index","size":39,"is-pure":"true","realsz":39,"noreturn":false,"recursive":false,"stackframe":8,"calltype":"amd64","cost":15,"cc":1,"bits":64,"file":"vuln_test.c","type":"fcn","nbbs":1,"tracecov":0,"is-lineal":true,"ninstrs":13,"edges":0,"ebbs":1,"signature":"int dbg.test_array_index (int *arr, int idx);","minaddr":4199799,"maxaddr":4199838,"maxbbins":13,"midbbins":13.000,"ratbbins":1.000,"indegree":1,"outdegree":0,"nlocals":2,"nargs":3,"difftype":"new"}]
+{"calltype":"amd64","name":"dbg.test_array_index","nargs":3,"nlocals":2,"signature":"int dbg.test_array_index (int *arr, int idx);","size":39}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-afij @ sym.test_array_index
+aflj | jq -c 'map(select(.name | test("(^sym\\._?|^dbg\\.)test_array_index$")))[0] | {name,size,calltype,signature,nlocals,nargs}' | python3 normalize_snapshot.py signature-json
 EOF_CMDS
 RUN

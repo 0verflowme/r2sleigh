@@ -99,6 +99,9 @@ impl DomTree {
                 domtree.children.entry(idom).or_default().push(block);
             }
         }
+        for children in domtree.children.values_mut() {
+            children.sort_unstable();
+        }
 
         // Compute depths
         domtree.compute_depths(cfg.entry, 0);
@@ -206,10 +209,14 @@ impl DomTree {
 
     /// Get the dominance frontier of a block.
     pub fn frontier(&self, block: u64) -> impl Iterator<Item = u64> + '_ {
-        self.frontier
+        let mut frontier: Vec<u64> = self
+            .frontier
             .get(&block)
             .into_iter()
             .flat_map(|s| s.iter().copied())
+            .collect();
+        frontier.sort_unstable();
+        frontier.into_iter()
     }
 
     /// Get the depth of a block in the dominator tree.
@@ -277,6 +284,7 @@ impl DomTree {
     pub fn iterated_frontier(&self, blocks: &[u64]) -> HashSet<u64> {
         let mut result = HashSet::new();
         let mut worklist: Vec<u64> = blocks.to_vec();
+        worklist.sort_unstable_by(|a, b| b.cmp(a));
         let mut processed = HashSet::new();
 
         while let Some(block) = worklist.pop() {
@@ -284,7 +292,9 @@ impl DomTree {
                 continue;
             }
 
-            for frontier_block in self.frontier(block) {
+            let mut frontier_blocks: Vec<u64> = self.frontier(block).collect();
+            frontier_blocks.sort_unstable_by(|a, b| b.cmp(a));
+            for frontier_block in frontier_blocks {
                 if result.insert(frontier_block) {
                     worklist.push(frontier_block);
                 }

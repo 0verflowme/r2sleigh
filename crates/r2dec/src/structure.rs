@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::SSAFunction;
+use r2ssa::cfg::BlockTerminator;
+use r2ssa::{CFGEdge, SSAFunction};
 
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
@@ -18,6 +19,8 @@ pub struct ControlFlowStructurer<'a, 'o> {
     func: &'a SSAFunction,
     /// Folding context for expression optimization.
     fold_ctx: &'o FoldingContext<'o>,
+    /// Cached folded statements per basic block.
+    folded_block_cache: HashMap<u64, Vec<CStmt>>,
     /// Labels for blocks that need gotos.
     labels: HashMap<u64, String>,
     /// Counter for generating unique labels.
@@ -30,6 +33,15 @@ pub struct ControlFlowStructurer<'a, 'o> {
     safety_reason: Option<String>,
 }
 
+struct SwitchRegionView<'r> {
+    entry_block: u64,
+    switch_block: u64,
+    cases: &'r [(Option<u64>, Box<Region>)],
+    default: Option<&'r Region>,
+    merge_block: Option<u64>,
+    prefix_regions: &'r [Region],
+}
+
 impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Create a new structurer using a pre-analyzed folding context.
     pub fn new(func: &'a SSAFunction, fold_ctx: &'o FoldingContext<'o>) -> Self {
@@ -39,6 +51,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self {
             func,
             fold_ctx,
+            folded_block_cache: HashMap::new(),
             labels: HashMap::new(),
             label_counter: 0,
             region_analyzer: Some(region_analyzer),
@@ -54,6 +67,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self {
             func,
             fold_ctx,
+            folded_block_cache: HashMap::new(),
             labels: HashMap::new(),
             label_counter: 0,
             region_analyzer: Some(RegionAnalyzer::new(func)),
@@ -65,6 +79,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     fn compute_safety_budget(num_blocks: usize) -> usize {
         num_blocks.saturating_mul(128).max(256)
+    }
+
+    fn is_unresolved_indirect_dispatch_block(&self, addr: u64) -> bool {
+        let Some(cfg_block) = self.func.cfg().get_block(addr) else {
+            return false;
+        };
+
+        matches!(
+            cfg_block.terminator,
+            r2ssa::cfg::BlockTerminator::IndirectBranch
+        ) && self.func.successors(addr).is_empty()
+            && self.func.switch_info(addr).is_none()
     }
 
     fn reset_safety_budget(&mut self) {
@@ -150,17 +176,46 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 cond_block,
                 then_region,
                 else_region,
-                merge_block: _,
+                merge_block,
             } => {
-                let cond = self.get_branch_condition(*cond_block);
+                if let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
+                    *cond_block,
+                    then_region,
+                    else_region.as_deref(),
+                    *merge_block,
+                ) {
+                    return rewritten;
+                }
+                if let Some(rewritten) = self.try_structure_guarded_switch_with_default(
+                    *cond_block,
+                    then_region,
+                    else_region.as_deref(),
+                    *merge_block,
+                ) {
+                    return rewritten;
+                }
+                let mut cond = self.get_branch_condition(*cond_block);
+                if else_region.is_none()
+                    && let Some(merge_addr) = merge_block
+                    && self.single_arm_if_needs_condition_inversion(
+                        *cond_block,
+                        then_region.entry(),
+                        *merge_addr,
+                    )
+                {
+                    cond = Self::negate_condition(cond);
+                }
                 let then_stmt = self.structure_region(then_region);
                 let else_stmt = else_region.as_ref().map(|r| self.structure_region(r));
                 let if_stmt = CStmt::if_stmt(cond, then_stmt, else_stmt);
                 let mut prefix = self.structure_block_prefix_stmts(*cond_block);
-                if prefix.is_empty() {
-                    if_stmt
+                prefix.push(if_stmt);
+                if let Some(merge_addr) = merge_block {
+                    Self::append_stmt_body_flat(&mut prefix, self.structure_block(*merge_addr));
+                }
+                if prefix.len() == 1 {
+                    prefix.into_iter().next().unwrap_or(CStmt::Empty)
                 } else {
-                    prefix.push(if_stmt);
                     CStmt::Block(prefix)
                 }
             }
@@ -181,40 +236,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 switch_block,
                 cases,
                 default,
-                merge_block: _,
+                merge_block,
             } => {
-                // Get the switch expression from the block
-                let switch_expr = self.get_switch_expression(*switch_block);
-
-                // Build switch cases
-                let mut switch_cases = Vec::new();
-                for (case_value, case_region) in cases {
-                    let value_expr = case_value
-                        .map(|v| CExpr::IntLit(v as i64))
-                        .unwrap_or(CExpr::IntLit(0));
-                    let case_stmt = self.structure_region(case_region);
-                    switch_cases.push(crate::ast::SwitchCase {
-                        value: value_expr,
-                        body: vec![case_stmt, CStmt::Break],
-                    });
-                }
-
-                // Build default case
-                let default_body = default.as_ref().map(|r| vec![self.structure_region(r)]);
-
-                let switch_stmt = CStmt::Switch {
-                    expr: switch_expr,
-                    cases: switch_cases,
-                    default: default_body,
-                };
-
-                let mut prefix = self.structure_block_prefix_stmts(*switch_block);
-                if prefix.is_empty() {
-                    switch_stmt
-                } else {
-                    prefix.push(switch_stmt);
-                    CStmt::Block(prefix)
-                }
+                self.structure_switch_region(*switch_block, cases, default.as_deref(), *merge_block)
             }
             Region::Irreducible { entry, blocks } => self.structure_irreducible(*entry, blocks),
         }
@@ -222,14 +246,26 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Get the switch expression from a block.
     fn get_switch_expression(&mut self, addr: u64) -> CExpr {
-        let block = match self.func.get_block(addr) {
+        let switch_addr = self.unique_switch_block().unwrap_or(addr);
+        let block = match self.func.get_block(switch_addr) {
             Some(b) => b,
             None => return CExpr::Var("switch_expr".to_string()),
         };
 
+        if let Some(expr) = self.fold_ctx.resolve_switch_expr_for_block(switch_addr) {
+            return expr;
+        }
+
+        if let Some(expr) =
+            Self::selector_expr_from_condition(&self.get_branch_condition(switch_addr))
+        {
+            return expr;
+        }
+        if let Some(expr) = self.selector_expr_from_switch_predecessors(switch_addr) {
+            return expr;
+        }
+
         // Look for an indirect branch which typically has the switch variable
-        // For now, return a generic switch variable
-        // A more sophisticated implementation would trace the indirect branch target
         for op in &block.ops {
             if let Some(expr) = self.fold_ctx.extract_switch_expr(op) {
                 return expr;
@@ -239,8 +275,263 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         CExpr::Var("test".to_string())
     }
 
+    fn unique_switch_block(&self) -> Option<u64> {
+        let mut switch_blocks = self.func.cfg().block_addrs().filter(|addr| {
+            self.func
+                .cfg()
+                .get_block(*addr)
+                .is_some_and(|block| matches!(block.terminator, BlockTerminator::Switch { .. }))
+        });
+        let block = switch_blocks.next()?;
+        if switch_blocks.next().is_some() {
+            return None;
+        }
+        Some(block)
+    }
+
+    fn selector_expr_from_switch_predecessors(&mut self, addr: u64) -> Option<CExpr> {
+        let mut candidates = self
+            .func
+            .predecessors(addr)
+            .into_iter()
+            .filter_map(|pred| Self::selector_expr_from_condition(&self.get_branch_condition(pred)))
+            .collect::<Vec<_>>();
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates.pop()).flatten()
+    }
+
+    fn selector_expr_from_condition(cond: &CExpr) -> Option<CExpr> {
+        match cond {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::selector_expr_from_condition(inner)
+            }
+            CExpr::Binary {
+                op:
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge,
+                left,
+                right,
+            } => {
+                if matches!(left.as_ref(), CExpr::IntLit(_) | CExpr::UIntLit(_)) {
+                    return Some((**right).clone());
+                }
+                if matches!(right.as_ref(), CExpr::IntLit(_) | CExpr::UIntLit(_)) {
+                    return Some((**left).clone());
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn structure_switch_region(
+        &mut self,
+        switch_block: u64,
+        cases: &[(Option<u64>, Box<Region>)],
+        default: Option<&Region>,
+        merge_block: Option<u64>,
+    ) -> CStmt {
+        let switch_expr = self.get_switch_expression(switch_block);
+        let case_display_bias = self.switch_case_display_bias(switch_block, cases);
+
+        let mut switch_cases = Vec::new();
+        for (case_value, case_region) in cases {
+            let value_expr = case_value
+                .map(|v| CExpr::IntLit(v.saturating_add_signed(case_display_bias) as i64))
+                .unwrap_or(CExpr::IntLit(0));
+            let case_stmt = self.structure_region(case_region);
+            switch_cases.push(crate::ast::SwitchCase {
+                value: value_expr,
+                body: vec![case_stmt, CStmt::Break],
+            });
+        }
+
+        let default_body = default.map(|region| vec![self.structure_region(region)]);
+        let switch_stmt = CStmt::Switch {
+            expr: switch_expr,
+            cases: switch_cases,
+            default: default_body,
+        };
+
+        let mut prefix = self.structure_block_prefix_stmts(switch_block);
+        prefix.push(switch_stmt);
+        if let Some(merge_addr) = merge_block {
+            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
+        }
+        if prefix.len() == 1 {
+            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(prefix)
+        }
+    }
+
+    fn single_arm_if_needs_condition_inversion(
+        &self,
+        cond_block: u64,
+        then_entry: u64,
+        merge_block: u64,
+    ) -> bool {
+        let Some((true_target, false_target)) = self.resolve_conditional_targets(cond_block) else {
+            return false;
+        };
+
+        true_target == merge_block && false_target == then_entry
+    }
+
+    fn resolve_conditional_targets(&self, cond_block: u64) -> Option<(u64, u64)> {
+        let succs = self.func.successors(cond_block);
+        if succs.len() != 2 {
+            return None;
+        }
+
+        let mut true_target = None;
+        let mut false_target = None;
+        for succ in succs {
+            match self.func.edge_type(cond_block, succ) {
+                Some(CFGEdge::True) => true_target = Some(succ),
+                Some(CFGEdge::False) => false_target = Some(succ),
+                _ => {}
+            }
+        }
+
+        Some((true_target?, false_target?))
+    }
+
+    fn switch_case_display_bias(
+        &self,
+        switch_block: u64,
+        cases: &[(Option<u64>, Box<Region>)],
+    ) -> i64 {
+        let values = cases
+            .iter()
+            .filter_map(|(value, _)| *value)
+            .collect::<Vec<_>>();
+        if values.is_empty() || !values.contains(&0) {
+            return 0;
+        }
+        if let Some(bias) = values.iter().copied().max().and_then(|upper_bound| {
+            self.guarded_dense_zero_based_switch_bias(switch_block, values.len(), upper_bound)
+        }) {
+            return bias;
+        }
+
+        let mut search_blocks = vec![switch_block];
+        let mut seen = HashSet::from([switch_block]);
+        let mut queue = std::collections::VecDeque::from([(switch_block, 0usize)]);
+        for succ in self.func.successors(switch_block) {
+            if seen.insert(succ) {
+                search_blocks.push(succ);
+                queue.push_back((succ, 0usize));
+            }
+        }
+        while let Some((block, depth)) = queue.pop_front() {
+            if depth >= 8 {
+                continue;
+            }
+            for pred in self.func.predecessors(block) {
+                if seen.insert(pred) {
+                    search_blocks.push(pred);
+                    queue.push_back((pred, depth + 1));
+                }
+            }
+        }
+
+        let mut best_bias = 0i64;
+        for block_addr in search_blocks {
+            let Some(block) = self.func.get_block(block_addr) else {
+                continue;
+            };
+            for op in &block.ops {
+                if let r2ssa::SSAOp::IntSub { b, .. } = op
+                    && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
+                    && let Ok(bias) = i64::try_from(raw)
+                    && (1..=8).contains(&bias)
+                    && (best_bias == 0 || bias < best_bias)
+                {
+                    best_bias = bias;
+                }
+            }
+        }
+
+        if best_bias == 0 && values.len() >= 16 {
+            for block_addr in self.func.block_addrs() {
+                let Some(block) = self.func.get_block(*block_addr) else {
+                    continue;
+                };
+                for op in &block.ops {
+                    if let r2ssa::SSAOp::IntSub { b, .. } = op
+                        && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
+                        && let Ok(bias) = i64::try_from(raw)
+                        && (1..=8).contains(&bias)
+                        && (best_bias == 0 || bias < best_bias)
+                    {
+                        best_bias = bias;
+                    }
+                }
+            }
+        }
+
+        if best_bias == 0
+            && values.len() >= 32
+            && values
+                .iter()
+                .enumerate()
+                .all(|(idx, value)| *value == idx as u64)
+        {
+            return 1;
+        }
+
+        best_bias
+    }
+
+    fn guarded_dense_zero_based_switch_bias(
+        &self,
+        switch_block: u64,
+        case_count: usize,
+        upper_bound: u64,
+    ) -> Option<i64> {
+        if case_count < 4 {
+            return None;
+        }
+
+        for block_addr in std::iter::once(switch_block).chain(self.func.predecessors(switch_block))
+        {
+            let Some(block) = self.func.get_block(block_addr) else {
+                continue;
+            };
+            let mut best_bias = None;
+            let mut saw_upper_bound_guard = false;
+            for op in &block.ops {
+                if let r2ssa::SSAOp::IntSub { b, .. } = op
+                    && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
+                {
+                    if raw == upper_bound {
+                        saw_upper_bound_guard = true;
+                    }
+                    if let Ok(bias) = i64::try_from(raw)
+                        && (1..=8).contains(&bias)
+                    {
+                        best_bias = Some(best_bias.map_or(bias, |current: i64| current.min(bias)));
+                    }
+                }
+            }
+            if saw_upper_bound_guard && best_bias.is_some() {
+                return best_bias;
+            }
+        }
+
+        None
+    }
+
     /// Structure a single basic block.
     fn structure_block(&mut self, addr: u64) -> CStmt {
+        if self.is_unresolved_indirect_dispatch_block(addr) {
+            return CStmt::Empty;
+        }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
             None => return CStmt::Empty,
@@ -254,8 +545,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         // Convert operations to statements
-        // Use folding context for optimized output
-        stmts.extend(self.fold_ctx.fold_block(block, addr));
+        stmts.extend(self.folded_block_stmts(block, addr));
 
         // Check for break/continue at block end
         if let Some(ref analyzer) = self.region_analyzer {
@@ -317,6 +607,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Emit statements for a block directly into an existing statement list
     /// (without wrapping in CStmt::Block). Used for loop body flattening.
     fn structure_block_stmts_into(&mut self, addr: u64, stmts: &mut Vec<CStmt>) {
+        if self.is_unresolved_indirect_dispatch_block(addr) {
+            return;
+        }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
             None => return,
@@ -328,7 +621,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         // Convert operations to statements
-        stmts.extend(self.fold_ctx.fold_block(block, addr));
+        stmts.extend(self.folded_block_stmts(block, addr));
 
         // Check for break/continue at block end
         if let Some(ref analyzer) = self.region_analyzer {
@@ -359,12 +652,25 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Used for condition/switch header blocks where statements must appear before
     /// the structured control-flow construct.
     fn structure_block_prefix_stmts(&mut self, addr: u64) -> Vec<CStmt> {
+        if self.is_unresolved_indirect_dispatch_block(addr) {
+            return Vec::new();
+        }
         let block = match self.func.get_block(addr) {
             Some(b) => b,
             None => return Vec::new(),
         };
 
-        self.fold_ctx.fold_block(block, addr)
+        self.folded_block_stmts(block, addr)
+    }
+
+    fn folded_block_stmts(&mut self, block: &r2ssa::FunctionSSABlock, addr: u64) -> Vec<CStmt> {
+        if let Some(stmts) = self.folded_block_cache.get(&addr) {
+            return stmts.clone();
+        }
+
+        let stmts = self.fold_ctx.fold_block(block, addr);
+        self.folded_block_cache.insert(addr, stmts.clone());
+        stmts
     }
 
     /// Get the branch condition from a block.
@@ -373,6 +679,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Some(b) => b,
             None => return CExpr::IntLit(1),
         };
+
+        if let Some(cond) = self.fold_ctx.extract_condition_from_block(block) {
+            return cond;
+        }
 
         // Look for a conditional branch in the block
         for op in &block.ops {
@@ -440,6 +750,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .filter(|s| !matches!(s, CStmt::Empty))
                     .collect();
                 let cleaned = Self::rewrite_block_tail_guard_clauses(cleaned);
+                let cleaned = Self::rewrite_guarded_switch_if_else(cleaned);
+                let cleaned = Self::truncate_dead_straight_line_tail(cleaned);
                 let rewritten = Self::rewrite_block_loops_to_for(cleaned);
                 if rewritten.is_empty() {
                     CStmt::Empty
@@ -465,7 +777,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     else_body,
                 };
                 let stmt = Self::rewrite_if_short_circuit(stmt);
-                Self::rewrite_if_condition_inversion(stmt)
+                let stmt = Self::rewrite_if_condition_inversion(stmt);
+                let stmt = Self::rewrite_empty_if_bodies(stmt);
+                Self::rewrite_guarded_switch_with_trailing_return(stmt)
             }
             CStmt::While { cond, body } => {
                 let cond = Self::normalize_condition_addr_artifacts(cond);
@@ -627,6 +941,365 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
+    fn rewrite_empty_if_bodies(stmt: CStmt) -> CStmt {
+        let CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = stmt
+        else {
+            return stmt;
+        };
+
+        if matches!(then_body.as_ref(), CStmt::Empty) {
+            return match else_body {
+                Some(else_body) => CStmt::If {
+                    cond: Self::negate_condition(cond),
+                    then_body: else_body,
+                    else_body: None,
+                },
+                None => CStmt::Empty,
+            };
+        }
+
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        }
+    }
+
+    fn rewrite_guarded_switch_with_trailing_return(stmt: CStmt) -> CStmt {
+        let CStmt::If {
+            cond,
+            then_body,
+            else_body: Some(else_body),
+        } = stmt
+        else {
+            return stmt;
+        };
+
+        let then_branch = Self::extract_switch_with_trailing_stmt(then_body.as_ref());
+        let else_branch = Self::extract_switch_with_trailing_stmt(else_body.as_ref());
+        let (switch_stmt, default_stmt, trailing_stmt) = match (then_branch, else_branch) {
+            (Some((switch_stmt, trailing_stmt)), None) => {
+                (switch_stmt, (*else_body).clone(), trailing_stmt)
+            }
+            (None, Some((switch_stmt, trailing_stmt))) => {
+                (switch_stmt, (*then_body).clone(), trailing_stmt)
+            }
+            _ => {
+                return CStmt::If {
+                    cond,
+                    then_body,
+                    else_body: Some(else_body),
+                };
+            }
+        };
+
+        if !matches!(switch_stmt, CStmt::Switch { default: None, .. })
+            || !Self::stmt_guarantees_termination(&default_stmt)
+            || trailing_stmt.as_ref().is_some_and(|stmt| {
+                !matches!(
+                    Self::single_terminator_stmt(stmt),
+                    Some(CStmt::Return(Some(CExpr::IntLit(0) | CExpr::UIntLit(0))))
+                )
+            })
+        {
+            return CStmt::If {
+                cond,
+                then_body,
+                else_body: Some(else_body),
+            };
+        }
+
+        let CStmt::Switch { expr, cases, .. } = switch_stmt else {
+            unreachable!();
+        };
+        let mut rewritten = vec![CStmt::Switch {
+            expr,
+            cases,
+            default: Some(vec![default_stmt]),
+        }];
+        if let Some(trailing_stmt) = trailing_stmt {
+            rewritten.push(trailing_stmt);
+        }
+        CStmt::Block(rewritten)
+    }
+
+    fn try_structure_if_else_with_slot_merge_returns(
+        &mut self,
+        cond_block: u64,
+        then_region: &Region,
+        else_region: Option<&Region>,
+        merge_block: Option<u64>,
+    ) -> Option<CStmt> {
+        let merge_block = merge_block?;
+        let else_region = else_region?;
+
+        let summaries = self
+            .fold_ctx
+            .frame_slot_merges_map()
+            .values()
+            .filter(|summary| summary.merge_block_addr == merge_block)
+            .collect::<Vec<_>>();
+        let [summary] = summaries.as_slice() else {
+            return None;
+        };
+
+        let then_pred = self.unique_region_predecessor_to_merge(then_region, merge_block);
+        let else_pred = self.unique_region_predecessor_to_merge(else_region, merge_block);
+        let then_can_rewrite =
+            then_pred.is_some_and(|pred| self.has_merged_slot_return_expr(pred, summary));
+        let else_can_rewrite =
+            else_pred.is_some_and(|pred| self.has_merged_slot_return_expr(pred, summary));
+        if !then_can_rewrite && !else_can_rewrite {
+            return None;
+        }
+
+        let mut then_stmt = self.structure_region(then_region);
+        let mut else_stmt = self.structure_region(else_region);
+        let mut rewrote_any = false;
+
+        if then_can_rewrite
+            && let Some(pred) = then_pred
+            && let Some(rewritten) =
+                self.append_merged_slot_return_if_needed(then_stmt.clone(), pred, summary)
+        {
+            then_stmt = rewritten;
+            rewrote_any = true;
+        }
+        if else_can_rewrite
+            && let Some(pred) = else_pred
+            && let Some(rewritten) =
+                self.append_merged_slot_return_if_needed(else_stmt.clone(), pred, summary)
+        {
+            else_stmt = rewritten;
+            rewrote_any = true;
+        }
+        if !rewrote_any
+            || !Self::stmt_guarantees_termination(&then_stmt)
+            || !Self::stmt_guarantees_termination(&else_stmt)
+        {
+            return None;
+        }
+
+        let if_stmt = CStmt::If {
+            cond: self.get_branch_condition(cond_block),
+            then_body: Box::new(then_stmt),
+            else_body: Some(Box::new(else_stmt)),
+        };
+        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        prefix.push(if_stmt);
+        Some(if prefix.len() == 1 {
+            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(prefix)
+        })
+    }
+
+    fn try_structure_guarded_switch_with_default(
+        &mut self,
+        cond_block: u64,
+        then_region: &Region,
+        else_region: Option<&Region>,
+        merge_block: Option<u64>,
+    ) -> Option<CStmt> {
+        let else_region = else_region?;
+        let (switch_view, default_region) = match (
+            Self::switch_region_view(then_region),
+            Self::switch_region_view(else_region),
+        ) {
+            (Some(switch_view), None) => (switch_view, else_region),
+            (None, Some(switch_view)) => (switch_view, then_region),
+            _ => return None,
+        };
+
+        if self.func.switch_info(switch_view.switch_block).is_some() {
+            return None;
+        }
+        if switch_view.default.is_some() || switch_view.cases.len() < 4 {
+            return None;
+        }
+        if !self
+            .func
+            .successors(cond_block)
+            .contains(&switch_view.entry_block)
+        {
+            return None;
+        }
+
+        let combined_merge = merge_block.or(switch_view.merge_block);
+        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        for region in switch_view.prefix_regions {
+            Self::append_stmt_body_flat(&mut prefix, self.structure_region(region));
+        }
+        let switch_stmt = self.structure_switch_region(
+            switch_view.switch_block,
+            switch_view.cases,
+            Some(default_region),
+            None,
+        );
+        Self::append_stmt_body_flat(&mut prefix, switch_stmt);
+        if let Some(merge_addr) = combined_merge {
+            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
+        }
+        Some(if prefix.len() == 1 {
+            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(prefix)
+        })
+    }
+
+    fn switch_region_view(region: &Region) -> Option<SwitchRegionView<'_>> {
+        match region {
+            Region::Switch {
+                switch_block,
+                cases,
+                default,
+                merge_block,
+            } => Some(SwitchRegionView {
+                entry_block: *switch_block,
+                switch_block: *switch_block,
+                cases: cases.as_slice(),
+                default: default.as_deref(),
+                merge_block: *merge_block,
+                prefix_regions: &[],
+            }),
+            Region::Sequence(regions) if !regions.is_empty() => {
+                let (prefix_regions, tail) = regions.split_at(regions.len() - 1);
+                let tail_region = tail.first()?;
+                let mut view = Self::switch_region_view(tail_region)?;
+                view.entry_block = region.entry();
+                if view.prefix_regions.is_empty() {
+                    view.prefix_regions = prefix_regions;
+                }
+                Some(view)
+            }
+            _ => None,
+        }
+    }
+
+    fn unique_region_predecessor_to_merge(&self, region: &Region, merge_block: u64) -> Option<u64> {
+        let mut candidates = region
+            .blocks()
+            .into_iter()
+            .filter(|addr| self.func.successors(*addr).contains(&merge_block))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        match candidates.as_slice() {
+            [pred] => Some(*pred),
+            _ => None,
+        }
+    }
+
+    fn append_merged_slot_return_if_needed(
+        &self,
+        stmt: CStmt,
+        pred_addr: u64,
+        summary: &crate::analysis::FrameSlotMergeSummary,
+    ) -> Option<CStmt> {
+        let mut visited = std::collections::HashSet::new();
+        let expr = summary
+            .incoming
+            .get(&pred_addr)
+            .and_then(|value| self.fold_ctx.render_semantic_value(value, 0, &mut visited))
+            .or_else(|| {
+                self.fold_ctx
+                    .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
+            })?;
+        let stmt = self.prepend_named_merged_slot_assignment_if_needed(stmt, summary, &expr);
+        if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
+            return Some(rewritten);
+        }
+        if Self::single_terminator_stmt(&stmt).is_some() {
+            return Some(stmt);
+        }
+        let mut stmts = Vec::new();
+        Self::append_stmt_body_flat(&mut stmts, stmt);
+        stmts.push(CStmt::Return(Some(expr)));
+        Some(if stmts.len() == 1 {
+            stmts.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(stmts)
+        })
+    }
+
+    fn has_merged_slot_return_expr(
+        &self,
+        pred_addr: u64,
+        summary: &crate::analysis::FrameSlotMergeSummary,
+    ) -> bool {
+        summary.incoming.contains_key(&pred_addr)
+            || self
+                .fold_ctx
+                .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
+                .is_some()
+    }
+
+    fn prepend_named_merged_slot_assignment_if_needed(
+        &self,
+        stmt: CStmt,
+        summary: &crate::analysis::FrameSlotMergeSummary,
+        expr: &CExpr,
+    ) -> CStmt {
+        let Some(local_name) = self
+            .fold_ctx
+            .resolve_stack_var(summary.slot_offset)
+            .filter(|name| !crate::fold::op_lower::is_generic_stack_placeholder_alias(name))
+        else {
+            return stmt;
+        };
+
+        let lhs = CExpr::Var(local_name);
+        let resolved_expr = self.fold_ctx.resolve_return_candidate(expr);
+        if lhs == *expr || lhs == resolved_expr {
+            return stmt;
+        }
+
+        let assignment = CStmt::Expr(CExpr::assign(lhs, resolved_expr.clone()));
+        if Self::stmt_starts_with_assignment(&stmt, &assignment) {
+            return stmt;
+        }
+        match stmt {
+            CStmt::Empty => assignment,
+            CStmt::Block(mut stmts) => {
+                stmts.insert(0, assignment);
+                CStmt::Block(stmts)
+            }
+            other => CStmt::Block(vec![assignment, other]),
+        }
+    }
+
+    fn stmt_starts_with_assignment(stmt: &CStmt, assignment: &CStmt) -> bool {
+        match stmt {
+            CStmt::Block(stmts) => stmts.first().is_some_and(|first| first == assignment),
+            other => other == assignment,
+        }
+    }
+
+    fn rewrite_trailing_return_with_merged_expr(
+        &self,
+        stmt: &CStmt,
+        merged: &CExpr,
+    ) -> Option<CStmt> {
+        match stmt {
+            // A proven frame-slot merge is authoritative for this region tail.
+            // Once structure has matched the if/else -> merge-slot -> return pattern,
+            // do not let an earlier synthesized return expression beat the merged value.
+            CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(merged.clone()))),
+            CStmt::Block(stmts) => {
+                let (last, prefix) = stmts.split_last()?;
+                let rewritten_tail = self.rewrite_trailing_return_with_merged_expr(last, merged)?;
+                let mut rebuilt = prefix.to_vec();
+                rebuilt.push(rewritten_tail);
+                Some(CStmt::Block(rebuilt))
+            }
+            _ => None,
+        }
+    }
+
     fn rewrite_block_tail_guard_clauses(stmts: Vec<CStmt>) -> Vec<CStmt> {
         let mut rewritten = Vec::with_capacity(stmts.len());
         let mut i = 0;
@@ -658,6 +1331,100 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         rewritten
     }
 
+    fn rewrite_guarded_switch_if_else(stmts: Vec<CStmt>) -> Vec<CStmt> {
+        let mut rewritten = Vec::with_capacity(stmts.len());
+        let mut i = 0;
+        while i < stmts.len() {
+            if i + 1 < stmts.len()
+                && let CStmt::If {
+                    then_body,
+                    else_body: Some(else_body),
+                    ..
+                } = &stmts[i]
+                && let Some(CStmt::Return(Some(CExpr::IntLit(0) | CExpr::UIntLit(0)))) =
+                    Self::single_terminator_stmt(&stmts[i + 1])
+            {
+                let then_switch = Self::single_switch_stmt(then_body.as_ref())
+                    .filter(|stmt| matches!(stmt, CStmt::Switch { default: None, .. }));
+                let else_switch = Self::single_switch_stmt(else_body.as_ref())
+                    .filter(|stmt| matches!(stmt, CStmt::Switch { default: None, .. }));
+                let (switch_stmt, default_stmt) = match (then_switch, else_switch) {
+                    (Some(switch_stmt), None) => (switch_stmt, else_body.as_ref().clone()),
+                    (None, Some(switch_stmt)) => (switch_stmt, then_body.as_ref().clone()),
+                    _ => {
+                        rewritten.push(stmts[i].clone());
+                        i += 1;
+                        continue;
+                    }
+                };
+                if !Self::stmt_guarantees_termination(&default_stmt) {
+                    rewritten.push(stmts[i].clone());
+                    i += 1;
+                    continue;
+                }
+
+                if let CStmt::Switch { expr, cases, .. } = switch_stmt {
+                    rewritten.push(CStmt::Switch {
+                        expr,
+                        cases,
+                        default: Some(vec![default_stmt]),
+                    });
+                    rewritten.push(stmts[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+            }
+
+            rewritten.push(stmts[i].clone());
+            i += 1;
+        }
+        rewritten
+    }
+
+    fn truncate_dead_straight_line_tail(stmts: Vec<CStmt>) -> Vec<CStmt> {
+        let mut rewritten = Vec::with_capacity(stmts.len());
+        let mut terminated = false;
+        for stmt in stmts {
+            match stmt {
+                CStmt::Label(_) => {
+                    terminated = false;
+                    rewritten.push(stmt);
+                }
+                other => {
+                    if terminated {
+                        continue;
+                    }
+                    terminated = Self::stmt_guarantees_termination(&other);
+                    rewritten.push(other);
+                }
+            }
+        }
+        rewritten
+    }
+
+    fn stmt_guarantees_termination(stmt: &CStmt) -> bool {
+        if Self::stmt_is_unconditional_terminator(stmt) {
+            return true;
+        }
+
+        match stmt {
+            CStmt::Block(stmts) => stmts
+                .iter()
+                .rev()
+                .find(|stmt| !matches!(stmt, CStmt::Empty))
+                .is_some_and(Self::stmt_guarantees_termination),
+            CStmt::If {
+                then_body,
+                else_body: Some(else_body),
+                ..
+            } => {
+                Self::stmt_guarantees_termination(then_body)
+                    && Self::stmt_guarantees_termination(else_body)
+            }
+            _ => false,
+        }
+    }
+
     fn single_terminator_stmt(stmt: &CStmt) -> Option<CStmt> {
         if Self::stmt_is_unconditional_terminator(stmt) {
             return Some(stmt.clone());
@@ -673,12 +1440,62 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         None
     }
 
+    fn single_switch_stmt(stmt: &CStmt) -> Option<CStmt> {
+        match stmt {
+            CStmt::Switch { .. } => Some(stmt.clone()),
+            CStmt::Block(stmts) if stmts.len() == 1 && matches!(stmts[0], CStmt::Switch { .. }) => {
+                Some(stmts[0].clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_switch_with_trailing_stmt(stmt: &CStmt) -> Option<(CStmt, Option<CStmt>)> {
+        match stmt {
+            CStmt::Switch { .. } => Some((stmt.clone(), None)),
+            CStmt::Block(stmts) => {
+                let stmts = stmts
+                    .iter()
+                    .filter(|stmt| !matches!(stmt, CStmt::Empty))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                match stmts.as_slice() {
+                    [switch @ CStmt::Switch { .. }] => Some((switch.clone(), None)),
+                    [switch @ CStmt::Switch { .. }, trailing] => {
+                        Some((switch.clone(), Some(trailing.clone())))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn negate_condition(cond: CExpr) -> CExpr {
         match cond {
             CExpr::Unary {
                 op: UnaryOp::Not,
                 operand,
             } => *operand,
+            CExpr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                if let Some(rewritten) =
+                    Self::negate_disjunctive_relation_pair(left.as_ref(), right.as_ref())
+                {
+                    return rewritten;
+                }
+                CExpr::unary(
+                    UnaryOp::Not,
+                    CExpr::Binary {
+                        op: BinaryOp::Or,
+                        left,
+                        right,
+                    },
+                )
+            }
             CExpr::Binary { op, left, right } => {
                 let negated = match op {
                     BinaryOp::Eq => Some(BinaryOp::Ne),
@@ -697,6 +1514,45 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
             other => CExpr::unary(UnaryOp::Not, other),
+        }
+    }
+
+    fn negate_disjunctive_relation_pair(left: &CExpr, right: &CExpr) -> Option<CExpr> {
+        let (lhs_a, rhs_a, op_a) = Self::relation_signature(left)?;
+        let (lhs_b, rhs_b, op_b) = Self::relation_signature(right)?;
+        if lhs_a != lhs_b || rhs_a != rhs_b {
+            return None;
+        }
+
+        let negated_op = match (op_a, op_b) {
+            (BinaryOp::Eq, BinaryOp::Lt) | (BinaryOp::Lt, BinaryOp::Eq) => BinaryOp::Gt,
+            (BinaryOp::Eq, BinaryOp::Le) | (BinaryOp::Le, BinaryOp::Eq) => BinaryOp::Gt,
+            (BinaryOp::Eq, BinaryOp::Gt) | (BinaryOp::Gt, BinaryOp::Eq) => BinaryOp::Lt,
+            (BinaryOp::Eq, BinaryOp::Ge) | (BinaryOp::Ge, BinaryOp::Eq) => BinaryOp::Lt,
+            _ => return None,
+        };
+
+        Some(CExpr::Binary {
+            op: negated_op,
+            left: Box::new(lhs_a.clone()),
+            right: Box::new(rhs_a.clone()),
+        })
+    }
+
+    fn relation_signature(expr: &CExpr) -> Option<(&CExpr, &CExpr, BinaryOp)> {
+        match expr {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::relation_signature(inner)
+            }
+            CExpr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                ) =>
+            {
+                Some((left.as_ref(), right.as_ref(), *op))
+            }
+            _ => None,
         }
     }
 
@@ -1665,6 +2521,76 @@ mod tests {
         assert_eq!(
             cleaned,
             CStmt::if_stmt(v("a"), assign("x", CExpr::IntLit(1)), None)
+        );
+    }
+
+    #[test]
+    fn removes_empty_if_without_else() {
+        let input = CStmt::if_stmt(v("a"), CStmt::Empty, None);
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        assert_eq!(cleaned, CStmt::Empty);
+    }
+
+    #[test]
+    fn guarded_switch_with_trailing_return_becomes_switch_default() {
+        let input = CStmt::Block(vec![CStmt::if_stmt(
+            v("guard"),
+            CStmt::Block(vec![
+                expr_stmt(CExpr::call(
+                    v("sym.imp.printf"),
+                    vec![CExpr::StringLit("bad".into())],
+                )),
+                CStmt::ret(Some(CExpr::IntLit(1))),
+            ]),
+            Some(CStmt::Block(vec![
+                CStmt::Switch {
+                    expr: v("selector"),
+                    cases: vec![crate::ast::SwitchCase {
+                        value: CExpr::IntLit(1),
+                        body: vec![assign("x", CExpr::IntLit(1)), CStmt::Break],
+                    }],
+                    default: None,
+                },
+                CStmt::ret(Some(CExpr::IntLit(0))),
+            ])),
+        )]);
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        assert_eq!(
+            cleaned,
+            CStmt::Block(vec![
+                CStmt::Switch {
+                    expr: v("selector"),
+                    cases: vec![crate::ast::SwitchCase {
+                        value: CExpr::IntLit(1),
+                        body: vec![assign("x", CExpr::IntLit(1)), CStmt::Break],
+                    }],
+                    default: Some(vec![CStmt::Block(vec![
+                        expr_stmt(CExpr::call(
+                            v("sym.imp.printf"),
+                            vec![CExpr::StringLit("bad".into())],
+                        )),
+                        CStmt::ret(Some(CExpr::IntLit(1))),
+                    ])]),
+                },
+                CStmt::ret(Some(CExpr::IntLit(0))),
+            ])
+        );
+    }
+
+    #[test]
+    fn selector_expr_from_condition_extracts_non_constant_side() {
+        let cond = CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::binary(BinaryOp::BitAnd, v("i"), CExpr::IntLit(7)),
+            CExpr::IntLit(0),
+        );
+
+        let selector = ControlFlowStructurer::selector_expr_from_condition(&cond)
+            .expect("selector expression");
+        assert_eq!(
+            selector,
+            CExpr::binary(BinaryOp::BitAnd, v("i"), CExpr::IntLit(7))
         );
     }
 

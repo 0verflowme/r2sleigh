@@ -21,6 +21,18 @@ pub struct OptimizationConfig {
     pub preserve_memory_reads: bool,
 }
 
+/// Configuration for preparing SSA for decompilation.
+///
+/// The decompiler needs provenance-preserving SSA more than aggressively
+/// simplified SSA, so the default intentionally disables destructive
+/// simplification passes and only allows explicitly opted-in transforms.
+#[derive(Debug, Clone)]
+pub struct DecompilePrepConfig {
+    pub max_iterations: usize,
+    pub enable_inst_combine: bool,
+    pub enable_cse: bool,
+}
+
 impl Default for OptimizationConfig {
     fn default() -> Self {
         Self {
@@ -32,6 +44,31 @@ impl Default for OptimizationConfig {
             enable_cse: true,
             enable_dce: true,
             preserve_memory_reads: false,
+        }
+    }
+}
+
+impl Default for DecompilePrepConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: 1,
+            enable_inst_combine: false,
+            enable_cse: false,
+        }
+    }
+}
+
+impl From<&DecompilePrepConfig> for OptimizationConfig {
+    fn from(value: &DecompilePrepConfig) -> Self {
+        Self {
+            max_iterations: value.max_iterations.max(1),
+            enable_sccp: false,
+            enable_const_prop: false,
+            enable_inst_combine: value.enable_inst_combine,
+            enable_copy_prop: false,
+            enable_cse: value.enable_cse,
+            enable_dce: false,
+            preserve_memory_reads: true,
         }
     }
 }
@@ -709,12 +746,21 @@ fn replace_sources_with_constants(
     let block_addrs = func.block_addrs().to_vec();
 
     for addr in block_addrs {
+        let is_return_block = func
+            .cfg()
+            .get_block(addr)
+            .is_some_and(|cfg_block| cfg_block.is_return());
         let Some(block) = func.get_block_mut(addr) else {
             continue;
         };
 
         for phi in &mut block.phis {
+            let preserve_phi_sources =
+                is_return_block && return_value_family(&phi.dst.name).is_some();
             for (_, src) in &mut phi.sources {
+                if preserve_phi_sources {
+                    continue;
+                }
                 let key = VarKey::from_var(src);
                 if let Some(val) = consts.get(&key).copied() {
                     let new_var = SSAVar::constant(val, src.size);
@@ -1248,13 +1294,23 @@ fn apply_replacements(
     };
 
     for addr in block_addrs {
+        let is_return_block = func
+            .cfg()
+            .get_block(addr)
+            .is_some_and(|cfg_block| cfg_block.is_return());
         let Some(block) = func.get_block_mut(addr) else {
             continue;
         };
 
         for phi in &mut block.phis {
+            let preserve_phi_sources =
+                is_return_block && return_value_family(&phi.dst.name).is_some();
             for (_, src) in &mut phi.sources {
-                let new_src = mapper(src);
+                let new_src = if preserve_phi_sources {
+                    src.clone()
+                } else {
+                    mapper(src)
+                };
                 if new_src != *src {
                     *src = new_src;
                     stats.copies_propagated += 1;
@@ -1552,6 +1608,58 @@ fn dead_code_elim(
     changed
 }
 
+fn return_value_family(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "rax" | "eax" | "ax" | "al" | "ah" => Some("x86-gpr-ret"),
+        "xmm0" | "ymm0" | "zmm0" => Some("x86-simd-ret"),
+        "st0" | "st(0)" => Some("x86-fpu-ret"),
+        "r0" => Some("arm-gpr-ret"),
+        "x0" | "w0" => Some("aarch64-gpr-ret"),
+        "v0" | "q0" | "d0" | "s0" => Some("aarch64-simd-ret"),
+        "a0" => Some("riscv-gpr-ret"),
+        "fa0" => Some("riscv-fp-ret"),
+        _ => None,
+    }
+}
+
+fn collect_preserved_return_defs(func: &SSAFunction) -> HashSet<VarKey> {
+    let mut preserved = HashSet::new();
+
+    for block in func.blocks() {
+        let Some(cfg_block) = func.cfg().get_block(block.addr) else {
+            continue;
+        };
+        if !cfg_block.is_return() {
+            continue;
+        }
+
+        let mut seen_families = HashSet::new();
+        for op in block.ops.iter().rev() {
+            let Some(dst) = op.dst() else {
+                continue;
+            };
+            let Some(family) = return_value_family(&dst.name) else {
+                continue;
+            };
+            if seen_families.insert(family) {
+                preserved.insert(VarKey::from_var(dst));
+            }
+        }
+
+        for phi in block.phis.iter().rev() {
+            let Some(family) = return_value_family(&phi.dst.name) else {
+                continue;
+            };
+            if seen_families.insert(family) {
+                preserved.insert(VarKey::from_var(&phi.dst));
+            }
+        }
+    }
+
+    preserved
+}
+
 fn collect_uses(func: &SSAFunction) -> HashSet<VarKey> {
     let mut uses = HashSet::new();
 
@@ -1567,10 +1675,12 @@ fn collect_uses(func: &SSAFunction) -> HashSet<VarKey> {
         }
     }
 
+    uses.extend(collect_preserved_return_defs(func));
+
     uses
 }
 
-fn map_sources_in_op<F>(op: &SSAOp, map: &F) -> SSAOp
+pub(crate) fn map_sources_in_op<F>(op: &SSAOp, map: &F) -> SSAOp
 where
     F: Fn(&SSAVar) -> SSAVar,
 {
@@ -1842,6 +1952,7 @@ where
         CallInd { target } => CallInd {
             target: map(target),
         },
+        CallDefine { dst } => CallDefine { dst: dst.clone() },
         Return { target } => Return {
             target: map(target),
         },
@@ -2311,5 +2422,129 @@ mod sccp_tests {
         assert!(!func.cfg().has_edge(0x1000, 0x1004));
         assert!(stats.sccp_edges_pruned > 0);
         assert!(stats.sccp_blocks_removed > 0);
+    }
+
+    #[test]
+    fn dce_preserves_branch_merged_return_register_phi() {
+        let mut func = raw_func(vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1008, 8),
+                    cond: make_reg(32, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x100c, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x100c, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x100c,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_ram(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ]);
+
+        func.get_block_mut(0x1000).expect("entry block").ops = vec![SSAOp::CBranch {
+            target: SSAVar::new("ram:1008", 0, 8),
+            cond: SSAVar::new("tmp:cond", 0, 1),
+        }];
+        func.get_block_mut(0x1004).expect("left block").ops = vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("rax", 1, 8),
+                src: SSAVar::constant(1, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:100c", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x1008).expect("right block").ops = vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("rax", 2, 8),
+                src: SSAVar::constant(0, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:100c", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x100c).expect("merge block").phis = vec![PhiNode {
+            dst: SSAVar::new("rax", 3, 8),
+            sources: vec![
+                (0x1004, SSAVar::new("rax", 1, 8)),
+                (0x1008, SSAVar::new("rax", 2, 8)),
+            ],
+        }];
+
+        let stats = optimize_function(&mut func, &OptimizationConfig::default());
+        let merge = func.get_block(0x100c).expect("merge block");
+        assert_eq!(merge.phis.len(), 1, "return-value phi must survive DCE");
+        assert!(
+            func.get_block(0x1004).expect("left block").ops.iter().any(
+                |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("rax", 1, 8))
+            ),
+            "left return-value write must remain live through the exit phi"
+        );
+        assert!(
+            func.get_block(0x1008).expect("right block").ops.iter().any(
+                |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("rax", 2, 8))
+            ),
+            "right return-value write must remain live through the exit phi"
+        );
+        assert!(
+            stats.dce_removed_phis == 0,
+            "DCE must not classify the exit return phi as dead"
+        );
+    }
+
+    #[test]
+    fn dce_preserves_direct_return_register_write_in_return_block() {
+        let mut func = raw_func(vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }]);
+
+        func.get_block_mut(0x1000).expect("entry block").ops = vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("eax", 1, 4),
+                src: SSAVar::constant(1, 4),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("ram:0", 0, 8),
+            },
+        ];
+
+        optimize_function(&mut func, &OptimizationConfig::default());
+        assert!(
+            func.get_block(0x1000).expect("entry block").ops.iter().any(
+                |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("eax", 1, 4))
+            ),
+            "the last return-register write in a return block must survive DCE"
+        );
     }
 }

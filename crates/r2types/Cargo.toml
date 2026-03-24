@@ -13,3 +13,6 @@ thiserror.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+r2il = { path = "../r2il" }

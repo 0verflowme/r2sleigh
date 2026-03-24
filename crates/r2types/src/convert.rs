@@ -9,6 +9,8 @@ pub enum CTypeLike {
     Pointer(Box<CTypeLike>),
     Array(Box<CTypeLike>, Option<usize>),
     Struct(String),
+    Union(String),
+    Enum(String),
     Function,
     Unknown,
 }
@@ -33,6 +35,12 @@ pub fn to_c_type_like(arena: &TypeArena, ty: TypeId) -> CTypeLike {
         Type::UnknownAlias(name) if name == "void" => CTypeLike::Void,
         Type::UnknownAlias(name) if name.starts_with("struct ") => {
             CTypeLike::Struct(name.trim_start_matches("struct ").to_string())
+        }
+        Type::UnknownAlias(name) if name.starts_with("union ") => {
+            CTypeLike::Union(name.trim_start_matches("union ").to_string())
+        }
+        Type::UnknownAlias(name) if name.starts_with("enum ") => {
+            CTypeLike::Enum(name.trim_start_matches("enum ").to_string())
         }
         Type::UnknownAlias(_) => CTypeLike::Unknown,
     }

@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
 use r2il::{R2ILBlock, R2ILOp};
 use serde::{Deserialize, Serialize};
 
@@ -227,6 +228,15 @@ pub enum CFGEdge {
 }
 
 impl CFG {
+    fn edge_sort_rank(edge: CFGEdge) -> u8 {
+        match edge {
+            CFGEdge::True => 0,
+            CFGEdge::False => 1,
+            CFGEdge::Normal => 2,
+            CFGEdge::Back => 3,
+        }
+    }
+
     /// Create a new empty CFG with the given entry address.
     pub fn new(entry: u64) -> Self {
         Self {
@@ -254,7 +264,8 @@ impl CFG {
         }
 
         // Second pass: add edges based on terminators
-        let addrs: Vec<u64> = cfg.addr_to_node.keys().copied().collect();
+        let mut addrs: Vec<u64> = cfg.addr_to_node.keys().copied().collect();
+        addrs.sort_unstable();
         for addr in addrs {
             cfg.add_edges_for_block(addr);
         }
@@ -350,7 +361,9 @@ impl CFG {
 
     /// Get all block addresses in the CFG.
     pub fn block_addrs(&self) -> impl Iterator<Item = u64> + '_ {
-        self.addr_to_node.keys().copied()
+        let mut addrs: Vec<u64> = self.addr_to_node.keys().copied().collect();
+        addrs.sort_unstable();
+        addrs.into_iter()
     }
 
     /// Get all blocks in the CFG.
@@ -374,10 +387,13 @@ impl CFG {
             return vec![];
         };
 
-        self.graph
-            .neighbors_directed(node_idx, Direction::Incoming)
-            .map(|idx| self.graph[idx].addr)
-            .collect()
+        let mut preds: Vec<_> = self
+            .graph
+            .edges_directed(node_idx, Direction::Incoming)
+            .map(|edge| self.graph[edge.source()].addr)
+            .collect();
+        preds.sort_unstable();
+        preds
     }
 
     /// Get the successors of a block.
@@ -386,10 +402,18 @@ impl CFG {
             return vec![];
         };
 
-        self.graph
-            .neighbors_directed(node_idx, Direction::Outgoing)
-            .map(|idx| self.graph[idx].addr)
-            .collect()
+        let mut succs: Vec<_> = self
+            .graph
+            .edges_directed(node_idx, Direction::Outgoing)
+            .map(|edge| {
+                (
+                    Self::edge_sort_rank(*edge.weight()),
+                    self.graph[edge.target()].addr,
+                )
+            })
+            .collect();
+        succs.sort_unstable();
+        succs.into_iter().map(|(_, addr)| addr).collect()
     }
 
     /// Get the edge type between two blocks.
@@ -427,8 +451,10 @@ impl CFG {
             return;
         }
 
-        for succ in self.graph.neighbors_directed(node, Direction::Outgoing) {
-            self.dfs_postorder(succ, visited, postorder);
+        for succ_addr in self.successors(self.graph[node].addr) {
+            if let Some(succ) = self.get_node(succ_addr) {
+                self.dfs_postorder(succ, visited, postorder);
+            }
         }
 
         postorder.push(self.graph[node].addr);
@@ -470,9 +496,23 @@ impl CFG {
 
     /// Replace the terminator for a block.
     pub fn set_terminator(&mut self, addr: u64, terminator: BlockTerminator) {
+        let Some(&node_idx) = self.addr_to_node.get(&addr) else {
+            return;
+        };
+
+        let outgoing: Vec<_> = self
+            .graph
+            .edges_directed(node_idx, Direction::Outgoing)
+            .map(|edge| edge.id())
+            .collect();
+        for edge in outgoing {
+            self.graph.remove_edge(edge);
+        }
+
         if let Some(block) = self.get_block_mut(addr) {
             block.terminator = terminator;
         }
+        self.add_edges_for_block(addr);
     }
 
     fn rebuild_addr_map(&mut self) {
@@ -802,6 +842,49 @@ mod tests {
         assert_eq!(
             cfg.get_block(0x1000).map(|b| b.terminator.clone()),
             Some(BlockTerminator::Branch { target: 0x1004 })
+        );
+        assert_eq!(cfg.successors(0x1000), vec![0x1004]);
+        assert_eq!(cfg.predecessors(0x1004), vec![0x1000]);
+    }
+
+    #[test]
+    fn test_successors_are_deterministic_true_then_false() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1008, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_ram(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_ram(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let cfg = CFG::from_blocks(&blocks).unwrap();
+        assert_eq!(cfg.successors(0x1000), vec![0x1008, 0x1004]);
+        assert_eq!(
+            cfg.block_addrs().collect::<Vec<_>>(),
+            vec![0x1000, 0x1004, 0x1008]
         );
     }
 }

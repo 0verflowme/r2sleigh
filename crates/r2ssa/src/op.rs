@@ -214,6 +214,12 @@ pub enum SSAOp {
     /// Indirect call: call *target
     CallInd { target: SSAVar },
 
+    /// Fresh unknown register value defined by a call boundary.
+    ///
+    /// Decompiler-safe SSA emits this after calls for return/caller-saved
+    /// registers so later reads cannot reuse pre-call versions.
+    CallDefine { dst: SSAVar },
+
     /// Return from subroutine
     Return { target: SSAVar },
 
@@ -414,7 +420,8 @@ impl SSAOp {
             | New { dst, .. }
             | Cast { dst, .. }
             | Extract { dst, .. }
-            | Insert { dst, .. } => Some(dst),
+            | Insert { dst, .. }
+            | CallDefine { dst } => Some(dst),
 
             CallOther { output, .. } | StoreConditional { result: output, .. } => output.as_ref(),
 
@@ -584,7 +591,7 @@ impl SSAOp {
                 }
             }
 
-            Fence { .. } | Nop | Unimplemented | Breakpoint | CpuId { .. } => {}
+            Fence { .. } | Nop | Unimplemented | Breakpoint | CpuId { .. } | CallDefine { .. } => {}
         }
     }
 
@@ -754,6 +761,7 @@ impl std::fmt::Display for SSAOp {
             SSAOp::BranchInd { target } => write!(f, "BRANCHIND {}", target),
             SSAOp::Call { target } => write!(f, "CALL {}", target),
             SSAOp::CallInd { target } => write!(f, "CALLIND {}", target),
+            SSAOp::CallDefine { dst } => write!(f, "{} = CALLDEF", dst),
             SSAOp::Return { target } => write!(f, "RETURN {}", target),
             SSAOp::FloatAdd { dst, a, b } => write!(f, "{} = {} f+ {}", dst, a, b),
             SSAOp::FloatSub { dst, a, b } => write!(f, "{} = {} f- {}", dst, a, b),

@@ -3,7 +3,7 @@
 //! These tests invoke radare2 with the r2sleigh plugin and validate output.
 //! Run with: `cargo test -p r2sleigh-e2e-tests`
 
-use e2e::{r2_at_func, r2_cmd_timeout, require_binary, vuln_test_binary};
+use e2e::{r2_cmd, r2_cmd_timeout, release_plugin_path, require_binary, vuln_test_binary};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
@@ -128,12 +128,12 @@ mod cli_run {
 
     #[test]
     fn plugin_sla_json_still_valid_after_refactor() {
-        if !Path::new("target/release/libr2sleigh_plugin.so").exists() {
+        if !Path::new(release_plugin_path()).exists() {
             eprintln!("Skipping: plugin not built");
             return;
         }
         setup();
-        let result = r2_at_func(vuln_test_binary(), "main", "a:sla.json");
+        let result = r2_cmd(vuln_test_binary(), "s entry0; a:sla.json");
         result.assert_ok();
         let parsed: Value = serde_json::from_str(result.stdout.trim()).expect("valid JSON");
         assert!(
@@ -2001,6 +2001,168 @@ mod ffi {
             r2il_block_free(add_block);
             r2il_block_free(ret_block);
             r2il_free(ctx);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod host_matrix {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn fixture_source_and_output_dir() -> (PathBuf, PathBuf) {
+        if Path::new("tests/e2e/vuln_test.c").exists() {
+            return (
+                PathBuf::from("tests/e2e/vuln_test.c"),
+                PathBuf::from("target/host-matrix-integration"),
+            );
+        }
+        if Path::new("vuln_test.c").exists() {
+            return (
+                PathBuf::from("vuln_test.c"),
+                PathBuf::from("../../target/host-matrix-integration"),
+            );
+        }
+        panic!("unable to locate vuln_test.c for host-matrix integration");
+    }
+
+    fn compile_host_matrix_binary(arch: &str) -> PathBuf {
+        let (source, out_dir) = fixture_source_and_output_dir();
+        fs::create_dir_all(&out_dir).expect("create host-matrix output dir");
+        let output_path = out_dir.join(format!("vuln_test_{arch}"));
+        let output = Command::new("clang")
+            .args([
+                "-O0",
+                "-g",
+                "-fno-stack-protector",
+                "-Wl,-no_pie",
+                "-arch",
+                arch,
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output_path)
+            .output()
+            .expect("execute clang");
+        assert!(
+            output.status.success(),
+            "clang failed for {arch}: stdout=\n{}\nstderr=\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output_path
+    }
+
+    fn line_containing<'a>(output: &'a str, needle: &str) -> &'a str {
+        output
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing line containing {needle:?} in:\n{output}"))
+    }
+
+    fn count_occurrences(text: &str, needle: &str) -> usize {
+        text.match_indices(needle).count()
+    }
+
+    fn assert_main_semantic_invariants(output: &str) {
+        assert!(
+            !output.trim().is_empty(),
+            "fresh host-matrix main decompilation must be non-empty"
+        );
+        assert!(
+            output.contains("return 1;"),
+            "usage/default path must keep return 1:\n{output}"
+        );
+        assert!(
+            output.contains("switch ("),
+            "main should still structure around a switch:\n{output}"
+        );
+
+        let unlock_line = line_containing(output, "unlock(%d, %d, %d) = %d");
+        assert!(
+            unlock_line.contains("sym._unlock("),
+            "unlock result slot should inline helper call:\n{unlock_line}"
+        );
+        assert_eq!(
+            count_occurrences(unlock_line, "sym._unlock("),
+            1,
+            "unlock line should own the helper result exactly once:\n{unlock_line}"
+        );
+        for bad in ["0U", "&stack", "atoi(", "eax_", "rax_", " lr", " lr)", " x0_", " w0_"] {
+            assert!(
+                !unlock_line.contains(bad),
+                "unlock line leaked {bad:?}:\n{unlock_line}"
+            );
+        }
+
+        let solve_line = line_containing(output, "solve_equation(%d) = %d");
+        assert!(
+            solve_line.contains("sym._solve_equation("),
+            "solve_equation result slot should inline helper call:\n{solve_line}"
+        );
+        assert_eq!(
+            count_occurrences(solve_line, "sym._solve_equation("),
+            1,
+            "solve_equation line should own the helper result exactly once:\n{solve_line}"
+        );
+        for bad in ["0U", "&stack", "atoi(", "eax_", "rax_", " lr", " lr)", " x0_", " w0_"] {
+            assert!(
+                !solve_line.contains(bad),
+                "solve_equation line leaked {bad:?}:\n{solve_line}"
+            );
+        }
+
+        let complex_line = line_containing(output, "complex_check(%d, %d) = %d");
+        assert!(
+            complex_line.contains("sym._complex_check("),
+            "complex_check result slot should inline helper call:\n{complex_line}"
+        );
+        assert_eq!(
+            count_occurrences(complex_line, "sym._complex_check("),
+            1,
+            "complex_check line should own the helper result exactly once:\n{complex_line}"
+        );
+        for bad in ["0U", "&stack", "atoi(", "eax_", "rax_", " lr", " lr)", " x0_", " w0_"] {
+            assert!(
+                !complex_line.contains(bad),
+                "complex_check line leaked {bad:?}:\n{complex_line}"
+            );
+        }
+
+        let copied_line = line_containing(output, "Copied: %s");
+        assert!(
+            !copied_line.contains("0U"),
+            "Copied printf must keep a concrete pointer value:\n{copied_line}"
+        );
+        assert!(
+            !output.contains("free(\"Copied: %s\\n\")"),
+            "free must not consume the format string:\n{output}"
+        );
+
+        let vuln_alloc_line = line_containing(output, "vuln_alloc(%d, %d) = %p");
+        assert!(
+            vuln_alloc_line.contains("sym._vuln_alloc("),
+            "vuln_alloc result slot should inline helper call:\n{vuln_alloc_line}"
+        );
+        assert!(
+            !vuln_alloc_line.contains("0U"),
+            "vuln_alloc line must not re-materialize 0U:\n{vuln_alloc_line}"
+        );
+    }
+
+    #[test]
+    fn fresh_clang_host_matrix_keeps_main_semantics_consistent() {
+        let timeout = Duration::from_secs(180);
+        for arch in ["arm64", "arm64e", "x86_64", "x86_64h"] {
+            let binary = compile_host_matrix_binary(arch);
+            let result = r2_cmd_timeout(
+                binary.to_str().expect("utf8 binary path"),
+                "aa; a:sla.dec main",
+                timeout,
+            );
+            result.assert_ok();
+            assert_main_semantic_invariants(&result.stdout);
         }
     }
 }

@@ -71,6 +71,11 @@ and migrated deterministic integration checks from:
 - decompilation guardrail snapshots
 - deep radare2 integration smoke checks
 
+Prefer exact normalized snapshots there for stable user-facing output. Use
+`tests/r2r/normalize_snapshot.py` and `jq -S -c` to canonicalize cross-platform
+noise before snapshotting. Keep structural assertions for high-churn payloads
+such as SSA, symbolic execution, taint, and large CFG/DOM JSON.
+
 `tests/e2e` keeps non-snapshot checks (CLI run behavior, direct FFI, and
 analysis-quality benchmark thresholds).
 
@@ -187,7 +192,7 @@ New opcode:
   - e2e semantic assertion if structure/churn requires richer parsing
 
 New plugin command:
-  - r2r snapshot test for deterministic output formatting
+  - r2r exact normalized snapshot for deterministic user-facing output
   - e2e test for semantic/edge-case behavior where snapshots are brittle
 
 New optimization pass:
@@ -198,7 +203,7 @@ Bug fix:
   - Regression test reproducing the original bug
 
 Decompiler change:
-  - r2r full snapshot via `a:sla.dec` when output is deterministic
+  - r2r exact normalized full snapshot via `a:sla.dec` when output is deterministic
   - e2e only when decompiler behavior needs semantic parsing instead of snapshot diffs
 
 Test Coverage Checklist

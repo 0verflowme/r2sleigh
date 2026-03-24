@@ -1,5 +1,11 @@
-use r2ssa::{SSAOp, SSAVar};
+use r2ssa::{ObjectKind, SSAOp, SSAVar};
+use r2types::{
+    ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
+    VisibleBindingKind,
+};
 
+use crate::analysis::prepared_semantic::StackAliasView;
+use crate::analysis::utils;
 use crate::ast::{BinaryOp, CExpr};
 
 use super::context::FoldingContext;
@@ -12,8 +18,97 @@ use super::{MAX_STACK_ALIAS_DEPTH, MAX_STACK_OFFSET_DEPTH};
 const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
 
 impl<'a> FoldingContext<'a> {
+    fn preferred_prepared_stack_alias_name(&self, alias: &StackAliasView) -> Option<String> {
+        let visible = alias.visible_name.trim();
+        alias
+            .arg_alias
+            .as_ref()
+            .filter(|arg_alias| {
+                !arg_alias.is_empty()
+                    && (visible.is_empty()
+                        || visible.ends_with("_home")
+                        || visible.starts_with("var_")
+                        || visible.starts_with("local_")
+                        || visible.starts_with("stack_")
+                        || visible.starts_with("arg_"))
+            })
+            .cloned()
+            .or_else(|| (!visible.is_empty()).then(|| visible.to_string()))
+            .or_else(|| alias.arg_alias.clone())
+    }
+
+    fn prepared_stack_alias_view(&self) -> Option<&crate::analysis::PreparedSemanticView> {
+        self.prepared_semantic_view()
+    }
+
+    fn prepared_stack_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
+        let objects = self.prepared_objects()?;
+        let object = self.inputs.prepared_ssa?.object_for_var(var).or_else(|| {
+            self.prepared_canonical_value_root(var)
+                .and_then(|root| self.inputs.prepared_ssa?.object_for_var(&root))
+        })?;
+        let fact = objects.object(object)?;
+        match fact.kind {
+            ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
+                Some(offset)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_visible_external_stack_name_role(role: ExternalStackSlotRole) -> bool {
+        matches!(
+            role,
+            ExternalStackSlotRole::Local
+                | ExternalStackSlotRole::StackArg
+                | ExternalStackSlotRole::Unknown
+        )
+    }
+
+    fn stack_synthetic_name(offset: i64) -> String {
+        if offset < 0 {
+            format!("local_{:x}", (-offset) as u64)
+        } else {
+            format!("stack_{:x}", offset as u64)
+        }
+    }
+
+    fn stack_slot_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
+        if slot.offset == offset {
+            return true;
+        }
+        matches!(slot.base, ExternalStackBase::FramePointer) && -slot.offset == offset
+    }
+
+    fn visible_stack_binding_for_offset(&self, offset: i64) -> Option<&VisibleBinding> {
+        self.inputs.visible_bindings.iter().find(|binding| {
+            binding
+                .stack_slot
+                .as_ref()
+                .is_some_and(|slot| Self::stack_slot_matches_offset(slot, offset))
+        })
+    }
+
+    pub(super) fn is_reserved_param_alias_name(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.inputs
+            .param_register_aliases
+            .values()
+            .any(|alias| alias.eq_ignore_ascii_case(&lower))
+    }
+
     /// Try to extract a stack offset from a variable name or its definition.
     pub(crate) fn extract_stack_offset_from_var(&self, var: &SSAVar) -> Option<i64> {
+        if let Some(offset) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_offset_for_var(var))
+        {
+            return Some(offset);
+        }
+        if let Some(offset) = self.prepared_stack_offset_for_var(var) {
+            return Some(offset);
+        }
+
         let name_lower = var.name.to_lowercase();
 
         // Direct fp/sp reference
@@ -21,9 +116,12 @@ impl<'a> FoldingContext<'a> {
             return Some(0);
         }
 
+        if let Some(slot) = self.stack_slot_provenance_for_var(var) {
+            return Some(slot.offset);
+        }
+
         // Check if this variable was defined as fp/sp + offset
-        let key = var.display_name();
-        if let Some(expr) = self.definitions_map().get(&key) {
+        if let Some(expr) = self.definition_for_name(&var.display_name()) {
             return self.extract_offset_from_expr(expr);
         }
 
@@ -112,6 +210,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn arg_alias_for_register_name(&self, reg_name: &str) -> Option<String> {
+        let lower = reg_name.to_ascii_lowercase();
+        if let Some(alias) = self.inputs.param_register_aliases.get(&lower) {
+            return Some(alias.clone());
+        }
         self.inputs.arch.arg_alias_for_register_name(reg_name)
     }
 
@@ -135,6 +237,26 @@ impl<'a> FoldingContext<'a> {
         };
         let dst_name = self.var_name(dst);
         is_generic_arg_name(&dst_name) && dst_name.eq_ignore_ascii_case(&src_alias)
+    }
+
+    pub(super) fn is_entry_arg_alias_store(&self, addr: &SSAVar, val: &SSAVar) -> bool {
+        let entry_arg_alias = utils::arg_alias_for_store_source(
+            val,
+            self.copy_sources_map(),
+            self.var_aliases_map(),
+            self.inputs.param_register_aliases,
+        )
+        .or_else(|| {
+            self.lookup_definition_raw(&val.display_name())
+                .and_then(|expr| self.arg_alias_for_expr(&expr))
+        });
+        if entry_arg_alias.is_none() {
+            return false;
+        }
+        self.stack_slot_provenance_for_var(addr)
+            .map(|slot| slot.offset)
+            .or_else(|| self.extract_stack_offset_from_var(addr))
+            .is_some()
     }
 
     pub(super) fn arg_alias_for_expr(&self, expr: &CExpr) -> Option<String> {
@@ -184,6 +306,22 @@ impl<'a> FoldingContext<'a> {
                 if let Some(stripped) = name.strip_prefix('&') {
                     return Some(stripped.to_string());
                 }
+                let parsed_offset = if name == "saved_fp" {
+                    Some(0)
+                } else if let Some(suffix) = name.strip_prefix("local_") {
+                    i64::from_str_radix(suffix, 16).ok().map(|v| -v)
+                } else if let Some(suffix) = name.strip_prefix("stack_") {
+                    i64::from_str_radix(suffix, 16).ok()
+                } else if let Some(suffix) = name.strip_prefix("arg_") {
+                    i64::from_str_radix(suffix, 16).ok().map(|v| -v)
+                } else {
+                    None
+                };
+                if let Some(offset) = parsed_offset
+                    && let Some(alias) = self.resolve_stack_var(offset)
+                {
+                    return Some(alias);
+                }
                 self.lookup_definition(name)
                     .and_then(|inner| self.resolve_stack_alias_from_addr_expr(&inner, depth + 1))
             }
@@ -196,6 +334,20 @@ impl<'a> FoldingContext<'a> {
         }
     }
     pub(crate) fn stack_var_for_addr_var(&self, addr: &SSAVar) -> Option<String> {
+        if let Some(expr) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.owner_expr_for_var(addr))
+        {
+            match expr {
+                CExpr::Var(name) => return Some(name.clone()),
+                CExpr::AddrOf(inner) => {
+                    if let CExpr::Var(name) = inner.as_ref() {
+                        return Some(name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
         let addr_key = addr.display_name();
         if let Some(alias) =
             self.resolve_stack_alias_from_addr_expr(&CExpr::Var(addr_key.clone()), 0)
@@ -212,28 +364,113 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn external_stack_name_for_offset(&self, offset: i64) -> Option<String> {
-        if let Some(var) = self.inputs.external_stack_vars.get(&offset)
-            && !var.name.is_empty()
+        if let Some(alias_name) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_alias_for_offset(offset))
+            .and_then(|alias| self.preferred_prepared_stack_alias_name(alias))
         {
-            return Some(var.name.clone());
+            return Some(alias_name);
+        }
+        if let Some(binding) = self.visible_stack_binding_for_offset(offset) {
+            match binding.kind {
+                VisibleBindingKind::Param
+                | VisibleBindingKind::Local
+                | VisibleBindingKind::StackObject
+                | VisibleBindingKind::Unknown => {
+                    if !binding.name.is_empty() && !self.is_reserved_param_alias_name(&binding.name)
+                    {
+                        return Some(binding.name.clone());
+                    }
+                }
+                VisibleBindingKind::HiddenHome => {
+                    if let Some(alias) = self.visible_param_home_alias_for_binding(binding) {
+                        return Some(alias);
+                    }
+                }
+                VisibleBindingKind::HiddenSaved => {}
+            }
         }
 
-        for (ext_offset, var) in self.inputs.external_stack_vars {
-            if var.name.is_empty() {
+        for (slot_key, slot_spec) in self.inputs.stack_slots {
+            if !Self::stack_slot_matches_offset(slot_key, offset) {
                 continue;
             }
-            let base_lower = var.base.as_deref().unwrap_or_default().to_ascii_lowercase();
-            let is_frame_based = self.inputs.arch.is_frame_pointer_name(&base_lower);
-            if is_frame_based && -*ext_offset == offset {
-                return Some(var.name.clone());
+            if let Some(alias) = self.visible_param_home_alias_for_slot(slot_spec) {
+                return Some(alias);
+            }
+            if !slot_spec.name.is_empty()
+                && Self::is_visible_external_stack_name_role(slot_spec.role)
+                && !self.is_reserved_param_alias_name(&slot_spec.name)
+            {
+                return Some(slot_spec.name.clone());
             }
         }
 
         None
     }
 
+    fn visible_param_home_alias_for_binding(&self, binding: &VisibleBinding) -> Option<String> {
+        if !matches!(binding.kind, VisibleBindingKind::HiddenHome) {
+            return None;
+        }
+
+        if let Some(param_name) = binding
+            .param_index
+            .and_then(|idx| {
+                self.inputs.visible_bindings.iter().find(|candidate| {
+                    matches!(candidate.kind, VisibleBindingKind::Param)
+                        && candidate.param_index == Some(idx)
+                })
+            })
+            .map(|binding| binding.name.trim())
+            .filter(|name| {
+                !name.is_empty()
+                    && !self.is_reserved_param_alias_name(name)
+                    && !super::op_lower::is_generic_stack_placeholder_alias(name)
+                    && self.canonicalize_stack_name(name).is_none()
+                    && !name.eq_ignore_ascii_case("local")
+            })
+        {
+            return Some(param_name.to_string());
+        }
+
+        binding
+            .source_reg
+            .as_deref()
+            .and_then(|reg| self.arg_alias_for_register_name(reg))
+            .or_else(|| {
+                let binding_name = binding.name.trim();
+                (!binding_name.is_empty()
+                    && !self.is_reserved_param_alias_name(binding_name)
+                    && !super::op_lower::is_generic_stack_placeholder_alias(binding_name)
+                    && self.canonicalize_stack_name(binding_name).is_none()
+                    && !binding_name.eq_ignore_ascii_case("local"))
+                .then(|| binding_name.to_string())
+            })
+    }
+
+    fn visible_param_home_alias_for_slot(&self, slot: &ExternalStackSlotSpec) -> Option<String> {
+        if !matches!(slot.role, ExternalStackSlotRole::ParamHome) {
+            return None;
+        }
+
+        if let Some(param_name) = slot.param_name.as_deref()
+            && !param_name.trim().is_empty()
+        {
+            return Some(param_name.to_string());
+        }
+
+        slot.source_reg
+            .as_deref()
+            .and_then(|reg| self.arg_alias_for_register_name(reg))
+    }
+
     pub(super) fn canonicalize_stack_name(&self, name: &str) -> Option<String> {
-        let offset = if let Some(suffix) = name.strip_prefix("local_") {
+        let offset = if name == "saved_fp" {
+            Some(0)
+        } else if let Some(suffix) = name.strip_prefix("local_") {
+            i64::from_str_radix(suffix, 16).ok().map(|v| -v)
+        } else if let Some(suffix) = name.strip_prefix("stack_") {
             i64::from_str_radix(suffix, 16).ok()
         } else if let Some(suffix) = name.strip_prefix("arg_") {
             i64::from_str_radix(suffix, 16).ok().map(|v| -v)
@@ -246,15 +483,61 @@ impl<'a> FoldingContext<'a> {
 
     /// Resolve a stack variable name by signed stack offset.
     pub fn resolve_stack_var(&self, offset: i64) -> Option<String> {
-        self.stack_vars_map()
+        if let Some(alias_name) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_alias_for_offset(offset))
+            .and_then(|alias| self.preferred_prepared_stack_alias_name(alias))
+        {
+            return Some(alias_name);
+        }
+        let external_name = self.external_stack_name_for_offset(offset);
+        let resolved = self
+            .stack_vars_map()
             .get(&offset)
             .cloned()
             .map(|name| self.canonicalize_stack_name(&name).unwrap_or(name))
-            .or_else(|| self.external_stack_name_for_offset(offset))
+            .map(|name| {
+                if (name == "saved_fp"
+                    || name.starts_with("local_")
+                    || name.starts_with("stack_")
+                    || name.starts_with("arg_"))
+                    && external_name.is_some()
+                {
+                    external_name.clone().unwrap()
+                } else {
+                    name
+                }
+            })
+            .or_else(|| external_name.clone())
+            .or_else(|| {
+                self.stack_slots()
+                    .any(|slot| slot.offset == offset)
+                    .then(|| Self::stack_synthetic_name(offset))
+            })
+            .or_else(|| {
+                (offset < 0 && (self.has_stack_slots() || self.has_definitions()))
+                    .then(|| Self::stack_synthetic_name(offset))
+            });
+        resolved.map(|name| {
+            if self.is_reserved_param_alias_name(&name) {
+                Self::stack_synthetic_name(offset)
+            } else {
+                name
+            }
+        })
     }
 
     pub(super) fn rewrite_stack_expr(&self, expr: CExpr) -> CExpr {
         let rewritten = expr.map_children(&mut |child| self.rewrite_stack_expr(child));
+
+        if let CExpr::Var(name) = &rewritten
+            && let Some(alias) =
+                self.resolve_stack_alias_from_addr_expr(&CExpr::Var(name.clone()), 0)
+            && alias != *name
+            && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
+        {
+            return CExpr::Var(alias);
+        }
 
         if matches!(
             rewritten,
@@ -264,13 +547,16 @@ impl<'a> FoldingContext<'a> {
             } | CExpr::Paren(_)
                 | CExpr::Cast { .. }
         ) && let Some(alias) = self.resolve_stack_alias_from_addr_expr(&rewritten, 0)
+            && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
         {
             return CExpr::Var(alias);
         }
 
         match rewritten {
             CExpr::Deref(inner) => {
-                if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&inner, 0) {
+                if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&inner, 0)
+                    && !super::op_lower::is_generic_stack_placeholder_alias(&alias)
+                {
                     return CExpr::Var(alias);
                 }
                 if let Some(var_name) = self.extract_known_stack_var_name(&inner) {
@@ -354,7 +640,7 @@ impl<'a> FoldingContext<'a> {
                     // Indirect: val is a temp, trace it back via copy_sources
                     if val.name.starts_with("tmp:") {
                         let val_key = val.display_name();
-                        if let Some(src_key) = self.copy_sources_map().get(&val_key) {
+                        if let Some(src_key) = self.render_copy_source_for_name(&val_key) {
                             let src_lower = src_key.to_lowercase();
                             if self.inputs.arch.is_callee_saved_name(&src_lower)
                                 || self.inputs.arch.is_frame_pointer_name(&src_lower)

@@ -3,7 +3,7 @@
 //! This module implements the SSA renaming pass that assigns version numbers
 //! to variables, following the algorithm from Cytron et al.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::cfg::CFG;
 use crate::domtree::DomTree;
@@ -22,6 +22,19 @@ pub struct RenameContext {
     counters: HashMap<String, u32>,
     /// Variable sizes.
     sizes: HashMap<String, u32>,
+}
+
+/// Decompiler-safe call boundary policy.
+#[derive(Debug, Clone, Default)]
+pub struct CallBoundaryConfig {
+    /// Registers that must receive a fresh SSA definition after a call.
+    pub defined_regs: Vec<CallBoundaryDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallBoundaryDef {
+    pub name: String,
+    pub size: u32,
 }
 
 impl RenameContext {
@@ -89,6 +102,19 @@ impl RenameContext {
         let size = self.get_size(name);
         SSAVar::new(name, version, size)
     }
+
+    /// Find initialized variable names that match a register name ignoring case.
+    pub fn matching_var_names_ci(&self, name: &str) -> Vec<String> {
+        let needle = name.to_ascii_lowercase();
+        let mut matches: Vec<String> = self
+            .sizes
+            .keys()
+            .filter(|candidate| candidate.to_ascii_lowercase() == needle)
+            .cloned()
+            .collect();
+        matches.sort_unstable();
+        matches
+    }
 }
 
 impl Default for RenameContext {
@@ -144,17 +170,43 @@ pub fn rename_function_with_names(
     var_sizes: &HashMap<String, u32>,
     reg_names: Option<&RegisterNameMap>,
 ) -> RenamedFunction {
+    rename_function_with_names_and_call_boundaries(
+        cfg,
+        domtree,
+        phi_placement,
+        var_sizes,
+        reg_names,
+        None,
+    )
+}
+
+/// Perform SSA renaming on a CFG with optional register names and decompiler-safe call
+/// boundaries.
+pub fn rename_function_with_names_and_call_boundaries(
+    cfg: &CFG,
+    domtree: &DomTree,
+    phi_placement: &PhiPlacement,
+    var_sizes: &HashMap<String, u32>,
+    reg_names: Option<&RegisterNameMap>,
+    call_boundaries: Option<&CallBoundaryConfig>,
+) -> RenamedFunction {
     let mut ctx = RenameContext::new();
     let mut result = RenamedFunction::new(cfg.entry);
 
     // Initialize all variables
-    for (name, &size) in var_sizes {
+    let mut initialized_vars: Vec<(&String, &u32)> = var_sizes.iter().collect();
+    initialized_vars.sort_unstable_by(|(lhs_name, lhs_size), (rhs_name, rhs_size)| {
+        lhs_name.cmp(rhs_name).then(lhs_size.cmp(rhs_size))
+    });
+    for (name, &size) in initialized_vars {
         ctx.init_var(name, size);
     }
 
     // Also initialize variables from phi nodes
-    for phis in phi_placement.phis.values() {
-        for phi in phis {
+    let mut phi_blocks: Vec<u64> = phi_placement.phis.keys().copied().collect();
+    phi_blocks.sort_unstable();
+    for block_addr in phi_blocks {
+        for phi in phi_placement.get_phis(block_addr) {
             ctx.init_var(&phi.var_name, phi.var_size);
         }
     }
@@ -167,6 +219,23 @@ pub fn rename_function_with_names(
         result.blocks.insert(addr, Vec::new());
     }
 
+    // Prepopulate phi placeholders so predecessor-edge source propagation can update them
+    // even if the merge block is renamed later in dominator traversal.
+    for &addr in &result.block_order {
+        let block_ops = result.blocks.get_mut(&addr).expect("preinitialized block");
+        for phi in phi_placement.get_phis(addr) {
+            let sources: Vec<SSAVar> = phi
+                .predecessors
+                .iter()
+                .map(|_| SSAVar::new(&phi.var_name, 0, phi.var_size))
+                .collect();
+            block_ops.push(SSAOp::Phi {
+                dst: SSAVar::new(&phi.var_name, 0, phi.var_size),
+                sources,
+            });
+        }
+    }
+
     // Rename starting from entry block using dominator tree traversal
     rename_block(
         cfg.entry,
@@ -176,12 +245,14 @@ pub fn rename_function_with_names(
         &mut ctx,
         &mut result,
         reg_names,
+        call_boundaries,
     );
 
     result
 }
 
 /// Rename a single block and recursively rename dominated blocks.
+#[allow(clippy::too_many_arguments)]
 fn rename_block(
     block_addr: u64,
     cfg: &CFG,
@@ -190,28 +261,46 @@ fn rename_block(
     ctx: &mut RenameContext,
     result: &mut RenamedFunction,
     reg_names: Option<&RegisterNameMap>,
+    call_boundaries: Option<&CallBoundaryConfig>,
 ) {
     // Track variables defined in this block for cleanup
     let mut defined_vars: Vec<String> = Vec::new();
 
     // 1. Rename phi node destinations
     let phis = phi_placement.get_phis(block_addr);
-    for phi in phis {
+    let block_ops = result
+        .blocks
+        .get_mut(&block_addr)
+        .expect("preinitialized block");
+    for (phi_idx, phi) in phis.iter().enumerate() {
         let dst = ctx.write_var(&phi.var_name);
         defined_vars.push(phi.var_name.clone());
 
-        // Create phi with placeholder sources (will be filled by predecessors)
-        let sources: Vec<SSAVar> = phi
-            .predecessors
-            .iter()
-            .map(|_| SSAVar::new(&phi.var_name, 0, phi.var_size))
-            .collect();
-
-        result
-            .blocks
-            .get_mut(&block_addr)
-            .unwrap()
-            .push(SSAOp::Phi { dst, sources });
+        // Update the precreated placeholder so predecessor-edge propagation can land
+        // before or after the merge block is renamed.
+        match block_ops.get_mut(phi_idx) {
+            Some(SSAOp::Phi {
+                dst: existing_dst,
+                sources,
+            }) => {
+                *existing_dst = dst;
+                if sources.len() != phi.predecessors.len() {
+                    *sources = phi
+                        .predecessors
+                        .iter()
+                        .map(|_| SSAVar::new(&phi.var_name, 0, phi.var_size))
+                        .collect();
+                }
+            }
+            _ => {
+                let sources: Vec<SSAVar> = phi
+                    .predecessors
+                    .iter()
+                    .map(|_| SSAVar::new(&phi.var_name, 0, phi.var_size))
+                    .collect();
+                block_ops.insert(phi_idx, SSAOp::Phi { dst, sources });
+            }
+        }
     }
 
     // 2. Rename operations in the block
@@ -219,6 +308,19 @@ fn rename_block(
         for op in &block.ops {
             let renamed_op = rename_op(op, ctx, &mut defined_vars, reg_names);
             result.blocks.get_mut(&block_addr).unwrap().push(renamed_op);
+
+            if matches!(op, r2il::R2ILOp::Call { .. } | r2il::R2ILOp::CallInd { .. })
+                && let Some(boundary) = call_boundaries
+            {
+                append_call_boundary_defs(
+                    &mut result.blocks,
+                    block_addr,
+                    ctx,
+                    &mut defined_vars,
+                    boundary,
+                    reg_names,
+                );
+            }
         }
     }
 
@@ -229,12 +331,57 @@ fn rename_block(
 
     // 4. Recursively rename dominated blocks
     for &child in domtree.children(block_addr) {
-        rename_block(child, cfg, domtree, phi_placement, ctx, result, reg_names);
+        rename_block(
+            child,
+            cfg,
+            domtree,
+            phi_placement,
+            ctx,
+            result,
+            reg_names,
+            call_boundaries,
+        );
     }
 
     // 5. Pop versions defined in this block
     for var in defined_vars {
         ctx.pop_version(&var);
+    }
+}
+
+fn append_call_boundary_defs(
+    blocks: &mut HashMap<u64, Vec<SSAOp>>,
+    block_addr: u64,
+    ctx: &mut RenameContext,
+    defined_vars: &mut Vec<String>,
+    call_boundaries: &CallBoundaryConfig,
+    reg_names: Option<&RegisterNameMap>,
+) {
+    let Some(block_ops) = blocks.get_mut(&block_addr) else {
+        return;
+    };
+
+    for reg in &call_boundaries.defined_regs {
+        let mut actual_names: BTreeSet<String> =
+            ctx.matching_var_names_ci(&reg.name).into_iter().collect();
+        if actual_names.is_empty()
+            && let Some(reg_names) = reg_names
+        {
+            for ((_, size), candidate) in reg_names {
+                if *size == reg.size && candidate.eq_ignore_ascii_case(&reg.name) {
+                    actual_names.insert(candidate.clone());
+                }
+            }
+        }
+        if actual_names.is_empty() {
+            ctx.init_var(&reg.name, reg.size);
+            actual_names.insert(reg.name.clone());
+        }
+        for actual_name in actual_names {
+            let dst = ctx.write_var(&actual_name);
+            defined_vars.push(actual_name);
+            block_ops.push(SSAOp::CallDefine { dst });
+        }
     }
 }
 
@@ -1286,6 +1433,10 @@ mod tests {
         if let SSAOp::Phi { dst, sources } = &merge_ops[0] {
             assert_eq!(dst.name, "reg:0");
             assert_eq!(sources.len(), 2);
+            assert_eq!(sources[0].name, "reg:0");
+            assert_eq!(sources[1].name, "reg:0");
+            assert_eq!(sources[0].version, 1);
+            assert_eq!(sources[1].version, 2);
         } else {
             panic!("Expected Phi op, got {:?}", merge_ops[0]);
         }

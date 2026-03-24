@@ -74,7 +74,7 @@ impl DefUseInfo {
 }
 
 /// Reference to an SSA operation or phi node in a function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SliceOpRef {
     /// Phi node at the given index in the block.
     Phi { block_addr: u64, phi_idx: usize },

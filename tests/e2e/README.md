@@ -83,8 +83,9 @@ cargo test -p r2sleigh-e2e-tests
 
 ## When to use Rust E2E vs r2r
 
-- Use `tests/r2r` for deterministic command output snapshots (`a:sla.*` text/JSON views).
-- Prefer full multiline snapshots there for `a:sla.dec`, not one-line substring checks.
+- Use `tests/r2r` for deterministic command-output snapshots (`a:sla.*` text/JSON views).
+- Prefer exact normalized snapshots there for stable user-facing surfaces such as `a:sla.info`, small `a:sla.*` JSON/text views, signatures, and `a:sla.dec`.
+- Keep structural assertions there only for high-churn internals such as SSA, symex, taint, and large CFG/DOM payloads.
 - Use `tests/e2e` for:
   - FFI behavior and ABI checks
   - CLI run/export behavior checks

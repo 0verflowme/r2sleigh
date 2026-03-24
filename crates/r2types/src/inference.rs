@@ -1,25 +1,26 @@
-//! Type inference and representation.
+//! Type inference over SSA.
 //!
-//! This module provides type inference for decompiled code,
-//! mapping SSA variables to C types.
+//! This module owns the solver-backed function/type inference engine. It
+//! produces `CTypeLike` results and type/layout facts for decompiler and plugin
+//! consumers; rendering-specific conversion belongs outside this crate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use r2ssa::{SSAFunction, SSAOp, SSAVar};
-use r2types::{
-    CTypeLike, Constraint, ConstraintSource, ExternalTypeDb, MemoryCapability, ResolvedSignature,
-    SignatureRegistry, Signedness, SolvedTypes, SolverConfig, TypeArena, TypeId, TypeOracle,
-    TypeSolver, to_c_type_like,
+use crate::{
+    CTypeLike, Constraint, ConstraintSource, ExternalStackBase, ExternalStackVarSpec,
+    ExternalStruct, ExternalTypeDb, FunctionSignatureSpec, FunctionType, MemoryCapability,
+    ResolvedFieldLayout, ResolvedSignature, SignatureRegistry, Signedness, SolvedTypes,
+    SolverConfig, StackSlotKey, Type, TypeArena, TypeId, TypeOracle, TypeSolver, to_c_type_like,
 };
-
-use crate::analysis::utils::parse_const_offset;
-use crate::ast::CType;
-use crate::{ExternalFunctionSignature, ExternalStackVar};
+use r2ssa::{
+    DecompilePrepFacts, ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact, StackAddressBase,
+    StackAddressRoot,
+};
 
 /// Type inference context.
 pub struct TypeInference {
     /// Inferred types for variables.
-    var_types: HashMap<SSAVar, CType>,
+    var_types: HashMap<SSAVar, CTypeLike>,
     /// User-provided function signatures.
     func_types: HashMap<String, FunctionType>,
     /// Function names by address (injected from external context).
@@ -33,21 +34,20 @@ pub struct TypeInference {
     /// Embedded signature registry.
     signature_registry: SignatureRegistry,
     /// Optional externally recovered function signature.
-    external_signature: Option<ExternalFunctionSignature>,
-    /// Optional externally recovered stack variables.
-    external_stack_vars: HashMap<i64, ExternalStackVar>,
+    external_signature: Option<FunctionSignatureSpec>,
+    /// Canonical stack-slot facts keyed by structural slot identity.
+    external_stack_slots: BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    /// Proven SSA var -> stack-slot bindings from decompile prep.
+    ssa_stack_slots: BTreeMap<SSAVar, StackSlotKey>,
     /// Optional external host type database.
     external_type_db: ExternalTypeDb,
     /// Last solver output for this function inference pass.
     solved_types: Option<SolvedTypes>,
 }
 
-/// Function type signature.
-#[derive(Debug, Clone)]
-pub struct FunctionType {
-    pub return_type: CType,
-    pub params: Vec<CType>,
-    pub variadic: bool,
+pub struct CombinedTypeOracle<'a> {
+    solved: &'a SolvedTypes,
+    external_type_db: &'a ExternalTypeDb,
 }
 
 impl TypeInference {
@@ -92,7 +92,8 @@ impl TypeInference {
             ret_regs,
             signature_registry: SignatureRegistry::from_embedded_json(),
             external_signature: None,
-            external_stack_vars: HashMap::new(),
+            external_stack_slots: BTreeMap::new(),
+            ssa_stack_slots: BTreeMap::new(),
             external_type_db: ExternalTypeDb::default(),
             solved_types: None,
         }
@@ -104,13 +105,69 @@ impl TypeInference {
     }
 
     /// Set externally recovered function signature.
-    pub fn set_external_signature(&mut self, signature: Option<ExternalFunctionSignature>) {
+    pub fn set_external_signature(&mut self, signature: Option<FunctionSignatureSpec>) {
         self.external_signature = signature;
     }
 
     /// Set externally recovered stack variables.
-    pub fn set_external_stack_vars(&mut self, stack_vars: HashMap<i64, ExternalStackVar>) {
-        self.external_stack_vars = stack_vars;
+    pub fn set_external_stack_vars(&mut self, stack_vars: HashMap<i64, ExternalStackVarSpec>) {
+        for (offset, spec) in stack_vars {
+            self.external_stack_slots
+                .entry(StackSlotKey {
+                    base: spec.base.clone(),
+                    offset,
+                })
+                .or_insert(spec);
+        }
+    }
+
+    /// Set canonical externally recovered stack-slot facts.
+    pub fn set_external_stack_slots(
+        &mut self,
+        stack_slots: BTreeMap<StackSlotKey, ExternalStackVarSpec>,
+    ) {
+        self.external_stack_slots = stack_slots;
+    }
+
+    /// Set SSA -> stack-slot bindings from decompile prep facts.
+    pub fn set_decompile_prep_facts(&mut self, facts: Option<&DecompilePrepFacts>) {
+        self.ssa_stack_slots.clear();
+        let Some(facts) = facts else {
+            return;
+        };
+        for (var, root) in &facts.stack_address_roots {
+            self.ssa_stack_slots
+                .insert(var.clone(), stack_slot_key_from_root(*root));
+        }
+    }
+
+    /// Set SSA -> stack-slot bindings from the canonical prepared SSA artifact.
+    pub fn set_prepared_ssa(&mut self, prepared: &SsaArtifact) {
+        self.ssa_stack_slots.clear();
+
+        for (&value_id, object) in &prepared.objects().value_objects {
+            let Some(object_fact) = prepared.objects().object(*object) else {
+                continue;
+            };
+            let Some(var) = prepared.graph().value(value_id).map(|value| &value.var) else {
+                continue;
+            };
+            let root = match object_fact.kind {
+                ObjectKind::StackSlot { base, offset }
+                | ObjectKind::FrameObject { base, offset } => StackAddressRoot { base, offset },
+                _ => continue,
+            };
+            self.ssa_stack_slots
+                .insert(var.clone(), stack_slot_key_from_root(root));
+        }
+
+        if let Some(facts) = prepared.decompile_prep_facts() {
+            for (var, root) in &facts.stack_address_roots {
+                self.ssa_stack_slots
+                    .entry(var.clone())
+                    .or_insert_with(|| stack_slot_key_from_root(*root));
+            }
+        }
     }
 
     /// Set externally recovered type database (from tsj payload).
@@ -144,16 +201,84 @@ impl TypeInference {
         self.emit_call_signature_constraints(func, &mut arena, &mut constraints, &mut struct_hints);
 
         let solver = TypeSolver::new(SolverConfig::default());
-        let solved = solver.solve(arena, &constraints);
+        let mut solved = solver.solve(arena, &constraints);
+        let external_var_types = self.external_var_type_overrides(func);
+        for (var, ty) in &external_var_types {
+            let (ty_id, _) = self.type_like_to_typeid(ty, &mut solved.arena);
+            solved.var_types.insert(var.clone(), ty_id);
+        }
 
         self.var_types.clear();
         let vars = collect_vars(func);
         for var in vars {
             let ty_id = solved.type_of(&var);
-            let hinted = self.type_id_to_ctype(&solved.arena, ty_id, var.size);
+            let hinted = self.type_id_to_type_like(&solved.arena, ty_id, var.size);
             self.var_types.insert(var, hinted);
         }
+        for (var, ty) in external_var_types {
+            self.var_types.insert(var, ty);
+        }
         self.solved_types = Some(solved);
+    }
+
+    fn external_var_type_overrides(&self, func: &SSAFunction) -> HashMap<SSAVar, CTypeLike> {
+        let mut overrides = HashMap::new();
+        let mut reg0_map: HashMap<String, SSAVar> = HashMap::new();
+        for var in collect_vars(func) {
+            if var.version == 0 {
+                reg0_map.entry(var.name.to_ascii_lowercase()).or_insert(var);
+            }
+        }
+
+        if let Some(signature) = &self.external_signature {
+            let mut occupied_param_aliases = HashSet::new();
+            for (idx, ext) in signature.params.iter().enumerate() {
+                let Some(ty) = &ext.ty else {
+                    continue;
+                };
+                let Some(reg_name) = self.arg_regs.get(idx) else {
+                    continue;
+                };
+                for alias in register_alias_names(reg_name) {
+                    occupied_param_aliases.insert(alias);
+                }
+                if let Some(var) = reg0_map.get(&reg_name.to_ascii_lowercase()) {
+                    overrides.insert(var.clone(), ty.clone());
+                }
+            }
+
+            if let Some(ret_ty) = &signature.ret_type {
+                for reg_name in &self.ret_regs {
+                    if register_alias_names(reg_name)
+                        .into_iter()
+                        .any(|alias| occupied_param_aliases.contains(&alias))
+                    {
+                        continue;
+                    }
+                    if let Some(var) = reg0_map.get(&reg_name.to_ascii_lowercase()) {
+                        overrides.insert(var.clone(), ret_ty.clone());
+                    }
+                }
+            }
+        }
+
+        for var in collect_vars(func) {
+            let Some(slot_spec) = self.stack_slot_spec_for_var(&var) else {
+                continue;
+            };
+            let Some(ty) = &slot_spec.ty else {
+                continue;
+            };
+            overrides.insert(var, ty.clone());
+        }
+
+        overrides
+    }
+
+    fn stack_slot_spec_for_var(&self, var: &SSAVar) -> Option<&ExternalStackVarSpec> {
+        self.ssa_stack_slots
+            .get(var)
+            .and_then(|key| self.external_stack_slots.get(key))
     }
 
     fn emit_inferred_constraints(
@@ -759,7 +884,7 @@ impl TypeInference {
             let Some(reg_var) = reg0_map.get(reg_name).cloned() else {
                 continue;
             };
-            let (ty_id, struct_name) = self.ctype_to_typeid(raw_ty, arena);
+            let (ty_id, struct_name) = self.type_like_to_typeid(raw_ty, arena);
             constraints.push(Constraint::SetType {
                 var: reg_var.clone(),
                 ty: ty_id,
@@ -770,15 +895,14 @@ impl TypeInference {
             }
         }
 
-        for stack_var in self.external_stack_vars.values() {
+        for var in collect_vars(func) {
+            let Some(stack_var) = self.stack_slot_spec_for_var(&var) else {
+                continue;
+            };
             let Some(ty) = &stack_var.ty else {
                 continue;
             };
-            let key = stack_var.name.to_ascii_lowercase();
-            let Some(var) = reg0_map.get(&key).cloned() else {
-                continue;
-            };
-            let (ty_id, struct_name) = self.ctype_to_typeid(ty, arena);
+            let (ty_id, struct_name) = self.type_like_to_typeid(ty, arena);
             constraints.push(Constraint::SetType {
                 var: var.clone(),
                 ty: ty_id,
@@ -791,7 +915,7 @@ impl TypeInference {
 
         // If the external signature provides a return type, constrain return registers.
         if let Some(ret_ty) = &signature.ret_type {
-            let (ty_id, _) = self.ctype_to_typeid(ret_ty, arena);
+            let (ty_id, _) = self.type_like_to_typeid(ret_ty, arena);
             for ret_reg in &self.ret_regs {
                 if let Some(reg_var) = reg0_map.get(ret_reg).cloned() {
                     constraints.push(Constraint::SetType {
@@ -870,9 +994,9 @@ impl TypeInference {
                 let params = sig
                     .params
                     .iter()
-                    .map(|ty| self.ctype_to_typeid(ty, arena).0)
+                    .map(|ty| self.type_like_to_typeid(ty, arena).0)
                     .collect();
-                let ret = self.ctype_to_typeid(&sig.return_type, arena).0;
+                let ret = self.type_like_to_typeid(&sig.return_type, arena).0;
                 return Some(ResolvedSignature {
                     ret,
                     params,
@@ -1010,74 +1134,46 @@ impl TypeInference {
         }
     }
 
-    fn ctype_to_typeid(&self, ty: &CType, arena: &mut TypeArena) -> (TypeId, Option<String>) {
+    fn type_like_to_typeid(
+        &self,
+        ty: &CTypeLike,
+        arena: &mut TypeArena,
+    ) -> (TypeId, Option<String>) {
         match ty {
-            CType::Void => (arena.unknown_alias("void"), None),
-            CType::Bool => (arena.bool_ty(), None),
-            CType::Int(bits) => (arena.int(*bits, Signedness::Signed), None),
-            CType::UInt(bits) => (arena.int(*bits, Signedness::Unsigned), None),
-            CType::Float(bits) => (arena.float(*bits), None),
-            CType::Pointer(inner) => {
-                let (inner_ty, struct_name) = self.ctype_to_typeid(inner, arena);
+            CTypeLike::Void => (arena.unknown_alias("void"), None),
+            CTypeLike::Bool => (arena.bool_ty(), None),
+            CTypeLike::Int { bits, signedness } => (arena.int(*bits, *signedness), None),
+            CTypeLike::Float(bits) => (arena.float(*bits), None),
+            CTypeLike::Pointer(inner) => {
+                let (inner_ty, struct_name) = self.type_like_to_typeid(inner, arena);
                 (arena.ptr(inner_ty), struct_name)
             }
-            CType::Array(inner, len) => {
-                let (elem_ty, struct_name) = self.ctype_to_typeid(inner, arena);
+            CTypeLike::Array(inner, len) => {
+                let (elem_ty, struct_name) = self.type_like_to_typeid(inner, arena);
                 (arena.array(elem_ty, *len, None), struct_name)
             }
-            CType::Struct(name) => (
+            CTypeLike::Struct(name) => (
                 arena.struct_named_or_existing(name.clone()),
                 Some(name.clone()),
             ),
-            CType::Union(name) | CType::Enum(name) | CType::Typedef(name) => {
+            CTypeLike::Union(name) | CTypeLike::Enum(name) => {
                 (arena.unknown_alias(name.clone()), None)
             }
-            CType::Function { params, ret } => {
-                let param_ids = params
-                    .iter()
-                    .map(|param| self.ctype_to_typeid(param, arena).0)
-                    .collect();
-                let (ret_id, _) = self.ctype_to_typeid(ret, arena);
-                (arena.function(param_ids, ret_id, false), None)
-            }
-            CType::Unknown => (arena.top(), None),
+            CTypeLike::Function => (arena.top(), None),
+            CTypeLike::Unknown => (arena.top(), None),
         }
     }
 
-    fn type_id_to_ctype(&self, arena: &TypeArena, ty_id: TypeId, fallback_size: u32) -> CType {
+    fn type_id_to_type_like(
+        &self,
+        arena: &TypeArena,
+        ty_id: TypeId,
+        fallback_size: u32,
+    ) -> CTypeLike {
         match to_c_type_like(arena, ty_id) {
-            CTypeLike::Void => CType::Void,
-            CTypeLike::Bool => CType::Bool,
-            CTypeLike::Int { bits, signedness } => match signedness {
-                Signedness::Unsigned => CType::UInt(bits),
-                Signedness::Signed | Signedness::Unknown => CType::Int(bits),
-            },
-            CTypeLike::Float(bits) => CType::Float(bits),
-            CTypeLike::Pointer(inner) => CType::Pointer(Box::new(self.ctype_like_to_ctype(*inner))),
-            CTypeLike::Array(inner, len) => {
-                CType::Array(Box::new(self.ctype_like_to_ctype(*inner)), len)
-            }
-            CTypeLike::Struct(name) => CType::Struct(name),
-            CTypeLike::Function => CType::Unknown,
+            CTypeLike::Function => CTypeLike::Unknown,
             CTypeLike::Unknown => self.type_from_size(fallback_size),
-        }
-    }
-
-    fn ctype_like_to_ctype(&self, ty: CTypeLike) -> CType {
-        match ty {
-            CTypeLike::Void => CType::Void,
-            CTypeLike::Bool => CType::Bool,
-            CTypeLike::Int { bits, signedness } => match signedness {
-                Signedness::Unsigned => CType::UInt(bits),
-                Signedness::Signed | Signedness::Unknown => CType::Int(bits),
-            },
-            CTypeLike::Float(bits) => CType::Float(bits),
-            CTypeLike::Pointer(inner) => CType::Pointer(Box::new(self.ctype_like_to_ctype(*inner))),
-            CTypeLike::Array(inner, len) => {
-                CType::Array(Box::new(self.ctype_like_to_ctype(*inner)), len)
-            }
-            CTypeLike::Struct(name) => CType::Struct(name),
-            CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
+            other => other,
         }
     }
 
@@ -1095,7 +1191,7 @@ impl TypeInference {
     }
 
     /// Get the type of a variable.
-    pub fn get_type(&self, var: &SSAVar) -> CType {
+    pub fn get_type(&self, var: &SSAVar) -> CTypeLike {
         self.var_types
             .get(var)
             .cloned()
@@ -1103,19 +1199,19 @@ impl TypeInference {
     }
 
     /// Get a type from a size.
-    pub fn type_from_size(&self, size: u32) -> CType {
+    pub fn type_from_size(&self, size: u32) -> CTypeLike {
         match size {
-            0 => CType::Unknown,
-            1 => CType::Int(8),
-            2 => CType::Int(16),
-            4 => CType::Int(32),
-            8 => CType::Int(64),
-            _ => CType::Int(size.saturating_mul(8)),
+            0 => CTypeLike::Unknown,
+            1 => signed_int(8),
+            2 => signed_int(16),
+            4 => signed_int(32),
+            8 => signed_int(64),
+            _ => signed_int(size.saturating_mul(8)),
         }
     }
 
     /// Export inferred types keyed by variable display/lowered names.
-    pub fn var_type_hints(&self) -> HashMap<String, CType> {
+    pub fn var_type_hints(&self) -> HashMap<String, CTypeLike> {
         let mut out = HashMap::new();
         for (var, ty) in &self.var_types {
             let key = var.display_name();
@@ -1130,8 +1226,8 @@ impl TypeInference {
     }
 
     /// Register a function type.
-    pub fn add_function_type(&mut self, name: &str, func_type: FunctionType) {
-        self.func_types.insert(name.to_string(), func_type);
+    pub fn add_function_type<T: Into<FunctionType>>(&mut self, name: &str, func_type: T) {
+        self.func_types.insert(name.to_string(), func_type.into());
     }
 
     /// Get a function type.
@@ -1142,6 +1238,94 @@ impl TypeInference {
     /// Get the last solved type lattice for oracle-based consumers.
     pub fn solved_types(&self) -> Option<&SolvedTypes> {
         self.solved_types.as_ref()
+    }
+
+    pub fn combined_type_oracle(&self) -> Option<CombinedTypeOracle<'_>> {
+        self.solved_types.as_ref().map(|solved| CombinedTypeOracle {
+            solved,
+            external_type_db: &self.external_type_db,
+        })
+    }
+}
+
+fn stack_slot_key_from_root(root: StackAddressRoot) -> StackSlotKey {
+    StackSlotKey {
+        base: match root.base {
+            StackAddressBase::FramePointer => ExternalStackBase::FramePointer,
+            StackAddressBase::StackPointer => ExternalStackBase::StackPointer,
+        },
+        offset: root.offset,
+    }
+}
+
+impl<'a> CombinedTypeOracle<'a> {
+    fn external_struct_for_type(&self, ty: TypeId) -> Option<&ExternalStruct> {
+        let named = match self.solved.arena.get(ty) {
+            Type::Struct(shape) => shape.name.as_deref(),
+            Type::Ptr(inner) => match self.solved.arena.get(*inner) {
+                Type::Struct(shape) => shape.name.as_deref(),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        self.external_type_db
+            .structs
+            .get(&named.to_ascii_lowercase())
+    }
+}
+
+impl TypeOracle for CombinedTypeOracle<'_> {
+    fn type_of(&self, var: &SSAVar) -> TypeId {
+        self.solved.type_of(var)
+    }
+
+    fn struct_shape(&self, ty: TypeId) -> Option<&crate::StructShape> {
+        self.solved.struct_shape(ty)
+    }
+
+    fn is_pointer(&self, ty: TypeId) -> bool {
+        self.solved.is_pointer(ty)
+    }
+
+    fn is_array(&self, ty: TypeId) -> bool {
+        self.solved.is_array(ty)
+    }
+
+    fn field_name(&self, ty: TypeId, offset: u64) -> Option<&str> {
+        self.solved.field_name(ty, offset).or_else(|| {
+            self.external_struct_for_type(ty)
+                .and_then(|st| st.fields.get(&offset))
+                .map(|field| field.name.as_str())
+        })
+    }
+
+    fn field_name_any(&self, offset: u64) -> Option<&str> {
+        self.solved.field_name_any(offset).or_else(|| {
+            let mut matched: Option<&str> = None;
+            for st in self.external_type_db.structs.values() {
+                let Some(field) = st.fields.get(&offset) else {
+                    continue;
+                };
+                match matched {
+                    None => matched = Some(field.name.as_str()),
+                    Some(existing) if existing == field.name => {}
+                    Some(_) => return None,
+                }
+            }
+            matched
+        })
+    }
+
+    fn field_layout(&self, ty: TypeId, offset: u64) -> Option<ResolvedFieldLayout> {
+        self.solved.field_layout(ty, offset).or_else(|| {
+            let st = self.external_struct_for_type(ty)?;
+            let field = st.fields.get(&offset)?;
+            Some(ResolvedFieldLayout::direct(
+                Some(st.name.clone()),
+                offset,
+                field.name.clone(),
+            ))
+        })
     }
 }
 
@@ -1284,6 +1468,65 @@ fn parse_const_addr(name: &str) -> Option<u64> {
     }
 }
 
+fn parse_const_offset(var: &SSAVar) -> Option<i64> {
+    if !var.is_const() {
+        return None;
+    }
+    let val = {
+        let val_str = var
+            .name
+            .strip_prefix("const:")?
+            .split('_')
+            .next()
+            .unwrap_or_default();
+        if let Some(hex) = val_str
+            .strip_prefix("0x")
+            .or_else(|| val_str.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).ok()?
+        } else if let Some(dec) = val_str
+            .strip_prefix("0d")
+            .or_else(|| val_str.strip_prefix("0D"))
+        {
+            dec.parse().ok()?
+        } else {
+            u64::from_str_radix(val_str, 16).ok()?
+        }
+    };
+    const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
+    if val > LIKELY_NEGATIVE_THRESHOLD {
+        let neg = (!val).wrapping_add(1);
+        Some(-(neg as i64))
+    } else {
+        Some(val as i64)
+    }
+}
+
+fn register_alias_names(reg_name: &str) -> Vec<String> {
+    let lower = reg_name.to_ascii_lowercase();
+    let aliases = match lower.as_str() {
+        "rax" | "eax" | "ax" | "al" | "ah" => &["rax", "eax", "ax", "al", "ah"][..],
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => &["rbx", "ebx", "bx", "bl", "bh"][..],
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => &["rcx", "ecx", "cx", "cl", "ch"][..],
+        "rdx" | "edx" | "dx" | "dl" | "dh" => &["rdx", "edx", "dx", "dl", "dh"][..],
+        "rsi" | "esi" | "si" | "sil" => &["rsi", "esi", "si", "sil"][..],
+        "rdi" | "edi" | "di" | "dil" => &["rdi", "edi", "di", "dil"][..],
+        "rbp" | "ebp" | "bp" | "bpl" => &["rbp", "ebp", "bp", "bpl"][..],
+        "rsp" | "esp" | "sp" | "spl" => &["rsp", "esp", "sp", "spl"][..],
+        "r8" | "r8d" | "r8w" | "r8b" => &["r8", "r8d", "r8w", "r8b"][..],
+        "r9" | "r9d" | "r9w" | "r9b" => &["r9", "r9d", "r9w", "r9b"][..],
+        _ => return vec![lower],
+    };
+    aliases.iter().map(|alias| (*alias).to_string()).collect()
+}
+
+fn signed_int(bits: u32) -> CTypeLike {
+    CTypeLike::Int {
+        bits,
+        signedness: Signedness::Signed,
+    }
+}
+
 fn parse_const_u64(var: &SSAVar) -> Option<u64> {
     parse_const_offset(var).and_then(|offset| u64::try_from(offset).ok())
 }
@@ -1366,9 +1609,9 @@ fn collect_call_return(ops: &[SSAOp], call_idx: usize, ret_regs: &[String]) -> O
 
 fn struct_name_from_type(arena: &TypeArena, ty: TypeId) -> Option<&str> {
     match arena.get(ty) {
-        r2types::Type::Struct(shape) => shape.name.as_deref(),
-        r2types::Type::Ptr(inner) => match arena.get(*inner) {
-            r2types::Type::Struct(shape) => shape.name.as_deref(),
+        Type::Struct(shape) => shape.name.as_deref(),
+        Type::Ptr(inner) => match arena.get(*inner) {
+            Type::Struct(shape) => shape.name.as_deref(),
             _ => None,
         },
         _ => None,
@@ -1378,8 +1621,8 @@ fn struct_name_from_type(arena: &TypeArena, ty: TypeId) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Type;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use r2types::Type;
 
     fn ssa_from_ops(ops: Vec<R2ILOp>, arch: Option<&ArchSpec>) -> SSAFunction {
         let mut block = R2ILBlock::new(0x1000, 4);
@@ -1430,10 +1673,10 @@ mod tests {
     fn test_type_from_size() {
         let ti = TypeInference::new(64);
 
-        assert_eq!(ti.type_from_size(1), CType::Int(8));
-        assert_eq!(ti.type_from_size(2), CType::Int(16));
-        assert_eq!(ti.type_from_size(4), CType::Int(32));
-        assert_eq!(ti.type_from_size(8), CType::Int(64));
+        assert_eq!(ti.type_from_size(1), signed_int(8));
+        assert_eq!(ti.type_from_size(2), signed_int(16));
+        assert_eq!(ti.type_from_size(4), signed_int(32));
+        assert_eq!(ti.type_from_size(8), signed_int(64));
     }
 
     #[test]
@@ -1502,8 +1745,8 @@ mod tests {
         ti.add_function_type(
             "test_target",
             FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::Int(64), CType::Int(64)],
+                return_type: signed_int(32),
+                params: vec![signed_int(64), signed_int(64)],
                 variadic: false,
             },
         );
@@ -1555,8 +1798,8 @@ mod tests {
         ti.add_function_type(
             "const:401000",
             FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::Int(64), CType::Int(64)],
+                return_type: signed_int(32),
+                params: vec![signed_int(64), signed_int(64)],
                 variadic: false,
             },
         );
@@ -1849,6 +2092,106 @@ mod tests {
             set_type_count >= 2,
             "Subpiece should emit at least 2 SetType constraints (dst+src), got {}",
             set_type_count
+        );
+    }
+
+    #[test]
+    fn test_legacy_external_stack_vars_are_canonicalized_without_name_fallback() {
+        let mut ti = TypeInference::new(64);
+        let slot_var = SSAVar::new("tmp:stack", 1, 8);
+        ti.set_external_stack_vars(HashMap::from([(
+            -8,
+            ExternalStackVarSpec {
+                name: "count".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+                base: ExternalStackBase::FramePointer,
+                role: crate::ExternalStackSlotRole::Local,
+                param_index: None,
+                param_name: None,
+                source_reg: None,
+            },
+        )]));
+        ti.ssa_stack_slots.insert(
+            slot_var.clone(),
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -8,
+            },
+        );
+
+        assert_eq!(
+            ti.stack_slot_spec_for_var(&slot_var)
+                .map(|slot| slot.name.as_str()),
+            Some("count")
+        );
+        assert!(
+            ti.stack_slot_spec_for_var(&SSAVar::new("count", 1, 8))
+                .is_none(),
+            "legacy offset-only metadata must not bind unrelated SSA vars by name"
+        );
+    }
+
+    #[test]
+    fn set_prepared_ssa_uses_canonical_stack_objects_for_slot_binding() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RBP", 0x20, 8));
+
+        let prepared = SsaArtifact::for_decompile(
+            &[R2ILBlock {
+                addr: 0x2000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntSub {
+                        dst: Varnode::unique(0x10, 8),
+                        a: Varnode::register(0x20, 8),
+                        b: Varnode::constant(0x10, 8),
+                    },
+                    R2ILOp::Return {
+                        target: Varnode::constant(0, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&arch),
+        )
+        .expect("prepared SSA");
+
+        let mut ti = TypeInference::new(64);
+        ti.set_external_stack_slots(BTreeMap::from([(
+            StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: -16,
+            },
+            ExternalStackVarSpec {
+                name: "slot".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+                base: ExternalStackBase::FramePointer,
+                role: crate::ExternalStackSlotRole::Local,
+                param_index: None,
+                param_name: None,
+                source_reg: None,
+            },
+        )]));
+        ti.set_prepared_ssa(&prepared);
+
+        let slot_var = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.starts_with("tmp:"))
+            .map(|value| value.var.clone())
+            .expect("stack-root value");
+        assert_eq!(
+            ti.stack_slot_spec_for_var(&slot_var)
+                .map(|slot| slot.name.as_str()),
+            Some("slot")
         );
     }
 }

@@ -1,5 +1,5 @@
 use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
-use r2ssa::SSAFunction;
+use r2ssa::SsaArtifact;
 use r2sym::{ExploreConfig, PathExplorer, SymState};
 use z3::Context;
 
@@ -19,7 +19,7 @@ fn main() {
     // This example solves for the 4-byte input using r2sym.
 
     let blocks = build_blocks();
-    let func = SSAFunction::from_blocks(&blocks).expect("SSA build failed");
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("SSA build failed");
 
     let ctx = Context::thread_local();
 

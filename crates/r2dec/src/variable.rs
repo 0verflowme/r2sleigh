@@ -6,9 +6,56 @@
 use std::collections::{HashMap, HashSet};
 
 use r2ssa::{SSAFunction, SSAOp, SSAVar};
+use r2types::{
+    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionTypeFacts, StackSlotKey,
+    VisibleBinding, VisibleBindingKind,
+};
 
-use crate::ast::CType;
-use crate::{ExternalFunctionSignature, ExternalStackVar};
+use crate::analysis::utils;
+use crate::ast::{BinaryOp, CExpr, CType};
+
+pub(crate) fn type_like_to_ctype(ty: &CTypeLike) -> CType {
+    match ty {
+        CTypeLike::Void => CType::Void,
+        CTypeLike::Bool => CType::Bool,
+        CTypeLike::Int { bits, signedness } => match signedness {
+            r2types::Signedness::Unsigned => CType::UInt(*bits),
+            _ => CType::Int(*bits),
+        },
+        CTypeLike::Float(bits) => CType::Float(*bits),
+        CTypeLike::Pointer(inner) => CType::Pointer(Box::new(type_like_to_ctype(inner))),
+        CTypeLike::Array(inner, len) => CType::Array(Box::new(type_like_to_ctype(inner)), *len),
+        CTypeLike::Struct(name) => CType::Struct(name.clone()),
+        CTypeLike::Union(name) => CType::Union(name.clone()),
+        CTypeLike::Enum(name) => CType::Enum(name.clone()),
+        CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
+    }
+}
+
+fn parse_const_value(name: &str) -> Option<u64> {
+    let value = name.strip_prefix("const:")?;
+    let value = value.split('_').next().unwrap_or(value);
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if let Some(dec) = value
+        .strip_prefix("0d")
+        .or_else(|| value.strip_prefix("0D"))
+    {
+        return dec.parse::<u64>().ok();
+    }
+    if value.chars().all(|ch| ch.is_ascii_hexdigit())
+        && value
+            .chars()
+            .any(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_digit())
+    {
+        return u64::from_str_radix(value, 16).ok();
+    }
+    value.parse::<u64>().ok()
+}
 
 /// Variable information.
 #[derive(Debug, Clone)]
@@ -84,10 +131,8 @@ pub struct VariableRecovery {
     ret_regs: Vec<String>,
     /// Ordered argument registers for the active ABI.
     arg_regs: Vec<String>,
-    /// Optional external signature metadata.
-    external_signature: Option<ExternalFunctionSignature>,
-    /// Optional external stack variables keyed by signed stack offset.
-    external_stack_vars: HashMap<i64, ExternalStackVar>,
+    /// Externally recovered type and layout facts.
+    type_facts: FunctionTypeFacts,
     /// Stable insertion order for recovered variables.
     next_order_index: usize,
 }
@@ -133,51 +178,114 @@ impl VariableRecovery {
             loop_var_idx: 0,
             ret_regs,
             arg_regs,
-            external_signature: None,
-            external_stack_vars: HashMap::new(),
+            type_facts: FunctionTypeFacts::default(),
             next_order_index: 0,
         }
     }
 
-    /// Set an externally recovered function signature.
-    pub fn set_external_signature(&mut self, signature: ExternalFunctionSignature) {
-        self.external_signature = Some(signature);
+    /// Set externally recovered type/layout facts.
+    pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
+        self.type_facts = type_facts.canonicalized();
     }
 
-    /// Set externally recovered stack variable metadata.
-    pub fn set_external_stack_vars(&mut self, stack_vars: HashMap<i64, ExternalStackVar>) {
-        self.external_stack_vars = stack_vars;
+    fn is_visible_external_stack_name_role(role: ExternalStackSlotRole) -> bool {
+        matches!(
+            role,
+            ExternalStackSlotRole::Local
+                | ExternalStackSlotRole::StackArg
+                | ExternalStackSlotRole::Unknown
+        )
+    }
+
+    fn is_reserved_param_name(&self, name: &str) -> bool {
+        if self
+            .used_param_names
+            .iter()
+            .any(|used| used.eq_ignore_ascii_case(name))
+        {
+            return true;
+        }
+
+        let lower = name.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("arg")
+            && let Ok(idx) = rest.parse::<usize>()
+            && (1..=self.arg_regs.len()).contains(&idx)
+        {
+            return true;
+        }
+
+        self.type_facts
+            .visible_bindings
+            .iter()
+            .filter(|binding| matches!(binding.kind, VisibleBindingKind::Param))
+            .any(|binding| binding.name.eq_ignore_ascii_case(name))
+            || self
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .map(|sig| {
+                    sig.params
+                        .iter()
+                        .take(self.arg_regs.len())
+                        .any(|param| param.name.eq_ignore_ascii_case(name))
+                })
+                .unwrap_or(false)
+    }
+
+    fn visible_param_binding(&self, index: usize) -> Option<&VisibleBinding> {
+        self.type_facts.visible_bindings.iter().find(|binding| {
+            matches!(binding.kind, VisibleBindingKind::Param) && binding.param_index == Some(index)
+        })
+    }
+
+    fn visible_stack_binding_for_offset(&self, offset: i64) -> Option<&VisibleBinding> {
+        self.type_facts.visible_bindings.iter().find(|binding| {
+            !matches!(
+                binding.kind,
+                VisibleBindingKind::Param
+                    | VisibleBindingKind::HiddenHome
+                    | VisibleBindingKind::HiddenSaved
+            ) && binding
+                .stack_slot
+                .as_ref()
+                .is_some_and(|slot| Self::stack_slot_matches_offset(slot, offset))
+        })
+    }
+
+    fn stack_slot_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
+        if slot.offset == offset {
+            return true;
+        }
+        matches!(slot.base, ExternalStackBase::FramePointer) && -slot.offset == offset
     }
 
     fn external_stack_name_for_offset(&self, offset: i64) -> Option<String> {
-        if let Some(var) = self.external_stack_vars.get(&offset)
-            && !var.name.is_empty()
+        if let Some(binding) = self.visible_stack_binding_for_offset(offset)
+            && !binding.name.is_empty()
+            && !self.is_reserved_param_name(&binding.name)
         {
-            return Some(var.name.clone());
+            return Some(binding.name.clone());
         }
 
-        // r2 external metadata may encode RBP locals as negative offsets while
-        // internal recovery tracks locals as positive deltas from frame base.
-        let mut mirrored_offsets: Vec<_> = self.external_stack_vars.keys().copied().collect();
-        mirrored_offsets.sort_unstable();
-        for ext_offset in mirrored_offsets {
-            let Some(var) = self.external_stack_vars.get(&ext_offset) else {
-                continue;
-            };
-            if var.name.is_empty() {
+        for (slot_key, slot_spec) in &self.type_facts.stack_slots {
+            if !Self::stack_slot_matches_offset(slot_key, offset) {
                 continue;
             }
-            let is_frame_based = var
-                .base
-                .as_deref()
-                .map(|base| base.eq_ignore_ascii_case("rbp") || base.eq_ignore_ascii_case("ebp"))
-                .unwrap_or(false);
-            if is_frame_based && -ext_offset == offset {
-                return Some(var.name.clone());
+            if !slot_spec.name.is_empty()
+                && Self::is_visible_external_stack_name_role(slot_spec.role)
+                && !self.is_reserved_param_name(&slot_spec.name)
+            {
+                return Some(slot_spec.name.clone());
             }
         }
 
         None
+    }
+
+    fn visible_stack_type_for_offset(&self, offset: i64) -> Option<CType> {
+        self.visible_stack_binding_for_offset(offset)
+            .and_then(|binding| binding.ty.as_ref())
+            .map(type_like_to_ctype)
     }
 
     /// Recover variables from an SSA function.
@@ -319,20 +427,25 @@ impl VariableRecovery {
 
     /// Find stack variables (loads/stores relative to SP/FP).
     fn find_stack_variables(&mut self, func: &SSAFunction) {
+        let definitions = self.collect_definitions(func);
         for block in func.blocks() {
             for op in &block.ops {
                 match op {
                     SSAOp::Load { dst, addr, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr) {
+                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
                             let name = self.gen_stack_var_name(offset);
-                            let ty = self.type_from_size(dst.size);
+                            let ty = self
+                                .visible_stack_type_for_offset(offset)
+                                .unwrap_or_else(|| self.type_from_size(dst.size));
                             self.insert_var_info(dst.clone(), name, ty, VarAttrs::local(offset));
                         }
                     }
                     SSAOp::Store { addr, val, .. } => {
-                        if let Some(offset) = self.get_stack_offset(addr) {
+                        if let Some(offset) = self.get_stack_offset(addr, &definitions) {
                             let name = self.gen_stack_var_name(offset);
-                            let ty = self.type_from_size(val.size);
+                            let ty = self
+                                .visible_stack_type_for_offset(offset)
+                                .unwrap_or_else(|| self.type_from_size(val.size));
                             self.insert_var_info(val.clone(), name, ty, VarAttrs::local(offset));
                         }
                     }
@@ -343,11 +456,53 @@ impl VariableRecovery {
     }
 
     /// Get stack offset from an address variable.
-    fn get_stack_offset(&self, addr: &SSAVar) -> Option<i64> {
-        if addr.name.contains(&self.sp_name) || addr.name.contains(&self.fp_name) {
-            return Some(0);
+    fn get_stack_offset(&self, addr: &SSAVar, definitions: &HashMap<String, CExpr>) -> Option<i64> {
+        utils::extract_stack_offset_from_var(addr, definitions, &self.fp_name, &self.sp_name)
+    }
+
+    fn collect_definitions(&self, func: &SSAFunction) -> HashMap<String, CExpr> {
+        let mut definitions = HashMap::new();
+        for block in func.blocks() {
+            for op in &block.ops {
+                match op {
+                    SSAOp::Copy { dst, src } => {
+                        definitions.insert(dst.display_name(), self.expr_for_ssa_var(src));
+                    }
+                    SSAOp::IntAdd { dst, a, b } => {
+                        definitions.insert(
+                            dst.display_name(),
+                            CExpr::binary(
+                                BinaryOp::Add,
+                                self.expr_for_ssa_var(a),
+                                self.expr_for_ssa_var(b),
+                            ),
+                        );
+                    }
+                    SSAOp::IntSub { dst, a, b } => {
+                        definitions.insert(
+                            dst.display_name(),
+                            CExpr::binary(
+                                BinaryOp::Sub,
+                                self.expr_for_ssa_var(a),
+                                self.expr_for_ssa_var(b),
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
         }
-        None
+        definitions
+    }
+
+    fn expr_for_ssa_var(&self, var: &SSAVar) -> CExpr {
+        if let Some(val) = parse_const_value(&var.name) {
+            if let Ok(signed) = i64::try_from(val) {
+                return CExpr::IntLit(signed);
+            }
+            return CExpr::UIntLit(val);
+        }
+        CExpr::Var(var.display_name())
     }
 
     /// Generate a name for a stack variable.
@@ -442,7 +597,16 @@ impl VariableRecovery {
     }
 
     fn apply_external_param_override(&self, index: usize, name: &mut String, ty: &mut CType) {
-        let Some(signature) = self.external_signature.as_ref() else {
+        if let Some(binding) = self.visible_param_binding(index) {
+            if !is_generic_arg_name(&binding.name) {
+                *name = binding.name.clone();
+            }
+            if let Some(binding_ty) = binding.ty.as_ref() {
+                *ty = type_like_to_ctype(binding_ty);
+            }
+        }
+
+        let Some(signature) = self.type_facts.merged_signature.as_ref() else {
             return;
         };
         let Some(ext) = signature.params.get(index) else {
@@ -453,7 +617,7 @@ impl VariableRecovery {
             *name = ext.name.clone();
         }
         if let Some(ext_ty) = &ext.ty {
-            *ty = ext_ty.clone();
+            *ty = type_like_to_ctype(ext_ty);
         }
     }
 
@@ -644,7 +808,80 @@ fn is_generic_arg_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExternalFunctionParam, ExternalFunctionSignature, ExternalStackVar};
+    use r2il::{R2ILBlock, R2ILOp, Varnode};
+    use r2ssa::SSAFunction;
+    use r2types::{
+        ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, FunctionParamSpec,
+        FunctionSignatureSpec, FunctionTypeFacts, StackSlotKey, VisibleBinding, VisibleBindingKind,
+    };
+
+    fn stack_var_spec_from_ctype(
+        name: &str,
+        ty: Option<CType>,
+        base: Option<&str>,
+    ) -> ExternalStackVarSpec {
+        ExternalStackVarSpec {
+            name: name.to_string(),
+            ty: ty.as_ref().map(super::super::ctype_to_type_like),
+            base: match base.map(|raw| raw.to_ascii_lowercase()) {
+                Some(raw) if raw == "rbp" || raw == "ebp" || raw == "bp" || raw == "fp" => {
+                    ExternalStackBase::FramePointer
+                }
+                Some(raw) if raw == "rsp" || raw == "esp" || raw == "sp" => {
+                    ExternalStackBase::StackPointer
+                }
+                Some(raw) => ExternalStackBase::Named(raw),
+                None => ExternalStackBase::default(),
+            },
+            role: ExternalStackSlotRole::Unknown,
+            param_index: None,
+            param_name: None,
+            source_reg: None,
+        }
+    }
+
+    fn signature_spec(params: Vec<(&str, Option<CType>)>) -> FunctionSignatureSpec {
+        FunctionSignatureSpec {
+            ret_type: None,
+            params: params
+                .into_iter()
+                .map(|(name, ty)| FunctionParamSpec {
+                    name: name.to_string(),
+                    ty: ty.as_ref().map(super::super::ctype_to_type_like),
+                })
+                .collect(),
+        }
+    }
+
+    fn visible_stack_binding(name: &str, ty: Option<CType>, offset: i64) -> VisibleBinding {
+        VisibleBinding {
+            name: name.to_string(),
+            ty: ty.as_ref().map(super::super::ctype_to_type_like),
+            kind: VisibleBindingKind::Local,
+            stack_slot: Some(StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset,
+            }),
+            param_index: None,
+            source_reg: None,
+        }
+    }
+
+    fn visible_param_binding(
+        name: &str,
+        ty: Option<CType>,
+        index: usize,
+        reg: &str,
+    ) -> VisibleBinding {
+        VisibleBinding {
+            name: name.to_string(),
+            ty: ty.as_ref().map(super::super::ctype_to_type_like),
+            kind: VisibleBindingKind::Param,
+            stack_slot: None,
+            param_index: Some(index),
+            source_reg: Some(reg.to_string()),
+        }
+    }
 
     #[test]
     fn test_gen_param_name() {
@@ -684,14 +921,18 @@ mod tests {
     #[test]
     fn test_external_stack_var_name_preferred() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_external_stack_vars(HashMap::from([(
-            8,
-            ExternalStackVar {
-                name: "user_input".to_string(),
-                ty: None,
-                base: Some("RBP".to_string()),
-            },
-        )]));
+        vr.set_type_facts(FunctionTypeFacts {
+            visible_bindings: vec![visible_stack_binding(
+                "user_input",
+                Some(CType::ptr(CType::Int(8))),
+                -8,
+            )],
+            external_stack_vars: HashMap::from([(
+                8,
+                stack_var_spec_from_ctype("user_input", None, Some("RBP")),
+            )]),
+            ..FunctionTypeFacts::default()
+        });
 
         let name = vr.gen_stack_var_name(8);
         assert_eq!(name, "user_input");
@@ -700,14 +941,13 @@ mod tests {
     #[test]
     fn test_external_stack_var_name_fallback_when_missing() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_external_stack_vars(HashMap::from([(
-            -0x10,
-            ExternalStackVar {
-                name: "buf".to_string(),
-                ty: None,
-                base: Some("RBP".to_string()),
-            },
-        )]));
+        vr.set_type_facts(FunctionTypeFacts {
+            external_stack_vars: HashMap::from([(
+                -0x10,
+                stack_var_spec_from_ctype("buf", None, Some("RBP")),
+            )]),
+            ..FunctionTypeFacts::default()
+        });
 
         let name = vr.gen_stack_var_name(8);
         assert_eq!(name, "local_8");
@@ -716,24 +956,13 @@ mod tests {
     #[test]
     fn test_external_stack_var_name_collision_still_unique() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_external_stack_vars(HashMap::from([
-            (
-                8,
-                ExternalStackVar {
-                    name: "buf".to_string(),
-                    ty: None,
-                    base: Some("RBP".to_string()),
-                },
-            ),
-            (
-                16,
-                ExternalStackVar {
-                    name: "buf".to_string(),
-                    ty: None,
-                    base: Some("RBP".to_string()),
-                },
-            ),
-        ]));
+        vr.set_type_facts(FunctionTypeFacts {
+            external_stack_vars: HashMap::from([
+                (8, stack_var_spec_from_ctype("buf", None, Some("RBP"))),
+                (16, stack_var_spec_from_ctype("buf", None, Some("RBP"))),
+            ]),
+            ..FunctionTypeFacts::default()
+        });
 
         let first = vr.gen_stack_var_name(8);
         let second = vr.gen_stack_var_name(16);
@@ -744,28 +973,52 @@ mod tests {
     #[test]
     fn test_external_stack_var_name_prefers_mirrored_rbp_offset() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_external_stack_vars(HashMap::from([(
-            -4,
-            ExternalStackVar {
-                name: "result".to_string(),
-                ty: None,
-                base: Some("RBP".to_string()),
-            },
-        )]));
+        vr.set_type_facts(FunctionTypeFacts {
+            external_stack_vars: HashMap::from([(
+                -4,
+                stack_var_spec_from_ctype("result", None, Some("RBP")),
+            )]),
+            ..FunctionTypeFacts::default()
+        });
 
         let name = vr.gen_stack_var_name(4);
         assert_eq!(name, "result");
     }
 
     #[test]
+    fn test_external_stack_var_name_matching_param_alias_falls_back_to_generic_local() {
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(FunctionTypeFacts {
+            merged_signature: Some(signature_spec(vec![
+                ("a", Some(CType::Int(32))),
+                ("b", Some(CType::Int(32))),
+            ])),
+            external_stack_vars: HashMap::from([(
+                -8,
+                stack_var_spec_from_ctype("a", Some(CType::Int(32)), Some("RBP")),
+            )]),
+            ..FunctionTypeFacts::default()
+        });
+
+        let name = vr.gen_stack_var_name(8);
+        assert_eq!(name, "local_8");
+    }
+
+    #[test]
     fn test_external_signature_overrides_meaningful_param_name_and_type() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_external_signature(ExternalFunctionSignature {
-            ret_type: None,
-            params: vec![ExternalFunctionParam {
-                name: "user_input".to_string(),
-                ty: Some(CType::ptr(CType::Int(8))),
-            }],
+        vr.set_type_facts(FunctionTypeFacts {
+            visible_bindings: vec![visible_param_binding(
+                "user_input",
+                Some(CType::ptr(CType::Int(8))),
+                0,
+                "rdi",
+            )],
+            merged_signature: Some(signature_spec(vec![(
+                "user_input",
+                Some(CType::ptr(CType::Int(8))),
+            )])),
+            ..FunctionTypeFacts::default()
         });
 
         let mut name = "arg1".to_string();
@@ -777,14 +1030,51 @@ mod tests {
     }
 
     #[test]
+    fn visible_binding_type_and_name_drive_stack_local_recovery() {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:addr", 1, 8),
+                a: SSAVar::new("RBP", 1, 8),
+                b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+            },
+            SSAOp::Load {
+                dst: SSAVar::new("tmp:len", 1, 8),
+                space: "ram".to_string(),
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("tmp:len", 1, 8),
+            },
+        ];
+
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(FunctionTypeFacts {
+            visible_bindings: vec![visible_stack_binding("len", Some(CType::UInt(64)), -8)],
+            ..FunctionTypeFacts::default()
+        });
+
+        vr.recover(&func);
+
+        let local = vr
+            .locals()
+            .into_iter()
+            .find(|info| info.name == "len")
+            .expect("visible stack local");
+        assert_eq!(local.name, "len");
+        assert_eq!(local.ty, CType::UInt(64));
+    }
+
+    #[test]
     fn test_external_signature_generic_param_name_is_ignored() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_external_signature(ExternalFunctionSignature {
-            ret_type: None,
-            params: vec![ExternalFunctionParam {
-                name: "arg0".to_string(),
-                ty: Some(CType::Int(32)),
-            }],
+        vr.set_type_facts(FunctionTypeFacts {
+            merged_signature: Some(signature_spec(vec![("arg0", Some(CType::Int(32)))])),
+            ..FunctionTypeFacts::default()
         });
 
         let mut name = "arg1".to_string();
@@ -798,12 +1088,9 @@ mod tests {
     #[test]
     fn test_external_signature_type_override_only_when_available() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_external_signature(ExternalFunctionSignature {
-            ret_type: None,
-            params: vec![ExternalFunctionParam {
-                name: "count".to_string(),
-                ty: None,
-            }],
+        vr.set_type_facts(FunctionTypeFacts {
+            merged_signature: Some(signature_spec(vec![("count", None)])),
+            ..FunctionTypeFacts::default()
         });
 
         let mut name = "arg1".to_string();
@@ -812,6 +1099,52 @@ mod tests {
 
         assert_eq!(name, "count");
         assert_eq!(ty, CType::Int(64));
+    }
+
+    #[test]
+    fn test_recover_finds_stack_local_through_temp_frame_address() {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:addr", 1, 8),
+                a: SSAVar::new("RBP", 1, 8),
+                b: SSAVar::new("const:fffffffffffffffc", 0, 8),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: SSAVar::new("tmp:addr", 1, 8),
+                val: SSAVar::new("EAX", 1, 4),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("RIP", 1, 8),
+            },
+        ];
+
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(FunctionTypeFacts {
+            external_stack_vars: HashMap::from([(
+                -4,
+                stack_var_spec_from_ctype("sum", Some(CType::Int(32)), Some("RBP")),
+            )]),
+            ..FunctionTypeFacts::default()
+        });
+
+        vr.recover(&func);
+
+        let local_names: Vec<_> = vr
+            .locals()
+            .into_iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert!(
+            local_names.iter().any(|name| name == "sum"),
+            "expected temp-address store to recover named stack local, got {local_names:?}"
+        );
+        assert_eq!(vr.get_name(&SSAVar::new("EAX", 1, 4)), "sum");
     }
 
     #[test]

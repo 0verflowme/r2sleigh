@@ -71,6 +71,30 @@ pub fn stress_test_opt_binary() -> &'static str {
 pub const VULN_TEST_BINARY: &str = "vuln_test";
 pub const TEST_FUNC_BINARY: &str = "test_func";
 
+#[cfg(target_os = "macos")]
+const RELEASE_PLUGIN_CANDIDATES: &[&str] = &[
+    "target/release/libr2sleigh_plugin.dylib",
+    "../../target/release/libr2sleigh_plugin.dylib",
+];
+#[cfg(target_os = "linux")]
+const RELEASE_PLUGIN_CANDIDATES: &[&str] = &[
+    "target/release/libr2sleigh_plugin.so",
+    "../../target/release/libr2sleigh_plugin.so",
+];
+#[cfg(target_os = "windows")]
+const RELEASE_PLUGIN_CANDIDATES: &[&str] = &[
+    "target/release/r2sleigh_plugin.dll",
+    "../../target/release/r2sleigh_plugin.dll",
+];
+
+pub fn release_plugin_path() -> &'static str {
+    RELEASE_PLUGIN_CANDIDATES
+        .iter()
+        .copied()
+        .find(|path| Path::new(path).exists())
+        .unwrap_or(RELEASE_PLUGIN_CANDIDATES[0])
+}
+
 /// Result of running an r2 command
 #[derive(Debug)]
 pub struct R2Result {
@@ -231,8 +255,11 @@ fn configure_plugin_env(command: &mut Command) {
 
     #[cfg(target_os = "windows")]
     const ANAL_PLUGIN_LIB: &str = "anal_sleigh.dll";
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    const ANAL_PLUGIN_LIB: &str = "anal_sleigh.dylib";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     const ANAL_PLUGIN_LIB: &str = "anal_sleigh.so";
+    const RUST_PLUGIN_SUBDIR: &str = "r2sleigh";
 
     static R2_HOME_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
     let home_override = R2_HOME_OVERRIDE.get_or_init(|| {
@@ -240,7 +267,9 @@ fn configure_plugin_env(command: &mut Command) {
         let mut plugin_src: Option<PathBuf> = None;
         for candidate in ["r2plugin", "../r2plugin", "../../r2plugin"] {
             let dir = cwd.join(candidate);
-            if dir.join(ANAL_PLUGIN_LIB).exists() && dir.join(RUST_PLUGIN_LIB).exists() {
+            if dir.join(ANAL_PLUGIN_LIB).exists()
+                && dir.join(RUST_PLUGIN_SUBDIR).join(RUST_PLUGIN_LIB).exists()
+            {
                 plugin_src = Some(dir);
                 break;
             }
@@ -248,18 +277,30 @@ fn configure_plugin_env(command: &mut Command) {
         let plugin_src = plugin_src?;
         let home_dir = std::env::temp_dir().join("r2sleigh-e2e-home");
         let plugin_dst = home_dir.join(".local/share/radare2/plugins");
+        let runtime_dst = plugin_dst.join(RUST_PLUGIN_SUBDIR);
         fs::create_dir_all(&plugin_dst).ok()?;
+        fs::create_dir_all(&runtime_dst).ok()?;
         fs::copy(
             plugin_src.join(ANAL_PLUGIN_LIB),
             plugin_dst.join(ANAL_PLUGIN_LIB),
         )
         .ok()?;
         fs::copy(
-            plugin_src.join(RUST_PLUGIN_LIB),
-            plugin_dst.join(RUST_PLUGIN_LIB),
+            plugin_src.join(RUST_PLUGIN_SUBDIR).join(RUST_PLUGIN_LIB),
+            runtime_dst.join(RUST_PLUGIN_LIB),
         )
         .ok()?;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            const ARCH_PLUGIN_LIB: &str = "arch_sleigh.dylib";
+            if plugin_src.join(ARCH_PLUGIN_LIB).exists() {
+                let _ = fs::copy(
+                    plugin_src.join(ARCH_PLUGIN_LIB),
+                    plugin_dst.join(ARCH_PLUGIN_LIB),
+                );
+            }
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
             const ARCH_PLUGIN_LIB: &str = "arch_sleigh.so";
             if plugin_src.join(ARCH_PLUGIN_LIB).exists() {
@@ -267,6 +308,24 @@ fn configure_plugin_env(command: &mut Command) {
                     plugin_src.join(ARCH_PLUGIN_LIB),
                     plugin_dst.join(ARCH_PLUGIN_LIB),
                 );
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(plugin_dst.join(ANAL_PLUGIN_LIB))
+                .status();
+            let _ = Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(runtime_dst.join(RUST_PLUGIN_LIB))
+                .status();
+            let arch_plugin = plugin_dst.join("arch_sleigh.dylib");
+            if arch_plugin.exists() {
+                let _ = Command::new("codesign")
+                    .args(["--force", "--sign", "-"])
+                    .arg(arch_plugin)
+                    .status();
             }
         }
         Some(home_dir)
@@ -422,11 +481,10 @@ pub fn require_binary(path: &str) {
 
 /// Check that the plugin is built
 pub fn require_plugin() {
-    let plugin_path = "target/release/libr2sleigh_plugin.so";
     assert!(
-        Path::new(plugin_path).exists(),
-        "Plugin not found at {}. Run `cargo build --release -p r2plugin` first.",
-        plugin_path
+        Path::new(release_plugin_path()).exists(),
+        "Plugin not found at {}. Run `cargo build --release -p r2sleigh-plugin` first.",
+        release_plugin_path()
     );
 }
 

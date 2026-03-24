@@ -50,9 +50,15 @@ impl PhiPlacement {
     ) -> Self {
         let mut placement = Self::new();
 
-        for (var_name, def_blocks) in defs {
-            let def_list: Vec<u64> = def_blocks.iter().copied().collect();
-            let phi_blocks = domtree.iterated_frontier(&def_list);
+        let mut defs_by_name: Vec<(&String, &HashSet<u64>)> = defs.iter().collect();
+        defs_by_name.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+        for (var_name, def_blocks) in defs_by_name {
+            let mut def_list: Vec<u64> = def_blocks.iter().copied().collect();
+            def_list.sort_unstable();
+            let mut phi_blocks: Vec<u64> =
+                domtree.iterated_frontier(&def_list).into_iter().collect();
+            phi_blocks.sort_unstable();
 
             for phi_block in phi_blocks {
                 let preds = cfg.predecessors(phi_block);
@@ -66,6 +72,15 @@ impl PhiPlacement {
                     placement.phis.entry(phi_block).or_default().push(phi_info);
                 }
             }
+        }
+
+        for phis in placement.phis.values_mut() {
+            phis.sort_unstable_by(|lhs, rhs| {
+                lhs.var_name
+                    .cmp(&rhs.var_name)
+                    .then(lhs.var_size.cmp(&rhs.var_size))
+                    .then(lhs.predecessors.cmp(&rhs.predecessors))
+            });
         }
 
         placement
@@ -83,7 +98,9 @@ impl PhiPlacement {
 
     /// Get all blocks that have phi nodes.
     pub fn blocks_with_phis(&self) -> impl Iterator<Item = u64> + '_ {
-        self.phis.keys().copied()
+        let mut blocks: Vec<u64> = self.phis.keys().copied().collect();
+        blocks.sort_unstable();
+        blocks.into_iter()
     }
 
     /// Get total number of phi nodes.
@@ -124,7 +141,10 @@ pub fn collect_defs_from_cfg_with_names(
     let mut defs: HashMap<String, HashSet<u64>> = HashMap::new();
     let mut var_sizes: HashMap<String, u32> = HashMap::new();
 
-    for block in cfg.blocks() {
+    for addr in cfg.block_addrs() {
+        let Some(block) = cfg.get_block(addr) else {
+            continue;
+        };
         for op in &block.ops {
             if let Some((name, size)) = get_op_output_with_size(op, reg_names) {
                 defs.entry(name.clone()).or_default().insert(block.addr);

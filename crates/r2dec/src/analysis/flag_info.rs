@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use r2ssa::SSAOp;
 
+use super::lower::LowerCtx;
 use super::{FlagCompareKind, FlagCompareProvenance, FlagInfo, PassEnv, UseInfo, utils};
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::fold::SSABlock;
@@ -11,30 +12,53 @@ pub(crate) struct FlagScratch {
     pub(crate) info: FlagInfo,
 }
 
-pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, _env: &PassEnv<'_>) -> FlagInfo {
+pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> FlagInfo {
     let mut scratch = FlagScratch::default();
+    let lower = LowerCtx {
+        use_info: Some(use_info),
+        definitions: &use_info.definitions,
+        semantic_values: &use_info.semantic_values,
+        use_counts: &use_info.use_counts,
+        condition_vars: &use_info.condition_vars,
+        pinned: &use_info.pinned,
+        var_aliases: &use_info.var_aliases,
+        param_register_aliases: env.param_register_aliases,
+        type_hints: &use_info.type_hints,
+        ptr_arith: &use_info.ptr_arith,
+        stack_slots: &use_info.stack_slots,
+        forwarded_values: &use_info.forwarded_values,
+        function_names: env.function_names,
+        strings: env.strings,
+        symbols: env.symbols,
+        type_oracle: env.type_oracle,
+    };
 
     for block in blocks {
-        analyze_comparison_patterns(&mut scratch, block, use_info);
+        analyze_comparison_patterns(&mut scratch, block, use_info, &lower);
     }
     recompute_flag_only_values(&mut scratch, blocks);
 
     scratch.info
 }
 
-fn format_compare_operand(var_name: &str) -> String {
-    if let Some(val) = utils::parse_const_value(var_name) {
+fn format_compare_operand(var: &r2ssa::SSAVar, compare_width: u32) -> String {
+    if let Some(val) = utils::parse_compare_const_value_with_width(var, compare_width) {
         if (val > 255 && val % 10 != 0) || val > 0xffff {
             format!("0x{:x}", val)
         } else {
             format!("{}", val)
         }
     } else {
-        var_name.to_string()
+        var.name.clone()
     }
 }
 
-fn analyze_comparison_patterns(scratch: &mut FlagScratch, block: &SSABlock, use_info: &UseInfo) {
+fn analyze_comparison_patterns(
+    scratch: &mut FlagScratch,
+    block: &SSABlock,
+    use_info: &UseInfo,
+    lower: &LowerCtx<'_>,
+) {
     for op in &block.ops {
         if let SSAOp::IntSub { dst, a, b } = op {
             let dst_key = dst.display_name();
@@ -116,51 +140,51 @@ fn analyze_comparison_patterns(scratch: &mut FlagScratch, block: &SSABlock, use_
             | SSAOp::Cast { src, .. } => predicate_passthrough_expr(src, scratch),
             SSAOp::BoolNot { src, .. } => Some(CExpr::unary(
                 UnaryOp::Not,
-                predicate_operand_expr(src, scratch),
+                predicate_operand_expr(src, scratch, use_info, lower),
             )),
             SSAOp::BoolAnd { a, b, .. } => Some(CExpr::binary(
                 BinaryOp::And,
-                predicate_operand_expr(a, scratch),
-                predicate_operand_expr(b, scratch),
+                predicate_operand_expr(a, scratch, use_info, lower),
+                predicate_operand_expr(b, scratch, use_info, lower),
             )),
             SSAOp::BoolOr { a, b, .. } => Some(CExpr::binary(
                 BinaryOp::Or,
-                predicate_operand_expr(a, scratch),
-                predicate_operand_expr(b, scratch),
+                predicate_operand_expr(a, scratch, use_info, lower),
+                predicate_operand_expr(b, scratch, use_info, lower),
             )),
             SSAOp::BoolXor { a, b, .. } => Some(CExpr::binary(
                 BinaryOp::BitXor,
-                predicate_operand_expr(a, scratch),
-                predicate_operand_expr(b, scratch),
+                predicate_operand_expr(a, scratch, use_info, lower),
+                predicate_operand_expr(b, scratch, use_info, lower),
             )),
             SSAOp::IntEqual { dst, a, b } => {
                 predicate_expr_for_compare_flag(dst.display_name(), scratch).or_else(|| {
                     Some(CExpr::binary(
                         BinaryOp::Eq,
-                        predicate_operand_expr(a, scratch),
-                        predicate_operand_expr(b, scratch),
+                        predicate_operand_expr(a, scratch, use_info, lower),
+                        predicate_operand_expr(b, scratch, use_info, lower),
                     ))
                 })
             }
             SSAOp::IntNotEqual { a, b, .. } => Some(CExpr::binary(
                 BinaryOp::Ne,
-                predicate_operand_expr(a, scratch),
-                predicate_operand_expr(b, scratch),
+                predicate_operand_expr(a, scratch, use_info, lower),
+                predicate_operand_expr(b, scratch, use_info, lower),
             )),
             SSAOp::IntLess { dst, a, b } | SSAOp::IntSLess { dst, a, b } => {
                 predicate_expr_for_compare_flag(dst.display_name(), scratch).or_else(|| {
                     Some(CExpr::binary(
                         BinaryOp::Lt,
-                        predicate_operand_expr(a, scratch),
-                        predicate_operand_expr(b, scratch),
+                        predicate_operand_expr(a, scratch, use_info, lower),
+                        predicate_operand_expr(b, scratch, use_info, lower),
                     ))
                 })
             }
             SSAOp::IntLessEqual { a, b, .. } | SSAOp::IntSLessEqual { a, b, .. } => {
                 Some(CExpr::binary(
                     BinaryOp::Le,
-                    predicate_operand_expr(a, scratch),
-                    predicate_operand_expr(b, scratch),
+                    predicate_operand_expr(a, scratch, use_info, lower),
+                    predicate_operand_expr(b, scratch, use_info, lower),
                 ))
             }
             _ => None,
@@ -172,13 +196,8 @@ fn analyze_comparison_patterns(scratch: &mut FlagScratch, block: &SSABlock, use_
     }
 }
 
-fn const_expr_from_name(name: &str) -> Option<CExpr> {
-    let val = utils::parse_const_value(name)?;
-    Some(if val > 0x7fffffff {
-        CExpr::UIntLit(val)
-    } else {
-        CExpr::IntLit(val as i64)
-    })
+fn const_expr_from_var(var: &r2ssa::SSAVar) -> Option<CExpr> {
+    Some(utils::compare_const_to_expr(var))
 }
 
 fn predicate_passthrough_expr(src: &r2ssa::SSAVar, scratch: &FlagScratch) -> Option<CExpr> {
@@ -186,7 +205,7 @@ fn predicate_passthrough_expr(src: &r2ssa::SSAVar, scratch: &FlagScratch) -> Opt
         return Some(expr.clone());
     }
     if src.is_const() {
-        return const_expr_from_name(&src.name);
+        return const_expr_from_var(src);
     }
     if utils::is_cpu_flag(&src.name.to_lowercase()) {
         return Some(CExpr::Var(src.display_name()));
@@ -199,13 +218,24 @@ fn trace_compare_operands(
     b: &r2ssa::SSAVar,
     use_info: &UseInfo,
 ) -> (String, String) {
-    let a_name = utils::trace_ssa_var_to_source(a, &use_info.copy_sources, &use_info.var_aliases);
+    let a_name = traced_compare_operand_name(a, use_info);
+    let compare_width = a.size.max(b.size);
     let b_name = if b.is_const() {
-        format_compare_operand(&b.name)
+        format_compare_operand(b, compare_width)
     } else {
-        utils::trace_ssa_var_to_source(b, &use_info.copy_sources, &use_info.var_aliases)
+        traced_compare_operand_name(b, use_info)
     };
     (a_name, b_name)
+}
+
+fn traced_compare_operand_name(var: &r2ssa::SSAVar, use_info: &UseInfo) -> String {
+    let key = var.display_name();
+    if use_info.call_result_source_by_alias.contains_key(&key)
+        || matches!(use_info.definitions.get(&key), Some(CExpr::Call { .. }))
+    {
+        return key;
+    }
+    utils::trace_ssa_var_to_source(var, &use_info.copy_sources, &use_info.var_aliases)
 }
 
 fn record_flag_compare_provenance(
@@ -233,12 +263,33 @@ fn predicate_expr_for_compare_flag(dst_key: String, scratch: &FlagScratch) -> Op
         .then_some(CExpr::Var(dst_key))
 }
 
-fn predicate_operand_expr(src: &r2ssa::SSAVar, scratch: &FlagScratch) -> CExpr {
+fn predicate_operand_expr(
+    src: &r2ssa::SSAVar,
+    scratch: &FlagScratch,
+    use_info: &UseInfo,
+    lower: &LowerCtx<'_>,
+) -> CExpr {
     predicate_passthrough_expr(src, scratch).unwrap_or_else(|| {
         if src.is_const() {
-            const_expr_from_name(&src.name).unwrap_or_else(|| CExpr::Var(src.display_name()))
+            const_expr_from_var(src).unwrap_or_else(|| CExpr::Var(src.display_name()))
         } else {
-            CExpr::Var(src.display_name())
+            let lowered = lower.get_expr(src);
+            if matches!(lowered, CExpr::Call { .. })
+                && (use_info
+                    .call_result_source_by_alias
+                    .contains_key(&src.display_name())
+                    || matches!(
+                        use_info.definitions.get(&src.display_name()),
+                        Some(CExpr::Call { .. })
+                    ))
+            {
+                CExpr::Var(utils::format_traced_name(
+                    &src.display_name(),
+                    &use_info.var_aliases,
+                ))
+            } else {
+                lowered
+            }
         }
     })
 }

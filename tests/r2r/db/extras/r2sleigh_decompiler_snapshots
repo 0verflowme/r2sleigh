@@ -1,47 +1,45 @@
 NAME=decompiler_bool_carrier_chain_full_snapshot
-FILE=bins/vuln_test
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-int32_t dbg.test_bool_carrier_chain(int32_t arg1, int32_t arg2)
+int32_t dbg.test_bool_carrier_chain(int32_t x, int32_t y)
 {
-    local_14 = arg1;
-    local_18 = arg2;
-    <carrier_assign>
-    <carrier_store>
-    local_10 = (int64_t)local_4;
-    if (arg1 != arg2) {
-        <true_branch_return>
+    if (x != y) {
+        return x;
     } else {
-        <false_branch_return>
+        return y;
     }
 }
-
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-s sym.test_bool_carrier_chain
-a:sla.dec | awk "BEGIN{saw=0} /^[[:space:]]*eax(_[0-9]+)? = .*;$/ { print \"    <carrier_assign>\"; next } /^[[:space:]]*local_4 = eax(_[0-9]+)?;$/ { print \"    <carrier_store>\"; next } /^[[:space:]]*return .*;$/ { if (saw) print \"        <false_branch_return>\"; else { print \"        <true_branch_return>\"; saw=1 } next } { print }"
+a:sla.dec sym.test_bool_carrier_chain | python3 normalize_snapshot.py decompiler
 EOF_CMDS
 RUN
 
 NAME=decompiler_complex_check_stable_header_and_local_prefix
-FILE=bins/vuln_test
+FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 int32_t dbg.complex_check(int32_t a, int32_t b)
 {
-    local_14 = a;
-    local_18 = b;
-    eax = local_18 + local_14;
-    local_4 = eax;
-    eax = local_14 - arg2;
-    local_8 = eax;
+    int32_t diff;
+
+    diff = a - b;
+    {
+        if (b + a != 64) {
+            return 0;
+        }
+        if (diff != 14) {
+            return 0;
+        } else {
+            return 1;
+        }
+    }
+}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-s dbg.complex_check
-s sym.complex_check
-s sym._complex_check
-a:sla.dec | sed -n '1,8p'
+a:sla.dec sym.complex_check | python3 normalize_snapshot.py decompiler
 EOF_CMDS
 RUN

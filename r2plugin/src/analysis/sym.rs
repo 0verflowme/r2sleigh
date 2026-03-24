@@ -1,9 +1,8 @@
 use crate::blocks::BlockSlice;
 use crate::context::require_ctx_view;
-use crate::helpers::normalize_sim_name;
-use crate::{ArchSpec, R2ILBlock, R2ILContext, R2ILOp, parse_addr_name_map};
+use crate::{ArchSpec, R2ILBlock, R2ILContext, parse_addr_name_map};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
@@ -15,96 +14,6 @@ static MERGE_STATES: AtomicBool = AtomicBool::new(false);
 
 fn merge_states_enabled() -> bool {
     MERGE_STATES.load(Ordering::Relaxed)
-}
-
-fn arch_has_register(arch: &ArchSpec, name: &str) -> bool {
-    arch.registers
-        .iter()
-        .any(|reg| reg.name.eq_ignore_ascii_case(name))
-}
-
-fn seed_symbolic_state<'ctx>(
-    state: &mut r2sym::SymState<'ctx>,
-    func: &r2ssa::SSAFunction,
-    arch: Option<&ArchSpec>,
-) {
-    let Some(arch) = arch else {
-        return;
-    };
-
-    let arch_name = arch.name.to_ascii_lowercase();
-    let looks_riscv = arch_name.contains("riscv") || arch_name.starts_with("rv");
-    let (arg_regs, stack_regs, stack_value) = if arch_name == "x86-64"
-        || arch_name == "x86_64"
-        || (arch_name == "x86" && arch.addr_size == 8)
-    {
-        (
-            [
-                "RDI", "RSI", "RDX", "RCX", "R8", "R9", "EDI", "ESI", "EDX", "ECX", "R8D", "R9D",
-            ]
-            .as_slice(),
-            ["RSP", "RBP"].as_slice(),
-            0x7fff_ffff_0000u64,
-        )
-    } else if arch_name == "x86" {
-        (
-            ["EAX", "EBX", "ECX", "EDX", "ESI", "EDI"].as_slice(),
-            ["ESP", "EBP"].as_slice(),
-            0x7fff_0000u64,
-        )
-    } else if looks_riscv && (arch.addr_size == 8 || arch_name.contains("64")) {
-        (
-            [
-                "A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "X10", "X11", "X12", "X13", "X14",
-                "X15", "X16", "X17",
-            ]
-            .as_slice(),
-            ["SP", "S0", "FP", "X2", "X8"].as_slice(),
-            0x7fff_ffff_0000u64,
-        )
-    } else if looks_riscv {
-        (
-            [
-                "A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "X10", "X11", "X12", "X13", "X14",
-                "X15", "X16", "X17",
-            ]
-            .as_slice(),
-            ["SP", "S0", "FP", "X2", "X8"].as_slice(),
-            0x7fff_0000u64,
-        )
-    } else {
-        return;
-    };
-
-    let mut seen = HashSet::new();
-    let mut maybe_seed = |var: &r2ssa::SSAVar| {
-        if !var.is_register() || var.version != 0 {
-            return;
-        }
-
-        let base_name = var.name.strip_prefix("reg:").unwrap_or(&var.name);
-        let base = base_name.to_ascii_uppercase();
-        let reg_name = var.display_name();
-        if !seen.insert(reg_name.clone()) {
-            return;
-        }
-
-        let bits = var.size * 8;
-        if stack_regs.contains(&base.as_str()) {
-            state.set_concrete(&reg_name, stack_value, bits);
-            return;
-        }
-
-        if arg_regs.contains(&base.as_str()) {
-            let sym_name = base_name.to_ascii_lowercase();
-            state.make_symbolic_named(&reg_name, &sym_name, bits);
-        }
-    };
-
-    for block in func.blocks() {
-        block.for_each_def(|def| maybe_seed(def.var));
-        block.for_each_source(|src| maybe_seed(src.var));
-    }
 }
 
 /// Opaque symbolic state handle for C API.
@@ -221,111 +130,6 @@ pub extern "C" fn r2sym_set_symbol_map_json(json: *const c_char) -> i32 {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-struct SymHookStats {
-    attempted: usize,
-    installed: usize,
-    skipped_unknown: usize,
-    duplicates: usize,
-}
-
-fn callconv_for_arch(arch: Option<&ArchSpec>) -> Option<r2sym::CallConv> {
-    let arch = arch?;
-    let arch_name = arch.name.to_ascii_lowercase();
-    if arch.addr_size == 8 && arch_name.contains("x86") {
-        return Some(r2sym::CallConv::x86_64_sysv());
-    }
-
-    if arch_name.contains("riscv") || arch_name.starts_with("rv") {
-        const RISCV_ARG_ABI: [&str; 8] = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"];
-        const RISCV_ARG_NUMERIC: [&str; 8] =
-            ["x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17"];
-        let use_abi_names = arch_has_register(arch, "a0");
-        let is_64 = arch.addr_size == 8 || arch_name.contains("64");
-        let bits = if is_64 { 64 } else { 32 };
-        if use_abi_names {
-            return Some(r2sym::CallConv::new(
-                RISCV_ARG_ABI.to_vec(),
-                "a0",
-                bits,
-                bits,
-            ));
-        }
-        return Some(r2sym::CallConv::new(
-            RISCV_ARG_NUMERIC.to_vec(),
-            "x10",
-            bits,
-            bits,
-        ));
-    }
-    None
-}
-
-fn extract_call_target(vn: &r2il::Varnode) -> Option<u64> {
-    match vn.space {
-        r2il::SpaceId::Const | r2il::SpaceId::Ram => Some(vn.offset),
-        _ => None,
-    }
-}
-
-fn install_core_summaries_for_function<'ctx>(
-    explorer: &mut r2sym::PathExplorer<'ctx>,
-    func: &r2ssa::SSAFunction,
-    arch: Option<&ArchSpec>,
-) -> SymHookStats {
-    let mut stats = SymHookStats::default();
-    let Some(callconv) = callconv_for_arch(arch) else {
-        return stats;
-    };
-
-    let mut targets = BTreeSet::new();
-    for block in func.cfg().blocks() {
-        if let r2ssa::cfg::BlockTerminator::Call { target, .. } = block.terminator {
-            targets.insert(target);
-        }
-        for op in &block.ops {
-            if let R2ILOp::Call { target } = op
-                && let Some(addr) = extract_call_target(target)
-            {
-                targets.insert(addr);
-            }
-        }
-    }
-    if targets.is_empty() {
-        return stats;
-    }
-
-    let names = sym_symbol_map().lock().ok();
-    let registry = r2sym::SummaryRegistry::with_core(callconv);
-    let mut seen: HashSet<(u64, &'static str)> = HashSet::new();
-
-    for target in targets {
-        stats.attempted += 1;
-        let raw_name = names
-            .as_ref()
-            .and_then(|map| map.get(&target))
-            .map(String::as_str);
-        let Some(raw_name) = raw_name else {
-            stats.skipped_unknown += 1;
-            continue;
-        };
-        let Some(summary_name) = normalize_sim_name(raw_name) else {
-            stats.skipped_unknown += 1;
-            continue;
-        };
-        if !seen.insert((target, summary_name)) {
-            stats.duplicates += 1;
-            continue;
-        }
-        if registry.install_for_explorer(explorer, target, summary_name) {
-            stats.installed += 1;
-        } else {
-            stats.skipped_unknown += 1;
-        }
-    }
-    stats
-}
-
 #[derive(Serialize, Clone)]
 struct SymExecSummary {
     paths_explored: usize,
@@ -420,6 +224,20 @@ fn path_info_from_result<'ctx>(
     }
 }
 
+fn build_symbolic_prepared(
+    blocks: &[R2ILBlock],
+    arch: Option<&ArchSpec>,
+) -> Option<r2ssa::SsaArtifact> {
+    r2ssa::SsaArtifact::for_symbolic(blocks, arch)
+}
+
+fn symbol_map_snapshot() -> HashMap<u64, String> {
+    sym_symbol_map()
+        .lock()
+        .map(|map| map.clone())
+        .unwrap_or_default()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sym_function(
     ctx: *const R2ILContext,
@@ -434,20 +252,24 @@ pub extern "C" fn r2sym_function(
         return ptr::null_mut();
     };
 
-    let ssa_func = match r2ssa::SSAFunction::from_blocks_with_arch(blocks.as_slice(), ctx_view.arch)
-    {
-        Some(f) => f,
+    let prepared = match build_symbolic_prepared(blocks.as_slice(), ctx_view.arch) {
+        Some(prepared) => prepared,
         None => return ptr::null_mut(),
     };
+    let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        seed_symbolic_state(&mut initial_state, &ssa_func, ctx_view.arch);
+        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
         let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_default_config());
-        let _hook_stats =
-            install_core_summaries_for_function(&mut explorer, &ssa_func, ctx_view.arch);
-        let results = explorer.explore(&ssa_func, initial_state);
+        if let Some(arch) = ctx_view.arch
+            && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
+        {
+            let _ =
+                registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+        }
+        let results = explorer.explore(&prepared, initial_state);
         let stats = explorer.stats().clone();
         (results, stats)
     }));
@@ -507,20 +329,24 @@ pub extern "C" fn r2sym_paths(
         return ptr::null_mut();
     };
 
-    let ssa_func = match r2ssa::SSAFunction::from_blocks_with_arch(blocks.as_slice(), ctx_view.arch)
-    {
-        Some(f) => f,
+    let prepared = match build_symbolic_prepared(blocks.as_slice(), ctx_view.arch) {
+        Some(prepared) => prepared,
         None => return ptr::null_mut(),
     };
+    let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        seed_symbolic_state(&mut initial_state, &ssa_func, ctx_view.arch);
+        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
         let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_default_config());
-        let _hook_stats =
-            install_core_summaries_for_function(&mut explorer, &ssa_func, ctx_view.arch);
-        let results = explorer.explore(&ssa_func, initial_state);
+        if let Some(arch) = ctx_view.arch
+            && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
+        {
+            let _ =
+                registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+        }
+        let results = explorer.explore(&prepared, initial_state);
         (results, explorer)
     }));
 
@@ -558,20 +384,24 @@ pub extern "C" fn r2sym_explore_to(
         return sym_error_json("no blocks to explore");
     };
 
-    let ssa_func = match r2ssa::SSAFunction::from_blocks_with_arch(blocks.as_slice(), ctx_view.arch)
-    {
-        Some(f) => f,
+    let prepared = match build_symbolic_prepared(blocks.as_slice(), ctx_view.arch) {
+        Some(prepared) => prepared,
         None => return sym_error_json("failed to build SSA function"),
     };
+    let symbol_map = symbol_map_snapshot();
 
     let z3_ctx = Context::thread_local();
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        seed_symbolic_state(&mut initial_state, &ssa_func, ctx_view.arch);
+        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
         let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_default_config());
-        let _hook_stats =
-            install_core_summaries_for_function(&mut explorer, &ssa_func, ctx_view.arch);
-        let matched = explorer.find_paths_to(&ssa_func, initial_state, target_addr);
+        if let Some(arch) = ctx_view.arch
+            && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
+        {
+            let _ =
+                registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+        }
+        let matched = explorer.find_paths_to(&prepared, initial_state, target_addr);
         let stats = explorer.stats().clone();
         let paths: Vec<PathInfo> = matched
             .iter()
@@ -621,20 +451,24 @@ pub extern "C" fn r2sym_solve_to(
         return sym_error_json("no blocks to solve");
     };
 
-    let ssa_func = match r2ssa::SSAFunction::from_blocks_with_arch(blocks.as_slice(), ctx_view.arch)
-    {
-        Some(f) => f,
+    let prepared = match build_symbolic_prepared(blocks.as_slice(), ctx_view.arch) {
+        Some(prepared) => prepared,
         None => return sym_error_json("failed to build SSA function"),
     };
+    let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
     let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        seed_symbolic_state(&mut initial_state, &ssa_func, ctx_view.arch);
+        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
         let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_default_config());
-        let _hook_stats =
-            install_core_summaries_for_function(&mut explorer, &ssa_func, ctx_view.arch);
-        let matched = explorer.find_paths_to(&ssa_func, initial_state, target_addr);
+        if let Some(arch) = ctx_view.arch
+            && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
+        {
+            let _ =
+                registry.install_known_symbols_for_function(&mut explorer, &prepared, &symbol_map);
+        }
+        let matched = explorer.find_paths_to(&prepared, initial_state, target_addr);
         let stats = explorer.stats().clone();
         let selected = matched
             .iter()

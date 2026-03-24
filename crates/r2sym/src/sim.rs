@@ -3,9 +3,11 @@
 //! These summaries short-circuit into lightweight models to avoid
 //! path explosion from libc implementations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use r2il::ArchSpec;
+use r2ssa::SsaArtifact;
 use z3::ast::BV;
 
 use crate::executor::{CallHookResult, SymExecutor};
@@ -82,6 +84,29 @@ impl CallConv {
         Self::new(vec!["RDI", "RSI", "RDX", "RCX", "R8", "R9"], "RAX", 64, 64)
     }
 
+    /// Architecture-derived calling convention used by the symbolic runtime.
+    pub fn for_arch_spec(arch: &ArchSpec) -> Option<Self> {
+        let arch_name = arch.name.to_ascii_lowercase();
+        if arch.addr_size == 8 && arch_name.contains("x86") {
+            return Some(Self::x86_64_sysv());
+        }
+
+        if arch_name.contains("riscv") || arch_name.starts_with("rv") {
+            const RISCV_ARG_ABI: [&str; 8] = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"];
+            const RISCV_ARG_NUMERIC: [&str; 8] =
+                ["x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17"];
+            let use_abi_names = arch_has_register(arch, "a0");
+            let is_64 = arch.addr_size == 8 || arch_name.contains("64");
+            let bits = if is_64 { 64 } else { 32 };
+            if use_abi_names {
+                return Some(Self::new(RISCV_ARG_ABI.to_vec(), "a0", bits, bits));
+            }
+            return Some(Self::new(RISCV_ARG_NUMERIC.to_vec(), "x10", bits, bits));
+        }
+
+        None
+    }
+
     fn collect_call_info<'ctx>(&self, state: &SymState<'ctx>, arity: usize) -> CallInfo<'ctx> {
         let mut args = Vec::with_capacity(arity);
         for i in 0..arity {
@@ -114,6 +139,14 @@ impl CallConv {
     }
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryInstallStats {
+    pub attempted: usize,
+    pub installed: usize,
+    pub skipped_unknown: usize,
+    pub duplicates: usize,
+}
+
 /// Summary registry that can install summaries as call hooks.
 pub struct SummaryRegistry<'ctx> {
     summaries: HashMap<String, Arc<dyn FunctionSummary<'ctx> + 'ctx>>,
@@ -143,6 +176,11 @@ impl<'ctx> SummaryRegistry<'ctx> {
         registry.register_summary(PrintfSummaryBasic::new(DEFAULT_MAX_PRINTF_SCAN));
         registry.register_summary(ExitSummary::new());
         registry
+    }
+
+    /// Create a registry pre-populated with core summaries for a known architecture.
+    pub fn with_core_for_arch(arch: &ArchSpec) -> Option<Self> {
+        Some(Self::with_core(CallConv::for_arch_spec(arch)?))
     }
 
     /// Register a function summary.
@@ -187,6 +225,48 @@ impl<'ctx> SummaryRegistry<'ctx> {
         });
         true
     }
+
+    /// Install matching core summaries for direct call sites in a prepared function.
+    pub fn install_known_symbols_for_function(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        prepared: &SsaArtifact,
+        symbol_map: &HashMap<u64, String>,
+    ) -> SummaryInstallStats {
+        let mut stats = SummaryInstallStats::default();
+        let mut targets = BTreeSet::new();
+        for call in prepared.call_sites().by_id.values() {
+            if let Some(target) = call.direct_target {
+                targets.insert(target);
+            }
+        }
+        if targets.is_empty() {
+            return stats;
+        }
+
+        let mut seen: BTreeSet<(u64, &'static str)> = BTreeSet::new();
+        for target in targets {
+            stats.attempted += 1;
+            let Some(raw_name) = symbol_map.get(&target).map(String::as_str) else {
+                stats.skipped_unknown += 1;
+                continue;
+            };
+            let Some(summary_name) = normalize_core_summary_name(raw_name) else {
+                stats.skipped_unknown += 1;
+                continue;
+            };
+            if !seen.insert((target, summary_name)) {
+                stats.duplicates += 1;
+                continue;
+            }
+            if self.install_for_explorer(explorer, target, summary_name) {
+                stats.installed += 1;
+            } else {
+                stats.skipped_unknown += 1;
+            }
+        }
+        stats
+    }
 }
 
 fn apply_summary<'ctx>(
@@ -205,6 +285,78 @@ fn apply_summary<'ctx>(
         SummaryEffect::Terminate(status) => {
             state.terminate(status.clone());
             CallHookResult::Terminate(status)
+        }
+    }
+}
+
+fn arch_has_register(arch: &ArchSpec, name: &str) -> bool {
+    arch.registers
+        .iter()
+        .any(|reg| reg.name.eq_ignore_ascii_case(name))
+}
+
+fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
+    let normalized_owned = name.trim().to_ascii_lowercase();
+    let mut normalized = normalized_owned.as_str();
+
+    for prefix in ["sym.imp.", "sym.", "imp.", "reloc.", "dbg."] {
+        while let Some(rest) = normalized.strip_prefix(prefix) {
+            normalized = rest;
+        }
+    }
+
+    while let Some(rest) = normalized.strip_suffix("@plt") {
+        normalized = rest;
+    }
+    while let Some(rest) = normalized.strip_suffix(".plt") {
+        normalized = rest;
+    }
+    if let Some((base, _)) = normalized.split_once('@') {
+        normalized = base;
+    }
+
+    if let Some(rest) = normalized.strip_prefix("__isoc99_") {
+        normalized = rest;
+    }
+    if let Some(rest) = normalized.strip_prefix("__gi_") {
+        normalized = rest;
+    }
+
+    match normalized {
+        "strlen" | "__strlen_chk" => Some("strlen"),
+        "strcmp" => Some("strcmp"),
+        "memcmp" => Some("memcmp"),
+        "memcpy" | "__memcpy_chk" => Some("memcpy"),
+        "memset" => Some("memset"),
+        "malloc" | "__libc_malloc" | "__gi___libc_malloc" => Some("malloc"),
+        "free" => Some("free"),
+        "puts" => Some("puts"),
+        "printf" | "__printf_chk" => Some("printf"),
+        "exit" | "_exit" => Some("exit"),
+        _ => {
+            if normalized.starts_with("strlen") {
+                Some("strlen")
+            } else if normalized.starts_with("strcmp") {
+                Some("strcmp")
+            } else if normalized.starts_with("memcmp") {
+                Some("memcmp")
+            } else if normalized.starts_with("memcpy") {
+                Some("memcpy")
+            } else if normalized.starts_with("memset") {
+                Some("memset")
+            } else if normalized.starts_with("printf") || normalized == "__printf_chk" {
+                Some("printf")
+            } else if normalized.starts_with("puts") {
+                Some("puts")
+            } else if normalized == "malloc" || normalized.ends_with("malloc") {
+                Some("malloc")
+            } else if normalized == "free" || normalized.ends_with("free") {
+                Some("free")
+            } else if normalized.starts_with("exit") {
+                Some("exit")
+            } else {
+                None
+            }
         }
     }
 }

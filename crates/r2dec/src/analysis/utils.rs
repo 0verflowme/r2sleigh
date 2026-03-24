@@ -15,6 +15,12 @@ pub(crate) fn is_cpu_flag(name: &str) -> bool {
             | "zf"
             | "sf"
             | "of"
+            | "cy"
+            | "zr"
+            | "ng"
+            | "ov"
+            | "nf"
+            | "vf"
             | "df"
             | "tf"
             | "if"
@@ -26,6 +32,10 @@ pub(crate) fn is_cpu_flag(name: &str) -> bool {
             | "vif"
             | "vip"
             | "id"
+            | "tmpcy"
+            | "tmpzr"
+            | "tmpng"
+            | "tmpov"
     ) {
         return true;
     }
@@ -36,6 +46,16 @@ pub(crate) fn is_cpu_flag(name: &str) -> bool {
         || name.starts_with("zf_")
         || name.starts_with("sf_")
         || name.starts_with("of_")
+        || name.starts_with("cy_")
+        || name.starts_with("zr_")
+        || name.starts_with("ng_")
+        || name.starts_with("ov_")
+        || name.starts_with("nf_")
+        || name.starts_with("vf_")
+        || name.starts_with("tmpcy_")
+        || name.starts_with("tmpzr_")
+        || name.starts_with("tmpng_")
+        || name.starts_with("tmpov_")
 }
 
 pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
@@ -47,6 +67,11 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
         .or_else(|| val_str.strip_prefix("0X"))
     {
         u64::from_str_radix(hex, 16).ok()
+    } else if let Some(dec) = val_str
+        .strip_prefix("0d")
+        .or_else(|| val_str.strip_prefix("0D"))
+    {
+        dec.parse().ok()
     } else if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
         if val_str.chars().any(|c| c.is_ascii_alphabetic()) || val_str.len() > 4 {
             u64::from_str_radix(val_str, 16).ok()
@@ -56,6 +81,47 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     } else {
         val_str.parse().ok()
     }
+}
+
+pub(crate) fn parse_compare_const_value_with_width(
+    var: &SSAVar,
+    compare_width: u32,
+) -> Option<u64> {
+    let raw = var.name.strip_prefix("const:")?;
+    let raw = raw.split('_').next().unwrap_or(raw);
+
+    if let Some(dec) = raw.strip_prefix("0d").or_else(|| raw.strip_prefix("0D")) {
+        return dec.parse().ok();
+    }
+
+    if compare_width >= 8
+        && raw.len() > 1
+        && raw.chars().all(|c| c.is_ascii_hexdigit())
+        && !raw.starts_with("0x")
+        && !raw.starts_with("0X")
+    {
+        return u64::from_str_radix(raw, 16).ok();
+    }
+
+    parse_const_value(&var.name)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_compare_const_value(var: &SSAVar) -> Option<u64> {
+    parse_compare_const_value_with_width(var, var.size)
+}
+
+pub(crate) fn compare_const_to_expr_with_width(var: &SSAVar, compare_width: u32) -> CExpr {
+    let val = parse_compare_const_value_with_width(var, compare_width).unwrap_or(0);
+    if val > 0x7fffffff {
+        CExpr::UIntLit(val)
+    } else {
+        CExpr::IntLit(val as i64)
+    }
+}
+
+pub(crate) fn compare_const_to_expr(var: &SSAVar) -> CExpr {
+    compare_const_to_expr_with_width(var, var.size)
 }
 
 pub(crate) fn parse_const_offset(var: &SSAVar) -> Option<i64> {
@@ -119,16 +185,16 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
     }
 
     if key.starts_with("tmp:")
-        && let Some(version_str) = key.rsplit_once('_').map(|(_, v)| v)
+        && let Some((base, version_str)) = key.trim_start_matches("tmp:").rsplit_once('_')
     {
         if let Ok(ver) = version_str.parse::<u32>() {
             return if ver > 0 {
-                format!("t{}_{}", ver, ver)
+                format!("t{}_{}", base, ver)
             } else {
                 "t0".to_string()
             };
         }
-        return format!("t{}", version_str);
+        return format!("t{base}");
     }
 
     key.to_string()
@@ -272,6 +338,56 @@ fn extract_offset_from_expr_with_defs(
     }
 
     match expr {
+        CExpr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
+            if let Some(offset) = expr_to_offset(left)
+                && let Some(base) = extract_offset_from_expr_with_defs(
+                    right,
+                    definitions,
+                    fp_name,
+                    sp_name,
+                    depth + 1,
+                    visited,
+                )
+            {
+                return Some(base.saturating_add(offset));
+            }
+            if let Some(offset) = expr_to_offset(right)
+                && let Some(base) = extract_offset_from_expr_with_defs(
+                    left,
+                    definitions,
+                    fp_name,
+                    sp_name,
+                    depth + 1,
+                    visited,
+                )
+            {
+                return Some(base.saturating_add(offset));
+            }
+            None
+        }
+        CExpr::Binary {
+            op: BinaryOp::Sub,
+            left,
+            right,
+        } => {
+            if let Some(offset) = expr_to_offset(right)
+                && let Some(base) = extract_offset_from_expr_with_defs(
+                    left,
+                    definitions,
+                    fp_name,
+                    sp_name,
+                    depth + 1,
+                    visited,
+                )
+            {
+                return Some(base.saturating_sub(offset));
+            }
+            None
+        }
         CExpr::Var(name) => {
             if !visited.insert(name.clone()) {
                 return None;
@@ -302,6 +418,7 @@ fn extract_offset_from_expr_with_defs(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn normalize_stack_address(
     addr: &SSAVar,
     definitions: &HashMap<String, CExpr>,
@@ -372,10 +489,23 @@ pub(crate) fn arg_alias_for_ssa_name(ssa_name: &str) -> Option<String> {
     arg_alias_for_register_name(base)
 }
 
+pub(crate) fn param_register_alias_for_ssa_name(
+    ssa_name: &str,
+    param_register_aliases: &HashMap<String, String>,
+) -> Option<String> {
+    let lower = ssa_name.to_ascii_lowercase();
+    param_register_aliases.get(&lower).cloned().or_else(|| {
+        lower
+            .rsplit_once('_')
+            .and_then(|(base, _)| param_register_aliases.get(base).cloned())
+    })
+}
+
 pub(crate) fn arg_alias_for_store_source(
     src: &SSAVar,
     copy_sources: &HashMap<String, String>,
     var_aliases: &HashMap<String, String>,
+    param_register_aliases: &HashMap<String, String>,
 ) -> Option<String> {
     let mut key = src.display_name();
     let mut visited = HashSet::new();
@@ -383,6 +513,9 @@ pub(crate) fn arg_alias_for_store_source(
     for _ in 0..8 {
         if !visited.insert(key.clone()) {
             break;
+        }
+        if let Some(alias) = param_register_alias_for_ssa_name(&key, param_register_aliases) {
+            return Some(alias);
         }
         if let Some(alias) = arg_alias_for_ssa_name(&key) {
             return Some(alias);
@@ -394,7 +527,10 @@ pub(crate) fn arg_alias_for_store_source(
     }
 
     let traced = trace_ssa_var_to_source(src, copy_sources, var_aliases);
-    arg_alias_for_register_name(&traced)
+    param_register_aliases
+        .get(&traced.to_ascii_lowercase())
+        .cloned()
+        .or_else(|| arg_alias_for_register_name(&traced))
 }
 
 #[cfg(test)]
@@ -406,6 +542,27 @@ mod tests {
     fn parse_const_value_keeps_existing_general_behavior() {
         assert_eq!(parse_const_value("const:100"), Some(100));
         assert_eq!(parse_const_value("const:0x100"), Some(0x100));
+        assert_eq!(parse_const_value("const:0d100"), Some(100));
+    }
+
+    #[test]
+    fn parse_compare_const_value_keeps_lifted_wide_hex_immediates_and_narrow_decimal_tests() {
+        let wide = SSAVar::new("const:64", 0, 8);
+        let narrow = SSAVar::new("const:64", 0, 4);
+        let explicit_decimal = SSAVar::new("const:0d64", 0, 8);
+
+        assert_eq!(parse_compare_const_value(&wide), Some(0x64));
+        assert_eq!(parse_compare_const_value(&narrow), Some(64));
+        assert_eq!(parse_compare_const_value(&explicit_decimal), Some(64));
+    }
+
+    #[test]
+    fn parse_compare_const_value_with_width_prefers_hex_for_wide_comparisons() {
+        let narrow = SSAVar::new("const:64", 0, 4);
+        let decimal = SSAVar::new("const:100", 0, 4);
+
+        assert_eq!(parse_compare_const_value_with_width(&narrow, 8), Some(0x64));
+        assert_eq!(parse_compare_const_value_with_width(&decimal, 4), Some(100));
     }
 
     #[test]
@@ -420,5 +577,58 @@ mod tests {
         assert_eq!(parse_const_offset(&plain), Some(0x100));
         let explicit_dec = SSAVar::new("const:0d100", 0, 8);
         assert_eq!(parse_const_offset(&explicit_dec), Some(100));
+    }
+
+    #[test]
+    fn arg_alias_for_store_source_uses_arch_param_aliases() {
+        let src = SSAVar::new("X1", 0, 8);
+        let copy_sources = HashMap::new();
+        let var_aliases = HashMap::new();
+        let param_register_aliases = HashMap::from([(String::from("x1"), String::from("arg2"))]);
+
+        assert_eq!(
+            arg_alias_for_store_source(&src, &copy_sources, &var_aliases, &param_register_aliases),
+            Some(String::from("arg2"))
+        );
+    }
+
+    #[test]
+    fn extract_stack_offset_from_var_handles_nested_temp_plus_const() {
+        let mut definitions = HashMap::new();
+        definitions.insert(
+            String::from("tmp:11f80_2"),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var(String::from("sp_2")),
+                CExpr::IntLit(0x3e0),
+            ),
+        );
+        definitions.insert(
+            String::from("x8_1"),
+            CExpr::Var(String::from("tmp:11f80_2")),
+        );
+        definitions.insert(
+            String::from("tmp:6500_2"),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var(String::from("x8_1")),
+                CExpr::IntLit(0x160),
+            ),
+        );
+
+        let addr = SSAVar::new("tmp:6500", 2, 8);
+        assert_eq!(
+            extract_stack_offset_from_var(&addr, &definitions, "fp", "sp"),
+            Some(0x540)
+        );
+    }
+
+    #[test]
+    fn format_traced_name_keeps_temp_base_identity() {
+        assert_eq!(
+            format_traced_name("tmp:11f80_19", &HashMap::new()),
+            "t11f80_19"
+        );
+        assert_eq!(format_traced_name("tmp:foo_2", &HashMap::new()), "tfoo_2");
     }
 }

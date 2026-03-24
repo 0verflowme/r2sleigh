@@ -1120,6 +1120,7 @@ dependencies = [
  "r2ssa",
  "r2types",
  "serde",
+ "serde_json",
  "sleigh-config",
  "thiserror 2.0.17",
 ]
@@ -1234,6 +1235,7 @@ dependencies = [
 name = "r2types"
 version = "0.1.0"
 dependencies = [
+ "r2il",
  "r2ssa",
  "serde",
  "serde_json",

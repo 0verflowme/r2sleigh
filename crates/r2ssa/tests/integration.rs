@@ -132,6 +132,103 @@ mod tests {
     }
 
     #[test]
+    fn decompile_prep_multiblock_x86_call_boundaries_materialize_live_post_call_defs() {
+        let disasm = create_x86_64_disasm();
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &pad_hex(
+                        "f30f1efa554889e54883ec1048897df8488b45f8488d15801c00004889d64889c7e891fdffff85c07507",
+                    ),
+                    0x401379,
+                    42,
+                )
+                .expect("authenticate entry"),
+            disasm
+                .lift_block(&pad_hex("b801000000eb05"), 0x4013a3, 7)
+                .expect("authenticate false arm"),
+            disasm
+                .lift_block(&pad_hex("b800000000"), 0x4013aa, 5)
+                .expect("authenticate true arm"),
+            disasm
+                .lift_block(&pad_hex("c9c3"), 0x4013af, 2)
+                .expect("authenticate exit"),
+        ];
+
+        let arch = r2sleigh_lift::create_x86_64_spec();
+        let func = SSAFunction::from_blocks_for_decompile(&blocks, Some(&arch))
+            .expect("prepared SSA should build");
+        let entry = func.get_block(0x401379).expect("entry block");
+
+        assert!(
+            entry.ops.iter().any(
+                |op| matches!(op, SSAOp::CallDefine { dst } if dst.name.eq_ignore_ascii_case("rax"))
+            ),
+            "expected decompile-prep SSA to materialize a post-call return-register definition, got ops={:?}",
+            entry.ops
+        );
+        assert!(
+            entry
+                .ops
+                .iter()
+                .any(|op| matches!(op, SSAOp::IntAnd { a, b, .. }
+                    if ((a.name.eq_ignore_ascii_case("rax") && b.name.eq_ignore_ascii_case("rax"))
+                        || (a.name.eq_ignore_ascii_case("eax") && b.name.eq_ignore_ascii_case("eax")))
+                        && a.version > 0
+                        && b.version > 0)),
+            "expected post-call compare/test to use a fresh return-register version, got ops={:?}",
+            entry.ops
+        );
+    }
+
+    #[test]
+    fn decompile_prep_x86_call_boundaries_materialize_rax_defs_even_without_prior_rax_write() {
+        let disasm = create_x86_64_disasm();
+        let blocks = vec![
+            disasm
+                .lift_block(
+                    &pad_hex(
+                        "f30f1efa554889e54883ec2048897de8488b45e84889c7e8b2eeffff488945f8488b45f84883c0014889c7e8eeeeffff488945f048837df000741b",
+                    ),
+                    0x402272,
+                    59,
+                )
+                .expect("my_strdup entry"),
+            disasm
+                .lift_block(
+                    &pad_hex("488b45f8488d5001488b4de8488b45f04889ce4889c7e8a8eeffff"),
+                    0x4022ad,
+                    27,
+                )
+                .expect("my_strdup copy arm"),
+            disasm
+                .lift_block(&pad_hex("488b45f0c9c3"), 0x4022c8, 6)
+                .expect("my_strdup exit"),
+        ];
+
+        let arch = r2sleigh_lift::create_x86_64_spec();
+        let func = SSAFunction::from_blocks_for_decompile(&blocks, Some(&arch))
+            .expect("prepared SSA should build");
+        let entry = func.get_block(0x402272).expect("entry block");
+        let copy_arm = func.get_block(0x4022ad).expect("copy arm");
+
+        assert!(
+            entry.ops.iter().any(
+                |op| matches!(op, SSAOp::CallDefine { dst } if dst.name.eq_ignore_ascii_case("rax"))
+            ),
+            "expected first call boundary to materialize a fresh RAX definition even without a prior explicit RAX write, got ops={:?}",
+            entry.ops
+        );
+        assert!(
+            copy_arm.ops.iter().any(
+                |op| matches!(op, SSAOp::CallDefine { dst } if dst.name.eq_ignore_ascii_case("rax"))
+            ),
+            "expected second call boundary to materialize a fresh RAX definition for memcpy, got ops={:?}",
+            copy_arm.ops
+        );
+    }
+
+    #[test]
     fn test_ssa_var_display() {
         let var = SSAVar::new("RAX", 3, 8);
         assert_eq!(var.display_name(), "RAX_3");

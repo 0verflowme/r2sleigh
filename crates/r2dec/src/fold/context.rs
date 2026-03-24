@@ -1,16 +1,38 @@
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, OnceCell};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
-use r2ssa::{FunctionSSABlock, SSAVar};
-use r2types::{SignatureRegistry, TypeOracle};
-
-use crate::ExternalStackVar;
 use crate::analysis;
 use crate::ast::CType;
-use crate::types::FunctionType;
+use r2ssa::{
+    CallSiteFacts, FunctionSSABlock, InterprocSummarySet, MemorySSAFacts, ObjectModel,
+    PredicateFacts, SSAVar, SsaArtifact,
+};
+#[cfg(test)]
+use r2types::ExternalStackVarSpec;
+use r2types::{
+    CalleeFact, ExternalStackSlotSpec, ExternalTypeDb, FunctionType, SignatureRegistry,
+    StackSlotKey, TypeOracle, VisibleBinding,
+};
 
 pub(crate) type SSABlock = FunctionSSABlock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ResolutionPhase {
+    Semantic,
+    Definition,
+    DefinitionRaw,
+    Visible,
+    ImportedArg,
+    Memory,
+    Return,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ResolutionGuardKey {
+    pub(crate) phase: ResolutionPhase,
+    pub(crate) name: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PtrArith {
@@ -37,26 +59,61 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) strings: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
-    pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVar>,
+    pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
+    pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    #[cfg(test)]
+    pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
+    pub(crate) visible_bindings: &'a [VisibleBinding],
+    pub(crate) external_type_db: &'a ExternalTypeDb,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
+    pub(crate) function_return_type: Option<&'a CType>,
+    pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
+    pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
+    pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
+    pub(crate) prepared_objects: Option<&'a ObjectModel>,
+    #[allow(dead_code)]
+    pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
+    pub(crate) prepared_predicates: Option<&'a PredicateFacts>,
+    pub(crate) prepared_call_sites: Option<&'a CallSiteFacts>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FoldState {
-    pub(crate) analysis_ctx: analysis::AnalysisContext,
+    pub(crate) analysis_ctx: analysis::DecompilerFacts,
     pub(crate) exit_block: Option<u64>,
     pub(crate) return_blocks: HashSet<u64>,
+    pub(crate) return_stack_slots: HashSet<i64>,
 }
 
 pub struct FoldingContext<'a> {
     pub(crate) inputs: FoldInputs<'a>,
     pub(crate) state: FoldState,
     pub(crate) current_block_addr: Cell<Option<u64>>,
+    pub(crate) current_op_idx: Cell<Option<usize>>,
     pub(crate) hide_stack_frame: bool,
     pub(crate) userop_names: HashMap<u32, String>,
     pub(crate) signature_registry: SignatureRegistry,
+    pub(crate) rendered_alias_lookup_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    pub(crate) preferred_entry_arg_lookup_cache:
+        std::cell::RefCell<HashMap<String, Option<String>>>,
+    pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
+    pub(crate) call_result_owner_name_cache:
+        std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
+    pub(crate) call_result_owner_expr_cache:
+        std::cell::RefCell<HashMap<String, Option<crate::ast::CExpr>>>,
+    pub(crate) non_variadic_call_arity_cache: std::cell::RefCell<HashMap<String, Option<usize>>>,
+    pub(crate) authoritative_source_args_cache:
+        std::cell::RefCell<BTreeMap<(u64, usize), Vec<crate::ast::CExpr>>>,
+    pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
+    pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
+    pub(crate) prepared_semantic_view_building: Cell<bool>,
+    pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) value_render_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
+    pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
 }
 
 impl FoldArchConfig {
@@ -119,18 +176,40 @@ impl<'a> FoldingContext<'a> {
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
+            current_op_idx: Cell::new(None),
             hide_stack_frame: true,
             userop_names: HashMap::new(),
             signature_registry: SignatureRegistry::from_embedded_json(),
+            rendered_alias_lookup_cache: std::cell::RefCell::new(HashMap::new()),
+            preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
+            forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
+            call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
+            call_result_owner_expr_cache: std::cell::RefCell::new(HashMap::new()),
+            non_variadic_call_arity_cache: std::cell::RefCell::new(HashMap::new()),
+            authoritative_source_args_cache: std::cell::RefCell::new(BTreeMap::new()),
+            owned_call_visible_names_cache: std::cell::RefCell::new(None),
+            prepared_semantic_view_cache: OnceCell::new(),
+            prepared_semantic_view_building: Cell::new(false),
+            semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
+            value_render_in_progress: std::cell::RefCell::new(HashSet::new()),
+            definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
+            definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
+            resolution_guard: std::cell::RefCell::new(HashSet::new()),
         }
     }
 
     /// Test convenience constructor.
     pub fn new(ptr_size: u32) -> Self {
         static EMPTY_U64_STRING: OnceLock<HashMap<u64, String>> = OnceLock::new();
-        static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVar>> = OnceLock::new();
+        static EMPTY_STACK_SLOTS: OnceLock<BTreeMap<StackSlotKey, ExternalStackSlotSpec>> =
+            OnceLock::new();
+        #[cfg(test)]
+        static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
+        static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
+        static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
         static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
         static EMPTY_STRING_FNTY: OnceLock<HashMap<String, FunctionType>> = OnceLock::new();
+        static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
         static EMPTY_STRING_CTYPE: OnceLock<HashMap<String, CType>> = OnceLock::new();
         static ARCH64: OnceLock<FoldArchConfig> = OnceLock::new();
         static ARCH32: OnceLock<FoldArchConfig> = OnceLock::new();
@@ -147,10 +226,23 @@ impl<'a> FoldingContext<'a> {
             strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
             symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             known_function_signatures: EMPTY_STRING_FNTY.get_or_init(HashMap::new),
+            callee_facts: EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new),
+            stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
+            #[cfg(test)]
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
+            visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
+            external_type_db: EMPTY_TYPE_DB.get_or_init(ExternalTypeDb::default),
             param_register_aliases: EMPTY_STRING_STRING.get_or_init(HashMap::new),
             type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),
             type_oracle: None,
+            function_return_type: None,
+            prepared_ssa: None,
+            interproc_summary_set: None,
+            prepared_semantic_view: None,
+            prepared_objects: None,
+            prepared_memory: None,
+            prepared_predicates: None,
+            prepared_call_sites: None,
         };
 
         Self::from_inputs(inputs)

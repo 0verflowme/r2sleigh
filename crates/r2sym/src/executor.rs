@@ -66,6 +66,16 @@ impl<'ctx> SymExecutor<'ctx> {
                 Ok(vec![])
             }
 
+            CallDefine { dst } => {
+                let value = SymValue::new_symbolic(
+                    self.ctx,
+                    &format!("calldef_{}", dst.display_name()),
+                    dst.size * 8,
+                );
+                self.write_var(state, dst, value);
+                Ok(vec![])
+            }
+
             Load {
                 dst,
                 addr,

@@ -1,25 +1,365 @@
 use crate::blocks::BlockSlice;
 use crate::context::{PluginCtxView, require_ctx_view};
-use crate::decompiler::build_decompiler_env;
-use crate::helpers::resolve_function_name;
+use crate::decompiler::{
+    build_decompiler_env, decompiler_config_for_arch_name, normalize_sig_arch_name,
+};
+use crate::helpers::{effective_ptr_bits, normalize_sim_name, resolve_function_name};
 use crate::{
     ArchSpec, Disassembler, InferredParam, InferredParamJson, InferredSignatureCcJson, R2ILBlock,
     R2ILContext,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{self, Write};
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::{Arc, OnceLock, RwLock};
+
+const ANALYSIS_CACHE_LIMIT: usize = 256;
+
+fn should_reuse_decompile_ssa_for_pattern_analysis(prepared: &r2ssa::SsaArtifact) -> bool {
+    let summary = prepared.function().cfg_risk_summary();
+    summary.block_count >= 96
+        && summary.switch_block_count > 0
+        && summary.max_switch_cases >= 32
+        && summary.back_edge_count == 0
+}
 
 pub(crate) struct FunctionInput<'a> {
     pub(crate) ctx: PluginCtxView<'a>,
     pub(crate) blocks: BlockSlice,
+    pub(crate) function_addr: u64,
     pub(crate) function_name: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct FunctionAnalysis {
-    pub(crate) ssa_func: r2ssa::SSAFunction,
-    pub(crate) ssa_blocks: Vec<r2ssa::SSABlock>,
+    pub(crate) ssa_func: r2ssa::SsaArtifact,
+    pub(crate) pattern_ssa_func: r2ssa::SsaArtifact,
+}
+
+#[derive(Clone)]
+pub(crate) struct FunctionAnalysisArtifact {
+    pub(crate) ssa_func: r2ssa::SsaArtifact,
+    pub(crate) pattern_ssa_func: r2ssa::SsaArtifact,
+    pub(crate) type_facts: r2types::FunctionTypeFacts,
+    pub(crate) writeback_plan: r2types::TypeWritebackPlan,
+    pub(crate) interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FunctionAnalysisCacheKey {
+    arch_hash: u64,
+    blocks_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FunctionArtifactCacheKey {
+    analysis: FunctionAnalysisCacheKey,
+    semantic_metadata_enabled: bool,
+    external_context_hash: u64,
+    interproc_scope_hash: u64,
+}
+
+struct HasherWriter<'a, H: Hasher>(&'a mut H);
+
+impl<H: Hasher> Write for HasherWriter<'_, H> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hash_json_value<T: serde::Serialize>(value: &T) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut writer = HasherWriter(&mut hasher);
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(hasher.finish())
+}
+
+fn hash_optional_arch(arch: Option<&ArchSpec>) -> u64 {
+    arch.and_then(hash_json_value).unwrap_or(0)
+}
+
+fn hash_string_payload(payload: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    payload.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn function_analysis_cache_key_parts(
+    _function_name: &str,
+    arch: Option<&ArchSpec>,
+    blocks: &[R2ILBlock],
+) -> Option<FunctionAnalysisCacheKey> {
+    Some(FunctionAnalysisCacheKey {
+        arch_hash: hash_optional_arch(arch),
+        blocks_hash: hash_json_value(&blocks)?,
+    })
+}
+
+fn function_artifact_cache_key_parts(
+    function_name: &str,
+    arch: Option<&ArchSpec>,
+    blocks: &[R2ILBlock],
+    semantic_metadata_enabled: bool,
+    external_context_json: &str,
+    interproc_scope_json: &str,
+) -> Option<FunctionArtifactCacheKey> {
+    Some(FunctionArtifactCacheKey {
+        analysis: function_analysis_cache_key_parts(function_name, arch, blocks)?,
+        semantic_metadata_enabled,
+        external_context_hash: hash_string_payload(external_context_json),
+        interproc_scope_hash: hash_string_payload(interproc_scope_json),
+    })
+}
+
+fn analysis_cache() -> &'static RwLock<HashMap<FunctionAnalysisCacheKey, Arc<FunctionAnalysis>>> {
+    static CACHE: OnceLock<RwLock<HashMap<FunctionAnalysisCacheKey, Arc<FunctionAnalysis>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn artifact_cache()
+-> &'static RwLock<HashMap<FunctionArtifactCacheKey, Arc<FunctionAnalysisArtifact>>> {
+    static CACHE: OnceLock<
+        RwLock<HashMap<FunctionArtifactCacheKey, Arc<FunctionAnalysisArtifact>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn cache_insert_bounded<K, V>(cache: &RwLock<HashMap<K, Arc<V>>>, key: K, value: Arc<V>)
+where
+    K: Eq + Hash,
+{
+    let mut guard = cache.write().expect("plugin cache write lock poisoned");
+    if guard.len() >= ANALYSIS_CACHE_LIMIT {
+        guard.clear();
+    }
+    guard.insert(key, value);
+}
+
+fn rename_function_analysis(analysis: FunctionAnalysis, function_name: &str) -> FunctionAnalysis {
+    let FunctionAnalysis {
+        ssa_func,
+        pattern_ssa_func,
+    } = analysis;
+    FunctionAnalysis {
+        ssa_func: ssa_func.with_name(function_name),
+        pattern_ssa_func: pattern_ssa_func.with_name(function_name),
+    }
+}
+
+fn rename_function_analysis_artifact(
+    artifact: FunctionAnalysisArtifact,
+    function_name: &str,
+) -> FunctionAnalysisArtifact {
+    let FunctionAnalysisArtifact {
+        ssa_func,
+        pattern_ssa_func,
+        type_facts,
+        writeback_plan,
+        interproc_summary_set,
+    } = artifact;
+    FunctionAnalysisArtifact {
+        ssa_func: ssa_func.with_name(function_name),
+        pattern_ssa_func: pattern_ssa_func.with_name(function_name),
+        type_facts,
+        writeback_plan,
+        interproc_summary_set,
+    }
+}
+
+fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
+    match ty {
+        r2types::CTypeLike::Void => r2dec::CType::Void,
+        r2types::CTypeLike::Bool => r2dec::CType::Bool,
+        r2types::CTypeLike::Int { bits, signedness } => match signedness {
+            r2types::Signedness::Unsigned => r2dec::CType::UInt(*bits),
+            r2types::Signedness::Signed | r2types::Signedness::Unknown => r2dec::CType::Int(*bits),
+        },
+        r2types::CTypeLike::Float(bits) => r2dec::CType::Float(*bits),
+        r2types::CTypeLike::Pointer(inner) => {
+            r2dec::CType::Pointer(Box::new(type_like_to_ctype(inner)))
+        }
+        r2types::CTypeLike::Array(inner, len) => {
+            r2dec::CType::Array(Box::new(type_like_to_ctype(inner)), *len)
+        }
+        r2types::CTypeLike::Struct(name) => r2dec::CType::Struct(name.clone()),
+        r2types::CTypeLike::Union(name) => r2dec::CType::Union(name.clone()),
+        r2types::CTypeLike::Enum(name) => r2dec::CType::Enum(name.clone()),
+        r2types::CTypeLike::Function | r2types::CTypeLike::Unknown => r2dec::CType::Unknown,
+    }
+}
+
+fn insert_known_signature_aliases(
+    known: &mut std::collections::HashMap<String, r2types::FunctionType>,
+    name: &str,
+    sig: &r2types::FunctionType,
+) {
+    if name.is_empty() {
+        return;
+    }
+    known.insert(name.to_string(), sig.clone());
+
+    for prefix in ["sym.imp.", "sym.", "imp.", "dbg.", "fcn."] {
+        if let Some(stripped) = name.strip_prefix(prefix)
+            && !stripped.is_empty()
+        {
+            known.insert(stripped.to_string(), sig.clone());
+        }
+    }
+}
+
+pub(crate) fn enrich_known_function_signatures_from_names(
+    type_facts: &mut r2types::FunctionTypeFacts,
+    function_names: &std::collections::HashMap<u64, String>,
+    ptr_bits: u32,
+) {
+    let registry = r2types::SignatureRegistry::from_embedded_json();
+
+    for name in function_names.values() {
+        let mut candidates = vec![name.clone()];
+        if let Some(sim_name) = normalize_sim_name(name)
+            && sim_name != name
+            && !candidates.iter().any(|candidate| candidate == sim_name)
+        {
+            candidates.push(sim_name.to_string());
+        }
+
+        let resolved = candidates.into_iter().find_map(|candidate| {
+            let mut arena = r2types::TypeArena::default();
+            registry
+                .resolve(&candidate, &mut arena, ptr_bits)
+                .map(|sig| {
+                    (
+                        candidate,
+                        r2types::FunctionType {
+                            return_type: r2types::to_c_type_like(&arena, sig.ret),
+                            params: sig
+                                .params
+                                .into_iter()
+                                .map(|param| r2types::to_c_type_like(&arena, param))
+                                .collect(),
+                            variadic: sig.variadic,
+                        },
+                    )
+                })
+        });
+
+        let Some((resolved_name, sig)) = resolved else {
+            continue;
+        };
+
+        insert_known_signature_aliases(&mut type_facts.known_function_signatures, name, &sig);
+        if resolved_name != *name {
+            insert_known_signature_aliases(
+                &mut type_facts.known_function_signatures,
+                &resolved_name,
+                &sig,
+            );
+        }
+    }
+}
+
+fn signature_cc_to_writeback(sig: &InferredSignatureCcJson) -> r2types::InferredSignature {
+    r2types::InferredSignature {
+        function_name: sig.function_name.clone(),
+        signature: sig.signature.clone(),
+        ret_type: sig.ret_type.clone(),
+        params: sig
+            .params
+            .iter()
+            .map(|param| r2types::InferredSignatureParam {
+                name: param.name.clone(),
+                param_type: param.param_type.clone(),
+            })
+            .collect(),
+        callconv: sig.callconv.clone(),
+        arch: sig.arch.clone(),
+        confidence: sig.confidence,
+        callconv_confidence: sig.callconv_confidence,
+    }
+}
+
+fn var_prot_to_writeback(var: &VarProt) -> r2types::RecoveredVariable {
+    r2types::RecoveredVariable {
+        name: var.name.clone(),
+        kind: var.kind.clone(),
+        delta: var.delta,
+        var_type: var.var_type.clone(),
+        isarg: var.isarg,
+        reg: var.reg.clone(),
+    }
+}
+
+fn writeback_diagnostics_from_plugin(
+    diagnostics: crate::TypeWritebackDiagnosticsJson,
+) -> r2types::TypeWritebackDiagnostics {
+    r2types::TypeWritebackDiagnostics {
+        conflicts: diagnostics.conflicts,
+        warnings: diagnostics.warnings,
+        solver_warnings: diagnostics.solver_warnings,
+    }
+}
+
+fn struct_decl_to_writeback(decl: crate::StructDeclCandidateJson) -> r2types::StructDeclCandidate {
+    r2types::StructDeclCandidate {
+        name: decl.name,
+        decl: decl.decl,
+        confidence: decl.confidence,
+        source: if decl.source == "external_type_db" {
+            r2types::StructDeclSource::ExternalTypeDb
+        } else {
+            r2types::StructDeclSource::LocalInferred
+        },
+        fields: decl
+            .fields
+            .into_iter()
+            .map(|field| r2types::StructFieldCandidate {
+                name: field.name,
+                offset: field.offset,
+                field_type: field.field_type,
+                confidence: field.confidence,
+            })
+            .collect(),
+    }
+}
+
+fn local_struct_artifacts_to_writeback(
+    struct_decls: Vec<crate::StructDeclCandidateJson>,
+    slot_type_overrides: std::collections::HashMap<usize, String>,
+    slot_field_profiles: std::collections::HashMap<usize, std::collections::BTreeMap<u64, String>>,
+) -> r2types::LocalStructArtifacts {
+    r2types::LocalStructArtifacts {
+        struct_decls: struct_decls
+            .into_iter()
+            .map(struct_decl_to_writeback)
+            .collect(),
+        slot_type_overrides,
+        slot_field_profiles,
+    }
+}
+
+fn build_var_recovery_ssa_blocks(
+    blocks: &[R2ILBlock],
+    arch: Option<&ArchSpec>,
+) -> Option<Vec<r2ssa::SSABlock>> {
+    let func = r2ssa::SSAFunction::from_blocks_raw(blocks, arch)?;
+    Some(
+        func.blocks()
+            .map(|block| r2ssa::SSABlock {
+                addr: block.addr,
+                size: block.size,
+                ops: block.ops.clone(),
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn build_function_input<'a>(
@@ -34,51 +374,182 @@ pub(crate) fn build_function_input<'a>(
     Some(FunctionInput {
         ctx,
         blocks,
+        function_addr: fcn_addr,
         function_name: resolve_function_name(fcn_addr, fcn_name),
     })
 }
 
-pub(crate) fn build_function_analysis(input: &FunctionInput<'_>) -> Option<FunctionAnalysis> {
-    let ssa_func =
-        r2ssa::SSAFunction::from_blocks_with_arch(input.blocks.as_slice(), input.ctx.arch)?
-            .with_name(&input.function_name);
-    let ssa_blocks = input
-        .blocks
-        .as_slice()
-        .iter()
-        .map(|blk| r2ssa::block::to_ssa(blk, input.ctx.disasm))
-        .collect();
-
-    Some(FunctionAnalysis {
-        ssa_func,
-        ssa_blocks,
-    })
+fn function_artifact_cache_key(
+    input: &FunctionInput<'_>,
+    external_context_json: &str,
+    interproc_scope_json: &str,
+) -> Option<FunctionArtifactCacheKey> {
+    function_artifact_cache_key_parts(
+        &input.function_name,
+        input.ctx.arch,
+        input.blocks.as_slice(),
+        input.ctx.semantic_metadata_enabled,
+        external_context_json,
+        interproc_scope_json,
+    )
 }
 
-pub(crate) fn infer_signature_cc_inner(
+fn build_function_analysis_from_parts(
+    function_name: &str,
+    blocks: &[R2ILBlock],
+    arch: Option<&ArchSpec>,
+) -> Option<FunctionAnalysis> {
+    let cache_key = function_analysis_cache_key_parts(function_name, arch, blocks)?;
+    if let Some(cached) = analysis_cache()
+        .read()
+        .expect("plugin cache read lock poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Some(rename_function_analysis((*cached).clone(), function_name));
+    }
+
+    let ssa_func = r2ssa::SsaArtifact::for_decompile(blocks, arch)?.with_name(function_name);
+    let pattern_ssa_func = if should_reuse_decompile_ssa_for_pattern_analysis(&ssa_func) {
+        ssa_func.clone()
+    } else {
+        r2ssa::SsaArtifact::for_patterns(blocks, arch)?.with_name(function_name)
+    };
+    let analysis = FunctionAnalysis {
+        ssa_func,
+        pattern_ssa_func,
+    };
+    cache_insert_bounded(analysis_cache(), cache_key, Arc::new(analysis.clone()));
+    Some(rename_function_analysis(analysis, function_name))
+}
+
+pub(crate) fn build_function_analysis(input: &FunctionInput<'_>) -> Option<FunctionAnalysis> {
+    build_function_analysis_from_parts(
+        &input.function_name,
+        input.blocks.as_slice(),
+        input.ctx.arch,
+    )
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct InterprocScopeSeedNameJson {
+    id: u64,
+    name: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct InterprocScopeInputJson {
+    #[serde(default)]
+    summaries: Vec<r2ssa::FunctionSemanticSummary>,
+    #[serde(default)]
+    seeds: Vec<InterprocScopeSeedNameJson>,
+    #[serde(default)]
+    payloads: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct InterprocScopeSignaturePayloadJson {
+    #[serde(default)]
+    function_name: String,
+    #[serde(default)]
+    params: Vec<serde_json::Value>,
+}
+
+fn parse_interproc_seed_summaries(
+    scope_json: &str,
+) -> BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary> {
+    let Ok(scope) = serde_json::from_str::<InterprocScopeInputJson>(scope_json) else {
+        return BTreeMap::new();
+    };
+    let mut seeds = BTreeMap::new();
+
+    for summary in scope.summaries {
+        seeds.insert(summary.id, summary);
+    }
+    for payload in scope.payloads {
+        let Some(interproc) = payload.get("interproc") else {
+            continue;
+        };
+        let Some(summary_value) = interproc.get("summary") else {
+            continue;
+        };
+        let Ok(mut summary) =
+            serde_json::from_value::<r2ssa::FunctionSemanticSummary>(summary_value.clone())
+        else {
+            continue;
+        };
+        if payload.get("params").is_some()
+            && let Ok(signature) =
+                serde_json::from_value::<InterprocScopeSignaturePayloadJson>(payload.clone())
+            && !signature.function_name.trim().is_empty()
+        {
+            summary.arg_count_hint = Some(signature.params.len());
+        }
+        seeds.insert(summary.id, summary);
+    }
+    for seed in scope.seeds {
+        let id = r2ssa::InterprocFunctionId(seed.id);
+        if let Some(summary) = r2ssa::FunctionSemanticSummary::seed_for_name(id, &seed.name) {
+            seeds.insert(id, summary);
+        } else {
+            seeds
+                .entry(id)
+                .or_insert_with(|| r2ssa::FunctionSemanticSummary::unknown(id, Some(seed.name)));
+        }
+    }
+
+    seeds
+}
+
+pub(crate) fn build_interproc_summary_set(
     input: &FunctionInput<'_>,
+    analysis: &FunctionAnalysis,
+    scope_json: &str,
+    max_iterations: usize,
+) -> r2ssa::InterprocSummarySet {
+    let root = r2ssa::InterprocFunctionId(input.function_addr);
+    let seeds = parse_interproc_seed_summaries(scope_json);
+    r2ssa::solve_interproc_summary_set(
+        &[r2ssa::InterprocFunctionInput {
+            id: root,
+            name: Some(input.function_name.clone()),
+            prepared: &analysis.ssa_func,
+        }],
+        input.ctx.arch,
+        Some(root),
+        &seeds,
+        r2ssa::InterprocSolveConfig {
+            max_iterations: max_iterations.max(1),
+        },
+    )
+}
+
+pub(crate) fn infer_signature_cc_from_analysis(
+    input: &FunctionInput<'_>,
+    analysis: &FunctionAnalysis,
 ) -> Option<InferredSignatureCcJson> {
     let env = build_decompiler_env(&input.ctx);
-    let analysis = build_function_analysis(input)?;
-    let evidence_ctx = collect_signature_type_evidence_context(&analysis.ssa_blocks);
+    let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
+    let evidence_ctx = collect_signature_type_evidence_context(&pattern_ssa_blocks);
 
     let mut var_recovery =
         r2dec::VariableRecovery::new(&env.cfg.sp_name, &env.cfg.fp_name, env.cfg.ptr_size);
     var_recovery.recover(&analysis.ssa_func);
 
-    let mut type_inference = r2dec::TypeInference::new(env.cfg.ptr_size);
+    let mut type_inference = r2types::TypeInference::new(env.cfg.ptr_size);
+    type_inference.set_prepared_ssa(&analysis.ssa_func);
     type_inference.infer_function(&analysis.ssa_func);
 
     let mut inferred_params: Vec<InferredParam> = var_recovery
         .parameters()
         .into_iter()
         .map(|v| {
-            let initial_ty = type_inference.get_type(&v.ssa_var);
+            let initial_ty = type_like_to_ctype(&type_inference.get_type(&v.ssa_var));
             let mut evidence =
                 crate::collect_type_evidence_for_var(&evidence_ctx, &v.ssa_var, &initial_ty);
             if matches!(initial_ty, r2dec::CType::Void | r2dec::CType::Unknown) {
                 crate::merge_initial_type_evidence(
-                    &type_inference.type_from_size(v.ssa_var.size),
+                    &type_like_to_ctype(&type_inference.type_from_size(v.ssa_var.size)),
                     &mut evidence,
                 );
             }
@@ -106,7 +577,7 @@ pub(crate) fn infer_signature_cc_inner(
     if input.ctx.semantic_metadata_enabled {
         let reg_type_hints = collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm);
         let recovered_vars =
-            recover_vars_from_ssa(&analysis.ssa_blocks, input.ctx.arch, &reg_type_hints, true);
+            recover_vars_from_ssa(&pattern_ssa_blocks, input.ctx.arch, &reg_type_hints, true);
         let pointer_arg_slots = collect_pointer_arg_slots(&recovered_vars);
         merge_pointer_slot_evidence(&mut inferred_params, &pointer_arg_slots);
     }
@@ -175,6 +646,459 @@ pub(crate) fn infer_signature_cc_inner(
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn infer_signature_cc_inner(
+    input: &FunctionInput<'_>,
+) -> Option<InferredSignatureCcJson> {
+    let analysis = build_function_analysis(input)?;
+    infer_signature_cc_from_analysis(input, &analysis)
+}
+
+#[cfg(test)]
+fn apply_signature_context_overrides(
+    sig: &mut InferredSignatureCcJson,
+    signature: Option<&r2types::FunctionSignatureSpec>,
+) -> (
+    std::collections::HashMap<usize, String>,
+    std::collections::HashMap<usize, String>,
+) {
+    let mut param_types = std::collections::HashMap::new();
+    let mut param_names = std::collections::HashMap::new();
+
+    if let Some(signature) = signature {
+        while sig.params.len() < signature.params.len() {
+            let idx = sig.params.len();
+            let param_type = signature
+                .params
+                .get(idx)
+                .and_then(|param| param.ty.as_ref())
+                .map(|ty| type_like_to_ctype(ty).to_string())
+                .unwrap_or_else(|| "void *".to_string());
+            sig.params.push(InferredParamJson {
+                name: format!("arg{}", idx + 1),
+                param_type,
+            });
+        }
+        if let Some(ret_ty) = signature.ret_type.as_ref() {
+            let ret_ty = type_like_to_ctype(ret_ty);
+            let ret_ty_str = ret_ty.to_string();
+            if !matches!(ret_ty, r2dec::CType::Unknown) {
+                sig.ret_type = ret_ty_str;
+            }
+        }
+        for (idx, param) in signature.params.iter().enumerate() {
+            if let Some(ty) = param.ty.as_ref() {
+                let ty_str = type_like_to_ctype(ty).to_string();
+                param_types.insert(idx, ty_str.clone());
+                if !matches!(type_like_to_ctype(ty), r2dec::CType::Unknown)
+                    && let Some(inferred_param) = sig.params.get_mut(idx)
+                {
+                    inferred_param.param_type = ty_str;
+                }
+            }
+            if !crate::is_generic_arg_name(&param.name) {
+                param_names.insert(idx, param.name.clone());
+                if let Some(inferred_param) = sig.params.get_mut(idx) {
+                    inferred_param.name = param.name.clone();
+                }
+            }
+        }
+        sig.signature = crate::format_afs_signature(&sig.function_name, &sig.ret_type, &sig.params);
+        sig.confidence = sig.confidence.max(signature_strength(signature));
+    }
+
+    (param_types, param_names)
+}
+
+#[cfg(test)]
+pub(crate) fn apply_main_signature_override(
+    function_name: &str,
+    signature_cc: &mut InferredSignatureCcJson,
+    merged_signature: &mut Option<r2types::FunctionSignatureSpec>,
+) {
+    if !r2types::is_c_main_function(function_name) {
+        return;
+    }
+
+    let main_signature = r2types::canonical_main_signature_spec();
+    signature_cc.ret_type = main_signature
+        .ret_type
+        .as_ref()
+        .map(|ty| type_like_to_ctype(ty).to_string())
+        .unwrap_or_else(|| "int32_t".to_string());
+    signature_cc.params = main_signature
+        .params
+        .iter()
+        .map(|param| InferredParamJson {
+            name: param.name.clone(),
+            param_type: param
+                .ty
+                .as_ref()
+                .map(|ty| type_like_to_ctype(ty).to_string())
+                .unwrap_or_else(|| "void *".to_string()),
+        })
+        .collect();
+    signature_cc.signature = crate::format_afs_signature(
+        &signature_cc.function_name,
+        &signature_cc.ret_type,
+        &signature_cc.params,
+    );
+    signature_cc.confidence = signature_cc.confidence.max(96);
+    *merged_signature = Some(main_signature);
+}
+
+#[cfg(test)]
+fn signature_strength(signature: &r2types::FunctionSignatureSpec) -> u8 {
+    let has_type_info =
+        signature.ret_type.is_some() || signature.params.iter().any(|param| param.ty.is_some());
+    let has_named_params = signature
+        .params
+        .iter()
+        .any(|param| !crate::is_generic_arg_name(&param.name));
+    if has_type_info || has_named_params {
+        96
+    } else {
+        80
+    }
+}
+
+pub(crate) fn build_function_analysis_artifact_from_analysis(
+    input: &FunctionInput<'_>,
+    analysis: FunctionAnalysis,
+    external_context_json: &str,
+    interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
+) -> Option<FunctionAnalysisArtifact> {
+    let ptr_bits = input
+        .ctx
+        .arch
+        .as_ref()
+        .map(|arch| effective_ptr_bits(arch))
+        .unwrap_or(64);
+    let signature_cc = infer_signature_cc_from_analysis(input, &analysis)?;
+    let parsed_context = r2types::parse_external_context_json(external_context_json, ptr_bits);
+
+    let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
+    let mut diagnostics = crate::TypeWritebackDiagnosticsJson::default();
+    let raw_structs = crate::infer_structs_from_ssa(
+        &pattern_ssa_blocks,
+        input.ctx.arch,
+        ptr_bits,
+        &mut diagnostics,
+    );
+    let semantic_structs = crate::infer_structs_from_semantic_accesses(
+        &analysis.pattern_ssa_func,
+        &build_decompiler_env(&input.ctx).cfg,
+        ptr_bits,
+        &mut diagnostics,
+    );
+    let (struct_decls, slot_type_overrides, slot_field_profiles) =
+        crate::merge_struct_inference_artifacts(raw_structs, semantic_structs);
+
+    let reg_type_hints = if input.ctx.semantic_metadata_enabled {
+        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let vars = recover_vars_from_ssa(
+        &pattern_ssa_blocks,
+        input.ctx.arch,
+        &reg_type_hints,
+        input.ctx.semantic_metadata_enabled,
+    );
+    let recovered_vars = vars.iter().map(var_prot_to_writeback).collect::<Vec<_>>();
+    let writeback = r2types::build_type_writeback_analysis(r2types::TypeWritebackAnalysisInput {
+        function_name: &input.function_name,
+        ptr_bits,
+        inferred_signature: signature_cc_to_writeback(&signature_cc),
+        recovered_vars: &recovered_vars,
+        ssa_blocks: &pattern_ssa_blocks,
+        parsed_context,
+        local_structs: local_struct_artifacts_to_writeback(
+            struct_decls,
+            slot_type_overrides,
+            slot_field_profiles,
+        ),
+        interproc_summary_set: interproc_summary_set.clone(),
+        diagnostics: writeback_diagnostics_from_plugin(diagnostics),
+    });
+    Some(FunctionAnalysisArtifact {
+        ssa_func: analysis.ssa_func,
+        pattern_ssa_func: analysis.pattern_ssa_func,
+        type_facts: writeback.type_facts,
+        writeback_plan: writeback.plan,
+        interproc_summary_set,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_function_analysis_artifact(
+    input: &FunctionInput<'_>,
+    external_context_json: &str,
+    interproc_scope_json: &str,
+    interproc_max_iterations: usize,
+) -> Option<FunctionAnalysisArtifact> {
+    let cache_key =
+        function_artifact_cache_key(input, external_context_json, interproc_scope_json)?;
+    if let Some(cached) = artifact_cache()
+        .read()
+        .expect("plugin cache read lock poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Some(rename_function_analysis_artifact(
+            (*cached).clone(),
+            &input.function_name,
+        ));
+    }
+
+    let analysis = build_function_analysis(input)?;
+    let interproc_summary_set = build_interproc_summary_set(
+        input,
+        &analysis,
+        interproc_scope_json,
+        interproc_max_iterations,
+    );
+    let artifact = build_function_analysis_artifact_from_analysis(
+        input,
+        analysis,
+        external_context_json,
+        Some(interproc_summary_set),
+    )?;
+    cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
+    Some(rename_function_analysis_artifact(
+        artifact,
+        &input.function_name,
+    ))
+}
+
+pub(crate) fn get_cached_function_analysis_artifact(
+    input: &FunctionInput<'_>,
+    external_context_json: &str,
+) -> Option<FunctionAnalysisArtifact> {
+    let cache_key = function_artifact_cache_key(input, external_context_json, "{}")?;
+    artifact_cache()
+        .read()
+        .expect("plugin cache read lock poisoned")
+        .get(&cache_key)
+        .cloned()
+        .map(|artifact| {
+            rename_function_analysis_artifact((*artifact).clone(), &input.function_name)
+        })
+}
+
+pub(crate) fn alias_cached_function_analysis_artifact(
+    input: &FunctionInput<'_>,
+    source_external_context_json: &str,
+    target_external_context_json: &str,
+) -> bool {
+    let Some(source_key) = function_artifact_cache_key(input, source_external_context_json, "{}")
+    else {
+        return false;
+    };
+    let Some(target_key) = function_artifact_cache_key(input, target_external_context_json, "{}")
+    else {
+        return false;
+    };
+    let Some(cached) = artifact_cache()
+        .read()
+        .expect("plugin cache read lock poisoned")
+        .get(&source_key)
+        .cloned()
+    else {
+        return false;
+    };
+    cache_insert_bounded(artifact_cache(), target_key, cached);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_detached_function_analysis_artifact(
+    blocks: &[R2ILBlock],
+    function_name: &str,
+    arch: Option<&ArchSpec>,
+    ptr_bits: u32,
+    semantic_metadata_enabled: bool,
+    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
+    external_context_json: &str,
+) -> Option<FunctionAnalysisArtifact> {
+    let cache_key = function_artifact_cache_key_parts(
+        function_name,
+        arch,
+        blocks,
+        semantic_metadata_enabled,
+        external_context_json,
+        "{}",
+    )?;
+    if let Some(cached) = artifact_cache()
+        .read()
+        .expect("plugin cache read lock poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Some(rename_function_analysis_artifact(
+            (*cached).clone(),
+            function_name,
+        ));
+    }
+
+    let analysis = build_function_analysis_from_parts(function_name, blocks, arch)?;
+    let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
+
+    let arch_name = normalize_sig_arch_name(arch).unwrap_or_else(|| "unknown".to_string());
+    let cfg = decompiler_config_for_arch_name(&arch_name, ptr_bits);
+    let evidence_ctx = collect_signature_type_evidence_context(&pattern_ssa_blocks);
+    let mut var_recovery = r2dec::VariableRecovery::new(&cfg.sp_name, &cfg.fp_name, cfg.ptr_size);
+    var_recovery.recover(&analysis.ssa_func);
+    let mut type_inference = r2types::TypeInference::new(cfg.ptr_size);
+    type_inference.set_prepared_ssa(&analysis.ssa_func);
+    type_inference.infer_function(&analysis.ssa_func);
+
+    let mut inferred_params: Vec<InferredParam> = var_recovery
+        .parameters()
+        .into_iter()
+        .map(|v| {
+            let initial_ty = type_like_to_ctype(&type_inference.get_type(&v.ssa_var));
+            let mut evidence =
+                crate::collect_type_evidence_for_var(&evidence_ctx, &v.ssa_var, &initial_ty);
+            if matches!(initial_ty, r2dec::CType::Void | r2dec::CType::Unknown) {
+                crate::merge_initial_type_evidence(
+                    &type_like_to_ctype(&type_inference.type_from_size(v.ssa_var.size)),
+                    &mut evidence,
+                );
+            }
+            let ty = crate::resolve_evidence_driven_type(
+                initial_ty,
+                v.ssa_var.size,
+                ptr_bits,
+                &evidence,
+            );
+            let arg_index = v
+                .name
+                .strip_prefix("arg")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            InferredParam {
+                name: v.name.clone(),
+                ty,
+                arg_index,
+                size_bytes: v.ssa_var.size,
+                evidence,
+            }
+        })
+        .collect();
+
+    if semantic_metadata_enabled {
+        let recovered_vars = recover_vars_from_ssa(&pattern_ssa_blocks, arch, reg_type_hints, true);
+        let pointer_arg_slots = collect_pointer_arg_slots(&recovered_vars);
+        merge_pointer_slot_evidence(&mut inferred_params, &pointer_arg_slots);
+    }
+
+    for param in &mut inferred_params {
+        param.ty = crate::resolve_evidence_driven_type(
+            param.ty.clone(),
+            param.size_bytes,
+            ptr_bits,
+            &param.evidence,
+        );
+    }
+
+    inferred_params.sort_by(|a, b| {
+        a.arg_index
+            .cmp(&b.arg_index)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut used_param_names = HashSet::new();
+    let params: Vec<InferredParamJson> = inferred_params
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            let fallback_idx = if p.arg_index == usize::MAX {
+                idx
+            } else {
+                p.arg_index
+            };
+            InferredParamJson {
+                name: crate::normalize_inferred_param_name(
+                    &p.name,
+                    fallback_idx,
+                    &mut used_param_names,
+                ),
+                param_type: crate::materialize_signature_ctype(p.ty.clone(), ptr_bits).to_string(),
+            }
+        })
+        .collect();
+
+    let (ret_type, ret_evidence) = crate::infer_signature_return_type(
+        &analysis.ssa_func,
+        &type_inference,
+        ptr_bits,
+        &evidence_ctx,
+    );
+    let ret_type = crate::materialize_signature_ctype(ret_type, ptr_bits);
+    let signature_cc = InferredSignatureCcJson {
+        function_name: function_name.to_string(),
+        signature: crate::format_afs_signature(function_name, &ret_type.to_string(), &params),
+        ret_type: ret_type.to_string(),
+        params,
+        callconv: crate::compute_callconv_inference(
+            &arch_name,
+            &crate::collect_version0_input_regs(&analysis.ssa_func),
+        )
+        .0,
+        arch: arch_name.clone(),
+        confidence: crate::compute_signature_confidence(&inferred_params, &ret_type, &ret_evidence),
+        callconv_confidence: crate::compute_callconv_inference(
+            &arch_name,
+            &crate::collect_version0_input_regs(&analysis.ssa_func),
+        )
+        .1,
+    };
+    let parsed_context = r2types::parse_external_context_json(external_context_json, ptr_bits);
+
+    let mut diagnostics = crate::TypeWritebackDiagnosticsJson::default();
+    let raw_structs =
+        crate::infer_structs_from_ssa(&pattern_ssa_blocks, arch, ptr_bits, &mut diagnostics);
+    let semantic_structs = crate::infer_structs_from_semantic_accesses(
+        &analysis.pattern_ssa_func,
+        &cfg,
+        ptr_bits,
+        &mut diagnostics,
+    );
+    let (struct_decls, slot_type_overrides, slot_field_profiles) =
+        crate::merge_struct_inference_artifacts(raw_structs, semantic_structs);
+    let vars = recover_vars_from_ssa(
+        &pattern_ssa_blocks,
+        arch,
+        reg_type_hints,
+        semantic_metadata_enabled,
+    );
+    let recovered_vars = vars.iter().map(var_prot_to_writeback).collect::<Vec<_>>();
+    let writeback = r2types::build_type_writeback_analysis(r2types::TypeWritebackAnalysisInput {
+        function_name,
+        ptr_bits,
+        inferred_signature: signature_cc_to_writeback(&signature_cc),
+        recovered_vars: &recovered_vars,
+        ssa_blocks: &pattern_ssa_blocks,
+        parsed_context,
+        local_structs: local_struct_artifacts_to_writeback(
+            struct_decls,
+            slot_type_overrides,
+            slot_field_profiles,
+        ),
+        interproc_summary_set: None,
+        diagnostics: writeback_diagnostics_from_plugin(diagnostics),
+    });
+    let artifact = FunctionAnalysisArtifact {
+        ssa_func: analysis.ssa_func,
+        pattern_ssa_func: analysis.pattern_ssa_func,
+        type_facts: writeback.type_facts,
+        writeback_plan: writeback.plan,
+        interproc_summary_set: None,
+    };
+    cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
+    Some(rename_function_analysis_artifact(artifact, function_name))
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct VarProt {
     pub(crate) name: String,
@@ -187,7 +1111,7 @@ pub(crate) struct VarProt {
     pub(crate) reg: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct DataRef {
     pub(crate) from: u64,
     pub(crate) to: u64,
@@ -428,6 +1352,25 @@ fn ssa_var_is_register_like(name: &str) -> bool {
         || lower.starts_with("space"))
 }
 
+pub(crate) fn scalar_register_family_key(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+
+    if let Some(idx) = lower.strip_prefix('x').or_else(|| lower.strip_prefix('w'))
+        && !idx.is_empty()
+        && idx.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return format!("aarch64:gpr:{idx}");
+    }
+
+    match lower.as_str() {
+        "fp" => "aarch64:gpr:29".to_string(),
+        "lr" => "aarch64:gpr:30".to_string(),
+        "sp" | "wsp" => "aarch64:sp".to_string(),
+        "xzr" | "wzr" => "aarch64:zr".to_string(),
+        _ => lower,
+    }
+}
+
 fn collect_register_version_keys(
     ssa_blocks: &[r2ssa::SSABlock],
 ) -> std::collections::HashMap<String, Vec<String>> {
@@ -440,7 +1383,7 @@ fn collect_register_version_keys(
                 if !ssa_var_is_register_like(&var.name) {
                     return;
                 }
-                let reg_name = var.name.to_ascii_lowercase();
+                let reg_name = scalar_register_family_key(&var.name);
                 reg_versions
                     .entry(reg_name)
                     .or_default()
@@ -457,6 +1400,130 @@ fn collect_register_version_keys(
         keys.dedup();
     }
     reg_versions
+}
+
+fn set_width_hint_prefer_narrower(
+    width_hints: &mut std::collections::HashMap<String, u32>,
+    key: String,
+    bits: u32,
+) -> bool {
+    if bits == 0 {
+        return false;
+    }
+    match width_hints.get(&key).copied() {
+        Some(current) if current == bits => false,
+        Some(current) if current > 0 && current <= bits => false,
+        _ => {
+            width_hints.insert(key, bits);
+            true
+        }
+    }
+}
+
+fn normalize_register_family_width_hints(
+    register_versions: &std::collections::HashMap<String, Vec<String>>,
+    width_hints: &mut std::collections::HashMap<String, u32>,
+) -> bool {
+    let mut changed = false;
+    for reg_keys in register_versions.values() {
+        let max_bits = reg_keys
+            .iter()
+            .filter_map(|key| width_hints.get(key).copied())
+            .max()
+            .unwrap_or(0);
+        let min_bits = reg_keys
+            .iter()
+            .filter_map(|key| {
+                let current = width_hints.get(key).copied().unwrap_or(0);
+                let natural = register_key_natural_bits(key).unwrap_or(0);
+                let candidate = match (current, natural) {
+                    (0, 0) => 0,
+                    (0, natural) => natural,
+                    (current, 0) => current,
+                    (current, natural) => current.min(natural),
+                };
+                (candidate > 0).then_some(candidate)
+            })
+            .min()
+            .unwrap_or(0);
+        let preferred_bits = if min_bits > 0 && max_bits == 64 && min_bits <= 32 {
+            min_bits
+        } else {
+            max_bits
+        };
+        for key in reg_keys {
+            changed |= set_width_hint_prefer_narrower(width_hints, key.clone(), preferred_bits);
+        }
+    }
+    changed
+}
+
+fn register_key_natural_bits(key: &str) -> Option<u32> {
+    let reg = key.split('_').next()?;
+    if let Some(idx) = reg.strip_prefix('w')
+        && !idx.is_empty()
+        && idx.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Some(32);
+    }
+    if let Some(idx) = reg.strip_prefix('x')
+        && !idx.is_empty()
+        && idx.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Some(64);
+    }
+    match reg {
+        "wsp" | "wzr" => Some(32),
+        "sp" | "fp" | "lr" | "xzr" => Some(64),
+        _ => None,
+    }
+}
+
+fn propagate_normalized_scalar_result_widths(
+    ssa_blocks: &[r2ssa::SSABlock],
+    width_hints: &mut std::collections::HashMap<String, u32>,
+) -> bool {
+    let mut changed = false;
+    for block in ssa_blocks {
+        for op in &block.ops {
+            let (dst, source_bits) = match op {
+                r2ssa::SSAOp::Copy { dst, src }
+                | r2ssa::SSAOp::Cast { dst, src }
+                | r2ssa::SSAOp::New { dst, src }
+                | r2ssa::SSAOp::IntZExt { dst, src }
+                | r2ssa::SSAOp::IntSExt { dst, src }
+                | r2ssa::SSAOp::Subpiece { dst, src, .. } => {
+                    let bits = width_hints.get(&ssa_var_key(src)).copied().unwrap_or(0);
+                    (dst, bits)
+                }
+                r2ssa::SSAOp::IntAdd { dst, a, b }
+                | r2ssa::SSAOp::IntSub { dst, a, b }
+                | r2ssa::SSAOp::IntMult { dst, a, b }
+                | r2ssa::SSAOp::IntDiv { dst, a, b }
+                | r2ssa::SSAOp::IntSDiv { dst, a, b }
+                | r2ssa::SSAOp::IntRem { dst, a, b }
+                | r2ssa::SSAOp::IntSRem { dst, a, b }
+                | r2ssa::SSAOp::IntAnd { dst, a, b }
+                | r2ssa::SSAOp::IntOr { dst, a, b }
+                | r2ssa::SSAOp::IntXor { dst, a, b }
+                | r2ssa::SSAOp::IntLeft { dst, a, b }
+                | r2ssa::SSAOp::IntRight { dst, a, b }
+                | r2ssa::SSAOp::IntSRight { dst, a, b } => {
+                    let bits = [a, b]
+                        .into_iter()
+                        .filter(|var| !ssa_var_is_const(var))
+                        .filter_map(|var| width_hints.get(&ssa_var_key(var)).copied())
+                        .filter(|bits| *bits > 0)
+                        .max()
+                        .unwrap_or(0);
+                    (dst, bits)
+                }
+                _ => continue,
+            };
+            changed |= set_width_hint_prefer_narrower(width_hints, ssa_var_key(dst), source_bits);
+        }
+    }
+    changed
 }
 
 fn ssa_var_is_stack_base(var: &r2ssa::SSAVar) -> bool {
@@ -871,6 +1938,49 @@ fn infer_scalar_var_evidence_from_ssa(
         for block in ssa_blocks {
             for op in &block.ops {
                 match op {
+                    r2ssa::SSAOp::IntAdd { dst, a, b }
+                    | r2ssa::SSAOp::IntSub { dst, a, b }
+                    | r2ssa::SSAOp::IntMult { dst, a, b }
+                    | r2ssa::SSAOp::IntDiv { dst, a, b }
+                    | r2ssa::SSAOp::IntSDiv { dst, a, b }
+                    | r2ssa::SSAOp::IntRem { dst, a, b }
+                    | r2ssa::SSAOp::IntSRem { dst, a, b }
+                    | r2ssa::SSAOp::IntAnd { dst, a, b }
+                    | r2ssa::SSAOp::IntOr { dst, a, b }
+                    | r2ssa::SSAOp::IntXor { dst, a, b }
+                    | r2ssa::SSAOp::IntLeft { dst, a, b }
+                    | r2ssa::SSAOp::IntRight { dst, a, b }
+                    | r2ssa::SSAOp::IntSRight { dst, a, b } => {
+                        let dst_key = ssa_var_key(dst);
+                        let a_key = ssa_var_key(a);
+                        let b_key = ssa_var_key(b);
+                        let any_proven =
+                            scalar_proven.contains(&a_key) || scalar_proven.contains(&b_key);
+                        let any_likely = scalar_likely.contains(&a_key)
+                            || scalar_likely.contains(&b_key)
+                            || any_proven;
+                        if any_proven {
+                            changed |= scalar_proven.insert(dst_key.clone());
+                        }
+                        if any_likely {
+                            changed |= scalar_likely.insert(dst_key.clone());
+                        }
+
+                        let operand_bits = [a, b]
+                            .into_iter()
+                            .filter(|var| !ssa_var_is_const(var))
+                            .filter_map(|var| width_hints.get(&ssa_var_key(var)).copied())
+                            .filter(|bits| *bits > 0)
+                            .max()
+                            .unwrap_or(0);
+                        if operand_bits > 0 {
+                            let entry = width_hints.entry(dst_key).or_insert(0);
+                            if operand_bits > *entry {
+                                *entry = operand_bits;
+                                changed = true;
+                            }
+                        }
+                    }
                     r2ssa::SSAOp::Phi { dst, sources } => {
                         let dst_key = ssa_var_key(dst);
                         let any_proven = sources
@@ -960,6 +2070,17 @@ fn infer_scalar_var_evidence_from_ssa(
                 .filter_map(|key| width_hints.get(key).copied())
                 .max()
                 .unwrap_or(0);
+            let min_bits = reg_keys
+                .iter()
+                .filter_map(|key| width_hints.get(key).copied())
+                .filter(|bits| *bits > 0)
+                .min()
+                .unwrap_or(0);
+            let preferred_bits = if min_bits > 0 && max_bits == 64 && min_bits <= 32 {
+                min_bits
+            } else {
+                max_bits
+            };
             for key in reg_keys {
                 if any_proven {
                     changed |= scalar_proven.insert(key.clone());
@@ -970,10 +2091,10 @@ fn infer_scalar_var_evidence_from_ssa(
                 if any_bool {
                     changed |= bool_like.insert(key.clone());
                 }
-                if max_bits > 0 {
+                if preferred_bits > 0 {
                     let entry = width_hints.entry(key.clone()).or_insert(0);
-                    if max_bits > *entry {
-                        *entry = max_bits;
+                    if preferred_bits > *entry {
+                        *entry = preferred_bits;
                         changed = true;
                     }
                 }
@@ -988,8 +2109,12 @@ pub(crate) fn collect_signature_type_evidence_context(
     ssa_blocks: &[r2ssa::SSABlock],
 ) -> crate::SignatureTypeEvidenceContext {
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks);
-    let (scalar_proven_vars, scalar_likely_vars, bool_like_vars, width_bits) =
+    let (scalar_proven_vars, scalar_likely_vars, bool_like_vars, mut width_bits) =
         infer_scalar_var_evidence_from_ssa(ssa_blocks);
+    let register_versions = collect_register_version_keys(ssa_blocks);
+    normalize_register_family_width_hints(&register_versions, &mut width_bits);
+    propagate_normalized_scalar_result_widths(ssa_blocks, &mut width_bits);
+    normalize_register_family_width_hints(&register_versions, &mut width_bits);
     crate::SignatureTypeEvidenceContext {
         pointer_vars,
         scalar_proven_vars,
@@ -1047,6 +2172,64 @@ fn strongest_hint_for_aliases(
         }
     }
     best
+}
+
+fn width_hint_key_matches_family(key: &str, family: &str) -> bool {
+    let Some((name, _version)) = key.rsplit_once('_') else {
+        return false;
+    };
+    scalar_register_family_key(name) == family
+}
+
+fn width_hint_key_matches_family_version(key: &str, family: &str, version: u32) -> bool {
+    let Some((name, version_str)) = key.rsplit_once('_') else {
+        return false;
+    };
+    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
+}
+
+fn recovered_arg_family_width_hint(
+    evidence: &crate::SignatureTypeEvidenceContext,
+    src: &r2ssa::SSAVar,
+) -> Option<u32> {
+    let family = scalar_register_family_key(&src.name);
+    evidence
+        .width_bits
+        .iter()
+        .filter(|(key, bits)| {
+            **bits > 0 && width_hint_key_matches_family_version(key, &family, src.version)
+        })
+        .map(|(_, bits)| *bits)
+        .min()
+        .or_else(|| {
+            evidence
+                .width_bits
+                .iter()
+                .filter(|(key, bits)| **bits > 0 && width_hint_key_matches_family(key, &family))
+                .map(|(_, bits)| *bits)
+                .min()
+        })
+}
+
+fn recovered_arg_type_hint(
+    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
+    canonical: &str,
+    aliases: &[&str],
+    src: &r2ssa::SSAVar,
+    signature_evidence: Option<&crate::SignatureTypeEvidenceContext>,
+) -> Option<String> {
+    let best_hint = strongest_hint_for_aliases(reg_type_hints, canonical, aliases);
+    if let Some(hint) = best_hint.as_ref()
+        && hint.rank == TypeHintRank::Pointer
+    {
+        return Some(hint.ty.clone());
+    }
+    if let Some(evidence) = signature_evidence
+        && let Some(bits) = recovered_arg_family_width_hint(evidence, src)
+    {
+        return Some(size_to_type(bits.div_ceil(8)));
+    }
+    best_hint.map(|hint| hint.ty)
 }
 
 pub(crate) fn merge_register_type_hints(
@@ -1119,9 +2302,11 @@ pub(crate) fn recover_vars_from_ssa(
     use std::collections::{HashMap, HashSet};
 
     let mut vars = Vec::new();
-    let mut seen_offsets: HashMap<i64, usize> = HashMap::new();
+    let mut seen_slots: HashMap<(bool, i64), usize> = HashMap::new();
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
     let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(arch);
+    let signature_evidence =
+        semantic_typing_enabled.then(|| collect_signature_type_evidence_context(ssa_blocks));
     let (usage_reg_type_hints, pointer_var_keys) = if semantic_typing_enabled {
         infer_usage_register_type_hints(ssa_blocks)
     } else {
@@ -1176,7 +2361,7 @@ pub(crate) fn recover_vars_from_ssa(
                         };
                         add_stack_var(
                             &mut vars,
-                            &mut seen_offsets,
+                            &mut seen_slots,
                             base_reg,
                             frame_bases,
                             *offset,
@@ -1197,7 +2382,7 @@ pub(crate) fn recover_vars_from_ssa(
                         };
                         add_stack_var(
                             &mut vars,
-                            &mut seen_offsets,
+                            &mut seen_slots,
                             base_reg,
                             frame_bases,
                             *offset,
@@ -1218,8 +2403,13 @@ pub(crate) fn recover_vars_from_ssa(
                         {
                             seen_arg_regs.insert(canonical.to_string());
                             let hinted_type = if semantic_typing_enabled {
-                                strongest_hint_for_aliases(&reg_type_hints, canonical, aliases)
-                                    .map(|hint| hint.ty)
+                                recovered_arg_type_hint(
+                                    &reg_type_hints,
+                                    canonical,
+                                    aliases,
+                                    src,
+                                    signature_evidence.as_ref(),
+                                )
                             } else {
                                 None
                             };
@@ -1245,14 +2435,16 @@ pub(crate) fn recover_vars_from_ssa(
 
 pub(crate) fn add_stack_var(
     vars: &mut Vec<VarProt>,
-    seen_offsets: &mut std::collections::HashMap<i64, usize>,
+    seen_slots: &mut std::collections::HashMap<(bool, i64), usize>,
     base_reg: &str,
     frame_bases: &[&str],
     offset: i64,
     size: u32,
     type_override: Option<String>,
 ) {
-    if let Some(existing_idx) = seen_offsets.get(&offset).copied() {
+    let is_frame_base = frame_bases.contains(&base_reg);
+    let slot_key = (is_frame_base, offset);
+    if let Some(existing_idx) = seen_slots.get(&slot_key).copied() {
         if let Some(override_ty) = type_override
             && override_ty == "void *"
             && let Some(existing) = vars.get_mut(existing_idx)
@@ -1263,7 +2455,6 @@ pub(crate) fn add_stack_var(
         return;
     }
 
-    let is_frame_base = frame_bases.contains(&base_reg);
     let is_arg = if is_frame_base { offset > 0 } else { false };
 
     let var_name = if is_arg && offset > 8 {
@@ -1282,7 +2473,7 @@ pub(crate) fn add_stack_var(
         isarg: is_arg && offset > 8,
         reg: None,
     });
-    seen_offsets.insert(offset, vars.len().saturating_sub(1));
+    seen_slots.insert(slot_key, vars.len().saturating_sub(1));
 }
 
 pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
@@ -1334,6 +2525,78 @@ fn resolve_const_addr(
     resolve_const_value(const_env, var).filter(|addr| *addr >= 0x10000)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MemorySlotKey {
+    Absolute(u64),
+    Stack { base: String, offset: i64 },
+}
+
+fn is_stack_base_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sp" | "rsp" | "esp" | "fp" | "rbp" | "ebp" | "x29"
+    )
+}
+
+fn resolve_memory_slot_key(
+    addr_env: &std::collections::HashMap<String, MemorySlotKey>,
+    const_env: &std::collections::HashMap<String, u64>,
+    var: &r2ssa::SSAVar,
+) -> Option<MemorySlotKey> {
+    if let Some(addr) = resolve_const_addr(const_env, var) {
+        return Some(MemorySlotKey::Absolute(addr));
+    }
+
+    let lower = var.name.to_ascii_lowercase();
+    if is_stack_base_name(&lower) {
+        return Some(MemorySlotKey::Stack {
+            base: lower,
+            offset: 0,
+        });
+    }
+
+    addr_env.get(&ssa_var_key(var)).cloned()
+}
+
+fn resolve_memory_slot_with_delta(base: MemorySlotKey, delta: i64) -> Option<MemorySlotKey> {
+    match base {
+        MemorySlotKey::Absolute(addr) => {
+            if delta >= 0 {
+                addr.checked_add(delta as u64).map(MemorySlotKey::Absolute)
+            } else {
+                addr.checked_sub(delta.unsigned_abs())
+                    .map(MemorySlotKey::Absolute)
+            }
+        }
+        MemorySlotKey::Stack { base, offset } => offset
+            .checked_add(delta)
+            .map(|offset| MemorySlotKey::Stack { base, offset }),
+    }
+}
+
+fn resolve_memory_slot_from_add_sub(
+    addr_env: &std::collections::HashMap<String, MemorySlotKey>,
+    const_env: &std::collections::HashMap<String, u64>,
+    a: &r2ssa::SSAVar,
+    b: &r2ssa::SSAVar,
+    is_sub: bool,
+) -> Option<MemorySlotKey> {
+    if let Some(delta_raw) = resolve_const_value(const_env, b)
+        && let Ok(delta) = i64::try_from(delta_raw)
+        && let Some(base) = resolve_memory_slot_key(addr_env, const_env, a)
+    {
+        return resolve_memory_slot_with_delta(base, if is_sub { -delta } else { delta });
+    }
+    if !is_sub
+        && let Some(delta_raw) = resolve_const_value(const_env, a)
+        && let Ok(delta) = i64::try_from(delta_raw)
+        && let Some(base) = resolve_memory_slot_key(addr_env, const_env, b)
+    {
+        return resolve_memory_slot_with_delta(base, delta);
+    }
+    None
+}
+
 fn bit_width(size: u32) -> u32 {
     size.saturating_mul(8).min(64)
 }
@@ -1362,26 +2625,16 @@ fn sign_extend_bits(value: u64, bits: u32) -> u64 {
     }
 }
 
-fn op_source_addrs_from_r2il_block(block: &R2ILBlock) -> Vec<u64> {
-    block
-        .ops
-        .iter()
-        .enumerate()
-        .map(|(op_idx, _)| {
-            block
-                .op_metadata(op_idx)
-                .and_then(|meta| meta.instruction_addr)
-                .unwrap_or(block.addr)
-        })
-        .collect()
-}
-
 pub(crate) fn get_data_refs_from_ssa_with_op_sources(
     ssa_blocks: &[r2ssa::SSABlock],
     op_sources: Option<&[Vec<u64>]>,
 ) -> Vec<DataRef> {
     let mut refs = Vec::new();
     let mut const_env: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut addr_env: std::collections::HashMap<String, MemorySlotKey> =
+        std::collections::HashMap::new();
+    let mut stack_value_env: std::collections::HashMap<MemorySlotKey, u64> =
+        std::collections::HashMap::new();
 
     for (block_idx, block) in ssa_blocks.iter().enumerate() {
         for (op_idx, op) in block.ops.iter().enumerate() {
@@ -1395,7 +2648,10 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                     if let Some(value) = resolve_const_value(&const_env, src) {
                         const_env.insert(ssa_var_key(dst), value);
                     }
-                    if let Some(addr) = parse_const_addr(&src.name) {
+                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
+                        addr_env.insert(ssa_var_key(dst), slot);
+                    }
+                    if let Some(addr) = resolve_const_addr(&const_env, src) {
                         refs.push(DataRef {
                             from,
                             to: addr,
@@ -1411,14 +2667,41 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                             ref_type: "d".to_string(),
                         });
                     }
+                    if let r2ssa::SSAOp::Load { dst, .. } = op
+                        && let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, addr)
+                        && let Some(value) = stack_value_env.get(&slot).copied()
+                    {
+                        const_env.insert(ssa_var_key(dst), value);
+                        if value >= 0x10000 {
+                            refs.push(DataRef {
+                                from,
+                                to: value,
+                                ref_type: "d".to_string(),
+                            });
+                        }
+                    }
                 }
-                r2ssa::SSAOp::Store { addr, .. } => {
+                r2ssa::SSAOp::Store { addr, val, .. } => {
                     if let Some(target) = resolve_const_addr(&const_env, addr) {
                         refs.push(DataRef {
                             from,
                             to: target,
                             ref_type: "d".to_string(),
                         });
+                    }
+                    if let Some(value_addr) = resolve_const_addr(&const_env, val) {
+                        refs.push(DataRef {
+                            from,
+                            to: value_addr,
+                            ref_type: "d".to_string(),
+                        });
+                    }
+                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, addr) {
+                        if let Some(value) = resolve_const_value(&const_env, val) {
+                            stack_value_env.insert(slot, value);
+                        } else {
+                            stack_value_env.remove(&slot);
+                        }
                     }
                 }
                 r2ssa::SSAOp::IntAdd { dst, a, b } => {
@@ -1427,6 +2710,11 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                         resolve_const_value(&const_env, b),
                     ) {
                         const_env.insert(ssa_var_key(dst), lhs.wrapping_add(rhs));
+                    }
+                    if let Some(slot) =
+                        resolve_memory_slot_from_add_sub(&addr_env, &const_env, a, b, false)
+                    {
+                        addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = parse_const_addr(&a.name) {
                         refs.push(DataRef {
@@ -1456,6 +2744,11 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                         resolve_const_value(&const_env, b),
                     ) {
                         const_env.insert(ssa_var_key(dst), lhs.wrapping_sub(rhs));
+                    }
+                    if let Some(slot) =
+                        resolve_memory_slot_from_add_sub(&addr_env, &const_env, a, b, true)
+                    {
+                        addr_env.insert(ssa_var_key(dst), slot);
                     }
                     if let Some(addr) = parse_const_addr(&a.name) {
                         refs.push(DataRef {
@@ -1499,6 +2792,15 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                             ref_type: "d".to_string(),
                         });
                     }
+                    if let Some(index_val) = resolve_const_value(&const_env, index)
+                        && let Ok(delta) =
+                            i64::try_from(index_val.wrapping_mul((*element_size).into()))
+                        && let Some(base_slot) =
+                            resolve_memory_slot_key(&addr_env, &const_env, base)
+                        && let Some(slot) = resolve_memory_slot_with_delta(base_slot, delta)
+                    {
+                        addr_env.insert(ssa_var_key(dst), slot);
+                    }
                 }
                 r2ssa::SSAOp::PtrSub {
                     dst,
@@ -1520,10 +2822,29 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                             ref_type: "d".to_string(),
                         });
                     }
+                    if let Some(index_val) = resolve_const_value(&const_env, index)
+                        && let Ok(delta) =
+                            i64::try_from(index_val.wrapping_mul((*element_size).into()))
+                        && let Some(base_slot) =
+                            resolve_memory_slot_key(&addr_env, &const_env, base)
+                        && let Some(slot) = resolve_memory_slot_with_delta(base_slot, -delta)
+                    {
+                        addr_env.insert(ssa_var_key(dst), slot);
+                    }
                 }
                 r2ssa::SSAOp::Cast { dst, src } | r2ssa::SSAOp::New { dst, src } => {
                     if let Some(value) = resolve_const_value(&const_env, src) {
                         const_env.insert(ssa_var_key(dst), value);
+                    }
+                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
+                        addr_env.insert(ssa_var_key(dst), slot);
+                    }
+                    if let Some(addr) = resolve_const_addr(&const_env, src) {
+                        refs.push(DataRef {
+                            from,
+                            to: addr,
+                            ref_type: "d".to_string(),
+                        });
                     }
                 }
                 r2ssa::SSAOp::IntZExt { dst, src } => {
@@ -1533,6 +2854,16 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                         let zext = mask_to_bits(value, src_bits);
                         const_env.insert(ssa_var_key(dst), mask_to_bits(zext, dst_bits));
                     }
+                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
+                        addr_env.insert(ssa_var_key(dst), slot);
+                    }
+                    if let Some(addr) = resolve_const_addr(&const_env, src) {
+                        refs.push(DataRef {
+                            from,
+                            to: addr,
+                            ref_type: "d".to_string(),
+                        });
+                    }
                 }
                 r2ssa::SSAOp::IntSExt { dst, src } => {
                     if let Some(value) = resolve_const_value(&const_env, src) {
@@ -1540,6 +2871,16 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                         let dst_bits = bit_width(dst.size);
                         let sext = sign_extend_bits(value, src_bits);
                         const_env.insert(ssa_var_key(dst), mask_to_bits(sext, dst_bits));
+                    }
+                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
+                        addr_env.insert(ssa_var_key(dst), slot);
+                    }
+                    if let Some(addr) = resolve_const_addr(&const_env, src) {
+                        refs.push(DataRef {
+                            from,
+                            to: addr,
+                            ref_type: "d".to_string(),
+                        });
                     }
                 }
                 r2ssa::SSAOp::Call { target, .. } | r2ssa::SSAOp::Branch { target } => {
@@ -1592,6 +2933,10 @@ pub extern "C" fn r2sleigh_recover_vars(
     let Some(input) = build_function_input(ctx, blocks, num_blocks, 0, ptr::null()) else {
         return ptr::null_mut();
     };
+    let Some(ssa_blocks) = build_var_recovery_ssa_blocks(input.blocks.as_slice(), input.ctx.arch)
+    else {
+        return ptr::null_mut();
+    };
 
     let semantic_typing_enabled = input.ctx.semantic_metadata_enabled;
     let reg_type_hints = if semantic_typing_enabled {
@@ -1600,12 +2945,6 @@ pub extern "C" fn r2sleigh_recover_vars(
         std::collections::HashMap::new()
     };
 
-    let ssa_blocks: Vec<r2ssa::SSABlock> = input
-        .blocks
-        .as_slice()
-        .iter()
-        .map(|blk| r2ssa::block::to_ssa(blk, input.ctx.disasm))
-        .collect();
     if ssa_blocks.is_empty() {
         return ptr::null_mut();
     }
@@ -1636,18 +2975,53 @@ pub extern "C" fn r2sleigh_get_data_refs(
         return ptr::null_mut();
     };
 
-    let mut ssa_blocks = Vec::new();
+    let mut refs = Vec::new();
+    let mut inst_ssa_blocks = Vec::new();
     let mut op_source_addrs = Vec::new();
     for blk in input.blocks.as_slice() {
-        ssa_blocks.push(r2ssa::block::to_ssa(blk, input.ctx.disasm));
-        op_source_addrs.push(op_source_addrs_from_r2il_block(blk));
+        inst_ssa_blocks.push(r2ssa::block::to_ssa(blk, input.ctx.disasm));
+        op_source_addrs.push(
+            blk.ops
+                .iter()
+                .enumerate()
+                .map(|(op_idx, _)| {
+                    blk.op_metadata(op_idx)
+                        .and_then(|meta| meta.instruction_addr)
+                        .unwrap_or(blk.addr)
+                })
+                .collect::<Vec<_>>(),
+        );
     }
+    refs.extend(get_data_refs_from_ssa_with_op_sources(
+        &inst_ssa_blocks,
+        Some(&op_source_addrs),
+    ));
 
+    let Some(func) =
+        r2ssa::SSAFunction::from_blocks_for_data_refs(input.blocks.as_slice(), input.ctx.arch)
+    else {
+        return ptr::null_mut();
+    };
+    let ssa_blocks: Vec<r2ssa::SSABlock> = func
+        .blocks()
+        .map(|block| r2ssa::SSABlock {
+            addr: block.addr,
+            size: block.size,
+            ops: block.ops.clone(),
+        })
+        .collect();
     if ssa_blocks.is_empty() {
         return ptr::null_mut();
     }
 
-    let refs = get_data_refs_from_ssa_with_op_sources(&ssa_blocks, Some(&op_source_addrs));
+    refs.extend(get_data_refs_from_ssa_with_op_sources(&ssa_blocks, None));
+    refs.sort_by(|a, b| {
+        a.from
+            .cmp(&b.from)
+            .then_with(|| a.to.cmp(&b.to))
+            .then_with(|| a.ref_type.cmp(&b.ref_type))
+    });
+    refs.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.ref_type == b.ref_type);
     match serde_json::to_string(&refs) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
@@ -1690,6 +3064,43 @@ mod tests {
             refs.iter()
                 .any(|r| { r.from == 0x401000 && r.to == 0xdeadbeef && r.ref_type == "d" }),
             "const add chain should emit DATA xref to the computed target"
+        );
+    }
+
+    #[test]
+    fn parse_interproc_seed_summaries_prefers_recognized_seed_over_payload_summary() {
+        let scope_json = serde_json::json!({
+            "payloads": [{
+                "interproc": {
+                    "summary": {
+                        "id": 0x2000u64,
+                        "name": "sym.imp.malloc",
+                        "direct_callees": [],
+                        "callsite_count": 0,
+                        "has_unknown_calls": false,
+                        "arg_effects": {},
+                        "return_relation": "Void",
+                        "reads_global_memory": false,
+                        "writes_global_memory": false,
+                        "touches_unknown_memory": false
+                    }
+                }
+            }],
+            "seeds": [{
+                "id": 0x2000u64,
+                "name": "sym.imp.malloc"
+            }]
+        })
+        .to_string();
+
+        let summaries = parse_interproc_seed_summaries(&scope_json);
+        let summary = summaries
+            .get(&r2ssa::InterprocFunctionId(0x2000))
+            .expect("seed summary should exist");
+
+        assert_eq!(
+            summary.return_relation,
+            r2ssa::SummaryReturnRelation::HeapAlloc
         );
     }
 
@@ -1776,6 +3187,72 @@ mod tests {
             refs.iter()
                 .any(|r| { r.from != 0x404000 && r.to == 0x404d6c && r.ref_type == "d" }),
             "computed add-chain xref should use a non-block-head op source address"
+        );
+    }
+
+    #[test]
+    fn get_data_refs_resolves_const_add_chain_through_stack_spills() {
+        let block = r2ssa::SSABlock {
+            addr: 0x100001138,
+            size: 0x3c,
+            ops: vec![
+                r2ssa::SSAOp::IntSub {
+                    dst: r2ssa::SSAVar::new("SP", 1, 8),
+                    a: r2ssa::SSAVar::new("SP", 0, 8),
+                    b: r2ssa::SSAVar::new("const:10", 0, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:6500", 1, 8),
+                    a: r2ssa::SSAVar::new("SP", 1, 8),
+                    b: r2ssa::SSAVar::new("const:8", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
+                    val: r2ssa::SSAVar::new("const:404d00", 0, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("X8", 4, 8),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
+                    a: r2ssa::SSAVar::new("X8", 4, 8),
+                    b: r2ssa::SSAVar::new("const:108", 0, 8),
+                },
+                r2ssa::SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("SP", 1, 8),
+                    val: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("X9", 1, 8),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("SP", 1, 8),
+                },
+                r2ssa::SSAOp::IntSub {
+                    dst: r2ssa::SSAVar::new("tmp:cmp", 1, 8),
+                    a: r2ssa::SSAVar::new("X9", 1, 8),
+                    b: r2ssa::SSAVar::new("const:404e08", 0, 8),
+                },
+            ],
+        };
+        let op_sources = vec![vec![
+            0x100001138,
+            0x10000113c,
+            0x100001140,
+            0x100001144,
+            0x100001148,
+            0x10000114c,
+            0x100001150,
+            0x100001154,
+        ]];
+
+        let refs = get_data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
+        assert!(
+            refs.iter().any(|r| r.to == 0x404e08 && r.ref_type == "d"),
+            "stack-spilled const add chain should emit DATA xref to the recovered target: {refs:?}"
         );
     }
 
@@ -2199,6 +3676,201 @@ mod tests {
     }
 
     #[test]
+    fn signature_context_overrides_extend_empty_param_list() {
+        let mut sig = InferredSignatureCcJson {
+            function_name: "main".to_string(),
+            signature: "int32_t main(void)".to_string(),
+            ret_type: "int32_t".to_string(),
+            params: Vec::new(),
+            callconv: String::new(),
+            arch: "aarch64".to_string(),
+            confidence: 80,
+            callconv_confidence: 0,
+        };
+        let merged = Some(r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![
+                r2types::FunctionParamSpec {
+                    name: "argc".to_string(),
+                    ty: Some(r2types::CTypeLike::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                },
+                r2types::FunctionParamSpec {
+                    name: "argv".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        })),
+                    ))),
+                },
+            ],
+        });
+
+        apply_signature_context_overrides(&mut sig, merged.as_ref());
+
+        assert_eq!(sig.params.len(), 2);
+        assert_eq!(sig.params[0].name, "argc");
+        assert_eq!(sig.params[0].param_type, "int32_t");
+        assert_eq!(sig.params[1].name, "argv");
+        assert_eq!(sig.params[1].param_type, "int8_t**");
+    }
+
+    #[test]
+    fn scalar_register_family_key_merges_arm64_x_and_w_aliases() {
+        assert_eq!(scalar_register_family_key("X0"), "aarch64:gpr:0");
+        assert_eq!(scalar_register_family_key("w0"), "aarch64:gpr:0");
+        assert_eq!(scalar_register_family_key("fp"), "aarch64:gpr:29");
+        assert_eq!(scalar_register_family_key("lr"), "aarch64:gpr:30");
+    }
+
+    #[test]
+    fn scalar_width_hints_narrow_arm64_x_family_from_w_family_usage() {
+        let blocks = vec![r2ssa::SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("W8", 1, 4),
+                    src: r2ssa::SSAVar::new("W0", 0, 4),
+                },
+                r2ssa::SSAOp::IntZExt {
+                    dst: r2ssa::SSAVar::new("X9", 1, 8),
+                    src: r2ssa::SSAVar::new("W8", 1, 4),
+                },
+                r2ssa::SSAOp::IntAdd {
+                    dst: r2ssa::SSAVar::new("X10", 1, 8),
+                    a: r2ssa::SSAVar::new("X0", 0, 8),
+                    b: r2ssa::SSAVar::new("const:1", 0, 8),
+                },
+            ],
+        }];
+
+        let evidence = collect_signature_type_evidence_context(&blocks);
+        assert_eq!(
+            evidence.width_bits.get("x0_0"),
+            Some(&32),
+            "{:?}",
+            evidence.width_bits
+        );
+        assert_eq!(
+            evidence.width_bits.get("x9_1"),
+            Some(&32),
+            "{:?}",
+            evidence.width_bits
+        );
+        assert_eq!(
+            evidence.width_bits.get("x10_1"),
+            Some(&32),
+            "{:?}",
+            evidence.width_bits
+        );
+    }
+
+    #[test]
+    fn recover_vars_prefers_arm64_family_width_hint_for_wide_arg_carrier() {
+        let blocks = vec![r2ssa::SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("X8", 1, 8),
+                    src: r2ssa::SSAVar::new("X0", 0, 8),
+                },
+                r2ssa::SSAOp::IntAnd {
+                    dst: r2ssa::SSAVar::new("W9", 1, 4),
+                    a: r2ssa::SSAVar::new("W0", 0, 4),
+                    b: r2ssa::SSAVar::new("const:ff", 0, 4),
+                },
+            ],
+        }];
+
+        let arch = ArchSpec::new("aarch64");
+        let vars = recover_vars_from_ssa(
+            &blocks,
+            Some(&arch),
+            &std::collections::HashMap::new(),
+            true,
+        );
+        let arg0 = vars.iter().find(|var| var.name == "arg0").expect("arg0");
+        assert_eq!(arg0.var_type, "int32_t");
+    }
+
+    #[test]
+    fn main_signature_override_is_canonical_and_caps_extra_params() {
+        let mut sig = InferredSignatureCcJson {
+            function_name: "main".to_string(),
+            signature: "int32_t main(void)".to_string(),
+            ret_type: "int32_t".to_string(),
+            params: vec![InferredParamJson {
+                name: "arg1".to_string(),
+                param_type: "void *".to_string(),
+            }],
+            callconv: String::new(),
+            arch: "aarch64".to_string(),
+            confidence: 80,
+            callconv_confidence: 0,
+        };
+        let mut merged = Some(r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![
+                r2types::FunctionParamSpec {
+                    name: "arg0".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Void,
+                    ))),
+                },
+                r2types::FunctionParamSpec {
+                    name: "arg2".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Void,
+                    ))),
+                },
+                r2types::FunctionParamSpec {
+                    name: "arg3".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Void,
+                    ))),
+                },
+                r2types::FunctionParamSpec {
+                    name: "arg_550h".to_string(),
+                    ty: Some(r2types::CTypeLike::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                },
+            ],
+        });
+
+        apply_main_signature_override("sym._main", &mut sig, &mut merged);
+
+        assert_eq!(
+            sig.params
+                .iter()
+                .map(|param| (param.name.as_str(), param.param_type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("argc", "int32_t"),
+                ("argv", "int8_t**"),
+                ("envp", "int8_t**"),
+            ]
+        );
+        let merged = merged.expect("main signature");
+        assert_eq!(merged.params.len(), 3);
+        assert_eq!(merged.params[0].name, "argc");
+        assert_eq!(merged.params[1].name, "argv");
+        assert_eq!(merged.params[2].name, "envp");
+    }
+
+    #[test]
     fn merge_register_type_hints_prefers_pointer_over_integer_aliases() {
         let mut metadata = std::collections::HashMap::new();
         merge_type_hint(
@@ -2226,10 +3898,10 @@ mod tests {
     #[test]
     fn add_stack_var_upgrades_existing_slot_to_pointer_when_confident() {
         let mut vars = Vec::new();
-        let mut seen_offsets = std::collections::HashMap::new();
+        let mut seen_slots = std::collections::HashMap::new();
         add_stack_var(
             &mut vars,
-            &mut seen_offsets,
+            &mut seen_slots,
             "rbp",
             X86_FRAME_BASES,
             -8,
@@ -2241,7 +3913,7 @@ mod tests {
 
         add_stack_var(
             &mut vars,
-            &mut seen_offsets,
+            &mut seen_slots,
             "rbp",
             X86_FRAME_BASES,
             -8,
@@ -2250,6 +3922,41 @@ mod tests {
         );
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].var_type, "void *");
+    }
+
+    #[test]
+    fn add_stack_var_keeps_bp_and_sp_slots_distinct_at_same_offset() {
+        let mut vars = Vec::new();
+        let mut seen_slots = std::collections::HashMap::new();
+
+        add_stack_var(
+            &mut vars,
+            &mut seen_slots,
+            "rsp",
+            X86_FRAME_BASES,
+            -8,
+            8,
+            Some("void *".to_string()),
+        );
+        add_stack_var(
+            &mut vars,
+            &mut seen_slots,
+            "rbp",
+            X86_FRAME_BASES,
+            -8,
+            8,
+            None,
+        );
+
+        assert_eq!(vars.len(), 2);
+        assert!(
+            vars.iter()
+                .any(|var| var.kind == "s" && var.delta == -8 && var.var_type == "void *")
+        );
+        assert!(
+            vars.iter()
+                .any(|var| var.kind == "b" && var.delta == -8 && var.var_type == "int64_t")
+        );
     }
 
     #[test]
@@ -2388,7 +4095,7 @@ mod tests {
             ],
         }];
         let evidence_ctx = collect_signature_type_evidence_context(&blocks);
-        let mut type_inference = r2dec::TypeInference::new(64);
+        let mut type_inference = r2types::TypeInference::new(64);
         type_inference.infer_function(&func);
         let (ret_ty, _) = infer_signature_return_type(&func, &type_inference, 64, &evidence_ctx);
         assert_eq!(ret_ty, r2dec::CType::Int(32));
