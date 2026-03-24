@@ -14,17 +14,139 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Self-hosted runner optimization: persist incremental build artifacts
-  # across jobs/runs to avoid repeatedly recompiling the full workspace.
-  CARGO_TARGET_DIR: /tmp/r2sleigh-target
+
+# ── GitHub-hosted quality checks ──────────────────────────────────────
+# These jobs run on GitHub-hosted runners so that external contributors
+# (fork PRs) get CI feedback without needing self-hosted infrastructure.
+#
+# Strategy:
+#   - `quality` (GitHub-hosted): fmt, clippy, unit tests — pure Rust, no radare2
+#   - `r2r` (self-hosted): snapshot tests — requires radare2 + plugin installed
+#   - `e2e` (self-hosted): Rust integration tests — requires radare2
+#   - `release` (self-hosted): release build — master only
 
 jobs:
-  # ── Quality checks (single compile pipeline) ───────────────────────
-  quality:
-    name: Format + Clippy + Unit Tests
+  # ── Format check ────────────────────────────────────────────────────
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ── Clippy + Unit Tests (per-arch matrix) ───────────────────────────
+  # Run clippy and unit tests for each architecture feature separately
+  # to catch feature-gated compilation errors early.
+  check:
+    name: Clippy + Tests (${{ matrix.features_label }})
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Individual architectures — fast, catches feature-gated issues
+          - features: "x86"
+            features_label: "x86"
+          - features: "arm"
+            features_label: "arm"
+          - features: "riscv"
+            features_label: "riscv"
+          # All features combined — matches the old `--all-features` coverage.
+          # Z3 is required for r2sym; libz3-dev is installed below.
+          - features: "all"
+            features_label: "all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache per feature set to avoid constant invalidation
+          key: ${{ matrix.features_label }}
+
+      # Z3 is needed when building with all features (r2sym depends on z3)
+      - name: Install system dependencies
+        if: matrix.features == 'all'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libz3-dev
+
+      - name: Clippy
+        run: |
+          if [ "${{ matrix.features }}" = "all" ]; then
+            # --all-features enables every optional dep across the workspace,
+            # but r2plugin needs radare2 pkg-config which is unavailable here.
+            # Exclude the plugin crate and test it on self-hosted instead.
+            cargo clippy \
+              --workspace \
+              --exclude r2sleigh-plugin \
+              --all-features \
+              -- -D warnings
+          else
+            cargo clippy \
+              --workspace \
+              --exclude r2sleigh-plugin \
+              --features "${{ matrix.features }}" \
+              -- -D warnings
+          fi
+
+      - name: Unit tests
+        run: |
+          if [ "${{ matrix.features }}" = "all" ]; then
+            cargo test \
+              --workspace \
+              --exclude r2sleigh-plugin \
+              --all-features
+          else
+            cargo test \
+              --workspace \
+              --exclude r2sleigh-plugin \
+              --features "${{ matrix.features }}"
+          fi
+
+  # ── MSRV check ──────────────────────────────────────────────────────
+  # Verify the workspace compiles on the pinned minimum Rust version.
+  # This prevents accidental use of nightly/beta-only features.
+  msrv:
+    name: MSRV (1.93.0)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libz3-dev
+
+      - name: Check compilation
+        run: |
+          cargo check \
+            --workspace \
+            --exclude r2sleigh-plugin \
+            --all-features
+
+  # ── Self-hosted: Plugin clippy ──────────────────────────────────────
+  # The plugin crate needs radare2 headers (pkg-config r_anal) which are
+  # only available on the self-hosted runner.
+  plugin-check:
+    name: Plugin Clippy + Tests
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Setup Rust PATH
         run: |
           for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
@@ -38,24 +160,25 @@ jobs:
             exit 1
           fi
       - name: Prepare shared target dir
-        run: mkdir -p "$CARGO_TARGET_DIR"
-      - name: Print versions
-        run: |
-          echo "rustc:      $(rustc --version)"
-          echo "cargo:      $(cargo --version)"
-      - name: Rustfmt
-        run: cargo fmt --all -- --check
-      - name: Clippy (all features)
-        run: cargo clippy --workspace --all-features -- -D warnings
-      - name: Unit tests
-        run: cargo test --workspace --all-features
+        run: mkdir -p "${CARGO_TARGET_DIR:-/tmp/r2sleigh-target}"
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
+      - name: Clippy (plugin, all-archs)
+        run: cargo clippy -p r2sleigh-plugin --features all-archs -- -D warnings
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
+      - name: Unit tests (plugin)
+        run: cargo test -p r2sleigh-plugin --features all-archs
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
 
-  # ── Fast snapshot tests (r2r) ───────────────────────────────────────
+  # ── Self-hosted: Fast snapshot tests (r2r) ──────────────────────────
   r2r:
     name: Snapshot Tests (r2r)
     runs-on: self-hosted
+    needs: [plugin-check]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Setup Rust PATH
         run: |
           for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
@@ -69,7 +192,9 @@ jobs:
             exit 1
           fi
       - name: Prepare shared target dir
-        run: mkdir -p "$CARGO_TARGET_DIR"
+        run: mkdir -p "${CARGO_TARGET_DIR}"
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
       - name: Ensure radare2 + headers
         run: |
           check_radare2() {
@@ -128,35 +253,45 @@ jobs:
 
       - name: Prepare r2r temp dir
         run: |
-          # Use the runner temp area, but compute the path inside the job since
-          # the `runner` context is not available in job-level `env`.
           R2R_TMPDIR="$RUNNER_TEMP/r2sleigh-r2r-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
           echo "R2R_TMPDIR=$R2R_TMPDIR" >> "$GITHUB_ENV"
           rm -rf "$R2R_TMPDIR"
           mkdir -p "$R2R_TMPDIR"
       - name: Run r2r snapshot tests
         env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
           R2R_JOBS: "2"
           R2R_OFFLINE: "1"
         run: make -C tests/r2r run
 
-  # ── Rust E2E / integration tests ────────────────────────────────────
+  # ── Self-hosted: Rust E2E / integration tests ──────────────────────
   e2e:
     name: Rust E2E Tests
     runs-on: self-hosted
+    needs: [plugin-check]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+      - name: Setup Rust PATH
+        run: |
+          for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
+            if [ -d "$p" ]; then
+              echo "$p" >> "$GITHUB_PATH"
+              export PATH="$p:$PATH"
+            fi
+          done
       - name: Run Rust E2E tests
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
         run: cargo e2e-test
 
-  # ── Release build check ────────────────────────────────────────────
+  # ── Self-hosted: Release build check ────────────────────────────────
   release:
     name: Release Build
     runs-on: self-hosted
-    needs: [quality, r2r, e2e]
+    needs: [check, r2r, e2e]
     if: github.ref == 'refs/heads/master'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Setup Rust PATH
         run: |
           for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
@@ -170,9 +305,15 @@ jobs:
             exit 1
           fi
       - name: Prepare shared target dir
-        run: mkdir -p "$CARGO_TARGET_DIR"
+        run: mkdir -p "${CARGO_TARGET_DIR}"
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
 
       - name: Build release (all architectures)
         run: cargo build --release --features all-archs
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
       - name: Build plugin release
         run: make -C r2plugin RUST_FEATURES=all-archs
+        env:
+          CARGO_TARGET_DIR: /tmp/r2sleigh-target
