@@ -327,13 +327,6 @@ af
 ?v $$ > /dev/null
 a:sla.cfg.json > /tmp/r2sleigh_large_block_cfg.json
 a:sla.ssa.func > /tmp/r2sleigh_large_block_ssa.json
-jq -n -c \
-  --slurpfile cfg /tmp/r2sleigh_large_block_cfg.json \
-  --slurpfile ssa /tmp/r2sleigh_large_block_ssa.json \
-  '($cfg[0].blocks[0].size > 256)
-   and (($cfg[0].blocks[0].successors | length) > 0)
-   and ($cfg[0].num_blocks > 1)
-   and ($ssa[0].num_blocks > 1)
-   and (($ssa[0].blocks | length) > 1)'
+jq -n -c --slurpfile cfg /tmp/r2sleigh_large_block_cfg.json --slurpfile ssa /tmp/r2sleigh_large_block_ssa.json "(\$cfg[0].blocks[0].size > 256) and ((\$cfg[0].blocks[0].successors | length) > 0) and (\$cfg[0].num_blocks > 1) and (\$ssa[0].num_blocks > 1) and ((\$ssa[0].blocks | length) > 1)"
 EOF_CMDS
 RUN
