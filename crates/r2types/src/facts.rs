@@ -108,17 +108,24 @@ pub enum CalleeMemoryEffectKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CalleeMemoryLocation {
-    Arg {
-        index: usize,
-        offset: Option<i64>,
-        width: Option<u32>,
-    },
-    Global {
-        address: u64,
-        width: Option<u32>,
-    },
+pub enum CalleeMemoryRegion {
+    Arg { index: usize },
+    Global { address: u64 },
+    HeapReturn,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeMemoryRange {
+    pub offset_lo: i64,
+    pub offset_hi: i64,
+    pub width: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeMemoryLocation {
+    pub region: CalleeMemoryRegion,
+    pub range: Option<CalleeMemoryRange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +153,8 @@ pub struct CalleeFact {
     pub has_unknown_calls: bool,
     pub arg_effects: BTreeMap<usize, CalleeArgEffect>,
     pub memory_effects: Vec<CalleeMemoryEffect>,
+    pub param_type_hints: BTreeMap<usize, CTypeLike>,
+    pub return_type_hint: Option<CTypeLike>,
     pub return_relation: CalleeReturnRelation,
     pub reads_global_memory: bool,
     pub writes_global_memory: bool,
@@ -158,6 +167,8 @@ pub struct InterprocFactDiagnostics {
     pub max_iterations: usize,
     pub converged: bool,
     pub scope_size: usize,
+    pub scc_count: usize,
+    pub max_scc_size: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

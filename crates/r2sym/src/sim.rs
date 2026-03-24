@@ -7,7 +7,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use r2il::ArchSpec;
-use r2ssa::SsaArtifact;
+use r2ssa::{
+    FunctionSemanticSummary, InterprocFunctionId, InterprocSummarySet, SsaArtifact,
+    SummaryMemoryEffectKind, SummaryMemoryRegion, SummaryReturnRelation,
+};
 use z3::ast::BV;
 
 use crate::executor::{CallHookResult, SymExecutor};
@@ -25,6 +28,8 @@ pub const DEFAULT_MAX_MEMSET: u64 = 0x1000;
 pub const DEFAULT_MAX_MEMCMP: u64 = 0x1000;
 /// Default upper bound for basic printf/puts modeled return values.
 pub const DEFAULT_MAX_PRINTF_SCAN: u64 = 0x400;
+/// Default upper bound for generic interproc memory havoc windows.
+pub const DEFAULT_MAX_INTERPROC_HAVOC: u64 = 0x40;
 
 /// Summary execution outcome.
 pub enum SummaryEffect<'ctx> {
@@ -267,6 +272,61 @@ impl<'ctx> SummaryRegistry<'ctx> {
         }
         stats
     }
+
+    /// Install generic direct-call hooks from typed interproc summaries.
+    ///
+    /// Manual core summaries keep precedence. Generic hooks are only installed
+    /// for direct targets that have an interproc summary but no core-summary
+    /// normalization match.
+    pub fn install_interproc_summaries_for_function(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        prepared: &SsaArtifact,
+        summary_set: &InterprocSummarySet,
+        symbol_map: &HashMap<u64, String>,
+    ) -> SummaryInstallStats {
+        let mut stats = SummaryInstallStats::default();
+        let mut targets = BTreeSet::new();
+        for call in prepared.call_sites().by_id.values() {
+            if let Some(target) = call.direct_target {
+                targets.insert(target);
+            }
+        }
+        if targets.is_empty() {
+            return stats;
+        }
+
+        let mut seen = BTreeSet::new();
+        for target in targets {
+            stats.attempted += 1;
+            if let Some(raw_name) = symbol_map.get(&target).map(String::as_str)
+                && let Some(summary_name) = normalize_core_summary_name(raw_name)
+                && self.summaries.contains_key(summary_name)
+            {
+                stats.skipped_unknown += 1;
+                continue;
+            }
+            let Some(summary) = summary_set
+                .summaries
+                .get(&InterprocFunctionId(target))
+                .cloned()
+            else {
+                stats.skipped_unknown += 1;
+                continue;
+            };
+            if !seen.insert(target) {
+                stats.duplicates += 1;
+                continue;
+            }
+            let callconv = self.callconv.clone();
+            explorer.register_call_hook(target, move |state| {
+                apply_interproc_summary(state, &summary, &callconv)
+            });
+            stats.installed += 1;
+        }
+
+        stats
+    }
 }
 
 fn apply_summary<'ctx>(
@@ -285,6 +345,118 @@ fn apply_summary<'ctx>(
         SummaryEffect::Terminate(status) => {
             state.terminate(status.clone());
             CallHookResult::Terminate(status)
+        }
+    }
+}
+
+fn apply_interproc_summary<'ctx>(
+    state: &mut SymState<'ctx>,
+    summary: &FunctionSemanticSummary,
+    callconv: &CallConv,
+) -> CallHookResult {
+    let call = callconv.collect_call_info(state, summary_arity(summary));
+    for effect in &summary.memory_effects {
+        apply_interproc_memory_effect(state, &call, effect);
+    }
+    if let Some(value) = interproc_return_value(state, &call, summary) {
+        callconv.write_return(state, value);
+    }
+    CallHookResult::Fallthrough
+}
+
+fn summary_arity(summary: &FunctionSemanticSummary) -> usize {
+    let mut arity = summary.arg_count_hint.unwrap_or(0);
+    if let SummaryReturnRelation::Arg(idx) = summary.return_relation {
+        arity = arity.max(idx.saturating_add(1));
+    }
+    if let Some(max_idx) = summary.arg_effects.keys().copied().max() {
+        arity = arity.max(max_idx.saturating_add(1));
+    }
+    for effect in &summary.memory_effects {
+        if let SummaryMemoryRegion::Arg { index } = effect.location.region {
+            arity = arity.max(index.saturating_add(1));
+        }
+    }
+    arity
+}
+
+fn interproc_return_value<'ctx>(
+    state: &mut SymState<'ctx>,
+    call: &CallInfo<'ctx>,
+    summary: &FunctionSemanticSummary,
+) -> Option<SymValue<'ctx>> {
+    match summary.return_relation {
+        SummaryReturnRelation::Void => None,
+        SummaryReturnRelation::Arg(idx) => call.args.get(idx).cloned(),
+        SummaryReturnRelation::Const(value) => Some(SymValue::concrete(value, call.ret_bits)),
+        SummaryReturnRelation::Global(address) => Some(SymValue::concrete(address, call.ret_bits)),
+        SummaryReturnRelation::HeapAlloc => {
+            let ret_ast = BV::fresh_const("interproc_heap_ptr", call.ret_bits);
+            let ret = SymValue::symbolic(ret_ast, call.ret_bits);
+            state.constrain_ne(&ret, 0);
+            Some(ret)
+        }
+        SummaryReturnRelation::Unknown => Some(SymValue::unknown(call.ret_bits)),
+    }
+}
+
+fn apply_interproc_memory_effect<'ctx>(
+    state: &mut SymState<'ctx>,
+    call: &CallInfo<'ctx>,
+    effect: &r2ssa::SummaryMemoryEffect,
+) {
+    match effect.location.region {
+        SummaryMemoryRegion::Arg { index } => {
+            let Some(base) = call.args.get(index).cloned() else {
+                return;
+            };
+            apply_memory_effect_at_base(state, &base, call.arg_bits, effect);
+        }
+        SummaryMemoryRegion::Global { address } => {
+            let base = SymValue::concrete(address, call.arg_bits);
+            apply_memory_effect_at_base(state, &base, call.arg_bits, effect);
+        }
+        SummaryMemoryRegion::HeapReturn | SummaryMemoryRegion::Unknown => {}
+    }
+}
+
+fn apply_memory_effect_at_base<'ctx>(
+    state: &mut SymState<'ctx>,
+    base: &SymValue<'ctx>,
+    ptr_bits: u32,
+    effect: &r2ssa::SummaryMemoryEffect,
+) {
+    let width = effect
+        .location
+        .range
+        .and_then(|range| range.width)
+        .unwrap_or(DEFAULT_MAX_INTERPROC_HAVOC as u32)
+        .min(DEFAULT_MAX_INTERPROC_HAVOC as u32)
+        .max(1);
+    let start_offset = effect
+        .location
+        .range
+        .map(|range| range.offset_lo)
+        .unwrap_or(0);
+    let start = base.add(
+        state.context(),
+        &SymValue::concrete(start_offset as u64, ptr_bits),
+    );
+
+    match effect.kind {
+        SummaryMemoryEffectKind::Read => {
+            let _ = state.mem_read(&start, width);
+        }
+        SummaryMemoryEffectKind::Write
+        | SummaryMemoryEffectKind::Escape
+        | SummaryMemoryEffectKind::Free => {
+            let taint = base.get_taint();
+            for i in 0..width {
+                let addr = start.add(state.context(), &SymValue::concrete(i as u64, ptr_bits));
+                let byte =
+                    SymValue::symbolic_tainted(BV::fresh_const("interproc_mem", 8), 8, taint);
+                state.mem_write(&addr, &byte, 1);
+            }
         }
     }
 }
