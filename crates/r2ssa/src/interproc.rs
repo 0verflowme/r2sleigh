@@ -867,26 +867,60 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                         .value_id_for_var(addr)
                         .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
                         .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
+                    let location =
+                        classify_memory_access_location(prepared, abi, addr, expected.size);
                     if let SummaryOperand::Arg(idx) = operand {
-                        out.arg_effects.entry(idx).or_default().mark_read();
+                        let effect = out.arg_effects.entry(idx).or_default();
+                        effect.mark_read();
+                        effect.mark_write();
                         out.memory_effects.insert(SummaryMemoryEffect {
                             kind: SummaryMemoryEffectKind::Read,
+                            location: arg_location(idx, None, None),
+                        });
+                        out.memory_effects.insert(SummaryMemoryEffect {
+                            kind: SummaryMemoryEffectKind::Write,
                             location: arg_location(idx, None, None),
                         });
                     }
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Read,
-                        location: classify_memory_access_location(
-                            prepared,
-                            abi,
-                            addr,
-                            expected.size,
-                        ),
+                        location,
+                    });
+                    out.memory_effects.insert(SummaryMemoryEffect {
+                        kind: SummaryMemoryEffectKind::Write,
+                        location,
                     });
                 }
-                SSAOp::Store { addr, val, .. }
-                | SSAOp::StoreConditional { addr, val, .. }
-                | SSAOp::StoreGuarded { addr, val, .. } => {
+                SSAOp::StoreConditional { addr, val, .. } => {
+                    let operand = prepared
+                        .graph()
+                        .value_id_for_var(addr)
+                        .map(|value_id| classify_value_operand(prepared, abi, value_id, 0))
+                        .unwrap_or_else(|| classify_var_operand(prepared, abi, addr, 0));
+                    let location = classify_memory_access_location(prepared, abi, addr, val.size);
+                    if let SummaryOperand::Arg(idx) = operand {
+                        let effect = out.arg_effects.entry(idx).or_default();
+                        effect.mark_read();
+                        effect.mark_write();
+                        out.memory_effects.insert(SummaryMemoryEffect {
+                            kind: SummaryMemoryEffectKind::Read,
+                            location: arg_location(idx, None, None),
+                        });
+                        out.memory_effects.insert(SummaryMemoryEffect {
+                            kind: SummaryMemoryEffectKind::Write,
+                            location: arg_location(idx, None, None),
+                        });
+                    }
+                    out.memory_effects.insert(SummaryMemoryEffect {
+                        kind: SummaryMemoryEffectKind::Read,
+                        location,
+                    });
+                    out.memory_effects.insert(SummaryMemoryEffect {
+                        kind: SummaryMemoryEffectKind::Write,
+                        location,
+                    });
+                }
+                SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
                     let operand = prepared
                         .graph()
                         .value_id_for_var(addr)
@@ -1586,7 +1620,7 @@ fn normalize_seed_name(name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::SsaArtifact;
-    use r2il::{R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{MemoryOrdering, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn x86_64_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
@@ -1785,5 +1819,128 @@ mod tests {
                 .and_then(|summary| summary.arg_effects.get(&0))
                 .is_some_and(|effect| effect.read)
         );
+    }
+
+    #[test]
+    fn store_conditional_marks_argument_read_and_write() {
+        let arch = x86_64_arch();
+        let blk = block(
+            0x4100,
+            vec![
+                R2ILOp::StoreConditional {
+                    result: Some(tmp(1, 1)),
+                    space: SpaceId::Ram,
+                    addr: reg(8, 8),
+                    val: c(0x41, 1),
+                    ordering: MemoryOrdering::SeqCst,
+                },
+                R2ILOp::Return { target: reg(16, 8) },
+            ],
+        );
+        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let set = solve_interproc_summary_set(
+            &[InterprocFunctionInput {
+                id: InterprocFunctionId(0x4100),
+                name: Some("store_conditional".to_string()),
+                prepared: &prepared,
+            }],
+            Some(&arch),
+            Some(InterprocFunctionId(0x4100)),
+            &BTreeMap::new(),
+            InterprocSolveConfig::default(),
+        );
+        let summary = set
+            .summaries
+            .get(&InterprocFunctionId(0x4100))
+            .expect("summary");
+        let arg0 = summary.arg_effects.get(&0).expect("arg effect");
+        assert!(arg0.read);
+        assert!(arg0.write);
+        assert!(summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::Arg { index: 0 },
+                        ..
+                    }
+                }
+            )
+        }));
+        assert!(summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Write,
+                    location: SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::Arg { index: 0 },
+                        ..
+                    }
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn atomic_cas_marks_argument_read_and_write() {
+        let arch = x86_64_arch();
+        let blk = block(
+            0x4200,
+            vec![
+                R2ILOp::AtomicCAS {
+                    dst: reg(0, 8),
+                    space: SpaceId::Ram,
+                    addr: reg(8, 8),
+                    expected: c(1, 8),
+                    replacement: c(2, 8),
+                    ordering: MemoryOrdering::SeqCst,
+                },
+                R2ILOp::Return { target: reg(16, 8) },
+            ],
+        );
+        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let set = solve_interproc_summary_set(
+            &[InterprocFunctionInput {
+                id: InterprocFunctionId(0x4200),
+                name: Some("atomic_cas".to_string()),
+                prepared: &prepared,
+            }],
+            Some(&arch),
+            Some(InterprocFunctionId(0x4200)),
+            &BTreeMap::new(),
+            InterprocSolveConfig::default(),
+        );
+        let summary = set
+            .summaries
+            .get(&InterprocFunctionId(0x4200))
+            .expect("summary");
+        let arg0 = summary.arg_effects.get(&0).expect("arg effect");
+        assert!(arg0.read);
+        assert!(arg0.write);
+        assert!(summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::Arg { index: 0 },
+                        ..
+                    }
+                }
+            )
+        }));
+        assert!(summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Write,
+                    location: SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::Arg { index: 0 },
+                        ..
+                    }
+                }
+            )
+        }));
     }
 }
