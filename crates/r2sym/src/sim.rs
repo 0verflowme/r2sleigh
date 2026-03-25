@@ -92,7 +92,9 @@ impl CallConv {
     /// Architecture-derived calling convention used by the symbolic runtime.
     pub fn for_arch_spec(arch: &ArchSpec) -> Option<Self> {
         let arch_name = arch.name.to_ascii_lowercase();
-        if arch.addr_size == 8 && arch_name.contains("x86") {
+        let looks_x86 = arch_name.contains("x86") || arch_name == "x64" || arch_name == "amd64";
+        let looks_64 = arch.addr_size == 8 || arch.addr_size == 64 || arch_name.contains("64");
+        if looks_x86 && looks_64 {
             return Some(Self::x86_64_sysv());
         }
 
@@ -129,17 +131,25 @@ impl CallConv {
     }
 
     fn read_register<'ctx>(&self, state: &SymState<'ctx>, base: &str) -> SymValue<'ctx> {
-        if let Some(key) = find_register_key(state, base) {
-            state.get_register_sized(&key, self.arg_bits)
-        } else {
-            SymValue::unknown(self.arg_bits)
+        for alias in register_aliases(base) {
+            if let Some(key) = find_register_key(state, alias) {
+                return state.get_register_sized(&key, self.arg_bits);
+            }
         }
+        SymValue::unknown(self.arg_bits)
     }
 
     fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
-        let key = find_register_key(state, self.ret_register)
+        let key = register_aliases(self.ret_register)
+            .into_iter()
+            .find_map(|alias| find_register_key(state, alias))
             .unwrap_or_else(|| format!("{}_0", self.ret_register));
-        let adjusted = adjust_bits(state.context(), value, self.ret_bits);
+        let key_bits = state
+            .registers()
+            .get(&key)
+            .map(|existing| existing.bits())
+            .unwrap_or(self.ret_bits);
+        let adjusted = adjust_bits(state.context(), value, key_bits);
         state.set_register(&key, adjusted);
     }
 }
@@ -179,6 +189,11 @@ impl<'ctx> SummaryRegistry<'ctx> {
         registry.register_summary(FreeSummary::new());
         registry.register_summary(PutsSummary::new(DEFAULT_MAX_PRINTF_SCAN));
         registry.register_summary(PrintfSummaryBasic::new(DEFAULT_MAX_PRINTF_SCAN));
+        registry.register_summary(ReadSummary::new());
+        registry.register_summary(IsattySummary::new());
+        registry.register_summary(SleepSummary::sleep());
+        registry.register_summary(SleepSummary::usleep());
+        registry.register_summary(SleepSummary::nanosleep());
         registry.register_summary(ExitSummary::new());
         registry
     }
@@ -467,6 +482,21 @@ fn arch_has_register(arch: &ArchSpec, name: &str) -> bool {
         .any(|reg| reg.name.eq_ignore_ascii_case(name))
 }
 
+fn register_aliases(base: &str) -> Vec<&str> {
+    match base {
+        "RAX" => vec!["RAX", "EAX"],
+        "RDI" => vec!["RDI", "EDI"],
+        "RSI" => vec!["RSI", "ESI"],
+        "RDX" => vec!["RDX", "EDX"],
+        "RCX" => vec!["RCX", "ECX"],
+        "R8" => vec!["R8", "R8D"],
+        "R9" => vec!["R9", "R9D"],
+        "RSP" => vec!["RSP", "ESP"],
+        "RBP" => vec!["RBP", "EBP"],
+        _ => vec![base],
+    }
+}
+
 fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
     let normalized_owned = name.trim().to_ascii_lowercase();
     let mut normalized = normalized_owned.as_str();
@@ -504,6 +534,11 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
         "free" => Some("free"),
         "puts" => Some("puts"),
         "printf" | "__printf_chk" => Some("printf"),
+        "read" | "__read_chk" => Some("read"),
+        "isatty" => Some("isatty"),
+        "sleep" => Some("sleep"),
+        "usleep" => Some("usleep"),
+        "nanosleep" => Some("nanosleep"),
         "exit" | "_exit" => Some("exit"),
         _ => {
             if normalized.starts_with("strlen") {
@@ -518,6 +553,16 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
                 Some("memset")
             } else if normalized.starts_with("printf") || normalized == "__printf_chk" {
                 Some("printf")
+            } else if normalized.starts_with("read") {
+                Some("read")
+            } else if normalized.starts_with("isatty") {
+                Some("isatty")
+            } else if normalized == "sleep" || normalized.ends_with("sleep") {
+                Some("sleep")
+            } else if normalized.starts_with("usleep") {
+                Some("usleep")
+            } else if normalized.starts_with("nanosleep") {
+                Some("nanosleep")
             } else if normalized.starts_with("puts") {
                 Some("puts")
             } else if normalized == "malloc" || normalized.ends_with("malloc") {
@@ -896,6 +941,141 @@ impl<'ctx> FunctionSummary<'ctx> for PrintfSummaryBasic {
     }
 }
 
+/// read(fd, buf, count) summary.
+#[derive(Default)]
+pub struct ReadSummary;
+
+impl ReadSummary {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for ReadSummary {
+    fn name(&self) -> &'static str {
+        "read"
+    }
+
+    fn arity(&self) -> usize {
+        3
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let fd = call
+            .args
+            .first()
+            .and_then(SymValue::as_concrete)
+            .map(|value| value as i32);
+        let buf = call
+            .args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
+        let count = call
+            .args
+            .get(2)
+            .and_then(SymValue::as_concrete)
+            .unwrap_or(0) as usize;
+
+        let Some(fd) = fd else {
+            let ret = SymValue::unknown(call.ret_bits);
+            return SummaryEffect::Return(Some(ret));
+        };
+
+        let Some(bytes) = state.read_symbolic_fd_bytes(fd, count) else {
+            return SummaryEffect::Return(Some(SymValue::concrete(0, call.ret_bits)));
+        };
+
+        if let Some(base) = buf.as_concrete() {
+            for (idx, byte) in bytes.iter().enumerate() {
+                let addr = SymValue::concrete(base.saturating_add(idx as u64), call.arg_bits);
+                state.mem_write(&addr, byte, 1);
+            }
+        }
+
+        SummaryEffect::Return(Some(SymValue::concrete(bytes.len() as u64, call.ret_bits)))
+    }
+}
+
+/// isatty(fd) summary.
+#[derive(Default)]
+pub struct IsattySummary;
+
+impl IsattySummary {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for IsattySummary {
+    fn name(&self) -> &'static str {
+        "isatty"
+    }
+
+    fn arity(&self) -> usize {
+        1
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let fd = call
+            .args
+            .first()
+            .and_then(SymValue::as_concrete)
+            .map(|value| value as i32)
+            .unwrap_or(-1);
+        let ret = if state.is_tty_fd(fd) { 1 } else { 0 };
+        SummaryEffect::Return(Some(SymValue::concrete(ret, call.ret_bits)))
+    }
+}
+
+/// sleep/usleep/nanosleep summary.
+pub struct SleepSummary {
+    name: &'static str,
+    arity: usize,
+}
+
+impl SleepSummary {
+    pub fn sleep() -> Self {
+        Self {
+            name: "sleep",
+            arity: 1,
+        }
+    }
+
+    pub fn usleep() -> Self {
+        Self {
+            name: "usleep",
+            arity: 1,
+        }
+    }
+
+    pub fn nanosleep() -> Self {
+        Self {
+            name: "nanosleep",
+            arity: 2,
+        }
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for SleepSummary {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        self.arity
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let ret = if state.skip_sleep_calls() {
+            SymValue::concrete(0, call.ret_bits)
+        } else {
+            SymValue::unknown(call.ret_bits)
+        };
+        SummaryEffect::Return(Some(ret))
+    }
+}
+
 /// malloc(size) summary.
 #[derive(Default)]
 pub struct MallocSummary;
@@ -1072,4 +1252,17 @@ fn constrain_ret_tristate<'ctx>(state: &mut SymState<'ctx>, ret: &SymValue<'ctx>
     let one = BV::from_u64(1, ret_bits);
     let cond = ret_bv.eq(&neg_one) | ret_bv.eq(&zero) | ret_bv.eq(&one);
     state.add_constraint(cond);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callconv_accepts_x86_64_arch_specs_with_bit_sized_addr_width() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 64;
+        assert!(CallConv::for_arch_spec(&arch).is_some());
+        assert!(SummaryRegistry::with_core_for_arch(&arch).is_some());
+    }
 }

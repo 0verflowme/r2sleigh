@@ -40,6 +40,7 @@ pub mod r2api;
 pub mod runtime;
 pub mod sim;
 pub mod solver;
+pub mod spec;
 pub mod state;
 pub mod value;
 
@@ -52,7 +53,11 @@ pub use sim::{
     CallConv, CallInfo, FunctionSummary, SummaryEffect, SummaryInstallStats, SummaryRegistry,
 };
 pub use solver::{SatResult, SymModel, SymSolver};
-pub use state::{SymState, SymbolicMemoryRegion};
+pub use spec::{
+    AddressValue, BudgetSpec, ExplorationSpec, InputSpec, MergeSpec, PredicateSpec, RuntimeSpec,
+    StartSpec, StrategySpec,
+};
+pub use state::{RuntimeState, SymState, SymbolicFdInput, SymbolicMemoryRegion};
 pub use value::SymValue;
 
 /// Error types for symbolic execution.

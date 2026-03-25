@@ -24,6 +24,28 @@ pub struct SymbolicMemoryRegion<'ctx> {
     pub value: SymValue<'ctx>,
 }
 
+/// A tracked symbolic input stream for a file descriptor.
+#[derive(Debug, Clone)]
+pub struct SymbolicFdInput<'ctx> {
+    /// Stable user-facing name of the stream.
+    pub name: String,
+    /// File descriptor identifier.
+    pub fd: i32,
+    /// Symbolic bytes available to the runtime model.
+    pub bytes: Vec<SymValue<'ctx>>,
+    /// Current read cursor.
+    pub cursor: usize,
+}
+
+/// Runtime policy carried with each symbolic state.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeState {
+    /// File descriptors that should report tty=true via isatty().
+    pub tty_fds: HashSet<i32>,
+    /// Whether sleep-family calls should become zero-cost no-ops.
+    pub skip_sleep_calls: bool,
+}
+
 /// The state of a symbolic execution.
 ///
 /// Contains registers, memory, path constraints, and program counter.
@@ -50,6 +72,10 @@ pub struct SymState<'ctx> {
     symbolic_inputs: HashMap<String, SymValue<'ctx>>,
     /// Tracked symbolic memory regions.
     symbolic_memory: Vec<SymbolicMemoryRegion<'ctx>>,
+    /// Symbolic external input streams keyed by file descriptor.
+    symbolic_fd_inputs: HashMap<i32, SymbolicFdInput<'ctx>>,
+    /// Runtime policy/state for summaries.
+    runtime: RuntimeState,
 }
 
 /// Exit status of a symbolic execution path.
@@ -84,6 +110,8 @@ impl<'ctx> SymState<'ctx> {
             depth: 0,
             symbolic_inputs: HashMap::new(),
             symbolic_memory: Vec::new(),
+            symbolic_fd_inputs: HashMap::new(),
+            runtime: RuntimeState::default(),
         }
     }
 
@@ -101,6 +129,8 @@ impl<'ctx> SymState<'ctx> {
             depth: 0,
             symbolic_inputs: HashMap::new(),
             symbolic_memory: Vec::new(),
+            symbolic_fd_inputs: HashMap::new(),
+            runtime: RuntimeState::default(),
         }
     }
 
@@ -174,6 +204,16 @@ impl<'ctx> SymState<'ctx> {
     /// Get tracked symbolic memory regions.
     pub fn symbolic_memory(&self) -> &[SymbolicMemoryRegion<'ctx>] {
         &self.symbolic_memory
+    }
+
+    /// Get tracked symbolic file-descriptor inputs.
+    pub fn symbolic_fd_inputs(&self) -> &HashMap<i32, SymbolicFdInput<'ctx>> {
+        &self.symbolic_fd_inputs
+    }
+
+    /// Get runtime policy/state.
+    pub fn runtime(&self) -> &RuntimeState {
+        &self.runtime
     }
 
     /// Read from memory.
@@ -286,6 +326,28 @@ impl<'ctx> SymState<'ctx> {
                 merged.symbolic_memory.push(region.clone());
             }
         }
+
+        merged.symbolic_fd_inputs = self.symbolic_fd_inputs.clone();
+        for (fd, other_input) in &other.symbolic_fd_inputs {
+            match merged.symbolic_fd_inputs.get_mut(fd) {
+                Some(existing) => {
+                    if existing.bytes.len() < other_input.bytes.len() {
+                        existing.bytes = other_input.bytes.clone();
+                    }
+                    existing.cursor = existing.cursor.max(other_input.cursor);
+                }
+                None => {
+                    merged.symbolic_fd_inputs.insert(*fd, other_input.clone());
+                }
+            }
+        }
+
+        merged.runtime = self.runtime.clone();
+        merged.runtime.skip_sleep_calls |= other.runtime.skip_sleep_calls;
+        merged
+            .runtime
+            .tty_fds
+            .extend(other.runtime.tty_fds.iter().copied());
 
         merged
     }
@@ -473,6 +535,8 @@ impl<'ctx> SymState<'ctx> {
             depth: self.depth,
             symbolic_inputs: self.symbolic_inputs.clone(),
             symbolic_memory: self.symbolic_memory.clone(),
+            symbolic_fd_inputs: self.symbolic_fd_inputs.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 
@@ -531,6 +595,88 @@ impl<'ctx> SymState<'ctx> {
         });
         value
     }
+
+    /// Configure tty behavior for a concrete file descriptor.
+    pub fn set_tty_fd(&mut self, fd: i32, is_tty: bool) {
+        if is_tty {
+            self.runtime.tty_fds.insert(fd);
+        } else {
+            self.runtime.tty_fds.remove(&fd);
+        }
+    }
+
+    /// Check whether a file descriptor should behave like a tty.
+    pub fn is_tty_fd(&self, fd: i32) -> bool {
+        self.runtime.tty_fds.contains(&fd)
+    }
+
+    /// Configure whether sleep-family calls should be skipped.
+    pub fn set_skip_sleep_calls(&mut self, enabled: bool) {
+        self.runtime.skip_sleep_calls = enabled;
+    }
+
+    /// Check whether sleep-family calls should be skipped.
+    pub fn skip_sleep_calls(&self) -> bool {
+        self.runtime.skip_sleep_calls
+    }
+
+    /// Register a symbolic byte stream for a file descriptor.
+    pub fn add_symbolic_fd_input(
+        &mut self,
+        fd: i32,
+        len: usize,
+        name: &str,
+        alphabet: Option<&str>,
+    ) {
+        let mut bytes = Vec::with_capacity(len);
+        for idx in 0..len {
+            let byte_name = format!("{}_{}", name, idx);
+            let byte = SymValue::new_symbolic(self.ctx, &byte_name, 8);
+            if let Some(alphabet) = alphabet {
+                constrain_symbolic_byte_to_alphabet(self, &byte, alphabet);
+            }
+            self.symbolic_inputs.insert(byte_name, byte.clone());
+            bytes.push(byte);
+        }
+        self.symbolic_fd_inputs.insert(
+            fd,
+            SymbolicFdInput {
+                name: name.to_string(),
+                fd,
+                bytes,
+                cursor: 0,
+            },
+        );
+    }
+
+    /// Read up to `count` bytes from a tracked symbolic file descriptor.
+    pub fn read_symbolic_fd_bytes(&mut self, fd: i32, count: usize) -> Option<Vec<SymValue<'ctx>>> {
+        let input = self.symbolic_fd_inputs.get_mut(&fd)?;
+        if input.cursor >= input.bytes.len() {
+            return Some(Vec::new());
+        }
+        let end = input.cursor.saturating_add(count).min(input.bytes.len());
+        let bytes = input.bytes[input.cursor..end].to_vec();
+        input.cursor = end;
+        Some(bytes)
+    }
+}
+
+fn constrain_symbolic_byte_to_alphabet<'ctx>(
+    state: &mut SymState<'ctx>,
+    value: &SymValue<'ctx>,
+    alphabet: &str,
+) {
+    let allowed = alphabet.as_bytes();
+    if allowed.is_empty() {
+        return;
+    }
+    let byte_bv = value.to_bv(state.context());
+    let ors: Vec<Bool> = allowed
+        .iter()
+        .map(|byte| byte_bv.eq(BV::from_u64(*byte as u64, 8)))
+        .collect();
+    state.add_constraint(or_all(state.context(), &ors));
 }
 
 fn parse_byte_ranges(pattern: &str) -> Vec<(u8, u8)> {

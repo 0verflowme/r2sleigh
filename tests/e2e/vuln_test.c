@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <locale.h>
+#include <unistd.h>
 
 volatile int global_counter = 0;
 volatile int global_limit = 10;
@@ -476,6 +477,23 @@ int test_bool_carrier_chain(int x, int y) {
     return x;
 }
 
+// Test 44: Stdin-driven gate for typed symbolic fd input specs.
+__attribute__((noinline)) int stdin_gate(void) {
+    char buf[2] = {0};
+    ssize_t n = read(0, buf, 1);
+    if (n != 1) {
+        return 0;
+    }
+    if (isatty(0)) {
+        global_tail++;
+    }
+    usleep(1000);
+    if (buf[0] == 'k') {
+        return 0x1337;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: %s <test_num> [args...]\n", argv[0]);
@@ -821,6 +839,9 @@ int main(int argc, char *argv[]) {
                     test_bool_carrier_chain(x, y)
                 );
             }
+            break;
+        case 44:
+            printf("stdin_gate() = %d\n", stdin_gate());
             break;
         default:
             printf("Unknown test: %d\n", test);

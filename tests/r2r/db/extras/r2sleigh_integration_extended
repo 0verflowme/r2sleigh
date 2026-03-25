@@ -458,6 +458,32 @@ a:sym.solve `afl~check_secret$[0]`+0x14 | jq -c '.found==true'
 EOF_CMDS
 RUN
 
+NAME=interactive_sym_runj_finds_check_secret_target
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~check_secret$[0]` >/dev/null
+a:sym.runj {\"find\":[{\"kind\":\"address\",\"addr\":\"`afl~check_secret$[0]`+0x14\"}],\"budget\":{\"max_states\":64,\"max_depth\":128,\"max_finds\":1,\"timeout_ms\":5000}} | jq -c '.stash_counts.found == 1 and ((.found_paths[0].solution.inputs | length) > 0)'
+EOF_CMDS
+RUN
+
+NAME=interactive_sym_runj_solves_stdin_gate
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~stdin_gate$[0]` >/dev/null
+a:sym.runj {\"find\":[{\"kind\":\"address\",\"addr\":\"`afl~stdin_gate$[0]`+0x69\"}],\"inputs\":[{\"kind\":\"fd\",\"fd\":0,\"len\":1,\"name\":\"stdin0\",\"alphabet\":\"k\"}],\"runtime\":{\"tty_fds\":[],\"skip_sleep_calls\":true},\"budget\":{\"max_states\":64,\"max_depth\":128,\"max_finds\":1,\"timeout_ms\":5000}} | jq -c '.stash_counts.found == 1 and .found_paths[0].solution.input_buffers.stdin0.hex == "6b" and .found_paths[0].solution.input_buffers.stdin0.ascii == "k"'
+EOF_CMDS
+RUN
+
 NAME=merge_mode_on
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true

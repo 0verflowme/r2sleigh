@@ -83,6 +83,8 @@ extern char *r2sym_explore_to(const R2ILContext *ctx, const R2ILBlock **blocks, 
 	unsigned long long entry_addr, unsigned long long target_addr);
 extern char *r2sym_solve_to(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long entry_addr, unsigned long long target_addr);
+extern char *r2sym_run_spec_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long entry_addr, const char *spec_json);
 extern int r2sym_set_symbol_map_json(const char *json);
 extern int r2sym_merge_is_enabled(void);
 extern void r2sym_merge_set_enabled(int enabled);
@@ -4127,6 +4129,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sla.cfg.json - Show CFG as JSON for current function");
 			r_cons_println (cons, "| a:sym.explore <target> - Explore symbolic paths reaching target");
 			r_cons_println (cons, "| a:sym.solve <target> - Solve concrete input for target reachability");
+			r_cons_println (cons, "| a:sym.runj <json-spec> - Run typed symbolic exploration spec");
 			r_cons_println (cons, "| a:sym.state  - Show last symbolic explore/solve cached result");
 		}
 		return strdup("");
@@ -4138,6 +4141,70 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_printf (cons, "%s\n", state_json);
 		}
 		free (state_json);
+		return strdup("");
+	}
+
+	if (is_sym_ns && !strncmp (cmd, "sym.runj", 8)) {
+		const char *arg = skip_cmd_spaces (cmd + 8);
+		R2ILContext *ctx;
+		RAnalFunction *fcn;
+		BlockArray blocks;
+		char *spec_json = NULL;
+		char *result = NULL;
+		bool rust_owned = true;
+
+		if (!arg || !*arg) {
+			if (cons) {
+				r_cons_println (cons, "Usage: a:sym.runj <json-spec>");
+			}
+			return strdup("");
+		}
+
+		ctx = get_context (anal);
+		if (!ctx) {
+			R_LOG_ERROR ("r2sleigh: no context");
+			return strdup("");
+		}
+		fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		if (!fcn) {
+			R_LOG_ERROR ("r2sleigh: no function at current address");
+			return strdup("");
+		}
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+			return strdup("");
+		}
+		char *sym_map_json = build_sym_symbol_map_json (core);
+		if (sym_map_json) {
+			r2sym_set_symbol_map_json (sym_map_json);
+			free (sym_map_json);
+		}
+
+		spec_json = strdup (arg);
+		if (!spec_json) {
+			block_array_free (&blocks);
+			return strdup("");
+		}
+		r_str_unescape (spec_json);
+		result = r2sym_run_spec_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, spec_json);
+		free (spec_json);
+		if (!result) {
+			rust_owned = false;
+			result = strdup ("{\"error\":\"symbolic execution failed\"}");
+		}
+
+		if (cons && result) {
+			r_cons_printf (cons, "%s\n", result);
+		}
+		if (result && !sym_result_has_error (result)) {
+			sym_state_cache_update ("runj", fcn->addr, fcn->addr, 0, result);
+		}
+		if (rust_owned) {
+			r2il_string_free (result);
+		} else {
+			free (result);
+		}
+		block_array_free (&blocks);
 		return strdup("");
 	}
 

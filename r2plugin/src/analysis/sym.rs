@@ -192,6 +192,19 @@ struct PathSolution {
 }
 
 #[derive(Serialize)]
+struct RunPathSolution {
+    inputs: std::collections::HashMap<String, String>,
+    input_buffers: std::collections::HashMap<String, BufferSolution>,
+    registers: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct BufferSolution {
+    hex: String,
+    ascii: String,
+}
+
+#[derive(Serialize)]
 struct SymTargetExploreResult {
     entry: String,
     target: String,
@@ -211,6 +224,37 @@ struct SymTargetSolveResult {
     selected_path: Option<PathInfo>,
 }
 
+#[derive(Serialize)]
+struct SymRunPathInfo {
+    path_id: usize,
+    feasible: bool,
+    depth: usize,
+    exit_status: String,
+    final_pc: String,
+    num_constraints: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    solution: Option<RunPathSolution>,
+}
+
+#[derive(Serialize)]
+struct SymRunStashCounts {
+    found: usize,
+    avoided: usize,
+    unsat: usize,
+    errored: usize,
+    completed: usize,
+}
+
+#[derive(Serialize)]
+struct SymRunResult {
+    entry: String,
+    spec: r2sym::ExplorationSpec,
+    stats: SymExecSummary,
+    stash_counts: SymRunStashCounts,
+    found_paths: Vec<SymRunPathInfo>,
+    diagnostics: Vec<String>,
+}
+
 fn path_solution_from_result<'ctx>(
     explorer: &r2sym::PathExplorer<'ctx>,
     result: &r2sym::PathResult<'ctx>,
@@ -223,6 +267,51 @@ fn path_solution_from_result<'ctx>(
             .inputs
             .into_iter()
             .map(|(k, v)| (k, format!("0x{:x}", v)))
+            .collect(),
+        registers: solved
+            .registers
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("tmp:") && !name.contains("_0"))
+            .map(|(k, v)| (k, format!("0x{:x}", v)))
+            .collect(),
+    })
+}
+
+fn buffer_solution(bytes: Vec<u8>) -> BufferSolution {
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let ascii = bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    BufferSolution { hex, ascii }
+}
+
+fn run_path_solution_from_result<'ctx>(
+    explorer: &r2sym::PathExplorer<'ctx>,
+    result: &r2sym::PathResult<'ctx>,
+) -> Option<RunPathSolution> {
+    if !result.feasible {
+        return None;
+    }
+    explorer.solve_path(result).map(|solved| RunPathSolution {
+        inputs: solved
+            .inputs
+            .into_iter()
+            .map(|(k, v)| (k, format!("0x{:x}", v)))
+            .collect(),
+        input_buffers: solved
+            .input_buffers
+            .into_iter()
+            .map(|(k, v)| (k, buffer_solution(v)))
             .collect(),
         registers: solved
             .registers
@@ -249,6 +338,22 @@ fn path_info_from_result<'ctx>(
     }
 }
 
+fn run_path_info_from_result<'ctx>(
+    path_id: usize,
+    result: &r2sym::PathResult<'ctx>,
+    explorer: &r2sym::PathExplorer<'ctx>,
+) -> SymRunPathInfo {
+    SymRunPathInfo {
+        path_id,
+        feasible: result.feasible,
+        depth: result.depth,
+        exit_status: format!("{:?}", result.exit_status),
+        final_pc: format!("0x{:x}", result.final_pc()),
+        num_constraints: result.num_constraints(),
+        solution: run_path_solution_from_result(explorer, result),
+    }
+}
+
 fn build_symbolic_prepared(
     blocks: &[R2ILBlock],
     arch: Option<&ArchSpec>,
@@ -261,6 +366,22 @@ fn symbol_map_snapshot() -> HashMap<u64, String> {
         .lock()
         .map(|map| map.clone())
         .unwrap_or_default()
+}
+
+fn install_symbolic_hooks<'ctx>(
+    explorer: &mut r2sym::PathExplorer<'ctx>,
+    prepared: &r2ssa::SsaArtifact,
+    arch: Option<&ArchSpec>,
+    symbol_map: &HashMap<u64, String>,
+) {
+    if let Some(arch) = arch
+        && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
+    {
+        let interproc = build_seed_interproc_summary_set(prepared, symbol_map);
+        let _ = registry.install_known_symbols_for_function(explorer, prepared, symbol_map);
+        let _ = registry
+            .install_interproc_summaries_for_function(explorer, prepared, &interproc, symbol_map);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -554,5 +675,99 @@ pub extern "C" fn r2sym_solve_to(
     match serde_json::to_string(&output) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => sym_error_json("failed to serialize symbolic solve output"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sym_run_spec_json(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    entry_addr: u64,
+    spec_json: *const c_char,
+) -> *mut c_char {
+    if spec_json.is_null() {
+        return sym_error_json("missing exploration spec json");
+    }
+    let spec_text = unsafe {
+        match CStr::from_ptr(spec_json).to_str() {
+            Ok(text) => text,
+            Err(_) => return sym_error_json("exploration spec is not valid utf-8"),
+        }
+    };
+    let spec = match serde_json::from_str::<r2sym::ExplorationSpec>(spec_text) {
+        Ok(spec) => spec,
+        Err(err) => return sym_error_json(&format!("failed to parse exploration spec: {err}")),
+    };
+    if let Err(err) = spec.validate() {
+        return sym_error_json(&err);
+    }
+
+    let Some(ctx_view) = require_ctx_view(ctx) else {
+        return sym_error_json("missing disassembler context");
+    };
+    let Some(blocks) = (unsafe { BlockSlice::from_ffi(blocks, num_blocks) }) else {
+        return sym_error_json("no blocks to explore");
+    };
+
+    let prepared = match build_symbolic_prepared(blocks.as_slice(), ctx_view.arch) {
+        Some(prepared) => prepared,
+        None => return sym_error_json("failed to build SSA function"),
+    };
+    let symbol_map = symbol_map_snapshot();
+    let z3_ctx = Context::thread_local();
+    let default_config = sym_default_config();
+
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let start_pc = spec.start_pc(entry_addr)?;
+        let mut initial_state = r2sym::SymState::new(&z3_ctx, start_pc);
+        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
+        spec.apply_to_state(&mut initial_state);
+
+        let mut explorer =
+            r2sym::PathExplorer::with_config(&z3_ctx, spec.to_explore_config(&default_config));
+        install_symbolic_hooks(&mut explorer, &prepared, ctx_view.arch, &symbol_map);
+        let result = explorer.run_spec(&prepared, initial_state, &spec)?;
+        let stats = explorer.stats().clone();
+        let found_paths = result
+            .found_paths
+            .iter()
+            .enumerate()
+            .map(|(idx, path)| run_path_info_from_result(idx, path, &explorer))
+            .collect::<Vec<_>>();
+        Ok::<_, String>((result, stats, found_paths))
+    }));
+
+    let (result, stats, found_paths) = match run_result {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => return sym_error_json(&err),
+        Err(_) => return sym_error_json("symbolic execution failed (z3 context error)"),
+    };
+
+    let output = SymRunResult {
+        entry: format!("0x{:x}", entry_addr),
+        spec,
+        stats: SymExecSummary {
+            paths_explored: stats.paths_completed,
+            paths_feasible: found_paths.len(),
+            paths_pruned: stats.paths_pruned,
+            max_depth: stats.max_depth_reached,
+            states_explored: stats.states_explored,
+            time_ms: stats.total_time.as_millis() as u64,
+        },
+        stash_counts: SymRunStashCounts {
+            found: found_paths.len(),
+            avoided: result.avoided_states,
+            unsat: result.unsat_states,
+            errored: result.errored_states,
+            completed: result.completed_states,
+        },
+        found_paths,
+        diagnostics: result.diagnostics,
+    };
+
+    match serde_json::to_string(&output) {
+        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
+        Err(_) => sym_error_json("failed to serialize symbolic run output"),
     }
 }

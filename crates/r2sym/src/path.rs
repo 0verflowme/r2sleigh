@@ -11,6 +11,7 @@ use z3::Context;
 
 use crate::executor::SymExecutor;
 use crate::solver::SymSolver;
+use crate::spec::ExplorationSpec;
 use crate::state::{ExitStatus, SymState};
 
 /// Configuration for path exploration.
@@ -111,6 +112,8 @@ impl<'ctx> PathResult<'ctx> {
 pub struct SolvedPath {
     /// Concrete input values (symbolic variable name -> value).
     pub inputs: std::collections::HashMap<String, u64>,
+    /// Concrete multi-byte input buffers (input source name -> bytes).
+    pub input_buffers: std::collections::HashMap<String, Vec<u8>>,
     /// Concrete register values at path end.
     pub registers: std::collections::HashMap<String, u64>,
     /// Concrete memory bytes for tracked symbolic regions.
@@ -119,6 +122,23 @@ pub struct SolvedPath {
     pub final_pc: u64,
     /// Path constraints that were satisfied.
     pub num_constraints: usize,
+}
+
+/// Result of a spec-driven exploration run.
+#[derive(Debug, Default)]
+pub struct SpecExploreResult<'ctx> {
+    /// Feasible paths that matched a find predicate.
+    pub found_paths: Vec<PathResult<'ctx>>,
+    /// Number of states pruned by avoid predicates.
+    pub avoided_states: usize,
+    /// Number of states pruned as infeasible.
+    pub unsat_states: usize,
+    /// Number of states that ended in an execution error.
+    pub errored_states: usize,
+    /// Number of completed states that did not hit a find predicate.
+    pub completed_states: usize,
+    /// Non-fatal diagnostics gathered during execution.
+    pub diagnostics: Vec<String>,
 }
 
 /// Path explorer for symbolic execution.
@@ -247,6 +267,17 @@ impl<'ctx> PathExplorer<'ctx> {
         for region in path.state.symbolic_memory() {
             if let Some(bytes) = model.eval_bytes(&region.value, region.size as usize) {
                 solved.memory.insert(region.name.clone(), bytes);
+            }
+        }
+
+        for input in path.state.symbolic_fd_inputs().values() {
+            let bytes: Option<Vec<u8>> = input
+                .bytes
+                .iter()
+                .map(|byte| model.eval(byte).map(|v| v as u8))
+                .collect();
+            if let Some(bytes) = bytes {
+                solved.input_buffers.insert(input.name.clone(), bytes);
             }
         }
 
@@ -634,6 +665,138 @@ impl<'ctx> PathExplorer<'ctx> {
 
         None
     }
+
+    /// Run a typed exploration specification.
+    pub fn run_spec(
+        &mut self,
+        func: &SsaArtifact,
+        initial_state: SymState<'ctx>,
+        spec: &ExplorationSpec,
+    ) -> Result<SpecExploreResult<'ctx>, String> {
+        let find_set: HashSet<u64> = spec.find_addresses()?.into_iter().collect();
+        let avoid_set: HashSet<u64> = spec.avoid_addresses()?.into_iter().collect();
+        let max_finds = spec.max_finds();
+        let start_time = Instant::now();
+        let mut result = SpecExploreResult::default();
+        let mut worklist: VecDeque<SymState<'ctx>> = VecDeque::new();
+        worklist.push_back(initial_state);
+
+        while let Some(mut state) = self.next_state(&mut worklist) {
+            if self.config.merge_states
+                && let Some(other) = take_merge_candidate(&mut worklist, state.pc)
+            {
+                state = state.merge_with(&other);
+            }
+
+            if let Some(timeout) = self.config.timeout
+                && start_time.elapsed() > timeout
+            {
+                result.diagnostics.push("exploration timed out".to_string());
+                break;
+            }
+
+            if avoid_set.contains(&state.pc) {
+                result.avoided_states += 1;
+                continue;
+            }
+
+            if find_set.contains(&state.pc) {
+                let feasible = self.solver.is_sat(&state);
+                if feasible {
+                    self.stats.paths_completed += 1;
+                    if state.depth > self.stats.max_depth_reached {
+                        self.stats.max_depth_reached = state.depth;
+                    }
+                    result.found_paths.push(PathResult::new(state, true));
+                    if result.found_paths.len() >= max_finds {
+                        break;
+                    }
+                } else {
+                    self.stats.paths_pruned += 1;
+                    result.unsat_states += 1;
+                }
+                continue;
+            }
+
+            if self.stats.states_explored >= self.config.max_states {
+                result
+                    .diagnostics
+                    .push("exploration stopped at max_states budget".to_string());
+                break;
+            }
+
+            if state.depth >= self.config.max_depth {
+                self.stats.paths_max_depth += 1;
+                result.completed_states += 1;
+                continue;
+            }
+
+            self.stats.states_explored += 1;
+
+            if self.config.prune_infeasible && !self.solver.is_sat(&state) {
+                self.stats.paths_pruned += 1;
+                result.unsat_states += 1;
+                continue;
+            }
+
+            let block_addr = state.pc;
+            let Some(block) = func.get_block(block_addr) else {
+                result
+                    .diagnostics
+                    .push(format!("no SSA block at 0x{block_addr:x}"));
+                result.completed_states += 1;
+                self.stats.paths_completed += 1;
+                continue;
+            };
+
+            match self.executor.execute_block(&mut state, block) {
+                Ok(forked_states) => {
+                    for mut forked in forked_states {
+                        forked.set_prev_pc(Some(block_addr));
+                        if !avoid_set.contains(&forked.pc) {
+                            worklist.push_back(forked);
+                        } else {
+                            result.avoided_states += 1;
+                        }
+                    }
+
+                    if !state.is_terminated() {
+                        if state.pc == block_addr
+                            && let Some(next) = self.fallthrough_target(func, block_addr)
+                        {
+                            state.pc = next;
+                        }
+                        state.set_prev_pc(Some(block_addr));
+                        if !avoid_set.contains(&state.pc) {
+                            worklist.push_back(state);
+                        } else {
+                            result.avoided_states += 1;
+                        }
+                    } else {
+                        self.stats.paths_completed += 1;
+                        result.diagnostics.push(format!(
+                            "state terminated at 0x{:x} with {:?}",
+                            block_addr, state.exit_status
+                        ));
+                        match &state.exit_status {
+                            Some(ExitStatus::Error(_)) => result.errored_states += 1,
+                            _ => result.completed_states += 1,
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.stats.paths_completed += 1;
+                    result.errored_states += 1;
+                    result
+                        .diagnostics
+                        .push(format!("execution error at 0x{block_addr:x}: {e}"));
+                }
+            }
+        }
+
+        self.stats.total_time = start_time.elapsed();
+        Ok(result)
+    }
 }
 
 fn take_merge_candidate<'ctx>(
@@ -727,6 +890,7 @@ mod tests {
     fn test_solved_path_default() {
         let solved = SolvedPath::default();
         assert!(solved.inputs.is_empty());
+        assert!(solved.input_buffers.is_empty());
         assert!(solved.registers.is_empty());
         assert!(solved.memory.is_empty());
         assert_eq!(solved.final_pc, 0);
