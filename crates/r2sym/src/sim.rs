@@ -30,6 +30,92 @@ pub const DEFAULT_MAX_MEMCMP: u64 = 0x1000;
 pub const DEFAULT_MAX_PRINTF_SCAN: u64 = 0x400;
 /// Default upper bound for generic interproc memory havoc windows.
 pub const DEFAULT_MAX_INTERPROC_HAVOC: u64 = 0x40;
+/// Path-listing upper bound for memory copy operations.
+pub const PATH_LIST_MAX_MEMCPY: u64 = 0x40;
+/// Path-listing upper bound for memory set operations.
+pub const PATH_LIST_MAX_MEMSET: u64 = 0x40;
+/// Path-listing upper bound for string operations.
+pub const PATH_LIST_MAX_STRLEN: u64 = 0x80;
+/// Path-listing upper bound for memcmp operations.
+pub const PATH_LIST_MAX_MEMCMP: u64 = 0x40;
+/// Path-listing upper bound for printf/puts modeled return values.
+pub const PATH_LIST_MAX_PRINTF_SCAN: u64 = 0x40;
+/// Path-listing precise-byte threshold before summaries switch to coarse modeling.
+pub const PATH_LIST_PRECISE_BYTE_LIMIT: u64 = 0x10;
+
+/// Summary profile used to install function summaries for different workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryProfile {
+    /// Default symbolic execution behavior.
+    Default,
+    /// Fast bounded modeling for path-listing workflows.
+    PathListing,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SummaryBudgets {
+    max_strlen: u64,
+    max_memcpy: u64,
+    max_memset: u64,
+    max_memcmp: u64,
+    max_printf_scan: u64,
+    byte_policy: ByteSummaryPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ByteSummaryPolicy {
+    summarize_symbolic: bool,
+    summarize_large: bool,
+    precise_limit: u64,
+}
+
+impl ByteSummaryPolicy {
+    const fn precise(max_bytes: u64) -> Self {
+        Self {
+            summarize_symbolic: false,
+            summarize_large: false,
+            precise_limit: max_bytes,
+        }
+    }
+
+    const fn summarized(precise_limit: u64) -> Self {
+        Self {
+            summarize_symbolic: true,
+            summarize_large: true,
+            precise_limit,
+        }
+    }
+
+    fn use_precise_model(&self, n_concrete: Option<u64>) -> bool {
+        match n_concrete {
+            Some(len) => !self.summarize_large || len <= self.precise_limit,
+            None => !self.summarize_symbolic,
+        }
+    }
+}
+
+impl SummaryProfile {
+    fn budgets(self) -> SummaryBudgets {
+        match self {
+            SummaryProfile::Default => SummaryBudgets {
+                max_strlen: DEFAULT_MAX_STRLEN,
+                max_memcpy: DEFAULT_MAX_MEMCPY,
+                max_memset: DEFAULT_MAX_MEMSET,
+                max_memcmp: DEFAULT_MAX_MEMCMP,
+                max_printf_scan: DEFAULT_MAX_PRINTF_SCAN,
+                byte_policy: ByteSummaryPolicy::precise(DEFAULT_MAX_MEMCPY),
+            },
+            SummaryProfile::PathListing => SummaryBudgets {
+                max_strlen: PATH_LIST_MAX_STRLEN,
+                max_memcpy: PATH_LIST_MAX_MEMCPY,
+                max_memset: PATH_LIST_MAX_MEMSET,
+                max_memcmp: PATH_LIST_MAX_MEMCMP,
+                max_printf_scan: PATH_LIST_MAX_PRINTF_SCAN,
+                byte_policy: ByteSummaryPolicy::summarized(PATH_LIST_PRECISE_BYTE_LIMIT),
+            },
+        }
+    }
+}
 
 /// Summary execution outcome.
 pub enum SummaryEffect<'ctx> {
@@ -179,16 +265,28 @@ impl<'ctx> SummaryRegistry<'ctx> {
 
     /// Create a registry pre-populated with core summaries.
     pub fn with_core(callconv: CallConv) -> Self {
+        Self::with_profile(callconv, SummaryProfile::Default)
+    }
+
+    /// Create a registry pre-populated with summaries for a typed workflow profile.
+    pub fn with_profile(callconv: CallConv, profile: SummaryProfile) -> Self {
+        let budgets = profile.budgets();
         let mut registry = Self::new(callconv);
-        registry.register_summary(MemcpySummary::new(DEFAULT_MAX_MEMCPY));
-        registry.register_summary(MemsetSummary::new(DEFAULT_MAX_MEMSET));
-        registry.register_summary(StrlenSummary::new(DEFAULT_MAX_STRLEN));
+        registry.register_summary(MemcpySummary::with_policy(
+            budgets.max_memcpy,
+            budgets.byte_policy,
+        ));
+        registry.register_summary(MemsetSummary::with_policy(
+            budgets.max_memset,
+            budgets.byte_policy,
+        ));
+        registry.register_summary(StrlenSummary::new(budgets.max_strlen));
         registry.register_summary(StrcmpSummary::new());
-        registry.register_summary(MemcmpSummary::new(DEFAULT_MAX_MEMCMP));
+        registry.register_summary(MemcmpSummary::new(budgets.max_memcmp));
         registry.register_summary(MallocSummary::new());
         registry.register_summary(FreeSummary::new());
-        registry.register_summary(PutsSummary::new(DEFAULT_MAX_PRINTF_SCAN));
-        registry.register_summary(PrintfSummaryBasic::new(DEFAULT_MAX_PRINTF_SCAN));
+        registry.register_summary(PutsSummary::new(budgets.max_printf_scan));
+        registry.register_summary(PrintfSummaryBasic::new(budgets.max_printf_scan));
         registry.register_summary(ReadSummary::new());
         registry.register_summary(IsattySummary::new());
         registry.register_summary(SleepSummary::sleep());
@@ -200,7 +298,15 @@ impl<'ctx> SummaryRegistry<'ctx> {
 
     /// Create a registry pre-populated with core summaries for a known architecture.
     pub fn with_core_for_arch(arch: &ArchSpec) -> Option<Self> {
-        Some(Self::with_core(CallConv::for_arch_spec(arch)?))
+        Some(Self::with_profile(
+            CallConv::for_arch_spec(arch)?,
+            SummaryProfile::Default,
+        ))
+    }
+
+    /// Create a registry pre-populated with summaries for a typed workflow profile.
+    pub fn with_profile_for_arch(arch: &ArchSpec, profile: SummaryProfile) -> Option<Self> {
+        Some(Self::with_profile(CallConv::for_arch_spec(arch)?, profile))
     }
 
     /// Register a function summary.
@@ -619,12 +725,20 @@ fn adjust_bits<'ctx>(ctx: &'ctx z3::Context, value: SymValue<'ctx>, bits: u32) -
 /// memcpy(dst, src, n) summary.
 pub struct MemcpySummary {
     max_copy: u64,
+    byte_policy: ByteSummaryPolicy,
 }
 
 impl MemcpySummary {
     /// Create a memcpy summary with an upper bound on copy size.
     pub fn new(max_copy: u64) -> Self {
-        Self { max_copy }
+        Self::with_policy(max_copy, ByteSummaryPolicy::precise(max_copy))
+    }
+
+    fn with_policy(max_copy: u64, byte_policy: ByteSummaryPolicy) -> Self {
+        Self {
+            max_copy,
+            byte_policy,
+        }
     }
 }
 
@@ -653,7 +767,7 @@ impl<'ctx> FunctionSummary<'ctx> for MemcpySummary {
             .get(2)
             .cloned()
             .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
-        copy_bytes(state, &dst, &src, &n, self.max_copy);
+        copy_bytes(state, &dst, &src, &n, self.max_copy, self.byte_policy);
         SummaryEffect::Return(Some(dst))
     }
 }
@@ -821,12 +935,20 @@ impl<'ctx> FunctionSummary<'ctx> for MemcmpSummary {
 /// memset(dst, c, n) summary.
 pub struct MemsetSummary {
     max_set: u64,
+    byte_policy: ByteSummaryPolicy,
 }
 
 impl MemsetSummary {
     /// Create a memset summary with an upper bound on set size.
     pub fn new(max_set: u64) -> Self {
-        Self { max_set }
+        Self::with_policy(max_set, ByteSummaryPolicy::precise(max_set))
+    }
+
+    fn with_policy(max_set: u64, byte_policy: ByteSummaryPolicy) -> Self {
+        Self {
+            max_set,
+            byte_policy,
+        }
     }
 }
 
@@ -856,7 +978,7 @@ impl<'ctx> FunctionSummary<'ctx> for MemsetSummary {
             .cloned()
             .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
 
-        set_bytes(state, &dst, &c, &n, self.max_set);
+        set_bytes(state, &dst, &c, &n, self.max_set, self.byte_policy);
         SummaryEffect::Return(Some(dst))
     }
 }
@@ -1171,13 +1293,32 @@ fn copy_bytes<'ctx>(
     src: &SymValue<'ctx>,
     n: &SymValue<'ctx>,
     max_copy: u64,
+    byte_policy: ByteSummaryPolicy,
 ) {
     let ctx = state.context();
     let n_concrete = n.as_concrete();
+    if n_concrete == Some(0) {
+        return;
+    }
     let copy_len = n_concrete.unwrap_or(max_copy).min(max_copy);
 
     if n_concrete.is_none() {
         state.constrain_range(n, 0, max_copy);
+    }
+
+    if !byte_policy.use_precise_model(n_concrete) {
+        let src_byte = if src.as_concrete().is_some() {
+            let read = state.mem_read(src, 1);
+            read.with_taint(read.get_taint() | src.get_taint() | n.get_taint())
+        } else {
+            SymValue::symbolic_tainted(
+                BV::fresh_const("memcpy_byte", 8),
+                8,
+                src.get_taint() | n.get_taint(),
+            )
+        };
+        state.mem_write(dst, &src_byte, 1);
+        return;
     }
 
     for offset in 0..copy_len {
@@ -1209,9 +1350,13 @@ fn set_bytes<'ctx>(
     c: &SymValue<'ctx>,
     n: &SymValue<'ctx>,
     max_set: u64,
+    byte_policy: ByteSummaryPolicy,
 ) {
     let ctx = state.context();
     let n_concrete = n.as_concrete();
+    if n_concrete == Some(0) {
+        return;
+    }
     let set_len = n_concrete.unwrap_or(max_set).min(max_set);
 
     if n_concrete.is_none() {
@@ -1223,6 +1368,11 @@ fn set_bytes<'ctx>(
     } else {
         c.extract(ctx, 7, 0).with_taint(c.get_taint())
     };
+
+    if !byte_policy.use_precise_model(n_concrete) {
+        state.mem_write(dst, &c_byte, 1);
+        return;
+    }
 
     for offset in 0..set_len {
         let offset_val = SymValue::concrete(offset, dst.bits());
@@ -1264,5 +1414,61 @@ mod tests {
         arch.addr_size = 64;
         assert!(CallConv::for_arch_spec(&arch).is_some());
         assert!(SummaryRegistry::with_core_for_arch(&arch).is_some());
+        assert!(
+            SummaryRegistry::with_profile_for_arch(&arch, SummaryProfile::PathListing).is_some()
+        );
+    }
+
+    #[test]
+    fn memcpy_summary_path_listing_summarizes_symbolic_lengths() {
+        let ctx = z3::Context::thread_local();
+        let src = SymValue::concrete(0x1000, 64);
+        let dst = SymValue::concrete(0x2000, 64);
+        let n = SymValue::symbolic(BV::fresh_const("n", 64), 64);
+
+        let mut precise_state = SymState::new(&ctx, 0);
+        precise_state.mem_write(
+            &src,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_base", 8), 8, 0x20),
+            1,
+        );
+        let src_far = src.add(&ctx, &SymValue::concrete(5, 64));
+        precise_state.mem_write(
+            &src_far,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_far", 8), 8, 0x40),
+            1,
+        );
+        let precise_summary = MemcpySummary::new(0x40);
+        let call = CallInfo {
+            args: vec![dst.clone(), src.clone(), n.clone()],
+            arg_bits: 64,
+            ret_bits: 64,
+        };
+        let _ = precise_summary.execute(&mut precise_state, &call);
+        let precise_far = precise_state.mem_read(&dst.add(&ctx, &SymValue::concrete(5, 64)), 1);
+        assert_eq!(precise_far.get_taint(), 0x40);
+
+        let mut path_listing_state = SymState::new(&ctx, 0);
+        path_listing_state.mem_write(
+            &src,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_base_pl", 8), 8, 0x20),
+            1,
+        );
+        let src_far = src.add(&ctx, &SymValue::concrete(5, 64));
+        path_listing_state.mem_write(
+            &src_far,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_far_pl", 8), 8, 0x40),
+            1,
+        );
+        let path_listing_summary = MemcpySummary::with_policy(
+            0x40,
+            ByteSummaryPolicy::summarized(PATH_LIST_PRECISE_BYTE_LIMIT),
+        );
+        let _ = path_listing_summary.execute(&mut path_listing_state, &call);
+        let path_listing_far =
+            path_listing_state.mem_read(&dst.add(&ctx, &SymValue::concrete(5, 64)), 1);
+        assert_eq!(path_listing_far.get_taint(), 0);
+        let path_listing_base = path_listing_state.mem_read(&dst, 1);
+        assert_eq!(path_listing_base.get_taint(), 0x20);
     }
 }

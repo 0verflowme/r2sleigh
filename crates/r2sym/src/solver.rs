@@ -3,10 +3,11 @@
 //! This module provides a high-level interface to Z3 for checking
 //! path feasibility and extracting concrete values.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use z3::ast::{BV, Bool};
+use z3::ast::{Ast, BV, Bool};
 use z3::{Context, Model, Params, Solver};
 
 use crate::state::SymState;
@@ -33,6 +34,21 @@ impl From<z3::SatResult> for SatResult {
     }
 }
 
+/// Lightweight counters for solver-heavy symbolic execution workflows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SolverStats {
+    /// Number of state satisfiability queries.
+    pub sat_queries: usize,
+    /// Number of satisfiability queries answered from the cache.
+    pub sat_cache_hits: usize,
+    /// Number of satisfiability queries that required a solver check.
+    pub sat_cache_misses: usize,
+    /// Number of model-building solve requests.
+    pub solve_calls: usize,
+    /// Number of solve calls that returned early from a cached UNSAT result.
+    pub solve_unsat_shortcuts: usize,
+}
+
 /// A wrapper around Z3's solver with convenience methods.
 pub struct SymSolver<'ctx> {
     /// The Z3 context.
@@ -41,6 +57,10 @@ pub struct SymSolver<'ctx> {
     solver: Solver,
     /// Timeout in milliseconds (0 = no timeout).
     _timeout_ms: u32,
+    /// Memoized satisfiability results for state queries.
+    sat_cache: RefCell<HashMap<String, SatResult>>,
+    /// Internal counters used for perf/debug summaries.
+    stats: RefCell<SolverStats>,
 }
 
 impl<'ctx> SymSolver<'ctx> {
@@ -51,6 +71,8 @@ impl<'ctx> SymSolver<'ctx> {
             ctx,
             solver,
             _timeout_ms: 0,
+            sat_cache: RefCell::new(HashMap::new()),
+            stats: RefCell::new(SolverStats::default()),
         }
     }
 
@@ -68,6 +90,8 @@ impl<'ctx> SymSolver<'ctx> {
             ctx,
             solver,
             _timeout_ms: timeout_ms,
+            sat_cache: RefCell::new(HashMap::new()),
+            stats: RefCell::new(SolverStats::default()),
         }
     }
 
@@ -78,11 +102,38 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Add a constraint to the solver.
     pub fn assert(&self, constraint: &Bool) {
-        self.solver.assert(constraint);
+        self.clear_sat_cache();
+        self.solver_assert(constraint);
     }
 
     /// Add multiple constraints.
     pub fn assert_all(&self, constraints: &[Bool]) {
+        if !constraints.is_empty() {
+            self.clear_sat_cache();
+        }
+        self.solver_assert_all(constraints);
+    }
+
+    /// Return current solver/cache counters.
+    pub fn stats(&self) -> SolverStats {
+        self.stats.borrow().clone()
+    }
+
+    /// Reset solver/cache counters without touching constraints.
+    pub fn clear_stats(&self) {
+        *self.stats.borrow_mut() = SolverStats::default();
+    }
+
+    /// Drop memoized satisfiability results.
+    pub fn clear_sat_cache(&self) {
+        self.sat_cache.borrow_mut().clear();
+    }
+
+    fn solver_assert(&self, constraint: &Bool) {
+        self.solver.assert(constraint);
+    }
+
+    fn solver_assert_all(&self, constraints: &[Bool]) {
         for c in constraints {
             self.solver.assert(c);
         }
@@ -105,40 +156,74 @@ impl<'ctx> SymSolver<'ctx> {
 
     /// Push a new scope (for backtracking).
     pub fn push(&self) {
+        self.clear_sat_cache();
         self.solver.push();
     }
 
     /// Pop a scope.
     pub fn pop(&self, n: u32) {
+        self.clear_sat_cache();
         self.solver.pop(n);
     }
 
     /// Reset the solver.
     pub fn reset(&self) {
+        self.clear_sat_cache();
         self.solver.reset();
+    }
+
+    fn state_sat_cache_key(&self, state: &SymState<'ctx>) -> String {
+        match state.constraints() {
+            [] => "true".to_string(),
+            [constraint] => constraint.simplify().to_string(),
+            _ => state.path_condition().simplify().to_string(),
+        }
     }
 
     /// Check if a state's path constraints are satisfiable.
     pub fn is_sat(&self, state: &SymState<'ctx>) -> bool {
-        self.push();
-        self.assert_all(state.constraints());
+        self.stats.borrow_mut().sat_queries += 1;
+
+        let cache_key = self.state_sat_cache_key(state);
+        if let Some(result) = self.sat_cache.borrow().get(&cache_key).copied() {
+            self.stats.borrow_mut().sat_cache_hits += 1;
+            return result == SatResult::Sat;
+        }
+
+        self.stats.borrow_mut().sat_cache_misses += 1;
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
         let result = self.check();
-        self.pop(1);
+        self.solver.pop(1);
+        self.sat_cache.borrow_mut().insert(cache_key, result);
         result == SatResult::Sat
     }
 
     /// Get a concrete model for a state's constraints.
     pub fn solve(&self, state: &SymState<'ctx>) -> Option<SymModel<'_>> {
-        self.push();
-        self.assert_all(state.constraints());
+        self.stats.borrow_mut().solve_calls += 1;
 
-        let result = if self.check() == SatResult::Sat {
+        let cache_key = self.state_sat_cache_key(state);
+        if matches!(
+            self.sat_cache.borrow().get(&cache_key),
+            Some(SatResult::Unsat)
+        ) {
+            self.stats.borrow_mut().solve_unsat_shortcuts += 1;
+            return None;
+        }
+
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
+
+        let sat_result = self.check();
+        let result = if sat_result == SatResult::Sat {
             self.get_model().map(|m| SymModel::new(self.ctx, m))
         } else {
             None
         };
 
-        self.pop(1);
+        self.solver.pop(1);
+        self.sat_cache.borrow_mut().insert(cache_key, sat_result);
         result
     }
 
@@ -157,9 +242,9 @@ impl<'ctx> SymSolver<'ctx> {
         target: &SymValue<'ctx>,
         constraint: &Bool,
     ) -> Option<u64> {
-        self.push();
-        self.assert_all(state.constraints());
-        self.assert(constraint);
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
+        self.solver_assert(constraint);
 
         let result = if self.check() == SatResult::Sat {
             self.eval(target)
@@ -167,7 +252,7 @@ impl<'ctx> SymSolver<'ctx> {
             None
         };
 
-        self.pop(1);
+        self.solver.pop(1);
         result
     }
 
@@ -194,11 +279,11 @@ impl<'ctx> SymSolver<'ctx> {
         };
         let eq = a_bv.eq(&b_bv);
 
-        self.push();
-        self.assert_all(state.constraints());
-        self.assert(&eq);
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
+        self.solver_assert(&eq);
         let result = self.check() == SatResult::Sat;
-        self.pop(1);
+        self.solver.pop(1);
 
         result
     }
@@ -209,11 +294,11 @@ impl<'ctx> SymSolver<'ctx> {
         let zero = BV::from_i64(0, value.bits());
         let eq = bv.eq(&zero);
 
-        self.push();
-        self.assert_all(state.constraints());
-        self.assert(&eq);
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
+        self.solver_assert(&eq);
         let result = self.check() == SatResult::Sat;
-        self.pop(1);
+        self.solver.pop(1);
 
         result
     }
@@ -224,11 +309,11 @@ impl<'ctx> SymSolver<'ctx> {
         let zero = BV::from_i64(0, value.bits());
         let neq = bv.eq(&zero).not();
 
-        self.push();
-        self.assert_all(state.constraints());
-        self.assert(&neq);
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
+        self.solver_assert(&neq);
         let result = self.check() == SatResult::Unsat;
-        self.pop(1);
+        self.solver.pop(1);
 
         result
     }
@@ -236,8 +321,8 @@ impl<'ctx> SymSolver<'ctx> {
     /// Get the minimum value for a symbolic expression.
     pub fn minimize(&self, state: &SymState<'ctx>, value: &SymValue<'ctx>) -> Option<u64> {
         // Binary search for minimum
-        self.push();
-        self.assert_all(state.constraints());
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
 
         let bv = value.to_bv(self.ctx);
         let bits = value.bits();
@@ -256,8 +341,8 @@ impl<'ctx> SymSolver<'ctx> {
             let mid_bv = BV::from_u64(mid, bits);
             let constraint = bv.bvule(&mid_bv);
 
-            self.push();
-            self.assert(&constraint);
+            self.solver.push();
+            self.solver_assert(&constraint);
 
             if self.check() == SatResult::Sat {
                 result = self.eval(value);
@@ -266,21 +351,21 @@ impl<'ctx> SymSolver<'ctx> {
                 lo = mid.saturating_add(1);
             }
 
-            self.pop(1);
+            self.solver.pop(1);
 
             if lo == 0 && hi == u64::MAX {
                 break; // Prevent infinite loop
             }
         }
 
-        self.pop(1);
+        self.solver.pop(1);
         result
     }
 
     /// Get the maximum value for a symbolic expression.
     pub fn maximize(&self, state: &SymState<'ctx>, value: &SymValue<'ctx>) -> Option<u64> {
-        self.push();
-        self.assert_all(state.constraints());
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
 
         let bv = value.to_bv(self.ctx);
         let bits = value.bits();
@@ -298,8 +383,8 @@ impl<'ctx> SymSolver<'ctx> {
             let mid_bv = BV::from_u64(mid, bits);
             let constraint = bv.bvuge(&mid_bv);
 
-            self.push();
-            self.assert(&constraint);
+            self.solver.push();
+            self.solver_assert(&constraint);
 
             if self.check() == SatResult::Sat {
                 result = self.eval(value);
@@ -308,14 +393,14 @@ impl<'ctx> SymSolver<'ctx> {
                 hi = mid.saturating_sub(1);
             }
 
-            self.pop(1);
+            self.solver.pop(1);
 
             if lo == 0 && hi == u64::MAX {
                 break;
             }
         }
 
-        self.pop(1);
+        self.solver.pop(1);
         result
     }
 }
@@ -452,6 +537,27 @@ mod tests {
     }
 
     #[test]
+    fn test_state_sat_cache_hit() {
+        let ctx = Context::thread_local();
+
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("x", 32);
+        let x = state.get_register("x");
+        let five = SymValue::concrete(5, 32);
+        let cond = x.ult(&ctx, &five);
+        state.add_true_constraint(&cond);
+
+        let solver = SymSolver::new(&ctx);
+        assert!(solver.is_sat(&state));
+        assert!(solver.is_sat(&state));
+
+        let stats = solver.stats();
+        assert_eq!(stats.sat_queries, 2);
+        assert_eq!(stats.sat_cache_hits, 1);
+        assert_eq!(stats.sat_cache_misses, 1);
+    }
+
+    #[test]
     fn test_solve() {
         let ctx = Context::thread_local();
 
@@ -469,5 +575,27 @@ mod tests {
         // Evaluate x directly from the model
         let x_value = model.eval(&x);
         assert_eq!(x_value, Some(10));
+    }
+
+    #[test]
+    fn test_solve_uses_cached_unsat_shortcut() {
+        let ctx = Context::thread_local();
+
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("x", 32);
+
+        let x = state.get_register("x");
+        let five = SymValue::concrete(5, 32);
+        let three = SymValue::concrete(3, 32);
+        state.add_true_constraint(&x.ult(&ctx, &three));
+        state.add_true_constraint(&x.eq(&ctx, &five));
+
+        let solver = SymSolver::new(&ctx);
+        assert!(!solver.is_sat(&state));
+        assert!(solver.solve(&state).is_none());
+
+        let stats = solver.stats();
+        assert_eq!(stats.solve_calls, 1);
+        assert_eq!(stats.solve_unsat_shortcuts, 1);
     }
 }

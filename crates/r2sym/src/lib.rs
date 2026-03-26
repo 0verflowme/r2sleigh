@@ -50,9 +50,10 @@ pub use path::{ExploreConfig, PathExplorer, PathResult, SolvedPath};
 pub use r2api::{R2Api, R2Error};
 pub use runtime::seed_default_state_for_arch;
 pub use sim::{
-    CallConv, CallInfo, FunctionSummary, SummaryEffect, SummaryInstallStats, SummaryRegistry,
+    CallConv, CallInfo, FunctionSummary, SummaryEffect, SummaryInstallStats, SummaryProfile,
+    SummaryRegistry,
 };
-pub use solver::{SatResult, SymModel, SymSolver};
+pub use solver::{SatResult, SolverStats, SymModel, SymSolver};
 pub use spec::{
     AddressValue, BudgetSpec, ExplorationSpec, InputSpec, MergeSpec, PredicateSpec, RuntimeSpec,
     StartSpec, StrategySpec,

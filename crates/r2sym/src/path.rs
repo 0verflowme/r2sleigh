@@ -3,7 +3,7 @@
 //! This module provides different strategies for exploring paths
 //! during symbolic execution, including DFS, BFS, and coverage-guided.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use r2ssa::{BlockTerminator, SsaArtifact};
@@ -19,6 +19,8 @@ use crate::state::{ExitStatus, SymState};
 pub struct ExploreConfig {
     /// Maximum number of states to explore.
     pub max_states: usize,
+    /// Maximum number of completed paths to collect during full exploration.
+    pub max_completed_paths: Option<usize>,
     /// Maximum execution depth per path.
     pub max_depth: usize,
     /// Timeout for the entire exploration.
@@ -35,6 +37,7 @@ impl Default for ExploreConfig {
     fn default() -> Self {
         Self {
             max_states: 1000,
+            max_completed_paths: None,
             max_depth: 100,
             timeout: Some(Duration::from_secs(60)),
             strategy: ExploreStrategy::Dfs,
@@ -93,7 +96,9 @@ impl<'ctx> PathResult<'ctx> {
 
     /// Get all register names in the final state.
     pub fn register_names(&self) -> Vec<String> {
-        self.state.register_names().cloned().collect()
+        let mut names: Vec<String> = self.state.register_names().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Get a register value (returns None if symbolic or not set).
@@ -111,13 +116,13 @@ impl<'ctx> PathResult<'ctx> {
 #[derive(Debug, Clone, Default)]
 pub struct SolvedPath {
     /// Concrete input values (symbolic variable name -> value).
-    pub inputs: std::collections::HashMap<String, u64>,
+    pub inputs: BTreeMap<String, u64>,
     /// Concrete multi-byte input buffers (input source name -> bytes).
-    pub input_buffers: std::collections::HashMap<String, Vec<u8>>,
+    pub input_buffers: BTreeMap<String, Vec<u8>>,
     /// Concrete register values at path end.
-    pub registers: std::collections::HashMap<String, u64>,
+    pub registers: BTreeMap<String, u64>,
     /// Concrete memory bytes for tracked symbolic regions.
-    pub memory: std::collections::HashMap<String, Vec<u8>>,
+    pub memory: BTreeMap<String, Vec<u8>>,
     /// Final program counter.
     pub final_pc: u64,
     /// Path constraints that were satisfied.
@@ -170,6 +175,391 @@ pub struct ExploreStats {
     pub max_depth_reached: usize,
     /// Total execution time.
     pub total_time: Duration,
+}
+
+struct StateWorklist<'ctx> {
+    strategy: ExploreStrategy,
+    ready: VecDeque<usize>,
+    same_pc: HashMap<u64, VecDeque<usize>>,
+    slots: Vec<Option<SymState<'ctx>>>,
+    live_states: usize,
+}
+
+impl<'ctx> StateWorklist<'ctx> {
+    fn new(strategy: ExploreStrategy) -> Self {
+        Self {
+            strategy,
+            ready: VecDeque::new(),
+            same_pc: HashMap::new(),
+            slots: Vec::new(),
+            live_states: 0,
+        }
+    }
+
+    fn push(&mut self, state: SymState<'ctx>) {
+        let id = self.slots.len();
+        let pc = state.pc;
+        self.slots.push(Some(state));
+        self.ready.push_back(id);
+        self.same_pc.entry(pc).or_default().push_back(id);
+        self.live_states += 1;
+    }
+
+    fn pop_next(&mut self) -> Option<SymState<'ctx>> {
+        loop {
+            let id = match self.strategy {
+                ExploreStrategy::Dfs => self.ready.pop_back(),
+                ExploreStrategy::Bfs => self.ready.pop_front(),
+                ExploreStrategy::Random => {
+                    if self.ready.is_empty() {
+                        None
+                    } else if self.live_states.is_multiple_of(2) {
+                        self.ready.pop_front()
+                    } else {
+                        self.ready.pop_back()
+                    }
+                }
+            }?;
+
+            if let Some(state) = self.take_slot(id) {
+                return Some(state);
+            }
+        }
+    }
+
+    fn take_same_pc(&mut self, pc: u64) -> Option<SymState<'ctx>> {
+        loop {
+            let id = {
+                let bucket = self.same_pc.get_mut(&pc)?;
+                match self.strategy {
+                    ExploreStrategy::Dfs => bucket.pop_back(),
+                    ExploreStrategy::Bfs => bucket.pop_front(),
+                    ExploreStrategy::Random => {
+                        if bucket.is_empty() {
+                            None
+                        } else if self.live_states.is_multiple_of(2) {
+                            bucket.pop_front()
+                        } else {
+                            bucket.pop_back()
+                        }
+                    }
+                }
+            }?;
+
+            let remove_bucket = self.same_pc.get(&pc).is_some_and(VecDeque::is_empty);
+            if remove_bucket {
+                self.same_pc.remove(&pc);
+            }
+
+            if let Some(state) = self.take_slot(id) {
+                return Some(state);
+            }
+        }
+    }
+
+    fn take_slot(&mut self, id: usize) -> Option<SymState<'ctx>> {
+        let slot = self.slots.get_mut(id)?;
+        let state = slot.take()?;
+        self.live_states = self.live_states.saturating_sub(1);
+        Some(state)
+    }
+}
+
+enum DriverAction<'ctx> {
+    Continue(Box<SymState<'ctx>>),
+    Skip,
+    Finish,
+}
+
+enum DriverMode<'ctx> {
+    Explore {
+        results: Vec<PathResult<'ctx>>,
+    },
+    FindFirst {
+        target_addr: u64,
+        found: Option<PathResult<'ctx>>,
+    },
+    FindAll {
+        target_addr: u64,
+        matches: Vec<PathResult<'ctx>>,
+    },
+    Avoid {
+        avoid_set: HashSet<u64>,
+        found: Option<PathResult<'ctx>>,
+    },
+    Spec {
+        find_set: HashSet<u64>,
+        avoid_set: HashSet<u64>,
+        max_finds: usize,
+        result: SpecExploreResult<'ctx>,
+    },
+}
+
+impl<'ctx> DriverMode<'ctx> {
+    fn explore_path_cap_reached(&self, max_completed_paths: Option<usize>) -> bool {
+        let Some(limit) = max_completed_paths else {
+            return false;
+        };
+        match self {
+            DriverMode::Explore { results } => results.len() >= limit,
+            _ => false,
+        }
+    }
+
+    fn on_timeout(&mut self) -> bool {
+        if let DriverMode::Spec { result, .. } = self {
+            result.diagnostics.push("exploration timed out".to_string());
+        }
+        true
+    }
+
+    fn on_max_states(&mut self) -> bool {
+        if let DriverMode::Spec { result, .. } = self {
+            result
+                .diagnostics
+                .push("exploration stopped at max_states budget".to_string());
+        }
+        true
+    }
+
+    fn on_unsat_pruned(&mut self) {
+        if let DriverMode::Spec { result, .. } = self {
+            result.unsat_states += 1;
+        }
+    }
+
+    fn on_state_popped(
+        &mut self,
+        explorer: &mut PathExplorer<'ctx>,
+        state: SymState<'ctx>,
+    ) -> DriverAction<'ctx> {
+        match self {
+            DriverMode::Explore { .. } => DriverAction::Continue(Box::new(state)),
+            DriverMode::FindFirst { target_addr, found } => {
+                if state.pc == *target_addr {
+                    if explorer.solver.is_sat(&state) {
+                        *found = Some(PathResult::new(state, true));
+                        DriverAction::Finish
+                    } else {
+                        DriverAction::Skip
+                    }
+                } else {
+                    DriverAction::Continue(Box::new(state))
+                }
+            }
+            DriverMode::FindAll {
+                target_addr,
+                matches,
+            } => {
+                if state.pc == *target_addr {
+                    if explorer.solver.is_sat(&state) {
+                        explorer.record_depth(state.depth);
+                        explorer.stats.paths_completed += 1;
+                        matches.push(PathResult::new(state, true));
+                    }
+                    DriverAction::Skip
+                } else {
+                    DriverAction::Continue(Box::new(state))
+                }
+            }
+            DriverMode::Avoid { avoid_set, .. } => {
+                if avoid_set.contains(&state.pc) {
+                    DriverAction::Skip
+                } else {
+                    DriverAction::Continue(Box::new(state))
+                }
+            }
+            DriverMode::Spec {
+                find_set,
+                avoid_set,
+                max_finds,
+                result,
+            } => {
+                if avoid_set.contains(&state.pc) {
+                    result.avoided_states += 1;
+                    return DriverAction::Skip;
+                }
+                if find_set.contains(&state.pc) {
+                    if explorer.solver.is_sat(&state) {
+                        explorer.record_depth(state.depth);
+                        explorer.stats.paths_completed += 1;
+                        result.found_paths.push(PathResult::new(state, true));
+                        if result.found_paths.len() >= *max_finds {
+                            return DriverAction::Finish;
+                        }
+                    } else {
+                        explorer.stats.paths_pruned += 1;
+                        result.unsat_states += 1;
+                    }
+                    DriverAction::Skip
+                } else {
+                    DriverAction::Continue(Box::new(state))
+                }
+            }
+        }
+    }
+
+    fn on_depth_limit(
+        &mut self,
+        explorer: &mut PathExplorer<'ctx>,
+        mut state: SymState<'ctx>,
+        max_completed_paths: Option<usize>,
+    ) -> DriverAction<'ctx> {
+        match self {
+            DriverMode::Explore { results } => {
+                state.terminate(ExitStatus::MaxDepth);
+                explorer.record_depth(state.depth);
+                explorer.stats.paths_max_depth += 1;
+                results.push(PathResult::new(state, true));
+                if self.explore_path_cap_reached(max_completed_paths) {
+                    DriverAction::Finish
+                } else {
+                    DriverAction::Skip
+                }
+            }
+            DriverMode::FindFirst { .. } => DriverAction::Skip,
+            DriverMode::FindAll { .. } => {
+                explorer.stats.paths_max_depth += 1;
+                DriverAction::Skip
+            }
+            DriverMode::Avoid { found, .. } => {
+                if explorer.solver.is_sat(&state) {
+                    *found = Some(PathResult::new(state, true));
+                    DriverAction::Finish
+                } else {
+                    DriverAction::Skip
+                }
+            }
+            DriverMode::Spec { result, .. } => {
+                explorer.stats.paths_max_depth += 1;
+                result.completed_states += 1;
+                DriverAction::Skip
+            }
+        }
+    }
+
+    fn on_missing_block(
+        &mut self,
+        explorer: &mut PathExplorer<'ctx>,
+        mut state: SymState<'ctx>,
+        block_addr: u64,
+        max_completed_paths: Option<usize>,
+    ) -> DriverAction<'ctx> {
+        match self {
+            DriverMode::Explore { results } => {
+                state.terminate(ExitStatus::Return);
+                results.push(PathResult::new(state, true));
+                explorer.stats.paths_completed += 1;
+                if self.explore_path_cap_reached(max_completed_paths) {
+                    DriverAction::Finish
+                } else {
+                    DriverAction::Skip
+                }
+            }
+            DriverMode::FindFirst { .. } | DriverMode::FindAll { .. } => DriverAction::Skip,
+            DriverMode::Avoid { found, .. } => {
+                if explorer.solver.is_sat(&state) {
+                    *found = Some(PathResult::new(state, true));
+                    DriverAction::Finish
+                } else {
+                    DriverAction::Skip
+                }
+            }
+            DriverMode::Spec { result, .. } => {
+                result
+                    .diagnostics
+                    .push(format!("no SSA block at 0x{block_addr:x}"));
+                result.completed_states += 1;
+                explorer.stats.paths_completed += 1;
+                DriverAction::Skip
+            }
+        }
+    }
+
+    fn on_terminated_state(
+        &mut self,
+        explorer: &mut PathExplorer<'ctx>,
+        state: SymState<'ctx>,
+        block_addr: u64,
+        max_completed_paths: Option<usize>,
+    ) -> DriverAction<'ctx> {
+        match self {
+            DriverMode::Explore { results } => {
+                explorer.record_depth(state.depth);
+                let feasible = explorer.solver.is_sat(&state);
+                results.push(PathResult::new(state, feasible));
+                explorer.stats.paths_completed += 1;
+                if self.explore_path_cap_reached(max_completed_paths) {
+                    return DriverAction::Finish;
+                }
+            }
+            DriverMode::FindFirst { .. }
+            | DriverMode::FindAll { .. }
+            | DriverMode::Avoid { .. } => {}
+            DriverMode::Spec { result, .. } => {
+                explorer.stats.paths_completed += 1;
+                result.diagnostics.push(format!(
+                    "state terminated at 0x{:x} with {:?}",
+                    block_addr, state.exit_status
+                ));
+                match &state.exit_status {
+                    Some(ExitStatus::Error(_)) => result.errored_states += 1,
+                    _ => result.completed_states += 1,
+                }
+            }
+        }
+        DriverAction::Skip
+    }
+
+    fn on_execute_error(
+        &mut self,
+        explorer: &mut PathExplorer<'ctx>,
+        mut state: SymState<'ctx>,
+        block_addr: u64,
+        error: String,
+        max_completed_paths: Option<usize>,
+    ) -> DriverAction<'ctx> {
+        match self {
+            DriverMode::Explore { results } => {
+                explorer.record_depth(state.depth);
+                state.terminate(ExitStatus::Error(error));
+                results.push(PathResult::new(state, false));
+                explorer.stats.paths_completed += 1;
+                if self.explore_path_cap_reached(max_completed_paths) {
+                    return DriverAction::Finish;
+                }
+            }
+            DriverMode::FindAll { .. } => {
+                explorer.stats.paths_completed += 1;
+            }
+            DriverMode::Spec { result, .. } => {
+                explorer.stats.paths_completed += 1;
+                result.errored_states += 1;
+                result
+                    .diagnostics
+                    .push(format!("execution error at 0x{block_addr:x}: {error}"));
+            }
+            DriverMode::FindFirst { .. } | DriverMode::Avoid { .. } => {}
+        }
+        DriverAction::Skip
+    }
+
+    fn allow_enqueue(&mut self, state: &SymState<'ctx>) -> bool {
+        match self {
+            DriverMode::Avoid { avoid_set, .. } => !avoid_set.contains(&state.pc),
+            DriverMode::Spec {
+                avoid_set, result, ..
+            } => {
+                if avoid_set.contains(&state.pc) {
+                    result.avoided_states += 1;
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => true,
+        }
+    }
 }
 
 impl<'ctx> PathExplorer<'ctx> {
@@ -289,106 +679,141 @@ impl<'ctx> PathExplorer<'ctx> {
         paths.iter().map(|p| self.solve_path(p)).collect()
     }
 
-    /// Explore all paths in a function.
-    pub fn explore(
+    fn record_depth(&mut self, depth: usize) {
+        if depth > self.stats.max_depth_reached {
+            self.stats.max_depth_reached = depth;
+        }
+    }
+
+    fn drive(
         &mut self,
         func: &SsaArtifact,
         initial_state: SymState<'ctx>,
-    ) -> Vec<PathResult<'ctx>> {
+        mode: &mut DriverMode<'ctx>,
+    ) {
         let start_time = Instant::now();
-        let mut results = Vec::new();
-        let mut worklist: VecDeque<SymState<'ctx>> = VecDeque::new();
-        worklist.push_back(initial_state);
+        let mut worklist = StateWorklist::new(self.config.strategy);
+        worklist.push(initial_state);
 
-        while let Some(mut state) = self.next_state(&mut worklist) {
+        while let Some(mut state) = worklist.pop_next() {
             if self.config.merge_states
-                && let Some(other) = take_merge_candidate(&mut worklist, state.pc)
+                && let Some(other) = worklist.take_same_pc(state.pc)
             {
                 state = state.merge_with(&other);
             }
-            // Check timeout
+
             if let Some(timeout) = self.config.timeout
                 && start_time.elapsed() > timeout
+                && mode.on_timeout()
             {
                 break;
             }
 
-            // Check state limit
-            if self.stats.states_explored >= self.config.max_states {
+            match mode.on_state_popped(self, state) {
+                DriverAction::Continue(next_state) => state = *next_state,
+                DriverAction::Skip => continue,
+                DriverAction::Finish => break,
+            }
+
+            if self.stats.states_explored >= self.config.max_states && mode.on_max_states() {
                 break;
+            }
+
+            if state.depth >= self.config.max_depth {
+                match mode.on_depth_limit(self, state, self.config.max_completed_paths) {
+                    DriverAction::Continue(next_state) => state = *next_state,
+                    DriverAction::Skip => continue,
+                    DriverAction::Finish => break,
+                }
             }
 
             self.stats.states_explored += 1;
 
-            // Check depth limit
-            if state.depth >= self.config.max_depth {
-                state.terminate(ExitStatus::MaxDepth);
-                self.stats.paths_max_depth += 1;
-                results.push(PathResult::new(state, true));
-                continue;
-            }
-
-            // Check feasibility
             if self.config.prune_infeasible && !self.solver.is_sat(&state) {
                 self.stats.paths_pruned += 1;
+                mode.on_unsat_pruned();
                 continue;
             }
 
-            // Get current block
             let block_addr = state.pc;
             let Some(block) = func.get_block(block_addr) else {
-                // No block at this address - path ends
-                state.terminate(ExitStatus::Return);
-                results.push(PathResult::new(state, true));
-                self.stats.paths_completed += 1;
-                continue;
+                match mode.on_missing_block(
+                    self,
+                    state,
+                    block_addr,
+                    self.config.max_completed_paths,
+                ) {
+                    DriverAction::Finish => break,
+                    DriverAction::Continue(_) | DriverAction::Skip => continue,
+                }
             };
 
-            // Execute the block
             match self.executor.execute_block(&mut state, block) {
                 Ok(forked_states) => {
-                    // Add forked states to worklist
+                    self.record_depth(state.depth);
+
                     for mut forked in forked_states {
                         forked.set_prev_pc(Some(block_addr));
-                        worklist.push_back(forked);
+                        if mode.allow_enqueue(&forked) {
+                            worklist.push(forked);
+                        }
                     }
 
-                    // Update max depth before potentially moving state
-                    if state.depth > self.stats.max_depth_reached {
-                        self.stats.max_depth_reached = state.depth;
-                    }
-
-                    // Check if state terminated
-                    if state.is_terminated() {
-                        let feasible = self.solver.is_sat(&state);
-                        results.push(PathResult::new(state, feasible));
-                        self.stats.paths_completed += 1;
-                    } else {
-                        // Continue exploring this path
-                        // Update PC to next block if not changed by control flow
+                    if !state.is_terminated() {
                         if state.pc == block_addr
                             && let Some(next) = self.fallthrough_target(func, block_addr)
                         {
                             state.pc = next;
                         }
                         state.set_prev_pc(Some(block_addr));
-                        worklist.push_back(state);
+                        if mode.allow_enqueue(&state) {
+                            worklist.push(state);
+                        }
+                    } else {
+                        match mode.on_terminated_state(
+                            self,
+                            state,
+                            block_addr,
+                            self.config.max_completed_paths,
+                        ) {
+                            DriverAction::Finish => break,
+                            DriverAction::Continue(_) | DriverAction::Skip => continue,
+                        }
                     }
                 }
-                Err(e) => {
-                    // Update max depth before moving state
-                    if state.depth > self.stats.max_depth_reached {
-                        self.stats.max_depth_reached = state.depth;
-                    }
-                    state.terminate(ExitStatus::Error(format!("{}", e)));
-                    results.push(PathResult::new(state, false));
-                    self.stats.paths_completed += 1;
-                }
+                Err(e) => match mode.on_execute_error(
+                    self,
+                    state,
+                    block_addr,
+                    e.to_string(),
+                    self.config.max_completed_paths,
+                ) {
+                    DriverAction::Finish => break,
+                    DriverAction::Continue(_) | DriverAction::Skip => continue,
+                },
             }
         }
 
         self.stats.total_time = start_time.elapsed();
-        results
+    }
+
+    /// Explore all paths in a function.
+    pub fn explore(
+        &mut self,
+        func: &SsaArtifact,
+        initial_state: SymState<'ctx>,
+    ) -> Vec<PathResult<'ctx>> {
+        if self.config.max_completed_paths == Some(0) {
+            return Vec::new();
+        }
+        let mut mode = DriverMode::Explore {
+            results: Vec::new(),
+        };
+        self.drive(func, initial_state, &mut mode);
+        match mode {
+            DriverMode::Explore { results } => results,
+            _ => unreachable!("explore should always use explore mode"),
+        }
     }
 
     fn fallthrough_target(&self, func: &SsaArtifact, block_addr: u64) -> Option<u64> {
@@ -403,26 +828,6 @@ impl<'ctx> PathExplorer<'ctx> {
         }
     }
 
-    /// Get the next state from the worklist based on strategy.
-    fn next_state(&self, worklist: &mut VecDeque<SymState<'ctx>>) -> Option<SymState<'ctx>> {
-        match self.config.strategy {
-            ExploreStrategy::Dfs => worklist.pop_back(),
-            ExploreStrategy::Bfs => worklist.pop_front(),
-            ExploreStrategy::Random => {
-                if worklist.is_empty() {
-                    None
-                } else {
-                    // Simple random: alternate between front and back
-                    if worklist.len().is_multiple_of(2) {
-                        worklist.pop_front()
-                    } else {
-                        worklist.pop_back()
-                    }
-                }
-            }
-        }
-    }
-
     /// Explore paths to find inputs that reach a target address.
     pub fn find_path_to(
         &mut self,
@@ -430,73 +835,15 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Option<PathResult<'ctx>> {
-        let start_time = Instant::now();
-        let mut worklist: VecDeque<SymState<'ctx>> = VecDeque::new();
-        worklist.push_back(initial_state);
-
-        while let Some(mut state) = self.next_state(&mut worklist) {
-            if self.config.merge_states
-                && let Some(other) = take_merge_candidate(&mut worklist, state.pc)
-            {
-                state = state.merge_with(&other);
-            }
-            // Check timeout
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
-            {
-                break;
-            }
-
-            // Check if we reached the target
-            if state.pc == target_addr {
-                let feasible = self.solver.is_sat(&state);
-                if feasible {
-                    return Some(PathResult::new(state, true));
-                }
-                continue;
-            }
-
-            // Check limits
-            if self.stats.states_explored >= self.config.max_states {
-                break;
-            }
-            if state.depth >= self.config.max_depth {
-                continue;
-            }
-
-            self.stats.states_explored += 1;
-
-            // Check feasibility
-            if self.config.prune_infeasible && !self.solver.is_sat(&state) {
-                self.stats.paths_pruned += 1;
-                continue;
-            }
-
-            // Get and execute block
-            let block_addr = state.pc;
-            let Some(block) = func.get_block(block_addr) else {
-                continue;
-            };
-
-            if let Ok(forked_states) = self.executor.execute_block(&mut state, block) {
-                for mut forked in forked_states {
-                    forked.set_prev_pc(Some(block_addr));
-                    worklist.push_back(forked);
-                }
-
-                if !state.is_terminated() {
-                    if state.pc == block_addr
-                        && let Some(next) = self.fallthrough_target(func, block_addr)
-                    {
-                        state.pc = next;
-                    }
-                    state.set_prev_pc(Some(block_addr));
-                    worklist.push_back(state);
-                }
-            }
+        let mut mode = DriverMode::FindFirst {
+            target_addr,
+            found: None,
+        };
+        self.drive(func, initial_state, &mut mode);
+        match mode {
+            DriverMode::FindFirst { found, .. } => found,
+            _ => unreachable!("find_path_to should always use first-match mode"),
         }
-
-        None
     }
 
     /// Explore paths to collect all feasible states that reach a target address.
@@ -506,80 +853,15 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Vec<PathResult<'ctx>> {
-        let start_time = Instant::now();
-        let mut matches = Vec::new();
-        let mut worklist: VecDeque<SymState<'ctx>> = VecDeque::new();
-        worklist.push_back(initial_state);
-
-        while let Some(mut state) = self.next_state(&mut worklist) {
-            if self.config.merge_states
-                && let Some(other) = take_merge_candidate(&mut worklist, state.pc)
-            {
-                state = state.merge_with(&other);
-            }
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
-            {
-                break;
-            }
-
-            if state.pc == target_addr {
-                let feasible = self.solver.is_sat(&state);
-                if feasible {
-                    if state.depth > self.stats.max_depth_reached {
-                        self.stats.max_depth_reached = state.depth;
-                    }
-                    self.stats.paths_completed += 1;
-                    matches.push(PathResult::new(state, true));
-                }
-                continue;
-            }
-
-            if self.stats.states_explored >= self.config.max_states {
-                break;
-            }
-            if state.depth >= self.config.max_depth {
-                self.stats.paths_max_depth += 1;
-                continue;
-            }
-
-            self.stats.states_explored += 1;
-
-            if self.config.prune_infeasible && !self.solver.is_sat(&state) {
-                self.stats.paths_pruned += 1;
-                continue;
-            }
-
-            let block_addr = state.pc;
-            let Some(block) = func.get_block(block_addr) else {
-                continue;
-            };
-
-            match self.executor.execute_block(&mut state, block) {
-                Ok(forked_states) => {
-                    for mut forked in forked_states {
-                        forked.set_prev_pc(Some(block_addr));
-                        worklist.push_back(forked);
-                    }
-
-                    if !state.is_terminated() {
-                        if state.pc == block_addr
-                            && let Some(next) = self.fallthrough_target(func, block_addr)
-                        {
-                            state.pc = next;
-                        }
-                        state.set_prev_pc(Some(block_addr));
-                        worklist.push_back(state);
-                    }
-                }
-                Err(_) => {
-                    self.stats.paths_completed += 1;
-                }
-            }
+        let mut mode = DriverMode::FindAll {
+            target_addr,
+            matches: Vec::new(),
+        };
+        self.drive(func, initial_state, &mut mode);
+        match mode {
+            DriverMode::FindAll { matches, .. } => matches,
+            _ => unreachable!("find_paths_to should always use all-match mode"),
         }
-
-        self.stats.total_time = start_time.elapsed();
-        matches
     }
 
     /// Explore paths to find inputs that avoid a target address.
@@ -589,81 +871,15 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         avoid_addrs: &[u64],
     ) -> Option<PathResult<'ctx>> {
-        let avoid_set: HashSet<u64> = avoid_addrs.iter().copied().collect();
-        let start_time = Instant::now();
-        let mut worklist: VecDeque<SymState<'ctx>> = VecDeque::new();
-        worklist.push_back(initial_state);
-
-        while let Some(mut state) = self.next_state(&mut worklist) {
-            if self.config.merge_states
-                && let Some(other) = take_merge_candidate(&mut worklist, state.pc)
-            {
-                state = state.merge_with(&other);
-            }
-            // Check timeout
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
-            {
-                break;
-            }
-
-            // Check if we hit an avoided address
-            if avoid_set.contains(&state.pc) {
-                continue;
-            }
-
-            // Check limits
-            if self.stats.states_explored >= self.config.max_states {
-                break;
-            }
-            if state.depth >= self.config.max_depth {
-                let feasible = self.solver.is_sat(&state);
-                if feasible {
-                    return Some(PathResult::new(state, true));
-                }
-                continue;
-            }
-
-            self.stats.states_explored += 1;
-
-            // Check feasibility
-            if self.config.prune_infeasible && !self.solver.is_sat(&state) {
-                self.stats.paths_pruned += 1;
-                continue;
-            }
-
-            // Get and execute block
-            let block_addr = state.pc;
-            let Some(block) = func.get_block(block_addr) else {
-                // Reached end without hitting avoided addresses
-                let feasible = self.solver.is_sat(&state);
-                if feasible {
-                    return Some(PathResult::new(state, true));
-                }
-                continue;
-            };
-
-            if let Ok(forked_states) = self.executor.execute_block(&mut state, block) {
-                for mut forked in forked_states {
-                    forked.set_prev_pc(Some(block_addr));
-                    if !avoid_set.contains(&forked.pc) {
-                        worklist.push_back(forked);
-                    }
-                }
-
-                if !state.is_terminated() && !avoid_set.contains(&state.pc) {
-                    if state.pc == block_addr
-                        && let Some(next) = self.fallthrough_target(func, block_addr)
-                    {
-                        state.pc = next;
-                    }
-                    state.set_prev_pc(Some(block_addr));
-                    worklist.push_back(state);
-                }
-            }
+        let mut mode = DriverMode::Avoid {
+            avoid_set: avoid_addrs.iter().copied().collect(),
+            found: None,
+        };
+        self.drive(func, initial_state, &mut mode);
+        match mode {
+            DriverMode::Avoid { found, .. } => found,
+            _ => unreachable!("find_path_avoiding should always use avoid mode"),
         }
-
-        None
     }
 
     /// Run a typed exploration specification.
@@ -673,143 +889,18 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         spec: &ExplorationSpec,
     ) -> Result<SpecExploreResult<'ctx>, String> {
-        let find_set: HashSet<u64> = spec.find_addresses()?.into_iter().collect();
-        let avoid_set: HashSet<u64> = spec.avoid_addresses()?.into_iter().collect();
-        let max_finds = spec.max_finds();
-        let start_time = Instant::now();
-        let mut result = SpecExploreResult::default();
-        let mut worklist: VecDeque<SymState<'ctx>> = VecDeque::new();
-        worklist.push_back(initial_state);
-
-        while let Some(mut state) = self.next_state(&mut worklist) {
-            if self.config.merge_states
-                && let Some(other) = take_merge_candidate(&mut worklist, state.pc)
-            {
-                state = state.merge_with(&other);
-            }
-
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
-            {
-                result.diagnostics.push("exploration timed out".to_string());
-                break;
-            }
-
-            if avoid_set.contains(&state.pc) {
-                result.avoided_states += 1;
-                continue;
-            }
-
-            if find_set.contains(&state.pc) {
-                let feasible = self.solver.is_sat(&state);
-                if feasible {
-                    self.stats.paths_completed += 1;
-                    if state.depth > self.stats.max_depth_reached {
-                        self.stats.max_depth_reached = state.depth;
-                    }
-                    result.found_paths.push(PathResult::new(state, true));
-                    if result.found_paths.len() >= max_finds {
-                        break;
-                    }
-                } else {
-                    self.stats.paths_pruned += 1;
-                    result.unsat_states += 1;
-                }
-                continue;
-            }
-
-            if self.stats.states_explored >= self.config.max_states {
-                result
-                    .diagnostics
-                    .push("exploration stopped at max_states budget".to_string());
-                break;
-            }
-
-            if state.depth >= self.config.max_depth {
-                self.stats.paths_max_depth += 1;
-                result.completed_states += 1;
-                continue;
-            }
-
-            self.stats.states_explored += 1;
-
-            if self.config.prune_infeasible && !self.solver.is_sat(&state) {
-                self.stats.paths_pruned += 1;
-                result.unsat_states += 1;
-                continue;
-            }
-
-            let block_addr = state.pc;
-            let Some(block) = func.get_block(block_addr) else {
-                result
-                    .diagnostics
-                    .push(format!("no SSA block at 0x{block_addr:x}"));
-                result.completed_states += 1;
-                self.stats.paths_completed += 1;
-                continue;
-            };
-
-            match self.executor.execute_block(&mut state, block) {
-                Ok(forked_states) => {
-                    for mut forked in forked_states {
-                        forked.set_prev_pc(Some(block_addr));
-                        if !avoid_set.contains(&forked.pc) {
-                            worklist.push_back(forked);
-                        } else {
-                            result.avoided_states += 1;
-                        }
-                    }
-
-                    if !state.is_terminated() {
-                        if state.pc == block_addr
-                            && let Some(next) = self.fallthrough_target(func, block_addr)
-                        {
-                            state.pc = next;
-                        }
-                        state.set_prev_pc(Some(block_addr));
-                        if !avoid_set.contains(&state.pc) {
-                            worklist.push_back(state);
-                        } else {
-                            result.avoided_states += 1;
-                        }
-                    } else {
-                        self.stats.paths_completed += 1;
-                        result.diagnostics.push(format!(
-                            "state terminated at 0x{:x} with {:?}",
-                            block_addr, state.exit_status
-                        ));
-                        match &state.exit_status {
-                            Some(ExitStatus::Error(_)) => result.errored_states += 1,
-                            _ => result.completed_states += 1,
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.stats.paths_completed += 1;
-                    result.errored_states += 1;
-                    result
-                        .diagnostics
-                        .push(format!("execution error at 0x{block_addr:x}: {e}"));
-                }
-            }
-        }
-
-        self.stats.total_time = start_time.elapsed();
-        Ok(result)
-    }
-}
-
-fn take_merge_candidate<'ctx>(
-    worklist: &mut VecDeque<SymState<'ctx>>,
-    pc: u64,
-) -> Option<SymState<'ctx>> {
-    let len = worklist.len();
-    for idx in 0..len {
-        if worklist[idx].pc == pc {
-            return worklist.remove(idx);
+        let mut mode = DriverMode::Spec {
+            find_set: spec.find_addresses()?.into_iter().collect(),
+            avoid_set: spec.avoid_addresses()?.into_iter().collect(),
+            max_finds: spec.max_finds(),
+            result: SpecExploreResult::default(),
+        };
+        self.drive(func, initial_state, &mut mode);
+        match mode {
+            DriverMode::Spec { result, .. } => Ok(result),
+            _ => unreachable!("run_spec should always use spec mode"),
         }
     }
-    None
 }
 
 #[cfg(test)]
@@ -821,6 +912,7 @@ mod tests {
     fn test_explore_config_default() {
         let config = ExploreConfig::default();
         assert_eq!(config.max_states, 1000);
+        assert_eq!(config.max_completed_paths, None);
         assert_eq!(config.max_depth, 100);
         assert!(config.prune_infeasible);
     }
@@ -841,18 +933,45 @@ mod tests {
     }
 
     #[test]
+    fn test_state_worklist_same_pc_lookup_skips_popped_entries() {
+        let ctx = Context::thread_local();
+        let mut worklist = StateWorklist::new(ExploreStrategy::Bfs);
+
+        worklist.push(SymState::new(&ctx, 0x1000));
+        worklist.push(SymState::new(&ctx, 0x2000));
+        worklist.push(SymState::new(&ctx, 0x1000));
+
+        let first = worklist.pop_next().expect("first state should exist");
+        assert_eq!(first.pc, 0x1000);
+
+        let merged = worklist
+            .take_same_pc(0x1000)
+            .expect("queued same-pc state should still be found");
+        assert_eq!(merged.pc, 0x1000);
+
+        let remaining = worklist.pop_next().expect("non-merged state should remain");
+        assert_eq!(remaining.pc, 0x2000);
+        assert!(worklist.pop_next().is_none());
+        assert!(worklist.take_same_pc(0x1000).is_none());
+    }
+
+    #[test]
     fn test_path_result_methods() {
         let ctx = Context::thread_local();
 
         let mut state = SymState::new(&ctx, 0x1000);
         state.set_register("rax", SymValue::concrete(42, 64));
         state.make_symbolic("rbx", 64);
+        state.set_register("aaa", SymValue::concrete(7, 64));
 
         let result = PathResult::new(state, true);
 
         assert_eq!(result.final_pc(), 0x1000);
         assert_eq!(result.num_constraints(), 0);
-        assert!(result.register_names().contains(&"rax".to_string()));
+        assert_eq!(
+            result.register_names(),
+            vec!["aaa".to_string(), "rax".to_string(), "rbx".to_string()]
+        );
         assert_eq!(result.get_concrete_register("rax"), Some(42));
         assert!(result.is_register_symbolic("rbx"));
     }
@@ -895,5 +1014,34 @@ mod tests {
         assert!(solved.memory.is_empty());
         assert_eq!(solved.final_pc, 0);
         assert_eq!(solved.num_constraints, 0);
+    }
+
+    #[test]
+    fn test_solve_path_emits_stable_map_order() {
+        let ctx = Context::thread_local();
+
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.new_symbolic_input("z_input", 64);
+        state.new_symbolic_input("a_input", 64);
+        state.set_register("z_reg", SymValue::concrete(3, 64));
+        state.set_register("a_reg", SymValue::concrete(1, 64));
+        state.set_register("m_reg", SymValue::concrete(9, 64));
+
+        let result = PathResult::new(state, true);
+        let explorer = PathExplorer::new(&ctx);
+        let solved = explorer.solve_path(&result).expect("path should solve");
+
+        assert_eq!(
+            solved.inputs.keys().cloned().collect::<Vec<_>>(),
+            vec!["a_input".to_string(), "z_input".to_string()]
+        );
+        assert_eq!(
+            solved.registers.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "a_reg".to_string(),
+                "m_reg".to_string(),
+                "z_reg".to_string()
+            ]
+        );
     }
 }

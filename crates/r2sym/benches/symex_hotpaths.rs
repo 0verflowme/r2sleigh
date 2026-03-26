@@ -1,0 +1,447 @@
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+use r2ssa::SsaArtifact;
+use r2sym::path::ExploreStrategy;
+use r2sym::{
+    AddressValue, ExplorationSpec, ExploreConfig, InputSpec, PathExplorer, PredicateSpec,
+    SummaryRegistry, SymSolver, SymState, SymValue,
+};
+use z3::Context;
+
+const RAX: u64 = 0;
+const RBX: u64 = 8;
+const RCX: u64 = 16;
+const RDI: u64 = 56;
+const RSI: u64 = 64;
+const RDX: u64 = 72;
+const TMP0: u64 = 0x80;
+const TMP1: u64 = 0x88;
+
+fn make_reg(offset: u64, size: u32) -> Varnode {
+    Varnode {
+        space: SpaceId::Register,
+        offset,
+        size,
+        meta: None,
+    }
+}
+
+fn make_const(val: u64, size: u32) -> Varnode {
+    Varnode {
+        space: SpaceId::Const,
+        offset: val,
+        size,
+        meta: None,
+    }
+}
+
+fn make_x86_64_arch() -> ArchSpec {
+    let mut arch = ArchSpec::new("x86-64");
+    arch.addr_size = 8;
+    arch.add_register(RegisterDef::new("RAX", RAX, 8));
+    arch.add_register(RegisterDef::new("RBX", RBX, 8));
+    arch.add_register(RegisterDef::new("RCX", RCX, 8));
+    arch.add_register(RegisterDef::new("RDI", RDI, 8));
+    arch.add_register(RegisterDef::new("RSI", RSI, 8));
+    arch.add_register(RegisterDef::new("RDX", RDX, 8));
+    arch
+}
+
+fn build_branching_function() -> SsaArtifact {
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(RDI, 8),
+                    b: make_const(0x1337, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+    ];
+
+    SsaArtifact::for_symbolic(&blocks, None).expect("branching benchmark SSA should build")
+}
+
+fn build_join_heavy_function(levels: u64) -> SsaArtifact {
+    let mut blocks = Vec::new();
+    let mut addr = 0x2000;
+
+    for level in 0..levels {
+        let branch_addr = addr;
+        let false_addr = addr + 0x4;
+        let true_addr = addr + 0x8;
+        let join_addr = addr + 0xc;
+
+        blocks.push(R2ILBlock {
+            addr: branch_addr,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(RDI, 8),
+                    b: make_const(level, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(true_addr, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        });
+        blocks.push(R2ILBlock {
+            addr: false_addr,
+            size: 4,
+            ops: vec![R2ILOp::Branch {
+                target: make_const(join_addr, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        });
+        blocks.push(R2ILBlock {
+            addr: true_addr,
+            size: 4,
+            ops: vec![R2ILOp::Branch {
+                target: make_const(join_addr, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        });
+        blocks.push(R2ILBlock {
+            addr: join_addr,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_reg(RAX, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        });
+
+        addr += 0x10;
+    }
+
+    blocks.push(R2ILBlock {
+        addr,
+        size: 4,
+        ops: vec![R2ILOp::Copy {
+            dst: make_reg(RAX, 8),
+            src: make_const(0x1337, 8),
+        }],
+        switch_info: None,
+        op_metadata: Default::default(),
+    });
+
+    blocks.sort_by_key(|block| block.addr);
+    SsaArtifact::for_symbolic(&blocks, None).expect("join-heavy benchmark SSA should build")
+}
+
+fn emit_branch_tree(
+    blocks: &mut Vec<R2ILBlock>,
+    next_addr: &mut u64,
+    depth: u32,
+    seed: &mut u64,
+) -> u64 {
+    let entry = *next_addr;
+    *next_addr += 4;
+
+    if depth == 0 {
+        let leaf_value = *seed;
+        *seed += 1;
+        blocks.push(R2ILBlock {
+            addr: entry,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(leaf_value, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        });
+        return entry;
+    }
+
+    let false_entry = emit_branch_tree(blocks, next_addr, depth - 1, seed);
+    let true_entry = emit_branch_tree(blocks, next_addr, depth - 1, seed);
+    let compare_value = *seed;
+    *seed += 1;
+
+    debug_assert_eq!(false_entry, entry + 4);
+
+    blocks.push(R2ILBlock {
+        addr: entry,
+        size: 4,
+        ops: vec![
+            R2ILOp::IntEqual {
+                dst: make_reg(RCX, 1),
+                a: make_reg(RDI, 8),
+                b: make_const(compare_value, 8),
+            },
+            R2ILOp::CBranch {
+                target: make_const(true_entry, 8),
+                cond: make_reg(RCX, 1),
+            },
+        ],
+        switch_info: None,
+        op_metadata: Default::default(),
+    });
+
+    entry
+}
+
+fn build_branch_tree_function(levels: u32) -> SsaArtifact {
+    let mut blocks = Vec::new();
+    let mut next_addr = 0x3000;
+    let mut seed = 0;
+
+    emit_branch_tree(&mut blocks, &mut next_addr, levels, &mut seed);
+    blocks.sort_by_key(|block| block.addr);
+    SsaArtifact::for_symbolic(&blocks, None).expect("branch-tree benchmark SSA should build")
+}
+
+fn build_fd_spec_function(arch: &ArchSpec) -> SsaArtifact {
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 8),
+                    src: make_const(0x2000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RDX, 8),
+                    src: make_const(1, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x5000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x2000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(b'k' as u64, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0x1337, 8),
+            }],
+        },
+    ];
+
+    SsaArtifact::for_symbolic(&blocks, Some(arch)).expect("fd benchmark SSA should build")
+}
+
+fn bench_solver_sat_cache(c: &mut Criterion) {
+    c.bench_function("r2sym/solver_is_sat_cached", |b| {
+        b.iter(|| {
+            let ctx = Context::thread_local();
+            let solver = SymSolver::new(&ctx);
+            let mut state = SymState::new(&ctx, 0x1000);
+            state.make_symbolic("x", 32);
+            let x = state.get_register("x");
+            state.add_true_constraint(&x.ult(&ctx, &SymValue::concrete(5, 32)));
+
+            black_box(solver.is_sat(&state));
+            black_box(solver.is_sat(&state));
+            black_box(solver.stats())
+        });
+    });
+}
+
+fn bench_explore_symbolic_branching(c: &mut Criterion) {
+    let func = build_branching_function();
+    let config = ExploreConfig {
+        max_states: 64,
+        max_depth: 32,
+        timeout: None,
+        ..Default::default()
+    };
+
+    c.bench_function("r2sym/explore_symbolic_branching", |b| {
+        b.iter(|| {
+            let ctx = Context::thread_local();
+            let mut state = SymState::new(&ctx, 0x1000);
+            state.make_symbolic("reg:56_0", 64);
+
+            let mut explorer = PathExplorer::with_config(&ctx, config.clone());
+            let results = explorer.explore(black_box(&func), state);
+            black_box(results.len());
+            black_box(explorer.solver().stats())
+        });
+    });
+}
+
+fn bench_explore_branch_tree(c: &mut Criterion) {
+    let func = build_branch_tree_function(5);
+    let config = ExploreConfig {
+        max_states: 256,
+        max_depth: 64,
+        timeout: None,
+        strategy: ExploreStrategy::Bfs,
+        ..Default::default()
+    };
+
+    c.bench_function("r2sym/explore_branch_tree", |b| {
+        b.iter(|| {
+            let ctx = Context::thread_local();
+            let mut state = SymState::new(&ctx, 0x3000);
+            state.make_symbolic("reg:56_0", 64);
+
+            let mut explorer = PathExplorer::with_config(&ctx, config.clone());
+            let results = explorer.explore(black_box(&func), state);
+            black_box(results.len());
+            black_box(explorer.stats().clone())
+        });
+    });
+}
+
+fn bench_explore_same_pc_merge(c: &mut Criterion) {
+    let func = build_join_heavy_function(6);
+    let mut group = c.benchmark_group("r2sym/explore_same_pc_merge");
+
+    for (name, merge_states) in [("merge_off", false), ("merge_on", true)] {
+        let config = ExploreConfig {
+            max_states: 256,
+            max_depth: 96,
+            timeout: None,
+            strategy: ExploreStrategy::Bfs,
+            merge_states,
+            ..Default::default()
+        };
+
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let ctx = Context::thread_local();
+                let mut state = SymState::new(&ctx, 0x2000);
+                state.make_symbolic("reg:56_0", 64);
+
+                let mut explorer = PathExplorer::with_config(&ctx, config.clone());
+                let results = explorer.explore(black_box(&func), state);
+                black_box(results.len());
+                black_box(explorer.stats().clone())
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_run_spec_symbolic_fd_input(c: &mut Criterion) {
+    let arch = make_x86_64_arch();
+    let func = build_fd_spec_function(&arch);
+    let config = ExploreConfig {
+        max_states: 64,
+        max_depth: 64,
+        timeout: None,
+        ..Default::default()
+    };
+    let spec = ExplorationSpec {
+        find: vec![PredicateSpec::Address {
+            addr: AddressValue::Integer(0x1010),
+        }],
+        inputs: vec![InputSpec::Fd {
+            fd: 0,
+            len: 1,
+            name: Some("stdin0".to_string()),
+            alphabet: Some("k".to_string()),
+        }],
+        ..Default::default()
+    };
+
+    c.bench_function("r2sym/run_spec_symbolic_fd_input", |b| {
+        b.iter(|| {
+            let ctx = Context::thread_local();
+            let mut initial_state = SymState::new(&ctx, 0x1000);
+            spec.apply_to_state(&mut initial_state);
+
+            let mut explorer = PathExplorer::with_config(&ctx, config.clone());
+            let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+            assert!(registry.install_for_explorer(&mut explorer, 0x5000, "read"));
+
+            let result = explorer
+                .run_spec(black_box(&func), initial_state, black_box(&spec))
+                .expect("fd-input benchmark should succeed");
+            black_box(result.found_paths.len());
+            black_box(explorer.solver().stats())
+        });
+    });
+}
+
+criterion_group!(
+    symex_hotpaths,
+    bench_solver_sat_cache,
+    bench_explore_symbolic_branching,
+    bench_explore_branch_tree,
+    bench_explore_same_pc_merge,
+    bench_run_spec_symbolic_fd_input
+);
+criterion_main!(symex_hotpaths);

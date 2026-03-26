@@ -3,8 +3,7 @@
 //! This module provides a sparse memory model that can handle both
 //! concrete and symbolic addresses and values.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 
 use z3::ast::{BV, Bool};
 use z3::{Context, SatResult, Solver};
@@ -61,7 +60,7 @@ impl<'ctx> SymMemory<'ctx> {
     }
 
     pub(crate) fn merge_addrs(&self) -> Vec<u64> {
-        let mut addrs = HashSet::new();
+        let mut addrs = BTreeSet::new();
         addrs.extend(self.concrete.keys().copied());
         for (addr, _value, size) in &self.symbolic_writes {
             if let Some(base) = addr.as_concrete() {
@@ -453,5 +452,21 @@ mod tests {
         let model = solver.get_model().unwrap();
         let val = model.eval(&result_bv, true).unwrap().as_u64().unwrap();
         assert_eq!(val, 0xCAFEBABE);
+    }
+
+    #[test]
+    fn test_merge_addrs_are_sorted() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+
+        mem.write_bytes(0x1003, &[0xaa]);
+        mem.write_bytes(0x1000, &[0xbb]);
+        mem.push_symbolic_write(
+            SymValue::concrete(0x1001, 64),
+            SymValue::concrete(0x1122, 16),
+            2,
+        );
+
+        assert_eq!(mem.merge_addrs(), vec![0x1000, 0x1001, 0x1002, 0x1003]);
     }
 }

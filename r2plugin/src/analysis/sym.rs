@@ -12,6 +12,13 @@ use std::sync::{Mutex, OnceLock};
 use z3::{Config, Context};
 
 static MERGE_STATES: AtomicBool = AtomicBool::new(false);
+const SYM_PATHS_LIMIT: usize = 32;
+const SYM_PATHS_CALL_FREE_MAX_STATES: usize = 16;
+const SYM_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
+const SYM_PATHS_CALL_HEAVY_MAX_STATES: usize = 8;
+const SYM_PATHS_CALL_HEAVY_MAX_DEPTH: usize = 32;
+const SYM_PATHS_TIMEOUT_MS: u64 = 500;
+const SYM_PATHS_SOLUTION_LIMIT: usize = 4;
 
 fn merge_states_enabled() -> bool {
     MERGE_STATES.load(Ordering::Relaxed)
@@ -100,6 +107,31 @@ fn sym_default_config() -> r2sym::ExploreConfig {
     }
 }
 
+fn sym_paths_config(prepared: &r2ssa::SsaArtifact) -> r2sym::ExploreConfig {
+    let mut config = sym_default_config();
+    if prepared.call_sites().by_id.is_empty() {
+        config.max_states = SYM_PATHS_CALL_FREE_MAX_STATES;
+        config.max_depth = SYM_PATHS_CALL_FREE_MAX_DEPTH;
+    } else {
+        config.max_states = SYM_PATHS_CALL_HEAVY_MAX_STATES;
+        config.max_depth = SYM_PATHS_CALL_HEAVY_MAX_DEPTH;
+    }
+    config.timeout = Some(std::time::Duration::from_millis(SYM_PATHS_TIMEOUT_MS));
+    config.max_completed_paths = Some(SYM_PATHS_LIMIT);
+    config
+}
+
+fn sym_paths_solution_limit(result_count: usize, prepared: &r2ssa::SsaArtifact) -> usize {
+    if !prepared.call_sites().by_id.is_empty() {
+        return 0;
+    }
+    if result_count <= SYM_PATHS_SOLUTION_LIMIT {
+        result_count
+    } else {
+        0
+    }
+}
+
 fn sym_error_json(message: &str) -> *mut c_char {
     let payload = format!(r#"{{"error":"{}"}}"#, message);
     CString::new(payload).map_or(ptr::null_mut(), |c| c.into_raw())
@@ -162,6 +194,11 @@ struct SymExecSummary {
     paths_pruned: usize,
     max_depth: usize,
     states_explored: usize,
+    sat_queries: usize,
+    sat_cache_hits: usize,
+    sat_cache_misses: usize,
+    solve_calls: usize,
+    solve_unsat_shortcuts: usize,
     time_ms: u64,
 }
 
@@ -170,7 +207,7 @@ struct SymStateInfo {
     pc: u64,
     depth: usize,
     num_constraints: usize,
-    registers: std::collections::HashMap<String, String>,
+    registers: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -187,15 +224,15 @@ struct PathInfo {
 
 #[derive(Serialize)]
 struct PathSolution {
-    inputs: std::collections::HashMap<String, String>,
-    registers: std::collections::HashMap<String, String>,
+    inputs: BTreeMap<String, String>,
+    registers: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
 struct RunPathSolution {
-    inputs: std::collections::HashMap<String, String>,
-    input_buffers: std::collections::HashMap<String, BufferSolution>,
-    registers: std::collections::HashMap<String, String>,
+    inputs: BTreeMap<String, String>,
+    input_buffers: BTreeMap<String, BufferSolution>,
+    registers: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -253,6 +290,26 @@ struct SymRunResult {
     stash_counts: SymRunStashCounts,
     found_paths: Vec<SymRunPathInfo>,
     diagnostics: Vec<String>,
+}
+
+fn build_sym_exec_summary(
+    stats: &r2sym::path::ExploreStats,
+    solver_stats: &r2sym::SolverStats,
+    paths_feasible: usize,
+) -> SymExecSummary {
+    SymExecSummary {
+        paths_explored: stats.paths_completed,
+        paths_feasible,
+        paths_pruned: stats.paths_pruned,
+        max_depth: stats.max_depth_reached,
+        states_explored: stats.states_explored,
+        sat_queries: solver_stats.sat_queries,
+        sat_cache_hits: solver_stats.sat_cache_hits,
+        sat_cache_misses: solver_stats.sat_cache_misses,
+        solve_calls: solver_stats.solve_calls,
+        solve_unsat_shortcuts: solver_stats.solve_unsat_shortcuts,
+        time_ms: stats.total_time.as_millis() as u64,
+    }
 }
 
 fn path_solution_from_result<'ctx>(
@@ -322,10 +379,11 @@ fn run_path_solution_from_result<'ctx>(
     })
 }
 
-fn path_info_from_result<'ctx>(
+fn path_info_from_result_with_solution<'ctx>(
     path_id: usize,
     result: &r2sym::PathResult<'ctx>,
     explorer: &r2sym::PathExplorer<'ctx>,
+    include_solution: bool,
 ) -> PathInfo {
     PathInfo {
         path_id,
@@ -334,8 +392,18 @@ fn path_info_from_result<'ctx>(
         exit_status: format!("{:?}", result.exit_status),
         final_pc: format!("0x{:x}", result.final_pc()),
         num_constraints: result.num_constraints(),
-        solution: path_solution_from_result(explorer, result),
+        solution: include_solution
+            .then(|| path_solution_from_result(explorer, result))
+            .flatten(),
     }
+}
+
+fn path_info_from_result<'ctx>(
+    path_id: usize,
+    result: &r2sym::PathResult<'ctx>,
+    explorer: &r2sym::PathExplorer<'ctx>,
+) -> PathInfo {
+    path_info_from_result_with_solution(path_id, result, explorer, true)
 }
 
 fn run_path_info_from_result<'ctx>(
@@ -408,9 +476,12 @@ pub extern "C" fn r2sym_function(
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_default_config());
+        let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_paths_config(&prepared));
         if let Some(arch) = ctx_view.arch
-            && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
+            && let Some(registry) = r2sym::SummaryRegistry::with_profile_for_arch(
+                arch,
+                r2sym::SummaryProfile::PathListing,
+            )
         {
             let interproc = build_seed_interproc_summary_set(&prepared, &symbol_map);
             let _ =
@@ -424,10 +495,11 @@ pub extern "C" fn r2sym_function(
         }
         let results = explorer.explore(&prepared, initial_state);
         let stats = explorer.stats().clone();
-        (results, stats)
+        let solver_stats = explorer.solver().stats();
+        (results, stats, solver_stats)
     }));
 
-    let (results, stats) = match explore_result {
+    let (results, stats, solver_stats) = match explore_result {
         Ok(r) => r,
         Err(_) => {
             let error_msg = r#"{"error": "symbolic execution failed (z3 context error)"}"#;
@@ -436,14 +508,7 @@ pub extern "C" fn r2sym_function(
     };
 
     let feasible_count = results.iter().filter(|r| r.feasible).count();
-    let summary = SymExecSummary {
-        paths_explored: stats.paths_completed,
-        paths_feasible: feasible_count,
-        paths_pruned: stats.paths_pruned,
-        max_depth: stats.max_depth_reached,
-        states_explored: stats.states_explored,
-        time_ms: stats.total_time.as_millis() as u64,
-    };
+    let summary = build_sym_exec_summary(&stats, &solver_stats, feasible_count);
     match serde_json::to_string_pretty(&summary) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
@@ -460,7 +525,7 @@ pub extern "C" fn r2sym_state_json(state: *const R2SymContext) -> *mut c_char {
         pc: state_ref.entry_pc,
         depth: 0,
         num_constraints: 0,
-        registers: std::collections::HashMap::new(),
+        registers: BTreeMap::new(),
     };
     match serde_json::to_string_pretty(&info) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
@@ -492,9 +557,12 @@ pub extern "C" fn r2sym_paths(
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_default_config());
+        let mut explorer = r2sym::PathExplorer::with_config(&z3_ctx, sym_paths_config(&prepared));
         if let Some(arch) = ctx_view.arch
-            && let Some(registry) = r2sym::SummaryRegistry::with_core_for_arch(arch)
+            && let Some(registry) = r2sym::SummaryRegistry::with_profile_for_arch(
+                arch,
+                r2sym::SummaryProfile::PathListing,
+            )
         {
             let interproc = build_seed_interproc_summary_set(&prepared, &symbol_map);
             let _ =
@@ -518,10 +586,11 @@ pub extern "C" fn r2sym_paths(
         }
     };
 
+    let solution_limit = sym_paths_solution_limit(results.len(), &prepared);
     let paths: Vec<PathInfo> = results
         .iter()
         .enumerate()
-        .map(|(i, r)| path_info_from_result(i, r, &explorer))
+        .map(|(i, r)| path_info_from_result_with_solution(i, r, &explorer, i < solution_limit))
         .collect();
     match serde_json::to_string_pretty(&paths) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
@@ -570,15 +639,16 @@ pub extern "C" fn r2sym_explore_to(
         }
         let matched = explorer.find_paths_to(&prepared, initial_state, target_addr);
         let stats = explorer.stats().clone();
+        let solver_stats = explorer.solver().stats();
         let paths: Vec<PathInfo> = matched
             .iter()
             .enumerate()
             .map(|(i, r)| path_info_from_result(i, r, &explorer))
             .collect();
-        (paths, stats)
+        (paths, stats, solver_stats)
     }));
 
-    let (paths, stats) = match explore_result {
+    let (paths, stats, solver_stats) = match explore_result {
         Ok(value) => value,
         Err(_) => return sym_error_json("symbolic execution failed (z3 context error)"),
     };
@@ -586,14 +656,7 @@ pub extern "C" fn r2sym_explore_to(
         entry: format!("0x{:x}", entry_addr),
         target: format!("0x{:x}", target_addr),
         matched_paths: paths.len(),
-        stats: SymExecSummary {
-            paths_explored: stats.paths_completed,
-            paths_feasible: paths.len(),
-            paths_pruned: stats.paths_pruned,
-            max_depth: stats.max_depth_reached,
-            states_explored: stats.states_explored,
-            time_ms: stats.total_time.as_millis() as u64,
-        },
+        stats: build_sym_exec_summary(&stats, &solver_stats, paths.len()),
         paths,
     };
 
@@ -644,15 +707,16 @@ pub extern "C" fn r2sym_solve_to(
         }
         let matched = explorer.find_paths_to(&prepared, initial_state, target_addr);
         let stats = explorer.stats().clone();
+        let solver_stats = explorer.solver().stats();
         let selected = matched
             .iter()
             .enumerate()
             .min_by_key(|(idx, path)| (path.num_constraints(), path.depth, *idx))
             .map(|(idx, path)| path_info_from_result(idx, path, &explorer));
-        (matched.len(), selected, stats)
+        (matched.len(), selected, stats, solver_stats)
     }));
 
-    let (matched_paths, selected_path, stats) = match solve_result {
+    let (matched_paths, selected_path, stats, solver_stats) = match solve_result {
         Ok(value) => value,
         Err(_) => return sym_error_json("symbolic execution failed (z3 context error)"),
     };
@@ -661,14 +725,7 @@ pub extern "C" fn r2sym_solve_to(
         target: format!("0x{:x}", target_addr),
         matched_paths,
         found: selected_path.is_some(),
-        stats: SymExecSummary {
-            paths_explored: stats.paths_completed,
-            paths_feasible: matched_paths,
-            paths_pruned: stats.paths_pruned,
-            max_depth: stats.max_depth_reached,
-            states_explored: stats.states_explored,
-            time_ms: stats.total_time.as_millis() as u64,
-        },
+        stats: build_sym_exec_summary(&stats, &solver_stats, matched_paths),
         selected_path,
     };
 
@@ -729,16 +786,17 @@ pub extern "C" fn r2sym_run_spec_json(
         install_symbolic_hooks(&mut explorer, &prepared, ctx_view.arch, &symbol_map);
         let result = explorer.run_spec(&prepared, initial_state, &spec)?;
         let stats = explorer.stats().clone();
+        let solver_stats = explorer.solver().stats();
         let found_paths = result
             .found_paths
             .iter()
             .enumerate()
             .map(|(idx, path)| run_path_info_from_result(idx, path, &explorer))
             .collect::<Vec<_>>();
-        Ok::<_, String>((result, stats, found_paths))
+        Ok::<_, String>((result, stats, solver_stats, found_paths))
     }));
 
-    let (result, stats, found_paths) = match run_result {
+    let (result, stats, solver_stats, found_paths) = match run_result {
         Ok(Ok(value)) => value,
         Ok(Err(err)) => return sym_error_json(&err),
         Err(_) => return sym_error_json("symbolic execution failed (z3 context error)"),
@@ -747,14 +805,7 @@ pub extern "C" fn r2sym_run_spec_json(
     let output = SymRunResult {
         entry: format!("0x{:x}", entry_addr),
         spec,
-        stats: SymExecSummary {
-            paths_explored: stats.paths_completed,
-            paths_feasible: found_paths.len(),
-            paths_pruned: stats.paths_pruned,
-            max_depth: stats.max_depth_reached,
-            states_explored: stats.states_explored,
-            time_ms: stats.total_time.as_millis() as u64,
-        },
+        stats: build_sym_exec_summary(&stats, &solver_stats, found_paths.len()),
         stash_counts: SymRunStashCounts {
             found: found_paths.len(),
             avoided: result.avoided_states,

@@ -7,7 +7,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s `afl~parse_number$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'type=="array"'
+a:sla.sym.paths | jq -c 'type=="array" and length>0 and length<=32'
 EOF_CMDS
 RUN
 
@@ -143,6 +143,19 @@ a:sla.sym | jq -c 'has("paths_explored") and has("paths_feasible") and has("stat
 EOF_CMDS
 RUN
 
+NAME=symbolic_check_secret_has_solver_cache_stats
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~check_secret$[0]` >/dev/null
+a:sla.sym | jq -c 'has("sat_queries") and has("sat_cache_hits") and has("sat_cache_misses") and has("solve_unsat_shortcuts")'
+EOF_CMDS
+RUN
+
 NAME=symbolic_unlock_has_paths_explored
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -206,7 +219,7 @@ aaa
 s `afl~check_secret$[0]` >/dev/null
 s `afl~check_secret$[0]` >/dev/null
 s `afl~check_secret$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (.[0]|has("path_id") and has("feasible") and has("solution") and has("exit_status"))'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (.[0]|has("path_id") and has("feasible") and has("solution") and has("exit_status"))'
 EOF_CMDS
 RUN
 
@@ -221,7 +234,7 @@ aaa
 s `afl~check_secret$[0]` >/dev/null
 s `afl~check_secret$[0]` >/dev/null
 s `afl~check_secret$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'tostring|contains("0xdead")'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (tostring|contains("0xdead"))'
 EOF_CMDS
 RUN
 
@@ -236,7 +249,7 @@ aaa
 s `afl~solve_equation$[0]` >/dev/null
 s `afl~solve_equation$[0]` >/dev/null
 s `afl~solve_equation$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'tostring|contains("0xa")'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (tostring|contains("0xa"))'
 EOF_CMDS
 RUN
 
@@ -251,7 +264,7 @@ aaa
 s `afl~bitwise_check$[0]` >/dev/null
 s `afl~bitwise_check$[0]` >/dev/null
 s `afl~bitwise_check$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'tostring|contains("0x5a")'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (tostring|contains("0x5a"))'
 EOF_CMDS
 RUN
 
@@ -309,7 +322,7 @@ aaa
 s `afl~check_secret$[0]` >/dev/null
 s `afl~check_secret$[0]` >/dev/null
 s `afl~check_secret$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'type=="array"'
+a:sla.sym.paths | jq -c 'type=="array" and length>0 and length<=32'
 EOF_CMDS
 RUN
 
@@ -379,7 +392,7 @@ aaa
 s `afl~process_string$[0]` >/dev/null
 s `afl~process_string$[0]` >/dev/null
 s `afl~process_string$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (map(has("error")|not)|all)'
 EOF_CMDS
 RUN
 
@@ -394,7 +407,7 @@ aaa
 s `afl~authenticate$[0]` >/dev/null
 s `afl~authenticate$[0]` >/dev/null
 s `afl~authenticate$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (map(has("error")|not)|all)'
 EOF_CMDS
 RUN
 
@@ -409,7 +422,7 @@ aaa
 s `afl~alloc_and_copy$[0]` >/dev/null
 s `afl~alloc_and_copy$[0]` >/dev/null
 s `afl~alloc_and_copy$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (map(has("error")|not)|all)'
 EOF_CMDS
 RUN
 
@@ -424,7 +437,7 @@ aaa
 s `afl~vuln_printf$[0]` >/dev/null
 s `afl~vuln_printf$[0]` >/dev/null
 s `afl~vuln_printf$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (map(has("error")|not)|all)'
 EOF_CMDS
 RUN
 
@@ -439,7 +452,7 @@ aaa
 s `afl~vuln_memcpy$[0]` >/dev/null
 s `afl~vuln_memcpy$[0]` >/dev/null
 s `afl~vuln_memcpy$[0]` >/dev/null
-a:sla.sym.paths | jq -c 'length>0 and (map(has("error")|not)|all)'
+a:sla.sym.paths | jq -c 'length>0 and length<=32 and (map(has("error")|not)|all)'
 EOF_CMDS
 RUN
 
