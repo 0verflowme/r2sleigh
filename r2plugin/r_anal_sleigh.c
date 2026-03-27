@@ -85,6 +85,60 @@ extern char *r2sym_solve_to(const R2ILContext *ctx, const R2ILBlock **blocks, si
 	unsigned long long entry_addr, unsigned long long target_addr);
 extern char *r2sym_run_spec_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long entry_addr, const char *spec_json);
+typedef struct {
+	unsigned long long entry_addr;
+	const char *name;
+	const R2ILBlock **blocks;
+	size_t num_blocks;
+} R2ILFunctionBlocks;
+typedef struct {
+	const char *name;
+	unsigned long long value;
+} R2SymReplayRegister;
+typedef struct {
+	unsigned long long addr;
+	const unsigned char *bytes;
+	size_t size;
+	const char *label;
+} R2SymReplayMemoryWindow;
+typedef struct {
+	const char *name;
+	const char *symbol;
+} R2SymReplayRegisterOverlay;
+typedef struct {
+	unsigned long long addr;
+	unsigned int size;
+	const char *name;
+} R2SymReplayMemoryOverlay;
+typedef struct {
+	unsigned long long checkpoint_id;
+	unsigned long long entry_addr;
+	const R2SymReplayRegister *registers;
+	size_t num_registers;
+	const R2SymReplayMemoryWindow *memory;
+	size_t num_memory;
+	const R2SymReplayRegisterOverlay *register_overlays;
+	size_t num_register_overlays;
+	const R2SymReplayMemoryOverlay *memory_overlays;
+	size_t num_memory_overlays;
+	const int *tty_fds;
+	size_t num_tty_fds;
+	int skip_sleep_calls;
+} R2SymReplaySeed;
+extern char *r2sym_function_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr);
+extern char *r2sym_paths_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr);
+extern char *r2sym_explore_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr);
+extern char *r2sym_solve_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr);
+extern char *r2sym_explore_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed);
+extern char *r2sym_solve_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed);
+extern char *r2sym_compile_semantics_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr);
+extern char *r2sym_run_spec_json_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, const char *spec_json);
 extern int r2sym_set_symbol_map_json(const char *json);
 extern int r2sym_merge_is_enabled(void);
 extern void r2sym_merge_set_enabled(int enabled);
@@ -94,6 +148,10 @@ extern char *r2dec_function_with_context(const R2ILContext *ctx, const R2ILBlock
                                           const char *func_name, const char *func_names_json,
                                           const char *strings_json, const char *symbols_json,
                                           const char *external_context_json);
+extern char *r2dec_function_with_context_scope(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *func_name, const char *func_names_json,
+	const char *strings_json, const char *symbols_json, const char *external_context_json,
+	const R2ILFunctionBlocks *functions, size_t num_functions);
 
 /* CFG */
 extern char *r2cfg_function_ascii(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
@@ -112,6 +170,10 @@ extern char *r2sleigh_infer_type_writeback_json(const R2ILContext *ctx, const R2
 extern char *r2sleigh_infer_type_writeback_json_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
 	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json);
+extern char *r2sleigh_infer_type_writeback_json_scope_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
+	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json,
+	const R2ILFunctionBlocks *functions, size_t num_functions);
 extern char *r2sleigh_get_direct_call_targets_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name);
 extern int r2sleigh_alias_function_analysis_artifact_cache(const R2ILContext *ctx, const R2ILBlock **blocks,
@@ -243,6 +305,18 @@ typedef struct {
 	size_t capacity;
 } BlockArray;
 
+#define SLEIGH_SYM_HELPER_MAX_FUNCTIONS 16
+#define SLEIGH_SCOPE_HELPER_MAX_BLOCKS 64
+#define SLEIGH_SCOPE_HELPER_MAX_COST 256
+
+typedef struct {
+	R2ILFunctionBlocks *functions;
+	BlockArray *owned_blocks;
+	char **owned_names;
+	size_t count;
+	size_t capacity;
+} SymFunctionScope;
+
 static char *build_type_interproc_scope_json(
 	RCore *core,
 	RAnal *anal,
@@ -269,6 +343,21 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	ut64 fcn_addr,
 	const char *fcn_name,
 	size_t *out_count
+);
+static void sym_function_scope_init(SymFunctionScope *scope);
+static void sym_function_scope_free(SymFunctionScope *scope);
+static bool sym_function_scope_ensure_capacity(SymFunctionScope *scope, size_t needed);
+static bool sym_function_scope_append(
+	SymFunctionScope *scope,
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx
+);
+static bool build_symbolic_function_scope(
+	RAnal *anal,
+	RAnalFunction *root_fcn,
+	R2ILContext *ctx,
+	SymFunctionScope *scope
 );
 
 static void block_array_init(BlockArray *arr) {
@@ -953,6 +1042,43 @@ static bool parse_sym_target_expr(RCore *core, const char *expr, ut64 *target) {
 	return true;
 }
 
+static bool parse_replay_target_and_json(RCore *core, const char *arg, ut64 *target, char **out_json) {
+	char *owned = NULL;
+	char *json = NULL;
+	char *sep;
+	const char *json_start;
+	if (!core || !arg || !*arg || !target || !out_json) {
+		return false;
+	}
+	*out_json = NULL;
+	owned = strdup (arg);
+	if (!owned) {
+		return false;
+	}
+	sep = owned;
+	while (*sep && !isspace ((unsigned char)*sep)) {
+		sep++;
+	}
+	if (!*sep) {
+		free (owned);
+		return false;
+	}
+	*sep++ = '\0';
+	json_start = skip_cmd_spaces (sep);
+	if (!*json_start || !parse_sym_target_expr (core, owned, target)) {
+		free (owned);
+		return false;
+	}
+	json = strdup (json_start);
+	free (owned);
+	if (!json) {
+		return false;
+	}
+	r_str_unescape (json);
+	*out_json = json;
+	return true;
+}
+
 typedef enum {
 	REPLAY_EXPR_CONST = 0,
 	REPLAY_EXPR_REG,
@@ -1067,6 +1193,30 @@ typedef struct {
 	size_t stop_count;
 	bool big_endian;
 } ReplaySearchSpec;
+
+typedef struct {
+	char *name;
+	char *symbol;
+} ReplaySymRegisterOverlay;
+
+typedef struct {
+	ut64 addr;
+	ut32 size;
+	char *name;
+} ReplaySymMemoryOverlay;
+
+typedef struct {
+	ut64 checkpoint_id;
+	ut64 entry_addr;
+	RDebugStateRequest *snapshot_request;
+	ReplaySymRegisterOverlay *register_overlays;
+	size_t register_overlay_count;
+	ReplaySymMemoryOverlay *memory_overlays;
+	size_t memory_overlay_count;
+	int *tty_fds;
+	size_t tty_fd_count;
+	bool skip_sleep_calls;
+} ReplaySymSeedSpec;
 
 typedef struct {
 	ut64 checkpoint_id;
@@ -1494,10 +1644,9 @@ static bool replay_state_request_add_reg(RDebugStateRequest *request, const char
 	return true;
 }
 
-static bool replay_state_request_add_mem(RDebugStateRequest *request, ut64 addr, int width_bits) {
+static bool replay_state_request_add_mem_range(RDebugStateRequest *request, ut64 addr, ut32 size, const char *label) {
 	RListIter *iter;
 	RDebugStateMemSpec *spec;
-	ut32 size = (ut32)(width_bits / 8);
 	if (!request || !size) {
 		return false;
 	}
@@ -1512,7 +1661,38 @@ static bool replay_state_request_add_mem(RDebugStateRequest *request, ut64 addr,
 	}
 	spec->addr = addr;
 	spec->size = size;
+	if (label && *label) {
+		spec->label = strdup (label);
+		if (!spec->label) {
+			r_debug_state_mem_spec_free (spec);
+			return false;
+		}
+	}
 	r_list_append (request->memory, spec);
+	return true;
+}
+
+static bool replay_state_request_add_mem(RDebugStateRequest *request, ut64 addr, int width_bits) {
+	ut32 size = (ut32)(width_bits / 8);
+	return replay_state_request_add_mem_range (request, addr, size, NULL);
+}
+
+static bool replay_state_request_add_all_gprs(RDebug *dbg, RDebugStateRequest *request) {
+	RListIter *iter;
+	RRegItem *item;
+	RList *regs;
+	if (!dbg || !dbg->reg || !request) {
+		return false;
+	}
+	regs = r_reg_get_list (dbg->reg, R_REG_TYPE_GPR);
+	if (!regs) {
+		return false;
+	}
+	r_list_foreach (regs, iter, item) {
+		if (item && item->name && !replay_state_request_add_reg (request, item->name)) {
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -1579,6 +1759,403 @@ static void replay_search_spec_fini(ReplaySearchSpec *spec) {
 	spec->stop_addrs = NULL;
 	spec->frontier_stop_count = 0;
 	spec->stop_count = 0;
+}
+
+static void replay_sym_seed_spec_fini(ReplaySymSeedSpec *spec) {
+	size_t i;
+	if (!spec) {
+		return;
+	}
+	r_debug_state_request_free (spec->snapshot_request);
+	spec->snapshot_request = NULL;
+	for (i = 0; i < spec->register_overlay_count; i++) {
+		free (spec->register_overlays[i].name);
+		free (spec->register_overlays[i].symbol);
+	}
+	free (spec->register_overlays);
+	spec->register_overlays = NULL;
+	spec->register_overlay_count = 0;
+	for (i = 0; i < spec->memory_overlay_count; i++) {
+		free (spec->memory_overlays[i].name);
+	}
+	free (spec->memory_overlays);
+	spec->memory_overlays = NULL;
+	spec->memory_overlay_count = 0;
+	free (spec->tty_fds);
+	spec->tty_fds = NULL;
+	spec->tty_fd_count = 0;
+	spec->checkpoint_id = 0;
+	spec->entry_addr = 0;
+	spec->skip_sleep_calls = false;
+}
+
+static bool replay_sym_seed_add_register_overlay(ReplaySymSeedSpec *spec, const char *name, const char *symbol) {
+	ReplaySymRegisterOverlay *next;
+	size_t index;
+	if (!spec || !name || !*name || !symbol || !*symbol) {
+		return false;
+	}
+	next = realloc (spec->register_overlays, (spec->register_overlay_count + 1) * sizeof (*next));
+	if (!next) {
+		return false;
+	}
+	spec->register_overlays = next;
+	index = spec->register_overlay_count++;
+	memset (&spec->register_overlays[index], 0, sizeof (spec->register_overlays[index]));
+	spec->register_overlays[index].name = strdup (name);
+	spec->register_overlays[index].symbol = strdup (symbol);
+	if (!spec->register_overlays[index].name || !spec->register_overlays[index].symbol) {
+		free (spec->register_overlays[index].name);
+		free (spec->register_overlays[index].symbol);
+		spec->register_overlays[index].name = NULL;
+		spec->register_overlays[index].symbol = NULL;
+		spec->register_overlay_count--;
+		return false;
+	}
+	return true;
+}
+
+static bool replay_sym_seed_add_memory_overlay(ReplaySymSeedSpec *spec, ut64 addr, ut32 size, const char *name) {
+	ReplaySymMemoryOverlay *next;
+	size_t index;
+	if (!spec || !size || !name || !*name) {
+		return false;
+	}
+	next = realloc (spec->memory_overlays, (spec->memory_overlay_count + 1) * sizeof (*next));
+	if (!next) {
+		return false;
+	}
+	spec->memory_overlays = next;
+	index = spec->memory_overlay_count++;
+	memset (&spec->memory_overlays[index], 0, sizeof (spec->memory_overlays[index]));
+	spec->memory_overlays[index].addr = addr;
+	spec->memory_overlays[index].size = size;
+	spec->memory_overlays[index].name = strdup (name);
+	if (!spec->memory_overlays[index].name) {
+		spec->memory_overlay_count--;
+		return false;
+	}
+	return true;
+}
+
+static bool replay_sym_seed_add_tty_fd(ReplaySymSeedSpec *spec, int fd) {
+	int *next;
+	if (!spec) {
+		return false;
+	}
+	next = realloc (spec->tty_fds, (spec->tty_fd_count + 1) * sizeof (*next));
+	if (!next) {
+		return false;
+	}
+	spec->tty_fds = next;
+	spec->tty_fds[spec->tty_fd_count++] = fd;
+	return true;
+}
+
+static bool replay_sym_seed_spec_parse(RCore *core, const char *json, ReplaySymSeedSpec *spec) {
+	char *json_copy;
+	char *owned_json = NULL;
+	RJson *root;
+	const RJson *value;
+	size_t i;
+
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && json && spec, false);
+	memset (spec, 0, sizeof (*spec));
+	spec->snapshot_request = replay_state_request_new ();
+	if (!spec->snapshot_request || !replay_state_request_add_all_gprs (core->dbg, spec->snapshot_request)) {
+		replay_sym_seed_spec_fini (spec);
+		return false;
+	}
+
+	json_copy = strdup (json);
+	if (!json_copy) {
+		replay_sym_seed_spec_fini (spec);
+		return false;
+	}
+	owned_json = json_copy;
+	root = r_json_parse (json_copy);
+	if (!root || root->type != R_JSON_OBJECT) {
+		R_LOG_ERROR ("r2sleigh replay sym seed: json root parse failed");
+		free (owned_json);
+		r_json_free (root);
+		replay_sym_seed_spec_fini (spec);
+		return false;
+	}
+
+	value = r_json_get (root, "checkpoint");
+	if (!value) {
+		value = r_json_get (root, "seed_checkpoint");
+	}
+	if (!replay_parse_addr_expr (core, value, &spec->checkpoint_id) || !spec->checkpoint_id) {
+		R_LOG_ERROR ("r2sleigh replay sym seed: missing/invalid checkpoint");
+		goto fail;
+	}
+	value = r_json_get (root, "entry");
+	if (value && !replay_parse_addr_expr (core, value, &spec->entry_addr)) {
+		R_LOG_ERROR ("r2sleigh replay sym seed: invalid entry");
+		goto fail;
+	}
+	value = r_json_get (root, "skip_sleep");
+	if (value) {
+		if (value->type != R_JSON_BOOLEAN) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid skip_sleep");
+			goto fail;
+		}
+		spec->skip_sleep_calls = value->num.u_value;
+	}
+	value = r_json_get (root, "tty_fds");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid tty_fds");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			st64 fd = 0;
+			if (!replay_parse_num_expr (core, item, &fd)) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid tty fd");
+				goto fail;
+			}
+			if (!replay_sym_seed_add_tty_fd (spec, (int)fd)) {
+				goto fail;
+			}
+		}
+	}
+	value = r_json_get (root, "memory");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid memory");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			const RJson *label_json;
+			char *label = NULL;
+			ut64 addr = 0;
+			st64 size_value = 0;
+			if (!item || item->type != R_JSON_OBJECT) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid memory item");
+				goto fail;
+			}
+			if (!replay_parse_addr_expr (core, r_json_get (item, "addr"), &addr)
+				|| !replay_parse_num_expr (core, r_json_get (item, "size"), &size_value)
+				|| size_value <= 0 || size_value > UT32_MAX) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid memory window");
+				goto fail;
+			}
+			label_json = r_json_get (item, "label");
+			if (label_json && label_json->type == R_JSON_STRING && label_json->str_value) {
+				label = strdup (label_json->str_value);
+				if (!label) {
+					goto fail;
+				}
+			}
+			if (!replay_state_request_add_mem_range (spec->snapshot_request, addr, (ut32)size_value, label)) {
+				free (label);
+				goto fail;
+			}
+			free (label);
+		}
+	}
+	value = r_json_get (root, "symbolic_registers");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic_registers");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			const char *name = NULL;
+			const char *symbol = NULL;
+			char default_symbol[128];
+			if (!item) {
+				goto fail;
+			}
+			if (item->type == R_JSON_STRING && item->str_value) {
+				name = item->str_value;
+			} else if (item->type == R_JSON_OBJECT) {
+				const RJson *name_json = r_json_get (item, "name");
+				const RJson *symbol_json = r_json_get (item, "symbol");
+				if (name_json && name_json->type == R_JSON_STRING) {
+					name = name_json->str_value;
+				}
+				if (symbol_json && symbol_json->type == R_JSON_STRING) {
+					symbol = symbol_json->str_value;
+				}
+			}
+			if (!name || !*name) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic register");
+				goto fail;
+			}
+			if (!symbol || !*symbol) {
+				snprintf (default_symbol, sizeof (default_symbol), "replay_%s", name);
+				symbol = default_symbol;
+			}
+			if (!replay_sym_seed_add_register_overlay (spec, name, symbol)) {
+				goto fail;
+			}
+		}
+	}
+	value = r_json_get (root, "symbolic_memory");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic_memory");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			const RJson *name_json;
+			char default_name[128];
+			const char *name = NULL;
+			ut64 addr = 0;
+			st64 size_value = 0;
+			if (!item || item->type != R_JSON_OBJECT) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic memory item");
+				goto fail;
+			}
+			if (!replay_parse_addr_expr (core, r_json_get (item, "addr"), &addr)
+				|| !replay_parse_num_expr (core, r_json_get (item, "size"), &size_value)
+				|| size_value <= 0 || size_value > UT32_MAX) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic memory window");
+				goto fail;
+			}
+			name_json = r_json_get (item, "name");
+			if (name_json && name_json->type == R_JSON_STRING && name_json->str_value) {
+				name = name_json->str_value;
+			} else {
+				snprintf (default_name, sizeof (default_name), "replay_mem_%zu", i);
+				name = default_name;
+			}
+			if (!replay_state_request_add_mem_range (spec->snapshot_request, addr, (ut32)size_value, name)
+				|| !replay_sym_seed_add_memory_overlay (spec, addr, (ut32)size_value, name)) {
+				goto fail;
+			}
+		}
+	}
+
+	free (owned_json);
+	r_json_free (root);
+	return true;
+
+fail:
+	free (owned_json);
+	r_json_free (root);
+	replay_sym_seed_spec_fini (spec);
+	return false;
+}
+
+static RDebugStateSnapshot *replay_sym_collect_seed_snapshot(RCore *core, const ReplaySymSeedSpec *spec) {
+	RDebugStateSnapshot *snapshot;
+	ut64 previous_checkpoint;
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->session && spec && spec->snapshot_request, NULL);
+	previous_checkpoint = core->dbg->session->current_checkpoint_id;
+	if (!r_debug_session_restore_checkpoint (core->dbg, spec->checkpoint_id)) {
+		return NULL;
+	}
+	snapshot = r_debug_state_snapshot_collect (core->dbg, spec->snapshot_request);
+	if (previous_checkpoint != UT64_MAX && previous_checkpoint != spec->checkpoint_id) {
+		r_debug_session_restore_checkpoint (core->dbg, previous_checkpoint);
+	}
+	return snapshot;
+}
+
+static char *replay_sym_query_run(RCore *core, const R2ILContext *ctx, const SymFunctionScope *scope,
+	ut64 entry_addr, ut64 target_addr, const ReplaySymSeedSpec *spec, bool is_explore) {
+	RDebugStateSnapshot *snapshot = NULL;
+	R2SymReplayRegister *registers = NULL;
+	R2SymReplayMemoryWindow *memory = NULL;
+	R2SymReplayRegisterOverlay *register_overlays = NULL;
+	R2SymReplayMemoryOverlay *memory_overlays = NULL;
+	R2SymReplaySeed seed = {0};
+	RListIter *iter;
+	RDebugStateRegValue *reg;
+	RDebugStateMemValue *memv;
+	size_t reg_count = 0;
+	size_t mem_count = 0;
+	size_t idx = 0;
+	char *result = NULL;
+
+	R_RETURN_VAL_IF_FAIL (core && ctx && scope && spec, NULL);
+
+	snapshot = replay_sym_collect_seed_snapshot (core, spec);
+	if (!snapshot) {
+		return NULL;
+	}
+	r_list_foreach (snapshot->registers, iter, reg) {
+		if (reg && reg->found && reg->name) {
+			reg_count++;
+		}
+	}
+	r_list_foreach (snapshot->memory, iter, memv) {
+		if (memv && memv->ok && memv->bytes && memv->size > 0) {
+			mem_count++;
+		}
+	}
+	registers = reg_count? calloc (reg_count, sizeof (*registers)): NULL;
+	memory = mem_count? calloc (mem_count, sizeof (*memory)): NULL;
+	register_overlays = spec->register_overlay_count? calloc (spec->register_overlay_count, sizeof (*register_overlays)): NULL;
+	memory_overlays = spec->memory_overlay_count? calloc (spec->memory_overlay_count, sizeof (*memory_overlays)): NULL;
+	if ((reg_count && !registers) || (mem_count && !memory)
+		|| (spec->register_overlay_count && !register_overlays)
+		|| (spec->memory_overlay_count && !memory_overlays)) {
+		goto cleanup;
+	}
+
+	idx = 0;
+	r_list_foreach (snapshot->registers, iter, reg) {
+		if (!reg || !reg->found || !reg->name) {
+			continue;
+		}
+		registers[idx].name = reg->name;
+		registers[idx].value = reg->value;
+		idx++;
+	}
+	idx = 0;
+	r_list_foreach (snapshot->memory, iter, memv) {
+		if (!memv || !memv->ok || !memv->bytes || !memv->size) {
+			continue;
+		}
+		memory[idx].addr = memv->addr;
+		memory[idx].bytes = memv->bytes;
+		memory[idx].size = memv->size;
+		memory[idx].label = memv->label;
+		idx++;
+	}
+	for (idx = 0; idx < spec->register_overlay_count; idx++) {
+		register_overlays[idx].name = spec->register_overlays[idx].name;
+		register_overlays[idx].symbol = spec->register_overlays[idx].symbol;
+	}
+	for (idx = 0; idx < spec->memory_overlay_count; idx++) {
+		memory_overlays[idx].addr = spec->memory_overlays[idx].addr;
+		memory_overlays[idx].size = spec->memory_overlays[idx].size;
+		memory_overlays[idx].name = spec->memory_overlays[idx].name;
+	}
+
+	seed.checkpoint_id = spec->checkpoint_id;
+	seed.entry_addr = spec->entry_addr? spec->entry_addr: snapshot->pc;
+	seed.registers = registers;
+	seed.num_registers = reg_count;
+	seed.memory = memory;
+	seed.num_memory = mem_count;
+	seed.register_overlays = register_overlays;
+	seed.num_register_overlays = spec->register_overlay_count;
+	seed.memory_overlays = memory_overlays;
+	seed.num_memory_overlays = spec->memory_overlay_count;
+	seed.tty_fds = spec->tty_fds;
+	seed.num_tty_fds = spec->tty_fd_count;
+	seed.skip_sleep_calls = spec->skip_sleep_calls? 1: 0;
+
+	result = is_explore
+		? r2sym_explore_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed)
+		: r2sym_solve_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed);
+
+cleanup:
+	free (registers);
+	free (memory);
+	free (register_overlays);
+	free (memory_overlays);
+	r_debug_state_snapshot_free (snapshot);
+	return result;
 }
 
 static void replay_search_node_free(ReplaySearchNode *node) {
@@ -2401,7 +2978,65 @@ static RAnalFunction *resolve_function_target_by_name(RAnal *anal, const char *t
 	return fcn;
 }
 
-static RAnalFunction *resolve_function_target(RCore *core, RAnal *anal, const char *target_arg) {
+static int function_bb_count(const RAnalFunction *fcn) {
+	return (fcn && fcn->bbs)? r_list_length (fcn->bbs): 0;
+}
+
+static bool function_exceeds_helper_scope_budget(const RAnalFunction *fcn) {
+	ut32 cost;
+	int bb_count;
+	if (!fcn) {
+		return true;
+	}
+	bb_count = function_bb_count (fcn);
+	if (bb_count > SLEIGH_SCOPE_HELPER_MAX_BLOCKS) {
+		return true;
+	}
+	cost = r_anal_function_cost ((RAnalFunction *)fcn);
+	return cost > SLEIGH_SCOPE_HELPER_MAX_COST;
+}
+
+static RAnalFunction *materialize_function_at(RAnal *anal, ut64 addr) {
+	RAnalFunction *fcn;
+	int ret;
+	RCore *core;
+
+	if (!anal || addr == UT64_MAX) {
+		return NULL;
+	}
+
+	fcn = r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+	if (fcn) {
+		return fcn;
+	}
+
+	core = anal->coreb.core;
+	if (core) {
+		if (r_core_anal_fcn (core, addr, UT64_MAX, R_ANAL_REF_TYPE_NULL, 1)) {
+			fcn = r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+			if (fcn) {
+				return fcn;
+			}
+		}
+	}
+
+	fcn = r_anal_create_function (anal, NULL, addr, R_ANAL_FCN_TYPE_FCN, NULL);
+	if (!fcn) {
+		return r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+	}
+
+	ret = r_anal_function (anal, fcn, addr, R_ANAL_REF_TYPE_NULL);
+	if ((ret < 0 && ret != R_ANAL_RET_END) || function_bb_count (fcn) <= 0) {
+		if (!r_anal_function_delete (anal, fcn)) {
+			r_anal_function_free (fcn);
+		}
+		return NULL;
+	}
+
+	return r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+}
+
+static RAnalFunction *resolve_or_materialize_function_target(RCore *core, RAnal *anal, const char *target_arg) {
 	ut64 target_addr = 0;
 	RAnalFunction *fcn;
 
@@ -2417,7 +3052,14 @@ static RAnalFunction *resolve_function_target(RCore *core, RAnal *anal, const ch
 	if (!parse_sym_target_expr (core, target_arg, &target_addr)) {
 		return NULL;
 	}
-	return r_anal_get_fcn_in (anal, target_addr, R_ANAL_FCN_TYPE_ANY);
+	return materialize_function_at (anal, target_addr);
+}
+
+static RAnalFunction *resolve_or_materialize_current_function(RCore *core, RAnal *anal) {
+	if (!core || !anal) {
+		return NULL;
+	}
+	return materialize_function_at (anal, core->addr);
 }
 
 static char *build_sym_symbol_map_json(RCore *core) {
@@ -5498,14 +6140,14 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sla.vars   - Show all varnodes used by instruction");
 			r_cons_println (cons, "| a:sla.ssa    - Show SSA form of instruction");
 			r_cons_println (cons, "| a:sla.defuse - Show def-use analysis of instruction");
-			r_cons_println (cons, "| a:sla.types  - Dump inferred type write-back payload for current function");
+			r_cons_println (cons, "| a:sla.types [name|addr] - Dump inferred type write-back payload (current by default)");
 			r_cons_println (cons, "| a:sla.ssa.func - Show function SSA with phi nodes");
 				r_cons_println (cons, "| a:sla.ssa.func.opt - Show optimized function SSA");
 				r_cons_println (cons, "| a:sla.defuse.func - Show function-wide def-use analysis");
 				r_cons_println (cons, "| a:sla.dom    - Show dominator tree for current function");
 				r_cons_println (cons, "| a:sla.slice <var> - Backward slice from variable (e.g. rax_3)");
-				r_cons_println (cons, "| a:sla.sym    - Symbolic execution summary for current function");
-				r_cons_println (cons, "| a:sla.sym.paths - Explore paths in current function");
+				r_cons_println (cons, "| a:sla.sym [name|addr] - Symbolic execution summary (current by default)");
+				r_cons_println (cons, "| a:sla.sym.paths [name|addr] - Explore paths in function (current by default)");
 			r_cons_println (cons, "| a:sla.sym.merge [on|off] - Toggle symbolic state merging");
 			r_cons_println (cons, "| a:sla.taint  - Taint analysis for current function");
 			r_cons_println (cons, "| a:sla.dec [name|addr] - Decompile function (current by default)");
@@ -5513,6 +6155,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sla.cfg.json - Show CFG as JSON for current function");
 			r_cons_println (cons, "| a:sym.explore <target> - Explore symbolic paths reaching target");
 			r_cons_println (cons, "| a:sym.solve <target> - Solve concrete input for target reachability");
+			r_cons_println (cons, "| a:sym.explore.replayj <target> <json-spec> - Explore from a replay checkpoint frontier");
+			r_cons_println (cons, "| a:sym.solve.replayj <target> <json-spec> - Solve from a replay checkpoint frontier");
 			r_cons_println (cons, "| a:sym.runj <json-spec> - Run typed symbolic exploration spec");
 			r_cons_println (cons, "| a:sym.replayj <json-spec> - Search checkpointed replay branches");
 			r_cons_println (cons, "| a:sym.state  - Show last symbolic explore/solve cached result");
@@ -5533,7 +6177,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		const char *arg = skip_cmd_spaces (cmd + 8);
 		R2ILContext *ctx;
 		RAnalFunction *fcn;
-		BlockArray blocks;
+		SymFunctionScope scope;
 		char *spec_json = NULL;
 		char *result = NULL;
 		bool rust_owned = true;
@@ -5555,8 +6199,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: no function at current address");
 			return strdup("");
 		}
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
 		char *sym_map_json = build_sym_symbol_map_json (core);
@@ -5567,11 +6211,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		spec_json = strdup (arg);
 		if (!spec_json) {
-			block_array_free (&blocks);
+			sym_function_scope_free (&scope);
 			return strdup("");
 		}
 		r_str_unescape (spec_json);
-		result = r2sym_run_spec_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, spec_json);
+		result = r2sym_run_spec_json_scope (ctx, scope.functions, scope.count, fcn->addr, spec_json);
 		free (spec_json);
 		if (!result) {
 			rust_owned = false;
@@ -5589,7 +6233,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		} else {
 			free (result);
 		}
-		block_array_free (&blocks);
+		sym_function_scope_free (&scope);
 		return strdup("");
 	}
 
@@ -5628,6 +6272,93 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup ("");
 	}
 
+	if (is_sym_ns && (!strncmp (cmd, "sym.explore.replayj", 19) || !strncmp (cmd, "sym.solve.replayj", 17))) {
+		bool is_explore = r_str_startswith (cmd, "sym.explore.replayj");
+		size_t prefix_len = is_explore ? 19 : 17;
+		const char *arg = skip_cmd_spaces (cmd + prefix_len);
+		ReplaySymSeedSpec spec;
+		ut64 target = 0;
+		R2ILContext *ctx;
+		RAnalFunction *fcn;
+		SymFunctionScope scope;
+		char *spec_json = NULL;
+		char *result = NULL;
+		bool rust_owned = true;
+
+		if (!arg || !*arg) {
+			if (cons) {
+				r_cons_println (cons, is_explore
+					? "Usage: a:sym.explore.replayj <target_addr_expr> <json-spec>"
+					: "Usage: a:sym.solve.replayj <target_addr_expr> <json-spec>");
+			}
+			return strdup ("");
+		}
+		if (!core->dbg || !core->dbg->session) {
+			R_LOG_ERROR ("r2sleigh: debug session with checkpoints is required");
+			return strdup ("");
+		}
+		if (!parse_replay_target_and_json (core, arg, &target, &spec_json)) {
+			R_LOG_ERROR ("r2sleigh: invalid replay symbolic target/spec");
+			if (cons) {
+				r_cons_println (cons, is_explore
+					? "Usage: a:sym.explore.replayj <target_addr_expr> <json-spec>"
+					: "Usage: a:sym.solve.replayj <target_addr_expr> <json-spec>");
+			}
+			return strdup ("");
+		}
+		if (!replay_sym_seed_spec_parse (core, spec_json, &spec)) {
+			R_LOG_ERROR ("r2sleigh: invalid replay symbolic seed spec");
+			free (spec_json);
+			return strdup ("");
+		}
+		free (spec_json);
+
+		ctx = get_context (anal);
+		if (!ctx) {
+			R_LOG_ERROR ("r2sleigh: no context");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		fcn = resolve_or_materialize_current_function (core, anal);
+		if (!fcn) {
+			R_LOG_ERROR ("r2sleigh: no function at current address");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		char *sym_map_json = build_sym_symbol_map_json (core);
+		if (sym_map_json) {
+			r2sym_set_symbol_map_json (sym_map_json);
+			free (sym_map_json);
+		}
+
+		result = replay_sym_query_run (core, ctx, &scope, fcn->addr, target, &spec, is_explore);
+		if (!result) {
+			rust_owned = false;
+			result = strdup ("{\"error\":\"replay symbolic execution failed\"}");
+		}
+
+		if (cons && result) {
+			r_cons_printf (cons, "%s\n", result);
+		}
+		if (result && !sym_result_has_error (result)) {
+			sym_state_cache_update (is_explore ? "explore.replayj" : "solve.replayj",
+				fcn->addr, spec.entry_addr? spec.entry_addr: fcn->addr, target, result);
+		}
+		if (rust_owned) {
+			r2il_string_free (result);
+		} else {
+			free (result);
+		}
+		sym_function_scope_free (&scope);
+		replay_sym_seed_spec_fini (&spec);
+		return strdup ("");
+	}
+
 	if (is_sym_ns && (!strncmp (cmd, "sym.explore", 11) || !strncmp (cmd, "sym.solve", 9))) {
 		bool is_explore = r_str_startswith (cmd, "sym.explore");
 		size_t prefix_len = is_explore ? 11 : 9;
@@ -5635,7 +6366,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		ut64 target = 0;
 		R2ILContext *ctx;
 		RAnalFunction *fcn;
-		BlockArray blocks;
+		SymFunctionScope scope;
 		char *result = NULL;
 		bool rust_owned = true;
 
@@ -5662,13 +6393,13 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: no context");
 			return strdup("");
 		}
-		fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		fcn = resolve_or_materialize_current_function (core, anal);
 		if (!fcn) {
 			R_LOG_ERROR ("r2sleigh: no function at current address");
 			return strdup("");
 		}
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
 		char *sym_map_json = build_sym_symbol_map_json (core);
@@ -5678,9 +6409,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		if (is_explore) {
-			result = r2sym_explore_to (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, target);
+			result = r2sym_explore_to_scope (ctx, scope.functions, scope.count, fcn->addr, target);
 		} else {
-			result = r2sym_solve_to (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, target);
+			result = r2sym_solve_to_scope (ctx, scope.functions, scope.count, fcn->addr, target);
 		}
 		if (!result) {
 			rust_owned = false;
@@ -5699,7 +6430,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		} else {
 			free (result);
 		}
-		block_array_free (&blocks);
+		sym_function_scope_free (&scope);
 		return strdup("");
 	}
 
@@ -6008,13 +6739,14 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup("");
 	}
 
-	if (!strcmp (cmd, "sla.types")) {
+	if (!strncmp (cmd, "sla.types", 9) && (!cmd[9] || isspace ((unsigned char)cmd[9]))) {
 		R2ILContext *ctx = get_context (anal);
 		RAnalFunction *fcn;
 		BlockArray blocks;
 		char *external_context_json = NULL;
 		char *interproc_scope_json = NULL;
 		char *result = NULL;
+		const char *target_arg = skip_cmd_spaces (cmd + 9);
 		ut64 *seen_addrs = NULL;
 		size_t seen_count = 0;
 		size_t seen_cap = 0;
@@ -6025,9 +6757,15 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup ("");
 		}
 
-		fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		fcn = (target_arg && *target_arg)
+			? resolve_or_materialize_function_target (core, anal, target_arg)
+			: resolve_or_materialize_current_function (core, anal);
 		if (!fcn) {
-			R_LOG_ERROR ("r2sleigh: no function at current address");
+			if (target_arg && *target_arg) {
+				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
+			} else {
+				R_LOG_ERROR ("r2sleigh: no function at current address");
+			}
 			return strdup ("");
 		}
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
@@ -6044,10 +6782,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		warm_type_payload_cache_for_function (core, anal, ctx, fcn, interproc_max_iters,
 			&seen_addrs, &seen_count, &seen_cap);
 		interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
-		result = r2sleigh_infer_type_writeback_json_ex (ctx,
-			(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
-			external_context_json,
-			1, interproc_max_iters, 1, interproc_scope_json? interproc_scope_json: "{}");
+		SymFunctionScope sym_scope;
+		if (build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
+			result = r2sleigh_infer_type_writeback_json_scope_ex (ctx,
+				(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+				external_context_json,
+				1, interproc_max_iters, 1, interproc_scope_json? interproc_scope_json: "{}",
+				sym_scope.functions, sym_scope.count);
+			sym_function_scope_free (&sym_scope);
+		} else {
+			result = r2sleigh_infer_type_writeback_json_ex (ctx,
+				(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+				external_context_json,
+				1, interproc_max_iters, 1, interproc_scope_json? interproc_scope_json: "{}");
+		}
 		if (cons) {
 			if (result && *result) {
 				r_cons_printf (cons, "%s\n", result);
@@ -6277,24 +7025,34 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup("");
 	}
 
-	if (!strcmp (cmd, "sla.sym") || !strcmp (cmd, "sla.sym.paths")) {
+	if ((!strncmp (cmd, "sla.sym.paths", 13) && (!cmd[13] || isspace ((unsigned char)cmd[13])))
+		|| (!strncmp (cmd, "sla.sym", 7) && (!cmd[7] || isspace ((unsigned char)cmd[7])))) {
 		R2ILContext *ctx = get_context (anal);
+		bool is_paths_cmd = r_str_startswith (cmd, "sla.sym.paths");
+		size_t prefix_len = is_paths_cmd ? 13: 7;
+		const char *target_arg = skip_cmd_spaces (cmd + prefix_len);
+		RAnalFunction *fcn;
 		if (!ctx) {
 			R_LOG_ERROR ("r2sleigh: no context");
 			return strdup("");
 		}
 
-		/* Get current function */
-		RAnalFunction *fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		fcn = (target_arg && *target_arg)
+			? resolve_or_materialize_function_target (core, anal, target_arg)
+			: resolve_or_materialize_current_function (core, anal);
 		if (!fcn) {
-			R_LOG_ERROR ("r2sleigh: no function at current address");
+			if (target_arg && *target_arg) {
+				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
+			} else {
+				R_LOG_ERROR ("r2sleigh: no function at current address");
+			}
 			return strdup("");
 		}
 
-		/* Lift all blocks */
-		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+		/* Lift root + reachable helper closure */
+		SymFunctionScope scope;
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
 		char *sym_map_json = build_sym_symbol_map_json (core);
@@ -6305,10 +7063,10 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Call symbolic execution */
 		char *result;
-		if (!strcmp (cmd, "sla.sym.paths")) {
-			result = r2sym_paths (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr);
+		if (is_paths_cmd) {
+			result = r2sym_paths_scope (ctx, scope.functions, scope.count, fcn->addr);
 		} else {
-			result = r2sym_function (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr);
+			result = r2sym_function_scope (ctx, scope.functions, scope.count, fcn->addr);
 		}
 
 		if (cons && result) {
@@ -6316,7 +7074,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		r2il_string_free (result);
-		block_array_free (&blocks);
+		sym_function_scope_free (&scope);
 		return strdup("");
 	}
 
@@ -6362,16 +7120,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		const char *target_arg = skip_cmd_spaces (cmd + 7);
 		RAnalFunction *fcn = NULL;
 		if (target_arg && *target_arg) {
-			fcn = resolve_function_target (core, anal, target_arg);
+			fcn = resolve_or_materialize_function_target (core, anal, target_arg);
 		} else {
-			fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+			fcn = resolve_or_materialize_current_function (core, anal);
 		}
 
 		if (!fcn) {
 			if (target_arg && *target_arg) {
 				if (cons) {
 					r_cons_printf (cons,
-						"/* r2dec: function target '%s' not found. It may be inlined or stripped. Try 'afl' or 'a:sla.dec 0xADDR'. */\n",
+						"/* r2dec: function target '%s' not found or could not be materialized (it may be inlined or stripped). */\n",
 						target_arg);
 				}
 			} else {
@@ -6379,7 +7137,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			return strdup("");
 		}
-
 		/* Lift all blocks */
 		BlockArray blocks;
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
@@ -6497,9 +7254,18 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 
 			/* Decompile with context */
-			char *result = r2dec_function_with_context (ctx, (const R2ILBlock **)blocks.blocks, blocks.count,
-			                                             fcn->name, func_names_json, strings_json, symbols_json,
-			                                             external_context_json);
+			char *result;
+			SymFunctionScope sym_scope;
+			if (build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
+				result = r2dec_function_with_context_scope (ctx, (const R2ILBlock **)blocks.blocks, blocks.count,
+					fcn->addr, fcn->name, func_names_json, strings_json, symbols_json,
+					external_context_json, sym_scope.functions, sym_scope.count);
+				sym_function_scope_free (&sym_scope);
+			} else {
+				result = r2dec_function_with_context (ctx, (const R2ILBlock **)blocks.blocks, blocks.count,
+					fcn->name, func_names_json, strings_json, symbols_json,
+					external_context_json);
+			}
 
 		if (cons) {
 			if (result && result[0]) {
@@ -8088,6 +8854,140 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	return targets;
 }
 
+static void sym_function_scope_init(SymFunctionScope *scope) {
+	if (!scope) {
+		return;
+	}
+	memset (scope, 0, sizeof (*scope));
+}
+
+static void sym_function_scope_free(SymFunctionScope *scope) {
+	size_t i;
+	if (!scope) {
+		return;
+	}
+	for (i = 0; i < scope->count; i++) {
+		block_array_free (&scope->owned_blocks[i]);
+		free (scope->owned_names[i]);
+	}
+	free (scope->functions);
+	free (scope->owned_blocks);
+	free (scope->owned_names);
+	memset (scope, 0, sizeof (*scope));
+}
+
+static bool sym_function_scope_ensure_capacity(SymFunctionScope *scope, size_t needed) {
+	R2ILFunctionBlocks *functions_next;
+	BlockArray *blocks_next;
+	char **names_next;
+	size_t new_cap;
+	if (!scope) {
+		return false;
+	}
+	if (needed <= scope->capacity) {
+		return true;
+	}
+	new_cap = scope->capacity? scope->capacity * 2: 4;
+	while (new_cap < needed) {
+		new_cap *= 2;
+	}
+	functions_next = realloc (scope->functions, new_cap * sizeof (*scope->functions));
+	blocks_next = realloc (scope->owned_blocks, new_cap * sizeof (*scope->owned_blocks));
+	names_next = realloc (scope->owned_names, new_cap * sizeof (*scope->owned_names));
+	if (!functions_next || !blocks_next || !names_next) {
+		free (functions_next);
+		free (blocks_next);
+		free (names_next);
+		return false;
+	}
+	scope->functions = functions_next;
+	scope->owned_blocks = blocks_next;
+	scope->owned_names = names_next;
+	scope->capacity = new_cap;
+	return true;
+}
+
+static bool sym_function_scope_append(
+	SymFunctionScope *scope,
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx
+) {
+	BlockArray blocks;
+	if (!scope || !anal || !fcn || !ctx) {
+		return false;
+	}
+	if (!sym_function_scope_ensure_capacity (scope, scope->count + 1)) {
+		return false;
+	}
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		return false;
+	}
+	scope->owned_blocks[scope->count] = blocks;
+	scope->owned_names[scope->count] = fcn->name? strdup (fcn->name): NULL;
+	scope->functions[scope->count].entry_addr = fcn->addr;
+	scope->functions[scope->count].name = scope->owned_names[scope->count];
+	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
+	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
+	scope->count++;
+	return true;
+}
+
+static bool build_symbolic_function_scope(
+	RAnal *anal,
+	RAnalFunction *root_fcn,
+	R2ILContext *ctx,
+	SymFunctionScope *scope
+) {
+	size_t queue_count = 0;
+	size_t queue_cap = 0;
+	size_t queue_index = 0;
+	ut64 *queue = NULL;
+	ut64 *seen = NULL;
+	size_t seen_count = 0;
+	size_t seen_cap = 0;
+
+	if (!anal || !root_fcn || !ctx || !scope) {
+		return false;
+	}
+	sym_function_scope_init (scope);
+	if (!append_unique_ut64 (&queue, &queue_count, &queue_cap, root_fcn->addr)) {
+		free (queue);
+		return false;
+	}
+
+	while (queue_index < queue_count && scope->count < SLEIGH_SYM_HELPER_MAX_FUNCTIONS) {
+		RAnalFunction *fcn;
+		ut64 addr = queue[queue_index++];
+		ut64 *targets = NULL;
+		size_t target_count = 0;
+		size_t i;
+		const BlockArray *blocks;
+
+		fcn = materialize_function_at (anal, addr);
+		if (!fcn || !append_unique_ut64 (&seen, &seen_count, &seen_cap, fcn->addr)) {
+			continue;
+		}
+		if (!sym_function_scope_append (scope, anal, fcn, ctx)) {
+			continue;
+		}
+		blocks = &scope->owned_blocks[scope->count - 1];
+		targets = collect_type_interproc_direct_targets_from_blocks (
+			ctx, blocks, fcn->addr, fcn->name, &target_count);
+		for (i = 0; i < target_count; i++) {
+			RAnalFunction *callee = materialize_function_at (anal, targets[i]);
+			if (callee && !function_exceeds_helper_scope_budget (callee)) {
+				append_unique_ut64 (&queue, &queue_count, &queue_cap, callee->addr);
+			}
+		}
+		free (targets);
+	}
+
+	free (queue);
+	free (seen);
+	return scope->count > 0;
+}
+
 static char *build_type_interproc_scope_json_from_targets(
 	RCore *core,
 	RAnal *anal,
@@ -8120,8 +9020,9 @@ static char *build_type_interproc_scope_json_from_targets(
 		if (!target) {
 			continue;
 		}
-		callee_fcn = r_anal_get_fcn_in (anal, target, 0);
-		if (!callee_fcn || !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, callee_fcn->addr)) {
+		callee_fcn = materialize_function_at (anal, target);
+		if (!callee_fcn || function_exceeds_helper_scope_budget (callee_fcn)
+			|| !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, callee_fcn->addr)) {
 			continue;
 		}
 		entry = type_writeback_cache_get (callee_fcn->addr);
@@ -8139,18 +9040,24 @@ static char *build_type_interproc_scope_json_from_targets(
 	pj_k (pj, "seeds");
 	pj_a (pj);
 	for (i = 0; i < target_count; i++) {
+		RAnalFunction *seed_fcn;
 		ut64 seed_addr = targets[i];
 		char *seed_name;
-		if (!seed_addr || !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, seed_addr)) {
+		if (!seed_addr) {
 			continue;
 		}
-		seed_name = resolve_interproc_seed_name (core, anal, seed_addr);
+		seed_fcn = materialize_function_at (anal, seed_addr);
+		if (!seed_fcn || function_exceeds_helper_scope_budget (seed_fcn)
+			|| !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, seed_fcn->addr)) {
+			continue;
+		}
+		seed_name = resolve_interproc_seed_name (core, anal, seed_fcn->addr);
 		if (!seed_name || !*seed_name) {
 			free (seed_name);
 			continue;
 		}
 		pj_o (pj);
-		pj_kn (pj, "id", seed_addr);
+		pj_kn (pj, "id", seed_fcn->addr);
 		pj_ks (pj, "name", seed_name);
 		pj_end (pj);
 		free (seed_name);
@@ -8202,8 +9109,9 @@ static bool warm_type_payload_cache_for_function(
 	direct_targets = collect_type_interproc_direct_targets_from_blocks (
 		ctx, &blocks, fcn->addr, fcn->name, &direct_target_count);
 	for (i = 0; i < direct_target_count; i++) {
-		RAnalFunction *callee_fcn = r_anal_get_fcn_in (anal, direct_targets[i], 0);
-		if (!callee_fcn || callee_fcn->addr == fcn->addr) {
+		RAnalFunction *callee_fcn = materialize_function_at (anal, direct_targets[i]);
+		if (!callee_fcn || callee_fcn->addr == fcn->addr
+			|| function_exceeds_helper_scope_budget (callee_fcn)) {
 			continue;
 		}
 		warm_type_payload_cache_for_function (core, anal, ctx, callee_fcn, max_iters,

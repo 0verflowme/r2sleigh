@@ -12,8 +12,16 @@ use r2sym::sim::{
     SummaryRegistry,
 };
 use r2sym::spec::{AddressValue, ExplorationSpec, InputSpec, PredicateSpec};
-use r2sym::{ExploreConfig, PathExplorer, SymState, SymValue};
+use r2sym::{
+    BackwardConditionPrecision, BackwardMemoryCondition, BackwardMemoryRegion,
+    CompiledSemanticMode, ExploreConfig, PathExplorer, QueryCompletion, ReachabilityStatus,
+    ReplayRegisterOverlay, ReplayRegisterValue, ReplaySeed, SolveStatus, SymQueryConfig, SymState,
+    SymValue, SymbolicReachabilityStatus, collect_symbolic_function_facts,
+    collect_symbolic_function_facts_with_scope, compile_derived_summary_return_postcondition,
+    compile_function_semantics_with_scope,
+};
 use z3::Context;
+use z3::ast::{BV, Bool};
 
 // Helper functions for creating varnodes
 fn make_reg(offset: u64, size: u32) -> Varnode {
@@ -34,11 +42,53 @@ fn make_const(val: u64, size: u32) -> Varnode {
     }
 }
 
+fn assert_argument_memory_term(
+    term: &BackwardMemoryCondition,
+    index: usize,
+    offset_lo: i64,
+    offset_hi: i64,
+    exact_offset: bool,
+    size: u32,
+) {
+    assert!(matches!(
+        &term.region,
+        BackwardMemoryRegion::Argument { index: actual } if *actual == index
+    ));
+    assert_eq!(term.offset_lo, offset_lo);
+    assert_eq!(term.offset_hi, offset_hi);
+    assert_eq!(term.exact_offset, exact_offset);
+    assert_eq!(term.size, size);
+}
+
+fn assert_region_memory_term(
+    term: &BackwardMemoryCondition,
+    kind: r2sym::MemoryRegionKind,
+    name: &str,
+    offset_lo: i64,
+    offset_hi: i64,
+    exact_offset: bool,
+    size: u32,
+) {
+    match &term.region {
+        BackwardMemoryRegion::Region(region) => {
+            assert_eq!(region.kind, kind);
+            assert_eq!(region.name, name);
+        }
+        other => panic!("expected concrete region-backed term, got {other:?}"),
+    }
+    assert_eq!(term.offset_lo, offset_lo);
+    assert_eq!(term.offset_hi, offset_hi);
+    assert_eq!(term.exact_offset, exact_offset);
+    assert_eq!(term.size, size);
+}
+
 fn make_x86_64_arch() -> ArchSpec {
     let mut arch = ArchSpec::new("x86-64");
     arch.addr_size = 8;
     arch.add_register(RegisterDef::new("RAX", RAX, 8));
+    arch.add_register(RegisterDef::new("EAX", RAX, 4));
     arch.add_register(RegisterDef::new("RCX", RCX, 8));
+    arch.add_register(RegisterDef::new("EDI", RDI, 4));
     arch.add_register(RegisterDef::new("RDI", RDI, 8));
     arch.add_register(RegisterDef::new("RSI", RSI, 8));
     arch.add_register(RegisterDef::new("RDX", RDX, 8));
@@ -54,6 +104,197 @@ const RSI: u64 = 64;
 const RDX: u64 = 72;
 const TMP0: u64 = 0x80;
 const TMP1: u64 = 0x88;
+
+fn make_conditional_branch_blocks() -> Vec<R2ILBlock> {
+    vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(RDI, 8),
+                    b: make_const(0x1337, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 6,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 6,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+    ]
+}
+
+fn make_conditional_branch_blocks_low32_arg() -> Vec<R2ILBlock> {
+    vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(RDI, 4),
+                    b: make_const(0xdead, 4),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 6,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 6,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+    ]
+}
+
+fn make_self_xor_guard_blocks() -> Vec<R2ILBlock> {
+    vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntXor {
+                    dst: make_reg(TMP0, 8),
+                    a: make_reg(RDI, 8),
+                    b: make_reg(RDI, 8),
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(TMP0, 8),
+                    b: make_const(0, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+    ]
+}
+
+fn make_target_guided_budget_blocks() -> Vec<R2ILBlock> {
+    vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(RDI, 8),
+                    b: make_const(0x1337, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x2000, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            ops: vec![R2ILOp::Branch {
+                target: make_const(0x1008, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 4,
+            ops: vec![R2ILOp::Branch {
+                target: make_const(0x100c, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x100c,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x2000,
+            size: 4,
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+    ]
+}
 
 #[test]
 fn test_symbolic_execution_linear_block() {
@@ -212,6 +453,7 @@ fn test_symbolic_execution_conditional_branch() {
         strategy: ExploreStrategy::Dfs,
         prune_infeasible: true,
         merge_states: false,
+        ..ExploreConfig::default()
     };
 
     let mut explorer = PathExplorer::with_config(&ctx, config);
@@ -230,6 +472,1219 @@ fn test_symbolic_execution_conditional_branch() {
         !feasible_paths.is_empty(),
         "Should have at least one feasible path"
     );
+}
+
+#[test]
+fn test_query_defaults_enable_subsumption() {
+    let config = SymQueryConfig::default();
+    assert!(config.explore.subsumption_states);
+}
+
+#[test]
+fn test_query_target_guided_mode_enables_ranked_query_search() {
+    let ctx = Context::thread_local();
+    let explorer = SymQueryConfig {
+        mode: r2sym::QueryMode::TargetGuided,
+        ..SymQueryConfig::default()
+    }
+    .make_explorer(&ctx);
+    assert!(explorer.target_guided_queries_enabled());
+}
+
+#[test]
+fn test_query_can_reach_reports_reachable_and_unreachable() {
+    let blocks = make_conditional_branch_blocks();
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut reachable_state = SymState::new(&ctx, 0x1000);
+    reachable_state.make_symbolic("reg:56_0", 64);
+    let mut explorer = SymQueryConfig {
+        mode: r2sym::QueryMode::TargetGuided,
+        ..SymQueryConfig::default()
+    }
+    .make_explorer(&ctx);
+    let reachable = explorer.can_reach(&func, reachable_state, 0x1010);
+    assert_eq!(reachable.status, ReachabilityStatus::Reachable);
+    assert!(!reachable.paths.is_empty());
+
+    let mut unreachable_state = SymState::new(&ctx, 0x1000);
+    unreachable_state.make_symbolic("reg:56_0", 64);
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let unreachable = explorer.can_reach(&func, unreachable_state, 0x2000);
+    assert_eq!(unreachable.status, ReachabilityStatus::Unreachable);
+    assert!(unreachable.paths.is_empty());
+}
+
+#[test]
+fn test_query_solve_for_target_returns_solution() {
+    let blocks = make_conditional_branch_blocks();
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.make_symbolic("reg:56_0", 64);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let solve = explorer.solve_for_target(&func, state, 0x1010);
+    assert_eq!(solve.status, SolveStatus::Solved);
+    assert_eq!(
+        solve
+            .compiled_precondition
+            .as_ref()
+            .map(|compiled| compiled.precision),
+        Some(BackwardConditionPrecision::Exact)
+    );
+    assert!(solve.selected_path_index.is_some());
+    assert!(solve.solution.is_some());
+}
+
+#[test]
+fn test_query_path_conditions_at_collects_conditions() {
+    let blocks = make_conditional_branch_blocks();
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.make_symbolic("reg:56_0", 64);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let conditions = explorer.path_conditions_at(&func, state, 0x1010);
+    assert_eq!(
+        conditions
+            .compiled_precondition
+            .as_ref()
+            .map(|compiled| compiled.precision),
+        Some(BackwardConditionPrecision::Exact)
+    );
+    assert!(!conditions.conditions.is_empty());
+    assert!(
+        conditions
+            .conditions
+            .iter()
+            .all(|condition| condition.final_pc == 0x1010)
+    );
+    assert!(
+        conditions
+            .conditions
+            .iter()
+            .all(|condition| condition.num_constraints > 0)
+    );
+    assert!(conditions.conditions.iter().all(|condition| {
+        condition.condition == condition.path_condition.simplified
+            && condition.path_condition.num_constraints == condition.num_constraints
+            && condition.path_condition.terms.len() == condition.num_constraints
+    }));
+}
+
+#[test]
+fn test_query_compiled_precondition_shortcuts_exact_unsat() {
+    let blocks = make_conditional_branch_blocks();
+    let arch = make_x86_64_arch();
+    let func =
+        SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.make_symbolic_named("RDI_0", "rdi", 64);
+    let rdi = state.get_register_sized("RDI_0", 64);
+    state.constrain_ne(&rdi, 0x1337);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let solve = explorer.solve_for_target(&func, state, 0x1010);
+    assert_eq!(solve.status, SolveStatus::Unsat);
+    assert!(solve.matched_paths.is_empty());
+    assert_eq!(
+        solve
+            .compiled_precondition
+            .as_ref()
+            .map(|compiled| compiled.precision),
+        Some(BackwardConditionPrecision::Exact)
+    );
+}
+
+#[test]
+fn test_query_load_dependent_precondition_compiles_through_local_store() {
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Store {
+                    addr: make_const(0x2000, 8),
+                    val: make_reg(RDI, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 8),
+                    addr: make_const(0x2000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 8),
+                    b: make_const(0x1337, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(1, 8),
+            }],
+        },
+    ];
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.make_symbolic("reg:56_0", 64);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let solve = explorer.solve_for_target(&func, state, 0x1010);
+    assert_eq!(solve.status, SolveStatus::Solved);
+    assert_eq!(
+        solve
+            .compiled_precondition
+            .as_ref()
+            .map(|compiled| compiled.precision),
+        Some(BackwardConditionPrecision::Exact)
+    );
+    assert!(!solve.matched_paths.is_empty());
+    assert!(solve.solution.is_some());
+}
+
+#[test]
+fn test_query_load_dependent_precondition_emits_region_backed_global_term() {
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 8),
+                    addr: make_const(0x2000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 8),
+                    b: make_const(0x41, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(1, 8),
+            }],
+        },
+    ];
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    let region = state.define_memory_region(
+        r2sym::MemoryRegionKind::Global,
+        "global_2000",
+        Some(0x2000),
+        Some(8),
+    );
+    state.seed_region_bytes(region, 0, &[0x41, 0, 0, 0, 0, 0, 0, 0]);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let conditions = explorer.path_conditions_at(&func, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Global,
+        "global_2000",
+        0,
+        0,
+        true,
+        8,
+    );
+}
+
+#[test]
+fn test_query_load_dependent_precondition_emits_region_backed_stack_term() {
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 8),
+                    addr: make_const(0x7008, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 8),
+                    b: make_const(0x41, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(1, 8),
+            }],
+        },
+    ];
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    let region = state.define_memory_region(
+        r2sym::MemoryRegionKind::Stack,
+        "stack_window",
+        Some(0x7000),
+        Some(0x100),
+    );
+    state.seed_region_bytes(region, 8, &[0x41, 0, 0, 0, 0, 0, 0, 0]);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let conditions = explorer.path_conditions_at(&func, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Stack,
+        "stack_window",
+        8,
+        8,
+        true,
+        8,
+    );
+}
+
+#[test]
+fn test_query_load_dependent_precondition_emits_region_backed_replay_term() {
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 8),
+                    addr: make_const(0x9004, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 8),
+                    b: make_const(0x41, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(1, 8),
+            }],
+        },
+    ];
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    let region = state.define_memory_region(
+        r2sym::MemoryRegionKind::Replay,
+        "replay_window",
+        Some(0x9000),
+        Some(0x100),
+    );
+    state.seed_region_bytes(region, 4, &[0x41, 0, 0, 0, 0, 0, 0, 0]);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let conditions = explorer.path_conditions_at(&func, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Replay,
+        "replay_window",
+        4,
+        4,
+        true,
+        8,
+    );
+}
+
+#[test]
+fn test_query_load_dependent_precondition_emits_region_backed_heap_term() {
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 8),
+                    addr: make_const(0xa004, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 8),
+                    b: make_const(0x41, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(1, 8),
+            }],
+        },
+    ];
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    let region = state.define_memory_region(
+        r2sym::MemoryRegionKind::Heap,
+        "heap_window",
+        Some(0xa000),
+        Some(0x100),
+    );
+    state.seed_region_bytes(region, 4, &[0x41, 0, 0, 0, 0, 0, 0, 0]);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let conditions = explorer.path_conditions_at(&func, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Heap,
+        "heap_window",
+        4,
+        4,
+        true,
+        8,
+    );
+}
+
+#[test]
+fn test_replay_seeded_query_solve_with_register_overlay() {
+    let blocks = make_conditional_branch_blocks();
+    let arch = make_x86_64_arch();
+    let func =
+        SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    let seed = ReplaySeed {
+        checkpoint_id: Some(2),
+        entry_pc: Some(0x1000),
+        registers: vec![ReplayRegisterValue {
+            name: "rdi".to_string(),
+            value: 0,
+        }],
+        register_overlays: vec![ReplayRegisterOverlay {
+            name: "rdi".to_string(),
+            symbol: "rdi".to_string(),
+        }],
+        ..ReplaySeed::default()
+    };
+    r2sym::seed_replay_state_for_arch(&mut state, Some(&func), Some(&arch), &seed);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let solve = explorer.solve_for_target(&func, state, 0x1010);
+    assert_eq!(solve.status, SolveStatus::Solved);
+    assert_eq!(
+        solve
+            .compiled_precondition
+            .as_ref()
+            .map(|compiled| compiled.precision),
+        Some(BackwardConditionPrecision::Exact)
+    );
+    let solution = solve.solution.expect("solution");
+    assert_eq!(solution.inputs.get("rdi").copied(), Some(0x1337));
+}
+
+#[test]
+fn test_query_compiles_bounded_indexed_memory_range() {
+    let arch = make_x86_64_arch();
+    let blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntAdd {
+                    dst: make_reg(TMP0, 8),
+                    a: make_reg(RDI, 8),
+                    b: make_reg(RCX, 8),
+                },
+                R2ILOp::Load {
+                    dst: make_reg(TMP1, 1),
+                    addr: make_reg(TMP0, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(RDX, 1),
+                    a: make_reg(TMP1, 1),
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RDX, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: make_const(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        },
+    ];
+    let func = SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("ssa");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    r2sym::seed_default_state_for_arch(&mut state, &func, Some(&arch));
+    let rcx = state.get_register_sized("RCX_0", 64);
+    let is_zero = rcx.to_bv(&ctx).eq(BV::from_u64(0, 64));
+    let is_one = rcx.to_bv(&ctx).eq(BV::from_u64(1, 64));
+    state.add_constraint(Bool::or(&[&is_zero, &is_one]));
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let conditions = explorer.path_conditions_at(&func, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    if matches!(
+        &compiled.memory_terms[0].region,
+        BackwardMemoryRegion::Argument { .. }
+    ) {
+        assert_eq!(compiled.memory_terms[0].offset_lo, 0);
+        assert_eq!(compiled.memory_terms[0].offset_hi, 1);
+    } else {
+        assert!(compiled.memory_terms[0].offset_hi >= compiled.memory_terms[0].offset_lo);
+    }
+    assert!(!compiled.memory_terms[0].exact_offset);
+    assert_eq!(compiled.memory_terms[0].size, 1);
+    assert!(compiled.backward_memory_candidate_enumerations > 0);
+    assert_eq!(compiled.backward_memory_residual_fallbacks, 0);
+}
+
+#[test]
+fn test_replay_seeded_query_solve_with_register_alias_overlay() {
+    let blocks = make_conditional_branch_blocks_low32_arg();
+    let arch = make_x86_64_arch();
+    let func =
+        SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    let seed = ReplaySeed {
+        checkpoint_id: Some(2),
+        entry_pc: Some(0x1000),
+        registers: vec![ReplayRegisterValue {
+            name: "rdi".to_string(),
+            value: 0,
+        }],
+        register_overlays: vec![ReplayRegisterOverlay {
+            name: "rdi".to_string(),
+            symbol: "rdi".to_string(),
+        }],
+        ..ReplaySeed::default()
+    };
+    r2sym::seed_replay_state_for_arch(&mut state, Some(&func), Some(&arch), &seed);
+
+    assert!(state.get_register("EDI_0").is_symbolic());
+    assert!(!state.registers().contains_key("RDI"));
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let solve = explorer.solve_for_target(&func, state, 0x1010);
+    assert_eq!(solve.status, SolveStatus::Solved);
+    let solution = solve.solution.expect("solution");
+    assert_eq!(solution.inputs.get("rdi").copied(), Some(0xdead));
+}
+
+#[test]
+fn test_query_target_guided_can_reach_finds_target_under_tight_budget() {
+    let blocks = make_target_guided_budget_blocks();
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.make_symbolic("reg:56_0", 64);
+
+    let forward_config = SymQueryConfig {
+        explore: ExploreConfig {
+            max_states: 2,
+            ..ExploreConfig::default()
+        },
+        mode: r2sym::QueryMode::ForwardOnly,
+        ..SymQueryConfig::default()
+    };
+    let mut forward = forward_config.make_explorer(&ctx);
+    let forward_result = forward.can_reach(&func, state.fork(), 0x2000);
+    assert_eq!(forward_result.status, ReachabilityStatus::BudgetExhausted);
+    assert!(forward_result.paths.is_empty());
+
+    let guided_config = SymQueryConfig {
+        explore: ExploreConfig {
+            max_states: 2,
+            ..ExploreConfig::default()
+        },
+        mode: r2sym::QueryMode::TargetGuided,
+        ..SymQueryConfig::default()
+    };
+    let mut guided = guided_config.make_explorer(&ctx);
+    let guided_result = guided.can_reach(&func, state, 0x2000);
+    assert_eq!(guided_result.status, ReachabilityStatus::Reachable);
+    assert_eq!(guided_result.paths.len(), 1);
+}
+
+#[test]
+fn collect_symbolic_function_facts_prunes_self_xor_dead_branch() {
+    let arch = make_x86_64_arch();
+    let func = SsaArtifact::for_symbolic(&make_self_xor_guard_blocks(), Some(&arch))
+        .expect("symbolic ssa");
+    let ctx = Context::thread_local();
+
+    let facts = collect_symbolic_function_facts(
+        &ctx,
+        &func,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let branch = facts
+        .branch_fact_for_block(0x1000)
+        .expect("entry branch fact");
+
+    assert_eq!(branch.true_target, 0x1010);
+    assert_eq!(branch.false_target, 0x1004);
+    assert_eq!(branch.true_status, SymbolicReachabilityStatus::Reachable);
+    assert_eq!(branch.false_status, SymbolicReachabilityStatus::Unreachable);
+    assert_eq!(facts.diagnostics.branches_pruned, 1);
+}
+
+#[test]
+fn collect_symbolic_function_facts_with_scope_prunes_helper_return_dead_branch() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::IntNotEqual {
+                    dst: make_reg(TMP0, 1),
+                    a: make_reg(RAX, 8),
+                    b: make_const(0, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP0, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntXor {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RDI, 8),
+                b: make_reg(RDI, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_zero".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let facts = collect_symbolic_function_facts_with_scope(
+        &ctx,
+        &root,
+        Some(&scope),
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let branch = facts
+        .branch_fact_for_block(0x1004)
+        .expect("post-call branch fact");
+
+    assert_eq!(branch.true_target, 0x1010);
+    assert_eq!(branch.false_target, 0x1008);
+    assert_eq!(
+        branch.true_status,
+        SymbolicReachabilityStatus::Unreachable,
+        "{branch:#?}"
+    );
+    assert_eq!(
+        branch.false_status,
+        SymbolicReachabilityStatus::Reachable,
+        "{branch:#?}"
+    );
+    assert_eq!(facts.diagnostics.branches_pruned, 1);
+}
+
+#[test]
+fn compile_function_semantics_with_scope_marks_helper_scope_compiled() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::IntNotEqual {
+                    dst: make_reg(TMP0, 1),
+                    a: make_reg(RAX, 8),
+                    b: make_const(0, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP0, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntXor {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RDI, 8),
+                b: make_reg(RDI, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_zero".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let compiled = compile_function_semantics_with_scope(
+        &ctx,
+        &root,
+        Some(&scope),
+        Some(&arch),
+        &std::collections::HashMap::new(),
+        r2sym::SummaryProfile::Default,
+    );
+
+    assert_eq!(compiled.mode, CompiledSemanticMode::Compiled);
+    assert_eq!(compiled.closure_functions, 2);
+    assert_eq!(compiled.helper_functions, 1);
+    assert!(compiled.derived_summaries >= 1);
+    assert_eq!(compiled.symbolic_facts.diagnostics.branches_pruned, 1);
+}
+
+#[test]
+fn collect_symbolic_function_facts_with_scope_prunes_helper_return_spilled_dead_branch() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: Varnode {
+                        space: SpaceId::Ram,
+                        offset: 0x4000,
+                        size: 8,
+                        meta: None,
+                    },
+                    val: make_reg(RAX, 8),
+                },
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode {
+                        space: SpaceId::Ram,
+                        offset: 0x4000,
+                        size: 8,
+                        meta: None,
+                    },
+                },
+                R2ILOp::IntNotEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 8),
+                    b: make_const(0, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntXor {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RDI, 8),
+                b: make_reg(RDI, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_zero".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let facts = collect_symbolic_function_facts_with_scope(
+        &ctx,
+        &root,
+        Some(&scope),
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let branch = facts
+        .branch_fact_for_block(0x1004)
+        .expect("post-call branch fact");
+
+    assert_eq!(branch.true_target, 0x1010);
+    assert_eq!(branch.false_target, 0x1008);
+    assert_eq!(
+        branch.true_status,
+        SymbolicReachabilityStatus::Unreachable,
+        "{branch:#?}"
+    );
+    assert_eq!(
+        branch.false_status,
+        SymbolicReachabilityStatus::Reachable,
+        "{branch:#?}"
+    );
+    assert_eq!(facts.diagnostics.branches_pruned, 1);
+}
+
+#[test]
+fn collect_symbolic_function_facts_with_scope_prunes_helper_return_dead_branch_via_eax_alias() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP0, 1),
+                    a: make_reg(RAX, 4),
+                    b: make_const(0, 4),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP0, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntXor {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RDI, 8),
+                b: make_reg(RDI, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_decompile(&root_blocks, Some(&arch)).expect("root decompile function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_zero".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let facts = collect_symbolic_function_facts_with_scope(
+        &ctx,
+        &root,
+        Some(&scope),
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let branch = facts
+        .branch_fact_for_block(0x1004)
+        .expect("post-call branch fact");
+
+    assert_eq!(branch.true_target, 0x1010);
+    assert_eq!(branch.false_target, 0x1008);
+    assert_eq!(
+        branch.true_status,
+        SymbolicReachabilityStatus::Reachable,
+        "{branch:#?}"
+    );
+    assert_eq!(
+        branch.false_status,
+        SymbolicReachabilityStatus::Unreachable,
+        "{branch:#?}"
+    );
+    assert_eq!(facts.diagnostics.branches_pruned, 1);
+}
+
+#[test]
+fn test_query_summarize_function_marks_budget_exhausted() {
+    let blocks = make_conditional_branch_blocks();
+    let func = SsaArtifact::for_symbolic(&blocks, None).expect("Failed to build SSA function");
+    let ctx = Context::thread_local();
+
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.make_symbolic("reg:56_0", 64);
+
+    let query_config = SymQueryConfig {
+        explore: ExploreConfig {
+            max_states: 0,
+            ..ExploreConfig::default()
+        },
+        ..SymQueryConfig::default()
+    };
+    let mut explorer = query_config.make_explorer(&ctx);
+    let summary = explorer.summarize_function(&func, state);
+    assert_eq!(summary.completion, QueryCompletion::BudgetExhausted);
 }
 
 #[test]
@@ -357,6 +1812,7 @@ fn test_find_paths_to_honors_limits() {
         strategy: ExploreStrategy::Dfs,
         prune_infeasible: true,
         merge_states: false,
+        ..ExploreConfig::default()
     };
     let mut explorer = PathExplorer::with_config(&ctx, config);
     let paths = explorer.find_paths_to(&func, state, 0x1010);
@@ -421,6 +1877,7 @@ fn test_find_paths_to_with_same_pc_merge_still_reaches_target() {
         strategy: ExploreStrategy::Bfs,
         prune_infeasible: true,
         merge_states: true,
+        ..ExploreConfig::default()
     };
     let mut explorer = PathExplorer::with_config(&ctx, config);
     let paths = explorer.find_paths_to(&func, state, 0x1010);
@@ -488,6 +1945,7 @@ fn test_explore_honors_max_completed_paths() {
         strategy: ExploreStrategy::Bfs,
         prune_infeasible: true,
         merge_states: false,
+        ..ExploreConfig::default()
     };
     let mut explorer = PathExplorer::with_config(&ctx, config);
     let paths = explorer.explore(&func, state);
@@ -1019,5 +2477,2113 @@ fn symbolic_n_constraints_bounded_for_memset_memcmp() {
     assert!(
         state_memcmp.num_constraints() > before_memcmp,
         "symbolic memcmp length should add bounds constraints"
+    );
+}
+
+#[test]
+fn derived_helper_summary_solves_return_transform() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP0, 1),
+                    a: make_reg(RAX, 8),
+                    b: make_const(0x6a, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP0, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntXor {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RDI, 8),
+                b: make_const(0x55, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_xor".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let mut state = SymState::new(&ctx, 0x1000);
+    r2sym::seed_default_state_for_arch(&mut state, &root, Some(&arch));
+    state.make_symbolic_named("RDI_0", "rdi", 64);
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let solve = explorer.solve_for_target(&root, state, 0x1010);
+    assert_eq!(solve.status, SolveStatus::Solved);
+    let solution = solve.solution.expect("solution");
+    assert_eq!(solution.inputs.get("rdi").copied(), Some(0x3f));
+}
+
+#[test]
+fn derived_helper_summary_solves_transitive_return_chain() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP0, 1),
+                    a: make_reg(RAX, 8),
+                    b: make_const(0x6a, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP0, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Copy {
+                dst: make_reg(RAX, 8),
+                src: make_const(1, 8),
+            }],
+        },
+    ];
+    let helper1_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Call {
+                target: make_const(0x3000, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+    let helper2_blocks = vec![R2ILBlock {
+        addr: 0x3000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntXor {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RDI, 8),
+                b: make_const(0x55, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper1 =
+        SsaArtifact::for_symbolic(&helper1_blocks, Some(&arch)).expect("helper1 symbolic function");
+    let helper2 =
+        SsaArtifact::for_symbolic(&helper2_blocks, Some(&arch)).expect("helper2 symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_wrapper".to_string()),
+                prepared: helper1,
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x3000),
+                name: Some("helper_xor".to_string()),
+                prepared: helper2,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let mut state = SymState::new(&ctx, 0x1000);
+    r2sym::seed_default_state_for_arch(&mut state, &root, Some(&arch));
+    state.make_symbolic_named("RDI_0", "rdi", 64);
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let wrapper_return = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .and_then(|summary| summary.cases.first())
+        .and_then(|case| case.return_value.as_ref())
+        .map(|value| value.to_bv(&ctx).to_string())
+        .expect("wrapper return relation");
+    assert!(wrapper_return.contains("helper_wrapper_arg0"));
+    assert!(wrapper_return.contains("0055"));
+    let diagnostics = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let solve = explorer.solve_for_target(&root, state, 0x1010);
+    assert_eq!(solve.status, SolveStatus::Solved);
+    assert_eq!(
+        solve
+            .compiled_precondition
+            .as_ref()
+            .map(|compiled| compiled.precision),
+        Some(BackwardConditionPrecision::Exact)
+    );
+    let solution = solve.solution.expect("solution");
+    assert_eq!(solution.inputs.get("rdi").copied(), Some(0x3f));
+    assert_eq!(diagnostics.scc_count, 2);
+    assert_eq!(diagnostics.max_scc_size, 1);
+}
+
+#[test]
+fn derived_helper_summary_preserves_pointer_write_value() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x3000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 1),
+                    src: make_const(0x41, 1),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x3000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Store {
+                addr: make_reg(RDI, 8),
+                val: make_reg(RSI, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_store".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let state = SymState::new(&ctx, 0x1000);
+    let mut explorer = PathExplorer::new(&ctx);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let paths = explorer.find_paths_to(&root, state, 0x1010);
+    assert_eq!(paths.len(), 1);
+}
+
+#[test]
+fn derived_helper_summary_compiles_backward_memory_terms() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x3000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 1),
+                    src: make_const(0x41, 1),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x3000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Store {
+                addr: make_reg(RDI, 8),
+                val: make_reg(RSI, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_store".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let state = SymState::new(&ctx, 0x1000);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let static_summary = derived
+        .interproc
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("static helper summary");
+    assert!(
+        static_summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect.location.region,
+                r2ssa::SummaryMemoryRegion::Arg { index: 0 }
+            ) && effect
+                .location
+                .range
+                .is_some_and(|range| range.offset_lo == 0 && range.width.unwrap_or(0) >= 1)
+        }),
+        "expected static summary to record arg0 write, got {:?}",
+        static_summary.memory_effects
+    );
+    let helper_summary = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("derived helper summary");
+    assert!(
+        helper_summary.cases.iter().any(|case| {
+            case.memory_writes
+                .iter()
+                .any(|write| write.arg_index == 0 && write.offset == 0 && write.size >= 1)
+        }),
+        "expected derived summary to record arg0 write, got {:?}",
+        helper_summary
+            .cases
+            .iter()
+            .flat_map(|case| case.memory_writes.iter().map(|write| (
+                write.arg_index,
+                write.offset,
+                write.size
+            )))
+            .collect::<Vec<_>>()
+    );
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert!(!compiled.memory_terms.is_empty());
+    assert_argument_memory_term(&compiled.memory_terms[0], 0, 0, 0, true, 1);
+}
+
+#[test]
+fn derived_helper_summary_compiles_region_backed_global_memory_terms() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x2000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 1),
+                    src: make_const(0x41, 1),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x3000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x2000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x3000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Store {
+                addr: make_reg(RDI, 8),
+                val: make_reg(RSI, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x3000),
+                name: Some("helper_store".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.define_memory_region(
+        r2sym::MemoryRegionKind::Global,
+        "global_2000",
+        Some(0x2000),
+        Some(8),
+    );
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Global,
+        "global_2000",
+        0,
+        0,
+        true,
+        1,
+    );
+}
+
+#[test]
+fn derived_helper_summary_compiles_region_backed_stack_memory_terms() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x7008, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 1),
+                    src: make_const(0x41, 1),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x3000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x7008, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x3000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Store {
+                addr: make_reg(RDI, 8),
+                val: make_reg(RSI, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x3000),
+                name: Some("helper_store".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.define_memory_region(
+        r2sym::MemoryRegionKind::Stack,
+        "stack_window",
+        Some(0x7000),
+        Some(0x100),
+    );
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Stack,
+        "stack_window",
+        8,
+        8,
+        true,
+        1,
+    );
+}
+
+#[test]
+fn derived_helper_summary_compiles_region_backed_replay_memory_terms() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x9004, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 1),
+                    src: make_const(0x41, 1),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x3000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x9004, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x3000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Store {
+                addr: make_reg(RDI, 8),
+                val: make_reg(RSI, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x3000),
+                name: Some("helper_store".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.define_memory_region(
+        r2sym::MemoryRegionKind::Replay,
+        "replay_window",
+        Some(0x9000),
+        Some(0x100),
+    );
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Replay,
+        "replay_window",
+        4,
+        4,
+        true,
+        1,
+    );
+}
+
+#[test]
+fn derived_helper_summary_region_alias_falls_back_to_residual() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x2000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 8),
+                    src: make_const(0x2000, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x3000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x2000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(0x42, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x3000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Store {
+                addr: make_reg(RDI, 8),
+                val: make_const(0x41, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Store {
+                addr: make_reg(RSI, 8),
+                val: make_const(0x42, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x3000),
+                name: Some("helper_alias_store".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.define_memory_region(
+        r2sym::MemoryRegionKind::Global,
+        "global_2000",
+        Some(0x2000),
+        Some(8),
+    );
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(
+        compiled.precision,
+        BackwardConditionPrecision::ResidualSearchRequired
+    );
+    assert!(compiled.backward_memory_residual_fallbacks > 0);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_region_memory_term(
+        &compiled.memory_terms[0],
+        r2sym::MemoryRegionKind::Global,
+        "global_2000",
+        0,
+        0,
+        true,
+        1,
+    );
+}
+
+#[test]
+fn derived_helper_summary_coalesces_adjacent_byte_writes_into_slice() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x3000, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 2),
+                    addr: make_const(0x3000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 2),
+                    b: make_const(0x4241, 2),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Store {
+                addr: make_reg(RDI, 8),
+                val: make_const(0x41, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::IntAdd {
+                dst: make_reg(TMP0, 8),
+                a: make_reg(RDI, 8),
+                b: make_const(1, 8),
+            },
+            R2ILOp::Store {
+                addr: make_reg(TMP0, 8),
+                val: make_const(0x42, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_store_pair".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let state = SymState::new(&ctx, 0x1000);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let helper_summary = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("derived helper summary");
+    assert!(
+        helper_summary.cases.iter().any(|case| {
+            case.memory_writes
+                .iter()
+                .any(|write| write.arg_index == 0 && write.offset == 0 && write.size == 2)
+        }),
+        "expected derived summary to coalesce adjacent byte writes into one 2-byte slice, got {:?}",
+        helper_summary
+            .cases
+            .iter()
+            .flat_map(|case| case.memory_writes.iter().map(|write| (
+                write.arg_index,
+                write.offset,
+                write.size
+            )))
+            .collect::<Vec<_>>()
+    );
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_argument_memory_term(&compiled.memory_terms[0], 0, 0, 0, true, 2);
+}
+
+#[test]
+fn derived_helper_summary_compiles_backward_memory_slice_at_offset() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x3000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 8),
+                    src: make_const(0x4142, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP1, 2),
+                    addr: make_const(0x3002, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(TMP1, 2),
+                    b: make_const(0x4142, 2),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntAdd {
+                dst: make_reg(TMP0, 8),
+                a: make_reg(RDI, 8),
+                b: make_const(2, 8),
+            },
+            R2ILOp::Store {
+                addr: make_reg(TMP0, 8),
+                val: make_reg(RSI, 2),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_store_offset".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let state = SymState::new(&ctx, 0x1000);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let static_summary = derived
+        .interproc
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("static helper summary");
+    assert!(
+        static_summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect.location.region,
+                r2ssa::SummaryMemoryRegion::Arg { index: 0 }
+            ) && effect
+                .location
+                .range
+                .is_some_and(|range| range.offset_lo == 2 && range.width.unwrap_or(0) >= 2)
+        }),
+        "expected static summary to record arg0+2 write, got {:?}",
+        static_summary.memory_effects
+    );
+    let helper_summary = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("derived helper summary");
+    assert!(
+        helper_summary.cases.iter().any(|case| {
+            case.memory_writes
+                .iter()
+                .any(|write| write.arg_index == 0 && write.offset == 2 && write.size >= 2)
+        }),
+        "expected derived summary to record arg0+2 write"
+    );
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_argument_memory_term(&compiled.memory_terms[0], 0, 2, 2, true, 2);
+}
+
+#[test]
+fn derived_helper_summary_compiles_backward_memory_slice_via_ptradd() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x3000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 8),
+                    src: make_const(0x4142, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP1, 2),
+                    addr: make_const(0x3002, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(TMP1, 2),
+                    b: make_const(0x4142, 2),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::PtrAdd {
+                dst: make_reg(TMP0, 8),
+                base: make_reg(RDI, 8),
+                index: make_const(1, 8),
+                element_size: 2,
+            },
+            R2ILOp::Store {
+                addr: make_reg(TMP0, 8),
+                val: make_reg(RSI, 2),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_store_ptradd".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let state = SymState::new(&ctx, 0x1000);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let helper_summary = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("derived helper summary");
+    assert!(
+        helper_summary.cases.iter().any(|case| {
+            case.memory_writes
+                .iter()
+                .any(|write| write.arg_index == 0 && write.offset == 2 && write.size >= 2)
+        }),
+        "expected derived summary to record arg0+2 write"
+    );
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_argument_memory_term(&compiled.memory_terms[0], 0, 2, 2, true, 2);
+}
+
+#[test]
+fn derived_helper_summary_preserves_negative_pointer_write_value() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x3001, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 1),
+                    src: make_const(0x41, 1),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP0, 1),
+                    addr: make_const(0x3000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(TMP1, 1),
+                    a: make_reg(TMP0, 1),
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(TMP1, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntSub {
+                dst: make_reg(TMP0, 8),
+                a: make_reg(RDI, 8),
+                b: make_const(1, 8),
+            },
+            R2ILOp::Store {
+                addr: make_reg(TMP0, 8),
+                val: make_reg(RSI, 1),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_store_prev".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let state = SymState::new(&ctx, 0x1000);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let static_summary = derived
+        .interproc
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("static helper summary");
+    assert!(
+        static_summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect.location.region,
+                r2ssa::SummaryMemoryRegion::Arg { index: 0 }
+            ) && effect
+                .location
+                .range
+                .is_some_and(|range| range.offset_lo == -1 && range.width.unwrap_or(0) >= 1)
+        }),
+        "expected static summary to record arg0-1 write, got {:?}",
+        static_summary.memory_effects
+    );
+    let helper_summary = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("derived helper summary");
+    assert!(
+        helper_summary.cases.iter().any(|case| {
+            case.memory_writes
+                .iter()
+                .any(|write| write.arg_index == 0 && write.offset == -1 && write.size >= 1)
+        }),
+        "expected derived summary to record arg0-1 write, got {:?}",
+        helper_summary
+            .cases
+            .iter()
+            .flat_map(|case| case.memory_writes.iter().map(|write| (
+                write.arg_index,
+                write.offset,
+                write.size
+            )))
+            .collect::<Vec<_>>()
+    );
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_argument_memory_term(&compiled.memory_terms[0], 0, -1, -1, true, 1);
+
+    let paths = explorer.find_paths_to(&root, SymState::new(&ctx, 0x1000), 0x1010);
+    assert_eq!(paths.len(), 1);
+}
+
+#[test]
+fn derived_helper_summary_compiles_backward_memory_slice_via_ptrsub() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(RDI, 8),
+                    src: make_const(0x3002, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(RSI, 8),
+                    src: make_const(0x4142, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(TMP1, 2),
+                    addr: make_const(0x3000, 8),
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(RCX, 1),
+                    a: make_reg(TMP1, 2),
+                    b: make_const(0x4142, 2),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(RCX, 1),
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::PtrSub {
+                dst: make_reg(TMP0, 8),
+                base: make_reg(RDI, 8),
+                index: make_const(1, 8),
+                element_size: 2,
+            },
+            R2ILOp::Store {
+                addr: make_reg(TMP0, 8),
+                val: make_reg(RSI, 2),
+                space: SpaceId::Ram,
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root.clone(),
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_store_ptrsub".to_string()),
+                prepared: helper,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let state = SymState::new(&ctx, 0x1000);
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let helper_summary = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("derived helper summary");
+    assert!(
+        helper_summary.cases.iter().any(|case| {
+            case.memory_writes
+                .iter()
+                .any(|write| write.arg_index == 0 && write.offset == -2 && write.size >= 2)
+        }),
+        "expected derived summary to record arg0-2 write"
+    );
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let _ = registry.install_scope_summaries_for_explorer(
+        &mut explorer,
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_argument_memory_term(&compiled.memory_terms[0], 0, -2, -2, true, 2);
+}
+
+#[test]
+fn derived_helper_summary_compiles_backward_return_precondition() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1004,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let helper_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::IntXor {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RDI, 8),
+                b: make_const(0x55, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper =
+        SsaArtifact::for_symbolic(&helper_blocks, Some(&arch)).expect("helper symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root,
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_xor".to_string()),
+                prepared: helper.clone(),
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+    let summary = derived
+        .summaries
+        .get(&r2ssa::InterprocFunctionId(0x2000))
+        .expect("derived summary");
+    let mut state = SymState::new(&ctx, 0x2000);
+    r2sym::seed_default_state_for_arch(&mut state, &helper, Some(&arch));
+    state.make_symbolic_named("RDI_0", "rdi", 64);
+
+    let compiled = compile_derived_summary_return_postcondition(
+        &state,
+        summary,
+        &r2sym::CallConv::x86_64_sysv(),
+        |ret| {
+            ret.eq(&ctx, &SymValue::concrete(0x6a, 64))
+                .to_bv(&ctx)
+                .eq(z3::ast::BV::from_u64(1, 1))
+        },
+    )
+    .expect("compiled backward precondition");
+
+    assert_eq!(
+        compiled.summary.precision,
+        BackwardConditionPrecision::Exact
+    );
+    let solver = SymSolver::new(&ctx);
+    assert_eq!(
+        solver.sat_with_constraint(&state, &compiled.predicate),
+        r2sym::SatResult::Sat
+    );
+}
+
+#[test]
+fn derived_helper_summary_reports_recursive_scc_diagnostics() {
+    let arch = make_x86_64_arch();
+    let root_blocks = vec![R2ILBlock {
+        addr: 0x1000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+    let helper_a_blocks = vec![R2ILBlock {
+        addr: 0x2000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Call {
+                target: make_const(0x3000, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+    let helper_b_blocks = vec![R2ILBlock {
+        addr: 0x3000,
+        size: 1,
+        switch_info: None,
+        op_metadata: Default::default(),
+        ops: vec![
+            R2ILOp::Call {
+                target: make_const(0x2000, 8),
+            },
+            R2ILOp::Return {
+                target: make_const(0, 8),
+            },
+        ],
+    }];
+
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let helper_a = SsaArtifact::for_symbolic(&helper_a_blocks, Some(&arch))
+        .expect("helper_a symbolic function");
+    let helper_b = SsaArtifact::for_symbolic(&helper_b_blocks, Some(&arch))
+        .expect("helper_b symbolic function");
+    let scope = r2sym::PreparedFunctionScope::new(
+        0x1000,
+        vec![
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("root".to_string()),
+                prepared: root,
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x2000),
+                name: Some("helper_a".to_string()),
+                prepared: helper_a,
+            },
+            r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x3000),
+                name: Some("helper_b".to_string()),
+                prepared: helper_b,
+            },
+        ],
+    )
+    .expect("scope");
+
+    let ctx = Context::thread_local();
+    let registry = SummaryRegistry::with_core(r2sym::CallConv::x86_64_sysv());
+    let derived = registry.derive_symbolic_summaries(
+        &ctx,
+        &scope,
+        Some(&arch),
+        &std::collections::HashMap::new(),
+    );
+
+    assert_eq!(derived.diagnostics.scc_count, 1);
+    assert_eq!(derived.diagnostics.max_scc_size, 2);
+    assert_eq!(
+        derived.diagnostics.scc_converged + derived.diagnostics.scc_budget_exhausted,
+        1
+    );
+    assert!(
+        derived
+            .summaries
+            .contains_key(&r2ssa::InterprocFunctionId(0x2000))
+    );
+    assert!(
+        derived
+            .summaries
+            .contains_key(&r2ssa::InterprocFunctionId(0x3000))
     );
 }

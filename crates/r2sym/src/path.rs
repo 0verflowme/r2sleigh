@@ -4,12 +4,15 @@
 //! during symbolic execution, including DFS, BFS, and coverage-guided.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use r2ssa::{BlockTerminator, SsaArtifact};
 use z3::Context;
 
+use crate::backward::DerivedCallSummaryView;
 use crate::executor::SymExecutor;
+use crate::sim::{CallConv, DerivedFunctionSummary, evaluate_derived_summary_guidance};
 use crate::solver::SymSolver;
 use crate::spec::ExplorationSpec;
 use crate::state::{ExitStatus, SymState};
@@ -31,6 +34,8 @@ pub struct ExploreConfig {
     pub prune_infeasible: bool,
     /// Whether to merge states at join points.
     pub merge_states: bool,
+    /// Whether to drop same-PC states that are already covered by weaker states.
+    pub subsumption_states: bool,
 }
 
 impl Default for ExploreConfig {
@@ -43,6 +48,7 @@ impl Default for ExploreConfig {
             strategy: ExploreStrategy::Dfs,
             prune_infeasible: true,
             merge_states: false,
+            subsumption_states: false,
         }
     }
 }
@@ -158,6 +164,10 @@ pub struct PathExplorer<'ctx> {
     config: ExploreConfig,
     /// Statistics.
     stats: ExploreStats,
+    /// Whether query helpers should prioritize states closer to their target.
+    target_guided_queries: bool,
+    /// Derived helper summaries registered for direct-call targets.
+    derived_call_summaries: HashMap<u64, RegisteredDerivedCallSummary<'ctx>>,
 }
 
 /// Statistics from path exploration.
@@ -175,6 +185,51 @@ pub struct ExploreStats {
     pub max_depth_reached: usize,
     /// Total execution time.
     pub total_time: Duration,
+    /// Whether exploration stopped because the timeout budget expired.
+    pub timed_out: bool,
+    /// Whether exploration stopped because the max_states budget was exhausted.
+    pub max_states_exhausted: bool,
+    /// Number of queued states discarded because another state subsumed them.
+    pub states_subsumed: usize,
+    /// Number of implication checks attempted for same-PC subsumption.
+    pub subsumption_checks: usize,
+    /// Number of implication checks that found a covering state.
+    pub subsumption_hits: usize,
+    /// Number of target-guided queue pops that differed from the base strategy order.
+    pub target_guided_reorders: usize,
+    /// Number of states dropped because their PC cannot reach the target in the CFG.
+    pub target_pruned_cfg_unreachable: usize,
+    /// Number of states dropped because an exact helper summary had no satisfiable case.
+    pub target_pruned_summary_contradiction: usize,
+    /// Number of target-guided states whose ranking/pruning used derived summary metadata.
+    pub target_summary_rank_hits: usize,
+}
+
+#[derive(Clone)]
+struct RegisteredDerivedCallSummary<'ctx> {
+    summary: Rc<DerivedFunctionSummary<'ctx>>,
+    callconv: CallConv,
+}
+
+#[derive(Clone, Default)]
+struct BlockSummaryRank {
+    has_summary: bool,
+    has_exact_summary: bool,
+    min_case_count: usize,
+}
+
+struct TargetGuidanceContext {
+    distances: HashMap<u64, usize>,
+    reachable_blocks: HashSet<u64>,
+    call_targets_by_block: HashMap<u64, Vec<u64>>,
+    block_summary_rank: HashMap<u64, BlockSummaryRank>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StateSummaryGuidance {
+    summary_hits: usize,
+    min_feasible_cases: usize,
+    contradictory: bool,
 }
 
 struct StateWorklist<'ctx> {
@@ -205,6 +260,21 @@ impl<'ctx> StateWorklist<'ctx> {
         self.live_states += 1;
     }
 
+    fn state(&self, id: usize) -> Option<&SymState<'ctx>> {
+        self.slots.get(id)?.as_ref()
+    }
+
+    fn same_pc_ids(&self, pc: u64) -> Vec<usize> {
+        self.same_pc
+            .get(&pc)
+            .map(|bucket| bucket.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn remove_slot(&mut self, id: usize) -> Option<SymState<'ctx>> {
+        self.take_slot(id)
+    }
+
     fn pop_next(&mut self) -> Option<SymState<'ctx>> {
         loop {
             let id = match self.strategy {
@@ -223,6 +293,46 @@ impl<'ctx> StateWorklist<'ctx> {
 
             if let Some(state) = self.take_slot(id) {
                 return Some(state);
+            }
+        }
+    }
+
+    fn pop_best_by_key_with_reorder<K, F>(
+        &mut self,
+        mut key_fn: F,
+    ) -> Option<(SymState<'ctx>, bool)>
+    where
+        K: Ord,
+        F: FnMut(usize, &SymState<'ctx>) -> K,
+    {
+        loop {
+            let default_candidate = match self.strategy {
+                ExploreStrategy::Dfs => self.ready.back().copied(),
+                ExploreStrategy::Bfs => self.ready.front().copied(),
+                ExploreStrategy::Random => {
+                    if self.ready.is_empty() {
+                        None
+                    } else if self.live_states.is_multiple_of(2) {
+                        self.ready.front().copied()
+                    } else {
+                        self.ready.back().copied()
+                    }
+                }
+            };
+            let best = self
+                .ready
+                .iter()
+                .filter_map(|id| self.state(*id).map(|state| (*id, key_fn(*id, state))))
+                .min_by(|a, b| a.1.cmp(&b.1))
+                .map(|(id, _)| id)?;
+            let reordered = default_candidate.is_some_and(|candidate| candidate != best);
+
+            if let Some(pos) = self.ready.iter().position(|queued| *queued == best) {
+                self.ready.remove(pos);
+            }
+
+            if let Some(state) = self.take_slot(best) {
+                return Some((state, reordered));
             }
         }
     }
@@ -571,6 +681,8 @@ impl<'ctx> PathExplorer<'ctx> {
             solver: SymSolver::new(ctx),
             config: ExploreConfig::default(),
             stats: ExploreStats::default(),
+            target_guided_queries: false,
+            derived_call_summaries: HashMap::new(),
         }
     }
 
@@ -588,6 +700,8 @@ impl<'ctx> PathExplorer<'ctx> {
             solver,
             config,
             stats: ExploreStats::default(),
+            target_guided_queries: false,
+            derived_call_summaries: HashMap::new(),
         }
     }
 
@@ -601,13 +715,54 @@ impl<'ctx> PathExplorer<'ctx> {
         &self.solver
     }
 
+    /// Enable target-guided ordering for query-only helpers.
+    pub fn set_target_guided_queries(&mut self, enabled: bool) {
+        self.target_guided_queries = enabled;
+    }
+
+    /// Whether target-guided ordering is enabled for query helpers.
+    pub fn target_guided_queries_enabled(&self) -> bool {
+        self.target_guided_queries
+    }
+
     /// Register a call hook for a concrete target address.
     pub fn register_call_hook<F>(&mut self, addr: u64, hook: F)
     where
         F: Fn(&mut SymState<'ctx>) -> crate::executor::CallHookResult + 'ctx,
     {
+        self.derived_call_summaries.remove(&addr);
         self.executor
             .register_call_hook(addr, move |state| Ok(hook(state)));
+    }
+
+    pub(crate) fn register_derived_call_hook<F>(
+        &mut self,
+        addr: u64,
+        summary: Rc<DerivedFunctionSummary<'ctx>>,
+        callconv: CallConv,
+        hook: F,
+    ) where
+        F: Fn(&mut SymState<'ctx>) -> crate::executor::CallHookResult + 'ctx,
+    {
+        self.derived_call_summaries
+            .insert(addr, RegisteredDerivedCallSummary { summary, callconv });
+        self.executor
+            .register_call_hook(addr, move |state| Ok(hook(state)));
+    }
+
+    pub(crate) fn derived_call_summary_views(&self) -> HashMap<u64, DerivedCallSummaryView<'ctx>> {
+        self.derived_call_summaries
+            .iter()
+            .map(|(addr, registered)| {
+                (
+                    *addr,
+                    DerivedCallSummaryView {
+                        summary: registered.summary.clone(),
+                        callconv: registered.callconv.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Solve a path's constraints and extract concrete values.
@@ -679,10 +834,82 @@ impl<'ctx> PathExplorer<'ctx> {
         paths.iter().map(|p| self.solve_path(p)).collect()
     }
 
+    /// Whether the most recent exploration stopped because of a budget limit.
+    pub fn budget_exhausted(&self) -> bool {
+        self.stats.timed_out || self.stats.max_states_exhausted
+    }
+
     fn record_depth(&mut self, depth: usize) {
         if depth > self.stats.max_depth_reached {
             self.stats.max_depth_reached = depth;
         }
+    }
+
+    fn state_rank(&self, state: &SymState<'ctx>, id: usize) -> (usize, usize, usize) {
+        (state.num_constraints(), state.depth, id)
+    }
+
+    fn prune_subsumed_same_pc_state(
+        &mut self,
+        worklist: &mut StateWorklist<'ctx>,
+        state: SymState<'ctx>,
+    ) -> Option<SymState<'ctx>> {
+        if !self.config.subsumption_states || state.is_terminated() {
+            return Some(state);
+        }
+
+        let candidate_ids = worklist.same_pc_ids(state.pc);
+        if candidate_ids.is_empty() {
+            return Some(state);
+        }
+
+        let state_fingerprint = state.semantic_fingerprint();
+        let state_rank = self.state_rank(&state, worklist.slots.len());
+        let mut keep_state = true;
+
+        for candidate_id in candidate_ids {
+            let Some(existing) = worklist.state(candidate_id) else {
+                continue;
+            };
+            if existing.is_terminated() || existing.semantic_fingerprint() != state_fingerprint {
+                continue;
+            }
+
+            self.stats.subsumption_checks += 1;
+            let existing_subsumes_new = self.solver.implies(&state, existing);
+            let new_subsumes_existing = self.solver.implies(existing, &state);
+
+            match (existing_subsumes_new, new_subsumes_existing) {
+                (Some(true), Some(true)) => {
+                    let existing_rank = self.state_rank(existing, candidate_id);
+                    if existing_rank <= state_rank {
+                        self.stats.subsumption_hits += 1;
+                        self.stats.states_subsumed += 1;
+                        keep_state = false;
+                        break;
+                    }
+                    if worklist.remove_slot(candidate_id).is_some() {
+                        self.stats.subsumption_hits += 1;
+                        self.stats.states_subsumed += 1;
+                    }
+                }
+                (Some(true), _) => {
+                    self.stats.subsumption_hits += 1;
+                    self.stats.states_subsumed += 1;
+                    keep_state = false;
+                    break;
+                }
+                (_, Some(true)) => {
+                    if worklist.remove_slot(candidate_id).is_some() {
+                        self.stats.subsumption_hits += 1;
+                        self.stats.states_subsumed += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        keep_state.then_some(state)
     }
 
     fn drive(
@@ -706,6 +933,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 && start_time.elapsed() > timeout
                 && mode.on_timeout()
             {
+                self.stats.timed_out = true;
                 break;
             }
 
@@ -716,6 +944,7 @@ impl<'ctx> PathExplorer<'ctx> {
             }
 
             if self.stats.states_explored >= self.config.max_states && mode.on_max_states() {
+                self.stats.max_states_exhausted = true;
                 break;
             }
 
@@ -754,7 +983,10 @@ impl<'ctx> PathExplorer<'ctx> {
 
                     for mut forked in forked_states {
                         forked.set_prev_pc(Some(block_addr));
-                        if mode.allow_enqueue(&forked) {
+                        if mode.allow_enqueue(&forked)
+                            && let Some(forked) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, forked)
+                        {
                             worklist.push(forked);
                         }
                     }
@@ -766,7 +998,10 @@ impl<'ctx> PathExplorer<'ctx> {
                             state.pc = next;
                         }
                         state.set_prev_pc(Some(block_addr));
-                        if mode.allow_enqueue(&state) {
+                        if mode.allow_enqueue(&state)
+                            && let Some(state) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, state)
+                        {
                             worklist.push(state);
                         }
                     } else {
@@ -795,6 +1030,329 @@ impl<'ctx> PathExplorer<'ctx> {
         }
 
         self.stats.total_time = start_time.elapsed();
+    }
+
+    fn target_guidance_context(
+        &self,
+        func: &SsaArtifact,
+        target_addr: u64,
+    ) -> TargetGuidanceContext {
+        let distances = self.target_distance_map(func, target_addr);
+        let reachable_blocks = distances.keys().copied().collect::<HashSet<_>>();
+        let mut call_targets_by_block: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut block_summary_rank: HashMap<u64, BlockSummaryRank> = HashMap::new();
+
+        for call in func.call_sites().by_id.values() {
+            let Some(target) = call.direct_target else {
+                continue;
+            };
+            let Some((block_addr, _)) = func.inst_op_site(call.at) else {
+                continue;
+            };
+            call_targets_by_block
+                .entry(block_addr)
+                .or_default()
+                .push(target);
+
+            let Some(binding) = self.derived_call_summaries.get(&target) else {
+                continue;
+            };
+            let entry = block_summary_rank
+                .entry(block_addr)
+                .or_insert_with(|| BlockSummaryRank {
+                    has_summary: false,
+                    has_exact_summary: false,
+                    min_case_count: usize::MAX,
+                });
+            entry.has_summary = true;
+            entry.has_exact_summary |= matches!(
+                binding.summary.completion,
+                crate::sim::DerivedSummaryCompletion::Exact
+            );
+            entry.min_case_count = entry.min_case_count.min(binding.summary.cases.len());
+        }
+
+        TargetGuidanceContext {
+            distances,
+            reachable_blocks,
+            call_targets_by_block,
+            block_summary_rank,
+        }
+    }
+
+    fn symbolic_fanout_proxy(&self, state: &SymState<'ctx>) -> usize {
+        state
+            .registers()
+            .values()
+            .filter(|value| value.is_symbolic())
+            .count()
+            .saturating_add(state.symbolic_inputs().len())
+            .saturating_add(state.symbolic_memory().len())
+            .saturating_add(state.symbolic_fd_inputs().len())
+    }
+
+    fn state_summary_guidance(
+        &self,
+        guidance: &TargetGuidanceContext,
+        state: &SymState<'ctx>,
+    ) -> StateSummaryGuidance {
+        let Some(targets) = guidance.call_targets_by_block.get(&state.pc) else {
+            return StateSummaryGuidance::default();
+        };
+
+        let mut result = StateSummaryGuidance {
+            summary_hits: 0,
+            min_feasible_cases: usize::MAX,
+            contradictory: false,
+        };
+
+        for target in targets {
+            let Some(binding) = self.derived_call_summaries.get(target) else {
+                continue;
+            };
+            let summary_guidance = evaluate_derived_summary_guidance(
+                state,
+                &binding.summary,
+                &binding.callconv,
+                &self.solver,
+            );
+            if !summary_guidance.summary_known {
+                continue;
+            }
+            result.summary_hits += 1;
+            result.min_feasible_cases = result
+                .min_feasible_cases
+                .min(summary_guidance.feasible_cases.max(1));
+            if summary_guidance.contradictory {
+                result.contradictory = true;
+                break;
+            }
+        }
+
+        if result.summary_hits == 0 {
+            StateSummaryGuidance::default()
+        } else {
+            result
+        }
+    }
+
+    fn target_enqueue_allowed(
+        &mut self,
+        guidance: &TargetGuidanceContext,
+        state: &SymState<'ctx>,
+    ) -> bool {
+        if !guidance.reachable_blocks.contains(&state.pc) {
+            self.stats.target_pruned_cfg_unreachable += 1;
+            return false;
+        }
+
+        let summary_guidance = self.state_summary_guidance(guidance, state);
+        if summary_guidance.summary_hits > 0 {
+            self.stats.target_summary_rank_hits += 1;
+        }
+        if summary_guidance.contradictory {
+            self.stats.target_pruned_summary_contradiction += 1;
+            return false;
+        }
+        true
+    }
+
+    fn drive_target_guided(
+        &mut self,
+        func: &SsaArtifact,
+        initial_state: SymState<'ctx>,
+        mode: &mut DriverMode<'ctx>,
+        target_addr: u64,
+    ) {
+        let start_time = Instant::now();
+        let mut worklist = StateWorklist::new(self.config.strategy);
+        let guidance = self.target_guidance_context(func, target_addr);
+        if self.target_enqueue_allowed(&guidance, &initial_state) {
+            worklist.push(initial_state);
+        }
+
+        while let Some((mut state, reordered)) = worklist
+            .pop_best_by_key_with_reorder(|id, state| self.state_target_rank(state, id, &guidance))
+        {
+            if reordered {
+                self.stats.target_guided_reorders += 1;
+            }
+            if self.config.merge_states
+                && let Some(other) = worklist.take_same_pc(state.pc)
+            {
+                state = state.merge_with(&other);
+            }
+
+            if let Some(timeout) = self.config.timeout
+                && start_time.elapsed() > timeout
+                && mode.on_timeout()
+            {
+                self.stats.timed_out = true;
+                break;
+            }
+
+            match mode.on_state_popped(self, state) {
+                DriverAction::Continue(next_state) => state = *next_state,
+                DriverAction::Skip => continue,
+                DriverAction::Finish => break,
+            }
+
+            if self.stats.states_explored >= self.config.max_states && mode.on_max_states() {
+                self.stats.max_states_exhausted = true;
+                break;
+            }
+
+            if state.depth >= self.config.max_depth {
+                match mode.on_depth_limit(self, state, self.config.max_completed_paths) {
+                    DriverAction::Continue(next_state) => state = *next_state,
+                    DriverAction::Skip => continue,
+                    DriverAction::Finish => break,
+                }
+            }
+
+            self.stats.states_explored += 1;
+
+            if self.config.prune_infeasible && !self.solver.is_sat(&state) {
+                self.stats.paths_pruned += 1;
+                mode.on_unsat_pruned();
+                continue;
+            }
+
+            let block_addr = state.pc;
+            let Some(block) = func.get_block(block_addr) else {
+                match mode.on_missing_block(
+                    self,
+                    state,
+                    block_addr,
+                    self.config.max_completed_paths,
+                ) {
+                    DriverAction::Finish => break,
+                    DriverAction::Continue(_) | DriverAction::Skip => continue,
+                }
+            };
+
+            match self.executor.execute_block(&mut state, block) {
+                Ok(forked_states) => {
+                    self.record_depth(state.depth);
+
+                    for mut forked in forked_states {
+                        forked.set_prev_pc(Some(block_addr));
+                        if mode.allow_enqueue(&forked)
+                            && self.target_enqueue_allowed(&guidance, &forked)
+                            && let Some(forked) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, forked)
+                        {
+                            worklist.push(forked);
+                        }
+                    }
+
+                    if !state.is_terminated() {
+                        if state.pc == block_addr
+                            && let Some(next) = self.fallthrough_target(func, block_addr)
+                        {
+                            state.pc = next;
+                        }
+                        state.set_prev_pc(Some(block_addr));
+                        if mode.allow_enqueue(&state)
+                            && self.target_enqueue_allowed(&guidance, &state)
+                            && let Some(state) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, state)
+                        {
+                            worklist.push(state);
+                        }
+                    } else {
+                        match mode.on_terminated_state(
+                            self,
+                            state,
+                            block_addr,
+                            self.config.max_completed_paths,
+                        ) {
+                            DriverAction::Finish => break,
+                            DriverAction::Continue(_) | DriverAction::Skip => continue,
+                        }
+                    }
+                }
+                Err(e) => match mode.on_execute_error(
+                    self,
+                    state,
+                    block_addr,
+                    e.to_string(),
+                    self.config.max_completed_paths,
+                ) {
+                    DriverAction::Finish => break,
+                    DriverAction::Continue(_) | DriverAction::Skip => continue,
+                },
+            }
+        }
+
+        self.stats.total_time = start_time.elapsed();
+    }
+
+    fn target_distance_map(&self, func: &SsaArtifact, target_addr: u64) -> HashMap<u64, usize> {
+        let mut predecessors: HashMap<u64, Vec<u64>> = HashMap::new();
+        for addr in func.cfg().block_addrs() {
+            let Some(block) = func.cfg().get_block(addr) else {
+                continue;
+            };
+            for succ in block.successors() {
+                predecessors.entry(succ).or_default().push(addr);
+            }
+        }
+
+        let mut distances: HashMap<u64, usize> = HashMap::new();
+        let mut queue = VecDeque::new();
+        distances.insert(target_addr, 0);
+        queue.push_back(target_addr);
+
+        while let Some(addr) = queue.pop_front() {
+            let distance = distances[&addr];
+            for pred in predecessors.get(&addr).into_iter().flatten() {
+                if distances.contains_key(pred) {
+                    continue;
+                }
+                distances.insert(*pred, distance.saturating_add(1));
+                queue.push_back(*pred);
+            }
+        }
+
+        distances
+    }
+
+    fn state_target_rank(
+        &self,
+        state: &SymState<'ctx>,
+        id: usize,
+        guidance: &TargetGuidanceContext,
+    ) -> (bool, usize, usize, usize, usize, usize, usize, usize, usize) {
+        let reachable = guidance.reachable_blocks.contains(&state.pc);
+        let distance = guidance
+            .distances
+            .get(&state.pc)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let summary_rank = guidance
+            .block_summary_rank
+            .get(&state.pc)
+            .cloned()
+            .unwrap_or_default();
+        let summary_known_penalty = usize::from(!summary_rank.has_summary);
+        let summary_exact_penalty = usize::from(!summary_rank.has_exact_summary);
+        let summary_case_rank = if summary_rank.has_summary {
+            summary_rank.min_case_count
+        } else {
+            usize::MAX
+        };
+        (
+            !reachable,
+            distance,
+            summary_known_penalty,
+            summary_exact_penalty,
+            summary_case_rank,
+            self.symbolic_fanout_proxy(state),
+            state.num_constraints(),
+            state.depth,
+            id,
+        )
     }
 
     /// Explore all paths in a function.
@@ -839,7 +1397,11 @@ impl<'ctx> PathExplorer<'ctx> {
             target_addr,
             found: None,
         };
-        self.drive(func, initial_state, &mut mode);
+        if self.target_guided_queries {
+            self.drive_target_guided(func, initial_state, &mut mode, target_addr);
+        } else {
+            self.drive(func, initial_state, &mut mode);
+        }
         match mode {
             DriverMode::FindFirst { found, .. } => found,
             _ => unreachable!("find_path_to should always use first-match mode"),
@@ -857,7 +1419,11 @@ impl<'ctx> PathExplorer<'ctx> {
             target_addr,
             matches: Vec::new(),
         };
-        self.drive(func, initial_state, &mut mode);
+        if self.target_guided_queries {
+            self.drive_target_guided(func, initial_state, &mut mode, target_addr);
+        } else {
+            self.drive(func, initial_state, &mut mode);
+        }
         match mode {
             DriverMode::FindAll { matches, .. } => matches,
             _ => unreachable!("find_paths_to should always use all-match mode"),
@@ -906,7 +1472,45 @@ impl<'ctx> PathExplorer<'ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2ssa::{InterprocFunctionId, SsaArtifact};
+    use z3::ast::BV;
+
     use crate::SymValue;
+    use crate::executor::CallHookResult;
+    use crate::sim::{
+        CallConv, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,
+    };
+
+    const RDI: u64 = 56;
+    const TMP0: u64 = 0x80;
+
+    fn make_reg(offset: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Register,
+            offset,
+            size,
+            meta: None,
+        }
+    }
+
+    fn make_const(val: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Const,
+            offset: val,
+            size,
+            meta: None,
+        }
+    }
+
+    fn make_x86_64_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RDI", RDI, 8));
+        arch
+    }
 
     #[test]
     fn test_explore_config_default() {
@@ -915,6 +1519,7 @@ mod tests {
         assert_eq!(config.max_completed_paths, None);
         assert_eq!(config.max_depth, 100);
         assert!(config.prune_infeasible);
+        assert!(!config.subsumption_states);
     }
 
     #[test]
@@ -953,6 +1558,99 @@ mod tests {
         assert_eq!(remaining.pc, 0x2000);
         assert!(worklist.pop_next().is_none());
         assert!(worklist.take_same_pc(0x1000).is_none());
+    }
+
+    #[test]
+    fn test_same_pc_subsumption_prefers_weaker_constraint_state() {
+        let ctx = Context::thread_local();
+        let mut config = ExploreConfig {
+            subsumption_states: true,
+            ..ExploreConfig::default()
+        };
+        config.prune_infeasible = false;
+        let mut explorer = PathExplorer::with_config(&ctx, config);
+        let mut worklist = StateWorklist::new(ExploreStrategy::Dfs);
+
+        let mut existing = SymState::new(&ctx, 0x1000);
+        existing.make_symbolic("sym_input", 64);
+        let input = existing.get_register("sym_input");
+        existing.add_constraint(input.to_bv(&ctx).bvult(z3::ast::BV::from_u64(10, 64)));
+        worklist.push(existing);
+
+        let mut stronger = SymState::new(&ctx, 0x1000);
+        stronger.make_symbolic("sym_input", 64);
+        let input = stronger.get_register("sym_input");
+        stronger.add_constraint(input.to_bv(&ctx).bvult(z3::ast::BV::from_u64(10, 64)));
+        stronger.add_constraint(input.to_bv(&ctx).bvult(z3::ast::BV::from_u64(5, 64)));
+
+        let pruned = explorer.prune_subsumed_same_pc_state(&mut worklist, stronger);
+        assert!(
+            pruned.is_none(),
+            "stronger same-pc state should be subsumed"
+        );
+        assert_eq!(explorer.stats.subsumption_checks, 1);
+        assert_eq!(explorer.stats.subsumption_hits, 1);
+        assert_eq!(explorer.stats.states_subsumed, 1);
+        assert_eq!(worklist.live_states, 1);
+    }
+
+    #[test]
+    fn test_same_pc_subsumption_replaces_stronger_constraint_state() {
+        let ctx = Context::thread_local();
+        let mut config = ExploreConfig {
+            subsumption_states: true,
+            ..ExploreConfig::default()
+        };
+        config.prune_infeasible = false;
+        let mut explorer = PathExplorer::with_config(&ctx, config);
+        let mut worklist = StateWorklist::new(ExploreStrategy::Dfs);
+
+        let mut stronger = SymState::new(&ctx, 0x1000);
+        stronger.make_symbolic("sym_input", 64);
+        let input = stronger.get_register("sym_input");
+        stronger.add_constraint(input.to_bv(&ctx).bvult(z3::ast::BV::from_u64(10, 64)));
+        stronger.add_constraint(input.to_bv(&ctx).bvult(z3::ast::BV::from_u64(5, 64)));
+        worklist.push(stronger);
+
+        let mut weaker = SymState::new(&ctx, 0x1000);
+        weaker.make_symbolic("sym_input", 64);
+        let input = weaker.get_register("sym_input");
+        weaker.add_constraint(input.to_bv(&ctx).bvult(z3::ast::BV::from_u64(10, 64)));
+        let kept = explorer.prune_subsumed_same_pc_state(&mut worklist, weaker);
+
+        assert!(kept.is_some(), "weaker same-pc state should survive");
+        assert_eq!(explorer.stats.subsumption_checks, 1);
+        assert_eq!(explorer.stats.subsumption_hits, 1);
+        assert_eq!(explorer.stats.states_subsumed, 1);
+        assert_eq!(worklist.live_states, 0);
+    }
+
+    #[test]
+    fn test_same_pc_subsumption_tie_break_prefers_shallower_state() {
+        let ctx = Context::thread_local();
+        let config = ExploreConfig {
+            subsumption_states: true,
+            ..ExploreConfig::default()
+        };
+        let mut explorer = PathExplorer::with_config(&ctx, config);
+        let mut worklist = StateWorklist::new(ExploreStrategy::Random);
+
+        let mut existing = SymState::new(&ctx, 0x1000);
+        existing.make_symbolic("sym_input", 64);
+        existing.step();
+        worklist.push(existing);
+
+        let mut new_state = SymState::new(&ctx, 0x1000);
+        new_state.make_symbolic("sym_input", 64);
+        let kept = explorer.prune_subsumed_same_pc_state(&mut worklist, new_state);
+
+        assert!(
+            kept.is_some(),
+            "shallower state should replace deeper equivalent state"
+        );
+        assert_eq!(worklist.live_states, 0);
+        assert_eq!(explorer.stats.subsumption_hits, 1);
+        assert_eq!(explorer.stats.states_subsumed, 1);
     }
 
     #[test]
@@ -1043,5 +1741,71 @@ mod tests {
                 "z_reg".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_target_guided_prunes_exact_summary_contradiction() {
+        let ctx = Context::thread_local();
+        let arch = make_x86_64_arch();
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x1010, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1010,
+                size: 4,
+                ops: vec![R2ILOp::Copy {
+                    dst: make_reg(TMP0, 1),
+                    src: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("symbolic function");
+
+        let mut explorer = PathExplorer::new(&ctx);
+        explorer.set_target_guided_queries(true);
+
+        let arg0 = SymValue::new_symbolic(&ctx, "summary_arg0", 64);
+        let guard = arg0.to_bv(&ctx).eq(BV::from_u64(1, 64));
+        let summary = Rc::new(DerivedFunctionSummary {
+            id: InterprocFunctionId(0x2000),
+            name: Some("contradict_helper".to_string()),
+            arg_count_hint: 1,
+            arg_symbols: vec![(0, arg0)],
+            memory_inputs: Vec::new(),
+            cases: vec![DerivedSummaryCase {
+                guard,
+                return_value: None,
+                memory_writes: Vec::new(),
+            }],
+            completion: DerivedSummaryCompletion::Exact,
+        });
+        explorer.register_derived_call_hook(0x2000, summary, CallConv::x86_64_sysv(), |_state| {
+            CallHookResult::Fallthrough
+        });
+
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.set_register("RDI_0", SymValue::concrete(2, 64));
+
+        let paths = explorer.find_paths_to(&func, state, 0x1010);
+        assert!(paths.is_empty(), "contradictory exact summary should prune");
+        assert_eq!(explorer.stats().target_pruned_summary_contradiction, 1);
     }
 }

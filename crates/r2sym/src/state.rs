@@ -6,14 +6,16 @@
 use std::collections::{HashMap, HashSet};
 
 use z3::Context;
-use z3::ast::{BV, Bool};
+use z3::ast::{Ast, BV, Bool};
 
-use crate::memory::SymMemory;
+use crate::memory::{MemoryRegionId, MemoryRegionKind, SymMemory};
 use crate::value::SymValue;
 
 /// A tracked symbolic memory region (usually an input buffer).
 #[derive(Debug, Clone)]
 pub struct SymbolicMemoryRegion<'ctx> {
+    /// Canonical region backing this symbolic buffer.
+    pub region_id: MemoryRegionId,
     /// Name of the symbolic buffer.
     pub name: String,
     /// Concrete address of the buffer.
@@ -216,6 +218,114 @@ impl<'ctx> SymState<'ctx> {
         &self.runtime
     }
 
+    pub(crate) fn semantic_fingerprint(&self) -> String {
+        let mut registers: Vec<_> = self
+            .registers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value.to_bv(self.ctx).simplify().to_string(),
+                    value.get_taint(),
+                )
+            })
+            .collect();
+        registers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let registers_repr = registers
+            .into_iter()
+            .map(|(name, value, taint)| format!("{name}={value}@{taint}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut symbolic_inputs: Vec<_> = self
+            .symbolic_inputs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value.to_bv(self.ctx).simplify().to_string(),
+                    value.get_taint(),
+                )
+            })
+            .collect();
+        symbolic_inputs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let symbolic_inputs_repr = symbolic_inputs
+            .into_iter()
+            .map(|(name, value, taint)| format!("{name}={value}@{taint}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut symbolic_regions: Vec<_> = self
+            .symbolic_memory
+            .iter()
+            .map(|region| {
+                (
+                    region.region_id,
+                    region.name.clone(),
+                    region.addr,
+                    region.size,
+                    region.value.to_bv(self.ctx).simplify().to_string(),
+                    region.value.get_taint(),
+                )
+            })
+            .collect();
+        symbolic_regions.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        let symbolic_regions_repr = symbolic_regions
+            .into_iter()
+            .map(|(region_id, name, addr, size, value, taint)| {
+                format!("{}:{name}@{addr:x}:{size}={value}@{taint}", region_id.0)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut fd_inputs: Vec<_> = self
+            .symbolic_fd_inputs
+            .iter()
+            .map(|(fd, input)| {
+                let bytes = input
+                    .bytes
+                    .iter()
+                    .map(|byte| format!("{}@{}", byte.to_bv(self.ctx).simplify(), byte.get_taint()))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                (*fd, input.name.clone(), input.cursor, bytes)
+            })
+            .collect();
+        fd_inputs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let fd_inputs_repr = fd_inputs
+            .into_iter()
+            .map(|(fd, name, cursor, bytes)| format!("{fd}:{name}@{cursor}[{bytes}]"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut tty_fds: Vec<_> = self.runtime.tty_fds.iter().copied().collect();
+        tty_fds.sort_unstable();
+        let tty_repr = tty_fds
+            .into_iter()
+            .map(|fd| fd.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "pc={:x};active={};exit={:?};regs=[{}];memory=({});inputs=[{}];regions=[{}];fds=[{}];tty=[{}];skip_sleep={}",
+            self.pc,
+            self.active,
+            self.exit_status,
+            registers_repr,
+            self.memory.semantic_fingerprint(),
+            symbolic_inputs_repr,
+            symbolic_regions_repr,
+            fd_inputs_repr,
+            tty_repr,
+            self.runtime.skip_sleep_calls
+        )
+    }
+
     /// Read from memory.
     pub fn mem_read(&self, addr: &SymValue<'ctx>, size: u32) -> SymValue<'ctx> {
         self.memory
@@ -284,29 +394,12 @@ impl<'ctx> SymState<'ctx> {
         }
         merged.registers = registers;
 
-        let mut memory = self.memory.fork();
-        let mut addrs = HashSet::new();
-        addrs.extend(self.memory.merge_addrs());
-        addrs.extend(other.memory.merge_addrs());
-        for addr in addrs {
-            let addr_val = SymValue::concrete(addr, 64);
-            let val_self = self
-                .memory
-                .read_with_constraints(&addr_val, 1, &self.constraints);
-            let val_other = other
-                .memory
-                .read_with_constraints(&addr_val, 1, &other.constraints);
-            let merged_val = merge_values(self.ctx, &cond_other, &val_self, &val_other);
-            memory.write(&addr_val, &merged_val, 1);
-        }
-
-        for (addr, value, size) in other.memory.symbolic_writes() {
-            if addr.as_concrete().is_none() {
-                memory.push_symbolic_write(addr.clone(), value.clone(), *size);
-            }
-        }
-
-        merged.memory = memory;
+        merged.memory = self.memory.merge_with(
+            &other.memory,
+            &self.constraints,
+            &other.constraints,
+            &cond_other,
+        );
 
         merged.symbolic_inputs = self.symbolic_inputs.clone();
         for (name, value) in &other.symbolic_inputs {
@@ -318,10 +411,12 @@ impl<'ctx> SymState<'ctx> {
 
         merged.symbolic_memory = self.symbolic_memory.clone();
         for region in &other.symbolic_memory {
-            let exists = merged
-                .symbolic_memory
-                .iter()
-                .any(|r| r.name == region.name && r.addr == region.addr && r.size == region.size);
+            let exists = merged.symbolic_memory.iter().any(|r| {
+                r.region_id == region.region_id
+                    && r.name == region.name
+                    && r.addr == region.addr
+                    && r.size == region.size
+            });
             if !exists {
                 merged.symbolic_memory.push(region.clone());
             }
@@ -584,16 +679,40 @@ impl<'ctx> SymState<'ctx> {
         } else {
             SymValue::new_symbolic_tainted(self.ctx, name, size * 8, taint)
         };
+        let region_id =
+            self.define_memory_region(MemoryRegionKind::Input, name, Some(addr), Some(size as u64));
         let addr_val = SymValue::concrete(addr, 64);
         self.mem_write(&addr_val, &value, size);
         self.symbolic_inputs.insert(name.to_string(), value.clone());
         self.symbolic_memory.push(SymbolicMemoryRegion {
+            region_id,
             name: name.to_string(),
             addr,
             size,
             value: value.clone(),
         });
         value
+    }
+
+    /// Define a canonical memory region for the symbolic state.
+    pub fn define_memory_region(
+        &mut self,
+        kind: MemoryRegionKind,
+        name: &str,
+        base_addr: Option<u64>,
+        extent: Option<u64>,
+    ) -> MemoryRegionId {
+        self.memory.define_region(kind, name, base_addr, extent)
+    }
+
+    /// Seed concrete bytes into an existing memory region.
+    pub fn seed_region_bytes(&mut self, region_id: MemoryRegionId, offset: u64, bytes: &[u8]) {
+        self.memory.seed_region_bytes(region_id, offset, bytes);
+    }
+
+    /// Allocate a deterministic heap region and return its concrete base pointer.
+    pub fn allocate_heap_region(&mut self, name: &str, size: u64) -> (MemoryRegionId, u64) {
+        self.memory.allocate_heap_region(name, size)
     }
 
     /// Configure tty behavior for a concrete file descriptor.
@@ -910,5 +1029,53 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(val, 2);
+    }
+
+    #[test]
+    fn test_merge_memory_preserves_region_only_present_on_one_side() {
+        let ctx = Context::thread_local();
+
+        let mut state_a = SymState::new(&ctx, 0x1000);
+        let x_a = SymValue::new_symbolic(&ctx, "x", 32);
+        state_a.set_register("x", x_a.clone());
+        state_a.add_constraint(x_a.to_bv(&ctx).eq(BV::from_u64(0, 32)));
+
+        let mut state_b = SymState::new(&ctx, 0x1000);
+        let x_b = SymValue::new_symbolic(&ctx, "x", 32);
+        state_b.set_register("x", x_b.clone());
+        state_b.add_constraint(x_b.to_bv(&ctx).eq(BV::from_u64(1, 32)));
+        state_b.define_memory_region(MemoryRegionKind::Replay, "replay", Some(0x9000), Some(0x10));
+        state_b.mem_write(
+            &SymValue::concrete(0x9000, 64),
+            &SymValue::concrete(0xab, 8),
+            1,
+        );
+
+        let merged = state_a.merge_with(&state_b);
+        let merged_byte = merged.mem_read(&SymValue::concrete(0x9000, 64), 1);
+
+        let solver = Solver::new();
+        solver.assert(merged.path_condition());
+        solver.assert(x_b.to_bv(&ctx).eq(BV::from_u64(0, 32)));
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().unwrap();
+        let value = model
+            .eval(&merged_byte.to_bv(&ctx), true)
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert_eq!(value, 0);
+
+        let solver = Solver::new();
+        solver.assert(merged.path_condition());
+        solver.assert(x_b.to_bv(&ctx).eq(BV::from_u64(1, 32)));
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().unwrap();
+        let value = model
+            .eval(&merged_byte.to_bv(&ctx), true)
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert_eq!(value, 0xab);
     }
 }

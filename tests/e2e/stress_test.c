@@ -713,6 +713,53 @@ int interpret_bytecode(uint8_t *code, int len) {
     return acc;
 }
 
+// Small interpreter loop intended to be step-summary friendly.
+__attribute__((noinline))
+int tiny_vm_dispatch(uint8_t *code, int len) {
+    int ip = 0;
+    int acc = 0;
+    uint8_t dispatch_op = 0;
+
+dispatch:
+    if (ip >= len) {
+        return acc;
+    }
+
+    dispatch_op = code[ip++];
+    switch (dispatch_op) {
+        case 0x00:
+            acc += 1;
+            goto dispatch;
+        case 0x01:
+            acc += 2;
+            goto dispatch;
+        case 0x02:
+            acc -= 1;
+            goto dispatch;
+        case 0x03:
+            acc ^= 0x55;
+            goto dispatch;
+        case 0x04:
+            acc ^= 0xaa;
+            goto dispatch;
+        case 0x05:
+            acc <<= 1;
+            goto dispatch;
+        case 0x06:
+            acc >>= 1;
+            goto dispatch;
+        case 0x07:
+            if (acc == 0 && ip < len) {
+                ip += (int8_t)code[ip];
+            }
+            goto dispatch;
+        case 0xff:
+            return acc;
+        default:
+            return -1;
+    }
+}
+
 // ============================================================================
 // 16. Vulnerability patterns for taint analysis
 // ============================================================================
@@ -896,6 +943,7 @@ int main(int argc, char *argv[]) {
         printf(" 18: ht_insert + ht_lookup\n");
         printf(" 19: vuln patterns\n");
         printf(" 20: saturating_add\n");
+        printf(" 21: tiny_vm_dispatch\n");
         return 1;
     }
     
@@ -1057,6 +1105,11 @@ int main(int argc, char *argv[]) {
                 uint32_t x = strtoul(argv[2], NULL, 0);
                 printf("rotate_left(0x%x, 4) = 0x%x\n", x, rotate_left(x, 4));
             }
+            break;
+        }
+        case 21: {
+            uint8_t code[] = {0x00, 0x01, 0x03, 0x05, 0x06, 0x04, 0xff};
+            printf("tiny_vm_dispatch result = %d\n", tiny_vm_dispatch(code, sizeof(code)));
             break;
         }
         default:

@@ -8,6 +8,278 @@ use crate::convert::CTypeLike;
 use crate::external::ExternalTypeDb;
 use crate::model::Signedness;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicReachabilityStatus {
+    Reachable,
+    Unreachable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicSemanticMode {
+    Raw,
+    Compiled,
+    Residual,
+    VmSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicSemanticSliceClass {
+    Wrapper,
+    Worker,
+    RecursiveGroup,
+    InterpreterSwitch,
+    InterpreterIndirect,
+    GenericLarge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct SymbolicSemanticCapability {
+    pub query_ready: bool,
+    pub type_ready: bool,
+    pub decompile_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicSemanticResidualReason {
+    MissingArch,
+    LargeCfg,
+    SummaryBudgetExhausted,
+    SccBudgetExhausted,
+    InterpreterRequiresStepSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicConditionPrecision {
+    Exact,
+    OverApprox,
+    ResidualSearchRequired,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicMemoryRegionKind {
+    Stack,
+    Global,
+    Input,
+    Heap,
+    Replay,
+    EscapedUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicMemoryRegionRef {
+    pub id: u32,
+    pub kind: SymbolicMemoryRegionKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicMemoryRegion {
+    Argument { index: usize },
+    Region(SymbolicMemoryRegionRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicMemoryCondition {
+    pub region: SymbolicMemoryRegion,
+    pub offset_lo: i64,
+    pub offset_hi: i64,
+    pub size: u32,
+    pub exact_offset: bool,
+    pub expr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicCompiledCondition {
+    pub simplified: String,
+    pub terms: Vec<String>,
+    pub memory_terms: Vec<SymbolicMemoryCondition>,
+    pub backward_memory_substitutions: usize,
+    pub backward_memory_candidate_enumerations: usize,
+    pub backward_memory_residual_fallbacks: usize,
+    pub precision: SymbolicConditionPrecision,
+    pub supported_paths: usize,
+    pub total_paths: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicInterpreterKind {
+    SwitchDispatch,
+    IndirectDispatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicInterpreterDispatch {
+    pub kind: SymbolicInterpreterKind,
+    pub dispatch_header: u64,
+    pub dispatch_targets: usize,
+    pub selector: Option<String>,
+    pub back_edges: usize,
+    pub score: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicVmValueExpr {
+    Const(u64),
+    Var(String),
+    Expr(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicVmStateUpdate {
+    pub output: String,
+    pub expr: String,
+    pub value: SymbolicVmValueExpr,
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicVmTransferArm {
+    pub handler_target: u64,
+    pub case_values: Vec<u64>,
+    pub region_blocks: Vec<u64>,
+    pub exit_targets: Vec<u64>,
+    pub state_updates: Vec<SymbolicVmStateUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_update: Option<SymbolicVmStateUpdate>,
+    pub exact: bool,
+    pub redispatch: bool,
+    pub may_return: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicVmStepSummary {
+    pub kind: SymbolicInterpreterKind,
+    pub loop_header: u64,
+    pub dispatch_header: u64,
+    pub selector: Option<String>,
+    pub dispatch_targets: Vec<u64>,
+    pub default_target: Option<u64>,
+    pub case_values_by_target: BTreeMap<u64, Vec<u64>>,
+    pub loop_latches: Vec<u64>,
+    pub state_inputs: Vec<String>,
+    pub state_outputs: Vec<String>,
+    pub step_blocks: Vec<u64>,
+    pub handler_regions: BTreeMap<u64, Vec<u64>>,
+    pub handler_state_inputs: BTreeMap<u64, Vec<String>>,
+    pub handler_state_outputs: BTreeMap<u64, Vec<String>>,
+    pub handler_state_updates: BTreeMap<u64, Vec<SymbolicVmStateUpdate>>,
+    pub handler_memory_reads: BTreeMap<u64, usize>,
+    pub handler_memory_writes: BTreeMap<u64, usize>,
+    pub handler_calls: BTreeMap<u64, usize>,
+    pub handler_conditional_branches: BTreeMap<u64, usize>,
+    pub handler_exit_targets: BTreeMap<u64, Vec<u64>>,
+    pub redispatch_handlers: Vec<u64>,
+    pub returning_handlers: Vec<u64>,
+    pub truncated_handlers: Vec<u64>,
+    pub transfers: Vec<SymbolicVmTransferArm>,
+}
+pub type SymbolicVmTransferSummary = SymbolicVmStepSummary;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicFactDiagnostics {
+    pub branches_evaluated: usize,
+    pub branches_pruned: usize,
+    pub branches_unknown: usize,
+    pub skipped_missing_arch: bool,
+    pub skipped_large_cfg: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_mode: Option<SymbolicSemanticMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_capability: Option<SymbolicSemanticCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slice_class: Option<SymbolicSemanticSliceClass>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_reasons: Vec<SymbolicSemanticResidualReason>,
+    pub closure_functions: usize,
+    pub helper_functions: usize,
+    pub derived_summaries: usize,
+    pub summary_attempted: usize,
+    pub summary_budget_exhausted: usize,
+    pub summary_scc_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicBranchFact {
+    pub block_addr: u64,
+    pub true_target: u64,
+    pub false_target: u64,
+    pub true_status: SymbolicReachabilityStatus,
+    pub false_status: SymbolicReachabilityStatus,
+    pub true_condition: Option<String>,
+    pub false_condition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub true_compiled: Option<SymbolicCompiledCondition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub false_compiled: Option<SymbolicCompiledCondition>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicSemanticFacts {
+    pub branch_facts: Vec<SymbolicBranchFact>,
+    pub diagnostics: SymbolicFactDiagnostics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<SymbolicInterpreterDispatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_step: Option<SymbolicVmStepSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_transfer: Option<SymbolicVmTransferSummary>,
+}
+
+impl SymbolicSemanticFacts {
+    pub fn is_empty(&self) -> bool {
+        self.branch_facts.is_empty()
+            && self.diagnostics == SymbolicFactDiagnostics::default()
+            && self.interpreter.is_none()
+            && self.vm_step.is_none()
+            && self.vm_transfer.is_none()
+    }
+
+    pub fn branch_fact_for_block(&self, block_addr: u64) -> Option<&SymbolicBranchFact> {
+        self.branch_facts
+            .iter()
+            .find(|fact| fact.block_addr == block_addr)
+    }
+
+    pub fn vm_step_for_dispatch_header(
+        &self,
+        dispatch_header: u64,
+    ) -> Option<&SymbolicVmStepSummary> {
+        self.vm_step
+            .as_ref()
+            .filter(|vm_step| vm_step.dispatch_header == dispatch_header)
+    }
+
+    pub fn vm_transfer_for_dispatch_header(
+        &self,
+        dispatch_header: u64,
+    ) -> Option<&SymbolicVmTransferSummary> {
+        self.vm_transfer
+            .as_ref()
+            .filter(|vm_transfer| vm_transfer.dispatch_header == dispatch_header)
+    }
+}
+
+impl SymbolicBranchFact {
+    pub fn exact_compiled_condition(&self) -> Option<&SymbolicCompiledCondition> {
+        match (self.true_status, self.false_status) {
+            (SymbolicReachabilityStatus::Reachable, SymbolicReachabilityStatus::Unreachable) => {
+                self.true_compiled.as_ref().filter(|compiled| {
+                    matches!(compiled.precision, SymbolicConditionPrecision::Exact)
+                })
+            }
+            (SymbolicReachabilityStatus::Unreachable, SymbolicReachabilityStatus::Reachable) => {
+                self.false_compiled.as_ref().filter(|compiled| {
+                    matches!(compiled.precision, SymbolicConditionPrecision::Exact)
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionType {
     pub return_type: CTypeLike,
@@ -184,6 +456,7 @@ pub struct FunctionTypeFacts {
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
+    pub symbolic_facts: SymbolicSemanticFacts,
     pub interproc_diagnostics: InterprocFactDiagnostics,
     pub diagnostics: Vec<String>,
 }
@@ -200,6 +473,7 @@ pub struct FunctionTypeFactInputs {
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
+    pub symbolic_facts: SymbolicSemanticFacts,
     pub local_field_accesses: Vec<LocalFieldAccessFact>,
     pub interproc_diagnostics: InterprocFactDiagnostics,
     pub diagnostics: Vec<String>,
@@ -225,6 +499,7 @@ impl FunctionTypeFacts {
             && self.external_type_db.diagnostics.is_empty()
             && self.slot_type_overrides.is_empty()
             && self.slot_field_profiles.is_empty()
+            && self.symbolic_facts.is_empty()
             && self.interproc_diagnostics == InterprocFactDiagnostics::default()
             && self.diagnostics.is_empty()
     }
@@ -241,6 +516,7 @@ impl FunctionTypeFacts {
             external_type_db: self.external_type_db,
             slot_type_overrides: self.slot_type_overrides,
             slot_field_profiles: self.slot_field_profiles,
+            symbolic_facts: self.symbolic_facts,
             local_field_accesses: Vec::new(),
             interproc_diagnostics: self.interproc_diagnostics,
             diagnostics: self.diagnostics,
@@ -275,6 +551,7 @@ impl FunctionTypeFactsBuilder {
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
+            symbolic_facts,
             interproc_diagnostics,
             diagnostics,
             ..
@@ -305,6 +582,7 @@ impl FunctionTypeFactsBuilder {
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
+            symbolic_facts,
             interproc_diagnostics,
             diagnostics,
         }

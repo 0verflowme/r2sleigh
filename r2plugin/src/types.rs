@@ -46,6 +46,7 @@ pub(crate) struct FunctionAnalysisArtifact {
     pub(crate) type_facts: r2types::FunctionTypeFacts,
     pub(crate) writeback_plan: r2types::TypeWritebackPlan,
     pub(crate) interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
+    pub(crate) semantic_artifact: Option<r2sym::CompiledSemanticArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -60,6 +61,7 @@ struct FunctionArtifactCacheKey {
     semantic_metadata_enabled: bool,
     external_context_hash: u64,
     interproc_scope_hash: u64,
+    symbolic_scope_hash: u64,
 }
 
 struct HasherWriter<'a, H: Hasher>(&'a mut H);
@@ -110,12 +112,14 @@ fn function_artifact_cache_key_parts(
     semantic_metadata_enabled: bool,
     external_context_json: &str,
     interproc_scope_json: &str,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<FunctionArtifactCacheKey> {
     Some(FunctionArtifactCacheKey {
         analysis: function_analysis_cache_key_parts(function_name, arch, blocks)?,
         semantic_metadata_enabled,
         external_context_hash: hash_string_payload(external_context_json),
         interproc_scope_hash: hash_string_payload(interproc_scope_json),
+        symbolic_scope_hash: r2sym::stable_scope_hash(symbolic_scope),
     })
 }
 
@@ -165,6 +169,7 @@ fn rename_function_analysis_artifact(
         type_facts,
         writeback_plan,
         interproc_summary_set,
+        semantic_artifact,
     } = artifact;
     FunctionAnalysisArtifact {
         ssa_func: ssa_func.with_name(function_name),
@@ -172,7 +177,352 @@ fn rename_function_analysis_artifact(
         type_facts,
         writeback_plan,
         interproc_summary_set,
+        semantic_artifact,
     }
+}
+
+fn symbolic_reachability_status_from_sym(
+    status: r2sym::SymbolicReachabilityStatus,
+) -> r2types::SymbolicReachabilityStatus {
+    match status {
+        r2sym::SymbolicReachabilityStatus::Reachable => {
+            r2types::SymbolicReachabilityStatus::Reachable
+        }
+        r2sym::SymbolicReachabilityStatus::Unreachable => {
+            r2types::SymbolicReachabilityStatus::Unreachable
+        }
+        r2sym::SymbolicReachabilityStatus::Unknown => r2types::SymbolicReachabilityStatus::Unknown,
+    }
+}
+
+fn symbolic_condition_precision_from_sym(
+    precision: r2sym::BackwardConditionPrecision,
+) -> r2types::SymbolicConditionPrecision {
+    match precision {
+        r2sym::BackwardConditionPrecision::Exact => r2types::SymbolicConditionPrecision::Exact,
+        r2sym::BackwardConditionPrecision::OverApprox => {
+            r2types::SymbolicConditionPrecision::OverApprox
+        }
+        r2sym::BackwardConditionPrecision::ResidualSearchRequired => {
+            r2types::SymbolicConditionPrecision::ResidualSearchRequired
+        }
+        r2sym::BackwardConditionPrecision::Unsupported => {
+            r2types::SymbolicConditionPrecision::Unsupported
+        }
+    }
+}
+
+fn symbolic_memory_region_kind_from_sym(
+    kind: &r2sym::MemoryRegionKind,
+) -> r2types::SymbolicMemoryRegionKind {
+    match kind {
+        r2sym::MemoryRegionKind::Stack => r2types::SymbolicMemoryRegionKind::Stack,
+        r2sym::MemoryRegionKind::Global => r2types::SymbolicMemoryRegionKind::Global,
+        r2sym::MemoryRegionKind::Input => r2types::SymbolicMemoryRegionKind::Input,
+        r2sym::MemoryRegionKind::Heap => r2types::SymbolicMemoryRegionKind::Heap,
+        r2sym::MemoryRegionKind::Replay => r2types::SymbolicMemoryRegionKind::Replay,
+        r2sym::MemoryRegionKind::EscapedUnknown => {
+            r2types::SymbolicMemoryRegionKind::EscapedUnknown
+        }
+    }
+}
+
+fn symbolic_memory_region_from_sym(
+    region: &r2sym::BackwardMemoryRegion,
+) -> r2types::SymbolicMemoryRegion {
+    match region {
+        r2sym::BackwardMemoryRegion::Argument { index } => {
+            r2types::SymbolicMemoryRegion::Argument { index: *index }
+        }
+        r2sym::BackwardMemoryRegion::Region(region) => {
+            r2types::SymbolicMemoryRegion::Region(r2types::SymbolicMemoryRegionRef {
+                id: region.id.0,
+                kind: symbolic_memory_region_kind_from_sym(&region.kind),
+                name: region.name.clone(),
+            })
+        }
+    }
+}
+
+fn symbolic_compiled_condition_from_sym(
+    summary: &r2sym::BackwardConditionSummary,
+) -> r2types::SymbolicCompiledCondition {
+    r2types::SymbolicCompiledCondition {
+        simplified: summary.simplified.clone(),
+        terms: summary.terms.clone(),
+        memory_terms: summary
+            .memory_terms
+            .iter()
+            .map(|term| r2types::SymbolicMemoryCondition {
+                region: symbolic_memory_region_from_sym(&term.region),
+                offset_lo: term.offset_lo,
+                offset_hi: term.offset_hi,
+                size: term.size,
+                exact_offset: term.exact_offset,
+                expr: term.expr.clone(),
+            })
+            .collect(),
+        backward_memory_substitutions: summary.backward_memory_substitutions,
+        backward_memory_candidate_enumerations: summary.backward_memory_candidate_enumerations,
+        backward_memory_residual_fallbacks: summary.backward_memory_residual_fallbacks,
+        precision: symbolic_condition_precision_from_sym(summary.precision),
+        supported_paths: summary.supported_paths,
+        total_paths: summary.total_paths,
+    }
+}
+
+fn symbolic_interpreter_kind_from_sym(
+    kind: r2sym::InterpreterKind,
+) -> r2types::SymbolicInterpreterKind {
+    match kind {
+        r2sym::InterpreterKind::SwitchDispatch => r2types::SymbolicInterpreterKind::SwitchDispatch,
+        r2sym::InterpreterKind::IndirectDispatch => {
+            r2types::SymbolicInterpreterKind::IndirectDispatch
+        }
+    }
+}
+
+fn symbolic_vm_value_expr_from_sym(value: &r2sym::VmValueExpr) -> r2types::SymbolicVmValueExpr {
+    match value {
+        r2sym::VmValueExpr::Const(value) => r2types::SymbolicVmValueExpr::Const(*value),
+        r2sym::VmValueExpr::Var(name) => r2types::SymbolicVmValueExpr::Var(name.clone()),
+        r2sym::VmValueExpr::Expr(expr) => r2types::SymbolicVmValueExpr::Expr(expr.clone()),
+    }
+}
+
+fn symbolic_vm_state_update_from_sym(
+    update: &r2sym::VmStateUpdate,
+) -> r2types::SymbolicVmStateUpdate {
+    r2types::SymbolicVmStateUpdate {
+        output: update.output.clone(),
+        expr: update.expr.clone(),
+        value: symbolic_vm_value_expr_from_sym(&update.value),
+        exact: update.exact,
+    }
+}
+
+fn symbolic_vm_transfer_arm_from_sym(
+    transfer: &r2sym::VmTransferArm,
+) -> r2types::SymbolicVmTransferArm {
+    r2types::SymbolicVmTransferArm {
+        handler_target: transfer.handler_target,
+        case_values: transfer.case_values.clone(),
+        region_blocks: transfer.region_blocks.clone(),
+        exit_targets: transfer.exit_targets.clone(),
+        state_updates: transfer
+            .state_updates
+            .iter()
+            .map(symbolic_vm_state_update_from_sym)
+            .collect(),
+        selector_update: transfer
+            .selector_update
+            .as_ref()
+            .map(symbolic_vm_state_update_from_sym),
+        exact: transfer.exact,
+        redispatch: transfer.redispatch,
+        may_return: transfer.may_return,
+        truncated: transfer.truncated,
+    }
+}
+
+fn symbolic_vm_step_summary_from_sym(
+    vm_step: &r2sym::VmStepSummary,
+) -> r2types::SymbolicVmStepSummary {
+    r2types::SymbolicVmStepSummary {
+        kind: symbolic_interpreter_kind_from_sym(vm_step.kind),
+        loop_header: vm_step.loop_header,
+        dispatch_header: vm_step.dispatch_header,
+        selector: vm_step.selector.clone(),
+        dispatch_targets: vm_step.dispatch_targets.clone(),
+        default_target: vm_step.default_target,
+        case_values_by_target: vm_step.case_values_by_target.clone(),
+        loop_latches: vm_step.loop_latches.clone(),
+        state_inputs: vm_step.state_inputs.clone(),
+        state_outputs: vm_step.state_outputs.clone(),
+        step_blocks: vm_step.step_blocks.clone(),
+        handler_regions: vm_step.handler_regions.clone(),
+        handler_state_inputs: vm_step.handler_state_inputs.clone(),
+        handler_state_outputs: vm_step.handler_state_outputs.clone(),
+        handler_state_updates: vm_step
+            .handler_state_updates
+            .iter()
+            .map(|(target, updates)| {
+                (
+                    *target,
+                    updates
+                        .iter()
+                        .map(symbolic_vm_state_update_from_sym)
+                        .collect(),
+                )
+            })
+            .collect(),
+        handler_memory_reads: vm_step.handler_memory_reads.clone(),
+        handler_memory_writes: vm_step.handler_memory_writes.clone(),
+        handler_calls: vm_step.handler_calls.clone(),
+        handler_conditional_branches: vm_step.handler_conditional_branches.clone(),
+        handler_exit_targets: vm_step.handler_exit_targets.clone(),
+        redispatch_handlers: vm_step.redispatch_handlers.clone(),
+        returning_handlers: vm_step.returning_handlers.clone(),
+        truncated_handlers: vm_step.truncated_handlers.clone(),
+        transfers: vm_step
+            .transfers
+            .iter()
+            .map(symbolic_vm_transfer_arm_from_sym)
+            .collect(),
+    }
+}
+
+pub(crate) fn symbolic_semantic_facts_from_sym(
+    compiled: &r2sym::CompiledSemanticArtifact,
+) -> r2types::SymbolicSemanticFacts {
+    let facts = &compiled.symbolic_facts;
+    r2types::SymbolicSemanticFacts {
+        branch_facts: facts
+            .branch_facts
+            .iter()
+            .cloned()
+            .map(|fact| r2types::SymbolicBranchFact {
+                block_addr: fact.block_addr,
+                true_target: fact.true_target,
+                false_target: fact.false_target,
+                true_status: symbolic_reachability_status_from_sym(fact.true_status),
+                false_status: symbolic_reachability_status_from_sym(fact.false_status),
+                true_condition: fact.true_condition,
+                false_condition: fact.false_condition,
+                true_compiled: fact
+                    .true_compiled
+                    .as_ref()
+                    .map(symbolic_compiled_condition_from_sym),
+                false_compiled: fact
+                    .false_compiled
+                    .as_ref()
+                    .map(symbolic_compiled_condition_from_sym),
+            })
+            .collect(),
+        diagnostics: r2types::SymbolicFactDiagnostics {
+            branches_evaluated: facts.diagnostics.branches_evaluated,
+            branches_pruned: facts.diagnostics.branches_pruned,
+            branches_unknown: facts.diagnostics.branches_unknown,
+            skipped_missing_arch: facts.diagnostics.skipped_missing_arch,
+            skipped_large_cfg: facts.diagnostics.skipped_large_cfg,
+            semantic_mode: Some(match compiled.mode {
+                r2sym::SemanticMode::Raw => r2types::SymbolicSemanticMode::Raw,
+                r2sym::SemanticMode::Compiled => r2types::SymbolicSemanticMode::Compiled,
+                r2sym::SemanticMode::Residual => r2types::SymbolicSemanticMode::Residual,
+                r2sym::SemanticMode::VmSummary => r2types::SymbolicSemanticMode::VmSummary,
+            }),
+            semantic_capability: Some(r2types::SymbolicSemanticCapability {
+                query_ready: compiled.capability.query_ready,
+                type_ready: compiled.capability.type_ready,
+                decompile_ready: compiled.capability.decompile_ready,
+            }),
+            slice_class: Some(match compiled.slice_class {
+                r2sym::SliceClass::Wrapper => r2types::SymbolicSemanticSliceClass::Wrapper,
+                r2sym::SliceClass::Worker => r2types::SymbolicSemanticSliceClass::Worker,
+                r2sym::SliceClass::RecursiveGroup => {
+                    r2types::SymbolicSemanticSliceClass::RecursiveGroup
+                }
+                r2sym::SliceClass::InterpreterSwitch => {
+                    r2types::SymbolicSemanticSliceClass::InterpreterSwitch
+                }
+                r2sym::SliceClass::InterpreterIndirect => {
+                    r2types::SymbolicSemanticSliceClass::InterpreterIndirect
+                }
+                r2sym::SliceClass::GenericLarge => {
+                    r2types::SymbolicSemanticSliceClass::GenericLarge
+                }
+            }),
+            residual_reasons: compiled
+                .residual_reasons
+                .iter()
+                .map(|reason| match reason {
+                    r2sym::ResidualReason::MissingArch => {
+                        r2types::SymbolicSemanticResidualReason::MissingArch
+                    }
+                    r2sym::ResidualReason::LargeCfg => {
+                        r2types::SymbolicSemanticResidualReason::LargeCfg
+                    }
+                    r2sym::ResidualReason::SummaryBudgetExhausted => {
+                        r2types::SymbolicSemanticResidualReason::SummaryBudgetExhausted
+                    }
+                    r2sym::ResidualReason::SccBudgetExhausted => {
+                        r2types::SymbolicSemanticResidualReason::SccBudgetExhausted
+                    }
+                    r2sym::ResidualReason::InterpreterRequiresStepSummary => {
+                        r2types::SymbolicSemanticResidualReason::InterpreterRequiresStepSummary
+                    }
+                })
+                .collect(),
+            closure_functions: compiled.closure_functions,
+            helper_functions: compiled.helper_functions,
+            derived_summaries: compiled.derived_summaries,
+            summary_attempted: compiled.derived_diagnostics.attempted,
+            summary_budget_exhausted: compiled.derived_diagnostics.budget_exhausted
+                + compiled.derived_diagnostics.scc_budget_exhausted,
+            summary_scc_count: compiled.derived_diagnostics.scc_count,
+        },
+        interpreter: compiled.interpreter.as_ref().map(|interpreter| {
+            r2types::SymbolicInterpreterDispatch {
+                kind: symbolic_interpreter_kind_from_sym(interpreter.kind),
+                dispatch_header: interpreter.dispatch_header,
+                dispatch_targets: interpreter.dispatch_targets,
+                selector: interpreter.selector.clone(),
+                back_edges: interpreter.back_edges,
+                score: interpreter.score,
+            }
+        }),
+        vm_step: compiled
+            .vm_step
+            .as_ref()
+            .map(symbolic_vm_step_summary_from_sym),
+        vm_transfer: compiled
+            .vm_step
+            .as_ref()
+            .map(symbolic_vm_step_summary_from_sym),
+    }
+}
+
+pub(crate) fn collect_plugin_semantic_artifact(
+    prepared: &r2ssa::SsaArtifact,
+    arch: Option<&ArchSpec>,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> r2sym::CompiledSemanticArtifact {
+    let scope = symbolic_scope_with_prepared_root(prepared, symbolic_scope);
+    r2sym::compile_semantic_artifact_with_scope(
+        &z3::Context::thread_local(),
+        prepared,
+        scope.as_ref(),
+        arch,
+        &HashMap::new(),
+        r2sym::SummaryProfile::Default,
+    )
+}
+
+fn symbolic_scope_with_prepared_root(
+    prepared: &r2ssa::SsaArtifact,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<r2sym::PreparedFunctionScope> {
+    let scope = symbolic_scope?;
+    let mut functions = scope.functions().values().cloned().collect::<Vec<_>>();
+    for function in &mut functions {
+        if function.id == scope.root_id() {
+            function.prepared = prepared.clone();
+            if function.name.is_none() {
+                function.name = prepared.function().name.clone();
+            }
+        }
+    }
+    r2sym::PreparedFunctionScope::new(scope.root_id().0, functions)
+}
+
+#[allow(dead_code)]
+fn collect_plugin_symbolic_facts(
+    prepared: &r2ssa::SsaArtifact,
+    arch: Option<&ArchSpec>,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> r2types::SymbolicSemanticFacts {
+    let artifact = collect_plugin_semantic_artifact(prepared, arch, symbolic_scope);
+    symbolic_semantic_facts_from_sym(&artifact)
 }
 
 fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
@@ -383,6 +733,7 @@ fn function_artifact_cache_key(
     input: &FunctionInput<'_>,
     external_context_json: &str,
     interproc_scope_json: &str,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<FunctionArtifactCacheKey> {
     function_artifact_cache_key_parts(
         &input.function_name,
@@ -391,10 +742,11 @@ fn function_artifact_cache_key(
         input.ctx.semantic_metadata_enabled,
         external_context_json,
         interproc_scope_json,
+        symbolic_scope,
     )
 }
 
-fn build_function_analysis_from_parts(
+pub(crate) fn build_function_analysis_from_parts(
     function_name: &str,
     blocks: &[R2ILBlock],
     arch: Option<&ArchSpec>,
@@ -429,6 +781,20 @@ pub(crate) fn build_function_analysis(input: &FunctionInput<'_>) -> Option<Funct
         input.blocks.as_slice(),
         input.ctx.arch,
     )
+}
+
+pub(crate) fn collect_detached_semantic_artifact(
+    blocks: &[R2ILBlock],
+    function_name: &str,
+    arch: Option<&ArchSpec>,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<r2sym::CompiledSemanticArtifact> {
+    let analysis = build_function_analysis_from_parts(function_name, blocks, arch)?;
+    Some(collect_plugin_semantic_artifact(
+        &analysis.ssa_func,
+        arch,
+        symbolic_scope,
+    ))
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -762,11 +1128,12 @@ fn signature_strength(signature: &r2types::FunctionSignatureSpec) -> u8 {
     }
 }
 
-pub(crate) fn build_function_analysis_artifact_from_analysis(
+pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artifact(
     input: &FunctionInput<'_>,
     analysis: FunctionAnalysis,
     external_context_json: &str,
     interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
+    semantic_artifact: r2sym::CompiledSemanticArtifact,
 ) -> Option<FunctionAnalysisArtifact> {
     let ptr_bits = input
         .ctx
@@ -821,13 +1188,41 @@ pub(crate) fn build_function_analysis_artifact_from_analysis(
         interproc_summary_set: interproc_summary_set.clone(),
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
+    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
+    let mut type_facts = writeback.type_facts;
+    if symbolic_facts.diagnostics.branches_pruned > 0 {
+        type_facts.diagnostics.push(format!(
+            "symbolic pruned {} branch arm(s)",
+            symbolic_facts.diagnostics.branches_pruned
+        ));
+    }
+    type_facts.symbolic_facts = symbolic_facts;
     Some(FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_func: analysis.pattern_ssa_func,
-        type_facts: writeback.type_facts,
+        type_facts,
         writeback_plan: writeback.plan,
         interproc_summary_set,
+        semantic_artifact: Some(semantic_artifact),
     })
+}
+
+pub(crate) fn build_function_analysis_artifact_from_analysis(
+    input: &FunctionInput<'_>,
+    analysis: FunctionAnalysis,
+    external_context_json: &str,
+    interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<FunctionAnalysisArtifact> {
+    let semantic_artifact =
+        collect_plugin_semantic_artifact(&analysis.ssa_func, input.ctx.arch, symbolic_scope);
+    build_function_analysis_artifact_from_analysis_with_semantic_artifact(
+        input,
+        analysis,
+        external_context_json,
+        interproc_summary_set,
+        semantic_artifact,
+    )
 }
 
 #[allow(dead_code)]
@@ -837,13 +1232,34 @@ pub(crate) fn build_function_analysis_artifact(
     interproc_scope_json: &str,
     interproc_max_iterations: usize,
 ) -> Option<FunctionAnalysisArtifact> {
-    let cache_key =
-        function_artifact_cache_key(input, external_context_json, interproc_scope_json)?;
-    if let Some(cached) = artifact_cache()
-        .read()
-        .expect("plugin cache read lock poisoned")
-        .get(&cache_key)
-        .cloned()
+    build_function_analysis_artifact_with_scope(
+        input,
+        external_context_json,
+        interproc_scope_json,
+        interproc_max_iterations,
+        None,
+    )
+}
+
+pub(crate) fn build_function_analysis_artifact_with_scope(
+    input: &FunctionInput<'_>,
+    external_context_json: &str,
+    interproc_scope_json: &str,
+    interproc_max_iterations: usize,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<FunctionAnalysisArtifact> {
+    let cache_key = function_artifact_cache_key(
+        input,
+        external_context_json,
+        interproc_scope_json,
+        symbolic_scope,
+    );
+    if let Some(cache_key) = cache_key.as_ref()
+        && let Some(cached) = artifact_cache()
+            .read()
+            .expect("plugin cache read lock poisoned")
+            .get(cache_key)
+            .cloned()
     {
         return Some(rename_function_analysis_artifact(
             (*cached).clone(),
@@ -863,19 +1279,24 @@ pub(crate) fn build_function_analysis_artifact(
         analysis,
         external_context_json,
         Some(interproc_summary_set),
+        symbolic_scope,
     )?;
-    cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
+    if let Some(cache_key) = cache_key {
+        cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
+    }
     Some(rename_function_analysis_artifact(
         artifact,
         &input.function_name,
     ))
 }
 
-pub(crate) fn get_cached_function_analysis_artifact(
+pub(crate) fn get_cached_function_analysis_artifact_with_scope(
     input: &FunctionInput<'_>,
     external_context_json: &str,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<FunctionAnalysisArtifact> {
-    let cache_key = function_artifact_cache_key(input, external_context_json, "{}")?;
+    let cache_key =
+        function_artifact_cache_key(input, external_context_json, "{}", symbolic_scope)?;
     artifact_cache()
         .read()
         .expect("plugin cache read lock poisoned")
@@ -891,11 +1312,13 @@ pub(crate) fn alias_cached_function_analysis_artifact(
     source_external_context_json: &str,
     target_external_context_json: &str,
 ) -> bool {
-    let Some(source_key) = function_artifact_cache_key(input, source_external_context_json, "{}")
+    let Some(source_key) =
+        function_artifact_cache_key(input, source_external_context_json, "{}", None)
     else {
         return false;
     };
-    let Some(target_key) = function_artifact_cache_key(input, target_external_context_json, "{}")
+    let Some(target_key) =
+        function_artifact_cache_key(input, target_external_context_json, "{}", None)
     else {
         return false;
     };
@@ -911,6 +1334,7 @@ pub(crate) fn alias_cached_function_analysis_artifact(
     true
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_detached_function_analysis_artifact(
     blocks: &[R2ILBlock],
@@ -921,6 +1345,29 @@ pub(crate) fn build_detached_function_analysis_artifact(
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
 ) -> Option<FunctionAnalysisArtifact> {
+    build_detached_function_analysis_artifact_with_scope(
+        blocks,
+        function_name,
+        arch,
+        ptr_bits,
+        semantic_metadata_enabled,
+        reg_type_hints,
+        external_context_json,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_detached_function_analysis_artifact_with_scope(
+    blocks: &[R2ILBlock],
+    function_name: &str,
+    arch: Option<&ArchSpec>,
+    ptr_bits: u32,
+    semantic_metadata_enabled: bool,
+    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
+    external_context_json: &str,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<FunctionAnalysisArtifact> {
     let cache_key = function_artifact_cache_key_parts(
         function_name,
         arch,
@@ -928,12 +1375,14 @@ pub(crate) fn build_detached_function_analysis_artifact(
         semantic_metadata_enabled,
         external_context_json,
         "{}",
-    )?;
-    if let Some(cached) = artifact_cache()
-        .read()
-        .expect("plugin cache read lock poisoned")
-        .get(&cache_key)
-        .cloned()
+        symbolic_scope,
+    );
+    if let Some(cache_key) = cache_key.as_ref()
+        && let Some(cached) = artifact_cache()
+            .read()
+            .expect("plugin cache read lock poisoned")
+            .get(cache_key)
+            .cloned()
     {
         return Some(rename_function_analysis_artifact(
             (*cached).clone(),
@@ -1088,14 +1537,28 @@ pub(crate) fn build_detached_function_analysis_artifact(
         interproc_summary_set: None,
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
+    let semantic_artifact =
+        collect_plugin_semantic_artifact(&analysis.ssa_func, arch, symbolic_scope);
+    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
+    let mut type_facts = writeback.type_facts;
+    if symbolic_facts.diagnostics.branches_pruned > 0 {
+        type_facts.diagnostics.push(format!(
+            "symbolic pruned {} branch arm(s)",
+            symbolic_facts.diagnostics.branches_pruned
+        ));
+    }
+    type_facts.symbolic_facts = symbolic_facts;
     let artifact = FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_func: analysis.pattern_ssa_func,
-        type_facts: writeback.type_facts,
+        type_facts,
         writeback_plan: writeback.plan,
         interproc_summary_set: None,
+        semantic_artifact: Some(semantic_artifact),
     };
-    cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
+    if let Some(cache_key) = cache_key {
+        cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));
+    }
     Some(rename_function_analysis_artifact(artifact, function_name))
 }
 
@@ -3036,6 +3499,14 @@ mod tests {
         infer_signature_return_type, resolve_evidence_driven_type,
     };
 
+    fn const_return_blocks(addr: u64, value: u64) -> Vec<r2il::R2ILBlock> {
+        let mut block = r2il::R2ILBlock::new(addr, 4);
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(value, 8),
+        });
+        vec![block]
+    }
+
     #[test]
     fn get_data_refs_resolves_const_add_chain_target() {
         let block = r2ssa::SSABlock {
@@ -4118,5 +4589,107 @@ mod tests {
         let (mips_args, _, _) = recover_vars_arch_profile(Some(&mips));
         assert_eq!(mips_args.len(), 4, "mips should expose a0..a3 args");
         assert!(mips_args[0].1.contains(&"$a0"));
+    }
+
+    #[test]
+    fn function_artifact_cache_key_distinguishes_symbolic_scope() {
+        let arch = ArchSpec::new("x86-64");
+        let root_blocks = const_return_blocks(0x1000, 0);
+        let helper_a_blocks = const_return_blocks(0x2000, 1);
+        let helper_b_blocks = const_return_blocks(0x2000, 2);
+
+        let root_prepared =
+            r2ssa::SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic ssa");
+        let helper_a_prepared = r2ssa::SsaArtifact::for_symbolic(&helper_a_blocks, Some(&arch))
+            .expect("helper a symbolic ssa");
+        let helper_b_prepared = r2ssa::SsaArtifact::for_symbolic(&helper_b_blocks, Some(&arch))
+            .expect("helper b symbolic ssa");
+
+        let scope_a = r2sym::PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x1000),
+                    name: Some("root".to_string()),
+                    prepared: root_prepared.clone(),
+                },
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x2000),
+                    name: Some("helper".to_string()),
+                    prepared: helper_a_prepared,
+                },
+            ],
+        )
+        .expect("scope a");
+        let scope_b = r2sym::PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x1000),
+                    name: Some("root".to_string()),
+                    prepared: root_prepared,
+                },
+                r2sym::ScopedPreparedFunction {
+                    id: r2ssa::InterprocFunctionId(0x2000),
+                    name: Some("helper".to_string()),
+                    prepared: helper_b_prepared,
+                },
+            ],
+        )
+        .expect("scope b");
+
+        let key_without_scope = function_artifact_cache_key_parts(
+            "root",
+            Some(&arch),
+            &root_blocks,
+            true,
+            "{}",
+            "{}",
+            None,
+        )
+        .expect("root-only cache key");
+        let key_a = function_artifact_cache_key_parts(
+            "root",
+            Some(&arch),
+            &root_blocks,
+            true,
+            "{}",
+            "{}",
+            Some(&scope_a),
+        )
+        .expect("scoped cache key a");
+        let key_a_repeat = function_artifact_cache_key_parts(
+            "root",
+            Some(&arch),
+            &root_blocks,
+            true,
+            "{}",
+            "{}",
+            Some(&scope_a),
+        )
+        .expect("scoped cache key a repeat");
+        let key_b = function_artifact_cache_key_parts(
+            "root",
+            Some(&arch),
+            &root_blocks,
+            true,
+            "{}",
+            "{}",
+            Some(&scope_b),
+        )
+        .expect("scoped cache key b");
+
+        assert_eq!(
+            key_a, key_a_repeat,
+            "same symbolic scope should hash stably"
+        );
+        assert_ne!(
+            key_without_scope, key_a,
+            "scope-aware artifacts must not alias the root-only cache key"
+        );
+        assert_ne!(
+            key_a, key_b,
+            "different helper closures must not alias the same artifact cache entry"
+        );
     }
 }

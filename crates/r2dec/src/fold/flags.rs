@@ -8,6 +8,7 @@ use r2ssa::{
 use crate::analysis;
 use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
+use r2types::SymbolicReachabilityStatus;
 
 use super::context::FoldingContext;
 use super::op_lower::parse_const_value;
@@ -85,6 +86,41 @@ impl<'a> FoldingContext<'a> {
     fn prepared_branch_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
         self.prepared_predicate_view()
             .and_then(|view| view.branch_expr_for_block(block_addr).cloned())
+    }
+
+    fn symbolic_branch_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
+        let fact = self
+            .inputs
+            .symbolic_facts
+            .branch_fact_for_block(block_addr)?;
+        match (fact.true_status, fact.false_status) {
+            (SymbolicReachabilityStatus::Reachable, SymbolicReachabilityStatus::Unreachable) => {
+                Some(CExpr::IntLit(1))
+            }
+            (SymbolicReachabilityStatus::Unreachable, SymbolicReachabilityStatus::Reachable) => {
+                Some(CExpr::IntLit(0))
+            }
+            _ => None,
+        }
+    }
+
+    fn symbolic_exact_compiled_condition(
+        &self,
+        block_addr: u64,
+    ) -> Option<&r2types::SymbolicCompiledCondition> {
+        self.inputs
+            .symbolic_facts
+            .branch_fact_for_block(block_addr)
+            .and_then(|fact| fact.exact_compiled_condition())
+    }
+
+    fn symbolic_exact_compiled_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
+        let compiled = self.symbolic_exact_compiled_condition(block_addr)?;
+        match compiled.simplified.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(CExpr::IntLit(1)),
+            "0" | "false" => Some(CExpr::IntLit(0)),
+            _ => None,
+        }
     }
 
     fn prepared_predicate_view(&self) -> Option<Cow<'_, analysis::PreparedSemanticView>> {
@@ -292,6 +328,14 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
+        if let Some(cond) = self.symbolic_exact_compiled_condition_expr(block.addr) {
+            return Some(cond);
+        }
+
+        if let Some(cond) = self.symbolic_branch_condition_expr(block.addr) {
+            return Some(cond);
+        }
+
         let (branch_idx, cond) =
             block
                 .ops
@@ -306,14 +350,16 @@ impl<'a> FoldingContext<'a> {
         let prepared_block_candidate =
             self.prepared_predicate_candidate_for_branch_block(block.addr, cond);
         let prepared_var_candidate = self.prepared_predicate_candidate_for_var(cond);
-        let allow_legacy_flag_provenance = ![
-            prepared_branch_candidate.as_ref(),
-            prepared_block_candidate.as_ref(),
-            prepared_var_candidate.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|expr| !self.prepared_candidate_needs_legacy_compare_help(expr));
+        let exact_compiled = self.symbolic_exact_compiled_condition(block.addr);
+        let allow_legacy_flag_provenance = exact_compiled.is_none()
+            && ![
+                prepared_branch_candidate.as_ref(),
+                prepared_block_candidate.as_ref(),
+                prepared_var_candidate.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|expr| !self.prepared_candidate_needs_legacy_compare_help(expr));
 
         let prev_block_addr = self.current_block_addr.replace(Some(block.addr));
         let prev_op_idx = self.current_op_idx.replace(Some(branch_idx));

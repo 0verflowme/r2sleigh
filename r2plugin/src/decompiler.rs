@@ -88,9 +88,32 @@ pub(crate) fn decompiler_input_from_artifact(
     .with_interproc_summary_set(interproc_summary_set)
 }
 
+fn rename_function_artifact_for_display(
+    artifact: FunctionAnalysisArtifact,
+    function_name: &str,
+) -> FunctionAnalysisArtifact {
+    let FunctionAnalysisArtifact {
+        ssa_func,
+        pattern_ssa_func,
+        type_facts,
+        writeback_plan,
+        interproc_summary_set,
+        semantic_artifact,
+    } = artifact;
+    FunctionAnalysisArtifact {
+        ssa_func: ssa_func.with_name(function_name),
+        pattern_ssa_func: pattern_ssa_func.with_name(function_name),
+        type_facts,
+        writeback_plan,
+        interproc_summary_set,
+        semantic_artifact,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_full_decompile_on_large_stack(
     r2il_blocks: Vec<R2ILBlock>,
+    fcn_addr: u64,
     func_name_str: String,
     arch: Option<r2il::ArchSpec>,
     ptr_bits: u32,
@@ -101,6 +124,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
     symbols_str: String,
     external_context_json: String,
     cached_artifact: Option<crate::types::FunctionAnalysisArtifact>,
+    symbolic_scope: Option<r2sym::PreparedFunctionScope>,
 ) -> String {
     const STACK_SIZE: usize = 512 * 1024 * 1024;
 
@@ -115,18 +139,52 @@ pub(crate) fn run_full_decompile_on_large_stack(
             let config = decompiler_config_for_arch_name(&arch_name, ptr_bits);
             let function_names = parse_addr_name_map(&func_names_str);
             let symbols = parse_addr_name_map(&symbols_str);
+            let display_func_name = crate::helpers::resolve_decompiler_display_name(
+                fcn_addr,
+                &func_name_str,
+                &function_names,
+                &symbols,
+            );
             let mut artifact = if let Some(artifact) = cached_artifact {
+                if let Some(semantic_artifact) = artifact.semantic_artifact.as_ref()
+                    && crate::should_decompile_from_semantic_fallback(
+                        &func_name_str,
+                        semantic_artifact,
+                    )
+                {
+                    return crate::decompile_semantic_artifact_fallback(
+                        &display_func_name,
+                        semantic_artifact,
+                    );
+                }
                 artifact
             } else {
-                let Some(artifact) = crate::types::build_detached_function_analysis_artifact(
+                if let Some(semantic_artifact) = crate::types::collect_detached_semantic_artifact(
                     &r2il_blocks,
                     &func_name_str,
                     arch.as_ref(),
-                    ptr_bits,
-                    semantic_metadata_enabled,
-                    &reg_type_hints,
-                    &external_context_json,
-                ) else {
+                    symbolic_scope.as_ref(),
+                ) && crate::should_decompile_from_semantic_fallback(
+                    &func_name_str,
+                    &semantic_artifact,
+                ) {
+                    return crate::decompile_semantic_artifact_fallback(
+                        &display_func_name,
+                        &semantic_artifact,
+                    );
+                }
+                let Some(artifact) =
+                    crate::types::build_detached_function_analysis_artifact_with_scope(
+                        &r2il_blocks,
+                        &func_name_str,
+                        arch.as_ref(),
+                        ptr_bits,
+                        semantic_metadata_enabled,
+                        &reg_type_hints,
+                        &external_context_json,
+                        symbolic_scope.as_ref(),
+                    )
+                else {
                     return decompile_artifact_guard_fallback(
                         &func_name_str,
                         "failed to build detached analysis artifact",
@@ -134,6 +192,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 };
                 artifact
             };
+            artifact = rename_function_artifact_for_display(artifact, &display_func_name);
             crate::types::enrich_known_function_signatures_from_names(
                 &mut artifact.type_facts,
                 &function_names,

@@ -53,9 +53,11 @@ use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2types::{
     CTypeLike, ExternalRegisterParamSpec, ExternalTypeDb, FunctionSignatureSpec, FunctionType,
-    FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding, VisibleBindingKind,
+    FunctionTypeFacts, StackSlotKey, SymbolicInterpreterKind, TypeInference, TypeOracle,
+    VisibleBinding, VisibleBindingKind,
 };
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 fn is_generic_arg_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
@@ -173,6 +175,37 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
         CTypeLike::Union(name) => CType::Union(name.clone()),
         CTypeLike::Enum(name) => CType::Enum(name.clone()),
         CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
+    }
+}
+
+fn format_vm_target_list(targets: &[u64]) -> String {
+    if targets.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered = targets
+        .iter()
+        .map(|target| format!("0x{:x}", target))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rendered}]")
+}
+
+fn format_vm_state_updates(updates: &[r2types::SymbolicVmStateUpdate]) -> String {
+    if updates.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered = updates
+        .iter()
+        .map(|update| format!("{}={}", update.output, update.expr))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rendered}]")
+}
+
+fn format_vm_summary_kind(kind: SymbolicInterpreterKind) -> &'static str {
+    match kind {
+        SymbolicInterpreterKind::SwitchDispatch => "switch_dispatch",
+        SymbolicInterpreterKind::IndirectDispatch => "indirect_dispatch",
     }
 }
 
@@ -663,6 +696,145 @@ impl Decompiler {
         }
     }
 
+    fn semantic_vm_summary_comment(&self) -> Option<String> {
+        let vm_step = self
+            .context
+            .type_facts
+            .symbolic_facts
+            .vm_step
+            .as_ref()
+            .or(self.context.type_facts.symbolic_facts.vm_transfer.as_ref())?;
+
+        let mut out = String::new();
+        let _ = writeln!(&mut out, "r2dec semantic summary: vm_summary");
+        let _ = writeln!(
+            &mut out,
+            "kind={} dispatch_header=0x{:x} loop_header=0x{:x} selector={} targets={} default_target={} latches={} step_blocks={} transfers={}",
+            format_vm_summary_kind(vm_step.kind),
+            vm_step.dispatch_header,
+            vm_step.loop_header,
+            vm_step.selector.as_deref().unwrap_or("<unknown>"),
+            vm_step.dispatch_targets.len(),
+            vm_step
+                .default_target
+                .map(|target| format!("0x{:x}", target))
+                .unwrap_or_else(|| "none".to_string()),
+            vm_step.loop_latches.len(),
+            vm_step.step_blocks.len(),
+            vm_step.transfers.len(),
+        );
+        if !vm_step.state_inputs.is_empty() || !vm_step.state_outputs.is_empty() {
+            let _ = writeln!(
+                &mut out,
+                "state_inputs=[{}] state_outputs=[{}]",
+                vm_step.state_inputs.join(", "),
+                vm_step.state_outputs.join(", "),
+            );
+        }
+
+        let transfer_preview = vm_step.transfers.iter().take(4).collect::<Vec<_>>();
+        if !transfer_preview.is_empty() {
+            for transfer in transfer_preview {
+                let selector_update = transfer
+                    .selector_update
+                    .as_ref()
+                    .map(|update| format!("{}={}", update.output, update.expr))
+                    .unwrap_or_else(|| "none".to_string());
+                let _ = writeln!(
+                    &mut out,
+                    "transfer handler=0x{:x} cases={} blocks={} exits={} updates={} selector_update={} exact={} redispatch={} return={} truncated={}",
+                    transfer.handler_target,
+                    format_vm_target_list(&transfer.case_values),
+                    format_vm_target_list(&transfer.region_blocks),
+                    format_vm_target_list(&transfer.exit_targets),
+                    format_vm_state_updates(&transfer.state_updates),
+                    selector_update,
+                    transfer.exact,
+                    transfer.redispatch,
+                    transfer.may_return,
+                    transfer.truncated,
+                );
+            }
+        }
+
+        let mut preview_handlers = vm_step.handler_regions.keys().copied().collect::<Vec<_>>();
+        preview_handlers.sort_unstable();
+        for handler in preview_handlers.into_iter().take(4) {
+            let regions = vm_step
+                .handler_regions
+                .get(&handler)
+                .map(|regions| format_vm_target_list(regions))
+                .unwrap_or_else(|| "[]".to_string());
+            let cases = vm_step
+                .case_values_by_target
+                .get(&handler)
+                .map(|values| format_vm_target_list(values))
+                .unwrap_or_else(|| "[]".to_string());
+            let updates = vm_step
+                .handler_state_updates
+                .get(&handler)
+                .map(|updates| format_vm_state_updates(updates))
+                .unwrap_or_else(|| "[]".to_string());
+            let inputs = vm_step
+                .handler_state_inputs
+                .get(&handler)
+                .map(|values| format!("[{}]", values.join(", ")))
+                .unwrap_or_else(|| "[]".to_string());
+            let outputs = vm_step
+                .handler_state_outputs
+                .get(&handler)
+                .map(|values| format!("[{}]", values.join(", ")))
+                .unwrap_or_else(|| "[]".to_string());
+            let exits = vm_step
+                .handler_exit_targets
+                .get(&handler)
+                .map(|values| format_vm_target_list(values))
+                .unwrap_or_else(|| "[]".to_string());
+            let _ = writeln!(
+                &mut out,
+                "handler 0x{:x}: regions={} cases={} inputs={} outputs={} updates={} reads={} writes={} calls={} branches={} exits={}",
+                handler,
+                regions,
+                cases,
+                inputs,
+                outputs,
+                updates,
+                vm_step
+                    .handler_memory_reads
+                    .get(&handler)
+                    .copied()
+                    .unwrap_or(0),
+                vm_step
+                    .handler_memory_writes
+                    .get(&handler)
+                    .copied()
+                    .unwrap_or(0),
+                vm_step.handler_calls.get(&handler).copied().unwrap_or(0),
+                vm_step
+                    .handler_conditional_branches
+                    .get(&handler)
+                    .copied()
+                    .unwrap_or(0),
+                exits,
+            );
+        }
+
+        if !vm_step.redispatch_handlers.is_empty()
+            || !vm_step.returning_handlers.is_empty()
+            || !vm_step.truncated_handlers.is_empty()
+        {
+            let _ = writeln!(
+                &mut out,
+                "redispatch_handlers={} returning_handlers={} truncated_handlers={}",
+                format_vm_target_list(&vm_step.redispatch_handlers),
+                format_vm_target_list(&vm_step.returning_handlers),
+                format_vm_target_list(&vm_step.truncated_handlers),
+            );
+        }
+
+        Some(out.trim_end().to_string())
+    }
+
     fn linearize_function_body(
         &self,
         func: &SSAFunction,
@@ -869,6 +1041,7 @@ impl Decompiler {
             external_stack_vars: &self.context.type_facts.external_stack_vars,
             visible_bindings: &self.context.type_facts.visible_bindings,
             external_type_db: &self.context.type_facts.external_type_db,
+            symbolic_facts: &self.context.type_facts.symbolic_facts,
             param_register_aliases: &param_register_aliases,
             type_hints: &type_hints,
             type_oracle,
@@ -945,6 +1118,10 @@ impl Decompiler {
 
         body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt);
         body_stmt = fold_ctx.prune_dead_temp_assignments_in_stmt(body_stmt);
+
+        if let Some(comment) = self.semantic_vm_summary_comment() {
+            body_stmt = Self::prepend_comment(body_stmt, comment);
+        }
 
         // Build the C function
         let func_name = func
@@ -1927,7 +2104,10 @@ mod tests {
     use r2ssa::SSAFunction;
     use r2types::{
         ExternalField, ExternalStruct, FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFacts,
+        SymbolicInterpreterKind, SymbolicSemanticFacts, SymbolicVmStateUpdate,
+        SymbolicVmStepSummary,
     };
+    use std::collections::BTreeMap;
 
     fn ssa_from_ops(ops: Vec<R2ILOp>, arch: &ArchSpec) -> SSAFunction {
         let mut block = R2ILBlock::new(0x1000, 4);
@@ -3639,6 +3819,7 @@ mod tests {
             external_stack_vars: &decompiler.context.type_facts.external_stack_vars,
             visible_bindings: &decompiler.context.type_facts.visible_bindings,
             external_type_db: &decompiler.context.type_facts.external_type_db,
+            symbolic_facts: &decompiler.context.type_facts.symbolic_facts,
             param_register_aliases: &param_register_aliases,
             type_hints: &type_hints,
             type_oracle: combined_type_oracle
@@ -4001,6 +4182,92 @@ mod tests {
                 && !output.contains("*(arg1 +")
                 && !output.contains("arg2 * 38"),
             "observed arm64 struct-array return path should stay semantic, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn decompiler_prepends_vm_semantic_summary_comment() {
+        let func = ssa_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &test_arch_for_decompile(),
+        );
+
+        let mut decompiler = Decompiler::new(DecompilerConfig::default());
+        decompiler.set_type_facts(FunctionTypeFacts {
+            symbolic_facts: SymbolicSemanticFacts {
+                vm_step: Some(SymbolicVmStepSummary {
+                    kind: SymbolicInterpreterKind::SwitchDispatch,
+                    loop_header: 0x1000,
+                    dispatch_header: 0x1000,
+                    selector: Some("vm.sel".to_string()),
+                    dispatch_targets: vec![0x1004, 0x1008],
+                    default_target: Some(0x1010),
+                    case_values_by_target: BTreeMap::from([
+                        (0x1004, vec![1, 2]),
+                        (0x1008, vec![3]),
+                    ]),
+                    loop_latches: vec![0x1000],
+                    state_inputs: vec!["state".to_string(), "pc".to_string()],
+                    state_outputs: vec!["state".to_string(), "pc".to_string()],
+                    step_blocks: vec![0x1000, 0x1004],
+                    handler_regions: BTreeMap::from([(0x1004, vec![0x1004, 0x1008])]),
+                    handler_state_inputs: BTreeMap::from([(0x1004, vec!["state".to_string()])]),
+                    handler_state_outputs: BTreeMap::from([(0x1004, vec!["state".to_string()])]),
+                    handler_state_updates: BTreeMap::from([(
+                        0x1004,
+                        vec![SymbolicVmStateUpdate {
+                            output: "state".to_string(),
+                            expr: "state + 1".to_string(),
+                            value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
+                            exact: false,
+                        }],
+                    )]),
+                    handler_memory_reads: BTreeMap::from([(0x1004, 1)]),
+                    handler_memory_writes: BTreeMap::from([(0x1004, 1)]),
+                    handler_calls: BTreeMap::from([(0x1004, 0)]),
+                    handler_conditional_branches: BTreeMap::from([(0x1004, 0)]),
+                    handler_exit_targets: BTreeMap::from([(0x1004, vec![0x1008])]),
+                    redispatch_handlers: vec![0x1000],
+                    returning_handlers: vec![],
+                    truncated_handlers: vec![],
+                    transfers: vec![r2types::SymbolicVmTransferArm {
+                        handler_target: 0x1004,
+                        case_values: vec![1, 2],
+                        region_blocks: vec![0x1004, 0x1008],
+                        exit_targets: vec![0x1008],
+                        state_updates: vec![SymbolicVmStateUpdate {
+                            output: "state".to_string(),
+                            expr: "state + 1".to_string(),
+                            value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
+                            exact: false,
+                        }],
+                        selector_update: Some(SymbolicVmStateUpdate {
+                            output: "vm.sel".to_string(),
+                            expr: "3".to_string(),
+                            value: r2types::SymbolicVmValueExpr::Const(3),
+                            exact: true,
+                        }),
+                        exact: false,
+                        redispatch: false,
+                        may_return: false,
+                        truncated: false,
+                    }],
+                }),
+                ..SymbolicSemanticFacts::default()
+            },
+            ..FunctionTypeFacts::default()
+        });
+
+        let output = decompiler.decompile(&func);
+        assert!(
+            output.contains("r2dec semantic summary: vm_summary"),
+            "expected VM semantic summary comment, got:\n{output}"
+        );
+        assert!(
+            output.contains("dispatch_header=0x1000") && output.contains("handler 0x1004"),
+            "expected richer VM details in summary comment, got:\n{output}"
         );
     }
 }

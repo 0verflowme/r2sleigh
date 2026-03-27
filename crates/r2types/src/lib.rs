@@ -30,7 +30,14 @@ pub use facts::{
     CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
     FunctionSignatureSpec, FunctionType, FunctionTypeFactInputs, FunctionTypeFacts,
     FunctionTypeFactsBuilder, InterprocFactDiagnostics, LocalFieldAccessFact, ResolvedFieldLayout,
-    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    SymbolicBranchFact, SymbolicCompiledCondition, SymbolicConditionPrecision,
+    SymbolicFactDiagnostics, SymbolicInterpreterDispatch, SymbolicInterpreterKind,
+    SymbolicMemoryCondition, SymbolicMemoryRegion, SymbolicMemoryRegionKind,
+    SymbolicMemoryRegionRef, SymbolicReachabilityStatus, SymbolicSemanticCapability,
+    SymbolicSemanticFacts, SymbolicSemanticMode, SymbolicSemanticResidualReason,
+    SymbolicSemanticSliceClass, SymbolicVmStateUpdate, SymbolicVmStepSummary,
+    SymbolicVmTransferArm, SymbolicVmTransferSummary, SymbolicVmValueExpr, VisibleBinding,
+    VisibleBindingKind, parse_type_like_spec,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

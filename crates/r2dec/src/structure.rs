@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use r2ssa::cfg::BlockTerminator;
 use r2ssa::{CFGEdge, SSAFunction};
+use r2types::SymbolicReachabilityStatus;
 
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
@@ -178,6 +179,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 else_region,
                 merge_block,
             } => {
+                if let Some(rewritten) = self.try_structure_symbolic_exact_if(
+                    *cond_block,
+                    then_region,
+                    else_region.as_deref(),
+                    *merge_block,
+                ) {
+                    return rewritten;
+                }
                 if let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
                     *cond_block,
                     then_region,
@@ -251,6 +260,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Some(b) => b,
             None => return CExpr::Var("switch_expr".to_string()),
         };
+
+        if let Some(vm_step) = self
+            .fold_ctx
+            .inputs
+            .symbolic_facts
+            .vm_step_for_dispatch_header(switch_addr)
+            .or_else(|| {
+                self.fold_ctx
+                    .inputs
+                    .symbolic_facts
+                    .vm_transfer_for_dispatch_header(switch_addr)
+            })
+            && let Some(selector) = vm_step.selector.as_ref()
+        {
+            return CExpr::Var(selector.clone());
+        }
 
         if let Some(expr) = self.fold_ctx.resolve_switch_expr_for_block(switch_addr) {
             return expr;
@@ -399,6 +424,53 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         Some((true_target?, false_target?))
+    }
+
+    fn symbolic_exact_reachable_target(&self, cond_block: u64) -> Option<u64> {
+        let fact = self
+            .fold_ctx
+            .inputs
+            .symbolic_facts
+            .branch_fact_for_block(cond_block)?;
+        match (fact.true_status, fact.false_status) {
+            (SymbolicReachabilityStatus::Reachable, SymbolicReachabilityStatus::Unreachable) => {
+                Some(fact.true_target)
+            }
+            (SymbolicReachabilityStatus::Unreachable, SymbolicReachabilityStatus::Reachable) => {
+                Some(fact.false_target)
+            }
+            _ => None,
+        }
+    }
+
+    fn try_structure_symbolic_exact_if(
+        &mut self,
+        cond_block: u64,
+        then_region: &Region,
+        else_region: Option<&Region>,
+        merge_block: Option<u64>,
+    ) -> Option<CStmt> {
+        let reachable_target = self.symbolic_exact_reachable_target(cond_block)?;
+        let reachable_region = if then_region.entry() == reachable_target {
+            then_region
+        } else {
+            let else_region = else_region?;
+            if else_region.entry() != reachable_target {
+                return None;
+            }
+            else_region
+        };
+
+        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        Self::append_stmt_body_flat(&mut prefix, self.structure_region(reachable_region));
+        if let Some(merge_addr) = merge_block {
+            Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
+        }
+        Some(if prefix.len() == 1 {
+            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(prefix)
+        })
     }
 
     fn switch_case_display_bias(
@@ -776,6 +848,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     then_body,
                     else_body,
                 };
+                let stmt = Self::rewrite_constant_condition_stmt(stmt);
                 let stmt = Self::rewrite_if_short_circuit(stmt);
                 let stmt = Self::rewrite_if_condition_inversion(stmt);
                 let stmt = Self::rewrite_empty_if_bodies(stmt);
@@ -831,6 +904,32 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             other => other,
         }
+    }
+
+    fn rewrite_constant_condition_stmt(stmt: CStmt) -> CStmt {
+        match stmt {
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } if Self::is_const_true_expr(&cond) => *then_body,
+            CStmt::If {
+                cond,
+                then_body: _,
+                else_body,
+            } if Self::is_const_false_expr(&cond) => {
+                else_body.map(|stmt| *stmt).unwrap_or(CStmt::Empty)
+            }
+            other => other,
+        }
+    }
+
+    fn is_const_true_expr(expr: &CExpr) -> bool {
+        matches!(expr, CExpr::IntLit(1) | CExpr::UIntLit(1))
+    }
+
+    fn is_const_false_expr(expr: &CExpr) -> bool {
+        matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
     }
 
     fn rewrite_if_short_circuit(stmt: CStmt) -> CStmt {
@@ -2140,6 +2239,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 mod tests {
     use super::ControlFlowStructurer;
     use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
+    use crate::fold::FoldingContext;
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use r2ssa::SSAFunction;
+    use r2types::{
+        SymbolicInterpreterKind, SymbolicSemanticFacts, SymbolicVmStateUpdate,
+        SymbolicVmStepSummary,
+    };
+    use std::collections::BTreeMap;
 
     fn v(name: &str) -> CExpr {
         CExpr::Var(name.to_string())
@@ -2151,6 +2258,25 @@ mod tests {
 
     fn assign(lhs: &str, rhs: CExpr) -> CStmt {
         expr_stmt(CExpr::assign(v(lhs), rhs))
+    }
+
+    fn test_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(RegisterDef::new("RDI", 0x10, 8));
+        arch.add_register(RegisterDef::new("RBP", 0x20, 8));
+        arch.add_register(RegisterDef::new("RSP", 0x28, 8));
+        arch
+    }
+
+    fn function_with_single_block(addr: u64) -> SSAFunction {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        SSAFunction::from_blocks_with_arch(&[block], Some(&test_arch()))
+            .expect("ssa function")
+            .with_name("vm_summary_demo")
     }
 
     #[test]
@@ -2532,6 +2658,24 @@ mod tests {
     }
 
     #[test]
+    fn constant_true_if_collapses_to_then_body() {
+        let input = CStmt::if_stmt(CExpr::IntLit(1), assign("x", CExpr::IntLit(7)), None);
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        assert_eq!(cleaned, assign("x", CExpr::IntLit(7)));
+    }
+
+    #[test]
+    fn constant_false_if_collapses_to_else_body() {
+        let input = CStmt::if_stmt(
+            CExpr::IntLit(0),
+            assign("x", CExpr::IntLit(7)),
+            Some(assign("x", CExpr::IntLit(9))),
+        );
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        assert_eq!(cleaned, assign("x", CExpr::IntLit(9)));
+    }
+
+    #[test]
     fn guarded_switch_with_trailing_return_becomes_switch_default() {
         let input = CStmt::Block(vec![CStmt::if_stmt(
             v("guard"),
@@ -2717,6 +2861,72 @@ mod tests {
         assert!(
             matches!(cleaned, CStmt::For { .. }),
             "Suffix-equivalent loop vars (local/local_4) should be treated as matching"
+        );
+    }
+
+    #[test]
+    fn uses_vm_transfer_selector_when_vm_step_is_absent() {
+        let func = function_with_single_block(0x1000);
+        let mut ctx = FoldingContext::new(64);
+        let facts = SymbolicSemanticFacts {
+            vm_transfer: Some(SymbolicVmStepSummary {
+                kind: SymbolicInterpreterKind::SwitchDispatch,
+                loop_header: 0x1000,
+                dispatch_header: 0x1000,
+                selector: Some("vm.sel".to_string()),
+                dispatch_targets: vec![0x1004],
+                default_target: None,
+                case_values_by_target: BTreeMap::from([(0x1004, vec![1, 2])]),
+                loop_latches: vec![0x1000],
+                state_inputs: vec!["state".to_string()],
+                state_outputs: vec!["state".to_string()],
+                step_blocks: vec![0x1000],
+                handler_regions: BTreeMap::from([(0x1004, vec![0x1004, 0x1008])]),
+                handler_state_inputs: BTreeMap::from([(0x1004, vec!["state".to_string()])]),
+                handler_state_outputs: BTreeMap::from([(0x1004, vec!["state".to_string()])]),
+                handler_state_updates: BTreeMap::from([(
+                    0x1004,
+                    vec![SymbolicVmStateUpdate {
+                        output: "state".to_string(),
+                        expr: "state + 1".to_string(),
+                        value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
+                        exact: false,
+                    }],
+                )]),
+                handler_memory_reads: BTreeMap::from([(0x1004, 1)]),
+                handler_memory_writes: BTreeMap::from([(0x1004, 1)]),
+                handler_calls: BTreeMap::from([(0x1004, 0)]),
+                handler_conditional_branches: BTreeMap::from([(0x1004, 0)]),
+                handler_exit_targets: BTreeMap::from([(0x1004, vec![0x1008])]),
+                redispatch_handlers: vec![0x1000],
+                returning_handlers: vec![],
+                truncated_handlers: vec![],
+                transfers: vec![r2types::SymbolicVmTransferArm {
+                    handler_target: 0x1004,
+                    case_values: vec![1, 2],
+                    region_blocks: vec![0x1004, 0x1008],
+                    exit_targets: vec![0x1008],
+                    state_updates: vec![SymbolicVmStateUpdate {
+                        output: "state".to_string(),
+                        expr: "state + 1".to_string(),
+                        value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
+                        exact: false,
+                    }],
+                    selector_update: None,
+                    exact: false,
+                    redispatch: false,
+                    may_return: false,
+                    truncated: false,
+                }],
+            }),
+            ..SymbolicSemanticFacts::default()
+        };
+        ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        assert_eq!(
+            structurer.get_switch_expression(0x1000),
+            CExpr::Var("vm.sel".to_string())
         );
     }
 }

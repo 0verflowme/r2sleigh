@@ -2,7 +2,7 @@ NAME=decompiler_bool_carrier_chain_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-int32_t dbg.test_bool_carrier_chain(int32_t x, int32_t y)
+int32_t test_bool_carrier_chain(int32_t x, int32_t y)
 {
     if (x != y) {
         return x;
@@ -21,7 +21,7 @@ NAME=decompiler_complex_check_stable_header_and_local_prefix
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-int32_t dbg.complex_check(int32_t a, int32_t b)
+int32_t complex_check(int32_t a, int32_t b)
 {
     int32_t diff;
 

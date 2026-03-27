@@ -199,6 +199,16 @@ impl<'ctx> SymSolver<'ctx> {
         result == SatResult::Sat
     }
 
+    /// Check whether a state's constraints remain satisfiable with one extra constraint.
+    pub fn sat_with_constraint(&self, state: &SymState<'ctx>, constraint: &Bool) -> SatResult {
+        self.solver.push();
+        self.solver_assert_all(state.constraints());
+        self.solver_assert(constraint);
+        let result = self.check();
+        self.solver.pop(1);
+        result
+    }
+
     /// Get a concrete model for a state's constraints.
     pub fn solve(&self, state: &SymState<'ctx>) -> Option<SymModel<'_>> {
         self.stats.borrow_mut().solve_calls += 1;
@@ -224,6 +234,24 @@ impl<'ctx> SymSolver<'ctx> {
 
         self.solver.pop(1);
         self.sat_cache.borrow_mut().insert(cache_key, sat_result);
+        result
+    }
+
+    /// Check whether one state's path condition implies another's.
+    pub fn implies(
+        &self,
+        antecedent: &SymState<'ctx>,
+        consequent: &SymState<'ctx>,
+    ) -> Option<bool> {
+        self.solver.push();
+        self.solver_assert_all(antecedent.constraints());
+        self.solver_assert(&consequent.path_condition().not());
+        let result = match self.check() {
+            SatResult::Unsat => Some(true),
+            SatResult::Sat => Some(false),
+            SatResult::Unknown => None,
+        };
+        self.solver.pop(1);
         result
     }
 
