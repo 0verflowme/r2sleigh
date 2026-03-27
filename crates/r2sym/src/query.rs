@@ -4,6 +4,8 @@
 //! analysis-oriented queries that can be consumed by the plugin or other
 //! analysis layers without exposing command-shaped policy.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 use z3::Context;
 use z3::ast::Ast;
 
@@ -19,6 +21,8 @@ use crate::semantics::{VmStepSummary, build_vm_step_summary, classify_interprete
 use crate::sim::SummaryProfile;
 use crate::solver::{SatResult, SolverStats};
 use crate::state::ExitStatus;
+
+const MAX_VM_COMPILED_STEPS: usize = 8;
 
 /// Query execution strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,30 +242,92 @@ fn vm_arm_for_case(vm_step: &VmStepSummary, case_value: u64) -> Option<&crate::V
         .find(|arm| arm.case_values.contains(&case_value))
 }
 
-fn vm_target_case_values(vm_step: &VmStepSummary, target_addr: u64) -> Vec<u64> {
-    let mut case_values = std::collections::BTreeSet::new();
+fn vm_selector_bindings(vm_step: &VmStepSummary, case_value: u64) -> BTreeMap<String, u64> {
+    let mut bindings = BTreeMap::new();
+    if let Some(selector) = vm_step.selector.as_ref() {
+        bindings.insert(selector.clone(), case_value);
+    }
+    bindings
+}
 
-    for arm in &vm_step.transfers {
-        if vm_arm_reaches_target(arm, target_addr) {
-            case_values.extend(arm.case_values.iter().copied());
+fn vm_apply_exact_state_updates(
+    bindings: &BTreeMap<String, u64>,
+    updates: &[crate::VmStateUpdate],
+) -> BTreeMap<String, u64> {
+    let mut next = bindings.clone();
+    for update in updates {
+        if !update.exact {
+            continue;
+        }
+        if let Some(value) = update.value.evaluate_u64(&next) {
+            next.insert(update.output.clone(), value);
         }
     }
+    next
+}
 
-    for arm in &vm_step.transfers {
-        if !arm.redispatch || arm.case_values.is_empty() {
+fn vm_next_case_value(
+    bindings: &BTreeMap<String, u64>,
+    arm: &crate::VmTransferArm,
+    selector_name: Option<&str>,
+) -> Option<(u64, BTreeMap<String, u64>)> {
+    if !arm.redispatch || arm.truncated {
+        return None;
+    }
+    let mut next_bindings = vm_apply_exact_state_updates(bindings, &arm.state_updates);
+    let selector_update = arm.selector_update.as_ref()?;
+    if !selector_update.exact {
+        return None;
+    }
+    let next_case = selector_update.value.evaluate_u64(&next_bindings)?;
+    next_bindings.insert(selector_update.output.clone(), next_case);
+    if let Some(selector_name) = selector_name {
+        next_bindings.insert(selector_name.to_string(), next_case);
+    }
+    Some((next_case, next_bindings))
+}
+
+fn vm_case_reaches_target(vm_step: &VmStepSummary, initial_case: u64, target_addr: u64) -> bool {
+    let initial_bindings = vm_selector_bindings(vm_step, initial_case);
+    let mut queue = VecDeque::from([(initial_case, initial_bindings, 0usize)]);
+    let mut seen = BTreeSet::new();
+
+    while let Some((case_value, bindings, depth)) = queue.pop_front() {
+        let binding_key = bindings
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect::<Vec<_>>();
+        if !seen.insert((case_value, binding_key)) {
             continue;
         }
-        let Some(selector_update) = arm.selector_update.as_ref() else {
+        let Some(arm) = vm_arm_for_case(vm_step, case_value) else {
             continue;
         };
-        let crate::VmValueExpr::Const(next_case) = &selector_update.value else {
+        if vm_arm_reaches_target(arm, target_addr) {
+            return true;
+        }
+        if depth >= MAX_VM_COMPILED_STEPS.saturating_sub(1) || !arm.redispatch {
+            continue;
+        }
+        let Some((next_case, next_bindings)) =
+            vm_next_case_value(&bindings, arm, vm_step.selector.as_deref())
+        else {
             continue;
         };
-        let Some(next_arm) = vm_arm_for_case(vm_step, *next_case) else {
-            continue;
-        };
-        if vm_arm_reaches_target(next_arm, target_addr) {
-            case_values.extend(arm.case_values.iter().copied());
+        queue.push_back((next_case, next_bindings, depth + 1));
+    }
+
+    false
+}
+
+fn vm_target_case_values(vm_step: &VmStepSummary, target_addr: u64) -> Vec<u64> {
+    let mut case_values = BTreeSet::new();
+
+    for arm in &vm_step.transfers {
+        for case_value in arm.case_values.iter().copied() {
+            if vm_case_reaches_target(vm_step, case_value, target_addr) {
+                case_values.insert(case_value);
+            }
         }
     }
 
@@ -558,7 +624,7 @@ mod tests {
         vm_target_case_values,
     };
     use crate::{
-        BackwardConditionPrecision, BackwardConditionSummary, SymQueryConfig, SymState,
+        BackwardConditionPrecision, BackwardConditionSummary, SymQueryConfig, SymState, VmBinaryOp,
         VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
     };
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
@@ -745,6 +811,128 @@ mod tests {
         ]);
 
         assert_eq!(vm_target_case_values(&vm_step, 0x1014), vec![0, 1]);
+    }
+
+    #[test]
+    fn vm_target_case_values_follow_exact_state_updates_across_redispatch() {
+        let vm_step = make_vm_step_summary_with_transfers(vec![
+            VmTransferArm {
+                handler_target: 0x1004,
+                case_values: vec![0],
+                region_blocks: vec![0x1004],
+                exit_targets: vec![0x1000],
+                state_updates: vec![VmStateUpdate {
+                    output: "TMP_1".to_string(),
+                    expr: "0x1".to_string(),
+                    value: VmValueExpr::Const(1),
+                    exact: true,
+                }],
+                selector_update: Some(VmStateUpdate {
+                    output: "RDI_1".to_string(),
+                    expr: "TMP_1".to_string(),
+                    value: VmValueExpr::Var("TMP_1".to_string()),
+                    exact: true,
+                }),
+                exact: true,
+                redispatch: true,
+                may_return: false,
+                truncated: false,
+            },
+            VmTransferArm {
+                handler_target: 0x1008,
+                case_values: vec![1],
+                region_blocks: vec![0x1008, 0x1014],
+                exit_targets: vec![0x1014],
+                state_updates: Vec::new(),
+                selector_update: None,
+                exact: true,
+                redispatch: false,
+                may_return: true,
+                truncated: false,
+            },
+        ]);
+
+        assert_eq!(vm_target_case_values(&vm_step, 0x1014), vec![0, 1]);
+    }
+
+    #[test]
+    fn vm_target_case_values_follow_bounded_selector_algebra() {
+        let vm_step = make_vm_step_summary_with_transfers(vec![
+            VmTransferArm {
+                handler_target: 0x1004,
+                case_values: vec![0],
+                region_blocks: vec![0x1004],
+                exit_targets: vec![0x1000],
+                state_updates: vec![VmStateUpdate {
+                    output: "RDI_1".to_string(),
+                    expr: "(RDI_0 + 0x1)".to_string(),
+                    value: VmValueExpr::Binary {
+                        op: VmBinaryOp::Add,
+                        lhs: Box::new(VmValueExpr::Var("RDI_0".to_string())),
+                        rhs: Box::new(VmValueExpr::Const(1)),
+                    },
+                    exact: true,
+                }],
+                selector_update: Some(VmStateUpdate {
+                    output: "RDI_1".to_string(),
+                    expr: "(RDI_0 + 0x1)".to_string(),
+                    value: VmValueExpr::Binary {
+                        op: VmBinaryOp::Add,
+                        lhs: Box::new(VmValueExpr::Var("RDI_0".to_string())),
+                        rhs: Box::new(VmValueExpr::Const(1)),
+                    },
+                    exact: true,
+                }),
+                exact: true,
+                redispatch: true,
+                may_return: false,
+                truncated: false,
+            },
+            VmTransferArm {
+                handler_target: 0x1008,
+                case_values: vec![1],
+                region_blocks: vec![0x1008],
+                exit_targets: vec![0x1000],
+                state_updates: vec![VmStateUpdate {
+                    output: "RDI_1".to_string(),
+                    expr: "(RDI_0 + 0x1)".to_string(),
+                    value: VmValueExpr::Binary {
+                        op: VmBinaryOp::Add,
+                        lhs: Box::new(VmValueExpr::Var("RDI_0".to_string())),
+                        rhs: Box::new(VmValueExpr::Const(1)),
+                    },
+                    exact: true,
+                }],
+                selector_update: Some(VmStateUpdate {
+                    output: "RDI_1".to_string(),
+                    expr: "(RDI_0 + 0x1)".to_string(),
+                    value: VmValueExpr::Binary {
+                        op: VmBinaryOp::Add,
+                        lhs: Box::new(VmValueExpr::Var("RDI_0".to_string())),
+                        rhs: Box::new(VmValueExpr::Const(1)),
+                    },
+                    exact: true,
+                }),
+                exact: true,
+                redispatch: true,
+                may_return: false,
+                truncated: false,
+            },
+            VmTransferArm {
+                handler_target: 0x1010,
+                case_values: vec![2],
+                region_blocks: vec![0x1010, 0x1014],
+                exit_targets: vec![0x1014],
+                state_updates: Vec::new(),
+                selector_update: None,
+                exact: true,
+                redispatch: false,
+                may_return: true,
+                truncated: false,
+            },
+        ]);
+
+        assert_eq!(vm_target_case_values(&vm_step, 0x1014), vec![0, 1, 2]);
     }
 
     #[test]

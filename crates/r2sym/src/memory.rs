@@ -168,12 +168,16 @@ impl<'ctx> MemoryRegion<'ctx> {
             }
         }
 
+        let mut concrete_bytes = Vec::with_capacity(size as usize);
         let mut value = 0u64;
         let mut all_concrete = true;
         for index in 0..size {
             let byte_offset = offset.wrapping_add(index as u64);
             if let Some(byte) = self.concrete.get(&byte_offset) {
-                value |= (*byte as u64) << (index * 8);
+                concrete_bytes.push(*byte);
+                if index < 8 {
+                    value |= (*byte as u64) << (index * 8);
+                }
             } else {
                 all_concrete = false;
                 break;
@@ -181,6 +185,15 @@ impl<'ctx> MemoryRegion<'ctx> {
         }
 
         if all_concrete {
+            if size > 8 {
+                let mut bytes = concrete_bytes.iter().rev();
+                let first = bytes.next().copied().unwrap_or(0);
+                let mut ast = BV::from_u64(first as u64, 8);
+                for byte in bytes {
+                    ast = ast.concat(BV::from_u64(*byte as u64, 8));
+                }
+                return SymValue::symbolic(ast, size * 8);
+            }
             return SymValue::concrete(value, size * 8);
         }
 

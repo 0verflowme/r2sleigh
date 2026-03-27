@@ -21,22 +21,153 @@ pub struct InterpreterDispatchSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VmUnaryOp {
+    Neg,
+    BitNot,
+    BoolNot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VmBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    LShr,
+    AShr,
+    Eq,
+    Ne,
+    Lt,
+    SLt,
+    Le,
+    SLe,
+    BoolAnd,
+    BoolOr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VmValueExpr {
     Const(u64),
     Var(String),
+    Unary {
+        op: VmUnaryOp,
+        arg: Box<VmValueExpr>,
+    },
+    Binary {
+        op: VmBinaryOp,
+        lhs: Box<VmValueExpr>,
+        rhs: Box<VmValueExpr>,
+    },
     Expr(String),
 }
 
 impl VmValueExpr {
+    fn render_unary(op: &VmUnaryOp) -> &'static str {
+        match op {
+            VmUnaryOp::Neg => "-",
+            VmUnaryOp::BitNot => "~",
+            VmUnaryOp::BoolNot => "!",
+        }
+    }
+
+    fn render_binary(op: &VmBinaryOp) -> &'static str {
+        match op {
+            VmBinaryOp::Add => "+",
+            VmBinaryOp::Sub => "-",
+            VmBinaryOp::Mul => "*",
+            VmBinaryOp::Div => "/",
+            VmBinaryOp::Rem => "%",
+            VmBinaryOp::And => "&",
+            VmBinaryOp::Or => "|",
+            VmBinaryOp::Xor => "^",
+            VmBinaryOp::Shl => "<<",
+            VmBinaryOp::LShr | VmBinaryOp::AShr => ">>",
+            VmBinaryOp::Eq => "==",
+            VmBinaryOp::Ne => "!=",
+            VmBinaryOp::Lt | VmBinaryOp::SLt => "<",
+            VmBinaryOp::Le | VmBinaryOp::SLe => "<=",
+            VmBinaryOp::BoolAnd => "&&",
+            VmBinaryOp::BoolOr => "||",
+        }
+    }
+
     fn render(&self) -> String {
         match self {
             Self::Const(value) => format!("0x{value:x}"),
             Self::Var(name) | Self::Expr(name) => name.clone(),
+            Self::Unary { op, arg } => {
+                format!("({}{})", Self::render_unary(op), arg.render())
+            }
+            Self::Binary { op, lhs, rhs } => format!(
+                "({} {} {})",
+                lhs.render(),
+                Self::render_binary(op),
+                rhs.render()
+            ),
         }
     }
 
     fn is_exact(&self) -> bool {
-        matches!(self, Self::Const(_) | Self::Var(_))
+        match self {
+            Self::Const(_) | Self::Var(_) => true,
+            Self::Unary { arg, .. } => arg.is_exact(),
+            Self::Binary { lhs, rhs, .. } => lhs.is_exact() && rhs.is_exact(),
+            Self::Expr(_) => false,
+        }
+    }
+
+    fn lookup_binding(bindings: &BTreeMap<String, u64>, name: &str) -> Option<u64> {
+        bindings.get(name).copied().or_else(|| {
+            bindings
+                .iter()
+                .find_map(|(candidate, value)| same_logical_name(candidate, name).then_some(*value))
+        })
+    }
+
+    pub(crate) fn evaluate_u64(&self, bindings: &BTreeMap<String, u64>) -> Option<u64> {
+        match self {
+            Self::Const(value) => Some(*value),
+            Self::Var(name) => Self::lookup_binding(bindings, name),
+            Self::Unary { op, arg } => {
+                let value = arg.evaluate_u64(bindings)?;
+                Some(match op {
+                    VmUnaryOp::Neg => value.wrapping_neg(),
+                    VmUnaryOp::BitNot => !value,
+                    VmUnaryOp::BoolNot => u64::from(value == 0),
+                })
+            }
+            Self::Binary { op, lhs, rhs } => {
+                let lhs = lhs.evaluate_u64(bindings)?;
+                let rhs = rhs.evaluate_u64(bindings)?;
+                Some(match op {
+                    VmBinaryOp::Add => lhs.wrapping_add(rhs),
+                    VmBinaryOp::Sub => lhs.wrapping_sub(rhs),
+                    VmBinaryOp::Mul => lhs.wrapping_mul(rhs),
+                    VmBinaryOp::Div => lhs.checked_div(rhs)?,
+                    VmBinaryOp::Rem => lhs.checked_rem(rhs)?,
+                    VmBinaryOp::And => lhs & rhs,
+                    VmBinaryOp::Or => lhs | rhs,
+                    VmBinaryOp::Xor => lhs ^ rhs,
+                    VmBinaryOp::Shl => lhs.wrapping_shl((rhs & 63) as u32),
+                    VmBinaryOp::LShr => lhs.wrapping_shr((rhs & 63) as u32),
+                    VmBinaryOp::AShr => ((lhs as i64) >> ((rhs & 63) as u32)) as u64,
+                    VmBinaryOp::Eq => u64::from(lhs == rhs),
+                    VmBinaryOp::Ne => u64::from(lhs != rhs),
+                    VmBinaryOp::Lt => u64::from(lhs < rhs),
+                    VmBinaryOp::SLt => u64::from((lhs as i64) < (rhs as i64)),
+                    VmBinaryOp::Le => u64::from(lhs <= rhs),
+                    VmBinaryOp::SLe => u64::from((lhs as i64) <= (rhs as i64)),
+                    VmBinaryOp::BoolAnd => u64::from(lhs != 0 && rhs != 0),
+                    VmBinaryOp::BoolOr => u64::from(lhs != 0 || rhs != 0),
+                })
+            }
+            Self::Expr(_) => None,
+        }
     }
 }
 
@@ -334,6 +465,113 @@ fn classify_vm_op_value(func: &SsaArtifact, op: &SSAOp, depth: u32) -> Option<Vm
         Copy { src, .. } | IntZExt { src, .. } | IntSExt { src, .. } | Cast { src, .. } => {
             classify_vm_var_value(func, src, depth + 1)
         }
+        IntAdd { a, b, .. } | FloatAdd { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Add,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntSub { a, b, .. } | FloatSub { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Sub,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntMult { a, b, .. } | FloatMult { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Mul,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntDiv { a, b, .. } | IntSDiv { a, b, .. } | FloatDiv { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Div,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntRem { a, b, .. } | IntSRem { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Rem,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntAnd { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::And,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntOr { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Or,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntXor { a, b, .. } | BoolXor { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Xor,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntLeft { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Shl,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntRight { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::LShr,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntSRight { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::AShr,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntEqual { a, b, .. } | FloatEqual { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Eq,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntNotEqual { a, b, .. } | FloatNotEqual { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Ne,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntLess { a, b, .. } | FloatLess { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Lt,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntSLess { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::SLt,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntLessEqual { a, b, .. } | FloatLessEqual { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::Le,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntSLessEqual { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::SLe,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        BoolAnd { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::BoolAnd,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        BoolOr { a, b, .. } => VmValueExpr::Binary {
+            op: VmBinaryOp::BoolOr,
+            lhs: Box::new(classify_vm_var_value(func, a, depth + 1)),
+            rhs: Box::new(classify_vm_var_value(func, b, depth + 1)),
+        },
+        IntNegate { src, .. } | FloatNeg { src, .. } => VmValueExpr::Unary {
+            op: VmUnaryOp::Neg,
+            arg: Box::new(classify_vm_var_value(func, src, depth + 1)),
+        },
+        IntNot { src, .. } => VmValueExpr::Unary {
+            op: VmUnaryOp::BitNot,
+            arg: Box::new(classify_vm_var_value(func, src, depth + 1)),
+        },
+        BoolNot { src, .. } => VmValueExpr::Unary {
+            op: VmUnaryOp::BoolNot,
+            arg: Box::new(classify_vm_var_value(func, src, depth + 1)),
+        },
         _ => VmValueExpr::Expr(render_vm_op_expr(func, op, depth + 1)?),
     })
 }

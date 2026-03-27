@@ -1,6 +1,8 @@
 use crate::blocks::BlockSlice;
 use crate::context::require_ctx_view;
+use crate::types::symbolic_vm_value_expr_from_sym;
 use crate::{ArchSpec, R2ILBlock, R2ILContext, parse_addr_name_map};
+use r2types::SymbolicVmValueExpr;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -334,18 +336,16 @@ pub(crate) struct VmStepSummaryInfo {
     pub(crate) transfers: Vec<VmTransferArmInfo>,
 }
 
-fn render_vm_value_expr(value: &r2sym::VmValueExpr) -> String {
-    match value {
-        r2sym::VmValueExpr::Const(value) => format!("0x{value:x}"),
-        r2sym::VmValueExpr::Var(name) | r2sym::VmValueExpr::Expr(name) => name.clone(),
-    }
+fn render_vm_value_expr(value: &SymbolicVmValueExpr) -> String {
+    value.render()
 }
 
 fn vm_state_update_info_from_sym(update: &r2sym::VmStateUpdate) -> VmStateUpdateInfo {
+    let value = symbolic_vm_value_expr_from_sym(&update.value);
     VmStateUpdateInfo {
         output: update.output.clone(),
         expr: update.expr.clone(),
-        value: render_vm_value_expr(&update.value),
+        value: render_vm_value_expr(&value),
         exact: update.exact,
     }
 }
@@ -671,7 +671,10 @@ pub(crate) fn compiled_semantic_info(
                 score: interpreter.score,
             }),
         vm_step: compiled.vm_step.as_ref().map(vm_step_summary_info_from_sym),
-        vm_transfer: compiled.vm_step.as_ref().map(vm_step_summary_info_from_sym),
+        vm_transfer: compiled
+            .vm_transfer
+            .as_ref()
+            .map(vm_step_summary_info_from_sym),
         cache_hit: compiled.cache_hit,
     }
 }

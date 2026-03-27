@@ -273,6 +273,18 @@ a:sla.sym sym.interpret_bytecode | jq -c '.semantic.mode=="vm_summary" and .sema
 EOF_CMDS
 RUN
 
+NAME=symbolic_interpret_bytecode_vm_summary_stays_query_ready
+FILE=bins/stress_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.sym sym.interpret_bytecode | jq -c '.semantic.mode=="vm_summary" and .semantic.capability.query_ready==true and .semantic.vm_transfer != null and ((.semantic.vm_transfer.transfers | length) >= 8) and ((.semantic.vm_transfer.transfers | map(select(.redispatch)) | length) >= 4)'
+EOF_CMDS
+RUN
+
 NAME=types_tiny_vm_dispatch_reports_vm_step_payload
 FILE=bins/stress_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -294,6 +306,19 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 a:sla.types sym.tiny_vm_dispatch | jq -c '.symbolic.diagnostics.semantic_mode=="VmSummary" and .symbolic.vm_transfer != null and (.symbolic.vm_transfer.dispatch_targets|length)>=8 and (.symbolic.vm_transfer.loop_latches|length)>=7 and (.symbolic.vm_transfer.step_blocks|length)>=10 and (.symbolic.vm_transfer.handler_state_updates | to_entries | length) >= 5 and (.symbolic.vm_transfer.transfers | type=="array")'
+EOF_CMDS
+RUN
+
+NAME=types_tiny_vm_dispatch_reports_semantic_cache_hit_on_repeat
+FILE=bins/stress_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.types sym.tiny_vm_dispatch >/dev/null
+a:sla.types sym.tiny_vm_dispatch | jq -c '.symbolic.diagnostics.semantic_mode=="VmSummary" and .symbolic.diagnostics.cache_hit==true and .symbolic.vm_transfer != null'
 EOF_CMDS
 RUN
 
@@ -330,6 +355,18 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 a:sla.dec sym.tiny_vm_dispatch | jq -Rs 'contains("r2dec semantic summary: vm_summary") and contains("tiny_vm_dispatch") and contains("switch_dispatch") and contains("targets=9") and contains("handlers=")'
+EOF_CMDS
+RUN
+
+NAME=decompile_tiny_vm_dispatch_reports_vm_transfer_totals
+FILE=bins/stress_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.dec sym.tiny_vm_dispatch | jq -Rs 'contains("exact_transfers=") and contains("redispatch_transfers=") and contains("selector_updates=") and contains("total_reads=") and contains("total_writes=")'
 EOF_CMDS
 RUN
 

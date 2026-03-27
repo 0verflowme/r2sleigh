@@ -3030,6 +3030,75 @@ fn derived_helper_summary_compiles_backward_memory_terms() {
 }
 
 #[test]
+fn derived_helper_summary_compiles_backward_memory_terms_through_cast_pointer() {
+    let arch = make_x86_64_arch();
+    let cast_ptr = make_reg(0x90, 8);
+    let loaded = make_reg(0x98, 1);
+    let cond = make_reg(0xa0, 1);
+    let root_blocks = vec![
+        R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Cast {
+                    dst: cast_ptr.clone(),
+                    src: make_reg(RDI, 8),
+                },
+                R2ILOp::Load {
+                    dst: loaded.clone(),
+                    addr: cast_ptr,
+                    space: SpaceId::Ram,
+                },
+                R2ILOp::IntEqual {
+                    dst: cond.clone(),
+                    a: loaded,
+                    b: make_const(0x41, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond,
+                },
+            ],
+        },
+        R2ILBlock {
+            addr: 0x1008,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+        R2ILBlock {
+            addr: 0x1010,
+            size: 1,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+        },
+    ];
+    let root =
+        SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic function");
+    let ctx = Context::thread_local();
+    let mut state = SymState::new(&ctx, 0x1000);
+    state.make_symbolic("reg:56_0", 64);
+
+    let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+    let conditions = explorer.path_conditions_at(&root, state, 0x1010);
+    let compiled = conditions
+        .compiled_precondition
+        .as_ref()
+        .expect("compiled precondition");
+    assert_eq!(compiled.precision, BackwardConditionPrecision::Exact);
+    assert!(!compiled.memory_terms.is_empty());
+    assert_argument_memory_term(&compiled.memory_terms[0], 0, 0, 0, true, 1);
+}
+
+#[test]
 fn derived_helper_summary_compiles_region_backed_global_memory_terms() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![

@@ -58,6 +58,42 @@ pub enum SymbolicConditionPrecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicVmUnaryOp {
+    Neg,
+    Not,
+    BoolNot,
+    ZExt,
+    SExt,
+    Trunc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicVmBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    SDiv,
+    Rem,
+    SRem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    PtrAdd,
+    PtrSub,
+    Piece,
+    Concat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SymbolicMemoryRegionKind {
     Stack,
     Global,
@@ -124,6 +160,70 @@ pub enum SymbolicVmValueExpr {
     Const(u64),
     Var(String),
     Expr(String),
+    Unary {
+        op: SymbolicVmUnaryOp,
+        expr: Box<SymbolicVmValueExpr>,
+    },
+    Binary {
+        op: SymbolicVmBinaryOp,
+        left: Box<SymbolicVmValueExpr>,
+        right: Box<SymbolicVmValueExpr>,
+    },
+}
+
+impl SymbolicVmValueExpr {
+    pub fn render(&self) -> String {
+        match self {
+            Self::Const(value) => format!("0x{value:x}"),
+            Self::Var(name) | Self::Expr(name) => name.clone(),
+            Self::Unary { op, expr } => {
+                let inner = expr.render();
+                match op {
+                    SymbolicVmUnaryOp::Neg => format!("(-{inner})"),
+                    SymbolicVmUnaryOp::Not => format!("(~{inner})"),
+                    SymbolicVmUnaryOp::BoolNot => format!("(!{inner})"),
+                    SymbolicVmUnaryOp::ZExt => format!("zext({inner})"),
+                    SymbolicVmUnaryOp::SExt => format!("sext({inner})"),
+                    SymbolicVmUnaryOp::Trunc => format!("trunc({inner})"),
+                }
+            }
+            Self::Binary { op, left, right } => {
+                let left = left.render();
+                let right = right.render();
+                let symbol = match op {
+                    SymbolicVmBinaryOp::Add => "+",
+                    SymbolicVmBinaryOp::Sub => "-",
+                    SymbolicVmBinaryOp::Mul => "*",
+                    SymbolicVmBinaryOp::Div | SymbolicVmBinaryOp::SDiv => "/",
+                    SymbolicVmBinaryOp::Rem | SymbolicVmBinaryOp::SRem => "%",
+                    SymbolicVmBinaryOp::And => "&",
+                    SymbolicVmBinaryOp::Or => "|",
+                    SymbolicVmBinaryOp::Xor => "^",
+                    SymbolicVmBinaryOp::Shl => "<<",
+                    SymbolicVmBinaryOp::Shr => ">>",
+                    SymbolicVmBinaryOp::Eq => "==",
+                    SymbolicVmBinaryOp::Ne => "!=",
+                    SymbolicVmBinaryOp::Lt => "<",
+                    SymbolicVmBinaryOp::Le => "<=",
+                    SymbolicVmBinaryOp::Gt => ">",
+                    SymbolicVmBinaryOp::Ge => ">=",
+                    SymbolicVmBinaryOp::PtrAdd => "+",
+                    SymbolicVmBinaryOp::PtrSub => "-",
+                    SymbolicVmBinaryOp::Piece => "piece",
+                    SymbolicVmBinaryOp::Concat => "concat",
+                };
+                match op {
+                    SymbolicVmBinaryOp::Piece | SymbolicVmBinaryOp::Concat => {
+                        format!("{symbol}({left}, {right})")
+                    }
+                    SymbolicVmBinaryOp::PtrAdd | SymbolicVmBinaryOp::PtrSub => {
+                        format!("({left} {symbol} {right})")
+                    }
+                    _ => format!("({left} {symbol} {right})"),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -185,6 +285,8 @@ pub struct SymbolicFactDiagnostics {
     pub branches_unknown: usize,
     pub skipped_missing_arch: bool,
     pub skipped_large_cfg: bool,
+    #[serde(default)]
+    pub cache_hit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_mode: Option<SymbolicSemanticMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -920,5 +1022,23 @@ mod tests {
             Some(signed_char_ptr)
         );
         assert_eq!(parse_type_like_spec("void const *", 64), Some(void_ptr));
+    }
+
+    #[test]
+    fn symbolic_vm_value_expr_renders_recursive_forms() {
+        let expr = SymbolicVmValueExpr::Binary {
+            op: SymbolicVmBinaryOp::Add,
+            left: Box::new(SymbolicVmValueExpr::Unary {
+                op: SymbolicVmUnaryOp::Neg,
+                expr: Box::new(SymbolicVmValueExpr::Const(0x10)),
+            }),
+            right: Box::new(SymbolicVmValueExpr::Binary {
+                op: SymbolicVmBinaryOp::Xor,
+                left: Box::new(SymbolicVmValueExpr::Var("state".to_string())),
+                right: Box::new(SymbolicVmValueExpr::Expr("mask".to_string())),
+            }),
+        };
+
+        assert_eq!(expr.render(), "((-0x10) + (state ^ mask))");
     }
 }

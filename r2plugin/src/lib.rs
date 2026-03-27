@@ -2434,6 +2434,28 @@ fn decompile_semantic_artifact_fallback(
         } else {
             vm_step.state_outputs.join(", ")
         };
+        let exact_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.exact)
+            .count();
+        let redispatch_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.redispatch)
+            .count();
+        let returning_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.may_return)
+            .count();
+        let selector_updates = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.selector_update.is_some())
+            .count();
+        let total_reads: usize = vm_step.handler_memory_reads.values().copied().sum();
+        let total_writes: usize = vm_step.handler_memory_writes.values().copied().sum();
         let handler_preview = vm_step
             .dispatch_targets
             .iter()
@@ -2468,13 +2490,19 @@ fn decompile_semantic_artifact_fallback(
             .collect::<Vec<_>>()
             .join("; ");
         return format!(
-            "/* r2dec semantic summary: vm_summary for {} ({kind} @ 0x{:x}, loop_header=0x{:x}, selector={}, targets={}, redispatch={}, state_inputs=[{}], state_outputs=[{}], handlers={}) */",
+            "/* r2dec semantic summary: vm_summary for {} ({kind} @ 0x{:x}, loop_header=0x{:x}, selector={}, targets={}, redispatch={}, exact_transfers={}, redispatch_transfers={}, returning_transfers={}, selector_updates={}, total_reads={}, total_writes={}, state_inputs=[{}], state_outputs=[{}], handlers={}) */",
             func_name,
             vm_step.dispatch_header,
             vm_step.loop_header,
             selector,
             vm_step.dispatch_targets.len(),
             vm_step.redispatch_handlers.len(),
+            exact_transfers,
+            redispatch_transfers,
+            returning_transfers,
+            selector_updates,
+            total_reads,
+            total_writes,
             inputs,
             outputs,
             handler_preview,

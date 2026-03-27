@@ -14,8 +14,8 @@ use super::artifact::{
     SemanticMode,
 };
 use super::cache::{
-    SemanticCompilationResult, SemanticSeedMode, cache_insert_bounded, lookup_semantic_cache,
-    semantic_cache_key,
+    SemanticCompilationResult, SemanticSeedMode, cache_insert_bounded,
+    coarse_large_slice_cache_key, lookup_semantic_cache, semantic_cache_key,
 };
 use super::classify::classify_slice;
 use super::facts::{
@@ -92,7 +92,7 @@ fn semantic_capability(mode: SemanticMode, facts: &SymbolicFunctionFacts) -> Sem
             decompile_ready: false,
         },
         SemanticMode::VmSummary => SemanticCapability {
-            query_ready: !facts.diagnostics.skipped_large_cfg,
+            query_ready: true,
             type_ready: true,
             decompile_ready: false,
         },
@@ -155,13 +155,14 @@ fn compile_function_semantics_uncached(
     let vm_step = interpreter
         .as_ref()
         .and_then(|dispatch| build_vm_step_summary(func, dispatch));
+    let vm_transfer = vm_step.clone();
     let mode = semantic_mode_for(
         helper_functions,
         derived_summaries,
         &derived_diagnostics,
         &symbolic_facts,
         interpreter.is_some(),
-        vm_step.is_some(),
+        vm_transfer.is_some(),
     );
     let slice_class = classify_slice(
         func,
@@ -187,6 +188,7 @@ fn compile_function_semantics_uncached(
         symbolic_facts,
         interpreter,
         vm_step,
+        vm_transfer,
         cache_hit: false,
     }
 }
@@ -206,6 +208,17 @@ pub(crate) fn compile_function_semantics_cached_with_scope(
             cache_hit: true,
         };
     }
+    let coarse_key = scope.map(|_| {
+        coarse_large_slice_cache_key(func.entry, arch, summary_profile, SemanticSeedMode::Static)
+    });
+    if let Some(coarse_key) = coarse_key.as_ref()
+        && let Some(existing) = lookup_semantic_cache(coarse_key)
+    {
+        return SemanticCompilationResult {
+            artifact: existing,
+            cache_hit: true,
+        };
+    }
 
     let artifact = Arc::new(compile_function_semantics_uncached(
         ctx,
@@ -216,6 +229,16 @@ pub(crate) fn compile_function_semantics_cached_with_scope(
         summary_profile,
     ));
     let artifact = cache_insert_bounded(key, artifact);
+    let should_cache_coarsely = scope.is_some()
+        && (matches!(artifact.mode, SemanticMode::VmSummary)
+            || artifact.symbolic_facts.diagnostics.skipped_large_cfg);
+    let artifact = if should_cache_coarsely {
+        let coarse_key =
+            coarse_key.expect("coarse large-slice cache key should exist when scope is present");
+        cache_insert_bounded(coarse_key, artifact)
+    } else {
+        artifact
+    };
     SemanticCompilationResult {
         artifact,
         cache_hit: false,
@@ -322,6 +345,59 @@ mod tests {
             &HashMap::new(),
             SummaryProfile::Default,
         );
+        assert!(!first.cache_hit);
+        assert!(second.cache_hit);
+    }
+
+    #[test]
+    fn compile_semantics_cache_ignores_scope_display_names() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+        let scope_a = crate::PreparedFunctionScope::new(
+            0x1000,
+            vec![crate::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("sym.display_a".to_string()),
+                prepared: func.clone(),
+            }],
+        )
+        .expect("scope a");
+        let scope_b = crate::PreparedFunctionScope::new(
+            0x1000,
+            vec![crate::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x1000),
+                name: Some("dbg.display_b".to_string()),
+                prepared: func.clone(),
+            }],
+        )
+        .expect("scope b");
+        let ctx = Context::thread_local();
+
+        let first = compile_function_semantics_cached_with_scope(
+            &ctx,
+            &func,
+            Some(&scope_a),
+            Some(&test_arch()),
+            &HashMap::new(),
+            SummaryProfile::Default,
+        );
+        let second = compile_function_semantics_cached_with_scope(
+            &ctx,
+            &func,
+            Some(&scope_b),
+            Some(&test_arch()),
+            &HashMap::new(),
+            SummaryProfile::Default,
+        );
+
         assert!(!first.cache_hit);
         assert!(second.cache_hit);
     }
@@ -460,6 +536,7 @@ mod tests {
             artifact.slice_class,
             super::super::artifact::SliceClass::InterpreterSwitch
         );
+        assert!(artifact.capability.query_ready);
         assert!(artifact.interpreter.is_some());
         let vm_step = artifact.vm_step.expect("vm step");
         assert_eq!(vm_step.loop_header, 0x1004);
@@ -725,6 +802,7 @@ mod tests {
 
         let vm_step = artifact.vm_step.expect("vm step summary");
         assert_eq!(artifact.mode, SemanticMode::VmSummary);
+        assert!(artifact.capability.query_ready);
         assert_eq!(vm_step.loop_header, 0x3004);
         assert_eq!(vm_step.dispatch_header, 0x3004);
         assert_eq!(vm_step.default_target, Some(0x3018));

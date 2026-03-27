@@ -74,8 +74,8 @@ pub use semantics::{
     CompiledFunctionSemantics, CompiledSemanticArtifact, CompiledSemanticMode,
     InterpreterDispatchSummary, InterpreterKind, ResidualReason, SemanticCapability, SemanticMode,
     SliceClass, SymbolicBranchFact, SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts,
-    SymbolicReachabilityStatus, VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
-    collect_symbolic_function_facts, collect_symbolic_function_facts_with_scope,
+    SymbolicReachabilityStatus, VmBinaryOp, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp,
+    VmValueExpr, collect_symbolic_function_facts, collect_symbolic_function_facts_with_scope,
     compile_function_semantics_with_scope, compile_semantic_artifact_with_scope, stable_scope_hash,
 };
 pub use sim::{

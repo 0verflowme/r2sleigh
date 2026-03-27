@@ -159,22 +159,25 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 }
                 artifact
             } else {
-                if let Some(semantic_artifact) = crate::types::collect_detached_semantic_artifact(
+                let precomputed_semantic_artifact = crate::types::collect_detached_semantic_artifact(
                     &r2il_blocks,
                     &func_name_str,
                     arch.as_ref(),
                     symbolic_scope.as_ref(),
-                ) && crate::should_decompile_from_semantic_fallback(
-                    &func_name_str,
-                    &semantic_artifact,
-                ) {
+                );
+                if let Some(semantic_artifact) = precomputed_semantic_artifact.as_ref()
+                    && crate::should_decompile_from_semantic_fallback(
+                        &func_name_str,
+                        semantic_artifact,
+                    )
+                {
                     return crate::decompile_semantic_artifact_fallback(
                         &display_func_name,
-                        &semantic_artifact,
+                        semantic_artifact,
                     );
                 }
                 let Some(artifact) =
-                    crate::types::build_detached_function_analysis_artifact_with_scope(
+                    crate::types::build_detached_function_analysis_artifact_with_scope_and_semantics(
                         &r2il_blocks,
                         &func_name_str,
                         arch.as_ref(),
@@ -183,6 +186,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
                         &reg_type_hints,
                         &external_context_json,
                         symbolic_scope.as_ref(),
+                        precomputed_semantic_artifact,
                     )
                 else {
                     return decompile_artifact_guard_fallback(

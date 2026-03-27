@@ -253,7 +253,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         use r2ssa::SSAOp::*;
 
         match op {
-            Copy { src, .. } => self.eval_ssa_var(src),
+            Copy { src, .. } | Cast { src, .. } => self.eval_ssa_var(src),
             Load { dst, addr, .. } => {
                 if let Some(local_value) = self.local_memory_value(inst_id, dst.size) {
                     return Ok(local_value);
@@ -393,16 +393,26 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 return Some(context);
             }
         }
-        let predecessor = self.phi_predecessors.get(&block_addr).copied()?;
-        let predecessor_block = self.func.get_block(predecessor)?;
-        for scan_idx in (0..predecessor_block.ops.len()).rev() {
-            let scan_inst = self
-                .func
-                .graph()
-                .inst_id_for_op_site(predecessor, scan_idx)?;
-            let call_id = self.func.call_sites().by_inst.get(&scan_inst).copied()?;
-            if let Some(context) = self.call_contexts.get(&call_id) {
-                return Some(context);
+        let predecessors =
+            if let Some(predecessor) = self.phi_predecessors.get(&block_addr).copied() {
+                vec![predecessor]
+            } else {
+                let preds = self.func.predecessors(block_addr);
+                if preds.len() == 1 { preds } else { Vec::new() }
+            };
+        for predecessor in predecessors {
+            let predecessor_block = self.func.get_block(predecessor)?;
+            for scan_idx in (0..predecessor_block.ops.len()).rev() {
+                let scan_inst = self
+                    .func
+                    .graph()
+                    .inst_id_for_op_site(predecessor, scan_idx)?;
+                let Some(call_id) = self.func.call_sites().by_inst.get(&scan_inst).copied() else {
+                    continue;
+                };
+                if let Some(context) = self.call_contexts.get(&call_id) {
+                    return Some(context);
+                }
             }
         }
         None
@@ -671,7 +681,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         };
         use r2ssa::SSAOp::*;
         match op {
-            Copy { src, .. } => self.normalized_memory_locations(src),
+            Copy { src, .. } | Cast { src, .. } => self.normalized_memory_locations(src),
             IntAdd { a, b, .. } => {
                 if let Some(base) = self.normalized_memory_locations(a)
                     && let Some(offsets) = self.resolve_delta_offsets(b, 1)

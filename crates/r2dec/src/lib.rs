@@ -196,7 +196,7 @@ fn format_vm_state_updates(updates: &[r2types::SymbolicVmStateUpdate]) -> String
     }
     let rendered = updates
         .iter()
-        .map(|update| format!("{}={}", update.output, update.expr))
+        .map(|update| format!("{}={}", update.output, update.value.render()))
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{rendered}]")
@@ -704,12 +704,34 @@ impl Decompiler {
             .vm_step
             .as_ref()
             .or(self.context.type_facts.symbolic_facts.vm_transfer.as_ref())?;
+        let exact_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.exact)
+            .count();
+        let redispatch_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.redispatch)
+            .count();
+        let returning_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.may_return)
+            .count();
+        let selector_updates = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.selector_update.is_some())
+            .count();
+        let total_reads: usize = vm_step.handler_memory_reads.values().copied().sum();
+        let total_writes: usize = vm_step.handler_memory_writes.values().copied().sum();
 
         let mut out = String::new();
         let _ = writeln!(&mut out, "r2dec semantic summary: vm_summary");
         let _ = writeln!(
             &mut out,
-            "kind={} dispatch_header=0x{:x} loop_header=0x{:x} selector={} targets={} default_target={} latches={} step_blocks={} transfers={}",
+            "kind={} dispatch_header=0x{:x} loop_header=0x{:x} selector={} targets={} default_target={} latches={} step_blocks={} transfers={} exact_transfers={} redispatch_transfers={} returning_transfers={} selector_updates={} total_reads={} total_writes={}",
             format_vm_summary_kind(vm_step.kind),
             vm_step.dispatch_header,
             vm_step.loop_header,
@@ -722,6 +744,12 @@ impl Decompiler {
             vm_step.loop_latches.len(),
             vm_step.step_blocks.len(),
             vm_step.transfers.len(),
+            exact_transfers,
+            redispatch_transfers,
+            returning_transfers,
+            selector_updates,
+            total_reads,
+            total_writes,
         );
         if !vm_step.state_inputs.is_empty() || !vm_step.state_outputs.is_empty() {
             let _ = writeln!(

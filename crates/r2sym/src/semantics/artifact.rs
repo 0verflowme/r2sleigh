@@ -54,6 +54,7 @@ pub struct CompiledSemanticArtifact {
     pub symbolic_facts: SymbolicFunctionFacts,
     pub interpreter: Option<InterpreterDispatchSummary>,
     pub vm_step: Option<VmStepSummary>,
+    pub vm_transfer: Option<VmStepSummary>,
     pub cache_hit: bool,
 }
 

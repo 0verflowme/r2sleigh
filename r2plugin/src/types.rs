@@ -282,10 +282,44 @@ fn symbolic_interpreter_kind_from_sym(
     }
 }
 
-fn symbolic_vm_value_expr_from_sym(value: &r2sym::VmValueExpr) -> r2types::SymbolicVmValueExpr {
+pub(crate) fn symbolic_vm_value_expr_from_sym(
+    value: &r2sym::VmValueExpr,
+) -> r2types::SymbolicVmValueExpr {
     match value {
         r2sym::VmValueExpr::Const(value) => r2types::SymbolicVmValueExpr::Const(*value),
         r2sym::VmValueExpr::Var(name) => r2types::SymbolicVmValueExpr::Var(name.clone()),
+        r2sym::VmValueExpr::Unary { op, arg } => r2types::SymbolicVmValueExpr::Unary {
+            op: match op {
+                r2sym::VmUnaryOp::Neg => r2types::SymbolicVmUnaryOp::Neg,
+                r2sym::VmUnaryOp::BitNot => r2types::SymbolicVmUnaryOp::Not,
+                r2sym::VmUnaryOp::BoolNot => r2types::SymbolicVmUnaryOp::BoolNot,
+            },
+            expr: Box::new(symbolic_vm_value_expr_from_sym(arg)),
+        },
+        r2sym::VmValueExpr::Binary { op, lhs, rhs } => r2types::SymbolicVmValueExpr::Binary {
+            op: match op {
+                r2sym::VmBinaryOp::Add => r2types::SymbolicVmBinaryOp::Add,
+                r2sym::VmBinaryOp::Sub => r2types::SymbolicVmBinaryOp::Sub,
+                r2sym::VmBinaryOp::Mul => r2types::SymbolicVmBinaryOp::Mul,
+                r2sym::VmBinaryOp::Div => r2types::SymbolicVmBinaryOp::Div,
+                r2sym::VmBinaryOp::Rem => r2types::SymbolicVmBinaryOp::Rem,
+                r2sym::VmBinaryOp::And => r2types::SymbolicVmBinaryOp::And,
+                r2sym::VmBinaryOp::Or => r2types::SymbolicVmBinaryOp::Or,
+                r2sym::VmBinaryOp::Xor => r2types::SymbolicVmBinaryOp::Xor,
+                r2sym::VmBinaryOp::Shl => r2types::SymbolicVmBinaryOp::Shl,
+                r2sym::VmBinaryOp::LShr | r2sym::VmBinaryOp::AShr => {
+                    r2types::SymbolicVmBinaryOp::Shr
+                }
+                r2sym::VmBinaryOp::Eq => r2types::SymbolicVmBinaryOp::Eq,
+                r2sym::VmBinaryOp::Ne => r2types::SymbolicVmBinaryOp::Ne,
+                r2sym::VmBinaryOp::Lt | r2sym::VmBinaryOp::SLt => r2types::SymbolicVmBinaryOp::Lt,
+                r2sym::VmBinaryOp::Le | r2sym::VmBinaryOp::SLe => r2types::SymbolicVmBinaryOp::Le,
+                r2sym::VmBinaryOp::BoolAnd => r2types::SymbolicVmBinaryOp::And,
+                r2sym::VmBinaryOp::BoolOr => r2types::SymbolicVmBinaryOp::Or,
+            },
+            left: Box::new(symbolic_vm_value_expr_from_sym(lhs)),
+            right: Box::new(symbolic_vm_value_expr_from_sym(rhs)),
+        },
         r2sym::VmValueExpr::Expr(expr) => r2types::SymbolicVmValueExpr::Expr(expr.clone()),
     }
 }
@@ -405,6 +439,7 @@ pub(crate) fn symbolic_semantic_facts_from_sym(
             branches_unknown: facts.diagnostics.branches_unknown,
             skipped_missing_arch: facts.diagnostics.skipped_missing_arch,
             skipped_large_cfg: facts.diagnostics.skipped_large_cfg,
+            cache_hit: compiled.cache_hit,
             semantic_mode: Some(match compiled.mode {
                 r2sym::SemanticMode::Raw => r2types::SymbolicSemanticMode::Raw,
                 r2sym::SemanticMode::Compiled => r2types::SymbolicSemanticMode::Compiled,
@@ -476,7 +511,7 @@ pub(crate) fn symbolic_semantic_facts_from_sym(
             .as_ref()
             .map(symbolic_vm_step_summary_from_sym),
         vm_transfer: compiled
-            .vm_step
+            .vm_transfer
             .as_ref()
             .map(symbolic_vm_step_summary_from_sym),
     }
@@ -1345,7 +1380,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
 ) -> Option<FunctionAnalysisArtifact> {
-    build_detached_function_analysis_artifact_with_scope(
+    build_detached_function_analysis_artifact_with_scope_and_semantics(
         blocks,
         function_name,
         arch,
@@ -1354,10 +1389,11 @@ pub(crate) fn build_detached_function_analysis_artifact(
         reg_type_hints,
         external_context_json,
         None,
+        None,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn build_detached_function_analysis_artifact_with_scope(
     blocks: &[R2ILBlock],
     function_name: &str,
@@ -1367,6 +1403,31 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope(
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<FunctionAnalysisArtifact> {
+    build_detached_function_analysis_artifact_with_scope_and_semantics(
+        blocks,
+        function_name,
+        arch,
+        ptr_bits,
+        semantic_metadata_enabled,
+        reg_type_hints,
+        external_context_json,
+        symbolic_scope,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics(
+    blocks: &[R2ILBlock],
+    function_name: &str,
+    arch: Option<&ArchSpec>,
+    ptr_bits: u32,
+    semantic_metadata_enabled: bool,
+    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
+    external_context_json: &str,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+    precomputed_semantic_artifact: Option<r2sym::CompiledSemanticArtifact>,
 ) -> Option<FunctionAnalysisArtifact> {
     let cache_key = function_artifact_cache_key_parts(
         function_name,
@@ -1537,8 +1598,9 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope(
         interproc_summary_set: None,
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
-    let semantic_artifact =
-        collect_plugin_semantic_artifact(&analysis.ssa_func, arch, symbolic_scope);
+    let semantic_artifact = precomputed_semantic_artifact.unwrap_or_else(|| {
+        collect_plugin_semantic_artifact(&analysis.ssa_func, arch, symbolic_scope)
+    });
     let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
     let mut type_facts = writeback.type_facts;
     if symbolic_facts.diagnostics.branches_pruned > 0 {

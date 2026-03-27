@@ -17,7 +17,7 @@ pub use facts::{
     collect_symbolic_function_facts_with_scope,
 };
 pub use vm::{
-    InterpreterDispatchSummary, InterpreterKind, VmStateUpdate, VmStepSummary, VmTransferArm,
-    VmValueExpr,
+    InterpreterDispatchSummary, InterpreterKind, VmBinaryOp, VmStateUpdate, VmStepSummary,
+    VmTransferArm, VmUnaryOp, VmValueExpr,
 };
 pub(crate) use vm::{build_vm_step_summary, classify_interpreter_like};
