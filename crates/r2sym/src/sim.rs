@@ -332,6 +332,19 @@ impl PreparedFunctionScope {
             .values()
             .filter(move |function| function.id != self.root)
     }
+
+    pub fn with_prepared_root(&self, prepared: &SsaArtifact) -> Option<Self> {
+        let mut functions = self.functions.values().cloned().collect::<Vec<_>>();
+        for function in &mut functions {
+            if function.id == self.root {
+                function.prepared = prepared.clone();
+                if function.name.is_none() {
+                    function.name = prepared.function().name.clone();
+                }
+            }
+        }
+        Self::new(self.root.0, functions)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2408,6 +2421,23 @@ fn constrain_ret_tristate<'ctx>(state: &mut SymState<'ctx>, ret: &SymValue<'ctx>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use r2il::{R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    fn test_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch
+    }
+
+    fn const_vn(value: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Const,
+            offset: value,
+            size,
+            meta: None,
+        }
+    }
 
     #[test]
     fn callconv_accepts_x86_64_arch_specs_with_bit_sized_addr_width() {
@@ -2471,6 +2501,71 @@ mod tests {
         assert_eq!(path_listing_far.get_taint(), 0);
         let path_listing_base = path_listing_state.mem_read(&dst, 1);
         assert_eq!(path_listing_base.get_taint(), 0x20);
+    }
+
+    #[test]
+    fn prepared_function_scope_with_prepared_root_rebinds_root_only() {
+        let blocks_a = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: const_vn(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let blocks_b = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: const_vn(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let helper_blocks = vec![R2ILBlock {
+            addr: 0x2000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: const_vn(2, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let root_a = SsaArtifact::for_symbolic(&blocks_a, Some(&test_arch())).expect("root a");
+        let root_b = SsaArtifact::for_symbolic(&blocks_b, Some(&test_arch())).expect("root b");
+        let helper = SsaArtifact::for_symbolic(&helper_blocks, Some(&test_arch())).expect("helper");
+
+        let scope = PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: None,
+                    prepared: root_a,
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x2000),
+                    name: Some("helper".to_string()),
+                    prepared: helper.clone(),
+                },
+            ],
+        )
+        .expect("scope");
+
+        let rebound = scope.with_prepared_root(&root_b).expect("rebound scope");
+        let rebound_root = rebound.root().expect("rebound root");
+        assert_eq!(rebound_root.prepared.entry, root_b.entry);
+        assert_eq!(rebound_root.prepared.function().blocks().count(), 1);
+        assert_eq!(
+            rebound
+                .functions()
+                .get(&InterprocFunctionId(0x2000))
+                .expect("helper")
+                .prepared
+                .entry,
+            helper.entry
+        );
     }
 
     #[test]

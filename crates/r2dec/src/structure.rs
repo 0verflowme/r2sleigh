@@ -178,7 +178,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 else_region,
                 merge_block,
             } => {
-                if let Some(rewritten) = self.try_structure_symbolic_exact_if(
+                if let Some(rewritten) = self.try_structure_symbolic_actionable_if(
                     *cond_block,
                     then_region,
                     else_region.as_deref(),
@@ -432,26 +432,300 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .exact_reachable_target_for_block(cond_block)
     }
 
-    fn try_structure_symbolic_exact_if(
+    fn symbolic_actionable_reachable_target(&self, cond_block: u64) -> Option<u64> {
+        self.fold_ctx
+            .inputs
+            .symbolic_facts
+            .actionable_reachable_target_for_block(cond_block)
+    }
+
+    fn worker_island_supports_semantic_structuring(island: &r2types::SymbolicWorkerIsland) -> bool {
+        let supporting_condition = Self::worker_island_supporting_compiled_condition(island);
+        let has_unique_target = island.exact_reachable_target().is_some()
+            || island.actionable_reachable_target().is_some();
+        let has_condition = supporting_condition.is_some();
+        let has_memory_support = !island.actionable_terms().is_empty()
+            || supporting_condition.is_some_and(|compiled| !compiled.memory_terms.is_empty());
+        island.evidence.allows_narrowing()
+            && has_unique_target
+            && has_condition
+            && has_memory_support
+    }
+
+    fn worker_island_supporting_compiled_condition(
+        island: &r2types::SymbolicWorkerIsland,
+    ) -> Option<&r2types::SymbolicCompiledCondition> {
+        let reachable_target = island
+            .exact_reachable_target()
+            .or_else(|| island.actionable_reachable_target())?;
+        island
+            .control_facts
+            .iter()
+            .find(|fact| fact.target == reachable_target)
+            .and_then(r2types::SymbolicControlFact::actionable_compiled_condition)
+    }
+
+    fn branch_condition_for_reachable_target(
+        &mut self,
+        cond_block: u64,
+        reachable_target: u64,
+    ) -> CExpr {
+        let cond = self.get_branch_condition(cond_block);
+        if let Some(branch) = self
+            .fold_ctx
+            .inputs
+            .symbolic_facts
+            .branch_fact_for_block(cond_block)
+            && branch.false_target == reachable_target
+        {
+            return Self::negate_condition(cond);
+        }
+        cond
+    }
+
+    fn structure_semantic_worker_island(
+        &mut self,
+        island: &r2types::SymbolicWorkerIsland,
+    ) -> Option<CStmt> {
+        if !Self::worker_island_supports_semantic_structuring(island) {
+            return None;
+        }
+        let reachable_target = island
+            .exact_reachable_target()
+            .or_else(|| island.actionable_reachable_target())?;
+        let cond =
+            self.branch_condition_for_reachable_target(island.anchor_block, reachable_target);
+        let mut then_stmts = Vec::new();
+        if let Some(compiled) = Self::worker_island_supporting_compiled_condition(island) {
+            then_stmts.push(CStmt::comment(format!(
+                "semantic worker branch: {}",
+                compiled.simplified
+            )));
+        }
+        if self.func.get_block(reachable_target).is_some() {
+            Self::append_stmt_body_flat(&mut then_stmts, self.structure_block(reachable_target));
+        } else {
+            then_stmts.push(CStmt::comment(format!(
+                "semantic worker target: 0x{reachable_target:x}"
+            )));
+        }
+        for term in island.actionable_terms().into_iter().take(2) {
+            then_stmts.push(CStmt::comment(format!(
+                "semantic memory: {} [{:?}]",
+                term.expr, term.evidence.tier
+            )));
+        }
+        let then_body = if then_stmts.len() == 1 {
+            then_stmts.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(then_stmts)
+        };
+        let mut prefix = self.structure_block_prefix_stmts(island.anchor_block);
+        prefix.push(CStmt::if_stmt(cond, then_body, None));
+        Some(if prefix.len() == 1 {
+            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(prefix)
+        })
+    }
+
+    pub fn structure_semantic_worker_islands(&mut self, limit: usize) -> Option<CStmt> {
+        let islands = self
+            .fold_ctx
+            .inputs
+            .symbolic_facts
+            .worker_islands
+            .iter()
+            .filter(|island| Self::worker_island_supports_semantic_structuring(island))
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut stmts = Vec::new();
+        let mut seen_targets = HashSet::new();
+        for island in &islands {
+            let Some(target) = island
+                .exact_reachable_target()
+                .or_else(|| island.actionable_reachable_target())
+            else {
+                continue;
+            };
+            if !seen_targets.insert((island.anchor_block, target)) {
+                continue;
+            }
+            if let Some(stmt) = self.structure_semantic_worker_island(island) {
+                Self::append_stmt_body_flat(&mut stmts, stmt);
+            }
+        }
+        if stmts.is_empty() {
+            None
+        } else if stmts.len() == 1 {
+            Some(stmts.into_iter().next().unwrap_or(CStmt::Empty))
+        } else {
+            Some(CStmt::Block(stmts))
+        }
+    }
+
+    fn structure_region_suffix_from_target(
+        &mut self,
+        region: &Region,
+        target: u64,
+    ) -> Option<CStmt> {
+        match region {
+            Region::Block(addr) => (*addr == target).then(|| self.structure_block(*addr)),
+            Region::Sequence(regions) => {
+                let start_idx = regions
+                    .iter()
+                    .position(|child| child.blocks().contains(&target))?;
+                let mut stmts = Vec::new();
+                Self::append_stmt_body_flat(
+                    &mut stmts,
+                    self.structure_region_suffix_from_target(&regions[start_idx], target)?,
+                );
+                for child in &regions[start_idx + 1..] {
+                    Self::append_stmt_body_flat(&mut stmts, self.structure_region(child));
+                }
+                Some(if stmts.len() == 1 {
+                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
+                } else {
+                    CStmt::Block(stmts)
+                })
+            }
+            Region::IfThenElse {
+                cond_block,
+                then_region,
+                else_region,
+                merge_block,
+            } => {
+                if *cond_block == target {
+                    return Some(self.structure_region(region));
+                }
+                let mut stmts = if then_region.blocks().contains(&target) {
+                    let mut stmts = Vec::new();
+                    Self::append_stmt_body_flat(
+                        &mut stmts,
+                        self.structure_region_suffix_from_target(then_region, target)?,
+                    );
+                    stmts
+                } else if else_region
+                    .as_deref()
+                    .is_some_and(|region| region.blocks().contains(&target))
+                {
+                    let mut stmts = Vec::new();
+                    Self::append_stmt_body_flat(
+                        &mut stmts,
+                        self.structure_region_suffix_from_target(else_region.as_deref()?, target)?,
+                    );
+                    stmts
+                } else if merge_block.is_some_and(|merge| merge == target) {
+                    vec![self.structure_block(target)]
+                } else {
+                    return None;
+                };
+                if let Some(merge_addr) = merge_block.filter(|merge| *merge != target) {
+                    Self::append_stmt_body_flat(&mut stmts, self.structure_block(merge_addr));
+                }
+                Some(if stmts.len() == 1 {
+                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
+                } else {
+                    CStmt::Block(stmts)
+                })
+            }
+            Region::WhileLoop { header, body } => {
+                if *header == target {
+                    Some(self.structure_region(region))
+                } else if body.blocks().contains(&target) {
+                    self.structure_region_suffix_from_target(body, target)
+                } else {
+                    None
+                }
+            }
+            Region::DoWhileLoop { body, cond_block } => {
+                if *cond_block == target {
+                    return Some(self.structure_block(*cond_block));
+                }
+                if !body.blocks().contains(&target) {
+                    return None;
+                }
+                let mut stmts = Vec::new();
+                Self::append_stmt_body_flat(
+                    &mut stmts,
+                    self.structure_region_suffix_from_target(body, target)?,
+                );
+                Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block));
+                Some(if stmts.len() == 1 {
+                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
+                } else {
+                    CStmt::Block(stmts)
+                })
+            }
+            Region::Switch {
+                switch_block,
+                cases,
+                default,
+                merge_block,
+            } => {
+                if *switch_block == target {
+                    return Some(self.structure_region(region));
+                }
+                let mut stmts = if let Some((_, case_region)) = cases
+                    .iter()
+                    .find(|(_, case_region)| case_region.blocks().contains(&target))
+                {
+                    let mut stmts = Vec::new();
+                    Self::append_stmt_body_flat(
+                        &mut stmts,
+                        self.structure_region_suffix_from_target(case_region, target)?,
+                    );
+                    stmts
+                } else if default
+                    .as_deref()
+                    .is_some_and(|region| region.blocks().contains(&target))
+                {
+                    let mut stmts = Vec::new();
+                    Self::append_stmt_body_flat(
+                        &mut stmts,
+                        self.structure_region_suffix_from_target(default.as_deref()?, target)?,
+                    );
+                    stmts
+                } else if merge_block.is_some_and(|merge| merge == target) {
+                    vec![self.structure_block(target)]
+                } else {
+                    return None;
+                };
+                if let Some(merge_addr) = merge_block.filter(|merge| *merge != target) {
+                    Self::append_stmt_body_flat(&mut stmts, self.structure_block(merge_addr));
+                }
+                Some(if stmts.len() == 1 {
+                    stmts.into_iter().next().unwrap_or(CStmt::Empty)
+                } else {
+                    CStmt::Block(stmts)
+                })
+            }
+            Region::Irreducible { blocks, .. } => blocks
+                .contains(&target)
+                .then(|| self.structure_block(target)),
+        }
+    }
+
+    fn try_structure_symbolic_actionable_if(
         &mut self,
         cond_block: u64,
         then_region: &Region,
         else_region: Option<&Region>,
         merge_block: Option<u64>,
     ) -> Option<CStmt> {
-        let reachable_target = self.symbolic_exact_reachable_target(cond_block)?;
-        let reachable_region = if then_region.entry() == reachable_target {
-            then_region
+        let reachable_target = self
+            .symbolic_exact_reachable_target(cond_block)
+            .or_else(|| self.symbolic_actionable_reachable_target(cond_block))?;
+        let reachable_stmt = if then_region.blocks().contains(&reachable_target) {
+            self.structure_region_suffix_from_target(then_region, reachable_target)?
         } else {
             let else_region = else_region?;
-            if else_region.entry() != reachable_target {
-                return None;
-            }
-            else_region
+            self.structure_region_suffix_from_target(else_region, reachable_target)?
         };
 
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
-        Self::append_stmt_body_flat(&mut prefix, self.structure_region(reachable_region));
+        Self::append_stmt_body_flat(&mut prefix, reachable_stmt);
         if let Some(merge_addr) = merge_block {
             Self::append_stmt_body_flat(&mut prefix, self.structure_block(merge_addr));
         }
@@ -2232,10 +2506,12 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::SSAFunction;
     use r2types::{
+        SymbolicBranchFact, SymbolicCompiledCondition, SymbolicConditionPrecision,
         SymbolicControlFact, SymbolicControlIsland, SymbolicControlIslandKind,
-        SymbolicInterpreterKind, SymbolicReachabilityStatus, SymbolicSemanticConfidence,
-        SymbolicSemanticEvidence, SymbolicSemanticFacts, SymbolicVmStateUpdate,
-        SymbolicVmStepSummary,
+        SymbolicInterpreterKind, SymbolicMemoryCondition, SymbolicMemoryIslandKind,
+        SymbolicMemoryRegion, SymbolicReachabilityStatus, SymbolicSemanticConfidence,
+        SymbolicSemanticEvidence, SymbolicSemanticEvidenceReason, SymbolicSemanticFacts,
+        SymbolicVmStateUpdate, SymbolicVmStepSummary, SymbolicWorkerIsland,
     };
     use std::collections::BTreeMap;
 
@@ -2268,6 +2544,53 @@ mod tests {
         SSAFunction::from_blocks_with_arch(&[block], Some(&test_arch()))
             .expect("ssa function")
             .with_name("vm_summary_demo")
+    }
+
+    fn function_with_return_blocks(addrs: &[u64]) -> SSAFunction {
+        let blocks = addrs
+            .iter()
+            .map(|addr| {
+                let mut block = R2ILBlock::new(*addr, 4);
+                block.push(R2ILOp::Return {
+                    target: Varnode::constant(0, 8),
+                });
+                block
+            })
+            .collect::<Vec<_>>();
+        SSAFunction::from_blocks_with_arch(&blocks, Some(&test_arch()))
+            .expect("ssa function")
+            .with_name("worker_region_demo")
+    }
+
+    fn function_with_conditional_return_blocks(
+        cond_block: u64,
+        true_target: u64,
+        false_target: u64,
+    ) -> SSAFunction {
+        let mut cond = R2ILBlock::new(cond_block, 4);
+        cond.push(R2ILOp::IntEqual {
+            dst: Varnode::register(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        cond.push(R2ILOp::CBranch {
+            target: Varnode::constant(true_target, 8),
+            cond: Varnode::register(0x80, 1),
+        });
+
+        let mut false_block = R2ILBlock::new(false_target, 4);
+        false_block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+
+        let mut true_block = R2ILBlock::new(true_target, 4);
+        true_block.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+
+        SSAFunction::from_blocks_with_arch(&[cond, false_block, true_block], Some(&test_arch()))
+            .expect("ssa function")
+            .with_name("worker_structured_demo")
     }
 
     #[test]
@@ -2978,6 +3301,265 @@ mod tests {
         assert_eq!(
             structurer.symbolic_exact_reachable_target(0x2000),
             Some(0x2004)
+        );
+    }
+
+    #[test]
+    fn symbolic_actionable_reachable_target_uses_likely_control_island_fallback() {
+        let func = function_with_single_block(0x2000);
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.symbolic_facts = Box::leak(Box::new(SymbolicSemanticFacts {
+            control_islands: vec![SymbolicControlIsland {
+                kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
+                anchor_block: 0x2000,
+                frontier_targets: vec![0x2004, 0x2008],
+                facts: vec![
+                    SymbolicControlFact {
+                        target: 0x2004,
+                        status: SymbolicReachabilityStatus::Reachable,
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(SymbolicCompiledCondition {
+                            simplified: "x == 0".to_string(),
+                            terms: vec!["x == 0".to_string()],
+                            memory_terms: Vec::new(),
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: SymbolicConditionPrecision::OverApprox,
+                            evidence: SymbolicSemanticEvidence::likely(
+                                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                            ),
+                            confidence: SymbolicSemanticConfidence::Likely,
+                            supported_paths: 1,
+                            total_paths: 2,
+                        }),
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                    SymbolicControlFact {
+                        target: 0x2008,
+                        status: SymbolicReachabilityStatus::Unreachable,
+                        condition: Some("!(x == 0)".to_string()),
+                        compiled: None,
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                ],
+                evidence: SymbolicSemanticEvidence::likely(
+                    SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                ),
+                confidence: SymbolicSemanticConfidence::Likely,
+            }],
+            ..SymbolicSemanticFacts::default()
+        }));
+
+        let structurer = ControlFlowStructurer::new(&func, &ctx);
+        assert_eq!(
+            structurer.symbolic_actionable_reachable_target(0x2000),
+            Some(0x2004)
+        );
+    }
+
+    #[test]
+    fn symbolic_actionable_if_accepts_reachable_target_inside_region() {
+        let func = function_with_return_blocks(&[0x2000, 0x2004, 0x2008]);
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.symbolic_facts = Box::leak(Box::new(SymbolicSemanticFacts {
+            control_islands: vec![SymbolicControlIsland {
+                kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
+                anchor_block: 0x2000,
+                frontier_targets: vec![0x2004, 0x2008],
+                facts: vec![
+                    SymbolicControlFact {
+                        target: 0x2008,
+                        status: SymbolicReachabilityStatus::Reachable,
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(SymbolicCompiledCondition {
+                            simplified: "x == 0".to_string(),
+                            terms: vec!["x == 0".to_string()],
+                            memory_terms: Vec::new(),
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: SymbolicConditionPrecision::OverApprox,
+                            evidence: SymbolicSemanticEvidence::likely(
+                                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                            ),
+                            confidence: SymbolicSemanticConfidence::Likely,
+                            supported_paths: 1,
+                            total_paths: 2,
+                        }),
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                    SymbolicControlFact {
+                        target: 0x2004,
+                        status: SymbolicReachabilityStatus::Unreachable,
+                        condition: Some("!(x == 0)".to_string()),
+                        compiled: Some(SymbolicCompiledCondition {
+                            simplified: "!(x == 0)".to_string(),
+                            terms: vec!["!(x == 0)".to_string()],
+                            memory_terms: Vec::new(),
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: SymbolicConditionPrecision::OverApprox,
+                            evidence: SymbolicSemanticEvidence::likely(
+                                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                            ),
+                            confidence: SymbolicSemanticConfidence::Likely,
+                            supported_paths: 1,
+                            total_paths: 2,
+                        }),
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                ],
+                evidence: SymbolicSemanticEvidence::likely(
+                    SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                ),
+                confidence: SymbolicSemanticConfidence::Likely,
+            }],
+            ..SymbolicSemanticFacts::default()
+        }));
+
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let then_region = crate::region::Region::Sequence(vec![
+            crate::region::Region::Block(0x2004),
+            crate::region::Region::Block(0x2008),
+        ]);
+
+        let rewritten =
+            structurer.try_structure_symbolic_actionable_if(0x2000, &then_region, None, None);
+        assert!(
+            rewritten.is_some(),
+            "reachable targets inside the structured region should still drive symbolic if shaping"
+        );
+    }
+
+    #[test]
+    fn semantic_worker_island_structuring_builds_real_if_statement() {
+        let func = function_with_conditional_return_blocks(0x2000, 0x2004, 0x2008);
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.symbolic_facts = Box::leak(Box::new(SymbolicSemanticFacts {
+            worker_islands: vec![SymbolicWorkerIsland {
+                anchor_block: 0x2000,
+                control_kind: Some(SymbolicControlIslandKind::LargeCfgBranchFrontier),
+                memory_kind: Some(SymbolicMemoryIslandKind::LargeCfgConditionFrontier),
+                frontier_targets: vec![0x2004, 0x2008],
+                control_facts: vec![
+                    SymbolicControlFact {
+                        target: 0x2004,
+                        status: SymbolicReachabilityStatus::Reachable,
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(SymbolicCompiledCondition {
+                            simplified: "x == 0".to_string(),
+                            terms: vec!["x == 0".to_string()],
+                            memory_terms: vec![SymbolicMemoryCondition {
+                                region: SymbolicMemoryRegion::Argument { index: 0 },
+                                offset_lo: 0,
+                                offset_hi: 0,
+                                size: 1,
+                                exact_offset: true,
+                                evidence: SymbolicSemanticEvidence::likely(
+                                    SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                                ),
+                                confidence: SymbolicSemanticConfidence::Likely,
+                                binding: None,
+                                expr: "*arg0".to_string(),
+                                value_expr: Some("0x0:8".to_string()),
+                                exact_value: true,
+                            }],
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: SymbolicConditionPrecision::OverApprox,
+                            evidence: SymbolicSemanticEvidence::likely(
+                                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                            ),
+                            confidence: SymbolicSemanticConfidence::Likely,
+                            supported_paths: 1,
+                            total_paths: 2,
+                        }),
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                    SymbolicControlFact {
+                        target: 0x2008,
+                        status: SymbolicReachabilityStatus::Unreachable,
+                        condition: Some("!(x == 0)".to_string()),
+                        compiled: Some(SymbolicCompiledCondition {
+                            simplified: "!(x == 0)".to_string(),
+                            terms: vec!["!(x == 0)".to_string()],
+                            memory_terms: Vec::new(),
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: SymbolicConditionPrecision::OverApprox,
+                            evidence: SymbolicSemanticEvidence::likely(
+                                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                            ),
+                            confidence: SymbolicSemanticConfidence::Likely,
+                            supported_paths: 1,
+                            total_paths: 2,
+                        }),
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                ],
+                memory_terms: vec![SymbolicMemoryCondition {
+                    region: SymbolicMemoryRegion::Argument { index: 0 },
+                    offset_lo: 0,
+                    offset_hi: 0,
+                    size: 1,
+                    exact_offset: true,
+                    evidence: SymbolicSemanticEvidence::likely(
+                        SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                    ),
+                    confidence: SymbolicSemanticConfidence::Likely,
+                    binding: None,
+                    expr: "*arg0".to_string(),
+                    value_expr: Some("0x0:8".to_string()),
+                    exact_value: true,
+                }],
+                evidence: SymbolicSemanticEvidence::likely(
+                    SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                ),
+                confidence: SymbolicSemanticConfidence::Likely,
+            }],
+            branch_facts: vec![SymbolicBranchFact {
+                block_addr: 0x2000,
+                true_target: 0x2004,
+                false_target: 0x2008,
+                true_status: SymbolicReachabilityStatus::Reachable,
+                false_status: SymbolicReachabilityStatus::Unreachable,
+                true_condition: Some("x == 0".to_string()),
+                false_condition: Some("!(x == 0)".to_string()),
+                true_compiled: None,
+                false_compiled: None,
+            }],
+            ..SymbolicSemanticFacts::default()
+        }));
+
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let rewritten = structurer
+            .structure_semantic_worker_islands(4)
+            .expect("semantic worker structuring");
+        assert!(
+            matches!(rewritten, CStmt::If { .. } | CStmt::Block(_)),
+            "expected structured semantic worker output, got {rewritten:?}"
         );
     }
 }

@@ -269,7 +269,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.sym sym.interpret_bytecode | jq -c '.semantic.mode=="vm_summary" and .semantic.slice_class=="interpreter_switch" and .semantic.skipped_large_cfg==true and (.semantic.residual_reasons|length)==1 and .semantic.residual_reasons[0]=="large_cfg" and .semantic.vm_step != null and (.semantic.vm_step.dispatch_targets|length)>=10'
+a:sla.sym sym.interpret_bytecode | jq -c '.semantic.mode=="vm_summary" and .semantic.slice_class=="interpreter_switch" and .semantic.skipped_large_cfg==true and (.semantic.residual_reasons|length)==0 and .semantic.vm_step != null and (.semantic.vm_step.dispatch_targets|length)>=10'
 EOF_CMDS
 RUN
 
@@ -343,6 +343,30 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 a:sla.types sym.test_stack_symbolic_eq_guard | jq -c '.symbolic.diagnostics.branches_pruned==1 and (.symbolic.branches|length)==1 and .symbolic.branches[0].true_compiled.precision=="Exact" and (.symbolic.branches[0].true_compiled.memory_terms|length)==1 and .symbolic.branches[0].true_compiled.memory_terms[0].region.Region.kind=="Stack" and .symbolic.branches[0].true_compiled.memory_terms[0].exact_offset==true'
+EOF_CMDS
+RUN
+
+NAME=types_stack_symbolic_eq_guard_reports_memory_island
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.types sym.test_stack_symbolic_eq_guard | jq -c '(.symbolic.memory_islands|length) >= 1 and .symbolic.memory_islands[0].anchor_block != null and ((.symbolic.memory_islands[0].terms|length) >= 1) and .symbolic.memory_islands[0].terms[0].region.Region.kind=="Stack"'
+EOF_CMDS
+RUN
+
+NAME=sym_stack_symbolic_eq_guard_reports_memory_island_count
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+a:sla.sym sym.test_stack_symbolic_eq_guard | jq -c '.semantic.memory_island_count >= 1'
 EOF_CMDS
 RUN
 

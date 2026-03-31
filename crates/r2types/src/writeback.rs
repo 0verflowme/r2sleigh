@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use r2ssa::{
     FunctionSemanticSummary, InterprocSummarySet, SSABlock, SSAOp, SSAVar, SummaryArgEffect,
@@ -18,10 +19,11 @@ use crate::facts::{
     CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
     CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
     FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics,
-    SymbolicMemoryCondition, SymbolicMemoryRegion, SymbolicSemanticFacts, VisibleBinding,
-    VisibleBindingKind, parse_type_like_spec,
+    LocalFieldAccessFact, SymbolicMemoryCondition, SymbolicMemoryRegion, SymbolicSemanticFacts,
+    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
 use crate::model::Signedness;
+use crate::prepare::recover_vars_arch_profile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritebackSource {
@@ -104,13 +106,15 @@ pub struct InferredSignature {
     pub callconv_confidence: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveredVariable {
     pub name: String,
     pub kind: String,
     pub delta: i64,
+    #[serde(rename = "type")]
     pub var_type: String,
     pub isarg: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reg: Option<String>,
 }
 
@@ -203,6 +207,11 @@ pub struct TypeWritebackAnalysisInput<'a> {
     pub local_structs: LocalStructArtifacts,
     pub interproc_summary_set: Option<InterprocSummarySet>,
     pub diagnostics: TypeWritebackDiagnostics,
+}
+
+pub struct TypeWritebackSemanticInputs<'a> {
+    pub symbolic_facts: &'a SymbolicSemanticFacts,
+    pub local_field_accesses: &'a [LocalFieldAccessFact],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -492,8 +501,9 @@ fn apply_interproc_summary_to_signature(
     }
 }
 
-pub fn build_type_writeback_analysis(
+fn build_type_writeback_analysis_inner(
     mut input: TypeWritebackAnalysisInput<'_>,
+    semantic_inputs: Option<TypeWritebackSemanticInputs<'_>>,
 ) -> TypeWritebackAnalysis {
     if input.parsed_context.stack_slots.is_empty()
         && !input.parsed_context.external_stack_vars.is_empty()
@@ -535,6 +545,18 @@ pub fn build_type_writeback_analysis(
         input.ptr_bits,
     );
     let mut local_structs = input.local_structs;
+    if let Some(semantic) = semantic_inputs.as_ref() {
+        augment_local_struct_artifacts_with_local_field_accesses(
+            &mut local_structs,
+            semantic.local_field_accesses,
+            input.ptr_bits,
+        );
+        augment_local_struct_artifacts_with_symbolic_facts(
+            &mut local_structs,
+            semantic.symbolic_facts,
+            input.ptr_bits,
+        );
+    }
     align_local_structs_with_external(
         &mut local_structs.struct_decls,
         &mut local_structs.slot_type_overrides,
@@ -602,7 +624,7 @@ pub fn build_type_writeback_analysis(
         &var_rename_candidates,
         input.ptr_bits,
     );
-    let type_facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+    let mut type_facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
         merged_signature: merged_signature.clone(),
         known_function_signatures: input.parsed_context.known_function_signatures.clone(),
         register_params: input.parsed_context.register_params.clone(),
@@ -628,6 +650,14 @@ pub fn build_type_writeback_analysis(
         external_type_db: type_db,
         slot_type_overrides: local_structs.slot_type_overrides.clone(),
         slot_field_profiles: local_structs.slot_field_profiles.clone(),
+        symbolic_facts: semantic_inputs
+            .as_ref()
+            .map(|semantic| semantic.symbolic_facts.clone())
+            .unwrap_or_default(),
+        local_field_accesses: semantic_inputs
+            .as_ref()
+            .map(|semantic| semantic.local_field_accesses.to_vec())
+            .unwrap_or_default(),
         interproc_diagnostics: input
             .interproc_summary_set
             .as_ref()
@@ -641,9 +671,16 @@ pub fn build_type_writeback_analysis(
             })
             .unwrap_or_default(),
         diagnostics: diagnostics.solver_warnings.clone(),
-        ..FunctionTypeFactInputs::default()
     })
     .build();
+    if let Some(semantic) = semantic_inputs.as_ref()
+        && semantic.symbolic_facts.diagnostics.branches_pruned > 0
+    {
+        type_facts.diagnostics.push(format!(
+            "symbolic pruned {} branch arm(s)",
+            semantic.symbolic_facts.diagnostics.branches_pruned
+        ));
+    }
     let global_type_links = score_global_type_links(
         input.ssa_blocks,
         &struct_decls,
@@ -667,27 +704,715 @@ pub fn build_type_writeback_analysis(
     }
 }
 
+pub fn build_type_writeback_analysis(
+    input: TypeWritebackAnalysisInput<'_>,
+) -> TypeWritebackAnalysis {
+    build_type_writeback_analysis_inner(input, None)
+}
+
+pub fn build_type_writeback_analysis_with_semantics(
+    input: TypeWritebackAnalysisInput<'_>,
+    semantic_inputs: TypeWritebackSemanticInputs<'_>,
+) -> TypeWritebackAnalysis {
+    build_type_writeback_analysis_inner(input, Some(semantic_inputs))
+}
+
+fn symbolic_semantic_mode_label(mode: crate::facts::SymbolicSemanticMode) -> &'static str {
+    match mode {
+        crate::facts::SymbolicSemanticMode::Raw => "raw",
+        crate::facts::SymbolicSemanticMode::Compiled => "compiled",
+        crate::facts::SymbolicSemanticMode::IslandCompiled => "island_compiled",
+        crate::facts::SymbolicSemanticMode::Residual => "residual",
+        crate::facts::SymbolicSemanticMode::VmSummary => "vm_summary",
+    }
+}
+
+fn symbolic_slice_class_label(
+    slice_class: crate::facts::SymbolicSemanticSliceClass,
+) -> &'static str {
+    match slice_class {
+        crate::facts::SymbolicSemanticSliceClass::Wrapper => "wrapper",
+        crate::facts::SymbolicSemanticSliceClass::Worker => "worker",
+        crate::facts::SymbolicSemanticSliceClass::RecursiveGroup => "recursive_group",
+        crate::facts::SymbolicSemanticSliceClass::InterpreterSwitch => "interpreter_switch",
+        crate::facts::SymbolicSemanticSliceClass::InterpreterIndirect => "interpreter_indirect",
+        crate::facts::SymbolicSemanticSliceClass::GenericLarge => "generic_large",
+    }
+}
+
+fn symbolic_residual_reason_label(
+    reason: crate::facts::SymbolicSemanticResidualReason,
+) -> &'static str {
+    match reason {
+        crate::facts::SymbolicSemanticResidualReason::MissingArch => "missing_arch",
+        crate::facts::SymbolicSemanticResidualReason::LargeCfg => "large_cfg",
+        crate::facts::SymbolicSemanticResidualReason::SummaryBudgetExhausted => {
+            "summary_budget_exhausted"
+        }
+        crate::facts::SymbolicSemanticResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
+        crate::facts::SymbolicSemanticResidualReason::InterpreterRequiresStepSummary => {
+            "interpreter_requires_step_summary"
+        }
+    }
+}
+
+fn semantic_fallback_warning(symbolic_facts: &SymbolicSemanticFacts) -> String {
+    let slice_class = symbolic_facts
+        .slice_class()
+        .map(symbolic_slice_class_label)
+        .unwrap_or("unknown");
+    let mode = symbolic_facts
+        .semantic_mode()
+        .map(symbolic_semantic_mode_label)
+        .unwrap_or("unknown");
+    let mut warning = format!("semantic fallback: {slice_class} slice in {mode} mode");
+    if !symbolic_facts.diagnostics.residual_reasons.is_empty() {
+        warning.push_str(" (");
+        warning.push_str(
+            &symbolic_facts
+                .diagnostics
+                .residual_reasons
+                .iter()
+                .map(|reason| symbolic_residual_reason_label(*reason))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        warning.push(')');
+    }
+    if !symbolic_facts.branch_facts.is_empty()
+        || !symbolic_facts.worker_islands.is_empty()
+        || !symbolic_facts.control_islands.is_empty()
+        || !symbolic_facts.memory_islands.is_empty()
+    {
+        warning.push_str(&format!(
+            "; branch_facts={}, worker_islands={}, control_islands={}, memory_islands={}, actionable_conditions={}, exact_conditions={}",
+            symbolic_facts.branch_facts.len(),
+            symbolic_facts.worker_islands.len(),
+            symbolic_facts.control_islands.len(),
+            symbolic_facts.memory_islands.len(),
+            symbolic_facts.actionable_compiled_condition_count(),
+            symbolic_facts.exact_compiled_condition_count(),
+        ));
+    }
+    warning
+}
+
+pub fn build_semantic_type_fallback_plan(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    symbolic_facts: &SymbolicSemanticFacts,
+) -> TypeWritebackPlan {
+    let mut warnings = vec![semantic_fallback_warning(symbolic_facts)];
+    if !symbolic_facts.type_ready() {
+        warnings.push("type analysis not ready from semantic capability".to_string());
+    }
+    let mut local_structs = LocalStructArtifacts::default();
+    augment_local_struct_artifacts_with_symbolic_facts(
+        &mut local_structs,
+        symbolic_facts,
+        ptr_bits,
+    );
+    let mut signature = InferredSignature {
+        function_name: function_name.to_string(),
+        signature: format!("void {}(void)", function_name),
+        ret_type: "void".to_string(),
+        params: Vec::new(),
+        callconv: "unknown".to_string(),
+        arch: arch_name.to_string(),
+        confidence: 0,
+        callconv_confidence: 0,
+    };
+    if let Some(merged_signature) = merge_slot_type_overrides_into_signature(
+        inferred_signature_to_spec(&signature, ptr_bits),
+        &local_structs.slot_type_overrides,
+        ptr_bits,
+    ) {
+        apply_signature_context_overrides(&mut signature, Some(&merged_signature), ptr_bits);
+    }
+    if !local_structs.struct_decls.is_empty() {
+        warnings.push(format!(
+            "semantic worker islands projected {} struct candidate(s)",
+            local_structs.struct_decls.len()
+        ));
+    }
+
+    TypeWritebackPlan {
+        signature,
+        var_type_candidates: Vec::new(),
+        var_rename_candidates: Vec::new(),
+        struct_decls: local_structs.struct_decls,
+        global_type_links: Vec::new(),
+        diagnostics: TypeWritebackDiagnostics {
+            conflicts: Vec::new(),
+            warnings,
+            solver_warnings: Vec::new(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalAddrExpr {
+    slot: usize,
+    offset: i64,
+    confidence: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct InferredLocalFieldEvidence {
+    reads: u32,
+    writes: u32,
+    widths: BTreeMap<u32, u32>,
+    type_votes: BTreeMap<String, u32>,
+}
+
+type LocalFieldEvidenceMap = HashMap<usize, BTreeMap<u64, InferredLocalFieldEvidence>>;
+
+fn collect_pointer_arg_slot_map(arch_name: Option<&str>, ptr_bits: u32) -> HashMap<String, usize> {
+    let (arg_regs, _, _) = recover_vars_arch_profile(arch_name);
+    let arch_name = arch_name.unwrap_or_default().to_ascii_lowercase();
+    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
+    let is_x86_64 = arch_name.contains("x86-64")
+        || arch_name.contains("x86_64")
+        || arch_name.contains("amd64")
+        || arch_name.contains("x64");
+    let is_riscv64 = arch_name.contains("riscv64") || arch_name.contains("rv64");
+
+    let mut out = HashMap::new();
+    for (idx, (canonical, aliases)) in arg_regs.iter().enumerate() {
+        let include_alias = |alias: &str| -> bool {
+            if ptr_bits <= 32 {
+                return true;
+            }
+            let alias = alias.to_ascii_lowercase();
+            if is_arm64 {
+                return alias.starts_with('x');
+            }
+            if is_x86_64 {
+                return alias.starts_with('r');
+            }
+            if is_riscv64 {
+                return alias.starts_with('x') || alias.starts_with('a');
+            }
+            alias == (*canonical).to_ascii_lowercase()
+        };
+
+        if include_alias(canonical) {
+            out.insert((*canonical).to_string(), idx);
+        }
+        for alias in *aliases {
+            if include_alias(alias) {
+                out.insert((*alias).to_string(), idx);
+            }
+        }
+    }
+    out
+}
+
+fn parse_ssa_const_offset(name: &str, ptr_bits: u32) -> Option<i64> {
+    let val_str = name
+        .strip_prefix("const:")
+        .or_else(|| name.strip_prefix("CONST:"))?;
+    let val_str = val_str.split('_').next().unwrap_or(val_str);
+
+    let raw = if let Some(hex) = val_str
+        .strip_prefix("0x")
+        .or_else(|| val_str.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()?
+    } else if let Some(dec) = val_str
+        .strip_prefix("0d")
+        .or_else(|| val_str.strip_prefix("0D"))
+    {
+        dec.parse::<u64>().ok()?
+    } else {
+        u64::from_str_radix(val_str, 16).ok()?
+    };
+    Some(signed_offset_from_const(raw, ptr_bits))
+}
+
+pub fn infer_local_struct_artifacts_from_ssa(
+    ssa_blocks: &[SSABlock],
+    arch_name: Option<&str>,
+    ptr_bits: u32,
+    diagnostics: &mut TypeWritebackDiagnostics,
+) -> LocalStructArtifacts {
+    let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
+    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
+    let mut addr_exprs: HashMap<String, LocalAddrExpr> = HashMap::new();
+    let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
+    let mut stack_slot_values: HashMap<(u64, i64), LocalAddrExpr> = HashMap::new();
+    let mut slot_field_evidence: LocalFieldEvidenceMap = HashMap::new();
+    let offset_bound = 0x4000i64;
+    let block_ops: HashMap<u64, HashMap<String, SSAOp>> = ssa_blocks
+        .iter()
+        .map(|block| {
+            let ops = block
+                .ops
+                .iter()
+                .filter_map(|op| {
+                    op.dst()
+                        .map(|dst| (ssa_var_block_key(block.addr, dst), op.clone()))
+                })
+                .collect::<HashMap<_, _>>();
+            (block.addr, ops)
+        })
+        .collect();
+
+    fn is_scaled_index_like(
+        block_addr: u64,
+        var: &SSAVar,
+        ops_by_block: &HashMap<u64, HashMap<String, SSAOp>>,
+        addr_exprs: &HashMap<String, LocalAddrExpr>,
+        depth: u32,
+    ) -> bool {
+        if depth > 8 || var.is_const() {
+            return false;
+        }
+        let key = ssa_var_block_key(block_addr, var);
+        if addr_exprs.contains_key(&key) {
+            return false;
+        }
+        let Some(op) = ops_by_block.get(&block_addr).and_then(|ops| ops.get(&key)) else {
+            return true;
+        };
+        match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::Cast { src, .. }
+            | SSAOp::New { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Trunc { src, .. }
+            | SSAOp::Subpiece { src, .. } => {
+                is_scaled_index_like(block_addr, src, ops_by_block, addr_exprs, depth + 1)
+            }
+            SSAOp::IntMult { a, b, .. } => {
+                (parse_ssa_const_offset(&a.name, 64).is_some()
+                    && is_scaled_index_like(block_addr, b, ops_by_block, addr_exprs, depth + 1))
+                    || (parse_ssa_const_offset(&b.name, 64).is_some()
+                        && is_scaled_index_like(block_addr, a, ops_by_block, addr_exprs, depth + 1))
+            }
+            SSAOp::IntLeft { a, b, .. } => {
+                parse_ssa_const_offset(&b.name, 64).is_some()
+                    && is_scaled_index_like(block_addr, a, ops_by_block, addr_exprs, depth + 1)
+            }
+            SSAOp::IntSub { a, b, .. } => {
+                parse_ssa_const_offset(&a.name, 64) == Some(0)
+                    && is_scaled_index_like(block_addr, b, ops_by_block, addr_exprs, depth + 1)
+            }
+            SSAOp::Load { .. } | SSAOp::Phi { .. } => true,
+            _ => false,
+        }
+    }
+
+    for block in ssa_blocks {
+        for op in &block.ops {
+            op.for_each_source(&mut |src: &SSAVar| {
+                if src.version != 0 {
+                    return;
+                }
+                let key = src.name.to_ascii_lowercase();
+                if let Some(slot) = pointer_arg_slot_map.get(key.as_str()).copied() {
+                    addr_exprs
+                        .entry(ssa_var_block_key(block.addr, src))
+                        .or_insert(LocalAddrExpr {
+                            slot,
+                            offset: 0,
+                            confidence: 92,
+                        });
+                }
+            });
+        }
+    }
+
+    let is_stack_base = |name: &str| stack_bases.contains(&name) || frame_bases.contains(&name);
+
+    for _ in 0..6 {
+        let mut changed = false;
+        for block in ssa_blocks {
+            for op in &block.ops {
+                let addr_of = |var: &SSAVar, map: &HashMap<String, LocalAddrExpr>| {
+                    if var.version == 0 {
+                        let key = var.name.to_ascii_lowercase();
+                        if let Some(slot) = pointer_arg_slot_map.get(key.as_str()).copied() {
+                            return Some(LocalAddrExpr {
+                                slot,
+                                offset: 0,
+                                confidence: 92,
+                            });
+                        }
+                    }
+                    map.get(&ssa_var_block_key(block.addr, var)).copied()
+                };
+                let stack_slot_of = |var: &SSAVar, stack_map: &HashMap<String, i64>| {
+                    stack_map.get(&ssa_var_block_key(block.addr, var)).copied()
+                };
+                let set_expr =
+                    |dst: &SSAVar,
+                     expr: LocalAddrExpr,
+                     map: &mut HashMap<String, LocalAddrExpr>| {
+                        let key = ssa_var_block_key(block.addr, dst);
+                        match map.get(&key).copied() {
+                            Some(prev) if prev.confidence >= expr.confidence => false,
+                            _ => {
+                                map.insert(key, expr);
+                                true
+                            }
+                        }
+                    };
+                let set_stack_slot = |dst: &SSAVar, offset: i64, map: &mut HashMap<String, i64>| {
+                    let key = ssa_var_block_key(block.addr, dst);
+                    match map.get(&key).copied() {
+                        Some(prev) if prev == offset => false,
+                        _ => {
+                            map.insert(key, offset);
+                            true
+                        }
+                    }
+                };
+
+                match op {
+                    SSAOp::Copy { dst, src }
+                    | SSAOp::Cast { dst, src }
+                    | SSAOp::New { dst, src }
+                    | SSAOp::IntZExt { dst, src }
+                    | SSAOp::IntSExt { dst, src } => {
+                        if let Some(mut expr) = addr_of(src, &addr_exprs) {
+                            expr.confidence = expr.confidence.saturating_sub(2);
+                            changed |= set_expr(dst, expr, &mut addr_exprs);
+                        }
+                        if let Some(offset) = stack_slot_of(src, &stack_addr_offsets) {
+                            changed |= set_stack_slot(dst, offset, &mut stack_addr_offsets);
+                        }
+                    }
+                    SSAOp::Phi { dst, sources } => {
+                        let mut selected = None;
+                        let mut selected_slot = None;
+                        for src in sources {
+                            let Some(expr) = addr_of(src, &addr_exprs) else {
+                                selected = None;
+                                break;
+                            };
+                            selected = match selected {
+                                None => Some(expr),
+                                Some(prev)
+                                    if prev.slot == expr.slot && prev.offset == expr.offset =>
+                                {
+                                    Some(LocalAddrExpr {
+                                        slot: prev.slot,
+                                        offset: prev.offset,
+                                        confidence: prev.confidence.max(expr.confidence),
+                                    })
+                                }
+                                _ => None,
+                            };
+                            let Some(slot) = stack_slot_of(src, &stack_addr_offsets) else {
+                                selected_slot = None;
+                                break;
+                            };
+                            selected_slot = match selected_slot {
+                                None => Some(slot),
+                                Some(prev) if prev == slot => Some(prev),
+                                _ => None,
+                            };
+                            if selected.is_none() {
+                                break;
+                            }
+                        }
+                        if let Some(mut expr) = selected {
+                            expr.confidence = expr.confidence.saturating_sub(3);
+                            changed |= set_expr(dst, expr, &mut addr_exprs);
+                        }
+                        if let Some(slot) = selected_slot {
+                            changed |= set_stack_slot(dst, slot, &mut stack_addr_offsets);
+                        }
+                    }
+                    SSAOp::IntAdd { dst, a, b } => {
+                        if let Some(off) = parse_ssa_const_offset(&b.name, ptr_bits) {
+                            let a_lower = a.name.to_ascii_lowercase();
+                            if is_stack_base(a_lower.as_str()) {
+                                changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
+                            }
+                        }
+                        if let Some(off) = parse_ssa_const_offset(&a.name, ptr_bits) {
+                            let b_lower = b.name.to_ascii_lowercase();
+                            if is_stack_base(b_lower.as_str()) {
+                                changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
+                            }
+                        }
+                        if let Some(base) = addr_of(a, &addr_exprs)
+                            && let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                        {
+                            let off = base.offset.saturating_add(delta);
+                            if (-offset_bound..=offset_bound).contains(&off) {
+                                changed |= set_expr(
+                                    dst,
+                                    LocalAddrExpr {
+                                        slot: base.slot,
+                                        offset: off,
+                                        confidence: base.confidence.saturating_sub(1),
+                                    },
+                                    &mut addr_exprs,
+                                );
+                            }
+                        } else if let Some(base) = addr_of(a, &addr_exprs)
+                            && is_scaled_index_like(block.addr, b, &block_ops, &addr_exprs, 0)
+                        {
+                            changed |= set_expr(
+                                dst,
+                                LocalAddrExpr {
+                                    slot: base.slot,
+                                    offset: base.offset,
+                                    confidence: base.confidence.saturating_sub(4),
+                                },
+                                &mut addr_exprs,
+                            );
+                        } else if let Some(base) = addr_of(b, &addr_exprs)
+                            && let Some(delta) = parse_ssa_const_offset(&a.name, ptr_bits)
+                        {
+                            let off = base.offset.saturating_add(delta);
+                            if (-offset_bound..=offset_bound).contains(&off) {
+                                changed |= set_expr(
+                                    dst,
+                                    LocalAddrExpr {
+                                        slot: base.slot,
+                                        offset: off,
+                                        confidence: base.confidence.saturating_sub(1),
+                                    },
+                                    &mut addr_exprs,
+                                );
+                            }
+                        } else if let Some(base) = addr_of(b, &addr_exprs)
+                            && is_scaled_index_like(block.addr, a, &block_ops, &addr_exprs, 0)
+                        {
+                            changed |= set_expr(
+                                dst,
+                                LocalAddrExpr {
+                                    slot: base.slot,
+                                    offset: base.offset,
+                                    confidence: base.confidence.saturating_sub(4),
+                                },
+                                &mut addr_exprs,
+                            );
+                        }
+                    }
+                    SSAOp::IntSub { dst, a, b } => {
+                        if let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits) {
+                            let a_lower = a.name.to_ascii_lowercase();
+                            if is_stack_base(a_lower.as_str()) {
+                                changed |= set_stack_slot(
+                                    dst,
+                                    delta.saturating_neg(),
+                                    &mut stack_addr_offsets,
+                                );
+                            }
+                        }
+                        if let Some(base) = addr_of(a, &addr_exprs)
+                            && let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                        {
+                            let off = base.offset.saturating_sub(delta);
+                            if (-offset_bound..=offset_bound).contains(&off) {
+                                changed |= set_expr(
+                                    dst,
+                                    LocalAddrExpr {
+                                        slot: base.slot,
+                                        offset: off,
+                                        confidence: base.confidence.saturating_sub(1),
+                                    },
+                                    &mut addr_exprs,
+                                );
+                            }
+                        } else if let Some(base) = addr_of(a, &addr_exprs)
+                            && is_scaled_index_like(block.addr, b, &block_ops, &addr_exprs, 0)
+                        {
+                            changed |= set_expr(
+                                dst,
+                                LocalAddrExpr {
+                                    slot: base.slot,
+                                    offset: base.offset,
+                                    confidence: base.confidence.saturating_sub(4),
+                                },
+                                &mut addr_exprs,
+                            );
+                        }
+                    }
+                    SSAOp::Store { addr, val, .. } => {
+                        if let Some(offset) = stack_slot_of(addr, &stack_addr_offsets)
+                            && let Some(mut expr) = addr_of(val, &addr_exprs)
+                        {
+                            expr.confidence = expr.confidence.saturating_sub(2);
+                            let key = (block.addr, offset);
+                            match stack_slot_values.get(&key).copied() {
+                                Some(prev) if prev.confidence >= expr.confidence => {}
+                                _ => {
+                                    stack_slot_values.insert(key, expr);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    SSAOp::Load { dst, addr, .. } => {
+                        if let Some(offset) = stack_slot_of(addr, &stack_addr_offsets)
+                            && let Some(mut expr) =
+                                stack_slot_values.get(&(block.addr, offset)).copied()
+                        {
+                            expr.confidence = expr.confidence.saturating_sub(3);
+                            changed |= set_expr(dst, expr, &mut addr_exprs);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for block in ssa_blocks {
+        for op in &block.ops {
+            let resolve_addr = |addr: &SSAVar| -> Option<LocalAddrExpr> {
+                if addr.version == 0 {
+                    let key = addr.name.to_ascii_lowercase();
+                    if let Some(slot) = pointer_arg_slot_map.get(key.as_str()).copied() {
+                        return Some(LocalAddrExpr {
+                            slot,
+                            offset: 0,
+                            confidence: 92,
+                        });
+                    }
+                }
+                addr_exprs
+                    .get(&ssa_var_block_key(block.addr, addr))
+                    .copied()
+            };
+            match op {
+                SSAOp::Load { dst, addr, .. } => {
+                    if let Some(expr) = resolve_addr(addr)
+                        && (0..=offset_bound).contains(&expr.offset)
+                    {
+                        let entry = slot_field_evidence
+                            .entry(expr.slot)
+                            .or_default()
+                            .entry(expr.offset as u64)
+                            .or_default();
+                        entry.reads = entry.reads.saturating_add(1);
+                        *entry.widths.entry(dst.size).or_insert(0) += 1;
+                        *entry.type_votes.entry(size_to_type(dst.size)).or_insert(0) += 1;
+                    }
+                }
+                SSAOp::Store { addr, val, .. } => {
+                    if let Some(expr) = resolve_addr(addr)
+                        && (0..=offset_bound).contains(&expr.offset)
+                    {
+                        let entry = slot_field_evidence
+                            .entry(expr.slot)
+                            .or_default()
+                            .entry(expr.offset as u64)
+                            .or_default();
+                        entry.writes = entry.writes.saturating_add(1);
+                        *entry.widths.entry(val.size).or_insert(0) += 1;
+                        *entry.type_votes.entry(size_to_type(val.size)).or_insert(0) += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut struct_decls = Vec::new();
+    let mut slot_type_overrides = HashMap::new();
+    let mut slot_field_profiles = HashMap::new();
+    let mut slots: Vec<usize> = slot_field_evidence.keys().copied().collect();
+    slots.sort_unstable();
+
+    for slot in slots {
+        let Some(fields_map) = slot_field_evidence.get(&slot) else {
+            continue;
+        };
+        if fields_map.is_empty() {
+            continue;
+        }
+        let mut shape = String::new();
+        let mut fields = Vec::new();
+        let mut normalized_fields = BTreeMap::new();
+        let mut confidence_acc = 0u32;
+        for (offset, evidence) in fields_map {
+            let total_votes: u32 = evidence.type_votes.values().copied().sum();
+            let Some((field_type, field_votes)) = evidence
+                .type_votes
+                .iter()
+                .max_by_key(|(_, count)| **count)
+                .map(|(ty, count)| (ty.clone(), *count))
+            else {
+                continue;
+            };
+            if evidence.type_votes.len() > 1 {
+                diagnostics.conflicts.push(format!(
+                    "slot {slot} field +0x{offset:x} conflicting type votes {:?}",
+                    evidence.type_votes
+                ));
+            }
+            let strength = ((field_votes.saturating_mul(100)) / total_votes.max(1)) as u8;
+            let rw_bonus = if evidence.reads > 0 && evidence.writes > 0 {
+                10
+            } else {
+                0
+            };
+            let field_conf = 70u8.saturating_add(strength / 3).saturating_add(rw_bonus);
+            confidence_acc = confidence_acc.saturating_add(field_conf as u32);
+            shape.push_str(&format!("{offset:x}:{field_type};"));
+            normalized_fields.insert(*offset, field_type.clone());
+            fields.push(StructFieldCandidate {
+                name: format!("f_{offset:x}"),
+                offset: *offset,
+                field_type,
+                confidence: field_conf,
+            });
+        }
+        if fields.is_empty() {
+            continue;
+        }
+        let avg_conf = (confidence_acc / fields.len() as u32).clamp(1, 100) as u8;
+        let allow_single_field = fields.len() == 1 && avg_conf >= 94;
+        if fields.len() < 2 && !allow_single_field {
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        shape.hash(&mut hasher);
+        let struct_name = format!("sla_struct_{:016x}", hasher.finish());
+        let Some(decl) = build_struct_decl(&struct_name, &fields, ptr_bits) else {
+            continue;
+        };
+        struct_decls.push(StructDeclCandidate {
+            name: struct_name.clone(),
+            decl,
+            confidence: avg_conf.max(84),
+            source: StructDeclSource::LocalInferred,
+            fields,
+        });
+        slot_field_profiles.insert(slot, normalized_fields);
+        slot_type_overrides.insert(slot, format!("struct {struct_name} *"));
+    }
+
+    LocalStructArtifacts {
+        struct_decls,
+        slot_type_overrides,
+        slot_field_profiles,
+    }
+}
+
 pub fn augment_local_struct_artifacts_with_symbolic_facts(
     local_structs: &mut LocalStructArtifacts,
     symbolic_facts: &SymbolicSemanticFacts,
     ptr_bits: u32,
 ) {
     let mut projected_profiles = BTreeMap::<usize, BTreeMap<u64, String>>::new();
-    for compiled in symbolic_facts
-        .branch_facts
-        .iter()
-        .filter_map(|fact| fact.actionable_compiled_condition())
-        .chain(
-            symbolic_facts
-                .control_islands
-                .iter()
-                .filter_map(|island| island.actionable_compiled_condition()),
-        )
-    {
-        if !(compiled.confidence.is_reliable() && compiled.evidence.is_reliable()) {
+    for island in &symbolic_facts.worker_islands {
+        if !(island.confidence.is_reliable() && island.evidence.is_reliable()) {
             continue;
         }
-        for term in &compiled.memory_terms {
+        for term in &island.memory_terms {
             let Some((slot, offset, field_type)) = symbolic_memory_term_slot_field(term, ptr_bits)
             else {
                 continue;
@@ -697,6 +1422,60 @@ pub fn augment_local_struct_artifacts_with_symbolic_facts(
                 .or_default()
                 .entry(offset)
                 .or_insert(field_type);
+        }
+    }
+    if projected_profiles.is_empty() {
+        for island in &symbolic_facts.memory_islands {
+            if !(island.confidence.is_reliable() && island.evidence.is_reliable()) {
+                continue;
+            }
+            for term in &island.terms {
+                let Some((slot, offset, field_type)) =
+                    symbolic_memory_term_slot_field(term, ptr_bits)
+                else {
+                    continue;
+                };
+                projected_profiles
+                    .entry(slot)
+                    .or_default()
+                    .entry(offset)
+                    .or_insert(field_type);
+            }
+        }
+    }
+    if projected_profiles.is_empty() {
+        for compiled in symbolic_facts
+            .branch_facts
+            .iter()
+            .filter_map(|fact| fact.actionable_compiled_condition())
+            .chain(
+                symbolic_facts
+                    .worker_islands
+                    .iter()
+                    .filter_map(|island| island.actionable_compiled_condition()),
+            )
+            .chain(
+                symbolic_facts
+                    .control_islands
+                    .iter()
+                    .filter_map(|island| island.actionable_compiled_condition()),
+            )
+        {
+            if !(compiled.confidence.is_reliable() && compiled.evidence.is_reliable()) {
+                continue;
+            }
+            for term in &compiled.memory_terms {
+                let Some((slot, offset, field_type)) =
+                    symbolic_memory_term_slot_field(term, ptr_bits)
+                else {
+                    continue;
+                };
+                projected_profiles
+                    .entry(slot)
+                    .or_default()
+                    .entry(offset)
+                    .or_insert(field_type);
+            }
         }
     }
 
@@ -730,6 +1509,75 @@ pub fn augment_local_struct_artifacts_with_symbolic_facts(
                 name: struct_name.clone(),
                 decl,
                 confidence: 84,
+                source: StructDeclSource::LocalInferred,
+                fields,
+            });
+        }
+        local_structs
+            .slot_type_overrides
+            .insert(slot, format!("struct {struct_name} *"));
+    }
+}
+
+fn augment_local_struct_artifacts_with_local_field_accesses(
+    local_structs: &mut LocalStructArtifacts,
+    local_field_accesses: &[LocalFieldAccessFact],
+    ptr_bits: u32,
+) {
+    let mut projected_profiles = BTreeMap::<usize, BTreeMap<u64, String>>::new();
+    for access in local_field_accesses {
+        let field_type = access
+            .field_type
+            .clone()
+            .unwrap_or_else(|| access.field_name.clone());
+        projected_profiles
+            .entry(access.slot)
+            .or_default()
+            .entry(access.field_offset)
+            .or_insert(field_type);
+    }
+
+    for (slot, projected) in projected_profiles {
+        let profile = local_structs.slot_field_profiles.entry(slot).or_default();
+        for (offset, field_type) in projected {
+            profile.entry(offset).or_insert(field_type);
+        }
+        if profile.is_empty() || local_structs.slot_type_overrides.contains_key(&slot) {
+            continue;
+        }
+
+        let allow_single_field = profile.len() == 1;
+        if profile.len() < 2 && !allow_single_field {
+            continue;
+        }
+        let mut shape = String::new();
+        let fields = profile
+            .iter()
+            .map(|(offset, field_type)| {
+                shape.push_str(&format!("{offset:x}:{field_type};"));
+                StructFieldCandidate {
+                    name: format!("f_{offset:x}"),
+                    offset: *offset,
+                    field_type: field_type.clone(),
+                    confidence: 90,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        shape.hash(&mut hasher);
+        let struct_name = format!("sla_struct_{:016x}", hasher.finish());
+        let Some(decl) = build_struct_decl(&struct_name, &fields, ptr_bits) else {
+            continue;
+        };
+        if !local_structs
+            .struct_decls
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(&struct_name))
+        {
+            local_structs.struct_decls.push(StructDeclCandidate {
+                name: struct_name.clone(),
+                decl,
+                confidence: 90,
                 source: StructDeclSource::LocalInferred,
                 fields,
             });
@@ -2463,119 +3311,7 @@ fn estimate_type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
 }
 
 fn render_signature_type(ty: &CTypeLike, ptr_bits: u32) -> String {
-    render_type_like(&materialize_signature_type_like(ty.clone(), ptr_bits))
-}
-
-fn materialize_signature_type_like(ty: CTypeLike, ptr_bits: u32) -> CTypeLike {
-    match ty {
-        CTypeLike::Pointer(inner) => {
-            if matches!(*inner, CTypeLike::Unknown | CTypeLike::Void)
-                || matches!(
-                    inner.as_ref(),
-                    CTypeLike::Struct(name)
-                        | CTypeLike::Union(name)
-                        | CTypeLike::Enum(name)
-                        if is_unmaterialized_aggregate_name(name)
-                )
-            {
-                return CTypeLike::Pointer(Box::new(CTypeLike::Void));
-            }
-            CTypeLike::Pointer(Box::new(materialize_signature_type_like(*inner, ptr_bits)))
-        }
-        CTypeLike::Array(inner, len) => {
-            if matches!(*inner, CTypeLike::Unknown | CTypeLike::Void) {
-                return CTypeLike::Array(
-                    Box::new(CTypeLike::Int {
-                        bits: 8,
-                        signedness: Signedness::Unsigned,
-                    }),
-                    len,
-                );
-            }
-            CTypeLike::Array(
-                Box::new(materialize_signature_type_like(*inner, ptr_bits)),
-                len,
-            )
-        }
-        CTypeLike::Unknown => fallback_scalar_type_like(ptr_bits),
-        CTypeLike::Struct(name) if is_unmaterialized_aggregate_name(&name) => {
-            fallback_scalar_type_like(ptr_bits)
-        }
-        CTypeLike::Union(name) if is_unmaterialized_aggregate_name(&name) => {
-            fallback_scalar_type_like(ptr_bits)
-        }
-        CTypeLike::Enum(name) if is_unmaterialized_aggregate_name(&name) => {
-            fallback_scalar_type_like(ptr_bits)
-        }
-        other => other,
-    }
-}
-
-fn fallback_scalar_type_like(ptr_bits: u32) -> CTypeLike {
-    CTypeLike::Int {
-        bits: if ptr_bits >= 64 { 64 } else { 32 },
-        signedness: Signedness::Signed,
-    }
-}
-
-fn render_type_like(ty: &CTypeLike) -> String {
-    match ty {
-        CTypeLike::Void => "void".to_string(),
-        CTypeLike::Bool => "bool".to_string(),
-        CTypeLike::Int {
-            bits: 8,
-            signedness: Signedness::Signed,
-        } => "int8_t".to_string(),
-        CTypeLike::Int {
-            bits: 16,
-            signedness: Signedness::Signed,
-        } => "int16_t".to_string(),
-        CTypeLike::Int {
-            bits: 32,
-            signedness: Signedness::Signed,
-        } => "int32_t".to_string(),
-        CTypeLike::Int {
-            bits: 64,
-            signedness: Signedness::Signed,
-        } => "int64_t".to_string(),
-        CTypeLike::Int {
-            bits,
-            signedness: Signedness::Signed | Signedness::Unknown,
-        } => {
-            format!("int{bits}_t")
-        }
-        CTypeLike::Int {
-            bits: 8,
-            signedness: Signedness::Unsigned,
-        } => "uint8_t".to_string(),
-        CTypeLike::Int {
-            bits: 16,
-            signedness: Signedness::Unsigned,
-        } => "uint16_t".to_string(),
-        CTypeLike::Int {
-            bits: 32,
-            signedness: Signedness::Unsigned,
-        } => "uint32_t".to_string(),
-        CTypeLike::Int {
-            bits: 64,
-            signedness: Signedness::Unsigned,
-        } => "uint64_t".to_string(),
-        CTypeLike::Int {
-            bits,
-            signedness: Signedness::Unsigned,
-        } => format!("uint{bits}_t"),
-        CTypeLike::Float(32) => "float".to_string(),
-        CTypeLike::Float(64) => "double".to_string(),
-        CTypeLike::Float(bits) => format!("float{bits}"),
-        CTypeLike::Pointer(inner) => format!("{}*", render_type_like(inner)),
-        CTypeLike::Array(inner, Some(size)) => format!("{}[{}]", render_type_like(inner), size),
-        CTypeLike::Array(inner, None) => format!("{}[]", render_type_like(inner)),
-        CTypeLike::Struct(name) => format!("struct {name}"),
-        CTypeLike::Union(name) => format!("union {name}"),
-        CTypeLike::Enum(name) => format!("enum {name}"),
-        CTypeLike::Function => "void (*)()".to_string(),
-        CTypeLike::Unknown => "/* unknown */".to_string(),
-    }
+    crate::render_signature_type(ty, ptr_bits)
 }
 
 fn format_signature(
@@ -2583,12 +3319,7 @@ fn format_signature(
     ret_type: &str,
     params: &[InferredSignatureParam],
 ) -> String {
-    let args = params
-        .iter()
-        .map(|param| format!("{},{}", param.param_type, param.name))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{ret_type} {function_name} ({args})")
+    crate::format_afs_signature(function_name, ret_type, params)
 }
 
 fn build_struct_decl(
@@ -2627,11 +3358,6 @@ fn is_generated_local_struct_name(name: &str) -> bool {
     lower
         .trim_start_matches("struct ")
         .starts_with("sla_struct_")
-}
-
-fn is_unmaterialized_aggregate_name(name: &str) -> bool {
-    let lower = name.trim().to_ascii_lowercase();
-    lower.is_empty() || lower == "anon" || lower.starts_with("anon_")
 }
 
 fn is_generic_type_string(ty: &str) -> bool {
@@ -4506,6 +5232,7 @@ mod tests {
         };
         let symbolic_facts = crate::facts::SymbolicSemanticFacts {
             branch_facts: Vec::new(),
+            worker_islands: Vec::new(),
             control_islands: vec![crate::facts::SymbolicControlIsland {
                 kind: crate::facts::SymbolicControlIslandKind::LargeCfgBranchFrontier,
                 anchor_block: 0x401000,
@@ -4521,6 +5248,7 @@ mod tests {
                 evidence: crate::facts::SymbolicSemanticEvidence::exact(),
                 confidence: crate::facts::SymbolicSemanticConfidence::Exact,
             }],
+            memory_islands: Vec::new(),
             diagnostics: crate::facts::SymbolicFactDiagnostics::default(),
             interpreter: None,
             vm_step: None,
@@ -4550,6 +5278,164 @@ mod tests {
                 .struct_decls
                 .iter()
                 .any(|decl| decl.name == "sla_struct_symbolic_arg1")
+        );
+    }
+
+    #[test]
+    fn symbolic_memory_islands_seed_local_struct_profiles_without_control_islands() {
+        let symbolic_facts = crate::facts::SymbolicSemanticFacts {
+            branch_facts: Vec::new(),
+            worker_islands: Vec::new(),
+            control_islands: Vec::new(),
+            memory_islands: vec![crate::facts::SymbolicMemoryIsland {
+                kind: crate::facts::SymbolicMemoryIslandKind::ConditionFrontier,
+                anchor_block: 0x401000,
+                terms: vec![crate::facts::SymbolicMemoryCondition {
+                    region: crate::facts::SymbolicMemoryRegion::Argument { index: 0 },
+                    offset_lo: 8,
+                    offset_hi: 8,
+                    size: 4,
+                    exact_offset: true,
+                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+                    binding: None,
+                    expr: "*(arg0 + 8)".to_string(),
+                    value_expr: None,
+                    exact_value: false,
+                }],
+                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+            }],
+            diagnostics: crate::facts::SymbolicFactDiagnostics::default(),
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+        };
+        let mut local_structs = LocalStructArtifacts::default();
+
+        augment_local_struct_artifacts_with_symbolic_facts(&mut local_structs, &symbolic_facts, 64);
+
+        assert_eq!(
+            local_structs
+                .slot_field_profiles
+                .get(&0)
+                .and_then(|profile| profile.get(&8))
+                .map(String::as_str),
+            Some("int32_t")
+        );
+        assert_eq!(
+            local_structs
+                .slot_type_overrides
+                .get(&0)
+                .map(String::as_str),
+            Some("struct sla_struct_symbolic_arg1 *")
+        );
+    }
+
+    #[test]
+    fn semantic_type_fallback_plan_uses_typed_symbolic_summary() {
+        let symbolic_facts = crate::facts::SymbolicSemanticFacts {
+            branch_facts: vec![crate::facts::SymbolicBranchFact {
+                block_addr: 0x401000,
+                true_target: 0x401010,
+                false_target: 0x401020,
+                true_status: crate::facts::SymbolicReachabilityStatus::Reachable,
+                false_status: crate::facts::SymbolicReachabilityStatus::Unreachable,
+                true_condition: Some("x == 0".to_string()),
+                false_condition: Some("x != 0".to_string()),
+                true_compiled: None,
+                false_compiled: None,
+            }],
+            worker_islands: Vec::new(),
+            control_islands: vec![crate::facts::SymbolicControlIsland {
+                kind: crate::facts::SymbolicControlIslandKind::LargeCfgBranchFrontier,
+                anchor_block: 0x401000,
+                frontier_targets: vec![0x401010],
+                facts: vec![crate::facts::SymbolicControlFact {
+                    target: 0x401010,
+                    status: crate::facts::SymbolicReachabilityStatus::Reachable,
+                    condition: Some("x == 0".to_string()),
+                    compiled: Some(crate::facts::SymbolicCompiledCondition {
+                        simplified: "x == 0".to_string(),
+                        terms: vec!["x == 0".to_string()],
+                        memory_terms: Vec::new(),
+                        backward_memory_substitutions: 0,
+                        backward_memory_candidate_enumerations: 0,
+                        backward_memory_residual_fallbacks: 0,
+                        precision: crate::facts::SymbolicConditionPrecision::Exact,
+                        evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                        confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+                        supported_paths: 1,
+                        total_paths: 1,
+                    }),
+                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+                }],
+                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+            }],
+            memory_islands: vec![crate::facts::SymbolicMemoryIsland {
+                kind: crate::facts::SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
+                anchor_block: 0x401000,
+                terms: vec![crate::facts::SymbolicMemoryCondition {
+                    region: crate::facts::SymbolicMemoryRegion::Argument { index: 0 },
+                    offset_lo: 8,
+                    offset_hi: 8,
+                    size: 4,
+                    exact_offset: true,
+                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+                    binding: None,
+                    expr: "*(arg0 + 8)".to_string(),
+                    value_expr: None,
+                    exact_value: false,
+                }],
+                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+            }],
+            diagnostics: crate::facts::SymbolicFactDiagnostics {
+                skipped_large_cfg: true,
+                semantic_mode: Some(crate::facts::SymbolicSemanticMode::Residual),
+                semantic_capability: Some(crate::facts::SymbolicSemanticCapability {
+                    query_ready: true,
+                    type_ready: false,
+                    decompile_ready: true,
+                }),
+                slice_class: Some(crate::facts::SymbolicSemanticSliceClass::Worker),
+                residual_reasons: vec![crate::facts::SymbolicSemanticResidualReason::LargeCfg],
+                ..Default::default()
+            },
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+        };
+
+        let plan = build_semantic_type_fallback_plan("fcn.401000", "x86-64", 64, &symbolic_facts);
+
+        assert_eq!(plan.signature.params.len(), 1);
+        assert!(plan.signature.params[0].param_type.contains("struct "));
+        assert_eq!(plan.struct_decls.len(), 1);
+        assert!(plan
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("semantic fallback: worker slice in residual mode")));
+        assert!(
+            plan.diagnostics
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("memory_islands=1"))
+        );
+        assert!(plan
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("type analysis not ready from semantic capability")));
+        assert!(
+            plan.diagnostics
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("projected 1 struct candidate"))
         );
     }
 }

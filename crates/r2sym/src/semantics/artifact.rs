@@ -2,13 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::sim::DerivedSummaryDiagnostics;
 
-use super::facts::SymbolicFunctionFacts;
+use crate::backward::BackwardMemoryCondition;
+
+use super::facts::{SymbolicFunctionFacts, SymbolicTargetConditionSource, SymbolicWorkerIsland};
 use super::vm::{InterpreterDispatchSummary, VmStepSummary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SemanticMode {
     Raw,
     Compiled,
+    IslandCompiled,
     Residual,
     VmSummary,
 }
@@ -241,6 +244,46 @@ pub struct CompiledSemanticArtifact {
     pub vm_step: Option<VmStepSummary>,
     pub vm_transfer: Option<VmStepSummary>,
     pub cache_hit: bool,
+}
+
+impl CompiledSemanticArtifact {
+    pub fn actionable_condition_source_for_target(
+        &self,
+        target_addr: u64,
+    ) -> Option<SymbolicTargetConditionSource<'_>> {
+        self.symbolic_facts
+            .actionable_condition_source_for_target(target_addr)
+    }
+
+    pub fn exact_condition_source_for_target(
+        &self,
+        target_addr: u64,
+    ) -> Option<SymbolicTargetConditionSource<'_>> {
+        self.symbolic_facts
+            .exact_condition_source_for_target(target_addr)
+    }
+
+    pub fn actionable_memory_terms_for_target(
+        &self,
+        target_addr: u64,
+    ) -> Vec<&BackwardMemoryCondition> {
+        self.symbolic_facts
+            .actionable_memory_terms_for_target(target_addr)
+    }
+
+    pub fn exact_memory_terms_for_target(&self, target_addr: u64) -> Vec<&BackwardMemoryCondition> {
+        self.symbolic_facts
+            .exact_memory_terms_for_target(target_addr)
+    }
+
+    pub fn best_worker_island_for_target(
+        &self,
+        target_addr: u64,
+        hard_proof_only: bool,
+    ) -> Option<&SymbolicWorkerIsland> {
+        self.symbolic_facts
+            .best_worker_island_for_target(target_addr, hard_proof_only)
+    }
 }
 
 pub type CompiledFunctionSemantics = CompiledSemanticArtifact;

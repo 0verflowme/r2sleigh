@@ -1,14 +1,13 @@
+#[cfg(test)]
+use crate::InferredParam;
 use crate::blocks::BlockSlice;
 use crate::context::{PluginCtxView, require_ctx_view};
-use crate::decompiler::{
-    build_decompiler_env, decompiler_config_for_arch_name, normalize_sig_arch_name,
-};
-use crate::helpers::{effective_ptr_bits, normalize_sim_name, resolve_function_name};
+use crate::decompiler::build_decompiler_env;
+use crate::helpers::{effective_ptr_bits, resolve_function_name};
 use crate::{
-    ArchSpec, Disassembler, InferredParam, InferredParamJson, InferredSignatureCcJson, R2ILBlock,
-    R2ILContext,
+    ArchSpec, Disassembler, InferredParamJson, InferredSignatureCcJson, R2ILBlock, R2ILContext,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
@@ -181,671 +180,22 @@ fn rename_function_analysis_artifact(
     }
 }
 
-fn symbolic_reachability_status_from_sym(
-    status: r2sym::SymbolicReachabilityStatus,
-) -> r2types::SymbolicReachabilityStatus {
-    match status {
-        r2sym::SymbolicReachabilityStatus::Reachable => {
-            r2types::SymbolicReachabilityStatus::Reachable
-        }
-        r2sym::SymbolicReachabilityStatus::Unreachable => {
-            r2types::SymbolicReachabilityStatus::Unreachable
-        }
-        r2sym::SymbolicReachabilityStatus::Unknown => r2types::SymbolicReachabilityStatus::Unknown,
-    }
-}
-
-fn symbolic_condition_precision_from_sym(
-    precision: r2sym::BackwardConditionPrecision,
-) -> r2types::SymbolicConditionPrecision {
-    match precision {
-        r2sym::BackwardConditionPrecision::Exact => r2types::SymbolicConditionPrecision::Exact,
-        r2sym::BackwardConditionPrecision::OverApprox => {
-            r2types::SymbolicConditionPrecision::OverApprox
-        }
-        r2sym::BackwardConditionPrecision::ResidualSearchRequired => {
-            r2types::SymbolicConditionPrecision::ResidualSearchRequired
-        }
-        r2sym::BackwardConditionPrecision::Unsupported => {
-            r2types::SymbolicConditionPrecision::Unsupported
-        }
-    }
-}
-
-fn symbolic_memory_region_kind_from_sym(
-    kind: &r2sym::MemoryRegionKind,
-) -> r2types::SymbolicMemoryRegionKind {
-    match kind {
-        r2sym::MemoryRegionKind::Stack => r2types::SymbolicMemoryRegionKind::Stack,
-        r2sym::MemoryRegionKind::Global => r2types::SymbolicMemoryRegionKind::Global,
-        r2sym::MemoryRegionKind::Input => r2types::SymbolicMemoryRegionKind::Input,
-        r2sym::MemoryRegionKind::Heap => r2types::SymbolicMemoryRegionKind::Heap,
-        r2sym::MemoryRegionKind::Replay => r2types::SymbolicMemoryRegionKind::Replay,
-        r2sym::MemoryRegionKind::EscapedUnknown => {
-            r2types::SymbolicMemoryRegionKind::EscapedUnknown
-        }
-    }
-}
-
-fn symbolic_memory_region_from_sym(
-    region: &r2sym::BackwardMemoryRegion,
-) -> r2types::SymbolicMemoryRegion {
-    match region {
-        r2sym::BackwardMemoryRegion::Argument { index } => {
-            r2types::SymbolicMemoryRegion::Argument { index: *index }
-        }
-        r2sym::BackwardMemoryRegion::Region(region) => {
-            r2types::SymbolicMemoryRegion::Region(r2types::SymbolicMemoryRegionRef {
-                id: region.id.0,
-                kind: symbolic_memory_region_kind_from_sym(&region.kind),
-                name: region.name.clone(),
-            })
-        }
-    }
-}
-
-fn symbolic_confidence_from_sym(
-    confidence: r2sym::SemanticConfidence,
-) -> r2types::SymbolicSemanticConfidence {
-    match confidence {
-        r2sym::SemanticConfidence::Exact => r2types::SymbolicSemanticConfidence::Exact,
-        r2sym::SemanticConfidence::Likely => r2types::SymbolicSemanticConfidence::Likely,
-        r2sym::SemanticConfidence::Heuristic => r2types::SymbolicSemanticConfidence::Heuristic,
-        r2sym::SemanticConfidence::Residual => r2types::SymbolicSemanticConfidence::Residual,
-    }
-}
-
-fn symbolic_evidence_reason_from_sym(
-    reason: r2sym::SemanticEvidenceReason,
-) -> r2types::SymbolicSemanticEvidenceReason {
-    match reason {
-        r2sym::SemanticEvidenceReason::LargeCfg => {
-            r2types::SymbolicSemanticEvidenceReason::LargeCfg
-        }
-        r2sym::SemanticEvidenceReason::SummaryBudget => {
-            r2types::SymbolicSemanticEvidenceReason::SummaryBudget
-        }
-        r2sym::SemanticEvidenceReason::AliasAmbiguity => {
-            r2types::SymbolicSemanticEvidenceReason::AliasAmbiguity
-        }
-        r2sym::SemanticEvidenceReason::ReplayOverlap => {
-            r2types::SymbolicSemanticEvidenceReason::ReplayOverlap
-        }
-        r2sym::SemanticEvidenceReason::HeapIdentityWeak => {
-            r2types::SymbolicSemanticEvidenceReason::HeapIdentityWeak
-        }
-        r2sym::SemanticEvidenceReason::GuardOpaque => {
-            r2types::SymbolicSemanticEvidenceReason::GuardOpaque
-        }
-        r2sym::SemanticEvidenceReason::ValueOpaque => {
-            r2types::SymbolicSemanticEvidenceReason::ValueOpaque
-        }
-        r2sym::SemanticEvidenceReason::TruncatedTransfer => {
-            r2types::SymbolicSemanticEvidenceReason::TruncatedTransfer
-        }
-        r2sym::SemanticEvidenceReason::DerivedFromRanking => {
-            r2types::SymbolicSemanticEvidenceReason::DerivedFromRanking
-        }
-        r2sym::SemanticEvidenceReason::PartialPathCoverage => {
-            r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage
-        }
-        r2sym::SemanticEvidenceReason::ResidualSearchRequired => {
-            r2types::SymbolicSemanticEvidenceReason::ResidualSearchRequired
-        }
-    }
-}
-
-fn symbolic_evidence_from_sym(
-    evidence: &r2sym::SemanticEvidence,
-) -> r2types::SymbolicSemanticEvidence {
-    r2types::SymbolicSemanticEvidence {
-        tier: symbolic_confidence_from_sym(evidence.tier),
-        soundness: match evidence.soundness {
-            r2sym::SemanticEvidenceSoundness::Proven => {
-                r2types::SymbolicSemanticEvidenceSoundness::Proven
-            }
-            r2sym::SemanticEvidenceSoundness::OverApprox => {
-                r2types::SymbolicSemanticEvidenceSoundness::OverApprox
-            }
-            r2sym::SemanticEvidenceSoundness::Ranked => {
-                r2types::SymbolicSemanticEvidenceSoundness::Ranked
-            }
-            r2sym::SemanticEvidenceSoundness::Unknown => {
-                r2types::SymbolicSemanticEvidenceSoundness::Unknown
-            }
-        },
-        coverage: match evidence.coverage {
-            r2sym::SemanticEvidenceCoverage::Full => {
-                r2types::SymbolicSemanticEvidenceCoverage::Full
-            }
-            r2sym::SemanticEvidenceCoverage::Partial => {
-                r2types::SymbolicSemanticEvidenceCoverage::Partial
-            }
-            r2sym::SemanticEvidenceCoverage::Bounded => {
-                r2types::SymbolicSemanticEvidenceCoverage::Bounded
-            }
-        },
-        provenance: match evidence.provenance {
-            r2sym::SemanticEvidenceProvenance::Stable => {
-                r2types::SymbolicSemanticEvidenceProvenance::Stable
-            }
-            r2sym::SemanticEvidenceProvenance::Normalized => {
-                r2types::SymbolicSemanticEvidenceProvenance::Normalized
-            }
-            r2sym::SemanticEvidenceProvenance::Ranked => {
-                r2types::SymbolicSemanticEvidenceProvenance::Ranked
-            }
-            r2sym::SemanticEvidenceProvenance::Unstable => {
-                r2types::SymbolicSemanticEvidenceProvenance::Unstable
-            }
-        },
-        ambiguity: match evidence.ambiguity {
-            r2sym::SemanticEvidenceAmbiguity::Single => {
-                r2types::SymbolicSemanticEvidenceAmbiguity::Single
-            }
-            r2sym::SemanticEvidenceAmbiguity::Bounded => {
-                r2types::SymbolicSemanticEvidenceAmbiguity::Bounded
-            }
-            r2sym::SemanticEvidenceAmbiguity::Ranked => {
-                r2types::SymbolicSemanticEvidenceAmbiguity::Ranked
-            }
-            r2sym::SemanticEvidenceAmbiguity::Multiple => {
-                r2types::SymbolicSemanticEvidenceAmbiguity::Multiple
-            }
-        },
-        budget_limited: evidence.budget_limited,
-        reasons: evidence
-            .reasons
-            .iter()
-            .copied()
-            .map(symbolic_evidence_reason_from_sym)
-            .collect(),
-    }
-}
-
-fn symbolic_compiled_condition_from_sym(
-    summary: &r2sym::BackwardConditionSummary,
-) -> r2types::SymbolicCompiledCondition {
-    let evidence = summary.evidence();
-    r2types::SymbolicCompiledCondition {
-        simplified: summary.simplified.clone(),
-        terms: summary.terms.clone(),
-        memory_terms: summary
-            .memory_terms
-            .iter()
-            .map(|term| r2types::SymbolicMemoryCondition {
-                region: symbolic_memory_region_from_sym(&term.region),
-                offset_lo: term.offset_lo,
-                offset_hi: term.offset_hi,
-                size: term.size,
-                exact_offset: term.exact_offset,
-                evidence: symbolic_evidence_from_sym(&term.evidence()),
-                confidence: symbolic_confidence_from_sym(term.confidence()),
-                binding: None,
-                expr: term.expr.clone(),
-                value_expr: None,
-                exact_value: false,
-            })
-            .collect(),
-        backward_memory_substitutions: summary.backward_memory_substitutions,
-        backward_memory_candidate_enumerations: summary.backward_memory_candidate_enumerations,
-        backward_memory_residual_fallbacks: summary.backward_memory_residual_fallbacks,
-        precision: symbolic_condition_precision_from_sym(summary.precision),
-        evidence: symbolic_evidence_from_sym(&evidence),
-        confidence: symbolic_confidence_from_sym(evidence.tier),
-        supported_paths: summary.supported_paths,
-        total_paths: summary.total_paths,
-    }
-}
-
-fn symbolic_control_island_kind_from_sym(
-    kind: r2sym::SymbolicControlIslandKind,
-) -> r2types::SymbolicControlIslandKind {
-    match kind {
-        r2sym::SymbolicControlIslandKind::BranchFrontier => {
-            r2types::SymbolicControlIslandKind::BranchFrontier
-        }
-        r2sym::SymbolicControlIslandKind::LargeCfgBranchFrontier => {
-            r2types::SymbolicControlIslandKind::LargeCfgBranchFrontier
-        }
-    }
-}
-
-fn symbolic_control_fact_from_sym(
-    fact: &r2sym::SymbolicControlFact,
-) -> r2types::SymbolicControlFact {
-    r2types::SymbolicControlFact {
-        target: fact.target,
-        status: symbolic_reachability_status_from_sym(fact.status),
-        condition: fact.condition.clone(),
-        compiled: fact
-            .compiled
-            .as_ref()
-            .map(symbolic_compiled_condition_from_sym),
-        evidence: symbolic_evidence_from_sym(&fact.evidence),
-        confidence: symbolic_confidence_from_sym(fact.evidence.tier),
-    }
-}
-
-fn symbolic_control_island_from_sym(
-    island: &r2sym::SymbolicControlIsland,
-) -> r2types::SymbolicControlIsland {
-    r2types::SymbolicControlIsland {
-        kind: symbolic_control_island_kind_from_sym(island.kind),
-        anchor_block: island.anchor_block,
-        frontier_targets: island.frontier_targets.clone(),
-        facts: island
-            .facts
-            .iter()
-            .map(symbolic_control_fact_from_sym)
-            .collect(),
-        evidence: symbolic_evidence_from_sym(&island.evidence),
-        confidence: symbolic_confidence_from_sym(island.evidence.tier),
-    }
-}
-
-fn symbolic_interpreter_kind_from_sym(
-    kind: r2sym::InterpreterKind,
-) -> r2types::SymbolicInterpreterKind {
-    match kind {
-        r2sym::InterpreterKind::SwitchDispatch => r2types::SymbolicInterpreterKind::SwitchDispatch,
-        r2sym::InterpreterKind::IndirectDispatch => {
-            r2types::SymbolicInterpreterKind::IndirectDispatch
-        }
-    }
-}
-
-pub(crate) fn symbolic_vm_value_expr_from_sym(
-    value: &r2sym::VmValueExpr,
-) -> r2types::SymbolicVmValueExpr {
-    match value {
-        r2sym::VmValueExpr::Const(value) => r2types::SymbolicVmValueExpr::Const(*value),
-        r2sym::VmValueExpr::Var(name) => r2types::SymbolicVmValueExpr::Var(name.clone()),
-        r2sym::VmValueExpr::Unary { op, arg } => r2types::SymbolicVmValueExpr::Unary {
-            op: match op {
-                r2sym::VmUnaryOp::Neg => r2types::SymbolicVmUnaryOp::Neg,
-                r2sym::VmUnaryOp::BitNot => r2types::SymbolicVmUnaryOp::Not,
-                r2sym::VmUnaryOp::BoolNot => r2types::SymbolicVmUnaryOp::BoolNot,
-            },
-            expr: Box::new(symbolic_vm_value_expr_from_sym(arg)),
-        },
-        r2sym::VmValueExpr::Binary { op, lhs, rhs } => r2types::SymbolicVmValueExpr::Binary {
-            op: match op {
-                r2sym::VmBinaryOp::Add => r2types::SymbolicVmBinaryOp::Add,
-                r2sym::VmBinaryOp::Sub => r2types::SymbolicVmBinaryOp::Sub,
-                r2sym::VmBinaryOp::Mul => r2types::SymbolicVmBinaryOp::Mul,
-                r2sym::VmBinaryOp::Div => r2types::SymbolicVmBinaryOp::Div,
-                r2sym::VmBinaryOp::Rem => r2types::SymbolicVmBinaryOp::Rem,
-                r2sym::VmBinaryOp::And => r2types::SymbolicVmBinaryOp::And,
-                r2sym::VmBinaryOp::Or => r2types::SymbolicVmBinaryOp::Or,
-                r2sym::VmBinaryOp::Xor => r2types::SymbolicVmBinaryOp::Xor,
-                r2sym::VmBinaryOp::Shl => r2types::SymbolicVmBinaryOp::Shl,
-                r2sym::VmBinaryOp::LShr | r2sym::VmBinaryOp::AShr => {
-                    r2types::SymbolicVmBinaryOp::Shr
-                }
-                r2sym::VmBinaryOp::Eq => r2types::SymbolicVmBinaryOp::Eq,
-                r2sym::VmBinaryOp::Ne => r2types::SymbolicVmBinaryOp::Ne,
-                r2sym::VmBinaryOp::Lt | r2sym::VmBinaryOp::SLt => r2types::SymbolicVmBinaryOp::Lt,
-                r2sym::VmBinaryOp::Le | r2sym::VmBinaryOp::SLe => r2types::SymbolicVmBinaryOp::Le,
-                r2sym::VmBinaryOp::BoolAnd => r2types::SymbolicVmBinaryOp::And,
-                r2sym::VmBinaryOp::BoolOr => r2types::SymbolicVmBinaryOp::Or,
-            },
-            left: Box::new(symbolic_vm_value_expr_from_sym(lhs)),
-            right: Box::new(symbolic_vm_value_expr_from_sym(rhs)),
-        },
-        r2sym::VmValueExpr::Expr(expr) => r2types::SymbolicVmValueExpr::Expr(expr.clone()),
-    }
-}
-
-fn symbolic_vm_state_update_from_sym(
-    update: &r2sym::VmStateUpdate,
-) -> r2types::SymbolicVmStateUpdate {
-    let evidence = update.evidence();
-    r2types::SymbolicVmStateUpdate {
-        output: update.output.clone(),
-        expr: update.expr.clone(),
-        value: symbolic_vm_value_expr_from_sym(&update.value),
-        exact: update.exact,
-        evidence: symbolic_evidence_from_sym(&evidence),
-        confidence: symbolic_confidence_from_sym(evidence.tier),
-    }
-}
-
-fn symbolic_vm_guard_condition_from_sym(
-    guard: &r2sym::VmGuardCondition,
-) -> r2types::SymbolicVmGuardCondition {
-    let evidence = guard.evidence();
-    r2types::SymbolicVmGuardCondition {
-        expr: guard.expr.clone(),
-        value: symbolic_vm_value_expr_from_sym(&guard.value),
-        expect_nonzero: guard.expect_nonzero,
-        exact: guard.exact,
-        evidence: symbolic_evidence_from_sym(&evidence),
-        confidence: symbolic_confidence_from_sym(evidence.tier),
-    }
-}
-
-fn symbolic_vm_guarded_exit_from_sym(
-    guarded: &r2sym::VmGuardedExit,
-) -> r2types::SymbolicVmGuardedExit {
-    r2types::SymbolicVmGuardedExit {
-        target: guarded.target,
-        guard: symbolic_vm_guard_condition_from_sym(&guarded.guard),
-    }
-}
-
-fn symbolic_vm_memory_condition_from_sym(
-    condition: &r2sym::VmMemoryCondition,
-) -> r2types::SymbolicMemoryCondition {
-    let evidence = condition.evidence();
-    r2types::SymbolicMemoryCondition {
-        region: r2types::SymbolicMemoryRegion::Region(r2types::SymbolicMemoryRegionRef {
-            id: condition.region.id,
-            kind: symbolic_memory_region_kind_from_sym(&condition.region.kind),
-            name: condition.region.name.clone(),
-        }),
-        offset_lo: condition.offset_lo,
-        offset_hi: condition.offset_hi,
-        size: condition.size,
-        exact_offset: condition.exact_offset,
-        evidence: symbolic_evidence_from_sym(&evidence),
-        confidence: symbolic_confidence_from_sym(evidence.tier),
-        binding: condition.binding.clone(),
-        expr: condition.expr.clone(),
-        value_expr: condition.value_expr.clone(),
-        exact_value: condition.exact_value,
-    }
-}
-
-fn symbolic_vm_transfer_arm_from_sym(
-    transfer: &r2sym::VmTransferArm,
-) -> r2types::SymbolicVmTransferArm {
-    let evidence = transfer.evidence();
-    r2types::SymbolicVmTransferArm {
-        handler_target: transfer.handler_target,
-        case_values: transfer.case_values.clone(),
-        region_blocks: transfer.region_blocks.clone(),
-        exit_targets: transfer.exit_targets.clone(),
-        exit_guards: transfer
-            .exit_guards
-            .iter()
-            .map(symbolic_vm_guarded_exit_from_sym)
-            .collect(),
-        state_updates: transfer
-            .state_updates
-            .iter()
-            .map(symbolic_vm_state_update_from_sym)
-            .collect(),
-        selector_update: transfer
-            .selector_update
-            .as_ref()
-            .map(symbolic_vm_state_update_from_sym),
-        memory_reads: transfer
-            .memory_reads
-            .iter()
-            .map(symbolic_vm_memory_condition_from_sym)
-            .collect(),
-        memory_writes: transfer
-            .memory_writes
-            .iter()
-            .map(symbolic_vm_memory_condition_from_sym)
-            .collect(),
-        residual_guards: transfer.residual_guards,
-        residual_memory_effects: transfer.residual_memory_effects,
-        exact: transfer.exact,
-        evidence: symbolic_evidence_from_sym(&evidence),
-        confidence: symbolic_confidence_from_sym(evidence.tier),
-        redispatch: transfer.redispatch,
-        may_return: transfer.may_return,
-        truncated: transfer.truncated,
-    }
-}
-
-fn symbolic_vm_step_summary_from_sym(
-    vm_step: &r2sym::VmStepSummary,
-) -> r2types::SymbolicVmStepSummary {
-    r2types::SymbolicVmStepSummary {
-        kind: symbolic_interpreter_kind_from_sym(vm_step.kind),
-        loop_header: vm_step.loop_header,
-        dispatch_header: vm_step.dispatch_header,
-        selector: vm_step.selector.clone(),
-        dispatch_targets: vm_step.dispatch_targets.clone(),
-        default_target: vm_step.default_target,
-        case_values_by_target: vm_step.case_values_by_target.clone(),
-        loop_latches: vm_step.loop_latches.clone(),
-        state_inputs: vm_step.state_inputs.clone(),
-        state_outputs: vm_step.state_outputs.clone(),
-        step_blocks: vm_step.step_blocks.clone(),
-        handler_regions: vm_step.handler_regions.clone(),
-        handler_state_inputs: vm_step.handler_state_inputs.clone(),
-        handler_state_outputs: vm_step.handler_state_outputs.clone(),
-        handler_state_updates: vm_step
-            .handler_state_updates
-            .iter()
-            .map(|(target, updates)| {
-                (
-                    *target,
-                    updates
-                        .iter()
-                        .map(symbolic_vm_state_update_from_sym)
-                        .collect(),
-                )
-            })
-            .collect(),
-        handler_exit_guards: vm_step
-            .handler_exit_guards
-            .iter()
-            .map(|(target, guards)| {
-                (
-                    *target,
-                    guards
-                        .iter()
-                        .map(symbolic_vm_guarded_exit_from_sym)
-                        .collect(),
-                )
-            })
-            .collect(),
-        handler_memory_read_effects: vm_step
-            .handler_memory_read_effects
-            .iter()
-            .map(|(target, effects)| {
-                (
-                    *target,
-                    effects
-                        .iter()
-                        .map(symbolic_vm_memory_condition_from_sym)
-                        .collect(),
-                )
-            })
-            .collect(),
-        handler_memory_write_effects: vm_step
-            .handler_memory_write_effects
-            .iter()
-            .map(|(target, effects)| {
-                (
-                    *target,
-                    effects
-                        .iter()
-                        .map(symbolic_vm_memory_condition_from_sym)
-                        .collect(),
-                )
-            })
-            .collect(),
-        handler_memory_reads: vm_step.handler_memory_reads.clone(),
-        handler_memory_writes: vm_step.handler_memory_writes.clone(),
-        handler_calls: vm_step.handler_calls.clone(),
-        handler_conditional_branches: vm_step.handler_conditional_branches.clone(),
-        handler_exit_targets: vm_step.handler_exit_targets.clone(),
-        redispatch_handlers: vm_step.redispatch_handlers.clone(),
-        returning_handlers: vm_step.returning_handlers.clone(),
-        truncated_handlers: vm_step.truncated_handlers.clone(),
-        transfers: vm_step
-            .transfers
-            .iter()
-            .map(symbolic_vm_transfer_arm_from_sym)
-            .collect(),
-    }
-}
-
-pub(crate) fn symbolic_semantic_facts_from_sym(
-    compiled: &r2sym::CompiledSemanticArtifact,
-) -> r2types::SymbolicSemanticFacts {
-    let facts = &compiled.symbolic_facts;
-    r2types::SymbolicSemanticFacts {
-        branch_facts: facts
-            .branch_facts
-            .iter()
-            .cloned()
-            .map(|fact| r2types::SymbolicBranchFact {
-                block_addr: fact.block_addr,
-                true_target: fact.true_target,
-                false_target: fact.false_target,
-                true_status: symbolic_reachability_status_from_sym(fact.true_status),
-                false_status: symbolic_reachability_status_from_sym(fact.false_status),
-                true_condition: fact.true_condition,
-                false_condition: fact.false_condition,
-                true_compiled: fact
-                    .true_compiled
-                    .as_ref()
-                    .map(symbolic_compiled_condition_from_sym),
-                false_compiled: fact
-                    .false_compiled
-                    .as_ref()
-                    .map(symbolic_compiled_condition_from_sym),
-            })
-            .collect(),
-        control_islands: facts
-            .control_islands
-            .iter()
-            .map(symbolic_control_island_from_sym)
-            .collect(),
-        diagnostics: r2types::SymbolicFactDiagnostics {
-            branches_evaluated: facts.diagnostics.branches_evaluated,
-            branches_pruned: facts.diagnostics.branches_pruned,
-            branches_unknown: facts.diagnostics.branches_unknown,
-            skipped_missing_arch: facts.diagnostics.skipped_missing_arch,
-            skipped_large_cfg: facts.diagnostics.skipped_large_cfg,
-            cache_hit: compiled.cache_hit,
-            semantic_mode: Some(match compiled.mode {
-                r2sym::SemanticMode::Raw => r2types::SymbolicSemanticMode::Raw,
-                r2sym::SemanticMode::Compiled => r2types::SymbolicSemanticMode::Compiled,
-                r2sym::SemanticMode::Residual => r2types::SymbolicSemanticMode::Residual,
-                r2sym::SemanticMode::VmSummary => r2types::SymbolicSemanticMode::VmSummary,
-            }),
-            semantic_capability: Some(r2types::SymbolicSemanticCapability {
-                query_ready: compiled.capability.query_ready,
-                type_ready: compiled.capability.type_ready,
-                decompile_ready: compiled.capability.decompile_ready,
-            }),
-            slice_class: Some(match compiled.slice_class {
-                r2sym::SliceClass::Wrapper => r2types::SymbolicSemanticSliceClass::Wrapper,
-                r2sym::SliceClass::Worker => r2types::SymbolicSemanticSliceClass::Worker,
-                r2sym::SliceClass::RecursiveGroup => {
-                    r2types::SymbolicSemanticSliceClass::RecursiveGroup
-                }
-                r2sym::SliceClass::InterpreterSwitch => {
-                    r2types::SymbolicSemanticSliceClass::InterpreterSwitch
-                }
-                r2sym::SliceClass::InterpreterIndirect => {
-                    r2types::SymbolicSemanticSliceClass::InterpreterIndirect
-                }
-                r2sym::SliceClass::GenericLarge => {
-                    r2types::SymbolicSemanticSliceClass::GenericLarge
-                }
-            }),
-            residual_reasons: compiled
-                .residual_reasons
-                .iter()
-                .map(|reason| match reason {
-                    r2sym::ResidualReason::MissingArch => {
-                        r2types::SymbolicSemanticResidualReason::MissingArch
-                    }
-                    r2sym::ResidualReason::LargeCfg => {
-                        r2types::SymbolicSemanticResidualReason::LargeCfg
-                    }
-                    r2sym::ResidualReason::SummaryBudgetExhausted => {
-                        r2types::SymbolicSemanticResidualReason::SummaryBudgetExhausted
-                    }
-                    r2sym::ResidualReason::SccBudgetExhausted => {
-                        r2types::SymbolicSemanticResidualReason::SccBudgetExhausted
-                    }
-                    r2sym::ResidualReason::InterpreterRequiresStepSummary => {
-                        r2types::SymbolicSemanticResidualReason::InterpreterRequiresStepSummary
-                    }
-                })
-                .collect(),
-            closure_functions: compiled.closure_functions,
-            helper_functions: compiled.helper_functions,
-            derived_summaries: compiled.derived_summaries,
-            summary_attempted: compiled.derived_diagnostics.attempted,
-            summary_budget_exhausted: compiled.derived_diagnostics.budget_exhausted
-                + compiled.derived_diagnostics.scc_budget_exhausted,
-            summary_scc_count: compiled.derived_diagnostics.scc_count,
-        },
-        interpreter: compiled.interpreter.as_ref().map(|interpreter| {
-            r2types::SymbolicInterpreterDispatch {
-                kind: symbolic_interpreter_kind_from_sym(interpreter.kind),
-                dispatch_header: interpreter.dispatch_header,
-                dispatch_targets: interpreter.dispatch_targets,
-                selector: interpreter.selector.clone(),
-                back_edges: interpreter.back_edges,
-                score: interpreter.score,
-            }
-        }),
-        vm_step: compiled
-            .vm_step
-            .as_ref()
-            .map(symbolic_vm_step_summary_from_sym),
-        vm_transfer: compiled
-            .vm_transfer
-            .as_ref()
-            .map(symbolic_vm_step_summary_from_sym),
-    }
-}
-
-pub(crate) fn collect_plugin_semantic_artifact(
-    prepared: &r2ssa::SsaArtifact,
-    arch: Option<&ArchSpec>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> r2sym::CompiledSemanticArtifact {
-    let scope = symbolic_scope_with_prepared_root(prepared, symbolic_scope);
-    r2sym::compile_semantic_artifact_with_scope(
-        &z3::Context::thread_local(),
-        prepared,
-        scope.as_ref(),
-        arch,
-        &HashMap::new(),
-        r2sym::SummaryProfile::Default,
-    )
-}
-
-fn symbolic_scope_with_prepared_root(
-    prepared: &r2ssa::SsaArtifact,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<r2sym::PreparedFunctionScope> {
-    let scope = symbolic_scope?;
-    let mut functions = scope.functions().values().cloned().collect::<Vec<_>>();
-    for function in &mut functions {
-        if function.id == scope.root_id() {
-            function.prepared = prepared.clone();
-            if function.name.is_none() {
-                function.name = prepared.function().name.clone();
-            }
-        }
-    }
-    r2sym::PreparedFunctionScope::new(scope.root_id().0, functions)
-}
-
 #[allow(dead_code)]
 fn collect_plugin_symbolic_facts(
     prepared: &r2ssa::SsaArtifact,
     arch: Option<&ArchSpec>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> r2types::SymbolicSemanticFacts {
-    let artifact = collect_plugin_semantic_artifact(prepared, arch, symbolic_scope);
-    symbolic_semantic_facts_from_sym(&artifact)
+    let artifact = r2sym::compile_semantic_artifact_default_with_scope(
+        &z3::Context::thread_local(),
+        prepared,
+        symbolic_scope,
+        arch,
+    );
+    r2types::symbolic_semantic_facts_from_artifact(&artifact)
 }
 
+#[cfg(test)]
 fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
     match ty {
         r2types::CTypeLike::Void => r2dec::CType::Void,
@@ -868,85 +218,15 @@ fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
     }
 }
 
-fn insert_known_signature_aliases(
-    known: &mut std::collections::HashMap<String, r2types::FunctionType>,
-    name: &str,
-    sig: &r2types::FunctionType,
-) {
-    if name.is_empty() {
-        return;
-    }
-    known.insert(name.to_string(), sig.clone());
-
-    for prefix in ["sym.imp.", "sym.", "imp.", "dbg.", "fcn."] {
-        if let Some(stripped) = name.strip_prefix(prefix)
-            && !stripped.is_empty()
-        {
-            known.insert(stripped.to_string(), sig.clone());
-        }
-    }
-}
-
-pub(crate) fn enrich_known_function_signatures_from_names(
-    type_facts: &mut r2types::FunctionTypeFacts,
-    function_names: &std::collections::HashMap<u64, String>,
-    ptr_bits: u32,
-) {
-    let registry = r2types::SignatureRegistry::from_embedded_json();
-
-    for name in function_names.values() {
-        let mut candidates = vec![name.clone()];
-        if let Some(sim_name) = normalize_sim_name(name)
-            && sim_name != name
-            && !candidates.iter().any(|candidate| candidate == sim_name)
-        {
-            candidates.push(sim_name.to_string());
-        }
-
-        let resolved = candidates.into_iter().find_map(|candidate| {
-            let mut arena = r2types::TypeArena::default();
-            registry
-                .resolve(&candidate, &mut arena, ptr_bits)
-                .map(|sig| {
-                    (
-                        candidate,
-                        r2types::FunctionType {
-                            return_type: r2types::to_c_type_like(&arena, sig.ret),
-                            params: sig
-                                .params
-                                .into_iter()
-                                .map(|param| r2types::to_c_type_like(&arena, param))
-                                .collect(),
-                            variadic: sig.variadic,
-                        },
-                    )
-                })
-        });
-
-        let Some((resolved_name, sig)) = resolved else {
-            continue;
-        };
-
-        insert_known_signature_aliases(&mut type_facts.known_function_signatures, name, &sig);
-        if resolved_name != *name {
-            insert_known_signature_aliases(
-                &mut type_facts.known_function_signatures,
-                &resolved_name,
-                &sig,
-            );
-        }
-    }
-}
-
-fn signature_cc_to_writeback(sig: &InferredSignatureCcJson) -> r2types::InferredSignature {
-    r2types::InferredSignature {
+pub(crate) fn signature_to_json(sig: &r2types::InferredSignature) -> InferredSignatureCcJson {
+    InferredSignatureCcJson {
         function_name: sig.function_name.clone(),
         signature: sig.signature.clone(),
         ret_type: sig.ret_type.clone(),
         params: sig
             .params
             .iter()
-            .map(|param| r2types::InferredSignatureParam {
+            .map(|param| InferredParamJson {
                 name: param.name.clone(),
                 param_type: param.param_type.clone(),
             })
@@ -958,63 +238,39 @@ fn signature_cc_to_writeback(sig: &InferredSignatureCcJson) -> r2types::Inferred
     }
 }
 
+pub(crate) type VarProt = r2types::RecoveredVariable;
+pub(crate) type TypeHintRank = r2types::TypeHintRank;
+pub(crate) type TypeHint = r2types::TypeHint;
+
 fn var_prot_to_writeback(var: &VarProt) -> r2types::RecoveredVariable {
-    r2types::RecoveredVariable {
-        name: var.name.clone(),
-        kind: var.kind.clone(),
-        delta: var.delta,
-        var_type: var.var_type.clone(),
-        isarg: var.isarg,
-        reg: var.reg.clone(),
-    }
+    var.clone()
 }
 
-fn writeback_diagnostics_from_plugin(
-    diagnostics: crate::TypeWritebackDiagnosticsJson,
-) -> r2types::TypeWritebackDiagnostics {
-    r2types::TypeWritebackDiagnostics {
-        conflicts: diagnostics.conflicts,
-        warnings: diagnostics.warnings,
-        solver_warnings: diagnostics.solver_warnings,
-    }
+fn local_field_accesses_to_writeback(
+    accesses: Vec<r2dec::LocalStructFieldAccess>,
+) -> Vec<r2types::LocalFieldAccessFact> {
+    accesses
+        .into_iter()
+        .map(|access| r2types::LocalFieldAccessFact {
+            slot: access.arg_index,
+            field_offset: access.field_offset,
+            field_name: format!("f_{:x}", access.field_offset),
+            field_type: Some(r2types::size_to_type(access.access_size)),
+        })
+        .collect()
 }
 
-fn struct_decl_to_writeback(decl: crate::StructDeclCandidateJson) -> r2types::StructDeclCandidate {
-    r2types::StructDeclCandidate {
-        name: decl.name,
-        decl: decl.decl,
-        confidence: decl.confidence,
-        source: if decl.source == "external_type_db" {
-            r2types::StructDeclSource::ExternalTypeDb
-        } else {
-            r2types::StructDeclSource::LocalInferred
-        },
-        fields: decl
-            .fields
-            .into_iter()
-            .map(|field| r2types::StructFieldCandidate {
-                name: field.name,
-                offset: field.offset,
-                field_type: field.field_type,
-                confidence: field.confidence,
-            })
-            .collect(),
-    }
-}
-
-fn local_struct_artifacts_to_writeback(
-    struct_decls: Vec<crate::StructDeclCandidateJson>,
-    slot_type_overrides: std::collections::HashMap<usize, String>,
-    slot_field_profiles: std::collections::HashMap<usize, std::collections::BTreeMap<u64, String>>,
-) -> r2types::LocalStructArtifacts {
-    r2types::LocalStructArtifacts {
-        struct_decls: struct_decls
-            .into_iter()
-            .map(struct_decl_to_writeback)
-            .collect(),
-        slot_type_overrides,
-        slot_field_profiles,
-    }
+fn recovered_signature_params_from_var_recovery(
+    params: Vec<&r2dec::variable::VarInfo>,
+) -> Vec<r2types::RecoveredSignatureParam> {
+    params
+        .into_iter()
+        .map(|param| r2types::RecoveredSignatureParam {
+            name: param.name.clone(),
+            ssa_var: param.ssa_var.clone(),
+            initial_ty: crate::ctype_to_type_like(&param.ty),
+        })
+        .collect()
 }
 
 fn build_var_recovery_ssa_blocks(
@@ -1111,10 +367,11 @@ pub(crate) fn collect_detached_semantic_artifact(
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<r2sym::CompiledSemanticArtifact> {
     let analysis = build_function_analysis_from_parts(function_name, blocks, arch)?;
-    Some(collect_plugin_semantic_artifact(
+    Some(r2sym::compile_semantic_artifact_default_with_scope(
+        &z3::Context::thread_local(),
         &analysis.ssa_func,
-        arch,
         symbolic_scope,
+        arch,
     ))
 }
 
@@ -1214,129 +471,39 @@ pub(crate) fn build_interproc_summary_set(
 pub(crate) fn infer_signature_cc_from_analysis(
     input: &FunctionInput<'_>,
     analysis: &FunctionAnalysis,
-) -> Option<InferredSignatureCcJson> {
+) -> Option<r2types::InferredSignature> {
     let env = build_decompiler_env(&input.ctx);
     let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
-    let evidence_ctx = collect_signature_type_evidence_context(&pattern_ssa_blocks);
 
     let mut var_recovery =
         r2dec::VariableRecovery::new(&env.cfg.sp_name, &env.cfg.fp_name, env.cfg.ptr_size);
     var_recovery.recover(&analysis.ssa_func);
 
-    let mut type_inference = r2types::TypeInference::new(env.cfg.ptr_size);
-    type_inference.set_prepared_ssa(&analysis.ssa_func);
-    type_inference.infer_function(&analysis.ssa_func);
-
-    let mut inferred_params: Vec<InferredParam> = var_recovery
-        .parameters()
-        .into_iter()
-        .map(|v| {
-            let initial_ty = type_like_to_ctype(&type_inference.get_type(&v.ssa_var));
-            let mut evidence =
-                crate::collect_type_evidence_for_var(&evidence_ctx, &v.ssa_var, &initial_ty);
-            if matches!(initial_ty, r2dec::CType::Void | r2dec::CType::Unknown) {
-                crate::merge_initial_type_evidence(
-                    &type_like_to_ctype(&type_inference.type_from_size(v.ssa_var.size)),
-                    &mut evidence,
-                );
-            }
-            let ty = crate::resolve_evidence_driven_type(
-                initial_ty,
-                v.ssa_var.size,
-                env.ptr_bits,
-                &evidence,
-            );
-            let arg_index = v
-                .name
-                .strip_prefix("arg")
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(usize::MAX);
-            InferredParam {
-                name: v.name.clone(),
-                ty,
-                arg_index,
-                size_bytes: v.ssa_var.size,
-                evidence,
-            }
-        })
-        .collect();
-
-    if input.ctx.semantic_metadata_enabled {
+    let pointer_arg_slots = if input.ctx.semantic_metadata_enabled {
         let reg_type_hints = collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm);
         let recovered_vars =
             recover_vars_from_ssa(&pattern_ssa_blocks, input.ctx.arch, &reg_type_hints, true);
-        let pointer_arg_slots = collect_pointer_arg_slots(&recovered_vars);
-        merge_pointer_slot_evidence(&mut inferred_params, &pointer_arg_slots);
-    }
+        collect_pointer_arg_slots(&recovered_vars)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let recovered_params = recovered_signature_params_from_var_recovery(var_recovery.parameters());
 
-    for param in &mut inferred_params {
-        param.ty = crate::resolve_evidence_driven_type(
-            param.ty.clone(),
-            param.size_bytes,
-            env.ptr_bits,
-            &param.evidence,
-        );
-    }
-
-    inferred_params.sort_by(|a, b| {
-        a.arg_index
-            .cmp(&b.arg_index)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    let mut used_param_names = HashSet::new();
-    let params: Vec<InferredParamJson> = inferred_params
-        .iter()
-        .enumerate()
-        .map(|(idx, p)| {
-            let fallback_idx = if p.arg_index == usize::MAX {
-                idx
-            } else {
-                p.arg_index
-            };
-            InferredParamJson {
-                name: crate::normalize_inferred_param_name(
-                    &p.name,
-                    fallback_idx,
-                    &mut used_param_names,
-                ),
-                param_type: crate::materialize_signature_ctype(p.ty.clone(), env.ptr_bits)
-                    .to_string(),
-            }
-        })
-        .collect();
-
-    let (ret_type, ret_evidence) = crate::infer_signature_return_type(
-        &analysis.ssa_func,
-        &type_inference,
+    Some(r2types::infer_signature_from_prepared_ssa(
+        &input.function_name,
+        &env.arch_name,
         env.ptr_bits,
-        &evidence_ctx,
-    );
-    let ret_type = crate::materialize_signature_ctype(ret_type, env.ptr_bits);
-    let ret_type_str = ret_type.to_string();
-
-    let input_counts = crate::collect_version0_input_regs(&analysis.ssa_func);
-    let (callconv, callconv_confidence) =
-        crate::compute_callconv_inference(&env.arch_name, &input_counts);
-    let confidence =
-        crate::compute_signature_confidence(&inferred_params, &ret_type, &ret_evidence);
-
-    let signature = crate::format_afs_signature(&input.function_name, &ret_type_str, &params);
-    Some(InferredSignatureCcJson {
-        function_name: input.function_name.clone(),
-        signature,
-        ret_type: ret_type_str,
-        params,
-        callconv,
-        arch: env.arch_name,
-        confidence,
-        callconv_confidence,
-    })
+        &analysis.ssa_func,
+        &pattern_ssa_blocks,
+        &recovered_params,
+        &pointer_arg_slots,
+    ))
 }
 
 #[allow(dead_code)]
 pub(crate) fn infer_signature_cc_inner(
     input: &FunctionInput<'_>,
-) -> Option<InferredSignatureCcJson> {
+) -> Option<r2types::InferredSignature> {
     let analysis = build_function_analysis(input)?;
     infer_signature_cc_from_analysis(input, &analysis)
 }
@@ -1462,26 +629,23 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
         .as_ref()
         .map(|arch| effective_ptr_bits(arch))
         .unwrap_or(64);
-    let signature_cc = infer_signature_cc_from_analysis(input, &analysis)?;
+    let signature = infer_signature_cc_from_analysis(input, &analysis)?;
     let parsed_context = r2types::parse_external_context_json(external_context_json, ptr_bits);
 
     let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
-    let mut diagnostics = crate::TypeWritebackDiagnosticsJson::default();
-    let raw_structs = crate::infer_structs_from_ssa(
+    let decompiler_env = build_decompiler_env(&input.ctx);
+    let decompiler_cfg = decompiler_env.cfg;
+    let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
+    let local_structs = r2types::infer_local_struct_artifacts_from_ssa(
         &pattern_ssa_blocks,
-        input.ctx.arch,
+        Some(decompiler_env.arch_name.as_str()),
         ptr_bits,
         &mut diagnostics,
     );
-    let semantic_structs = crate::infer_structs_from_semantic_accesses(
-        &analysis.pattern_ssa_func,
-        &build_decompiler_env(&input.ctx).cfg,
-        ptr_bits,
-        &mut diagnostics,
+    let local_field_accesses = local_field_accesses_to_writeback(
+        r2dec::infer_local_struct_field_accesses(&analysis.pattern_ssa_func, &decompiler_cfg),
     );
-    let (struct_decls, slot_type_overrides, slot_field_profiles) =
-        crate::merge_struct_inference_artifacts(raw_structs, semantic_structs);
-    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
+    let symbolic_facts = r2types::symbolic_semantic_facts_from_artifact(&semantic_artifact);
 
     let reg_type_hints = if input.ctx.semantic_metadata_enabled {
         collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
@@ -1495,36 +659,27 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
         input.ctx.semantic_metadata_enabled,
     );
     let recovered_vars = vars.iter().map(var_prot_to_writeback).collect::<Vec<_>>();
-    let mut local_structs =
-        local_struct_artifacts_to_writeback(struct_decls, slot_type_overrides, slot_field_profiles);
-    r2types::augment_local_struct_artifacts_with_symbolic_facts(
-        &mut local_structs,
-        &symbolic_facts,
-        ptr_bits,
+    let writeback = r2types::build_type_writeback_analysis_with_semantics(
+        r2types::TypeWritebackAnalysisInput {
+            function_name: &input.function_name,
+            ptr_bits,
+            inferred_signature: signature.clone(),
+            recovered_vars: &recovered_vars,
+            ssa_blocks: &pattern_ssa_blocks,
+            parsed_context,
+            local_structs,
+            interproc_summary_set: interproc_summary_set.clone(),
+            diagnostics,
+        },
+        r2types::TypeWritebackSemanticInputs {
+            symbolic_facts: &symbolic_facts,
+            local_field_accesses: &local_field_accesses,
+        },
     );
-    let writeback = r2types::build_type_writeback_analysis(r2types::TypeWritebackAnalysisInput {
-        function_name: &input.function_name,
-        ptr_bits,
-        inferred_signature: signature_cc_to_writeback(&signature_cc),
-        recovered_vars: &recovered_vars,
-        ssa_blocks: &pattern_ssa_blocks,
-        parsed_context,
-        local_structs,
-        interproc_summary_set: interproc_summary_set.clone(),
-        diagnostics: writeback_diagnostics_from_plugin(diagnostics),
-    });
-    let mut type_facts = writeback.type_facts;
-    if symbolic_facts.diagnostics.branches_pruned > 0 {
-        type_facts.diagnostics.push(format!(
-            "symbolic pruned {} branch arm(s)",
-            symbolic_facts.diagnostics.branches_pruned
-        ));
-    }
-    type_facts.symbolic_facts = symbolic_facts;
     Some(FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_func: analysis.pattern_ssa_func,
-        type_facts,
+        type_facts: writeback.type_facts,
         writeback_plan: writeback.plan,
         interproc_summary_set,
         semantic_artifact: Some(semantic_artifact),
@@ -1538,8 +693,12 @@ pub(crate) fn build_function_analysis_artifact_from_analysis(
     interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<FunctionAnalysisArtifact> {
-    let semantic_artifact =
-        collect_plugin_semantic_artifact(&analysis.ssa_func, input.ctx.arch, symbolic_scope);
+    let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+        &z3::Context::thread_local(),
+        &analysis.ssa_func,
+        symbolic_scope,
+        input.ctx.arch,
+    );
     build_function_analysis_artifact_from_analysis_with_semantic_artifact(
         input,
         analysis,
@@ -1743,132 +902,46 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
     let analysis = build_function_analysis_from_parts(function_name, blocks, arch)?;
     let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
 
-    let arch_name = normalize_sig_arch_name(arch).unwrap_or_else(|| "unknown".to_string());
-    let cfg = decompiler_config_for_arch_name(&arch_name, ptr_bits);
-    let evidence_ctx = collect_signature_type_evidence_context(&pattern_ssa_blocks);
+    let (arch_name, _, cfg) = r2dec::DecompilerConfig::for_arch(arch);
     let mut var_recovery = r2dec::VariableRecovery::new(&cfg.sp_name, &cfg.fp_name, cfg.ptr_size);
     var_recovery.recover(&analysis.ssa_func);
-    let mut type_inference = r2types::TypeInference::new(cfg.ptr_size);
-    type_inference.set_prepared_ssa(&analysis.ssa_func);
-    type_inference.infer_function(&analysis.ssa_func);
-
-    let mut inferred_params: Vec<InferredParam> = var_recovery
-        .parameters()
-        .into_iter()
-        .map(|v| {
-            let initial_ty = type_like_to_ctype(&type_inference.get_type(&v.ssa_var));
-            let mut evidence =
-                crate::collect_type_evidence_for_var(&evidence_ctx, &v.ssa_var, &initial_ty);
-            if matches!(initial_ty, r2dec::CType::Void | r2dec::CType::Unknown) {
-                crate::merge_initial_type_evidence(
-                    &type_like_to_ctype(&type_inference.type_from_size(v.ssa_var.size)),
-                    &mut evidence,
-                );
-            }
-            let ty = crate::resolve_evidence_driven_type(
-                initial_ty,
-                v.ssa_var.size,
-                ptr_bits,
-                &evidence,
-            );
-            let arg_index = v
-                .name
-                .strip_prefix("arg")
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(usize::MAX);
-            InferredParam {
-                name: v.name.clone(),
-                ty,
-                arg_index,
-                size_bytes: v.ssa_var.size,
-                evidence,
-            }
-        })
-        .collect();
-
-    if semantic_metadata_enabled {
+    let pointer_arg_slots = if semantic_metadata_enabled {
         let recovered_vars = recover_vars_from_ssa(&pattern_ssa_blocks, arch, reg_type_hints, true);
-        let pointer_arg_slots = collect_pointer_arg_slots(&recovered_vars);
-        merge_pointer_slot_evidence(&mut inferred_params, &pointer_arg_slots);
-    }
-
-    for param in &mut inferred_params {
-        param.ty = crate::resolve_evidence_driven_type(
-            param.ty.clone(),
-            param.size_bytes,
-            ptr_bits,
-            &param.evidence,
-        );
-    }
-
-    inferred_params.sort_by(|a, b| {
-        a.arg_index
-            .cmp(&b.arg_index)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    let mut used_param_names = HashSet::new();
-    let params: Vec<InferredParamJson> = inferred_params
-        .iter()
-        .enumerate()
-        .map(|(idx, p)| {
-            let fallback_idx = if p.arg_index == usize::MAX {
-                idx
-            } else {
-                p.arg_index
-            };
-            InferredParamJson {
-                name: crate::normalize_inferred_param_name(
-                    &p.name,
-                    fallback_idx,
-                    &mut used_param_names,
-                ),
-                param_type: crate::materialize_signature_ctype(p.ty.clone(), ptr_bits).to_string(),
-            }
-        })
-        .collect();
-
-    let (ret_type, ret_evidence) = crate::infer_signature_return_type(
-        &analysis.ssa_func,
-        &type_inference,
-        ptr_bits,
-        &evidence_ctx,
-    );
-    let ret_type = crate::materialize_signature_ctype(ret_type, ptr_bits);
-    let signature_cc = InferredSignatureCcJson {
-        function_name: function_name.to_string(),
-        signature: crate::format_afs_signature(function_name, &ret_type.to_string(), &params),
-        ret_type: ret_type.to_string(),
-        params,
-        callconv: crate::compute_callconv_inference(
-            &arch_name,
-            &crate::collect_version0_input_regs(&analysis.ssa_func),
-        )
-        .0,
-        arch: arch_name.clone(),
-        confidence: crate::compute_signature_confidence(&inferred_params, &ret_type, &ret_evidence),
-        callconv_confidence: crate::compute_callconv_inference(
-            &arch_name,
-            &crate::collect_version0_input_regs(&analysis.ssa_func),
-        )
-        .1,
+        collect_pointer_arg_slots(&recovered_vars)
+    } else {
+        std::collections::BTreeSet::new()
     };
+    let recovered_params = recovered_signature_params_from_var_recovery(var_recovery.parameters());
+    let signature = r2types::infer_signature_from_prepared_ssa(
+        function_name,
+        &arch_name,
+        ptr_bits,
+        &analysis.ssa_func,
+        &pattern_ssa_blocks,
+        &recovered_params,
+        &pointer_arg_slots,
+    );
     let parsed_context = r2types::parse_external_context_json(external_context_json, ptr_bits);
 
-    let mut diagnostics = crate::TypeWritebackDiagnosticsJson::default();
-    let raw_structs =
-        crate::infer_structs_from_ssa(&pattern_ssa_blocks, arch, ptr_bits, &mut diagnostics);
-    let semantic_structs = crate::infer_structs_from_semantic_accesses(
-        &analysis.pattern_ssa_func,
-        &cfg,
+    let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
+    let local_structs = r2types::infer_local_struct_artifacts_from_ssa(
+        &pattern_ssa_blocks,
+        Some(arch_name.as_str()),
         ptr_bits,
         &mut diagnostics,
     );
-    let (struct_decls, slot_type_overrides, slot_field_profiles) =
-        crate::merge_struct_inference_artifacts(raw_structs, semantic_structs);
+    let local_field_accesses = local_field_accesses_to_writeback(
+        r2dec::infer_local_struct_field_accesses(&analysis.pattern_ssa_func, &cfg),
+    );
     let semantic_artifact = precomputed_semantic_artifact.unwrap_or_else(|| {
-        collect_plugin_semantic_artifact(&analysis.ssa_func, arch, symbolic_scope)
+        r2sym::compile_semantic_artifact_default_with_scope(
+            &z3::Context::thread_local(),
+            &analysis.ssa_func,
+            symbolic_scope,
+            arch,
+        )
     });
-    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
+    let symbolic_facts = r2types::symbolic_semantic_facts_from_artifact(&semantic_artifact);
     let vars = recover_vars_from_ssa(
         &pattern_ssa_blocks,
         arch,
@@ -1876,36 +949,27 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
         semantic_metadata_enabled,
     );
     let recovered_vars = vars.iter().map(var_prot_to_writeback).collect::<Vec<_>>();
-    let mut local_structs =
-        local_struct_artifacts_to_writeback(struct_decls, slot_type_overrides, slot_field_profiles);
-    r2types::augment_local_struct_artifacts_with_symbolic_facts(
-        &mut local_structs,
-        &symbolic_facts,
-        ptr_bits,
+    let writeback = r2types::build_type_writeback_analysis_with_semantics(
+        r2types::TypeWritebackAnalysisInput {
+            function_name,
+            ptr_bits,
+            inferred_signature: signature.clone(),
+            recovered_vars: &recovered_vars,
+            ssa_blocks: &pattern_ssa_blocks,
+            parsed_context,
+            local_structs,
+            interproc_summary_set: None,
+            diagnostics,
+        },
+        r2types::TypeWritebackSemanticInputs {
+            symbolic_facts: &symbolic_facts,
+            local_field_accesses: &local_field_accesses,
+        },
     );
-    let writeback = r2types::build_type_writeback_analysis(r2types::TypeWritebackAnalysisInput {
-        function_name,
-        ptr_bits,
-        inferred_signature: signature_cc_to_writeback(&signature_cc),
-        recovered_vars: &recovered_vars,
-        ssa_blocks: &pattern_ssa_blocks,
-        parsed_context,
-        local_structs,
-        interproc_summary_set: None,
-        diagnostics: writeback_diagnostics_from_plugin(diagnostics),
-    });
-    let mut type_facts = writeback.type_facts;
-    if symbolic_facts.diagnostics.branches_pruned > 0 {
-        type_facts.diagnostics.push(format!(
-            "symbolic pruned {} branch arm(s)",
-            symbolic_facts.diagnostics.branches_pruned
-        ));
-    }
-    type_facts.symbolic_facts = symbolic_facts;
     let artifact = FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_func: analysis.pattern_ssa_func,
-        type_facts,
+        type_facts: writeback.type_facts,
         writeback_plan: writeback.plan,
         interproc_summary_set: None,
         semantic_artifact: Some(semantic_artifact),
@@ -1916,18 +980,6 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
     Some(rename_function_analysis_artifact(artifact, function_name))
 }
 
-#[derive(serde::Serialize)]
-pub(crate) struct VarProt {
-    pub(crate) name: String,
-    pub(crate) kind: String,
-    pub(crate) delta: i64,
-    #[serde(rename = "type")]
-    pub(crate) var_type: String,
-    pub(crate) isarg: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reg: Option<String>,
-}
-
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct DataRef {
     pub(crate) from: u64,
@@ -1936,43 +988,12 @@ pub(crate) struct DataRef {
     pub(crate) ref_type: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum TypeHintRank {
-    Integer = 1,
-    Float = 2,
-    Pointer = 3,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TypeHint {
-    pub(crate) rank: TypeHintRank,
-    pub(crate) ty: String,
-}
-
-impl TypeHint {
-    pub(crate) fn pointer() -> Self {
-        Self {
-            rank: TypeHintRank::Pointer,
-            ty: "void *".to_string(),
-        }
-    }
-}
-
-fn incoming_hint_should_replace(current: &TypeHint, incoming: &TypeHint) -> bool {
-    incoming.rank > current.rank || (incoming.rank == current.rank && incoming.ty < current.ty)
-}
-
 pub(crate) fn merge_type_hint(
     hints: &mut std::collections::HashMap<String, TypeHint>,
     key: String,
     incoming: TypeHint,
 ) {
-    match hints.get(&key) {
-        Some(current) if !incoming_hint_should_replace(current, &incoming) => {}
-        _ => {
-            hints.insert(key, incoming);
-        }
-    }
+    r2types::merge_type_hint(hints, key, incoming);
 }
 
 fn size_to_signed_int_type(size: u32) -> String {
@@ -2066,989 +1087,44 @@ pub(crate) fn collect_register_type_hints(
     hints
 }
 
-pub(crate) const X86_ARG_REGS: &[(&str, &[&str])] = &[
-    ("rdi", &["rdi", "edi", "di", "dil"]),
-    ("rsi", &["rsi", "esi", "si", "sil"]),
-    ("rdx", &["rdx", "edx", "dx", "dl", "dh"]),
-    ("rcx", &["rcx", "ecx", "cx", "cl", "ch"]),
-    ("r8", &["r8", "r8d", "r8w", "r8b"]),
-    ("r9", &["r9", "r9d", "r9w", "r9b"]),
-];
-const RISCV_ARG_REGS: &[(&str, &[&str])] = &[
-    ("a0", &["a0", "x10"]),
-    ("a1", &["a1", "x11"]),
-    ("a2", &["a2", "x12"]),
-    ("a3", &["a3", "x13"]),
-    ("a4", &["a4", "x14"]),
-    ("a5", &["a5", "x15"]),
-    ("a6", &["a6", "x16"]),
-    ("a7", &["a7", "x17"]),
-];
-const ARM64_ARG_REGS: &[(&str, &[&str])] = &[
-    ("x0", &["x0", "w0"]),
-    ("x1", &["x1", "w1"]),
-    ("x2", &["x2", "w2"]),
-    ("x3", &["x3", "w3"]),
-    ("x4", &["x4", "w4"]),
-    ("x5", &["x5", "w5"]),
-    ("x6", &["x6", "w6"]),
-    ("x7", &["x7", "w7"]),
-];
-const ARM32_ARG_REGS: &[(&str, &[&str])] = &[
-    ("r0", &["r0"]),
-    ("r1", &["r1"]),
-    ("r2", &["r2"]),
-    ("r3", &["r3"]),
-];
-const MIPS_ARG_REGS: &[(&str, &[&str])] = &[
-    ("a0", &["a0", "$a0", "r4"]),
-    ("a1", &["a1", "$a1", "r5"]),
-    ("a2", &["a2", "$a2", "r6"]),
-    ("a3", &["a3", "$a3", "r7"]),
-];
-const X86_STACK_BASES: &[&str] = &["rbp", "rsp", "ebp", "esp"];
-pub(crate) const X86_FRAME_BASES: &[&str] = &["rbp", "ebp"];
-const RISCV_STACK_BASES: &[&str] = &["sp", "s0", "fp", "x2", "x8"];
-const RISCV_FRAME_BASES: &[&str] = &["s0", "fp", "x8"];
-const ARM64_STACK_BASES: &[&str] = &["sp", "x29", "fp"];
-const ARM64_FRAME_BASES: &[&str] = &["x29", "fp"];
-const ARM32_STACK_BASES: &[&str] = &["sp", "r11", "fp"];
-const ARM32_FRAME_BASES: &[&str] = &["r11", "fp"];
-const MIPS_STACK_BASES: &[&str] = &["sp", "$sp", "fp", "$fp", "s8", "$s8"];
-const MIPS_FRAME_BASES: &[&str] = &["fp", "$fp", "s8", "$s8"];
-const GENERIC_STACK_BASES: &[&str] = &["sp", "fp", "bp", "s0", "x2", "x8", "rbp", "rsp"];
-const GENERIC_FRAME_BASES: &[&str] = &["fp", "bp", "s0", "x8", "rbp"];
+#[cfg(test)]
+pub(crate) const X86_ARG_REGS: &[(&str, &[&str])] = r2types::X86_ARG_REGS;
+#[cfg(test)]
+pub(crate) const X86_FRAME_BASES: &[&str] = r2types::X86_FRAME_BASES;
+#[cfg(test)]
+type ArgAliasMap = r2types::ArgAliasMap;
+#[cfg(test)]
+type BaseRegList = r2types::BaseRegList;
 
-type ArgAliasMap = &'static [(&'static str, &'static [&'static str])];
-type BaseRegList = &'static [&'static str];
-
+#[cfg(test)]
 pub(crate) fn recover_vars_arch_profile(
     arch: Option<&ArchSpec>,
 ) -> (ArgAliasMap, BaseRegList, BaseRegList) {
-    let Some(arch) = arch else {
-        return (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES);
-    };
-
-    let arch_name = arch.name.to_ascii_lowercase();
-    if arch_name.contains("x86") {
-        return (X86_ARG_REGS, X86_STACK_BASES, X86_FRAME_BASES);
-    }
-    if arch_name.contains("aarch64") || arch_name.contains("arm64") {
-        return (ARM64_ARG_REGS, ARM64_STACK_BASES, ARM64_FRAME_BASES);
-    }
-    if arch_name == "arm" || arch_name.starts_with("armv") {
-        return (ARM32_ARG_REGS, ARM32_STACK_BASES, ARM32_FRAME_BASES);
-    }
-    if arch_name.contains("riscv") || arch_name.starts_with("rv") {
-        return (RISCV_ARG_REGS, RISCV_STACK_BASES, RISCV_FRAME_BASES);
-    }
-    if arch_name.contains("mips") {
-        return (MIPS_ARG_REGS, MIPS_STACK_BASES, MIPS_FRAME_BASES);
-    }
-
-    (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES)
+    r2types::recover_vars_arch_profile(arch.map(|spec| spec.name.as_str()))
 }
 
 pub(crate) fn ssa_var_key(var: &r2ssa::SSAVar) -> String {
-    format!("{}_{}", var.name.to_ascii_lowercase(), var.version)
+    r2types::ssa_var_key(var)
 }
 
+#[cfg(test)]
 pub(crate) fn ssa_var_block_key(block_addr: u64, var: &r2ssa::SSAVar) -> String {
-    format!("{}@{block_addr:x}", ssa_var_key(var))
+    r2types::ssa_var_block_key(block_addr, var)
 }
 
-fn ssa_var_is_const(var: &r2ssa::SSAVar) -> bool {
-    parse_const_value(&var.name).is_some()
-}
-
-fn ssa_var_is_register_like(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    !(lower.starts_with("tmp:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("space"))
-}
-
+#[cfg(test)]
 pub(crate) fn scalar_register_family_key(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-
-    if let Some(idx) = lower.strip_prefix('x').or_else(|| lower.strip_prefix('w'))
-        && !idx.is_empty()
-        && idx.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return format!("aarch64:gpr:{idx}");
-    }
-
-    match lower.as_str() {
-        "fp" => "aarch64:gpr:29".to_string(),
-        "lr" => "aarch64:gpr:30".to_string(),
-        "sp" | "wsp" => "aarch64:sp".to_string(),
-        "xzr" | "wzr" => "aarch64:zr".to_string(),
-        _ => lower,
-    }
+    r2types::scalar_register_family_key(name)
 }
 
-fn collect_register_version_keys(
-    ssa_blocks: &[r2ssa::SSABlock],
-) -> std::collections::HashMap<String, Vec<String>> {
-    use std::collections::HashMap;
-
-    let mut reg_versions: HashMap<String, Vec<String>> = HashMap::new();
-    for block in ssa_blocks {
-        for op in &block.ops {
-            let mut collect_var = |var: &r2ssa::SSAVar| {
-                if !ssa_var_is_register_like(&var.name) {
-                    return;
-                }
-                let reg_name = scalar_register_family_key(&var.name);
-                reg_versions
-                    .entry(reg_name)
-                    .or_default()
-                    .push(ssa_var_key(var));
-            };
-            if let Some(dst) = op.dst() {
-                collect_var(dst);
-            }
-            op.for_each_source(&mut collect_var);
-        }
-    }
-    for keys in reg_versions.values_mut() {
-        keys.sort();
-        keys.dedup();
-    }
-    reg_versions
-}
-
-fn set_width_hint_prefer_narrower(
-    width_hints: &mut std::collections::HashMap<String, u32>,
-    key: String,
-    bits: u32,
-) -> bool {
-    if bits == 0 {
-        return false;
-    }
-    match width_hints.get(&key).copied() {
-        Some(current) if current == bits => false,
-        Some(current) if current > 0 && current <= bits => false,
-        _ => {
-            width_hints.insert(key, bits);
-            true
-        }
-    }
-}
-
-fn normalize_register_family_width_hints(
-    register_versions: &std::collections::HashMap<String, Vec<String>>,
-    width_hints: &mut std::collections::HashMap<String, u32>,
-) -> bool {
-    let mut changed = false;
-    for reg_keys in register_versions.values() {
-        let max_bits = reg_keys
-            .iter()
-            .filter_map(|key| width_hints.get(key).copied())
-            .max()
-            .unwrap_or(0);
-        let min_bits = reg_keys
-            .iter()
-            .filter_map(|key| {
-                let current = width_hints.get(key).copied().unwrap_or(0);
-                let natural = register_key_natural_bits(key).unwrap_or(0);
-                let candidate = match (current, natural) {
-                    (0, 0) => 0,
-                    (0, natural) => natural,
-                    (current, 0) => current,
-                    (current, natural) => current.min(natural),
-                };
-                (candidate > 0).then_some(candidate)
-            })
-            .min()
-            .unwrap_or(0);
-        let preferred_bits = if min_bits > 0 && max_bits == 64 && min_bits <= 32 {
-            min_bits
-        } else {
-            max_bits
-        };
-        for key in reg_keys {
-            changed |= set_width_hint_prefer_narrower(width_hints, key.clone(), preferred_bits);
-        }
-    }
-    changed
-}
-
-fn register_key_natural_bits(key: &str) -> Option<u32> {
-    let reg = key.split('_').next()?;
-    if let Some(idx) = reg.strip_prefix('w')
-        && !idx.is_empty()
-        && idx.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return Some(32);
-    }
-    if let Some(idx) = reg.strip_prefix('x')
-        && !idx.is_empty()
-        && idx.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return Some(64);
-    }
-    match reg {
-        "wsp" | "wzr" => Some(32),
-        "sp" | "fp" | "lr" | "xzr" => Some(64),
-        _ => None,
-    }
-}
-
-fn propagate_normalized_scalar_result_widths(
-    ssa_blocks: &[r2ssa::SSABlock],
-    width_hints: &mut std::collections::HashMap<String, u32>,
-) -> bool {
-    let mut changed = false;
-    for block in ssa_blocks {
-        for op in &block.ops {
-            let (dst, source_bits) = match op {
-                r2ssa::SSAOp::Copy { dst, src }
-                | r2ssa::SSAOp::Cast { dst, src }
-                | r2ssa::SSAOp::New { dst, src }
-                | r2ssa::SSAOp::IntZExt { dst, src }
-                | r2ssa::SSAOp::IntSExt { dst, src }
-                | r2ssa::SSAOp::Subpiece { dst, src, .. } => {
-                    let bits = width_hints.get(&ssa_var_key(src)).copied().unwrap_or(0);
-                    (dst, bits)
-                }
-                r2ssa::SSAOp::IntAdd { dst, a, b }
-                | r2ssa::SSAOp::IntSub { dst, a, b }
-                | r2ssa::SSAOp::IntMult { dst, a, b }
-                | r2ssa::SSAOp::IntDiv { dst, a, b }
-                | r2ssa::SSAOp::IntSDiv { dst, a, b }
-                | r2ssa::SSAOp::IntRem { dst, a, b }
-                | r2ssa::SSAOp::IntSRem { dst, a, b }
-                | r2ssa::SSAOp::IntAnd { dst, a, b }
-                | r2ssa::SSAOp::IntOr { dst, a, b }
-                | r2ssa::SSAOp::IntXor { dst, a, b }
-                | r2ssa::SSAOp::IntLeft { dst, a, b }
-                | r2ssa::SSAOp::IntRight { dst, a, b }
-                | r2ssa::SSAOp::IntSRight { dst, a, b } => {
-                    let bits = [a, b]
-                        .into_iter()
-                        .filter(|var| !ssa_var_is_const(var))
-                        .filter_map(|var| width_hints.get(&ssa_var_key(var)).copied())
-                        .filter(|bits| *bits > 0)
-                        .max()
-                        .unwrap_or(0);
-                    (dst, bits)
-                }
-                _ => continue,
-            };
-            changed |= set_width_hint_prefer_narrower(width_hints, ssa_var_key(dst), source_bits);
-        }
-    }
-    changed
-}
-
-fn ssa_var_is_stack_base(var: &r2ssa::SSAVar) -> bool {
-    matches!(
-        var.name.to_ascii_lowercase().as_str(),
-        "rbp" | "rsp" | "ebp" | "esp" | "sp" | "fp" | "bp" | "s0" | "x2" | "x8"
-    )
-}
-
-fn infer_pointer_width_bytes(ssa_blocks: &[r2ssa::SSABlock]) -> u32 {
-    let mut width = 0u32;
-    for block in ssa_blocks {
-        for op in &block.ops {
-            if let Some(dst) = op.dst()
-                && ssa_var_is_stack_base(dst)
-            {
-                width = width.max(dst.size);
-            }
-            op.for_each_source(|src| {
-                if ssa_var_is_stack_base(src) {
-                    width = width.max(src.size);
-                }
-            });
-        }
-    }
-    if width == 0 { 8 } else { width }
-}
-
-fn infer_index_like_var_keys(ssa_blocks: &[r2ssa::SSABlock]) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-
-    let mut index_like: HashSet<String> = HashSet::new();
-    for block in ssa_blocks {
-        for op in &block.ops {
-            if let r2ssa::SSAOp::IntSExt { dst, src } | r2ssa::SSAOp::IntZExt { dst, src } = op
-                && src.size < dst.size
-            {
-                index_like.insert(ssa_var_key(dst));
-            }
-        }
-    }
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in ssa_blocks {
-            for op in &block.ops {
-                match op {
-                    r2ssa::SSAOp::Copy { dst, src }
-                    | r2ssa::SSAOp::Cast { dst, src }
-                    | r2ssa::SSAOp::New { dst, src } => {
-                        if index_like.contains(&ssa_var_key(src)) {
-                            changed |= index_like.insert(ssa_var_key(dst));
-                        }
-                    }
-                    r2ssa::SSAOp::IntMult { dst, a, b } => {
-                        let a_key = ssa_var_key(a);
-                        let b_key = ssa_var_key(b);
-                        let a_is_scaled_const = ssa_var_is_const(a);
-                        let b_is_scaled_const = ssa_var_is_const(b);
-                        if (index_like.contains(&a_key) && ssa_var_is_const(b))
-                            || (index_like.contains(&b_key) && ssa_var_is_const(a))
-                            || (a_is_scaled_const && !b_is_scaled_const)
-                            || (b_is_scaled_const && !a_is_scaled_const)
-                        {
-                            changed |= index_like.insert(ssa_var_key(dst));
-                        }
-                    }
-                    r2ssa::SSAOp::IntLeft { dst, a, b } => {
-                        let shift_amount = parse_const_value(&b.name).unwrap_or(u64::MAX);
-                        if (index_like.contains(&ssa_var_key(a)) && ssa_var_is_const(b))
-                            || shift_amount <= 6
-                        {
-                            changed |= index_like.insert(ssa_var_key(dst));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    index_like
-}
-
-fn infer_pointer_var_keys_from_ssa(
-    ssa_blocks: &[r2ssa::SSABlock],
-) -> std::collections::HashSet<String> {
-    use std::collections::{HashMap, HashSet};
-
-    let mut pointer_vars: HashSet<String> = HashSet::new();
-    let register_versions = collect_register_version_keys(ssa_blocks);
-    let index_like_vars = infer_index_like_var_keys(ssa_blocks);
-    let pointer_width = infer_pointer_width_bytes(ssa_blocks);
-    let mut stack_addr_slots: HashMap<String, String> = HashMap::new();
-    let mut pointer_stack_slots: HashSet<String> = HashSet::new();
-
-    for block in ssa_blocks {
-        for op in &block.ops {
-            match op {
-                r2ssa::SSAOp::IntAdd { dst, a, b } | r2ssa::SSAOp::IntSub { dst, a, b } => {
-                    let a_is_stack = ssa_var_is_stack_base(a);
-                    let b_is_stack = ssa_var_is_stack_base(b);
-                    let a_const = parse_const_value(&a.name);
-                    let b_const = parse_const_value(&b.name);
-
-                    if a_is_stack && b_const.is_some() {
-                        let raw = b_const.unwrap_or(0);
-                        let offset = if matches!(op, r2ssa::SSAOp::IntSub { .. }) {
-                            -(raw as i64)
-                        } else {
-                            raw as i64
-                        };
-                        stack_addr_slots.insert(
-                            ssa_var_block_key(block.addr, dst),
-                            format!("{}:{offset}", a.name.to_ascii_lowercase()),
-                        );
-                    } else if matches!(op, r2ssa::SSAOp::IntAdd { .. })
-                        && b_is_stack
-                        && a_const.is_some()
-                    {
-                        let raw = a_const.unwrap_or(0);
-                        stack_addr_slots.insert(
-                            ssa_var_block_key(block.addr, dst),
-                            format!("{}:{}", b.name.to_ascii_lowercase(), raw as i64),
-                        );
-                    }
-                }
-                r2ssa::SSAOp::Load { addr, .. }
-                | r2ssa::SSAOp::Store { addr, .. }
-                | r2ssa::SSAOp::LoadLinked { addr, .. }
-                | r2ssa::SSAOp::StoreConditional { addr, .. }
-                | r2ssa::SSAOp::LoadGuarded { addr, .. }
-                | r2ssa::SSAOp::StoreGuarded { addr, .. }
-                | r2ssa::SSAOp::AtomicCAS { addr, .. } => {
-                    pointer_vars.insert(ssa_var_key(addr));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in ssa_blocks {
-            for op in &block.ops {
-                match op {
-                    r2ssa::SSAOp::Phi { dst, sources } => {
-                        let dst_key = ssa_var_key(dst);
-                        let dst_is_pointer = pointer_vars.contains(&dst_key);
-                        let any_source_pointer = sources
-                            .iter()
-                            .any(|src| pointer_vars.contains(&ssa_var_key(src)));
-
-                        if any_source_pointer {
-                            changed |= pointer_vars.insert(dst_key.clone());
-                        }
-                        if dst_is_pointer {
-                            for src in sources {
-                                changed |= pointer_vars.insert(ssa_var_key(src));
-                            }
-                        }
-                    }
-                    r2ssa::SSAOp::Copy { dst, src }
-                    | r2ssa::SSAOp::Cast { dst, src }
-                    | r2ssa::SSAOp::New { dst, src } => {
-                        let dst_key = ssa_var_key(dst);
-                        let src_key = ssa_var_key(src);
-                        if pointer_vars.contains(&dst_key) {
-                            changed |= pointer_vars.insert(src_key.clone());
-                        }
-                        if pointer_vars.contains(&src_key) {
-                            changed |= pointer_vars.insert(dst_key);
-                        }
-                    }
-                    r2ssa::SSAOp::IntAdd { dst, a, b } | r2ssa::SSAOp::IntSub { dst, a, b } => {
-                        let dst_key = ssa_var_key(dst);
-                        let a_key = ssa_var_key(a);
-                        let b_key = ssa_var_key(b);
-                        let a_is_const = ssa_var_is_const(a);
-                        let b_is_const = ssa_var_is_const(b);
-                        let a_index_like = index_like_vars.contains(&a_key);
-                        let b_index_like = index_like_vars.contains(&b_key);
-
-                        if pointer_vars.contains(&dst_key) {
-                            if a_is_const && !b_is_const {
-                                changed |= pointer_vars.insert(b_key.clone());
-                            } else if b_is_const && !a_is_const {
-                                changed |= pointer_vars.insert(a_key.clone());
-                            } else if a_index_like && !b_index_like {
-                                changed |= pointer_vars.insert(b_key.clone());
-                            } else if b_index_like && !a_index_like {
-                                changed |= pointer_vars.insert(a_key.clone());
-                            } else if a_index_like && b_index_like {
-                                let a_is_tmp = a.name.starts_with("tmp:");
-                                let b_is_tmp = b.name.starts_with("tmp:");
-                                if a_is_tmp && !b_is_tmp {
-                                    changed |= pointer_vars.insert(b_key.clone());
-                                } else if b_is_tmp && !a_is_tmp {
-                                    changed |= pointer_vars.insert(a_key.clone());
-                                }
-                            }
-                        }
-
-                        if pointer_vars.contains(&a_key) && b_is_const {
-                            changed |= pointer_vars.insert(dst_key.clone());
-                        }
-                        if pointer_vars.contains(&b_key) && a_is_const {
-                            changed |= pointer_vars.insert(dst_key.clone());
-                        }
-                        if pointer_vars.contains(&a_key) && index_like_vars.contains(&b_key) {
-                            changed |= pointer_vars.insert(dst_key.clone());
-                        }
-                        if pointer_vars.contains(&b_key) && index_like_vars.contains(&a_key) {
-                            changed |= pointer_vars.insert(dst_key.clone());
-                        }
-                    }
-                    r2ssa::SSAOp::PtrAdd { dst, base, .. }
-                    | r2ssa::SSAOp::PtrSub { dst, base, .. } => {
-                        let dst_key = ssa_var_key(dst);
-                        let base_key = ssa_var_key(base);
-                        if pointer_vars.contains(&dst_key) {
-                            changed |= pointer_vars.insert(base_key.clone());
-                        }
-                        if pointer_vars.contains(&base_key) {
-                            changed |= pointer_vars.insert(dst_key);
-                        }
-                    }
-                    r2ssa::SSAOp::SegmentOp { dst, offset, .. } => {
-                        let dst_key = ssa_var_key(dst);
-                        let offset_key = ssa_var_key(offset);
-                        if pointer_vars.contains(&dst_key) {
-                            changed |= pointer_vars.insert(offset_key.clone());
-                        }
-                        if pointer_vars.contains(&offset_key) {
-                            changed |= pointer_vars.insert(dst_key);
-                        }
-                    }
-                    r2ssa::SSAOp::Store { addr, val, .. } => {
-                        if let Some(slot) =
-                            stack_addr_slots.get(&ssa_var_block_key(block.addr, addr))
-                        {
-                            let val_key = ssa_var_key(val);
-                            if val.size >= pointer_width && pointer_vars.contains(&val_key) {
-                                changed |= pointer_stack_slots.insert(slot.clone());
-                            }
-                            if val.size >= pointer_width && pointer_stack_slots.contains(slot) {
-                                changed |= pointer_vars.insert(val_key);
-                            }
-                        }
-                    }
-                    r2ssa::SSAOp::Load { dst, addr, .. } => {
-                        if let Some(slot) =
-                            stack_addr_slots.get(&ssa_var_block_key(block.addr, addr))
-                        {
-                            let dst_key = ssa_var_key(dst);
-                            if dst.size >= pointer_width && pointer_stack_slots.contains(slot) {
-                                changed |= pointer_vars.insert(dst_key.clone());
-                            }
-                            if dst.size >= pointer_width && pointer_vars.contains(&dst_key) {
-                                changed |= pointer_stack_slots.insert(slot.clone());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        for reg_keys in register_versions.values() {
-            if reg_keys.iter().any(|key| pointer_vars.contains(key)) {
-                for key in reg_keys {
-                    changed |= pointer_vars.insert(key.clone());
-                }
-            }
-        }
-    }
-
-    pointer_vars
-}
-
-fn merge_width_hint(
-    width_hints: &mut std::collections::HashMap<String, u32>,
-    var: &r2ssa::SSAVar,
-    bits: u32,
-) {
-    let entry = width_hints.entry(ssa_var_key(var)).or_insert(0);
-    *entry = (*entry).max(bits.max(var.size.saturating_mul(8)));
-}
-
-fn mark_scalar_var(
-    vars: &mut std::collections::HashSet<String>,
-    width_hints: &mut std::collections::HashMap<String, u32>,
-    var: &r2ssa::SSAVar,
-) {
-    vars.insert(ssa_var_key(var));
-    merge_width_hint(width_hints, var, var.size.saturating_mul(8));
-}
-
-fn infer_scalar_var_evidence_from_ssa(
-    ssa_blocks: &[r2ssa::SSABlock],
-) -> (
-    std::collections::HashSet<String>,
-    std::collections::HashSet<String>,
-    std::collections::HashSet<String>,
-    std::collections::HashMap<String, u32>,
-) {
-    use std::collections::{HashMap, HashSet};
-
-    let register_versions = collect_register_version_keys(ssa_blocks);
-    let mut scalar_proven: HashSet<String> = HashSet::new();
-    let mut scalar_likely: HashSet<String> = HashSet::new();
-    let mut bool_like: HashSet<String> = HashSet::new();
-    let mut width_hints: HashMap<String, u32> = HashMap::new();
-
-    for block in ssa_blocks {
-        for op in &block.ops {
-            match op {
-                r2ssa::SSAOp::IntMult { a, b, .. }
-                | r2ssa::SSAOp::IntDiv { a, b, .. }
-                | r2ssa::SSAOp::IntSDiv { a, b, .. }
-                | r2ssa::SSAOp::IntRem { a, b, .. }
-                | r2ssa::SSAOp::IntSRem { a, b, .. }
-                | r2ssa::SSAOp::IntAnd { a, b, .. }
-                | r2ssa::SSAOp::IntOr { a, b, .. }
-                | r2ssa::SSAOp::IntXor { a, b, .. }
-                | r2ssa::SSAOp::IntLeft { a, b, .. }
-                | r2ssa::SSAOp::IntRight { a, b, .. }
-                | r2ssa::SSAOp::IntSRight { a, b, .. }
-                | r2ssa::SSAOp::IntCarry { a, b, .. }
-                | r2ssa::SSAOp::IntSCarry { a, b, .. }
-                | r2ssa::SSAOp::IntSBorrow { a, b, .. } => {
-                    mark_scalar_var(&mut scalar_proven, &mut width_hints, a);
-                    mark_scalar_var(&mut scalar_proven, &mut width_hints, b);
-                }
-                r2ssa::SSAOp::IntNegate { src, .. }
-                | r2ssa::SSAOp::IntNot { src, .. }
-                | r2ssa::SSAOp::PopCount { src, .. }
-                | r2ssa::SSAOp::Lzcount { src, .. } => {
-                    mark_scalar_var(&mut scalar_proven, &mut width_hints, src);
-                }
-                r2ssa::SSAOp::PtrAdd { index, .. } | r2ssa::SSAOp::PtrSub { index, .. } => {
-                    mark_scalar_var(&mut scalar_proven, &mut width_hints, index);
-                }
-                r2ssa::SSAOp::IntAdd { a, b, .. } | r2ssa::SSAOp::IntSub { a, b, .. } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, a);
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, b);
-                }
-                r2ssa::SSAOp::BoolNot { dst, src } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, src);
-                    bool_like.insert(ssa_var_key(src));
-                    bool_like.insert(ssa_var_key(dst));
-                    merge_width_hint(&mut width_hints, dst, 1);
-                }
-                r2ssa::SSAOp::CBranch { cond, .. }
-                | r2ssa::SSAOp::LoadGuarded { guard: cond, .. }
-                | r2ssa::SSAOp::StoreGuarded { guard: cond, .. } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, cond);
-                    bool_like.insert(ssa_var_key(cond));
-                    merge_width_hint(&mut width_hints, cond, 1);
-                }
-                r2ssa::SSAOp::FloatNeg { src, .. }
-                | r2ssa::SSAOp::FloatAbs { src, .. }
-                | r2ssa::SSAOp::FloatSqrt { src, .. }
-                | r2ssa::SSAOp::Cast { src, .. } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, src);
-                }
-                r2ssa::SSAOp::IntEqual { dst, a, b }
-                | r2ssa::SSAOp::IntNotEqual { dst, a, b }
-                | r2ssa::SSAOp::IntLess { dst, a, b }
-                | r2ssa::SSAOp::IntSLess { dst, a, b }
-                | r2ssa::SSAOp::IntLessEqual { dst, a, b }
-                | r2ssa::SSAOp::IntSLessEqual { dst, a, b }
-                | r2ssa::SSAOp::FloatEqual { dst, a, b }
-                | r2ssa::SSAOp::FloatNotEqual { dst, a, b }
-                | r2ssa::SSAOp::FloatLess { dst, a, b }
-                | r2ssa::SSAOp::FloatLessEqual { dst, a, b } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, a);
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, b);
-                    bool_like.insert(ssa_var_key(dst));
-                    merge_width_hint(&mut width_hints, dst, 1);
-                }
-                r2ssa::SSAOp::BoolAnd { dst, a, b }
-                | r2ssa::SSAOp::BoolOr { dst, a, b }
-                | r2ssa::SSAOp::BoolXor { dst, a, b } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, a);
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, b);
-                    bool_like.insert(ssa_var_key(a));
-                    bool_like.insert(ssa_var_key(b));
-                    bool_like.insert(ssa_var_key(dst));
-                    merge_width_hint(&mut width_hints, dst, 1);
-                }
-                r2ssa::SSAOp::IntZExt { dst, src } | r2ssa::SSAOp::IntSExt { dst, src } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, src);
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, dst);
-                    merge_width_hint(&mut width_hints, dst, dst.size.saturating_mul(8));
-                }
-                r2ssa::SSAOp::Subpiece { dst, src, .. } => {
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, src);
-                    mark_scalar_var(&mut scalar_likely, &mut width_hints, dst);
-                    merge_width_hint(&mut width_hints, dst, dst.size.saturating_mul(8));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in ssa_blocks {
-            for op in &block.ops {
-                match op {
-                    r2ssa::SSAOp::IntAdd { dst, a, b }
-                    | r2ssa::SSAOp::IntSub { dst, a, b }
-                    | r2ssa::SSAOp::IntMult { dst, a, b }
-                    | r2ssa::SSAOp::IntDiv { dst, a, b }
-                    | r2ssa::SSAOp::IntSDiv { dst, a, b }
-                    | r2ssa::SSAOp::IntRem { dst, a, b }
-                    | r2ssa::SSAOp::IntSRem { dst, a, b }
-                    | r2ssa::SSAOp::IntAnd { dst, a, b }
-                    | r2ssa::SSAOp::IntOr { dst, a, b }
-                    | r2ssa::SSAOp::IntXor { dst, a, b }
-                    | r2ssa::SSAOp::IntLeft { dst, a, b }
-                    | r2ssa::SSAOp::IntRight { dst, a, b }
-                    | r2ssa::SSAOp::IntSRight { dst, a, b } => {
-                        let dst_key = ssa_var_key(dst);
-                        let a_key = ssa_var_key(a);
-                        let b_key = ssa_var_key(b);
-                        let any_proven =
-                            scalar_proven.contains(&a_key) || scalar_proven.contains(&b_key);
-                        let any_likely = scalar_likely.contains(&a_key)
-                            || scalar_likely.contains(&b_key)
-                            || any_proven;
-                        if any_proven {
-                            changed |= scalar_proven.insert(dst_key.clone());
-                        }
-                        if any_likely {
-                            changed |= scalar_likely.insert(dst_key.clone());
-                        }
-
-                        let operand_bits = [a, b]
-                            .into_iter()
-                            .filter(|var| !ssa_var_is_const(var))
-                            .filter_map(|var| width_hints.get(&ssa_var_key(var)).copied())
-                            .filter(|bits| *bits > 0)
-                            .max()
-                            .unwrap_or(0);
-                        if operand_bits > 0 {
-                            let entry = width_hints.entry(dst_key).or_insert(0);
-                            if operand_bits > *entry {
-                                *entry = operand_bits;
-                                changed = true;
-                            }
-                        }
-                    }
-                    r2ssa::SSAOp::Phi { dst, sources } => {
-                        let dst_key = ssa_var_key(dst);
-                        let any_proven = sources
-                            .iter()
-                            .any(|src| scalar_proven.contains(&ssa_var_key(src)));
-                        let any_likely = sources
-                            .iter()
-                            .any(|src| scalar_likely.contains(&ssa_var_key(src)));
-                        let any_bool = sources
-                            .iter()
-                            .any(|src| bool_like.contains(&ssa_var_key(src)));
-
-                        if any_proven {
-                            changed |= scalar_proven.insert(dst_key.clone());
-                        }
-                        if any_likely || any_proven {
-                            changed |= scalar_likely.insert(dst_key.clone());
-                        }
-                        if any_bool {
-                            changed |= bool_like.insert(dst_key.clone());
-                        }
-                        let max_bits = sources
-                            .iter()
-                            .filter_map(|src| width_hints.get(&ssa_var_key(src)).copied())
-                            .max()
-                            .unwrap_or(0);
-                        if max_bits > 0 {
-                            let entry = width_hints.entry(dst_key).or_insert(0);
-                            if max_bits > *entry {
-                                *entry = max_bits;
-                                changed = true;
-                            }
-                        }
-                    }
-                    r2ssa::SSAOp::Copy { dst, src }
-                    | r2ssa::SSAOp::Cast { dst, src }
-                    | r2ssa::SSAOp::New { dst, src } => {
-                        let dst_key = ssa_var_key(dst);
-                        let src_key = ssa_var_key(src);
-                        if scalar_proven.contains(&src_key) {
-                            changed |= scalar_proven.insert(dst_key.clone());
-                        }
-                        if scalar_likely.contains(&src_key) || scalar_proven.contains(&src_key) {
-                            changed |= scalar_likely.insert(dst_key.clone());
-                        }
-                        if bool_like.contains(&src_key) {
-                            changed |= bool_like.insert(dst_key.clone());
-                        }
-                        let bits = width_hints.get(&src_key).copied().unwrap_or(0);
-                        if bits > 0 {
-                            let entry = width_hints.entry(dst_key).or_insert(0);
-                            if bits > *entry {
-                                *entry = bits;
-                                changed = true;
-                            }
-                        }
-                    }
-                    r2ssa::SSAOp::IntZExt { dst, src }
-                    | r2ssa::SSAOp::IntSExt { dst, src }
-                    | r2ssa::SSAOp::Subpiece { dst, src, .. } => {
-                        let dst_key = ssa_var_key(dst);
-                        let src_key = ssa_var_key(src);
-                        if scalar_likely.contains(&src_key) || scalar_proven.contains(&src_key) {
-                            changed |= scalar_likely.insert(dst_key.clone());
-                        }
-                        if bool_like.contains(&src_key) {
-                            changed |= bool_like.insert(dst_key.clone());
-                        }
-                        let entry = width_hints.entry(dst_key).or_insert(0);
-                        let bits = dst.size.saturating_mul(8);
-                        if bits > *entry {
-                            *entry = bits;
-                            changed = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        for reg_keys in register_versions.values() {
-            let any_proven = reg_keys.iter().any(|key| scalar_proven.contains(key));
-            let any_likely = reg_keys.iter().any(|key| scalar_likely.contains(key));
-            let any_bool = reg_keys.iter().any(|key| bool_like.contains(key));
-            let max_bits = reg_keys
-                .iter()
-                .filter_map(|key| width_hints.get(key).copied())
-                .max()
-                .unwrap_or(0);
-            let min_bits = reg_keys
-                .iter()
-                .filter_map(|key| width_hints.get(key).copied())
-                .filter(|bits| *bits > 0)
-                .min()
-                .unwrap_or(0);
-            let preferred_bits = if min_bits > 0 && max_bits == 64 && min_bits <= 32 {
-                min_bits
-            } else {
-                max_bits
-            };
-            for key in reg_keys {
-                if any_proven {
-                    changed |= scalar_proven.insert(key.clone());
-                }
-                if any_likely || any_proven {
-                    changed |= scalar_likely.insert(key.clone());
-                }
-                if any_bool {
-                    changed |= bool_like.insert(key.clone());
-                }
-                if preferred_bits > 0 {
-                    let entry = width_hints.entry(key.clone()).or_insert(0);
-                    if preferred_bits > *entry {
-                        *entry = preferred_bits;
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-
-    (scalar_proven, scalar_likely, bool_like, width_hints)
-}
-
+#[cfg(test)]
 pub(crate) fn collect_signature_type_evidence_context(
     ssa_blocks: &[r2ssa::SSABlock],
-) -> crate::SignatureTypeEvidenceContext {
-    let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks);
-    let (scalar_proven_vars, scalar_likely_vars, bool_like_vars, mut width_bits) =
-        infer_scalar_var_evidence_from_ssa(ssa_blocks);
-    let register_versions = collect_register_version_keys(ssa_blocks);
-    normalize_register_family_width_hints(&register_versions, &mut width_bits);
-    propagate_normalized_scalar_result_widths(ssa_blocks, &mut width_bits);
-    normalize_register_family_width_hints(&register_versions, &mut width_bits);
-    crate::SignatureTypeEvidenceContext {
-        pointer_vars,
-        scalar_proven_vars,
-        scalar_likely_vars,
-        bool_like_vars,
-        width_bits,
-    }
+) -> r2types::SignatureTypeEvidenceContext {
+    r2types::collect_signature_type_evidence_context(ssa_blocks)
 }
 
-fn infer_usage_register_type_hints(
-    ssa_blocks: &[r2ssa::SSABlock],
-) -> (
-    std::collections::HashMap<String, TypeHint>,
-    std::collections::HashSet<String>,
-) {
-    let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks);
-    let mut hints = std::collections::HashMap::new();
-
-    for block in ssa_blocks {
-        for op in &block.ops {
-            let mut maybe_add = |var: &r2ssa::SSAVar| {
-                let key = ssa_var_key(var);
-                if !pointer_vars.contains(&key) || !ssa_var_is_register_like(&var.name) {
-                    return;
-                }
-                merge_type_hint(
-                    &mut hints,
-                    var.name.to_ascii_lowercase(),
-                    TypeHint::pointer(),
-                );
-            };
-
-            if let Some(dst) = op.dst() {
-                maybe_add(dst);
-            }
-            op.for_each_source(&mut maybe_add);
-        }
-    }
-
-    (hints, pointer_vars)
-}
-
-fn strongest_hint_for_aliases(
-    hints: &std::collections::HashMap<String, TypeHint>,
-    canonical: &str,
-    aliases: &[&str],
-) -> Option<TypeHint> {
-    let mut best = hints.get(canonical).cloned();
-    for alias in aliases {
-        if let Some(candidate) = hints.get(*alias).cloned() {
-            match &best {
-                Some(current) if !incoming_hint_should_replace(current, &candidate) => {}
-                _ => best = Some(candidate),
-            }
-        }
-    }
-    best
-}
-
-fn width_hint_key_matches_family(key: &str, family: &str) -> bool {
-    let Some((name, _version)) = key.rsplit_once('_') else {
-        return false;
-    };
-    scalar_register_family_key(name) == family
-}
-
-fn width_hint_key_matches_family_version(key: &str, family: &str, version: u32) -> bool {
-    let Some((name, version_str)) = key.rsplit_once('_') else {
-        return false;
-    };
-    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
-}
-
-fn recovered_arg_family_width_hint(
-    evidence: &crate::SignatureTypeEvidenceContext,
-    src: &r2ssa::SSAVar,
-) -> Option<u32> {
-    let family = scalar_register_family_key(&src.name);
-    evidence
-        .width_bits
-        .iter()
-        .filter(|(key, bits)| {
-            **bits > 0 && width_hint_key_matches_family_version(key, &family, src.version)
-        })
-        .map(|(_, bits)| *bits)
-        .min()
-        .or_else(|| {
-            evidence
-                .width_bits
-                .iter()
-                .filter(|(key, bits)| **bits > 0 && width_hint_key_matches_family(key, &family))
-                .map(|(_, bits)| *bits)
-                .min()
-        })
-}
-
-fn recovered_arg_type_hint(
-    reg_type_hints: &std::collections::HashMap<String, TypeHint>,
-    canonical: &str,
-    aliases: &[&str],
-    src: &r2ssa::SSAVar,
-    signature_evidence: Option<&crate::SignatureTypeEvidenceContext>,
-) -> Option<String> {
-    let best_hint = strongest_hint_for_aliases(reg_type_hints, canonical, aliases);
-    if let Some(hint) = best_hint.as_ref()
-        && hint.rank == TypeHintRank::Pointer
-    {
-        return Some(hint.ty.clone());
-    }
-    if let Some(evidence) = signature_evidence
-        && let Some(bits) = recovered_arg_family_width_hint(evidence, src)
-    {
-        return Some(size_to_type(bits.div_ceil(8)));
-    }
-    best_hint.map(|hint| hint.ty)
-}
-
+#[cfg(test)]
 pub(crate) fn merge_register_type_hints(
     metadata_hints: &std::collections::HashMap<String, TypeHint>,
     usage_hints: &std::collections::HashMap<String, TypeHint>,
@@ -3064,7 +1140,14 @@ pub(crate) fn merge_register_type_hints(
     }
 
     for (canonical, aliases) in arg_regs {
-        if let Some(best) = strongest_hint_for_aliases(&merged, canonical, aliases) {
+        let candidates: Vec<TypeHint> = std::iter::once(*canonical)
+            .chain(aliases.iter().copied())
+            .filter_map(|name| merged.get(name).cloned())
+            .collect();
+        if let Some(best) = candidates
+            .into_iter()
+            .max_by(|a, b| a.rank.cmp(&b.rank).then_with(|| b.ty.cmp(&a.ty)))
+        {
             merge_type_hint(&mut merged, (*canonical).to_string(), best.clone());
             for alias in *aliases {
                 merge_type_hint(&mut merged, alias.to_string(), best.clone());
@@ -3076,16 +1159,10 @@ pub(crate) fn merge_register_type_hints(
 }
 
 pub(crate) fn collect_pointer_arg_slots(vars: &[VarProt]) -> std::collections::BTreeSet<usize> {
-    vars.iter()
-        .filter(|var| var.kind == "r" && var.isarg && var.var_type.contains('*'))
-        .filter_map(|var| {
-            var.name
-                .strip_prefix("arg")
-                .and_then(|idx| idx.parse::<usize>().ok())
-        })
-        .collect()
+    r2types::collect_pointer_arg_slots(vars)
 }
 
+#[cfg(test)]
 pub(crate) fn merge_pointer_slot_evidence(
     inferred_params: &mut [InferredParam],
     pointer_arg_slots: &std::collections::BTreeSet<usize>,
@@ -3116,140 +1193,15 @@ pub(crate) fn recover_vars_from_ssa(
     metadata_reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     semantic_typing_enabled: bool,
 ) -> Vec<VarProt> {
-    use std::collections::{HashMap, HashSet};
-
-    let mut vars = Vec::new();
-    let mut seen_slots: HashMap<(bool, i64), usize> = HashMap::new();
-    let mut seen_arg_regs: HashSet<String> = HashSet::new();
-    let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(arch);
-    let signature_evidence =
-        semantic_typing_enabled.then(|| collect_signature_type_evidence_context(ssa_blocks));
-    let (usage_reg_type_hints, pointer_var_keys) = if semantic_typing_enabled {
-        infer_usage_register_type_hints(ssa_blocks)
-    } else {
-        (HashMap::new(), HashSet::new())
-    };
-    let reg_type_hints = if semantic_typing_enabled {
-        merge_register_type_hints(metadata_reg_type_hints, &usage_reg_type_hints, arg_regs)
-    } else {
-        HashMap::new()
-    };
-
-    let mut stack_addr_temps: HashMap<String, (String, i64)> = HashMap::new();
-
-    for block in ssa_blocks {
-        for op in &block.ops {
-            match op {
-                r2ssa::SSAOp::IntAdd { dst, a, b } | r2ssa::SSAOp::IntSub { dst, a, b } => {
-                    let a_name = a.name.to_lowercase();
-                    let b_name = b.name.to_lowercase();
-
-                    let is_a_base = stack_bases.contains(&a_name.as_str());
-                    let is_b_const = b_name.starts_with("const:");
-
-                    if is_a_base && is_b_const {
-                        if let Some(raw_offset) = parse_const_value(&b.name) {
-                            let offset = if matches!(op, r2ssa::SSAOp::IntSub { .. }) {
-                                -(raw_offset as i64)
-                            } else {
-                                raw_offset as i64
-                            };
-                            let dst_key = ssa_var_block_key(block.addr, dst);
-                            stack_addr_temps.insert(dst_key, (a_name.clone(), offset));
-                        }
-                    } else if stack_bases.contains(&b_name.as_str())
-                        && a_name.starts_with("const:")
-                        && let Some(raw_offset) = parse_const_value(&a.name)
-                    {
-                        let offset = raw_offset as i64;
-                        let dst_key = ssa_var_block_key(block.addr, dst);
-                        stack_addr_temps.insert(dst_key, (b_name.clone(), offset));
-                    }
-                }
-                r2ssa::SSAOp::Store { addr, val, .. } => {
-                    let addr_key = ssa_var_block_key(block.addr, addr);
-                    if let Some((base_reg, offset)) = stack_addr_temps.get(&addr_key) {
-                        let type_override = if semantic_typing_enabled
-                            && pointer_var_keys.contains(&ssa_var_key(val))
-                        {
-                            Some("void *".to_string())
-                        } else {
-                            None
-                        };
-                        add_stack_var(
-                            &mut vars,
-                            &mut seen_slots,
-                            base_reg,
-                            frame_bases,
-                            *offset,
-                            val.size,
-                            type_override,
-                        );
-                    }
-                }
-                r2ssa::SSAOp::Load { dst, addr, .. } => {
-                    let addr_key = ssa_var_block_key(block.addr, addr);
-                    if let Some((base_reg, offset)) = stack_addr_temps.get(&addr_key) {
-                        let type_override = if semantic_typing_enabled
-                            && pointer_var_keys.contains(&ssa_var_key(dst))
-                        {
-                            Some("void *".to_string())
-                        } else {
-                            None
-                        };
-                        add_stack_var(
-                            &mut vars,
-                            &mut seen_slots,
-                            base_reg,
-                            frame_bases,
-                            *offset,
-                            dst.size,
-                            type_override,
-                        );
-                    }
-                }
-                _ => {}
-            }
-
-            for src in op.sources() {
-                let base_name = src.name.to_lowercase();
-                if src.version == 0 {
-                    for (i, (canonical, aliases)) in arg_regs.iter().enumerate() {
-                        if aliases.contains(&base_name.as_str())
-                            && !seen_arg_regs.contains(*canonical)
-                        {
-                            seen_arg_regs.insert(canonical.to_string());
-                            let hinted_type = if semantic_typing_enabled {
-                                recovered_arg_type_hint(
-                                    &reg_type_hints,
-                                    canonical,
-                                    aliases,
-                                    src,
-                                    signature_evidence.as_ref(),
-                                )
-                            } else {
-                                None
-                            };
-                            vars.push(VarProt {
-                                name: format!("arg{}", i),
-                                kind: "r".to_string(),
-                                delta: 0,
-                                var_type: hinted_type.unwrap_or_else(|| size_to_type(src.size)),
-                                isarg: true,
-                                reg: Some(canonical.to_string()),
-                            });
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    vars.sort_by_key(|v| v.delta);
-    vars
+    r2types::recover_vars_from_ssa(
+        ssa_blocks,
+        arch.map(|spec| spec.name.as_str()),
+        metadata_reg_type_hints,
+        semantic_typing_enabled,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn add_stack_var(
     vars: &mut Vec<VarProt>,
     seen_slots: &mut std::collections::HashMap<(bool, i64), usize>,
@@ -3313,14 +1265,9 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     u64::from_str_radix(val_str, 16).ok()
 }
 
+#[cfg(test)]
 pub(crate) fn size_to_type(size: u32) -> String {
-    match size {
-        1 => "int8_t".to_string(),
-        2 => "int16_t".to_string(),
-        4 => "int32_t".to_string(),
-        8 => "int64_t".to_string(),
-        _ => format!("byte[{}]", size),
-    }
+    r2types::size_to_type(size)
 }
 
 fn parse_const_addr(name: &str) -> Option<u64> {

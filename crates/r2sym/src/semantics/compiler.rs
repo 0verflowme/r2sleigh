@@ -50,6 +50,20 @@ fn residual_reasons(
     reasons
 }
 
+fn normalized_residual_reasons(
+    mode: SemanticMode,
+    reasons: Vec<ResidualReason>,
+) -> Vec<ResidualReason> {
+    if matches!(mode, SemanticMode::IslandCompiled | SemanticMode::VmSummary) {
+        reasons
+            .into_iter()
+            .filter(|reason| !matches!(reason, ResidualReason::LargeCfg))
+            .collect()
+    } else {
+        reasons
+    }
+}
+
 fn semantic_mode_for(
     helper_functions: usize,
     derived_summaries: usize,
@@ -67,6 +81,9 @@ fn semantic_mode_for(
     if derived_summaries > 0 && !facts.diagnostics.skipped_large_cfg {
         return SemanticMode::Compiled;
     }
+    if facts.diagnostics.skipped_large_cfg && has_island_compiled_semantics(facts) {
+        return SemanticMode::IslandCompiled;
+    }
     if helper_functions > 0
         || facts.diagnostics.skipped_large_cfg
         || diagnostics.budget_exhausted > 0
@@ -80,29 +97,93 @@ fn semantic_mode_for(
     SemanticMode::Raw
 }
 
+fn worker_island_supports_actionable_semantics(
+    island: &super::facts::SymbolicWorkerIsland,
+) -> bool {
+    let supporting_condition = worker_island_supporting_compiled_condition(island);
+    let has_unique_target =
+        island.exact_reachable_target().is_some() || island.actionable_reachable_target().is_some();
+    let has_condition = supporting_condition.is_some();
+    let has_memory_support = !island.actionable_memory_terms().is_empty()
+        || supporting_condition.is_some_and(|compiled| !compiled.memory_terms.is_empty());
+    island.evidence.allows_narrowing() && has_unique_target && has_condition && has_memory_support
+}
+
+fn worker_island_supports_structured_semantics(
+    island: &super::facts::SymbolicWorkerIsland,
+) -> bool {
+    let supporting_condition = worker_island_supporting_compiled_condition(island);
+    worker_island_supports_actionable_semantics(island)
+        && supporting_condition.is_some_and(|compiled| {
+            !matches!(
+                compiled.precision,
+                crate::backward::BackwardConditionPrecision::ResidualSearchRequired
+            )
+        })
+}
+
+fn worker_island_supporting_compiled_condition(
+    island: &super::facts::SymbolicWorkerIsland,
+) -> Option<&crate::backward::BackwardConditionSummary> {
+    let reachable_target = island
+        .exact_reachable_target()
+        .or_else(|| island.actionable_reachable_target())?;
+    island
+        .control_facts
+        .iter()
+        .find(|fact| fact.target == reachable_target)
+        .and_then(super::facts::SymbolicControlFact::actionable_compiled_condition)
+}
+
+fn has_island_compiled_semantics(facts: &SymbolicFunctionFacts) -> bool {
+    facts
+        .worker_islands
+        .iter()
+        .any(worker_island_supports_actionable_semantics)
+        || facts.branch_facts.iter().any(|fact| {
+            fact.actionable_compiled_condition().is_some()
+                && (fact.exact_reachable_target().is_some()
+                    || fact.actionable_reachable_target().is_some())
+                && (!facts
+                    .actionable_memory_terms_for_block(fact.block_addr)
+                    .is_empty()
+                    || fact
+                        .actionable_compiled_condition()
+                        .is_some_and(|compiled| !compiled.memory_terms.is_empty()))
+        })
+}
+
+fn has_structured_worker_semantics(facts: &SymbolicFunctionFacts) -> bool {
+    facts
+        .worker_islands
+        .iter()
+        .any(worker_island_supports_structured_semantics)
+}
+
 fn semantic_capability(mode: SemanticMode, facts: &SymbolicFunctionFacts) -> SemanticCapability {
     let has_bounded_branch_facts = !facts.branch_facts.is_empty();
-    let has_actionable_branch_frontier = facts
-        .branch_facts
-        .iter()
-        .any(|fact| fact.true_compiled.is_some() || fact.false_compiled.is_some());
-    let has_actionable_control_islands = facts
-        .control_islands
-        .iter()
-        .any(|island| island.actionable_compiled_condition().is_some());
-    let large_cfg_actionable_decompile = facts.diagnostics.skipped_large_cfg
-        && (has_actionable_branch_frontier || has_actionable_control_islands)
-        && facts.branch_facts.len() <= 4;
+    let large_cfg_semantic_decompile =
+        facts.diagnostics.skipped_large_cfg && has_island_compiled_semantics(facts);
+    let large_cfg_structured_decompile =
+        facts.diagnostics.skipped_large_cfg && has_structured_worker_semantics(facts);
     match mode {
         SemanticMode::Raw | SemanticMode::Compiled => SemanticCapability {
             query_ready: true,
             type_ready: true,
             decompile_ready: true,
         },
+        SemanticMode::IslandCompiled => SemanticCapability {
+            query_ready: true,
+            type_ready: true,
+            decompile_ready: large_cfg_semantic_decompile,
+        },
         SemanticMode::Residual => SemanticCapability {
             query_ready: true,
-            type_ready: !facts.diagnostics.skipped_large_cfg || has_bounded_branch_facts,
-            decompile_ready: large_cfg_actionable_decompile,
+            type_ready: !facts.diagnostics.skipped_large_cfg
+                || has_bounded_branch_facts
+                || !facts.worker_islands.is_empty()
+                || !facts.memory_islands.is_empty(),
+            decompile_ready: large_cfg_structured_decompile,
         },
         SemanticMode::VmSummary => SemanticCapability {
             query_ready: true,
@@ -231,11 +312,14 @@ fn compile_function_semantics_uncached(
                 mode,
                 slice_class,
                 capability: semantic_capability(mode, &symbolic_facts),
-                residual_reasons: residual_reasons(
-                    &derived_diagnostics,
-                    &symbolic_facts,
-                    interpreter.is_some(),
-                    vm_step.is_some(),
+                residual_reasons: normalized_residual_reasons(
+                    mode,
+                    residual_reasons(
+                        &derived_diagnostics,
+                        &symbolic_facts,
+                        interpreter.is_some(),
+                        vm_step.is_some(),
+                    ),
                 ),
                 closure_functions,
                 helper_functions,
@@ -297,11 +381,14 @@ fn compile_function_semantics_uncached(
         mode,
         slice_class,
         capability: semantic_capability(mode, &symbolic_facts),
-        residual_reasons: residual_reasons(
-            &derived_diagnostics,
-            &symbolic_facts,
-            interpreter.is_some(),
-            vm_step.is_some(),
+        residual_reasons: normalized_residual_reasons(
+            mode,
+            residual_reasons(
+                &derived_diagnostics,
+                &symbolic_facts,
+                interpreter.is_some(),
+                vm_step.is_some(),
+            ),
         ),
         closure_functions,
         helper_functions,
@@ -397,6 +484,23 @@ pub fn compile_semantic_artifact_with_scope(
     summary_profile: SummaryProfile,
 ) -> CompiledSemanticArtifact {
     compile_function_semantics_with_scope(ctx, func, scope, arch, symbol_map, summary_profile)
+}
+
+pub fn compile_semantic_artifact_default_with_scope(
+    ctx: &Context,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    arch: Option<&ArchSpec>,
+) -> CompiledSemanticArtifact {
+    let rebound_scope = scope.and_then(|scope| scope.with_prepared_root(func));
+    compile_semantic_artifact_with_scope(
+        ctx,
+        func,
+        rebound_scope.as_ref(),
+        arch,
+        &HashMap::new(),
+        SummaryProfile::Default,
+    )
 }
 
 #[cfg(test)]
@@ -947,6 +1051,15 @@ mod tests {
                 .get(&0x3008)
                 .is_some_and(|updates| !updates.is_empty())
         );
+        assert!(
+            vm_step
+                .handler_state_updates
+                .get(&0x3008)
+                .is_some_and(|updates| updates.iter().any(|update| {
+                    update.exact
+                        && matches!(update.value, crate::semantics::vm::VmValueExpr::Var(_))
+                }))
+        );
         assert!(vm_step.redispatch_handlers.contains(&0x3008));
         assert!(vm_step.redispatch_handlers.contains(&0x3010));
         assert!(vm_step.redispatch_handlers.contains(&0x3014));
@@ -976,6 +1089,13 @@ mod tests {
                 .iter()
                 .any(|transfer| transfer.handler_target == 0x3008 && transfer.redispatch)
         );
+        assert!(vm_step.transfers.iter().any(|transfer| {
+            transfer.handler_target == 0x3008
+                && transfer.state_updates.iter().any(|update| {
+                    update.exact
+                        && matches!(update.value, crate::semantics::vm::VmValueExpr::Var(_))
+                })
+        }));
         assert!(
             vm_step
                 .transfers
@@ -1067,7 +1187,70 @@ mod tests {
         assert!(artifact.symbolic_facts.diagnostics.skipped_large_cfg);
         assert_eq!(artifact.symbolic_facts.branch_facts.len(), 1);
         assert!(artifact.capability.type_ready);
-        assert!(artifact.capability.decompile_ready);
+        assert!(!artifact.capability.decompile_ready);
         assert_eq!(artifact.symbolic_facts.diagnostics.branches_evaluated, 1);
+    }
+
+    #[test]
+    fn large_cfg_exact_branch_frontier_with_memory_support_is_decompile_ready() {
+        let fact = crate::semantics::facts::SymbolicBranchFact {
+            block_addr: 0x401000,
+            true_target: 0x401010,
+            false_target: 0x401020,
+            true_status: crate::semantics::facts::SymbolicReachabilityStatus::Reachable,
+            false_status: crate::semantics::facts::SymbolicReachabilityStatus::Unreachable,
+            true_condition: Some("flag == 0".to_string()),
+            false_condition: Some("flag != 0".to_string()),
+            true_compiled: Some(crate::backward::BackwardConditionSummary {
+                simplified: "flag == 0".to_string(),
+                terms: vec!["flag == 0".to_string()],
+                memory_terms: vec![crate::backward::BackwardMemoryCondition {
+                    region: crate::backward::BackwardMemoryRegion::Argument { index: 0 },
+                    offset_lo: 0,
+                    offset_hi: 0,
+                    size: 1,
+                    exact_offset: true,
+                    evidence: crate::SemanticEvidence::exact(),
+                    binding: None,
+                    expr: "*arg0".to_string(),
+                    value_expr: Some("0x0:8".to_string()),
+                    exact_value: true,
+                }],
+                backward_memory_substitutions: 0,
+                backward_memory_candidate_enumerations: 0,
+                backward_memory_residual_fallbacks: 0,
+                precision: crate::backward::BackwardConditionPrecision::Exact,
+                supported_paths: 1,
+                total_paths: 1,
+            }),
+            false_compiled: None,
+        };
+        let mut facts = SymbolicFunctionFacts {
+            branch_facts: vec![fact],
+            ..Default::default()
+        };
+        facts.diagnostics.skipped_large_cfg = true;
+
+        let mode = semantic_mode_for(
+            0,
+            0,
+            &DerivedSummaryDiagnostics::default(),
+            &facts,
+            false,
+            false,
+        );
+        assert_eq!(mode, SemanticMode::IslandCompiled);
+        let capability = semantic_capability(mode, &facts);
+        assert!(capability.query_ready);
+        assert!(capability.type_ready);
+        assert!(capability.decompile_ready);
+        let reasons = normalized_residual_reasons(
+            mode,
+            residual_reasons(&DerivedSummaryDiagnostics::default(), &facts, false, false),
+        );
+        assert!(
+            !reasons.contains(&ResidualReason::LargeCfg),
+            "island-compiled workers should keep large_cfg as provenance, not a residual reason"
+        );
     }
 }

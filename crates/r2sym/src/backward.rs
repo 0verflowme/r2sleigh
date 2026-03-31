@@ -49,7 +49,15 @@ impl BackwardConditionSummary {
                     .with_provenance(SemanticEvidenceProvenance::Normalized)
             }
             BackwardConditionPrecision::ResidualSearchRequired => {
-                if self.supported_paths > 0 {
+                if self.supported_paths > 0
+                    && !self.memory_terms.is_empty()
+                    && self.backward_memory_residual_fallbacks == 0
+                {
+                    SemanticEvidence::likely(SemanticEvidenceReason::DerivedFromRanking)
+                        .with_coverage(SemanticEvidenceCoverage::Bounded)
+                        .with_provenance(SemanticEvidenceProvenance::Normalized)
+                        .with_reason(SemanticEvidenceReason::PartialPathCoverage)
+                } else if self.supported_paths > 0 {
                     SemanticEvidence::heuristic(SemanticEvidenceReason::ResidualSearchRequired)
                         .with_coverage(SemanticEvidenceCoverage::Bounded)
                 } else {
@@ -74,25 +82,89 @@ pub struct BackwardMemoryCondition {
     pub offset_hi: i64,
     pub size: u32,
     pub exact_offset: bool,
+    #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
+    pub evidence: SemanticEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
     pub expr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_expr: Option<String>,
+    #[serde(default)]
+    pub exact_value: bool,
 }
 
 impl BackwardMemoryCondition {
     pub fn evidence(&self) -> SemanticEvidence {
-        if self.exact_offset {
-            SemanticEvidence::exact()
-        } else if self.offset_hi >= self.offset_lo && (self.offset_hi - self.offset_lo) <= 8 {
-            SemanticEvidence::likely(SemanticEvidenceReason::DerivedFromRanking)
-                .with_coverage(SemanticEvidenceCoverage::Bounded)
-                .with_provenance(SemanticEvidenceProvenance::Normalized)
+        if self.evidence.is_default_exact() && !self.exact_offset {
+            inferred_memory_term_evidence(
+                &self.region,
+                self.offset_lo,
+                self.offset_hi,
+                self.exact_offset,
+            )
         } else {
-            SemanticEvidence::heuristic(SemanticEvidenceReason::AliasAmbiguity)
-                .with_coverage(SemanticEvidenceCoverage::Bounded)
+            self.evidence.clone()
         }
     }
 
     pub fn confidence(&self) -> SemanticConfidence {
         self.evidence().tier
+    }
+}
+
+fn inferred_memory_term_evidence(
+    region: &BackwardMemoryRegion,
+    offset_lo: i64,
+    offset_hi: i64,
+    exact_offset: bool,
+) -> SemanticEvidence {
+    if exact_offset {
+        SemanticEvidence::exact()
+    } else {
+        let Some(span) = (offset_hi >= offset_lo).then_some(offset_hi - offset_lo) else {
+            return SemanticEvidence::heuristic(SemanticEvidenceReason::AliasAmbiguity)
+                .with_coverage(SemanticEvidenceCoverage::Bounded);
+        };
+
+        let (likely_span, provenance, reason) = match region {
+            BackwardMemoryRegion::Argument { .. } => (
+                16,
+                SemanticEvidenceProvenance::Stable,
+                SemanticEvidenceReason::DerivedFromRanking,
+            ),
+            BackwardMemoryRegion::Region(region) => match region.kind {
+                MemoryRegionKind::Stack | MemoryRegionKind::Global | MemoryRegionKind::Input => (
+                    16,
+                    SemanticEvidenceProvenance::Stable,
+                    SemanticEvidenceReason::DerivedFromRanking,
+                ),
+                MemoryRegionKind::Replay => (
+                    16,
+                    SemanticEvidenceProvenance::Ranked,
+                    SemanticEvidenceReason::ReplayOverlap,
+                ),
+                MemoryRegionKind::Heap => (
+                    12,
+                    SemanticEvidenceProvenance::Ranked,
+                    SemanticEvidenceReason::HeapIdentityWeak,
+                ),
+                MemoryRegionKind::EscapedUnknown => (
+                    8,
+                    SemanticEvidenceProvenance::Unstable,
+                    SemanticEvidenceReason::AliasAmbiguity,
+                ),
+            },
+        };
+
+        if span <= likely_span {
+            SemanticEvidence::likely(reason)
+                .with_coverage(SemanticEvidenceCoverage::Bounded)
+                .with_provenance(provenance)
+        } else {
+            SemanticEvidence::heuristic(reason)
+                .with_coverage(SemanticEvidenceCoverage::Bounded)
+                .with_provenance(provenance)
+        }
     }
 }
 
@@ -107,6 +179,43 @@ pub struct BackwardRegionRef {
 pub enum BackwardMemoryRegion {
     Argument { index: usize },
     Region(BackwardRegionRef),
+}
+
+fn format_backward_memory_location(region: &BackwardMemoryRegion, offset: i64) -> String {
+    match region {
+        BackwardMemoryRegion::Argument { index } => {
+            if offset == 0 {
+                format!("*arg{index}")
+            } else if offset > 0 {
+                format!("*(arg{index} + 0x{:x})", offset as u64)
+            } else {
+                format!("*(arg{index} - 0x{:x})", offset.unsigned_abs())
+            }
+        }
+        BackwardMemoryRegion::Region(region) => {
+            let base = region.name.as_str();
+            if offset == 0 {
+                format!("*{base}")
+            } else if offset > 0 {
+                format!("*({base} + 0x{:x})", offset as u64)
+            } else {
+                format!("*({base} - 0x{:x})", offset.unsigned_abs())
+            }
+        }
+    }
+}
+
+fn backward_memory_term_expr(
+    region: &BackwardMemoryRegion,
+    offset_lo: i64,
+    offset_hi: i64,
+    fallback: &str,
+) -> String {
+    if offset_lo == offset_hi {
+        format_backward_memory_location(region, offset_lo)
+    } else {
+        fallback.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -700,13 +809,22 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         for (region, offsets) in grouped {
             let offset_lo = offsets.iter().copied().min().unwrap_or(0);
             let offset_hi = offsets.iter().copied().max().unwrap_or(0);
+            let exact_offset = offset_lo == offset_hi;
+            let value_expr = value.to_string();
+            let expr = backward_memory_term_expr(&region, offset_lo, offset_hi, &value_expr);
+            let evidence =
+                inferred_memory_term_evidence(&region, offset_lo, offset_hi, exact_offset);
             self.memory_terms.push(BackwardMemoryCondition {
                 region,
                 offset_lo,
                 offset_hi,
                 size,
-                exact_offset: offset_lo == offset_hi,
-                expr: value.to_string(),
+                exact_offset,
+                evidence,
+                binding: None,
+                expr,
+                value_expr: Some(value_expr),
+                exact_value: value.is_concrete(),
             });
         }
         true
@@ -1031,21 +1149,35 @@ where
         .pointers
         .into_iter()
         .find_map(|pointer| {
-            state
-                .memory
-                .region_def(pointer.region_id)
-                .map(|def| BackwardMemoryCondition {
-                    region: BackwardMemoryRegion::Region(BackwardRegionRef {
-                        id: def.id,
-                        kind: def.kind.clone(),
-                        name: def.name.clone(),
-                    }),
-                    offset_lo: i64::try_from(pointer.offset).unwrap_or(0),
-                    offset_hi: i64::try_from(pointer.offset).unwrap_or(0),
+            state.memory.region_def(pointer.region_id).map(|def| {
+                let region = BackwardMemoryRegion::Region(BackwardRegionRef {
+                    id: def.id,
+                    kind: def.kind.clone(),
+                    name: def.name.clone(),
+                });
+                let offset = i64::try_from(pointer.offset).unwrap_or(0);
+                BackwardMemoryCondition {
+                    region: region.clone(),
+                    offset_lo: offset,
+                    offset_hi: offset,
                     size,
                     exact_offset: true,
-                    expr: state.mem_read(&addr, size).to_string(),
-                })
+                    evidence: if matches!(
+                        summary.completion,
+                        crate::sim::DerivedSummaryCompletion::Exact
+                    ) {
+                        SemanticEvidence::exact()
+                    } else {
+                        SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
+                            .with_coverage(SemanticEvidenceCoverage::Bounded)
+                            .with_provenance(SemanticEvidenceProvenance::Normalized)
+                    },
+                    binding: None,
+                    expr: format_backward_memory_location(&region, offset),
+                    value_expr: None,
+                    exact_value: false,
+                }
+            })
         })
         .unwrap_or(BackwardMemoryCondition {
             region: BackwardMemoryRegion::Argument { index: arg_index },
@@ -1053,7 +1185,23 @@ where
             offset_hi: offset,
             size,
             exact_offset: true,
-            expr: state.mem_read(&addr, size).to_string(),
+            evidence: if matches!(
+                summary.completion,
+                crate::sim::DerivedSummaryCompletion::Exact
+            ) {
+                SemanticEvidence::exact()
+            } else {
+                SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
+                    .with_coverage(SemanticEvidenceCoverage::Bounded)
+                    .with_provenance(SemanticEvidenceProvenance::Normalized)
+            },
+            binding: None,
+            expr: format_backward_memory_location(
+                &BackwardMemoryRegion::Argument { index: arg_index },
+                offset,
+            ),
+            value_expr: None,
+            exact_value: false,
         });
     Some(CompiledBackwardCondition {
         summary: BackwardConditionSummary {
@@ -2091,5 +2239,54 @@ mod tests {
             (1usize, BTreeSet::from([0i64])),
         ]);
         assert!(select_best_translated_arg(translated).is_none());
+    }
+
+    #[test]
+    fn inferred_memory_term_evidence_promotes_bounded_global_and_replay_regions_to_likely() {
+        let global_region = BackwardMemoryRegion::Region(BackwardRegionRef {
+            id: MemoryRegionId(1),
+            kind: MemoryRegionKind::Global,
+            name: "global".to_string(),
+        });
+        let replay_region = BackwardMemoryRegion::Region(BackwardRegionRef {
+            id: MemoryRegionId(2),
+            kind: MemoryRegionKind::Replay,
+            name: "replay".to_string(),
+        });
+
+        let global = inferred_memory_term_evidence(&global_region, 0, 12, false);
+        let replay = inferred_memory_term_evidence(&replay_region, 4, 16, false);
+
+        assert_eq!(global.tier, SemanticConfidence::Likely);
+        assert!(
+            global
+                .reasons
+                .contains(&SemanticEvidenceReason::DerivedFromRanking)
+        );
+        assert_eq!(replay.tier, SemanticConfidence::Likely);
+        assert!(
+            replay
+                .reasons
+                .contains(&SemanticEvidenceReason::ReplayOverlap)
+        );
+    }
+
+    #[test]
+    fn inferred_memory_term_evidence_promotes_small_heap_windows_to_likely() {
+        let heap_region = BackwardMemoryRegion::Region(BackwardRegionRef {
+            id: MemoryRegionId(3),
+            kind: MemoryRegionKind::Heap,
+            name: "heap".to_string(),
+        });
+
+        let heap = inferred_memory_term_evidence(&heap_region, 8, 16, false);
+        let ambiguous = inferred_memory_term_evidence(&heap_region, 8, 32, false);
+
+        assert_eq!(heap.tier, SemanticConfidence::Likely);
+        assert!(
+            heap.reasons
+                .contains(&SemanticEvidenceReason::HeapIdentityWeak)
+        );
+        assert_eq!(ambiguous.tier, SemanticConfidence::Heuristic);
     }
 }

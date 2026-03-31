@@ -554,6 +554,11 @@ fn classify_vm_var_value(func: &SsaArtifact, var: &SSAVar, depth: u32) -> VmValu
     let r2ssa::graph::InstPayload::Op(op) = &inst.payload else {
         return VmValueExpr::Var(var.display_name());
     };
+    if let Some((block_addr, op_idx)) = func.inst_op_site(inst_id)
+        && let Some(value) = classify_vm_op_value_at_site(func, block_addr, op_idx, op, depth + 1)
+    {
+        return value;
+    }
     classify_vm_op_value(func, op, depth + 1)
         .unwrap_or_else(|| VmValueExpr::Var(var.display_name()))
 }

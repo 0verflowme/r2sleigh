@@ -7,17 +7,20 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use z3::Context;
-use z3::ast::Ast;
+use z3::ast::{Ast, BV, Bool};
 
 use r2ssa::SsaArtifact;
 
 use crate::SymState;
 use crate::backward::{
     BackwardConditionPrecision, BackwardConditionSummary, CompiledBackwardCondition,
-    compile_target_precondition_with_summaries, compile_value_postcondition_with_summaries,
+    compile_branch_precondition_with_summaries, compile_target_precondition_with_summaries,
+    compile_value_postcondition_with_summaries,
 };
 use crate::path::{ExploreConfig, ExploreStats, PathExplorer, PathResult, SolvedPath};
-use crate::semantics::{VmStepSummary, build_vm_step_summary, classify_interpreter_like};
+use crate::semantics::{
+    CompiledSemanticArtifact, VmStepSummary, build_vm_step_summary, classify_interpreter_like,
+};
 use crate::sim::SummaryProfile;
 use crate::solver::{SatResult, SolverStats};
 use crate::state::ExitStatus;
@@ -219,6 +222,12 @@ enum PreconditionApplication<'ctx> {
     ExactUnsat {
         compiled_precondition: BackwardConditionSummary,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompiledPreconditionMode {
+    Necessary,
+    NarrowOnly,
 }
 
 fn precision_rank(precision: BackwardConditionPrecision) -> u8 {
@@ -484,10 +493,109 @@ fn prefer_compiled_precondition(
     candidate.summary.total_paths < current.summary.total_paths
 }
 
-fn apply_compiled_precondition<'ctx>(
+fn parse_const_u64_text(text: &str) -> Option<u64> {
+    let trimmed = text.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x") {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if let Some(hex) = trimmed.strip_prefix("const:") {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+fn constrain_region_backed_memory_term<'ctx>(
+    narrowed: &mut SymState<'ctx>,
+    term: &crate::backward::BackwardMemoryCondition,
+    rhs: u64,
+) -> bool {
+    if !term.exact_value {
+        return false;
+    }
+    let (base_addr, offset_values) = match &term.region {
+        crate::backward::BackwardMemoryRegion::Region(region)
+            if term.offset_hi >= term.offset_lo =>
+        {
+            let Some(def) = narrowed.memory.region_def(region.id) else {
+                return false;
+            };
+            let Some(base_addr) = def.base_addr else {
+                return false;
+            };
+            let offset_values = if term.exact_offset || term.offset_lo == term.offset_hi {
+                vec![term.offset_lo]
+            } else {
+                let span = term.offset_hi - term.offset_lo;
+                if span > 8 {
+                    return false;
+                }
+                (term.offset_lo..=term.offset_hi).collect::<Vec<_>>()
+            };
+            (base_addr, offset_values)
+        }
+        _ => return false,
+    };
+    let mut predicates = Vec::new();
+    for offset in offset_values {
+        let Some(addr) = base_addr.checked_add_signed(offset) else {
+            continue;
+        };
+        let value = narrowed.mem_read(&crate::SymValue::concrete(addr, 64), term.size);
+        predicates.push(
+            value
+                .to_bv(narrowed.context())
+                .eq(BV::from_u64(rhs, value.bits())),
+        );
+    }
+    match predicates.as_slice() {
+        [] => false,
+        [single] => {
+            narrowed.add_constraint(single.clone());
+            true
+        }
+        _ => {
+            let refs = predicates.iter().collect::<Vec<_>>();
+            narrowed.add_constraint(Bool::or(&refs));
+            true
+        }
+    }
+}
+
+fn apply_memory_term_narrowing<'ctx>(
+    state: &SymState<'ctx>,
+    terms: &[&crate::backward::BackwardMemoryCondition],
+) -> Option<Box<SymState<'ctx>>> {
+    let mut narrowed = state.fork();
+    let mut applied = 0usize;
+    for term in terms {
+        if !term.evidence().allows_narrowing() || !term.exact_value {
+            continue;
+        }
+        let Some(value_expr) = term.value_expr.as_deref() else {
+            continue;
+        };
+        let Some(rhs) = parse_const_u64_text(value_expr) else {
+            continue;
+        };
+        if let Some(binding) = term.binding.as_ref()
+            && let Some(value) = narrowed.symbolic_inputs().get(binding).cloned()
+        {
+            narrowed.constrain_eq(&value, rhs);
+            applied += 1;
+            continue;
+        }
+        if constrain_region_backed_memory_term(&mut narrowed, term, rhs) {
+            applied += 1;
+        }
+    }
+    (applied > 0).then_some(Box::new(narrowed))
+}
+
+fn apply_compiled_precondition_with_mode<'ctx>(
     explorer: &PathExplorer<'ctx>,
     mut initial_state: SymState<'ctx>,
     compiled: crate::CompiledBackwardCondition,
+    mode: CompiledPreconditionMode,
 ) -> PreconditionApplication<'ctx> {
     let summary = compiled.summary.clone();
     let evidence = summary.evidence();
@@ -495,11 +603,15 @@ fn apply_compiled_precondition<'ctx>(
         .solver()
         .sat_with_constraint(&initial_state, &compiled.predicate)
     {
-        SatResult::Unsat if evidence.allows_hard_proof() => PreconditionApplication::ExactUnsat {
-            compiled_precondition: summary,
-        },
+        SatResult::Unsat
+            if mode == CompiledPreconditionMode::Necessary && evidence.allows_hard_proof() =>
+        {
+            PreconditionApplication::ExactUnsat {
+                compiled_precondition: summary,
+            }
+        }
         SatResult::Sat => {
-            if evidence.allows_hard_proof() {
+            if mode == CompiledPreconditionMode::Necessary && evidence.allows_hard_proof() {
                 initial_state.add_constraint(compiled.predicate);
                 PreconditionApplication::Continue {
                     initial_state: Box::new(initial_state),
@@ -551,17 +663,90 @@ where
 fn apply_best_compiled_precondition<'ctx>(
     explorer: &PathExplorer<'ctx>,
     func: &SsaArtifact,
+    artifact: Option<&CompiledSemanticArtifact>,
     initial_state: SymState<'ctx>,
     target_addr: u64,
 ) -> PreconditionApplication<'ctx> {
     let derived_summaries = explorer.derived_call_summary_views();
-    let mut compiled = compile_target_precondition_with_summaries(
-        func,
-        &initial_state,
-        target_addr,
-        &derived_summaries,
-    );
-    if compiled.as_ref().is_none_or(|compiled| {
+    let condition_source =
+        artifact.and_then(|artifact| artifact.actionable_condition_source_for_target(target_addr));
+    let memory_terms = artifact
+        .map(|artifact| artifact.actionable_memory_terms_for_target(target_addr))
+        .unwrap_or_default();
+    let worker_island =
+        artifact.and_then(|artifact| artifact.best_worker_island_for_target(target_addr, false));
+    let source_is_necessary = condition_source.is_some_and(|source| {
+        source.necessary_for_target && source.summary.evidence().allows_narrowing()
+    });
+    let island_mode = worker_island.and_then(|island| {
+        if island.exact_reachable_target() == Some(target_addr) {
+            Some(CompiledPreconditionMode::Necessary)
+        } else if island.actionable_reachable_target() == Some(target_addr) {
+            Some(CompiledPreconditionMode::NarrowOnly)
+        } else {
+            island
+                .actionable_compiled_condition()
+                .map(|_| CompiledPreconditionMode::NarrowOnly)
+        }
+    });
+    if !source_is_necessary
+        && matches!(island_mode, Some(CompiledPreconditionMode::NarrowOnly))
+        && let Some(narrowed_state) = apply_memory_term_narrowing(&initial_state, &memory_terms)
+    {
+        return PreconditionApplication::Continue {
+            initial_state: Box::new(initial_state),
+            narrowed_state: Some(narrowed_state),
+            compiled_precondition: worker_island
+                .and_then(|island| island.actionable_compiled_condition())
+                .cloned()
+                .or_else(|| condition_source.map(|source| source.summary.clone())),
+        };
+    }
+    let mut compiled = condition_source.and_then(|source| {
+        let compiled = compile_branch_precondition_with_summaries(
+            func,
+            &initial_state,
+            source.block_addr,
+            source.branch_truth,
+            &derived_summaries,
+        )?;
+        Some((
+            compiled,
+            if source.necessary_for_target {
+                CompiledPreconditionMode::Necessary
+            } else {
+                CompiledPreconditionMode::NarrowOnly
+            },
+        ))
+    });
+    let mut used_target_compile = false;
+    if compiled.is_none()
+        && let Some(mode) = island_mode
+        && let Some(target_compiled) = compile_target_precondition_with_summaries(
+            func,
+            &initial_state,
+            target_addr,
+            &derived_summaries,
+        )
+    {
+        compiled = Some((target_compiled, mode));
+        used_target_compile = true;
+    }
+    if !source_is_necessary
+        && !used_target_compile
+        && let Some(target_compiled) = compile_target_precondition_with_summaries(
+            func,
+            &initial_state,
+            target_addr,
+            &derived_summaries,
+        )
+        && compiled.as_ref().is_none_or(|(current, _)| {
+            prefer_compiled_precondition(Some(current), &target_compiled)
+        })
+    {
+        compiled = Some((target_compiled, CompiledPreconditionMode::Necessary));
+    }
+    if compiled.as_ref().is_none_or(|(compiled, _)| {
         !matches!(
             compiled.summary.precision,
             BackwardConditionPrecision::Exact
@@ -571,18 +756,36 @@ fn apply_best_compiled_precondition<'ctx>(
         &initial_state,
         target_addr,
         &derived_summaries,
-    ) && prefer_compiled_precondition(compiled.as_ref(), &vm_compiled)
-    {
-        compiled = Some(vm_compiled);
+    ) && prefer_compiled_precondition(
+        compiled.as_ref().map(|(compiled, _)| compiled),
+        &vm_compiled,
+    ) {
+        compiled = Some((vm_compiled, CompiledPreconditionMode::Necessary));
     }
-    let Some(compiled) = compiled else {
+    let Some((compiled, mode)) = compiled else {
+        let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
         return PreconditionApplication::Continue {
             initial_state: Box::new(initial_state),
-            narrowed_state: None,
+            narrowed_state,
             compiled_precondition: None,
         };
     };
-    apply_compiled_precondition(explorer, initial_state, compiled)
+    match apply_compiled_precondition_with_mode(explorer, initial_state, compiled, mode) {
+        PreconditionApplication::Continue {
+            initial_state,
+            narrowed_state,
+            compiled_precondition,
+        } => {
+            let narrowed_state = narrowed_state
+                .or_else(|| apply_memory_term_narrowing(initial_state.as_ref(), &memory_terms));
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            }
+        }
+        unsat => unsat,
+    }
 }
 
 impl<'ctx> PathExplorer<'ctx> {
@@ -593,25 +796,40 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> ReachabilityResult<'ctx> {
-        let (paths, compiled_precondition) =
-            match apply_best_compiled_precondition(self, func, initial_state, target_addr) {
-                PreconditionApplication::Continue {
-                    initial_state,
+        self.can_reach_with_artifact(func, None, initial_state, target_addr)
+    }
+
+    pub fn can_reach_with_artifact(
+        &mut self,
+        func: &SsaArtifact,
+        artifact: Option<&CompiledSemanticArtifact>,
+        initial_state: SymState<'ctx>,
+        target_addr: u64,
+    ) -> ReachabilityResult<'ctx> {
+        let (paths, compiled_precondition) = match apply_best_compiled_precondition(
+            self,
+            func,
+            artifact,
+            initial_state,
+            target_addr,
+        ) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => (
+                find_paths_with_compiled_narrowing(
+                    self,
+                    *initial_state,
                     narrowed_state,
-                    compiled_precondition,
-                } => (
-                    find_paths_with_compiled_narrowing(
-                        self,
-                        *initial_state,
-                        narrowed_state,
-                        |explorer, state| explorer.find_paths_to(func, state, target_addr),
-                    ),
-                    compiled_precondition,
+                    |explorer, state| explorer.find_paths_to(func, state, target_addr),
                 ),
-                PreconditionApplication::ExactUnsat {
-                    compiled_precondition,
-                } => (Vec::new(), Some(compiled_precondition)),
-            };
+                compiled_precondition,
+            ),
+            PreconditionApplication::ExactUnsat {
+                compiled_precondition,
+            } => (Vec::new(), Some(compiled_precondition)),
+        };
         let stats = self.stats().clone();
         let solver_stats = self.solver().stats();
         let status = if !paths.is_empty() {
@@ -638,25 +856,40 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_pc: u64,
     ) -> PathConditionResult<'ctx> {
-        let (matching_paths, compiled_precondition) =
-            match apply_best_compiled_precondition(self, func, initial_state, target_pc) {
-                PreconditionApplication::Continue {
-                    initial_state,
+        self.path_conditions_at_with_artifact(func, None, initial_state, target_pc)
+    }
+
+    pub fn path_conditions_at_with_artifact(
+        &mut self,
+        func: &SsaArtifact,
+        artifact: Option<&CompiledSemanticArtifact>,
+        initial_state: SymState<'ctx>,
+        target_pc: u64,
+    ) -> PathConditionResult<'ctx> {
+        let (matching_paths, compiled_precondition) = match apply_best_compiled_precondition(
+            self,
+            func,
+            artifact,
+            initial_state,
+            target_pc,
+        ) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => (
+                find_paths_with_compiled_narrowing(
+                    self,
+                    *initial_state,
                     narrowed_state,
-                    compiled_precondition,
-                } => (
-                    find_paths_with_compiled_narrowing(
-                        self,
-                        *initial_state,
-                        narrowed_state,
-                        |explorer, state| explorer.find_paths_to(func, state, target_pc),
-                    ),
-                    compiled_precondition,
+                    |explorer, state| explorer.find_paths_to(func, state, target_pc),
                 ),
-                PreconditionApplication::ExactUnsat {
-                    compiled_precondition,
-                } => (Vec::new(), Some(compiled_precondition)),
-            };
+                compiled_precondition,
+            ),
+            PreconditionApplication::ExactUnsat {
+                compiled_precondition,
+            } => (Vec::new(), Some(compiled_precondition)),
+        };
         let stats = self.stats().clone();
         let solver_stats = self.solver().stats();
         let conditions = matching_paths.iter().map(condition_summary).collect();
@@ -678,8 +911,19 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> SolveResult<'ctx> {
+        self.solve_for_target_with_artifact(func, None, initial_state, target_addr)
+    }
+
+    pub fn solve_for_target_with_artifact(
+        &mut self,
+        func: &SsaArtifact,
+        artifact: Option<&CompiledSemanticArtifact>,
+        initial_state: SymState<'ctx>,
+        target_addr: u64,
+    ) -> SolveResult<'ctx> {
         let (matched_paths, compiled_precondition, exact_unsat) =
-            match apply_best_compiled_precondition(self, func, initial_state, target_addr) {
+            match apply_best_compiled_precondition(self, func, artifact, initial_state, target_addr)
+            {
                 PreconditionApplication::Continue {
                     initial_state,
                     narrowed_state,
@@ -758,16 +1002,22 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        PreconditionApplication, apply_best_compiled_precondition, apply_compiled_precondition,
-        prefer_compiled_precondition, vm_target_case_values,
+        CompiledPreconditionMode, PreconditionApplication, apply_best_compiled_precondition,
+        apply_compiled_precondition_with_mode, prefer_compiled_precondition, vm_target_case_values,
     };
     use crate::{
-        BackwardConditionPrecision, BackwardConditionSummary, SymQueryConfig, SymState, VmBinaryOp,
+        BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
+        BackwardMemoryRegion, CompiledSemanticArtifact, ResidualReason, SatResult,
+        SemanticCapability, SemanticEvidence, SemanticEvidenceReason, SliceClass, SymQueryConfig,
+        SymState, SymbolicBranchFact, SymbolicControlFact, SymbolicControlIslandKind,
+        SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts, SymbolicMemoryIsland,
+        SymbolicMemoryIslandKind, SymbolicReachabilityStatus, SymbolicWorkerIsland, VmBinaryOp,
         VmGuardCondition, VmGuardedExit, VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
     };
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
     use r2ssa::SsaArtifact;
     use z3::Context;
+    use z3::ast::BV;
 
     const RDI: u64 = 56;
     const TMP0: u64 = 0x80;
@@ -894,7 +1144,7 @@ mod tests {
 
         let explorer = SymQueryConfig::default().make_explorer(&ctx);
         let original_constraints = state.num_constraints();
-        match apply_best_compiled_precondition(&explorer, &func, state, 0x1010) {
+        match apply_best_compiled_precondition(&explorer, &func, None, state, 0x1010) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
@@ -937,7 +1187,12 @@ mod tests {
             },
         };
 
-        match apply_compiled_precondition(&explorer, state, compiled) {
+        match apply_compiled_precondition_with_mode(
+            &explorer,
+            state,
+            compiled,
+            CompiledPreconditionMode::Necessary,
+        ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
@@ -953,6 +1208,524 @@ mod tests {
             }
             PreconditionApplication::ExactUnsat { .. } => {
                 panic!("likely precondition should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn exact_preconditions_in_narrow_only_mode_do_not_shortcut_unsat() {
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("reg:56_0", 64);
+
+        let compiled = crate::CompiledBackwardCondition {
+            predicate: z3::ast::Bool::from_bool(false),
+            summary: BackwardConditionSummary {
+                simplified: "guard".to_string(),
+                terms: vec!["guard".to_string()],
+                memory_terms: Vec::new(),
+                backward_memory_substitutions: 0,
+                backward_memory_candidate_enumerations: 0,
+                backward_memory_residual_fallbacks: 0,
+                precision: BackwardConditionPrecision::Exact,
+                supported_paths: 1,
+                total_paths: 1,
+            },
+        };
+
+        match apply_compiled_precondition_with_mode(
+            &explorer,
+            state,
+            compiled,
+            CompiledPreconditionMode::NarrowOnly,
+        ) {
+            PreconditionApplication::Continue {
+                narrowed_state,
+                compiled_precondition,
+                ..
+            } => {
+                assert!(narrowed_state.is_none());
+                assert_eq!(
+                    compiled_precondition
+                        .expect("compiled precondition")
+                        .precision,
+                    BackwardConditionPrecision::Exact
+                );
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("narrow-only exact precondition should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn exact_preconditions_in_narrow_only_mode_seed_narrowed_state() {
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("reg:56_0", 64);
+        let original_constraints = state.num_constraints();
+
+        let compiled = crate::CompiledBackwardCondition {
+            predicate: z3::ast::Bool::from_bool(true),
+            summary: BackwardConditionSummary {
+                simplified: "guard".to_string(),
+                terms: vec!["guard".to_string()],
+                memory_terms: Vec::new(),
+                backward_memory_substitutions: 0,
+                backward_memory_candidate_enumerations: 0,
+                backward_memory_residual_fallbacks: 0,
+                precision: BackwardConditionPrecision::Exact,
+                supported_paths: 1,
+                total_paths: 1,
+            },
+        };
+
+        match apply_compiled_precondition_with_mode(
+            &explorer,
+            state,
+            compiled,
+            CompiledPreconditionMode::NarrowOnly,
+        ) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                assert_eq!(initial_state.num_constraints(), original_constraints);
+                assert_eq!(
+                    narrowed_state.expect("narrowed state").num_constraints(),
+                    original_constraints + 1
+                );
+                assert_eq!(
+                    compiled_precondition
+                        .expect("compiled precondition")
+                        .precision,
+                    BackwardConditionPrecision::Exact
+                );
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("narrow-only exact precondition should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_memory_terms_seed_narrowed_state_without_branch_recompile() {
+        let blocks = make_residual_precondition_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.new_symbolic_input("sym_mem", 8);
+        let original_constraints = state.num_constraints();
+
+        let artifact = CompiledSemanticArtifact {
+            mode: crate::SemanticMode::Residual,
+            slice_class: SliceClass::Worker,
+            capability: SemanticCapability {
+                query_ready: true,
+                type_ready: true,
+                decompile_ready: false,
+            },
+            residual_reasons: vec![ResidualReason::LargeCfg],
+            closure_functions: 0,
+            helper_functions: 0,
+            derived_summaries: 0,
+            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+            symbolic_facts: SymbolicFunctionFacts {
+                branch_facts: vec![SymbolicBranchFact {
+                    block_addr: 0xdead,
+                    true_target: 0x2000,
+                    false_target: 0x2010,
+                    true_status: SymbolicReachabilityStatus::Reachable,
+                    false_status: SymbolicReachabilityStatus::Unreachable,
+                    true_condition: Some("guard".to_string()),
+                    false_condition: None,
+                    true_compiled: Some(BackwardConditionSummary {
+                        simplified: "guard".to_string(),
+                        terms: vec!["guard".to_string()],
+                        memory_terms: Vec::new(),
+                        backward_memory_substitutions: 0,
+                        backward_memory_candidate_enumerations: 0,
+                        backward_memory_residual_fallbacks: 0,
+                        precision: BackwardConditionPrecision::Exact,
+                        supported_paths: 1,
+                        total_paths: 1,
+                    }),
+                    false_compiled: None,
+                }],
+                worker_islands: Vec::new(),
+                control_islands: Vec::new(),
+                memory_islands: vec![SymbolicMemoryIsland {
+                    kind: SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
+                    anchor_block: 0xdead,
+                    terms: vec![BackwardMemoryCondition {
+                        region: BackwardMemoryRegion::Argument { index: 0 },
+                        offset_lo: 0,
+                        offset_hi: 0,
+                        size: 1,
+                        exact_offset: true,
+                        evidence: SemanticEvidence::exact(),
+                        binding: Some("sym_mem".to_string()),
+                        expr: "0x2a".to_string(),
+                        value_expr: Some("0x2a".to_string()),
+                        exact_value: true,
+                    }],
+                    evidence: SemanticEvidence::exact(),
+                }],
+                diagnostics: SymbolicFunctionFactDiagnostics::default(),
+            },
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+            cache_hit: false,
+        };
+
+        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                assert!(compiled_precondition.is_none());
+                assert_eq!(initial_state.num_constraints(), original_constraints);
+                let narrowed_state = narrowed_state.expect("narrowed state");
+                assert_eq!(narrowed_state.num_constraints(), original_constraints + 1);
+                let narrowed_value = narrowed_state
+                    .symbolic_inputs()
+                    .get("sym_mem")
+                    .expect("symbolic input")
+                    .to_bv(&ctx);
+                assert!(matches!(
+                    explorer.solver().sat_with_constraint(
+                        &narrowed_state,
+                        &narrowed_value.eq(BV::from_u64(0x2a, 8))
+                    ),
+                    SatResult::Sat
+                ));
+                assert!(matches!(
+                    explorer.solver().sat_with_constraint(
+                        &narrowed_state,
+                        &narrowed_value.eq(BV::from_u64(0x2b, 8))
+                    ),
+                    SatResult::Unsat
+                ));
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("memory-term-only narrowing should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_region_memory_terms_seed_narrowed_state_without_symbolic_binding() {
+        let blocks = make_residual_precondition_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        let symbolic_byte = state.new_symbolic_input("global_byte", 8);
+        let global_region = state.define_memory_region(
+            crate::MemoryRegionKind::Global,
+            "ram:0x2000",
+            Some(0x2000),
+            Some(1),
+        );
+        state.mem_write(&crate::SymValue::concrete(0x2000, 64), &symbolic_byte, 1);
+        let original_constraints = state.num_constraints();
+
+        let artifact = CompiledSemanticArtifact {
+            mode: crate::SemanticMode::Residual,
+            slice_class: SliceClass::Worker,
+            capability: SemanticCapability {
+                query_ready: true,
+                type_ready: true,
+                decompile_ready: false,
+            },
+            residual_reasons: vec![ResidualReason::LargeCfg],
+            closure_functions: 0,
+            helper_functions: 0,
+            derived_summaries: 0,
+            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+            symbolic_facts: SymbolicFunctionFacts {
+                branch_facts: vec![SymbolicBranchFact {
+                    block_addr: 0xdead,
+                    true_target: 0x2000,
+                    false_target: 0x2010,
+                    true_status: SymbolicReachabilityStatus::Reachable,
+                    false_status: SymbolicReachabilityStatus::Unreachable,
+                    true_condition: Some("guard".to_string()),
+                    false_condition: None,
+                    true_compiled: None,
+                    false_compiled: None,
+                }],
+                worker_islands: Vec::new(),
+                control_islands: Vec::new(),
+                memory_islands: vec![SymbolicMemoryIsland {
+                    kind: SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
+                    anchor_block: 0xdead,
+                    terms: vec![BackwardMemoryCondition {
+                        region: BackwardMemoryRegion::Region(crate::backward::BackwardRegionRef {
+                            id: global_region,
+                            kind: crate::MemoryRegionKind::Global,
+                            name: "ram:0x2000".to_string(),
+                        }),
+                        offset_lo: 0,
+                        offset_hi: 0,
+                        size: 1,
+                        exact_offset: true,
+                        evidence: SemanticEvidence::exact(),
+                        binding: None,
+                        expr: "*(ram:0x2000 + 0)".to_string(),
+                        value_expr: Some("0x2a".to_string()),
+                        exact_value: true,
+                    }],
+                    evidence: SemanticEvidence::exact(),
+                }],
+                diagnostics: SymbolicFunctionFactDiagnostics::default(),
+            },
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+            cache_hit: false,
+        };
+
+        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                assert!(compiled_precondition.is_none());
+                assert_eq!(initial_state.num_constraints(), original_constraints);
+                let narrowed_state = narrowed_state.expect("narrowed state");
+                assert_eq!(narrowed_state.num_constraints(), original_constraints + 1);
+                let narrowed_value = narrowed_state
+                    .mem_read(&crate::SymValue::concrete(0x2000, 64), 1)
+                    .to_bv(&ctx);
+                assert!(matches!(
+                    explorer.solver().sat_with_constraint(
+                        &narrowed_state,
+                        &narrowed_value.eq(BV::from_u64(0x2a, 8))
+                    ),
+                    SatResult::Sat
+                ));
+                assert!(matches!(
+                    explorer.solver().sat_with_constraint(
+                        &narrowed_state,
+                        &narrowed_value.eq(BV::from_u64(0x2b, 8))
+                    ),
+                    SatResult::Unsat
+                ));
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("region-backed memory-term narrowing should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn worker_island_memory_terms_seed_narrowed_state_without_branch_recompile() {
+        let blocks = make_residual_precondition_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.new_symbolic_input("sym_mem", 8);
+        let original_constraints = state.num_constraints();
+
+        let actionable = BackwardConditionSummary {
+            simplified: "worker_guard".to_string(),
+            terms: vec!["worker_guard".to_string()],
+            memory_terms: Vec::new(),
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: BackwardConditionPrecision::OverApprox,
+            supported_paths: 1,
+            total_paths: 2,
+        };
+        let artifact = CompiledSemanticArtifact {
+            mode: crate::SemanticMode::IslandCompiled,
+            slice_class: SliceClass::Worker,
+            capability: SemanticCapability {
+                query_ready: true,
+                type_ready: true,
+                decompile_ready: true,
+            },
+            residual_reasons: Vec::new(),
+            closure_functions: 0,
+            helper_functions: 0,
+            derived_summaries: 0,
+            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+            symbolic_facts: SymbolicFunctionFacts {
+                branch_facts: Vec::new(),
+                worker_islands: vec![SymbolicWorkerIsland {
+                    anchor_block: 0xdead,
+                    control_kind: Some(SymbolicControlIslandKind::LargeCfgBranchFrontier),
+                    memory_kind: Some(SymbolicMemoryIslandKind::LargeCfgConditionFrontier),
+                    frontier_targets: vec![0x2000, 0x2010],
+                    control_facts: vec![SymbolicControlFact {
+                        target: 0x2000,
+                        status: SymbolicReachabilityStatus::Reachable,
+                        condition: Some("worker_guard".to_string()),
+                        compiled: Some(actionable.clone()),
+                        evidence: SemanticEvidence::likely(
+                            SemanticEvidenceReason::DerivedFromRanking,
+                        ),
+                    }],
+                    memory_terms: vec![BackwardMemoryCondition {
+                        region: BackwardMemoryRegion::Argument { index: 0 },
+                        offset_lo: 0,
+                        offset_hi: 0,
+                        size: 1,
+                        exact_offset: true,
+                        evidence: SemanticEvidence::exact(),
+                        binding: Some("sym_mem".to_string()),
+                        expr: "0x2a".to_string(),
+                        value_expr: Some("0x2a".to_string()),
+                        exact_value: true,
+                    }],
+                    evidence: SemanticEvidence::likely(SemanticEvidenceReason::DerivedFromRanking),
+                }],
+                control_islands: Vec::new(),
+                memory_islands: Vec::new(),
+                diagnostics: SymbolicFunctionFactDiagnostics::default(),
+            },
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+            cache_hit: false,
+        };
+
+        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                assert_eq!(initial_state.num_constraints(), original_constraints);
+                let narrowed_state = narrowed_state.expect("narrowed state");
+                assert_eq!(narrowed_state.num_constraints(), original_constraints + 1);
+                assert_eq!(
+                    compiled_precondition
+                        .expect("worker island summary")
+                        .precision,
+                    BackwardConditionPrecision::OverApprox
+                );
+                let narrowed_value = narrowed_state
+                    .symbolic_inputs()
+                    .get("sym_mem")
+                    .expect("symbolic input")
+                    .to_bv(&ctx);
+                assert!(matches!(
+                    explorer.solver().sat_with_constraint(
+                        &narrowed_state,
+                        &narrowed_value.eq(BV::from_u64(0x2a, 8))
+                    ),
+                    SatResult::Sat
+                ));
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("worker-island memory narrowing should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn necessary_worker_island_still_prefers_real_compiled_precondition() {
+        let blocks = make_residual_precondition_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("reg:56_0", 64);
+        let original_constraints = state.num_constraints();
+
+        let artifact = CompiledSemanticArtifact {
+            mode: crate::SemanticMode::IslandCompiled,
+            slice_class: SliceClass::Worker,
+            capability: SemanticCapability {
+                query_ready: true,
+                type_ready: true,
+                decompile_ready: true,
+            },
+            residual_reasons: Vec::new(),
+            closure_functions: 0,
+            helper_functions: 0,
+            derived_summaries: 0,
+            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+            symbolic_facts: SymbolicFunctionFacts {
+                branch_facts: Vec::new(),
+                worker_islands: vec![SymbolicWorkerIsland {
+                    anchor_block: 0x1000,
+                    control_kind: Some(SymbolicControlIslandKind::LargeCfgBranchFrontier),
+                    memory_kind: Some(SymbolicMemoryIslandKind::LargeCfgConditionFrontier),
+                    frontier_targets: vec![0x1010, 0x1004],
+                    control_facts: vec![
+                        SymbolicControlFact {
+                            target: 0x1010,
+                            status: SymbolicReachabilityStatus::Reachable,
+                            condition: Some("guard".to_string()),
+                            compiled: Some(BackwardConditionSummary {
+                                simplified: "guard".to_string(),
+                                terms: vec!["guard".to_string()],
+                                memory_terms: Vec::new(),
+                                backward_memory_substitutions: 0,
+                                backward_memory_candidate_enumerations: 0,
+                                backward_memory_residual_fallbacks: 0,
+                                precision: BackwardConditionPrecision::Exact,
+                                supported_paths: 1,
+                                total_paths: 1,
+                            }),
+                            evidence: SemanticEvidence::exact(),
+                        },
+                        SymbolicControlFact {
+                            target: 0x1004,
+                            status: SymbolicReachabilityStatus::Unreachable,
+                            condition: None,
+                            compiled: None,
+                            evidence: SemanticEvidence::exact(),
+                        },
+                    ],
+                    memory_terms: vec![BackwardMemoryCondition {
+                        region: BackwardMemoryRegion::Argument { index: 0 },
+                        offset_lo: 0,
+                        offset_hi: 0,
+                        size: 1,
+                        exact_offset: true,
+                        evidence: SemanticEvidence::exact(),
+                        binding: Some("reg:56_0".to_string()),
+                        expr: "0x1".to_string(),
+                        value_expr: Some("0x1".to_string()),
+                        exact_value: true,
+                    }],
+                    evidence: SemanticEvidence::exact(),
+                }],
+                control_islands: Vec::new(),
+                memory_islands: Vec::new(),
+                diagnostics: SymbolicFunctionFactDiagnostics::default(),
+            },
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+            cache_hit: false,
+        };
+
+        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x1010) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                assert!(initial_state.num_constraints() >= original_constraints);
+                assert!(narrowed_state.is_none());
+                assert!(compiled_precondition.is_some());
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("necessary worker islands should use the real compiled precondition path")
             }
         }
     }

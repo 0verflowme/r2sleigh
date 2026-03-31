@@ -1,6 +1,5 @@
 use crate::blocks::BlockSlice;
 use crate::context::require_ctx_view;
-use crate::types::symbolic_vm_value_expr_from_sym;
 use crate::{ArchSpec, R2ILBlock, R2ILContext, parse_addr_name_map};
 use r2types::SymbolicVmValueExpr;
 use serde::Serialize;
@@ -257,7 +256,9 @@ pub(crate) struct CompiledSemanticInfo {
     pub(crate) summary_budget_exhausted: usize,
     pub(crate) summary_scc_count: usize,
     pub(crate) branch_fact_count: usize,
+    pub(crate) worker_island_count: usize,
     pub(crate) control_island_count: usize,
+    pub(crate) memory_island_count: usize,
     pub(crate) compiled_condition_count: usize,
     pub(crate) exact_compiled_condition_count: usize,
     pub(crate) actionable_compiled_condition_count: usize,
@@ -397,7 +398,7 @@ fn render_semantic_confidence(confidence: r2sym::SemanticConfidence) -> String {
 }
 
 fn vm_state_update_info_from_sym(update: &r2sym::VmStateUpdate) -> VmStateUpdateInfo {
-    let value = symbolic_vm_value_expr_from_sym(&update.value);
+    let value = SymbolicVmValueExpr::from(&update.value);
     VmStateUpdateInfo {
         output: update.output.clone(),
         expr: update.expr.clone(),
@@ -408,7 +409,7 @@ fn vm_state_update_info_from_sym(update: &r2sym::VmStateUpdate) -> VmStateUpdate
 }
 
 fn vm_guard_condition_info_from_sym(guard: &r2sym::VmGuardCondition) -> VmGuardConditionInfo {
-    let value = symbolic_vm_value_expr_from_sym(&guard.value);
+    let value = SymbolicVmValueExpr::from(&guard.value);
     VmGuardConditionInfo {
         expr: guard.expr.clone(),
         value: render_vm_value_expr(&value),
@@ -794,14 +795,15 @@ pub(crate) fn compiled_semantic_info(
         .collect::<Vec<_>>();
     let control_facts = compiled
         .symbolic_facts
-        .control_islands
+        .worker_islands
         .iter()
-        .flat_map(|island| island.facts.iter())
+        .flat_map(|island| island.control_facts.iter())
         .collect::<Vec<_>>();
     CompiledSemanticInfo {
         mode: match compiled.mode {
             r2sym::SemanticMode::Raw => "raw".to_string(),
             r2sym::SemanticMode::Compiled => "compiled".to_string(),
+            r2sym::SemanticMode::IslandCompiled => "island_compiled".to_string(),
             r2sym::SemanticMode::Residual => "residual".to_string(),
             r2sym::SemanticMode::VmSummary => "vm_summary".to_string(),
         },
@@ -842,7 +844,9 @@ pub(crate) fn compiled_semantic_info(
             + compiled.derived_diagnostics.scc_budget_exhausted,
         summary_scc_count: compiled.derived_diagnostics.scc_count,
         branch_fact_count: compiled.symbolic_facts.branch_facts.len(),
+        worker_island_count: compiled.symbolic_facts.worker_islands.len(),
         control_island_count: compiled.symbolic_facts.control_islands.len(),
+        memory_island_count: compiled.symbolic_facts.memory_islands.len(),
         compiled_condition_count: branch_compiled_conditions.len(),
         exact_compiled_condition_count: control_facts
             .iter()
@@ -1362,6 +1366,14 @@ pub extern "C" fn r2sym_explore_to(
 
     let z3_ctx = Context::thread_local();
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let compiled = r2sym::compile_semantic_artifact_with_scope(
+            &z3_ctx,
+            &prepared,
+            Some(&scope),
+            ctx_view.arch,
+            &symbol_map,
+            query_config.summary_profile,
+        );
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
         let mut explorer = query_config.make_explorer(&z3_ctx);
@@ -1373,7 +1385,12 @@ pub extern "C" fn r2sym_explore_to(
             &symbol_map,
             query_config.summary_profile,
         );
-        let reach = explorer.can_reach(&prepared, initial_state, target_addr);
+        let reach = explorer.can_reach_with_artifact(
+            &prepared,
+            Some(&compiled),
+            initial_state,
+            target_addr,
+        );
         let paths: Vec<PathInfo> = reach
             .paths
             .iter()
@@ -1428,6 +1445,14 @@ pub extern "C" fn r2sym_solve_to(
     let z3_ctx = Context::thread_local();
 
     let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let compiled = r2sym::compile_semantic_artifact_with_scope(
+            &z3_ctx,
+            &prepared,
+            Some(&scope),
+            ctx_view.arch,
+            &symbol_map,
+            query_config.summary_profile,
+        );
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
         let mut explorer = query_config.make_explorer(&z3_ctx);
@@ -1439,7 +1464,12 @@ pub extern "C" fn r2sym_solve_to(
             &symbol_map,
             query_config.summary_profile,
         );
-        let solve = explorer.solve_for_target(&prepared, initial_state, target_addr);
+        let solve = explorer.solve_for_target_with_artifact(
+            &prepared,
+            Some(&compiled),
+            initial_state,
+            target_addr,
+        );
         let selected = solve
             .selected_path_index
             .and_then(|idx| solve.matched_paths.get(idx).map(|path| (idx, path)))
@@ -1760,6 +1790,14 @@ pub extern "C" fn r2sym_explore_to_scope(
 
     let z3_ctx = Context::thread_local();
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let compiled = r2sym::compile_semantic_artifact_with_scope(
+            &z3_ctx,
+            prepared,
+            Some(&scope),
+            ctx_view.arch,
+            &symbol_map,
+            query_config.summary_profile,
+        );
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, prepared, ctx_view.arch);
         let mut explorer = query_config.make_explorer(&z3_ctx);
@@ -1771,7 +1809,8 @@ pub extern "C" fn r2sym_explore_to_scope(
             &symbol_map,
             query_config.summary_profile,
         );
-        let reach = explorer.can_reach(prepared, initial_state, target_addr);
+        let reach =
+            explorer.can_reach_with_artifact(prepared, Some(&compiled), initial_state, target_addr);
         let paths: Vec<PathInfo> = reach
             .paths
             .iter()
@@ -1823,6 +1862,14 @@ pub extern "C" fn r2sym_solve_to_scope(
     let z3_ctx = Context::thread_local();
 
     let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let compiled = r2sym::compile_semantic_artifact_with_scope(
+            &z3_ctx,
+            prepared,
+            Some(&scope),
+            ctx_view.arch,
+            &symbol_map,
+            query_config.summary_profile,
+        );
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, prepared, ctx_view.arch);
         let mut explorer = query_config.make_explorer(&z3_ctx);
@@ -1834,7 +1881,12 @@ pub extern "C" fn r2sym_solve_to_scope(
             &symbol_map,
             query_config.summary_profile,
         );
-        let solve = explorer.solve_for_target(prepared, initial_state, target_addr);
+        let solve = explorer.solve_for_target_with_artifact(
+            prepared,
+            Some(&compiled),
+            initial_state,
+            target_addr,
+        );
         let selected = solve
             .selected_path_index
             .and_then(|idx| solve.matched_paths.get(idx).map(|path| (idx, path)))
@@ -1995,6 +2047,14 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
     let z3_ctx = Context::thread_local();
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let compiled = r2sym::compile_semantic_artifact_with_scope(
+            &z3_ctx,
+            prepared,
+            Some(&scope),
+            ctx_view.arch,
+            &symbol_map,
+            query_config.summary_profile,
+        );
         let initial_state =
             build_replay_seeded_state(&z3_ctx, entry_addr, prepared, ctx_view.arch, &replay_seed);
         let mut explorer = query_config.make_explorer(&z3_ctx);
@@ -2006,7 +2066,8 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
             &symbol_map,
             query_config.summary_profile,
         );
-        let reach = explorer.can_reach(prepared, initial_state, target_addr);
+        let reach =
+            explorer.can_reach_with_artifact(prepared, Some(&compiled), initial_state, target_addr);
         let paths: Vec<PathInfo> = reach
             .paths
             .iter()
@@ -2066,6 +2127,14 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
     let z3_ctx = Context::thread_local();
 
     let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let compiled = r2sym::compile_semantic_artifact_with_scope(
+            &z3_ctx,
+            prepared,
+            Some(&scope),
+            ctx_view.arch,
+            &symbol_map,
+            query_config.summary_profile,
+        );
         let initial_state =
             build_replay_seeded_state(&z3_ctx, entry_addr, prepared, ctx_view.arch, &replay_seed);
         let mut explorer = query_config.make_explorer(&z3_ctx);
@@ -2077,7 +2146,12 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
             &symbol_map,
             query_config.summary_profile,
         );
-        let solve = explorer.solve_for_target(prepared, initial_state, target_addr);
+        let solve = explorer.solve_for_target_with_artifact(
+            prepared,
+            Some(&compiled),
+            initial_state,
+            target_addr,
+        );
         let selected = solve
             .selected_path_index
             .and_then(|idx| solve.matched_paths.get(idx).map(|path| (idx, path)))

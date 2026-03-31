@@ -19,6 +19,7 @@ pub enum SymbolicReachabilityStatus {
 pub enum SymbolicSemanticMode {
     Raw,
     Compiled,
+    IslandCompiled,
     Residual,
     VmSummary,
 }
@@ -671,6 +672,12 @@ pub enum SymbolicControlIslandKind {
     LargeCfgBranchFrontier,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymbolicMemoryIslandKind {
+    ConditionFrontier,
+    LargeCfgConditionFrontier,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolicControlFact {
     pub target: u64,
@@ -724,6 +731,10 @@ impl SymbolicControlIsland {
         unique_reachable_control_target(self.facts.iter(), true)
     }
 
+    pub fn actionable_reachable_target(&self) -> Option<u64> {
+        unique_reachable_control_target(self.facts.iter(), false)
+    }
+
     pub fn exact_compiled_condition(&self) -> Option<&SymbolicCompiledCondition> {
         unique_compiled_control_condition(self.facts.iter(), true)
     }
@@ -733,11 +744,122 @@ impl SymbolicControlIsland {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicMemoryIsland {
+    pub kind: SymbolicMemoryIslandKind,
+    pub anchor_block: u64,
+    pub terms: Vec<SymbolicMemoryCondition>,
+    #[serde(
+        default,
+        skip_serializing_if = "SymbolicSemanticEvidence::is_default_exact"
+    )]
+    pub evidence: SymbolicSemanticEvidence,
+    #[serde(default = "default_symbolic_confidence_exact")]
+    pub confidence: SymbolicSemanticConfidence,
+}
+
+impl SymbolicMemoryIsland {
+    pub fn exact_terms(&self) -> Vec<&SymbolicMemoryCondition> {
+        self.terms
+            .iter()
+            .filter(|term| term.evidence.allows_hard_proof())
+            .collect()
+    }
+
+    pub fn actionable_terms(&self) -> Vec<&SymbolicMemoryCondition> {
+        self.terms
+            .iter()
+            .filter(|term| term.evidence.allows_narrowing())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolicWorkerIsland {
+    pub anchor_block: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_kind: Option<SymbolicControlIslandKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_kind: Option<SymbolicMemoryIslandKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontier_targets: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_facts: Vec<SymbolicControlFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_terms: Vec<SymbolicMemoryCondition>,
+    #[serde(
+        default,
+        skip_serializing_if = "SymbolicSemanticEvidence::is_default_exact"
+    )]
+    pub evidence: SymbolicSemanticEvidence,
+    #[serde(default = "default_symbolic_confidence_exact")]
+    pub confidence: SymbolicSemanticConfidence,
+}
+
+impl SymbolicWorkerIsland {
+    pub fn exact_reachable_target(&self) -> Option<u64> {
+        unique_reachable_control_target(self.control_facts.iter(), true)
+    }
+
+    pub fn actionable_reachable_target(&self) -> Option<u64> {
+        unique_reachable_control_target(self.control_facts.iter(), false)
+    }
+
+    pub fn exact_compiled_condition(&self) -> Option<&SymbolicCompiledCondition> {
+        unique_compiled_control_condition(self.control_facts.iter(), true)
+    }
+
+    pub fn actionable_compiled_condition(&self) -> Option<&SymbolicCompiledCondition> {
+        unique_compiled_control_condition(self.control_facts.iter(), false)
+    }
+
+    pub fn exact_terms(&self) -> Vec<&SymbolicMemoryCondition> {
+        self.memory_terms
+            .iter()
+            .filter(|term| term.evidence.allows_hard_proof())
+            .collect()
+    }
+
+    pub fn actionable_terms(&self) -> Vec<&SymbolicMemoryCondition> {
+        self.memory_terms
+            .iter()
+            .filter(|term| term.evidence.allows_narrowing())
+            .collect()
+    }
+}
+
+fn worker_island_supporting_compiled_condition(
+    island: &SymbolicWorkerIsland,
+) -> Option<&SymbolicCompiledCondition> {
+    let reachable_target = island
+        .exact_reachable_target()
+        .or_else(|| island.actionable_reachable_target())?;
+    island
+        .control_facts
+        .iter()
+        .find(|fact| fact.target == reachable_target)
+        .and_then(SymbolicControlFact::actionable_compiled_condition)
+}
+
+fn worker_island_supports_structured_decompile(island: &SymbolicWorkerIsland) -> bool {
+    let has_unique_target =
+        island.exact_reachable_target().is_some() || island.actionable_reachable_target().is_some();
+    let supporting_condition = worker_island_supporting_compiled_condition(island);
+    let has_condition = supporting_condition.is_some();
+    let has_memory_support = !island.actionable_terms().is_empty()
+        || supporting_condition.is_some_and(|compiled| !compiled.memory_terms.is_empty());
+    island.evidence.allows_narrowing() && has_unique_target && has_condition && has_memory_support
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolicSemanticFacts {
     pub branch_facts: Vec<SymbolicBranchFact>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_islands: Vec<SymbolicWorkerIsland>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_islands: Vec<SymbolicControlIsland>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_islands: Vec<SymbolicMemoryIsland>,
     pub diagnostics: SymbolicFactDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<SymbolicInterpreterDispatch>,
@@ -750,7 +872,9 @@ pub struct SymbolicSemanticFacts {
 impl SymbolicSemanticFacts {
     pub fn is_empty(&self) -> bool {
         self.branch_facts.is_empty()
+            && self.worker_islands.is_empty()
             && self.control_islands.is_empty()
+            && self.memory_islands.is_empty()
             && self.diagnostics == SymbolicFactDiagnostics::default()
             && self.interpreter.is_none()
             && self.vm_step.is_none()
@@ -769,12 +893,28 @@ impl SymbolicSemanticFacts {
             .find(|island| island.anchor_block == block_addr)
     }
 
+    pub fn worker_island_for_block(&self, block_addr: u64) -> Option<&SymbolicWorkerIsland> {
+        self.worker_islands
+            .iter()
+            .find(|island| island.anchor_block == block_addr)
+    }
+
+    pub fn memory_island_for_block(&self, block_addr: u64) -> Option<&SymbolicMemoryIsland> {
+        self.memory_islands
+            .iter()
+            .find(|island| island.anchor_block == block_addr)
+    }
+
     pub fn exact_compiled_condition_for_block(
         &self,
         block_addr: u64,
     ) -> Option<&SymbolicCompiledCondition> {
         self.branch_fact_for_block(block_addr)
             .and_then(SymbolicBranchFact::exact_compiled_condition)
+            .or_else(|| {
+                self.worker_island_for_block(block_addr)
+                    .and_then(SymbolicWorkerIsland::exact_compiled_condition)
+            })
             .or_else(|| {
                 self.control_island_for_block(block_addr)
                     .and_then(SymbolicControlIsland::exact_compiled_condition)
@@ -785,8 +925,25 @@ impl SymbolicSemanticFacts {
         self.branch_fact_for_block(block_addr)
             .and_then(SymbolicBranchFact::exact_reachable_target)
             .or_else(|| {
+                self.worker_island_for_block(block_addr)
+                    .and_then(SymbolicWorkerIsland::exact_reachable_target)
+            })
+            .or_else(|| {
                 self.control_island_for_block(block_addr)
                     .and_then(SymbolicControlIsland::exact_reachable_target)
+            })
+    }
+
+    pub fn actionable_reachable_target_for_block(&self, block_addr: u64) -> Option<u64> {
+        self.branch_fact_for_block(block_addr)
+            .and_then(SymbolicBranchFact::actionable_reachable_target)
+            .or_else(|| {
+                self.worker_island_for_block(block_addr)
+                    .and_then(SymbolicWorkerIsland::actionable_reachable_target)
+            })
+            .or_else(|| {
+                self.control_island_for_block(block_addr)
+                    .and_then(SymbolicControlIsland::actionable_reachable_target)
             })
     }
 
@@ -797,9 +954,40 @@ impl SymbolicSemanticFacts {
         self.branch_fact_for_block(block_addr)
             .and_then(SymbolicBranchFact::actionable_compiled_condition)
             .or_else(|| {
+                self.worker_island_for_block(block_addr)
+                    .and_then(SymbolicWorkerIsland::actionable_compiled_condition)
+            })
+            .or_else(|| {
                 self.control_island_for_block(block_addr)
                     .and_then(SymbolicControlIsland::actionable_compiled_condition)
             })
+    }
+
+    pub fn actionable_memory_terms_for_block(
+        &self,
+        block_addr: u64,
+    ) -> Vec<&SymbolicMemoryCondition> {
+        self.worker_island_for_block(block_addr)
+            .map(SymbolicWorkerIsland::actionable_terms)
+            .or_else(|| {
+                self.memory_island_for_block(block_addr)
+                    .map(SymbolicMemoryIsland::actionable_terms)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn actionable_compiled_condition_for_target(
+        &self,
+        target_addr: u64,
+    ) -> Option<&SymbolicCompiledCondition> {
+        target_compiled_condition(self, target_addr, false)
+    }
+
+    pub fn exact_compiled_condition_for_target(
+        &self,
+        target_addr: u64,
+    ) -> Option<&SymbolicCompiledCondition> {
+        target_compiled_condition(self, target_addr, true)
     }
 
     pub fn vm_step_for_dispatch_header(
@@ -819,6 +1007,106 @@ impl SymbolicSemanticFacts {
             .as_ref()
             .filter(|vm_transfer| vm_transfer.dispatch_header == dispatch_header)
     }
+
+    pub fn semantic_mode(&self) -> Option<SymbolicSemanticMode> {
+        self.diagnostics.semantic_mode
+    }
+
+    pub fn semantic_capability(&self) -> Option<SymbolicSemanticCapability> {
+        self.diagnostics.semantic_capability
+    }
+
+    pub fn island_compiled(&self) -> bool {
+        matches!(
+            self.semantic_mode(),
+            Some(SymbolicSemanticMode::IslandCompiled)
+        )
+    }
+
+    pub fn query_ready(&self) -> bool {
+        self.semantic_capability()
+            .is_some_and(|capability| capability.query_ready)
+    }
+
+    pub fn type_ready(&self) -> bool {
+        self.semantic_capability()
+            .is_some_and(|capability| capability.type_ready)
+    }
+
+    pub fn decompile_ready(&self) -> bool {
+        self.semantic_capability()
+            .is_some_and(|capability| capability.decompile_ready)
+    }
+
+    pub fn structured_decompile_ready(&self) -> bool {
+        if !self.decompile_ready() || !self.diagnostics.skipped_large_cfg {
+            return false;
+        }
+        self.worker_islands
+            .iter()
+            .any(worker_island_supports_structured_decompile)
+    }
+
+    pub fn slice_class(&self) -> Option<SymbolicSemanticSliceClass> {
+        self.diagnostics.slice_class
+    }
+
+    pub fn requires_type_fallback(&self) -> bool {
+        self.semantic_capability().is_some() && !self.type_ready()
+    }
+
+    pub fn prefers_bounded_type_plan(&self) -> bool {
+        if self.requires_type_fallback() {
+            return true;
+        }
+        matches!(
+            self.semantic_mode(),
+            Some(SymbolicSemanticMode::Residual | SymbolicSemanticMode::IslandCompiled)
+        ) && self.diagnostics.skipped_large_cfg
+            && matches!(self.slice_class(), Some(SymbolicSemanticSliceClass::Worker))
+            && (!self.worker_islands.is_empty() || !self.memory_islands.is_empty())
+            && (self.actionable_compiled_condition_count() > 0
+                || self
+                    .worker_islands
+                    .iter()
+                    .any(|island| !island.actionable_terms().is_empty())
+                || self
+                    .memory_islands
+                    .iter()
+                    .any(|island| !island.actionable_terms().is_empty()))
+    }
+
+    pub fn exact_compiled_condition_count(&self) -> usize {
+        if self.worker_islands.is_empty() {
+            self.control_islands
+                .iter()
+                .flat_map(|island| island.facts.iter())
+                .filter(|fact| fact.evidence.allows_hard_proof())
+                .count()
+        } else {
+            self.worker_islands
+                .iter()
+                .flat_map(|island| island.control_facts.iter())
+                .filter(|fact| fact.evidence.allows_hard_proof())
+                .count()
+        }
+    }
+
+    pub fn actionable_compiled_condition_count(&self) -> usize {
+        if self.worker_islands.is_empty() {
+            self.control_islands
+                .iter()
+                .flat_map(|island| island.facts.iter())
+                .filter(|fact| fact.evidence.allows_narrowing())
+                .count()
+        } else {
+            self.worker_islands
+                .iter()
+                .flat_map(|island| island.control_facts.iter())
+                .filter(|fact| fact.evidence.allows_narrowing())
+                .count()
+        }
+    }
 }
 
 impl SymbolicBranchFact {
@@ -828,6 +1116,28 @@ impl SymbolicBranchFact {
                 Some(self.true_target)
             }
             (SymbolicReachabilityStatus::Unreachable, SymbolicReachabilityStatus::Reachable) => {
+                Some(self.false_target)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn actionable_reachable_target(&self) -> Option<u64> {
+        match (self.true_status, self.false_status) {
+            (SymbolicReachabilityStatus::Reachable, SymbolicReachabilityStatus::Unreachable)
+                if self
+                    .true_compiled
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.evidence.allows_narrowing()) =>
+            {
+                Some(self.true_target)
+            }
+            (SymbolicReachabilityStatus::Unreachable, SymbolicReachabilityStatus::Reachable)
+                if self
+                    .false_compiled
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.evidence.allows_narrowing()) =>
+            {
                 Some(self.false_target)
             }
             _ => None,
@@ -882,6 +1192,108 @@ fn unique_compiled_control_condition<'a>(
     candidates.next().is_none().then_some(first)
 }
 
+fn compiled_condition_precision_rank(condition: &SymbolicCompiledCondition) -> u8 {
+    match condition.precision {
+        SymbolicConditionPrecision::Exact => 3,
+        SymbolicConditionPrecision::OverApprox => 2,
+        SymbolicConditionPrecision::ResidualSearchRequired => 1,
+        SymbolicConditionPrecision::Unsupported => 0,
+    }
+}
+
+fn compiled_condition_evidence_rank(condition: &SymbolicCompiledCondition) -> u8 {
+    match condition.evidence.tier {
+        SymbolicSemanticConfidence::Exact => 3,
+        SymbolicSemanticConfidence::Likely => 2,
+        SymbolicSemanticConfidence::Heuristic => 1,
+        SymbolicSemanticConfidence::Residual => 0,
+    }
+}
+
+fn best_target_compiled_condition<'a>(
+    candidates: impl Iterator<Item = &'a SymbolicCompiledCondition>,
+) -> Option<&'a SymbolicCompiledCondition> {
+    candidates.max_by(|left, right| {
+        (
+            compiled_condition_evidence_rank(left),
+            compiled_condition_precision_rank(left),
+            std::cmp::Reverse(left.backward_memory_residual_fallbacks),
+            left.memory_terms.len(),
+            left.supported_paths,
+            std::cmp::Reverse(left.total_paths),
+            std::cmp::Reverse(left.simplified.len()),
+        )
+            .cmp(&(
+                compiled_condition_evidence_rank(right),
+                compiled_condition_precision_rank(right),
+                std::cmp::Reverse(right.backward_memory_residual_fallbacks),
+                right.memory_terms.len(),
+                right.supported_paths,
+                std::cmp::Reverse(right.total_paths),
+                std::cmp::Reverse(right.simplified.len()),
+            ))
+    })
+}
+
+fn target_compiled_condition(
+    facts: &SymbolicSemanticFacts,
+    target_addr: u64,
+    hard_proof_only: bool,
+) -> Option<&SymbolicCompiledCondition> {
+    let branch_candidates = facts.branch_facts.iter().flat_map(|fact| {
+        let mut candidates = Vec::new();
+        if fact.true_target == target_addr {
+            let compiled = if hard_proof_only {
+                fact.true_compiled
+                    .as_ref()
+                    .filter(|compiled| compiled.evidence.allows_hard_proof())
+            } else {
+                fact.true_compiled
+                    .as_ref()
+                    .filter(|compiled| compiled.evidence.allows_narrowing())
+            };
+            if let Some(compiled) = compiled {
+                candidates.push(compiled);
+            }
+        }
+        if fact.false_target == target_addr {
+            let compiled = if hard_proof_only {
+                fact.false_compiled
+                    .as_ref()
+                    .filter(|compiled| compiled.evidence.allows_hard_proof())
+            } else {
+                fact.false_compiled
+                    .as_ref()
+                    .filter(|compiled| compiled.evidence.allows_narrowing())
+            };
+            if let Some(compiled) = compiled {
+                candidates.push(compiled);
+            }
+        }
+        candidates
+    });
+    let control_candidates = facts
+        .worker_islands
+        .iter()
+        .flat_map(|island| island.control_facts.iter())
+        .chain(
+            facts
+                .control_islands
+                .iter()
+                .flat_map(|island| island.facts.iter()),
+        )
+        .filter_map(move |fact| {
+            (fact.target == target_addr)
+                .then_some(if hard_proof_only {
+                    fact.exact_compiled_condition()
+                } else {
+                    fact.actionable_compiled_condition()
+                })
+                .flatten()
+        });
+    best_target_compiled_condition(branch_candidates.chain(control_candidates))
+}
+
 fn unique_reachable_control_target<'a>(
     facts: impl Iterator<Item = &'a SymbolicControlFact>,
     hard_proof_only: bool,
@@ -891,6 +1303,9 @@ fn unique_reachable_control_target<'a>(
     for fact in facts {
         saw_any = true;
         if hard_proof_only && !fact.evidence.allows_hard_proof() {
+            return None;
+        }
+        if !hard_proof_only && !fact.evidence.allows_narrowing() {
             return None;
         }
         match fact.status {
@@ -918,6 +1333,7 @@ pub struct LocalFieldAccessFact {
     pub slot: usize,
     pub field_offset: u64,
     pub field_name: String,
+    pub field_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1224,7 +1640,12 @@ fn merge_local_field_accesses(
             .entry(access.slot)
             .or_default()
             .entry(access.field_offset)
-            .or_insert_with(|| access.field_name.clone());
+            .or_insert_with(|| {
+                access
+                    .field_type
+                    .clone()
+                    .unwrap_or_else(|| access.field_name.clone())
+            });
     }
 }
 
@@ -1387,11 +1808,13 @@ mod tests {
                     slot: 1,
                     field_offset: 0,
                     field_name: "first".to_string(),
+                    field_type: None,
                 },
                 LocalFieldAccessFact {
                     slot: 1,
                     field_offset: 8,
                     field_name: "second".to_string(),
+                    field_type: None,
                 },
             ],
             ..FunctionTypeFactInputs::default()
@@ -1425,6 +1848,7 @@ mod tests {
                 slot: 2,
                 field_offset: 0,
                 field_name: "local".to_string(),
+                field_type: None,
             }],
             ..FunctionTypeFactInputs::default()
         })
@@ -1436,6 +1860,28 @@ mod tests {
                 .get(&2)
                 .and_then(|profile| profile.get(&0)),
             Some(&"explicit".to_string())
+        );
+    }
+
+    #[test]
+    fn builder_prefers_local_field_access_type_when_present() {
+        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+            local_field_accesses: vec![LocalFieldAccessFact {
+                slot: 3,
+                field_offset: 4,
+                field_name: "f_4".to_string(),
+                field_type: Some("int32_t".to_string()),
+            }],
+            ..FunctionTypeFactInputs::default()
+        })
+        .build();
+
+        assert_eq!(
+            facts
+                .slot_field_profiles
+                .get(&3)
+                .and_then(|profile| profile.get(&4)),
+            Some(&"int32_t".to_string())
         );
     }
 
@@ -1701,6 +2147,7 @@ mod tests {
         };
         let facts = SymbolicSemanticFacts {
             branch_facts: Vec::new(),
+            worker_islands: Vec::new(),
             control_islands: vec![SymbolicControlIsland {
                 kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
                 anchor_block: 0x401000,
@@ -1716,6 +2163,7 @@ mod tests {
                 evidence: SymbolicSemanticEvidence::exact(),
                 confidence: SymbolicSemanticConfidence::Exact,
             }],
+            memory_islands: Vec::new(),
             diagnostics: SymbolicFactDiagnostics::default(),
             interpreter: None,
             vm_step: None,
@@ -1731,9 +2179,96 @@ mod tests {
     }
 
     #[test]
+    fn semantic_facts_actionable_condition_for_target_prefers_best_candidate() {
+        let exact = SymbolicCompiledCondition {
+            simplified: "x == 0".to_string(),
+            terms: vec!["x == 0".to_string()],
+            memory_terms: Vec::new(),
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: SymbolicConditionPrecision::Exact,
+            evidence: SymbolicSemanticEvidence::exact(),
+            confidence: SymbolicSemanticConfidence::Exact,
+            supported_paths: 1,
+            total_paths: 1,
+        };
+        let likely = SymbolicCompiledCondition {
+            simplified: "x <= 1".to_string(),
+            terms: vec!["x <= 1".to_string()],
+            memory_terms: vec![SymbolicMemoryCondition {
+                region: SymbolicMemoryRegion::Argument { index: 0 },
+                offset_lo: 8,
+                offset_hi: 12,
+                size: 4,
+                exact_offset: false,
+                expr: "*(arg0 + [8,12])".to_string(),
+                binding: None,
+                value_expr: None,
+                exact_value: false,
+                evidence: SymbolicSemanticEvidence::likely(
+                    SymbolicSemanticEvidenceReason::DerivedFromRanking,
+                ),
+                confidence: SymbolicSemanticConfidence::Likely,
+            }],
+            backward_memory_substitutions: 1,
+            backward_memory_candidate_enumerations: 1,
+            backward_memory_residual_fallbacks: 0,
+            precision: SymbolicConditionPrecision::OverApprox,
+            evidence: SymbolicSemanticEvidence::likely(
+                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+            ),
+            confidence: SymbolicSemanticConfidence::Likely,
+            supported_paths: 1,
+            total_paths: 2,
+        };
+        let facts = SymbolicSemanticFacts {
+            branch_facts: vec![
+                SymbolicBranchFact {
+                    block_addr: 0x401000,
+                    true_target: 0x401010,
+                    false_target: 0x401020,
+                    true_status: SymbolicReachabilityStatus::Reachable,
+                    false_status: SymbolicReachabilityStatus::Unreachable,
+                    true_condition: Some("x == 0".to_string()),
+                    false_condition: Some("x != 0".to_string()),
+                    true_compiled: Some(exact.clone()),
+                    false_compiled: None,
+                },
+                SymbolicBranchFact {
+                    block_addr: 0x401030,
+                    true_target: 0x401010,
+                    false_target: 0x401040,
+                    true_status: SymbolicReachabilityStatus::Reachable,
+                    false_status: SymbolicReachabilityStatus::Unreachable,
+                    true_condition: Some("x <= 1".to_string()),
+                    false_condition: None,
+                    true_compiled: Some(likely),
+                    false_compiled: None,
+                },
+            ],
+            worker_islands: Vec::new(),
+            control_islands: Vec::new(),
+            memory_islands: Vec::new(),
+            diagnostics: SymbolicFactDiagnostics::default(),
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+        };
+
+        assert_eq!(
+            facts
+                .actionable_compiled_condition_for_target(0x401010)
+                .map(|cond| cond.simplified.as_str()),
+            Some("x == 0")
+        );
+    }
+
+    #[test]
     fn semantic_facts_exact_reachable_target_for_block_uses_control_island_fallback() {
         let facts = SymbolicSemanticFacts {
             branch_facts: Vec::new(),
+            worker_islands: Vec::new(),
             control_islands: vec![SymbolicControlIsland {
                 kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
                 anchor_block: 0x401000,
@@ -1759,6 +2294,7 @@ mod tests {
                 evidence: SymbolicSemanticEvidence::exact(),
                 confidence: SymbolicSemanticConfidence::Exact,
             }],
+            memory_islands: Vec::new(),
             diagnostics: SymbolicFactDiagnostics::default(),
             interpreter: None,
             vm_step: None,
@@ -1769,5 +2305,190 @@ mod tests {
             facts.exact_reachable_target_for_block(0x401000),
             Some(0x401010)
         );
+    }
+
+    #[test]
+    fn semantic_facts_actionable_reachable_target_for_block_uses_likely_control_island() {
+        let compiled = SymbolicCompiledCondition {
+            simplified: "x == 0".to_string(),
+            terms: vec!["x == 0".to_string()],
+            memory_terms: Vec::new(),
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: SymbolicConditionPrecision::OverApprox,
+            evidence: SymbolicSemanticEvidence::likely(
+                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+            ),
+            confidence: SymbolicSemanticConfidence::Likely,
+            supported_paths: 1,
+            total_paths: 2,
+        };
+        let facts = SymbolicSemanticFacts {
+            branch_facts: Vec::new(),
+            worker_islands: Vec::new(),
+            control_islands: vec![SymbolicControlIsland {
+                kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
+                anchor_block: 0x401000,
+                frontier_targets: vec![0x401010, 0x401020],
+                facts: vec![
+                    SymbolicControlFact {
+                        target: 0x401010,
+                        status: SymbolicReachabilityStatus::Reachable,
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(compiled.clone()),
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                    SymbolicControlFact {
+                        target: 0x401020,
+                        status: SymbolicReachabilityStatus::Unreachable,
+                        condition: Some("!(x == 0)".to_string()),
+                        compiled: Some(compiled),
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                    },
+                ],
+                evidence: SymbolicSemanticEvidence::likely(
+                    SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                ),
+                confidence: SymbolicSemanticConfidence::Likely,
+            }],
+            memory_islands: Vec::new(),
+            diagnostics: SymbolicFactDiagnostics::default(),
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+        };
+
+        assert_eq!(
+            facts.actionable_reachable_target_for_block(0x401000),
+            Some(0x401010)
+        );
+    }
+
+    #[test]
+    fn semantic_facts_actionable_memory_terms_for_block_use_memory_island_fallback() {
+        let facts = SymbolicSemanticFacts {
+            branch_facts: Vec::new(),
+            worker_islands: Vec::new(),
+            control_islands: Vec::new(),
+            memory_islands: vec![SymbolicMemoryIsland {
+                kind: SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
+                anchor_block: 0x401000,
+                terms: vec![SymbolicMemoryCondition {
+                    region: SymbolicMemoryRegion::Argument { index: 0 },
+                    offset_lo: 8,
+                    offset_hi: 8,
+                    size: 4,
+                    exact_offset: true,
+                    evidence: SymbolicSemanticEvidence::exact(),
+                    confidence: SymbolicSemanticConfidence::Exact,
+                    binding: Some("arg0".to_string()),
+                    expr: "*(arg0 + 8)".to_string(),
+                    value_expr: None,
+                    exact_value: false,
+                }],
+                evidence: SymbolicSemanticEvidence::exact(),
+                confidence: SymbolicSemanticConfidence::Exact,
+            }],
+            diagnostics: SymbolicFactDiagnostics::default(),
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+        };
+
+        let terms = facts.actionable_memory_terms_for_block(0x401000);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].offset_lo, 8);
+        assert_eq!(terms[0].binding.as_deref(), Some("arg0"));
+    }
+
+    #[test]
+    fn structured_decompile_ready_allows_supported_worker_with_wide_frontier() {
+        let facts = SymbolicSemanticFacts {
+            worker_islands: vec![SymbolicWorkerIsland {
+                anchor_block: 0x401000,
+                control_kind: Some(SymbolicControlIslandKind::LargeCfgBranchFrontier),
+                memory_kind: Some(SymbolicMemoryIslandKind::LargeCfgConditionFrontier),
+                frontier_targets: vec![0x401010, 0x401020, 0x401030],
+                control_facts: vec![SymbolicControlFact {
+                    target: 0x401010,
+                    status: SymbolicReachabilityStatus::Reachable,
+                    condition: Some("x == 0".to_string()),
+                    compiled: Some(SymbolicCompiledCondition {
+                        simplified: "x == 0".to_string(),
+                        terms: vec!["x == 0".to_string()],
+                        memory_terms: vec![SymbolicMemoryCondition {
+                            region: SymbolicMemoryRegion::Argument { index: 0 },
+                            offset_lo: 0,
+                            offset_hi: 0,
+                            size: 1,
+                            exact_offset: true,
+                            evidence: SymbolicSemanticEvidence::likely(
+                                SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                            ),
+                            confidence: SymbolicSemanticConfidence::Likely,
+                            binding: None,
+                            expr: "*arg0".to_string(),
+                            value_expr: Some("0x0:8".to_string()),
+                            exact_value: true,
+                        }],
+                        backward_memory_substitutions: 0,
+                        backward_memory_candidate_enumerations: 0,
+                        backward_memory_residual_fallbacks: 0,
+                        precision: SymbolicConditionPrecision::OverApprox,
+                        evidence: SymbolicSemanticEvidence::likely(
+                            SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: SymbolicSemanticConfidence::Likely,
+                        supported_paths: 1,
+                        total_paths: 2,
+                    }),
+                    evidence: SymbolicSemanticEvidence::likely(
+                        SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                    ),
+                    confidence: SymbolicSemanticConfidence::Likely,
+                }],
+                memory_terms: vec![SymbolicMemoryCondition {
+                    region: SymbolicMemoryRegion::Argument { index: 0 },
+                    offset_lo: 0,
+                    offset_hi: 0,
+                    size: 1,
+                    exact_offset: true,
+                    evidence: SymbolicSemanticEvidence::likely(
+                        SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                    ),
+                    confidence: SymbolicSemanticConfidence::Likely,
+                    binding: None,
+                    expr: "*arg0".to_string(),
+                    value_expr: Some("0x0:8".to_string()),
+                    exact_value: true,
+                }],
+                evidence: SymbolicSemanticEvidence::likely(
+                    SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                ),
+                confidence: SymbolicSemanticConfidence::Likely,
+            }],
+            diagnostics: SymbolicFactDiagnostics {
+                skipped_large_cfg: true,
+                semantic_mode: Some(SymbolicSemanticMode::IslandCompiled),
+                semantic_capability: Some(SymbolicSemanticCapability {
+                    query_ready: true,
+                    type_ready: true,
+                    decompile_ready: true,
+                }),
+                slice_class: Some(SymbolicSemanticSliceClass::Worker),
+                residual_reasons: Vec::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(facts.structured_decompile_ready());
     }
 }

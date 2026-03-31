@@ -77,10 +77,12 @@ pub use semantics::{
     SemanticEvidenceProvenance, SemanticEvidenceReason, SemanticEvidenceSoundness, SemanticMode,
     SliceClass, SymbolicBranchFact, SymbolicControlFact, SymbolicControlIsland,
     SymbolicControlIslandKind, SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts,
-    SymbolicReachabilityStatus, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
+    SymbolicMemoryIsland, SymbolicMemoryIslandKind, SymbolicReachabilityStatus,
+    SymbolicWorkerIsland, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
     VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp, VmValueExpr,
     collect_symbolic_function_facts, collect_symbolic_function_facts_with_scope,
-    compile_function_semantics_with_scope, compile_semantic_artifact_with_scope, stable_scope_hash,
+    compile_function_semantics_with_scope, compile_semantic_artifact_default_with_scope,
+    compile_semantic_artifact_with_scope, stable_scope_hash,
 };
 pub use sim::{
     CallConv, CallInfo, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,

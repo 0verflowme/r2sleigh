@@ -12,10 +12,12 @@ pub use artifact::{
     SemanticEvidenceSoundness, SemanticMode, SliceClass,
 };
 pub use cache::stable_scope_hash;
+pub use compiler::compile_semantic_artifact_default_with_scope;
 pub use compiler::{compile_function_semantics_with_scope, compile_semantic_artifact_with_scope};
 pub use facts::{
     SymbolicBranchFact, SymbolicControlFact, SymbolicControlIsland, SymbolicControlIslandKind,
-    SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts, SymbolicReachabilityStatus,
+    SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts, SymbolicMemoryIsland,
+    SymbolicMemoryIslandKind, SymbolicReachabilityStatus, SymbolicWorkerIsland,
     collect_symbolic_function_facts, collect_symbolic_function_facts_with_scope,
 };
 pub use vm::{

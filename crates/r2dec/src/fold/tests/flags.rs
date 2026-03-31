@@ -369,3 +369,64 @@ fn actionable_control_island_parses_non_literal_compiled_condition_expr() {
         ))
     );
 }
+
+#[test]
+fn actionable_memory_island_parses_memory_condition_expr() {
+    let arch = make_test_arch_x86_64();
+    let mut entry = R2ILBlock::new(0x4000, 4);
+    entry.push(R2ILOp::IntNotEqual {
+        dst: Varnode::unique(1, 1),
+        a: Varnode::register(0x10, 4),
+        b: Varnode::constant(0, 4),
+    });
+    entry.push(R2ILOp::CBranch {
+        target: Varnode::constant(0x4008, 8),
+        cond: Varnode::unique(1, 1),
+    });
+    let mut fallthrough = R2ILBlock::new(0x4004, 4);
+    fallthrough.push(R2ILOp::Return {
+        target: Varnode::constant(0, 8),
+    });
+    let mut taken = R2ILBlock::new(0x4008, 4);
+    taken.push(R2ILOp::Return {
+        target: Varnode::constant(1, 8),
+    });
+
+    let prepared =
+        prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("memory_island");
+    let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+    let mut facts = SymbolicSemanticFacts::default();
+    facts.memory_islands.push(r2types::SymbolicMemoryIsland {
+        kind: r2types::SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
+        anchor_block: 0x4000,
+        terms: vec![r2types::SymbolicMemoryCondition {
+            region: r2types::SymbolicMemoryRegion::Argument { index: 0 },
+            offset_lo: 8,
+            offset_hi: 8,
+            size: 4,
+            exact_offset: true,
+            evidence: r2types::SymbolicSemanticEvidence::exact(),
+            confidence: r2types::SymbolicSemanticConfidence::Exact,
+            binding: None,
+            expr: "*(arg0 + 0x8)".to_string(),
+            value_expr: Some("0x2a".to_string()),
+            exact_value: true,
+        }],
+        evidence: r2types::SymbolicSemanticEvidence::exact(),
+        confidence: r2types::SymbolicSemanticConfidence::Exact,
+    });
+    ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+
+    assert_eq!(
+        ctx.extract_condition_from_block(prepared.function().get_block(0x4000).expect("entry")),
+        Some(CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::deref(CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("arg0".to_string()),
+                CExpr::IntLit(0x8),
+            )),
+            CExpr::IntLit(0x2a),
+        ))
+    );
+}

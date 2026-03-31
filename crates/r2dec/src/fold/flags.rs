@@ -461,6 +461,40 @@ impl<'a> FoldingContext<'a> {
             .map(|expr| self.finalize_condition_expr(expr))
     }
 
+    fn symbolic_actionable_memory_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
+        fn memory_term_rank(term: &r2types::SymbolicMemoryCondition) -> (u8, bool, bool, i64, i64) {
+            let evidence_rank = match term.evidence.tier {
+                r2types::SymbolicSemanticConfidence::Exact => 3,
+                r2types::SymbolicSemanticConfidence::Likely => 2,
+                r2types::SymbolicSemanticConfidence::Heuristic => 1,
+                r2types::SymbolicSemanticConfidence::Residual => 0,
+            };
+            (
+                evidence_rank,
+                term.exact_value,
+                term.exact_offset,
+                -(term.offset_hi - term.offset_lo),
+                -term.offset_lo.abs(),
+            )
+        }
+
+        let term = self
+            .inputs
+            .symbolic_facts
+            .actionable_memory_terms_for_block(block_addr)
+            .into_iter()
+            .filter(|term| {
+                term.value_expr
+                    .as_ref()
+                    .is_some_and(|value| value != &term.expr)
+            })
+            .max_by_key(|term| memory_term_rank(term))?;
+        let condition = format!("({} == {})", term.expr.trim(), term.value_expr.as_deref()?);
+        SymbolicConditionExprParser::new(self, &condition)
+            .and_then(SymbolicConditionExprParser::parse)
+            .map(|expr| self.finalize_condition_expr(expr))
+    }
+
     fn prepared_predicate_view(&self) -> Option<Cow<'_, analysis::PreparedSemanticView>> {
         self.prepared_semantic_view().map(Cow::Borrowed)
     }
@@ -667,6 +701,10 @@ impl<'a> FoldingContext<'a> {
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
         if let Some(cond) = self.symbolic_actionable_compiled_condition_expr(block.addr) {
+            return Some(cond);
+        }
+
+        if let Some(cond) = self.symbolic_actionable_memory_condition_expr(block.addr) {
             return Some(cond);
         }
 
