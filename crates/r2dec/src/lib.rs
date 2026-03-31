@@ -202,6 +202,55 @@ fn format_vm_state_updates(updates: &[r2types::SymbolicVmStateUpdate]) -> String
     format!("[{rendered}]")
 }
 
+fn format_vm_guarded_exits(guards: &[r2types::SymbolicVmGuardedExit]) -> String {
+    if guards.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered = guards
+        .iter()
+        .map(|guard| format!("0x{:x}:{}", guard.target, guard.guard.expr))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rendered}]")
+}
+
+fn format_vm_memory_conditions(conditions: &[r2types::SymbolicMemoryCondition]) -> String {
+    if conditions.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered = conditions
+        .iter()
+        .map(|condition| {
+            let region = match &condition.region {
+                r2types::SymbolicMemoryRegion::Argument { index } => format!("arg{index}"),
+                r2types::SymbolicMemoryRegion::Region(region) => region.name.clone(),
+            };
+            let binding = condition
+                .binding
+                .as_deref()
+                .map(|binding| format!(" -> {binding}"))
+                .unwrap_or_default();
+            let value = condition
+                .value_expr
+                .as_deref()
+                .map(|value| format!(" = {value}"))
+                .unwrap_or_default();
+            format!(
+                "{}@[{:#x}..{:#x}]/{}:{}{}{}",
+                region,
+                condition.offset_lo,
+                condition.offset_hi,
+                condition.size,
+                condition.expr,
+                binding,
+                value,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rendered}]")
+}
+
 fn format_vm_summary_kind(kind: SymbolicInterpreterKind) -> &'static str {
     match kind {
         SymbolicInterpreterKind::SwitchDispatch => "switch_dispatch",
@@ -707,7 +756,27 @@ impl Decompiler {
         let exact_transfers = vm_step
             .transfers
             .iter()
-            .filter(|transfer| transfer.exact)
+            .filter(|transfer| transfer.evidence.allows_hard_proof())
+            .count();
+        let likely_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| {
+                matches!(
+                    transfer.evidence.tier,
+                    r2types::SymbolicSemanticConfidence::Likely
+                )
+            })
+            .count();
+        let heuristic_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| {
+                matches!(
+                    transfer.evidence.tier,
+                    r2types::SymbolicSemanticConfidence::Heuristic
+                )
+            })
             .count();
         let redispatch_transfers = vm_step
             .transfers
@@ -724,6 +793,22 @@ impl Decompiler {
             .iter()
             .filter(|transfer| transfer.selector_update.is_some())
             .count();
+        let exact_exit_guards = vm_step
+            .transfers
+            .iter()
+            .flat_map(|transfer| transfer.exit_guards.iter())
+            .filter(|guard| guard.guard.evidence.allows_hard_proof())
+            .count();
+        let total_read_effects: usize = vm_step
+            .handler_memory_read_effects
+            .values()
+            .map(Vec::len)
+            .sum();
+        let total_write_effects: usize = vm_step
+            .handler_memory_write_effects
+            .values()
+            .map(Vec::len)
+            .sum();
         let total_reads: usize = vm_step.handler_memory_reads.values().copied().sum();
         let total_writes: usize = vm_step.handler_memory_writes.values().copied().sum();
 
@@ -731,7 +816,7 @@ impl Decompiler {
         let _ = writeln!(&mut out, "r2dec semantic summary: vm_summary");
         let _ = writeln!(
             &mut out,
-            "kind={} dispatch_header=0x{:x} loop_header=0x{:x} selector={} targets={} default_target={} latches={} step_blocks={} transfers={} exact_transfers={} redispatch_transfers={} returning_transfers={} selector_updates={} total_reads={} total_writes={}",
+            "kind={} dispatch_header=0x{:x} loop_header=0x{:x} selector={} targets={} default_target={} latches={} step_blocks={} transfers={} exact_transfers={} likely_transfers={} heuristic_transfers={} redispatch_transfers={} returning_transfers={} selector_updates={} exact_exit_guards={} total_reads={} total_writes={} total_read_effects={} total_write_effects={}",
             format_vm_summary_kind(vm_step.kind),
             vm_step.dispatch_header,
             vm_step.loop_header,
@@ -745,11 +830,16 @@ impl Decompiler {
             vm_step.step_blocks.len(),
             vm_step.transfers.len(),
             exact_transfers,
+            likely_transfers,
+            heuristic_transfers,
             redispatch_transfers,
             returning_transfers,
             selector_updates,
+            exact_exit_guards,
             total_reads,
             total_writes,
+            total_read_effects,
+            total_write_effects,
         );
         if !vm_step.state_inputs.is_empty() || !vm_step.state_outputs.is_empty() {
             let _ = writeln!(
@@ -770,14 +860,21 @@ impl Decompiler {
                     .unwrap_or_else(|| "none".to_string());
                 let _ = writeln!(
                     &mut out,
-                    "transfer handler=0x{:x} cases={} blocks={} exits={} updates={} selector_update={} exact={} redispatch={} return={} truncated={}",
+                    "transfer handler=0x{:x} cases={} blocks={} exits={} exit_guards={} updates={} selector_update={} reads={} writes={} exact={} confidence={:?} reasons={} residual_guards={} residual_memory={} redispatch={} return={} truncated={}",
                     transfer.handler_target,
                     format_vm_target_list(&transfer.case_values),
                     format_vm_target_list(&transfer.region_blocks),
                     format_vm_target_list(&transfer.exit_targets),
+                    format_vm_guarded_exits(&transfer.exit_guards),
                     format_vm_state_updates(&transfer.state_updates),
                     selector_update,
-                    transfer.exact,
+                    format_vm_memory_conditions(&transfer.memory_reads),
+                    format_vm_memory_conditions(&transfer.memory_writes),
+                    transfer.evidence.allows_hard_proof(),
+                    transfer.evidence.tier,
+                    format_args!("{:?}", transfer.evidence.reasons),
+                    transfer.residual_guards,
+                    transfer.residual_memory_effects,
                     transfer.redispatch,
                     transfer.may_return,
                     transfer.truncated,
@@ -818,9 +915,24 @@ impl Decompiler {
                 .get(&handler)
                 .map(|values| format_vm_target_list(values))
                 .unwrap_or_else(|| "[]".to_string());
+            let guards = vm_step
+                .handler_exit_guards
+                .get(&handler)
+                .map(|values| format_vm_guarded_exits(values))
+                .unwrap_or_else(|| "[]".to_string());
+            let read_effects = vm_step
+                .handler_memory_read_effects
+                .get(&handler)
+                .map(|values| format_vm_memory_conditions(values))
+                .unwrap_or_else(|| "[]".to_string());
+            let write_effects = vm_step
+                .handler_memory_write_effects
+                .get(&handler)
+                .map(|values| format_vm_memory_conditions(values))
+                .unwrap_or_else(|| "[]".to_string());
             let _ = writeln!(
                 &mut out,
-                "handler 0x{:x}: regions={} cases={} inputs={} outputs={} updates={} reads={} writes={} calls={} branches={} exits={}",
+                "handler 0x{:x}: regions={} cases={} inputs={} outputs={} updates={} reads={} writes={} read_effects={} write_effects={} calls={} branches={} exits={} guards={}",
                 handler,
                 regions,
                 cases,
@@ -837,6 +949,8 @@ impl Decompiler {
                     .get(&handler)
                     .copied()
                     .unwrap_or(0),
+                read_effects,
+                write_effects,
                 vm_step.handler_calls.get(&handler).copied().unwrap_or(0),
                 vm_step
                     .handler_conditional_branches
@@ -844,6 +958,7 @@ impl Decompiler {
                     .copied()
                     .unwrap_or(0),
                 exits,
+                guards,
             );
         }
 
@@ -4250,6 +4365,76 @@ mod tests {
                             expr: "state + 1".to_string(),
                             value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
                             exact: false,
+                            evidence: r2types::SymbolicSemanticEvidence::heuristic(
+                                r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                            ),
+                            confidence: r2types::SymbolicSemanticConfidence::Heuristic,
+                        }],
+                    )]),
+                    handler_exit_guards: BTreeMap::from([(
+                        0x1004,
+                        vec![r2types::SymbolicVmGuardedExit {
+                            target: 0x1008,
+                            guard: r2types::SymbolicVmGuardCondition {
+                                expr: "(state == 0x1)".to_string(),
+                                value: r2types::SymbolicVmValueExpr::Expr(
+                                    "state == 0x1".to_string(),
+                                ),
+                                expect_nonzero: true,
+                                exact: false,
+                                evidence: r2types::SymbolicSemanticEvidence::heuristic(
+                                    r2types::SymbolicSemanticEvidenceReason::GuardOpaque,
+                                ),
+                                confidence: r2types::SymbolicSemanticConfidence::Heuristic,
+                            },
+                        }],
+                    )]),
+                    handler_memory_read_effects: BTreeMap::from([(
+                        0x1004,
+                        vec![r2types::SymbolicMemoryCondition {
+                            region: r2types::SymbolicMemoryRegion::Region(
+                                r2types::SymbolicMemoryRegionRef {
+                                    id: 1,
+                                    kind: r2types::SymbolicMemoryRegionKind::Global,
+                                    name: "ram:0x2000".to_string(),
+                                },
+                            ),
+                            offset_lo: 0,
+                            offset_hi: 0,
+                            size: 1,
+                            exact_offset: true,
+                            evidence: r2types::SymbolicSemanticEvidence::likely(
+                                r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                            ),
+                            confidence: r2types::SymbolicSemanticConfidence::Likely,
+                            binding: Some("mem:r1:0:1".to_string()),
+                            expr: "vm.sel".to_string(),
+                            value_expr: None,
+                            exact_value: false,
+                        }],
+                    )]),
+                    handler_memory_write_effects: BTreeMap::from([(
+                        0x1004,
+                        vec![r2types::SymbolicMemoryCondition {
+                            region: r2types::SymbolicMemoryRegion::Region(
+                                r2types::SymbolicMemoryRegionRef {
+                                    id: 2,
+                                    kind: r2types::SymbolicMemoryRegionKind::Heap,
+                                    name: "heap_alloc@1".to_string(),
+                                },
+                            ),
+                            offset_lo: 4,
+                            offset_hi: 4,
+                            size: 1,
+                            exact_offset: true,
+                            evidence: r2types::SymbolicSemanticEvidence::likely(
+                                r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                            ),
+                            confidence: r2types::SymbolicSemanticConfidence::Likely,
+                            binding: Some("mem:r2:4:1".to_string()),
+                            expr: "state".to_string(),
+                            value_expr: Some("state".to_string()),
+                            exact_value: false,
                         }],
                     )]),
                     handler_memory_reads: BTreeMap::from([(0x1004, 1)]),
@@ -4265,19 +4450,88 @@ mod tests {
                         case_values: vec![1, 2],
                         region_blocks: vec![0x1004, 0x1008],
                         exit_targets: vec![0x1008],
+                        exit_guards: vec![r2types::SymbolicVmGuardedExit {
+                            target: 0x1008,
+                            guard: r2types::SymbolicVmGuardCondition {
+                                expr: "(state == 0x1)".to_string(),
+                                value: r2types::SymbolicVmValueExpr::Expr(
+                                    "state == 0x1".to_string(),
+                                ),
+                                expect_nonzero: true,
+                                exact: false,
+                                evidence: r2types::SymbolicSemanticEvidence::heuristic(
+                                    r2types::SymbolicSemanticEvidenceReason::GuardOpaque,
+                                ),
+                                confidence: r2types::SymbolicSemanticConfidence::Heuristic,
+                            },
+                        }],
                         state_updates: vec![SymbolicVmStateUpdate {
                             output: "state".to_string(),
                             expr: "state + 1".to_string(),
                             value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
                             exact: false,
+                            evidence: r2types::SymbolicSemanticEvidence::heuristic(
+                                r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                            ),
+                            confidence: r2types::SymbolicSemanticConfidence::Heuristic,
                         }],
                         selector_update: Some(SymbolicVmStateUpdate {
                             output: "vm.sel".to_string(),
                             expr: "3".to_string(),
                             value: r2types::SymbolicVmValueExpr::Const(3),
                             exact: true,
+                            evidence: r2types::SymbolicSemanticEvidence::exact(),
+                            confidence: r2types::SymbolicSemanticConfidence::Exact,
                         }),
+                        memory_reads: vec![r2types::SymbolicMemoryCondition {
+                            region: r2types::SymbolicMemoryRegion::Region(
+                                r2types::SymbolicMemoryRegionRef {
+                                    id: 1,
+                                    kind: r2types::SymbolicMemoryRegionKind::Global,
+                                    name: "ram:0x2000".to_string(),
+                                },
+                            ),
+                            offset_lo: 0,
+                            offset_hi: 0,
+                            size: 1,
+                            exact_offset: true,
+                            evidence: r2types::SymbolicSemanticEvidence::likely(
+                                r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                            ),
+                            confidence: r2types::SymbolicSemanticConfidence::Likely,
+                            binding: Some("mem:r1:0:1".to_string()),
+                            expr: "vm.sel".to_string(),
+                            value_expr: None,
+                            exact_value: false,
+                        }],
+                        memory_writes: vec![r2types::SymbolicMemoryCondition {
+                            region: r2types::SymbolicMemoryRegion::Region(
+                                r2types::SymbolicMemoryRegionRef {
+                                    id: 2,
+                                    kind: r2types::SymbolicMemoryRegionKind::Heap,
+                                    name: "heap_alloc@1".to_string(),
+                                },
+                            ),
+                            offset_lo: 4,
+                            offset_hi: 4,
+                            size: 1,
+                            exact_offset: true,
+                            evidence: r2types::SymbolicSemanticEvidence::likely(
+                                r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                            ),
+                            confidence: r2types::SymbolicSemanticConfidence::Likely,
+                            binding: Some("mem:r2:4:1".to_string()),
+                            expr: "state".to_string(),
+                            value_expr: Some("state".to_string()),
+                            exact_value: false,
+                        }],
+                        residual_guards: false,
+                        residual_memory_effects: false,
                         exact: false,
+                        evidence: r2types::SymbolicSemanticEvidence::likely(
+                            r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                        ),
+                        confidence: r2types::SymbolicSemanticConfidence::Likely,
                         redispatch: false,
                         may_return: false,
                         truncated: false,
@@ -4294,7 +4548,12 @@ mod tests {
             "expected VM semantic summary comment, got:\n{output}"
         );
         assert!(
-            output.contains("dispatch_header=0x1000") && output.contains("handler 0x1004"),
+            output.contains("dispatch_header=0x1000")
+                && output.contains("handler 0x1004")
+                && output.contains("guards=")
+                && output.contains("residual_memory=")
+                && output.contains("read_effects=")
+                && output.contains("write_effects="),
             "expected richer VM details in summary comment, got:\n{output}"
         );
     }

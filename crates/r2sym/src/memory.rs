@@ -4,11 +4,14 @@
 //! explicit stack/global/input/heap/replay/unknown regions. The public API
 //! remains address-shaped for compatibility with the executor and summaries.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 use z3::ast::{Ast, BV, Bool};
-use z3::{Context, SatResult, Solver};
+use z3::{Context, DeclKind, SatResult, Solver};
 
 use crate::value::SymValue;
 
@@ -48,14 +51,15 @@ pub struct ResolvedPointerSet {
 }
 
 #[derive(Clone)]
-enum RegionWriteTarget<'ctx> {
-    Offset(u64),
-    Address(SymValue<'ctx>),
+struct RegionOffsetWrite<'ctx> {
+    offset: u64,
+    value: SymValue<'ctx>,
+    size: u32,
 }
 
 #[derive(Clone)]
-struct RegionWrite<'ctx> {
-    target: RegionWriteTarget<'ctx>,
+struct RegionUnresolvedWrite<'ctx> {
+    addr: SymValue<'ctx>,
     value: SymValue<'ctx>,
     size: u32,
 }
@@ -64,7 +68,9 @@ struct RegionWrite<'ctx> {
 struct MemoryRegion<'ctx> {
     def: SymbolicMemoryRegionDef,
     concrete: BTreeMap<u64, u8>,
-    symbolic_writes: Vec<RegionWrite<'ctx>>,
+    offset_writes: Vec<RegionOffsetWrite<'ctx>>,
+    latest_write_by_offset: BTreeMap<u64, usize>,
+    unresolved_writes: Vec<RegionUnresolvedWrite<'ctx>>,
 }
 
 impl<'ctx> MemoryRegion<'ctx> {
@@ -84,7 +90,9 @@ impl<'ctx> MemoryRegion<'ctx> {
                 extent,
             },
             concrete: BTreeMap::new(),
-            symbolic_writes: Vec::new(),
+            offset_writes: Vec::new(),
+            latest_write_by_offset: BTreeMap::new(),
+            unresolved_writes: Vec::new(),
         }
     }
 
@@ -123,20 +131,49 @@ impl<'ctx> MemoryRegion<'ctx> {
     fn merge_offsets(&self) -> BTreeSet<u64> {
         let mut offsets = BTreeSet::new();
         offsets.extend(self.concrete.keys().copied());
-        for write in &self.symbolic_writes {
-            if let RegionWriteTarget::Offset(base) = write.target {
-                for index in 0..write.size {
-                    offsets.insert(base.wrapping_add(index as u64));
-                }
-            }
-        }
+        offsets.extend(self.latest_write_by_offset.keys().copied());
         offsets
     }
 
-    fn unresolved_symbolic_writes(&self) -> impl Iterator<Item = &RegionWrite<'ctx>> {
-        self.symbolic_writes
-            .iter()
-            .filter(|write| matches!(write.target, RegionWriteTarget::Address(_)))
+    fn unresolved_symbolic_writes(&self) -> impl Iterator<Item = &RegionUnresolvedWrite<'ctx>> {
+        self.unresolved_writes.iter()
+    }
+
+    fn read_byte_from_offset_write(
+        &self,
+        ctx: &'ctx Context,
+        byte_offset: u64,
+    ) -> Option<SymValue<'ctx>> {
+        let write_index = *self.latest_write_by_offset.get(&byte_offset)?;
+        let write = self.offset_writes.get(write_index)?;
+        let relative = byte_offset.checked_sub(write.offset)?;
+        if relative >= write.size as u64 {
+            return None;
+        }
+        let value = adjust_bits(ctx, &write.value, write.size * 8);
+        let low_bit = (relative * 8) as u32;
+        let high_bit = low_bit + 7;
+        Some(value.extract(ctx, high_bit, low_bit))
+    }
+
+    fn default_read_byte(
+        &self,
+        ctx: &'ctx Context,
+        byte_offset: u64,
+        default_symbolic: bool,
+        default_name: &str,
+    ) -> SymValue<'ctx> {
+        if let Some(byte) = self.read_byte_from_offset_write(ctx, byte_offset) {
+            return byte;
+        }
+        if let Some(byte) = self.concrete.get(&byte_offset) {
+            return SymValue::concrete(*byte as u64, 8);
+        }
+        if default_symbolic {
+            SymValue::new_symbolic(ctx, &format!("{default_name}_b{byte_offset:x}"), 8)
+        } else {
+            SymValue::concrete(0, 8)
+        }
     }
 
     fn read_offset(
@@ -147,61 +184,50 @@ impl<'ctx> MemoryRegion<'ctx> {
         default_symbolic: bool,
         default_name: &str,
     ) -> SymValue<'ctx> {
-        for write in self.symbolic_writes.iter().rev() {
-            let RegionWriteTarget::Offset(base) = write.target else {
-                continue;
-            };
-            let write_end = base.checked_add(write.size as u64);
-            let read_end = offset.checked_add(size as u64);
-            if let (Some(write_end), Some(read_end)) = (write_end, read_end)
-                && base <= offset
-                && write_end >= read_end
-            {
-                let relative = offset - base;
-                if relative == 0 && write.size == size {
-                    return adjust_bits(ctx, &write.value, size * 8);
-                }
-                let low_bit = (relative * 8) as u32;
-                let high_bit = low_bit + (size * 8) - 1;
-                return adjust_bits(ctx, &write.value, write.size * 8)
-                    .extract(ctx, high_bit, low_bit);
-            }
-        }
-
-        let mut concrete_bytes = Vec::with_capacity(size as usize);
+        let mut byte_values = Vec::with_capacity(size as usize);
         let mut value = 0u64;
         let mut all_concrete = true;
         for index in 0..size {
             let byte_offset = offset.wrapping_add(index as u64);
-            if let Some(byte) = self.concrete.get(&byte_offset) {
-                concrete_bytes.push(*byte);
+            let byte = self.default_read_byte(ctx, byte_offset, default_symbolic, default_name);
+            if let Some(concrete) = byte.as_concrete() {
                 if index < 8 {
-                    value |= (*byte as u64) << (index * 8);
+                    value |= concrete << (index * 8);
                 }
             } else {
                 all_concrete = false;
-                break;
             }
+            byte_values.push(byte);
         }
 
         if all_concrete {
             if size > 8 {
-                let mut bytes = concrete_bytes.iter().rev();
-                let first = bytes.next().copied().unwrap_or(0);
-                let mut ast = BV::from_u64(first as u64, 8);
+                let mut bytes = byte_values.iter().rev().filter_map(SymValue::as_concrete);
+                let first = bytes.next().unwrap_or(0);
+                let mut ast = BV::from_u64(first, 8);
                 for byte in bytes {
-                    ast = ast.concat(BV::from_u64(*byte as u64, 8));
+                    ast = ast.concat(BV::from_u64(byte, 8));
                 }
                 return SymValue::symbolic(ast, size * 8);
             }
             return SymValue::concrete(value, size * 8);
         }
 
-        if default_symbolic {
-            SymValue::new_symbolic(ctx, default_name, size * 8)
-        } else {
-            SymValue::concrete(0, size * 8)
+        let mut bytes = byte_values.iter().rev();
+        let Some(first) = bytes.next() else {
+            return if default_symbolic {
+                SymValue::new_symbolic(ctx, default_name, size * 8)
+            } else {
+                SymValue::concrete(0, size * 8)
+            };
+        };
+        let mut ast = first.to_bv(ctx);
+        let mut taint = first.get_taint();
+        for byte in bytes {
+            ast = ast.concat(byte.to_bv(ctx));
+            taint |= byte.get_taint();
         }
+        SymValue::symbolic_tainted(ast, size * 8, taint)
     }
 
     fn write_offset(&mut self, ctx: &'ctx Context, offset: u64, value: &SymValue<'ctx>, size: u32) {
@@ -214,27 +240,45 @@ impl<'ctx> MemoryRegion<'ctx> {
                 let byte_value = ((concrete_value >> (index * 8)) & 0xff) as u8;
                 self.concrete.insert(byte_offset, byte_value);
             }
+        } else {
+            for index in 0..size {
+                self.concrete.remove(&offset.wrapping_add(index as u64));
+            }
         }
-        self.symbolic_writes.push(RegionWrite {
-            target: RegionWriteTarget::Offset(offset),
+        let write_index = self.offset_writes.len();
+        self.offset_writes.push(RegionOffsetWrite {
+            offset,
             value,
             size,
         });
+        for index in 0..size {
+            self.latest_write_by_offset
+                .insert(offset.wrapping_add(index as u64), write_index);
+        }
     }
 
     fn push_unresolved_write(&mut self, addr: SymValue<'ctx>, value: SymValue<'ctx>, size: u32) {
-        self.symbolic_writes.push(RegionWrite {
-            target: RegionWriteTarget::Address(addr),
-            value,
-            size,
-        });
+        self.unresolved_writes
+            .push(RegionUnresolvedWrite { addr, value, size });
+    }
+
+    fn visible_offset_write_indices(&self) -> Vec<usize> {
+        let mut indices = self
+            .latest_write_by_offset
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices
     }
 }
 
 /// A symbolic memory model backed by explicit regions.
 pub struct SymMemory<'ctx> {
     ctx: &'ctx Context,
-    regions: BTreeMap<MemoryRegionId, MemoryRegion<'ctx>>,
+    regions: Rc<BTreeMap<MemoryRegionId, MemoryRegion<'ctx>>>,
     default_symbolic: bool,
     max_symbolic_targets: usize,
     next_region_id: u32,
@@ -268,7 +312,7 @@ impl<'ctx> SymMemory<'ctx> {
 
         Self {
             ctx,
-            regions,
+            regions: Rc::new(regions),
             default_symbolic,
             max_symbolic_targets: Self::DEFAULT_MAX_SYMBOLIC_TARGETS,
             next_region_id: 1,
@@ -303,7 +347,7 @@ impl<'ctx> SymMemory<'ctx> {
 
         let id = MemoryRegionId(self.next_region_id);
         self.next_region_id += 1;
-        self.regions
+        Rc::make_mut(&mut self.regions)
             .insert(id, MemoryRegion::new(id, kind, name, base_addr, extent));
         id
     }
@@ -320,7 +364,7 @@ impl<'ctx> SymMemory<'ctx> {
     }
 
     pub fn seed_region_bytes(&mut self, region_id: MemoryRegionId, offset: u64, bytes: &[u8]) {
-        let Some(region) = self.regions.get_mut(&region_id) else {
+        let Some(region) = Rc::make_mut(&mut self.regions).get_mut(&region_id) else {
             return;
         };
         region.ensure_extent_covers(offset, bytes.len() as u32);
@@ -385,53 +429,44 @@ impl<'ctx> SymMemory<'ctx> {
         self.write_region_pointer(pointer, value, size);
     }
 
-    pub(crate) fn semantic_fingerprint(&self) -> String {
-        let region_repr = self
-            .regions
-            .values()
-            .map(|region| {
-                let concrete = region
-                    .concrete
-                    .iter()
-                    .map(|(offset, byte)| format!("{offset:x}:{byte:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let symbolic = region
-                    .symbolic_writes
-                    .iter()
-                    .map(|write| {
-                        let target = match &write.target {
-                            RegionWriteTarget::Offset(offset) => format!("off:{offset:x}"),
-                            RegionWriteTarget::Address(addr) => {
-                                format!("addr:{}", addr.to_bv(self.ctx).simplify())
-                            }
-                        };
-                        format!(
-                            "{target}=>{}:{}",
-                            write.value.to_bv(self.ctx).simplify(),
-                            write.size
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("|");
-                format!(
-                    "{}:{:?}:{}:{:?}:{:?}:c[{}]:s[{}]",
-                    region.def.id.0,
-                    region.def.kind,
-                    region.def.name,
-                    region.def.base_addr,
-                    region.def.extent,
-                    concrete,
-                    symbolic
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
+    pub(crate) fn semantic_fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.default_symbolic.hash(&mut hasher);
+        self.max_symbolic_targets.hash(&mut hasher);
+        self.next_region_id.hash(&mut hasher);
+        self.escaped_unknown_region.hash(&mut hasher);
 
-        format!(
-            "default_symbolic={};max_targets={};regions=[{}]",
-            self.default_symbolic, self.max_symbolic_targets, region_repr
-        )
+        for region in self.regions.values() {
+            region.def.id.hash(&mut hasher);
+            region.def.kind.hash(&mut hasher);
+            region.def.name.hash(&mut hasher);
+            region.def.base_addr.hash(&mut hasher);
+            region.def.extent.hash(&mut hasher);
+
+            for (offset, byte) in &region.concrete {
+                offset.hash(&mut hasher);
+                byte.hash(&mut hasher);
+            }
+
+            for index in region.visible_offset_write_indices() {
+                if let Some(write) = region.offset_writes.get(index) {
+                    if write.value.as_concrete().is_some() {
+                        continue;
+                    }
+                    write.offset.hash(&mut hasher);
+                    write.size.hash(&mut hasher);
+                    hash_sym_value(self.ctx, &write.value, &mut hasher);
+                }
+            }
+
+            for write in &region.unresolved_writes {
+                write.size.hash(&mut hasher);
+                hash_sym_value(self.ctx, &write.addr, &mut hasher);
+                hash_sym_value(self.ctx, &write.value, &mut hasher);
+            }
+        }
+
+        hasher.finish()
     }
 
     pub(crate) fn merge_with(
@@ -524,14 +559,11 @@ impl<'ctx> SymMemory<'ctx> {
             let Some(mapped_region) = region_map.get(&region.def.id).copied() else {
                 continue;
             };
-            let Some(target) = merged.regions.get_mut(&mapped_region) else {
+            let Some(target) = Rc::make_mut(&mut merged.regions).get_mut(&mapped_region) else {
                 continue;
             };
             for write in region.unresolved_symbolic_writes() {
-                let RegionWriteTarget::Address(addr) = &write.target else {
-                    continue;
-                };
-                target.push_unresolved_write(addr.clone(), write.value.clone(), write.size);
+                target.push_unresolved_write(write.addr.clone(), write.value.clone(), write.size);
             }
         }
 
@@ -614,7 +646,9 @@ impl<'ctx> SymMemory<'ctx> {
 
         let resolved = self.resolve_pointer(addr, size, constraints);
         if resolved.pointers.is_empty() {
-            if let Some(region) = self.regions.get_mut(&self.escaped_unknown_region) {
+            if let Some(region) =
+                Rc::make_mut(&mut self.regions).get_mut(&self.escaped_unknown_region)
+            {
                 region.push_unresolved_write(addr.clone(), value, size);
             }
             return;
@@ -641,7 +675,8 @@ impl<'ctx> SymMemory<'ctx> {
         }
 
         if resolved.truncated
-            && let Some(region) = self.regions.get_mut(&self.escaped_unknown_region)
+            && let Some(region) =
+                Rc::make_mut(&mut self.regions).get_mut(&self.escaped_unknown_region)
         {
             region.push_unresolved_write(addr.clone(), value, size);
         }
@@ -690,7 +725,7 @@ impl<'ctx> SymMemory<'ctx> {
     pub fn symbolic_writes_count(&self) -> usize {
         self.regions
             .values()
-            .map(|region| region.symbolic_writes.len())
+            .map(|region| region.offset_writes.len() + region.unresolved_writes.len())
             .sum()
     }
 
@@ -706,9 +741,11 @@ impl<'ctx> SymMemory<'ctx> {
     }
 
     pub fn clear(&mut self) {
-        for region in self.regions.values_mut() {
+        for region in Rc::make_mut(&mut self.regions).values_mut() {
             region.concrete.clear();
-            region.symbolic_writes.clear();
+            region.offset_writes.clear();
+            region.latest_write_by_offset.clear();
+            region.unresolved_writes.clear();
         }
     }
 
@@ -760,7 +797,7 @@ impl<'ctx> SymMemory<'ctx> {
     }
 
     fn write_region_pointer(&mut self, pointer: &RegionPointer, value: &SymValue<'ctx>, size: u32) {
-        let Some(region) = self.regions.get_mut(&pointer.region_id) else {
+        let Some(region) = Rc::make_mut(&mut self.regions).get_mut(&pointer.region_id) else {
             return;
         };
         region.write_offset(self.ctx, pointer.offset, value, size);
@@ -779,6 +816,25 @@ impl<'ctx> SymMemory<'ctx> {
     }
 
     fn enumerate_symbolic_addresses(
+        &self,
+        addr: &SymValue<'ctx>,
+        constraints: &[Bool],
+    ) -> (Vec<u64>, bool) {
+        if let Some(affine) = recognize_affine_pointer(addr) {
+            let (targets, truncated) =
+                self.enumerate_symbolic_addresses_sat(&affine.base, constraints);
+            return (
+                targets
+                    .into_iter()
+                    .filter_map(|value| value.checked_add_signed(affine.delta))
+                    .collect(),
+                truncated,
+            );
+        }
+        self.enumerate_symbolic_addresses_sat(addr, constraints)
+    }
+
+    fn enumerate_symbolic_addresses_sat(
         &self,
         addr: &SymValue<'ctx>,
         constraints: &[Bool],
@@ -824,15 +880,28 @@ fn compare_region_specificity<'ctx>(
     left: &MemoryRegion<'ctx>,
     right: &MemoryRegion<'ctx>,
 ) -> std::cmp::Ordering {
+    fn kind_rank(kind: &MemoryRegionKind) -> u8 {
+        match kind {
+            MemoryRegionKind::Replay => 0,
+            MemoryRegionKind::Input => 1,
+            MemoryRegionKind::Global => 2,
+            MemoryRegionKind::Heap => 3,
+            MemoryRegionKind::Stack => 4,
+            MemoryRegionKind::EscapedUnknown => 5,
+        }
+    }
+
     let left_key = (
         left.def.extent.is_none(),
         left.def.extent.unwrap_or(u64::MAX),
+        kind_rank(&left.def.kind),
         std::cmp::Reverse(left.def.base_addr.unwrap_or(0)),
         left.def.id,
     );
     let right_key = (
         right.def.extent.is_none(),
         right.def.extent.unwrap_or(u64::MAX),
+        kind_rank(&right.def.kind),
         std::cmp::Reverse(right.def.base_addr.unwrap_or(0)),
         right.def.id,
     );
@@ -875,6 +944,12 @@ fn adjust_bits<'ctx>(ctx: &'ctx Context, value: &SymValue<'ctx>, bits: u32) -> S
     }
 }
 
+fn hash_sym_value<'ctx, H: Hasher>(ctx: &'ctx Context, value: &SymValue<'ctx>, hasher: &mut H) {
+    value.bits().hash(hasher);
+    value.get_taint().hash(hasher);
+    value.to_bv(ctx).hash(hasher);
+}
+
 impl<'ctx> std::fmt::Debug for SymMemory<'ctx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SymMemory")
@@ -884,6 +959,99 @@ impl<'ctx> std::fmt::Debug for SymMemory<'ctx> {
             .field("default_symbolic", &self.default_symbolic)
             .finish()
     }
+}
+
+#[derive(Clone)]
+struct AffinePointer<'ctx> {
+    base: SymValue<'ctx>,
+    delta: i64,
+}
+
+fn recognize_affine_pointer<'ctx>(addr: &SymValue<'ctx>) -> Option<AffinePointer<'ctx>> {
+    let ast = addr.as_ast()?;
+    let (base, delta) = recognize_affine_bv(ast)?;
+    Some(AffinePointer {
+        base: SymValue::symbolic_tainted(base, addr.bits(), addr.get_taint()),
+        delta,
+    })
+}
+
+fn recognize_affine_bv(ast: &BV) -> Option<(BV, i64)> {
+    if ast.as_u64().is_some() {
+        return None;
+    }
+
+    if ast.is_const() && ast.decl().kind() == DeclKind::UNINTERPRETED {
+        return Some((ast.clone(), 0));
+    }
+
+    match ast.decl().kind() {
+        DeclKind::BADD => {
+            let children = ast.children();
+            if children.len() != 2 {
+                return None;
+            }
+            let left = children[0].as_bv()?;
+            let right = children[1].as_bv()?;
+            if let Some(delta) = affine_constant(&right) {
+                let (base, base_delta) = recognize_affine_bv(&left)?;
+                return base_delta
+                    .checked_add(delta)
+                    .map(|combined| (widen_affine_base(&base, ast.get_size()), combined));
+            }
+            if let Some(delta) = affine_constant(&left) {
+                let (base, base_delta) = recognize_affine_bv(&right)?;
+                return base_delta
+                    .checked_add(delta)
+                    .map(|combined| (widen_affine_base(&base, ast.get_size()), combined));
+            }
+            None
+        }
+        DeclKind::BSUB => {
+            let children = ast.children();
+            if children.len() != 2 {
+                return None;
+            }
+            let left = children[0].as_bv()?;
+            let right = children[1].as_bv()?;
+            let delta = affine_constant(&right)?;
+            let (base, base_delta) = recognize_affine_bv(&left)?;
+            base_delta
+                .checked_sub(delta)
+                .map(|combined| (widen_affine_base(&base, ast.get_size()), combined))
+        }
+        DeclKind::ZERO_EXT | DeclKind::SIGN_EXT => {
+            let child = ast.nth_child(0)?.as_bv()?;
+            let (base, delta) = recognize_affine_bv(&child)?;
+            Some((widen_affine_base(&base, ast.get_size()), delta))
+        }
+        _ => None,
+    }
+}
+
+fn widen_affine_base(base: &BV, target_bits: u32) -> BV {
+    let base_bits = base.get_size();
+    if base_bits == target_bits {
+        base.clone()
+    } else if base_bits < target_bits {
+        base.zero_ext(target_bits - base_bits)
+    } else {
+        base.extract(target_bits - 1, 0)
+    }
+}
+
+fn affine_constant(ast: &BV) -> Option<i64> {
+    let value = ast.as_u64()?;
+    if let Ok(delta) = i64::try_from(value) {
+        return Some(delta);
+    }
+    let bits = ast.get_size();
+    if bits == 0 || bits >= 64 {
+        let sign_bit = 1u64 << 63;
+        return (value & sign_bit != 0).then_some(value as i64);
+    }
+    let sign_bit = 1u64 << (bits - 1);
+    (value & sign_bit != 0).then_some(value as i64)
 }
 
 #[cfg(test)]
@@ -934,6 +1102,30 @@ mod tests {
         let resolved = mem.resolve_pointer(&SymValue::concrete(0x7fff_1004, 64), 1, &[]);
         assert_eq!(resolved.pointers.len(), 1);
         assert_eq!(resolved.pointers[0].region_id, input);
+        assert_eq!(resolved.pointers[0].offset, 4);
+    }
+
+    #[test]
+    fn test_region_resolution_prefers_replay_over_global_when_overlapping() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+        let global = mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x4000),
+            Some(0x20),
+        );
+        let replay = mem.define_region(
+            MemoryRegionKind::Replay,
+            "checkpoint",
+            Some(0x4000),
+            Some(0x20),
+        );
+
+        let resolved = mem.resolve_pointer(&SymValue::concrete(0x4004, 64), 1, &[]);
+        assert_eq!(resolved.pointers.len(), 1);
+        assert_eq!(resolved.pointers[0].region_id, replay);
+        assert_ne!(resolved.pointers[0].region_id, global);
         assert_eq!(resolved.pointers[0].offset, 4);
     }
 
@@ -992,5 +1184,162 @@ mod tests {
             mem.read_bytes(0x9000, 4),
             Some(vec![0x11, 0x22, 0x33, 0x44])
         );
+    }
+
+    #[test]
+    fn test_overlapping_concrete_offset_writes_preserve_exact_bytes() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+        let globals = mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x2000),
+            Some(0x100),
+        );
+
+        let base = RegionPointer {
+            region_id: globals,
+            offset: 0,
+            ptr_bits: 64,
+        };
+        let overlap = RegionPointer {
+            region_id: globals,
+            offset: 1,
+            ptr_bits: 64,
+        };
+        mem.region_write(&base, &SymValue::concrete(0x1122_3344, 32), 4);
+        mem.region_write(&overlap, &SymValue::concrete(0xaabb, 16), 2);
+
+        let addr = SymValue::concrete(0x2000, 64);
+        assert_eq!(mem.read(&addr, 4).as_concrete(), Some(0x11aa_bb44));
+        assert_eq!(
+            mem.read_bytes(0x2000, 4),
+            Some(vec![0x44, 0xbb, 0xaa, 0x11])
+        );
+    }
+
+    #[test]
+    fn test_symbolic_offset_write_invalidates_overwritten_concrete_bytes() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+        let globals = mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x3000),
+            Some(0x100),
+        );
+        mem.seed_region_bytes(globals, 0, &[0x10, 0x20, 0x30, 0x40]);
+
+        let ptr = RegionPointer {
+            region_id: globals,
+            offset: 1,
+            ptr_bits: 64,
+        };
+        mem.region_write(&ptr, &SymValue::new_symbolic(&ctx, "sym_word", 16), 2);
+
+        assert_eq!(mem.read_bytes(0x3000, 4), None);
+        assert!(!mem.is_concrete_range(0x3000, 4));
+        assert_eq!(
+            mem.read(&SymValue::concrete(0x3000, 64), 1).as_concrete(),
+            Some(0x10)
+        );
+        assert!(mem.read(&SymValue::concrete(0x3001, 64), 1).is_symbolic());
+        assert!(mem.read(&SymValue::concrete(0x3002, 64), 1).is_symbolic());
+        assert_eq!(
+            mem.read(&SymValue::concrete(0x3003, 64), 1).as_concrete(),
+            Some(0x40)
+        );
+    }
+
+    #[test]
+    fn test_overlapping_symbolic_offset_writes_compose_by_byte() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+        let globals = mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x4000),
+            Some(0x100),
+        );
+
+        let wide = RegionPointer {
+            region_id: globals,
+            offset: 0,
+            ptr_bits: 64,
+        };
+        let byte = RegionPointer {
+            region_id: globals,
+            offset: 1,
+            ptr_bits: 64,
+        };
+        let word = SymValue::new_symbolic(&ctx, "word", 32);
+        mem.region_write(&wide, &word, 4);
+        mem.region_write(&byte, &SymValue::concrete(0xaa, 8), 1);
+
+        let read_back = mem.read(&SymValue::concrete(0x4000, 64), 4);
+        let solver = Solver::new();
+        solver.assert(word.to_bv(&ctx).eq(BV::from_u64(0x1122_3344, 32)));
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().unwrap();
+        let value = model
+            .eval(&read_back.to_bv(&ctx), true)
+            .and_then(|value| value.as_u64())
+            .unwrap();
+        assert_eq!(value, 0x1122_aa44);
+    }
+
+    #[test]
+    fn test_affine_pointer_recognizer_extracts_symbol_plus_delta() {
+        let ctx = Context::thread_local();
+        let base = SymValue::new_symbolic(&ctx, "ptr_base", 64);
+        let addr = base.add(&ctx, &SymValue::concrete(0x20, 64));
+
+        let affine = recognize_affine_pointer(&addr).expect("affine recognizer should match");
+        assert_eq!(affine.delta, 0x20);
+        let same = affine.base.to_bv(&ctx).eq(base.to_bv(&ctx));
+        assert_eq!(same.simplify().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_semantic_fingerprint_ignores_equivalent_concrete_write_chunking() {
+        let ctx = Context::thread_local();
+        let mut lhs = SymMemory::new(&ctx);
+        let mut rhs = SymMemory::new(&ctx);
+        let globals_lhs = lhs.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x5000),
+            Some(0x100),
+        );
+        let globals_rhs = rhs.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x5000),
+            Some(0x100),
+        );
+
+        lhs.region_write(
+            &RegionPointer {
+                region_id: globals_lhs,
+                offset: 0,
+                ptr_bits: 64,
+            },
+            &SymValue::concrete(0x4433_2211, 32),
+            4,
+        );
+        for (index, byte) in [0x11u8, 0x22, 0x33, 0x44].into_iter().enumerate() {
+            rhs.region_write(
+                &RegionPointer {
+                    region_id: globals_rhs,
+                    offset: index as u64,
+                    ptr_bits: 64,
+                },
+                &SymValue::concrete(byte as u64, 8),
+                1,
+            );
+        }
+
+        assert_eq!(lhs.read_bytes(0x5000, 4), rhs.read_bytes(0x5000, 4));
+        assert_eq!(lhs.semantic_fingerprint(), rhs.semantic_fingerprint());
     }
 }

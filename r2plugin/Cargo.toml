@@ -28,5 +28,6 @@ optional = true
 default = ["x86"]
 x86 = ["sleigh-config/x86"]
 arm = ["sleigh-config/ARM", "sleigh-config/AARCH64"]
+mips = ["sleigh-config/MIPS"]
 riscv = ["sleigh-config/RISCV"]
-all-archs = ["x86", "arm", "riscv"]
+all-archs = ["x86", "arm", "mips", "riscv"]

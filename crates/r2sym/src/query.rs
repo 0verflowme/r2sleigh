@@ -213,6 +213,7 @@ fn condition_summary<'ctx>(path: &PathResult<'ctx>) -> PathConditionSummary {
 enum PreconditionApplication<'ctx> {
     Continue {
         initial_state: Box<SymState<'ctx>>,
+        narrowed_state: Option<Box<SymState<'ctx>>>,
         compiled_precondition: Option<BackwardConditionSummary>,
     },
     ExactUnsat {
@@ -229,10 +230,50 @@ fn precision_rank(precision: BackwardConditionPrecision) -> u8 {
     }
 }
 
-fn vm_arm_reaches_target(arm: &crate::VmTransferArm, target_addr: u64) -> bool {
+fn vm_exit_guard_allows_target(
+    bindings: &BTreeMap<String, u64>,
+    arm: &crate::VmTransferArm,
+    target_addr: u64,
+) -> bool {
+    let guards = arm
+        .exit_guards
+        .iter()
+        .filter(|guard| guard.target == target_addr)
+        .collect::<Vec<_>>();
+    if guards.is_empty() {
+        return true;
+    }
+    let mut saw_reliable = false;
+    for guarded in guards {
+        let evidence = guarded.guard.evidence();
+        if !evidence.is_usable() {
+            return true;
+        }
+        if !evidence.allows_narrowing() {
+            if matches!(guarded.guard.evaluate(bindings), Some(true)) {
+                return true;
+            }
+            continue;
+        }
+        saw_reliable = true;
+        match guarded.guard.evaluate(bindings) {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return true,
+        }
+    }
+    !saw_reliable
+}
+
+fn vm_arm_reaches_target(
+    bindings: &BTreeMap<String, u64>,
+    arm: &crate::VmTransferArm,
+    target_addr: u64,
+) -> bool {
     arm.handler_target == target_addr
         || arm.region_blocks.contains(&target_addr)
-        || arm.exit_targets.contains(&target_addr)
+        || (arm.exit_targets.contains(&target_addr)
+            && vm_exit_guard_allows_target(bindings, arm, target_addr))
 }
 
 fn vm_arm_for_case(vm_step: &VmStepSummary, case_value: u64) -> Option<&crate::VmTransferArm> {
@@ -250,13 +291,13 @@ fn vm_selector_bindings(vm_step: &VmStepSummary, case_value: u64) -> BTreeMap<St
     bindings
 }
 
-fn vm_apply_exact_state_updates(
+fn vm_apply_confident_state_updates(
     bindings: &BTreeMap<String, u64>,
     updates: &[crate::VmStateUpdate],
 ) -> BTreeMap<String, u64> {
     let mut next = bindings.clone();
     for update in updates {
-        if !update.exact {
+        if !update.evidence().allows_narrowing() {
             continue;
         }
         if let Some(value) = update.value.evaluate_u64(&next) {
@@ -266,20 +307,53 @@ fn vm_apply_exact_state_updates(
     next
 }
 
+fn vm_apply_confident_memory_writes(
+    bindings: &BTreeMap<String, u64>,
+    writes: &[crate::VmMemoryCondition],
+) -> BTreeMap<String, u64> {
+    let mut next = bindings.clone();
+    for write in writes {
+        if !write.evidence().allows_narrowing() {
+            continue;
+        }
+        let Some(binding) = write.binding.as_ref() else {
+            continue;
+        };
+        let Some(value) = write.value.as_ref() else {
+            continue;
+        };
+        let Some(value) = value.evaluate_u64(&next) else {
+            continue;
+        };
+        next.insert(binding.clone(), value);
+    }
+    next
+}
+
 fn vm_next_case_value(
     bindings: &BTreeMap<String, u64>,
     arm: &crate::VmTransferArm,
     selector_name: Option<&str>,
+    dispatch_header: u64,
+    loop_header: u64,
 ) -> Option<(u64, BTreeMap<String, u64>)> {
     if !arm.redispatch || arm.truncated {
         return None;
     }
-    let mut next_bindings = vm_apply_exact_state_updates(bindings, &arm.state_updates);
+    let can_redispatch = arm.exit_targets.iter().any(|target| {
+        (*target == dispatch_header || *target == loop_header)
+            && vm_exit_guard_allows_target(bindings, arm, *target)
+    }) || arm.exit_targets.is_empty();
+    if !can_redispatch {
+        return None;
+    }
+    let mut next_bindings = vm_apply_confident_state_updates(bindings, &arm.state_updates);
     let selector_update = arm.selector_update.as_ref()?;
-    if !selector_update.exact {
+    if !selector_update.evidence().allows_narrowing() {
         return None;
     }
     let next_case = selector_update.value.evaluate_u64(&next_bindings)?;
+    next_bindings = vm_apply_confident_memory_writes(&next_bindings, &arm.memory_writes);
     next_bindings.insert(selector_update.output.clone(), next_case);
     if let Some(selector_name) = selector_name {
         next_bindings.insert(selector_name.to_string(), next_case);
@@ -303,15 +377,19 @@ fn vm_case_reaches_target(vm_step: &VmStepSummary, initial_case: u64, target_add
         let Some(arm) = vm_arm_for_case(vm_step, case_value) else {
             continue;
         };
-        if vm_arm_reaches_target(arm, target_addr) {
+        if vm_arm_reaches_target(&bindings, arm, target_addr) {
             return true;
         }
         if depth >= MAX_VM_COMPILED_STEPS.saturating_sub(1) || !arm.redispatch {
             continue;
         }
-        let Some((next_case, next_bindings)) =
-            vm_next_case_value(&bindings, arm, vm_step.selector.as_deref())
-        else {
+        let Some((next_case, next_bindings)) = vm_next_case_value(
+            &bindings,
+            arm,
+            vm_step.selector.as_deref(),
+            vm_step.dispatch_header,
+            vm_step.loop_header,
+        ) else {
             continue;
         };
         queue.push_back((next_case, next_bindings, depth + 1));
@@ -408,8 +486,72 @@ fn prefer_compiled_precondition(
 
 fn apply_compiled_precondition<'ctx>(
     explorer: &PathExplorer<'ctx>,
-    func: &SsaArtifact,
     mut initial_state: SymState<'ctx>,
+    compiled: crate::CompiledBackwardCondition,
+) -> PreconditionApplication<'ctx> {
+    let summary = compiled.summary.clone();
+    let evidence = summary.evidence();
+    match explorer
+        .solver()
+        .sat_with_constraint(&initial_state, &compiled.predicate)
+    {
+        SatResult::Unsat if evidence.allows_hard_proof() => PreconditionApplication::ExactUnsat {
+            compiled_precondition: summary,
+        },
+        SatResult::Sat => {
+            if evidence.allows_hard_proof() {
+                initial_state.add_constraint(compiled.predicate);
+                PreconditionApplication::Continue {
+                    initial_state: Box::new(initial_state),
+                    narrowed_state: None,
+                    compiled_precondition: Some(summary),
+                }
+            } else if evidence.allows_narrowing() {
+                let mut narrowed_state = initial_state.fork();
+                narrowed_state.add_constraint(compiled.predicate);
+                PreconditionApplication::Continue {
+                    initial_state: Box::new(initial_state),
+                    narrowed_state: Some(Box::new(narrowed_state)),
+                    compiled_precondition: Some(summary),
+                }
+            } else {
+                PreconditionApplication::Continue {
+                    initial_state: Box::new(initial_state),
+                    narrowed_state: None,
+                    compiled_precondition: Some(summary),
+                }
+            }
+        }
+        SatResult::Unknown | SatResult::Unsat => PreconditionApplication::Continue {
+            initial_state: Box::new(initial_state),
+            narrowed_state: None,
+            compiled_precondition: Some(summary),
+        },
+    }
+}
+
+fn find_paths_with_compiled_narrowing<'ctx, F>(
+    explorer: &mut PathExplorer<'ctx>,
+    initial_state: SymState<'ctx>,
+    narrowed_state: Option<Box<SymState<'ctx>>>,
+    mut search: F,
+) -> Vec<PathResult<'ctx>>
+where
+    F: FnMut(&mut PathExplorer<'ctx>, SymState<'ctx>) -> Vec<PathResult<'ctx>>,
+{
+    if let Some(narrowed_state) = narrowed_state {
+        let matches = search(explorer, *narrowed_state);
+        if !matches.is_empty() || explorer.budget_exhausted() {
+            return matches;
+        }
+    }
+    search(explorer, initial_state)
+}
+
+fn apply_best_compiled_precondition<'ctx>(
+    explorer: &PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    initial_state: SymState<'ctx>,
     target_addr: u64,
 ) -> PreconditionApplication<'ctx> {
     let derived_summaries = explorer.derived_call_summary_views();
@@ -436,33 +578,11 @@ fn apply_compiled_precondition<'ctx>(
     let Some(compiled) = compiled else {
         return PreconditionApplication::Continue {
             initial_state: Box::new(initial_state),
+            narrowed_state: None,
             compiled_precondition: None,
         };
     };
-
-    let summary = compiled.summary.clone();
-    let exact = matches!(summary.precision, BackwardConditionPrecision::Exact);
-    match explorer
-        .solver()
-        .sat_with_constraint(&initial_state, &compiled.predicate)
-    {
-        SatResult::Unsat if exact => PreconditionApplication::ExactUnsat {
-            compiled_precondition: summary,
-        },
-        SatResult::Sat => {
-            if exact {
-                initial_state.add_constraint(compiled.predicate);
-            }
-            PreconditionApplication::Continue {
-                initial_state: Box::new(initial_state),
-                compiled_precondition: Some(summary),
-            }
-        }
-        SatResult::Unknown | SatResult::Unsat => PreconditionApplication::Continue {
-            initial_state: Box::new(initial_state),
-            compiled_precondition: Some(summary),
-        },
-    }
+    apply_compiled_precondition(explorer, initial_state, compiled)
 }
 
 impl<'ctx> PathExplorer<'ctx> {
@@ -474,12 +594,18 @@ impl<'ctx> PathExplorer<'ctx> {
         target_addr: u64,
     ) -> ReachabilityResult<'ctx> {
         let (paths, compiled_precondition) =
-            match apply_compiled_precondition(self, func, initial_state, target_addr) {
+            match apply_best_compiled_precondition(self, func, initial_state, target_addr) {
                 PreconditionApplication::Continue {
                     initial_state,
+                    narrowed_state,
                     compiled_precondition,
                 } => (
-                    self.find_paths_to(func, *initial_state, target_addr),
+                    find_paths_with_compiled_narrowing(
+                        self,
+                        *initial_state,
+                        narrowed_state,
+                        |explorer, state| explorer.find_paths_to(func, state, target_addr),
+                    ),
                     compiled_precondition,
                 ),
                 PreconditionApplication::ExactUnsat {
@@ -513,12 +639,18 @@ impl<'ctx> PathExplorer<'ctx> {
         target_pc: u64,
     ) -> PathConditionResult<'ctx> {
         let (matching_paths, compiled_precondition) =
-            match apply_compiled_precondition(self, func, initial_state, target_pc) {
+            match apply_best_compiled_precondition(self, func, initial_state, target_pc) {
                 PreconditionApplication::Continue {
                     initial_state,
+                    narrowed_state,
                     compiled_precondition,
                 } => (
-                    self.find_paths_to(func, *initial_state, target_pc),
+                    find_paths_with_compiled_narrowing(
+                        self,
+                        *initial_state,
+                        narrowed_state,
+                        |explorer, state| explorer.find_paths_to(func, state, target_pc),
+                    ),
                     compiled_precondition,
                 ),
                 PreconditionApplication::ExactUnsat {
@@ -547,12 +679,18 @@ impl<'ctx> PathExplorer<'ctx> {
         target_addr: u64,
     ) -> SolveResult<'ctx> {
         let (matched_paths, compiled_precondition, exact_unsat) =
-            match apply_compiled_precondition(self, func, initial_state, target_addr) {
+            match apply_best_compiled_precondition(self, func, initial_state, target_addr) {
                 PreconditionApplication::Continue {
                     initial_state,
+                    narrowed_state,
                     compiled_precondition,
                 } => (
-                    self.find_paths_to(func, *initial_state, target_addr),
+                    find_paths_with_compiled_narrowing(
+                        self,
+                        *initial_state,
+                        narrowed_state,
+                        |explorer, state| explorer.find_paths_to(func, state, target_addr),
+                    ),
                     compiled_precondition,
                     false,
                 ),
@@ -620,12 +758,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        PreconditionApplication, apply_compiled_precondition, prefer_compiled_precondition,
-        vm_target_case_values,
+        PreconditionApplication, apply_best_compiled_precondition, apply_compiled_precondition,
+        prefer_compiled_precondition, vm_target_case_values,
     };
     use crate::{
         BackwardConditionPrecision, BackwardConditionSummary, SymQueryConfig, SymState, VmBinaryOp,
-        VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
+        VmGuardCondition, VmGuardedExit, VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
     };
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
     use r2ssa::SsaArtifact;
@@ -731,6 +869,9 @@ mod tests {
             handler_state_inputs: BTreeMap::new(),
             handler_state_outputs: BTreeMap::new(),
             handler_state_updates: BTreeMap::new(),
+            handler_exit_guards: BTreeMap::new(),
+            handler_memory_read_effects: BTreeMap::new(),
+            handler_memory_write_effects: BTreeMap::new(),
             handler_memory_reads: BTreeMap::new(),
             handler_memory_writes: BTreeMap::new(),
             handler_calls: BTreeMap::new(),
@@ -753,9 +894,10 @@ mod tests {
 
         let explorer = SymQueryConfig::default().make_explorer(&ctx);
         let original_constraints = state.num_constraints();
-        match apply_compiled_precondition(&explorer, &func, state, 0x1010) {
+        match apply_best_compiled_precondition(&explorer, &func, state, 0x1010) {
             PreconditionApplication::Continue {
                 initial_state,
+                narrowed_state,
                 compiled_precondition,
             } => {
                 let compiled = compiled_precondition.expect("compiled precondition");
@@ -764,9 +906,53 @@ mod tests {
                     crate::BackwardConditionPrecision::ResidualSearchRequired
                 );
                 assert_eq!(initial_state.num_constraints(), original_constraints);
+                assert!(narrowed_state.is_none());
             }
             PreconditionApplication::ExactUnsat { .. } => {
                 panic!("residual precondition should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn likely_compiled_preconditions_seed_narrowed_search_state() {
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("reg:56_0", 64);
+        let original_constraints = state.num_constraints();
+
+        let compiled = crate::CompiledBackwardCondition {
+            predicate: z3::ast::Bool::from_bool(true),
+            summary: BackwardConditionSummary {
+                simplified: "guard".to_string(),
+                terms: vec!["guard".to_string()],
+                memory_terms: Vec::new(),
+                backward_memory_substitutions: 0,
+                backward_memory_candidate_enumerations: 0,
+                backward_memory_residual_fallbacks: 0,
+                precision: BackwardConditionPrecision::OverApprox,
+                supported_paths: 1,
+                total_paths: 2,
+            },
+        };
+
+        match apply_compiled_precondition(&explorer, state, compiled) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                let compiled = compiled_precondition.expect("compiled precondition");
+                assert_eq!(compiled.precision, BackwardConditionPrecision::OverApprox);
+                assert_eq!(initial_state.num_constraints(), original_constraints);
+                assert_eq!(
+                    narrowed_state.expect("narrowed state").num_constraints(),
+                    original_constraints + 1
+                );
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("likely precondition should not shortcut as exact unsat")
             }
         }
     }
@@ -779,6 +965,7 @@ mod tests {
                 case_values: vec![0],
                 region_blocks: vec![0x1004],
                 exit_targets: vec![0x1000],
+                exit_guards: Vec::new(),
                 state_updates: vec![VmStateUpdate {
                     output: "RDI_1".to_string(),
                     expr: "0x1".to_string(),
@@ -791,6 +978,10 @@ mod tests {
                     value: VmValueExpr::Const(1),
                     exact: true,
                 }),
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
                 exact: true,
                 redispatch: true,
                 may_return: false,
@@ -801,8 +992,13 @@ mod tests {
                 case_values: vec![1],
                 region_blocks: vec![0x1008, 0x1014],
                 exit_targets: vec![0x1014],
+                exit_guards: Vec::new(),
                 state_updates: Vec::new(),
                 selector_update: None,
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
                 exact: true,
                 redispatch: false,
                 may_return: true,
@@ -821,6 +1017,7 @@ mod tests {
                 case_values: vec![0],
                 region_blocks: vec![0x1004],
                 exit_targets: vec![0x1000],
+                exit_guards: Vec::new(),
                 state_updates: vec![VmStateUpdate {
                     output: "TMP_1".to_string(),
                     expr: "0x1".to_string(),
@@ -833,6 +1030,10 @@ mod tests {
                     value: VmValueExpr::Var("TMP_1".to_string()),
                     exact: true,
                 }),
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
                 exact: true,
                 redispatch: true,
                 may_return: false,
@@ -843,8 +1044,13 @@ mod tests {
                 case_values: vec![1],
                 region_blocks: vec![0x1008, 0x1014],
                 exit_targets: vec![0x1014],
+                exit_guards: Vec::new(),
                 state_updates: Vec::new(),
                 selector_update: None,
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
                 exact: true,
                 redispatch: false,
                 may_return: true,
@@ -863,6 +1069,7 @@ mod tests {
                 case_values: vec![0],
                 region_blocks: vec![0x1004],
                 exit_targets: vec![0x1000],
+                exit_guards: Vec::new(),
                 state_updates: vec![VmStateUpdate {
                     output: "RDI_1".to_string(),
                     expr: "(RDI_0 + 0x1)".to_string(),
@@ -883,6 +1090,10 @@ mod tests {
                     },
                     exact: true,
                 }),
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
                 exact: true,
                 redispatch: true,
                 may_return: false,
@@ -893,6 +1104,7 @@ mod tests {
                 case_values: vec![1],
                 region_blocks: vec![0x1008],
                 exit_targets: vec![0x1000],
+                exit_guards: Vec::new(),
                 state_updates: vec![VmStateUpdate {
                     output: "RDI_1".to_string(),
                     expr: "(RDI_0 + 0x1)".to_string(),
@@ -913,6 +1125,10 @@ mod tests {
                     },
                     exact: true,
                 }),
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
                 exact: true,
                 redispatch: true,
                 may_return: false,
@@ -923,8 +1139,13 @@ mod tests {
                 case_values: vec![2],
                 region_blocks: vec![0x1010, 0x1014],
                 exit_targets: vec![0x1014],
+                exit_guards: Vec::new(),
                 state_updates: Vec::new(),
                 selector_update: None,
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
                 exact: true,
                 redispatch: false,
                 may_return: true,
@@ -933,6 +1154,168 @@ mod tests {
         ]);
 
         assert_eq!(vm_target_case_values(&vm_step, 0x1014), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn vm_target_case_values_respect_exact_exit_guards() {
+        let vm_step = make_vm_step_summary_with_transfers(vec![
+            VmTransferArm {
+                handler_target: 0x1004,
+                case_values: vec![0],
+                region_blocks: vec![0x1004],
+                exit_targets: vec![0x1014, 0x1000],
+                exit_guards: vec![VmGuardedExit {
+                    target: 0x1014,
+                    guard: VmGuardCondition {
+                        expr: "(RDI_0 == 0x1)".to_string(),
+                        value: VmValueExpr::Binary {
+                            op: VmBinaryOp::Eq,
+                            lhs: Box::new(VmValueExpr::Var("RDI_0".to_string())),
+                            rhs: Box::new(VmValueExpr::Const(1)),
+                        },
+                        expect_nonzero: true,
+                        exact: true,
+                    },
+                }],
+                state_updates: Vec::new(),
+                selector_update: None,
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
+                exact: false,
+                redispatch: false,
+                may_return: true,
+                truncated: false,
+            },
+            VmTransferArm {
+                handler_target: 0x1008,
+                case_values: vec![1],
+                region_blocks: vec![0x1008],
+                exit_targets: vec![0x1014],
+                exit_guards: Vec::new(),
+                state_updates: Vec::new(),
+                selector_update: None,
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
+                exact: true,
+                redispatch: false,
+                may_return: true,
+                truncated: false,
+            },
+        ]);
+
+        assert_eq!(vm_target_case_values(&vm_step, 0x1014), vec![1]);
+    }
+
+    #[test]
+    fn vm_target_case_values_follow_exact_memory_writes_across_redispatch() {
+        let binding = "mem:r7:0:1".to_string();
+        let vm_step = make_vm_step_summary_with_transfers(vec![
+            VmTransferArm {
+                handler_target: 0x1004,
+                case_values: vec![0],
+                region_blocks: vec![0x1004],
+                exit_targets: vec![0x1000],
+                exit_guards: Vec::new(),
+                state_updates: Vec::new(),
+                selector_update: Some(VmStateUpdate {
+                    output: "RDI_1".to_string(),
+                    expr: "0x1".to_string(),
+                    value: VmValueExpr::Const(1),
+                    exact: true,
+                }),
+                memory_reads: Vec::new(),
+                memory_writes: vec![crate::VmMemoryCondition {
+                    region: crate::VmMemoryRegionRef {
+                        id: 7,
+                        kind: crate::MemoryRegionKind::Global,
+                        name: "ram:0x4000".to_string(),
+                    },
+                    offset_lo: 0,
+                    offset_hi: 0,
+                    size: 1,
+                    exact_offset: true,
+                    binding: Some(binding.clone()),
+                    expr: "*0x4000".to_string(),
+                    value_expr: Some("0x1".to_string()),
+                    value: Some(VmValueExpr::Const(1)),
+                    exact_value: true,
+                }],
+                residual_guards: false,
+                residual_memory_effects: false,
+                exact: true,
+                redispatch: true,
+                may_return: false,
+                truncated: false,
+            },
+            VmTransferArm {
+                handler_target: 0x1008,
+                case_values: vec![2],
+                region_blocks: vec![0x1008],
+                exit_targets: vec![0x1000],
+                exit_guards: Vec::new(),
+                state_updates: Vec::new(),
+                selector_update: Some(VmStateUpdate {
+                    output: "RDI_1".to_string(),
+                    expr: "0x1".to_string(),
+                    value: VmValueExpr::Const(1),
+                    exact: true,
+                }),
+                memory_reads: Vec::new(),
+                memory_writes: vec![crate::VmMemoryCondition {
+                    region: crate::VmMemoryRegionRef {
+                        id: 7,
+                        kind: crate::MemoryRegionKind::Global,
+                        name: "ram:0x4000".to_string(),
+                    },
+                    offset_lo: 0,
+                    offset_hi: 0,
+                    size: 1,
+                    exact_offset: true,
+                    binding: Some(binding.clone()),
+                    expr: "*0x4000".to_string(),
+                    value_expr: Some("0x0".to_string()),
+                    value: Some(VmValueExpr::Const(0)),
+                    exact_value: true,
+                }],
+                residual_guards: false,
+                residual_memory_effects: false,
+                exact: true,
+                redispatch: true,
+                may_return: false,
+                truncated: false,
+            },
+            VmTransferArm {
+                handler_target: 0x1010,
+                case_values: vec![1],
+                region_blocks: vec![0x1010],
+                exit_targets: vec![0x1014],
+                exit_guards: vec![VmGuardedExit {
+                    target: 0x1014,
+                    guard: VmGuardCondition {
+                        expr: binding.clone(),
+                        value: VmValueExpr::Var(binding.clone()),
+                        expect_nonzero: true,
+                        exact: true,
+                    },
+                }],
+                state_updates: Vec::new(),
+                selector_update: None,
+                memory_reads: Vec::new(),
+                memory_writes: Vec::new(),
+                residual_guards: false,
+                residual_memory_effects: false,
+                exact: true,
+                redispatch: false,
+                may_return: true,
+                truncated: false,
+            },
+        ]);
+
+        assert_eq!(vm_target_case_values(&vm_step, 0x1014), vec![0, 1]);
     }
 
     #[test]

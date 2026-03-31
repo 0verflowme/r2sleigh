@@ -72,10 +72,14 @@ pub use replay::{
 pub use runtime::{seed_default_state_for_arch, seed_memory_regions_for_arch};
 pub use semantics::{
     CompiledFunctionSemantics, CompiledSemanticArtifact, CompiledSemanticMode,
-    InterpreterDispatchSummary, InterpreterKind, ResidualReason, SemanticCapability, SemanticMode,
-    SliceClass, SymbolicBranchFact, SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts,
-    SymbolicReachabilityStatus, VmBinaryOp, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp,
-    VmValueExpr, collect_symbolic_function_facts, collect_symbolic_function_facts_with_scope,
+    InterpreterDispatchSummary, InterpreterKind, ResidualReason, SemanticCapability,
+    SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
+    SemanticEvidenceProvenance, SemanticEvidenceReason, SemanticEvidenceSoundness, SemanticMode,
+    SliceClass, SymbolicBranchFact, SymbolicControlFact, SymbolicControlIsland,
+    SymbolicControlIslandKind, SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts,
+    SymbolicReachabilityStatus, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
+    VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp, VmValueExpr,
+    collect_symbolic_function_facts, collect_symbolic_function_facts_with_scope,
     compile_function_semantics_with_scope, compile_semantic_artifact_with_scope, stable_scope_hash,
 };
 pub use sim::{

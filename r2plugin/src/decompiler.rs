@@ -128,12 +128,18 @@ pub(crate) fn run_full_decompile_on_large_stack(
 ) -> String {
     const STACK_SIZE: usize = 512 * 1024 * 1024;
 
+    fn semantic_artifact_allows_full_decompile(
+        artifact: Option<&crate::types::FunctionAnalysisArtifact>,
+    ) -> bool {
+        artifact
+            .and_then(|artifact| artifact.semantic_artifact.as_ref())
+            .is_some_and(|compiled| compiled.capability.decompile_ready)
+    }
+
     let handle = std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(move || {
-            if let Some(reason) = crate::decompiler_cfg_guard_reason(&r2il_blocks) {
-                return decompile_artifact_guard_fallback(&func_name_str, &reason);
-            }
+            let cfg_guard_reason = crate::decompiler_cfg_guard_reason(&r2il_blocks);
             let arch_name =
                 normalize_sig_arch_name(arch.as_ref()).unwrap_or_else(|| "unknown".to_string());
             let config = decompiler_config_for_arch_name(&arch_name, ptr_bits);
@@ -146,6 +152,8 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 &symbols,
             );
             let mut artifact = if let Some(artifact) = cached_artifact {
+                let allow_semantic_decompile =
+                    semantic_artifact_allows_full_decompile(Some(&artifact));
                 if let Some(semantic_artifact) = artifact.semantic_artifact.as_ref()
                     && crate::should_decompile_from_semantic_fallback(
                         &func_name_str,
@@ -157,14 +165,27 @@ pub(crate) fn run_full_decompile_on_large_stack(
                         semantic_artifact,
                     );
                 }
+                if let Some(reason) = cfg_guard_reason.as_ref()
+                    && !allow_semantic_decompile
+                {
+                    return decompile_artifact_guard_fallback(&func_name_str, reason);
+                }
                 artifact
             } else {
-                let precomputed_semantic_artifact = crate::types::collect_detached_semantic_artifact(
-                    &r2il_blocks,
-                    &func_name_str,
-                    arch.as_ref(),
-                    symbolic_scope.as_ref(),
+                let precomputed_semantic_artifact = cfg_guard_reason.as_ref().map_or_else(
+                    || None,
+                    |_| {
+                        crate::types::collect_detached_semantic_artifact(
+                            &r2il_blocks,
+                            &func_name_str,
+                            arch.as_ref(),
+                            symbolic_scope.as_ref(),
+                        )
+                    },
                 );
+                let allow_semantic_decompile = precomputed_semantic_artifact
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.capability.decompile_ready);
                 if let Some(semantic_artifact) = precomputed_semantic_artifact.as_ref()
                     && crate::should_decompile_from_semantic_fallback(
                         &func_name_str,
@@ -175,6 +196,11 @@ pub(crate) fn run_full_decompile_on_large_stack(
                         &display_func_name,
                         semantic_artifact,
                     );
+                }
+                if let Some(reason) = cfg_guard_reason.as_ref()
+                    && !allow_semantic_decompile
+                {
+                    return decompile_artifact_guard_fallback(&func_name_str, reason);
                 }
                 let Some(artifact) =
                     crate::types::build_detached_function_analysis_artifact_with_scope_and_semantics(
@@ -209,6 +235,10 @@ pub(crate) fn run_full_decompile_on_large_stack(
             );
 
             let decompiler = r2dec::Decompiler::new(config);
+            let semantic_fallback_output = artifact
+                .semantic_artifact
+                .as_ref()
+                .map(|compiled| crate::decompile_semantic_artifact_fallback(&display_func_name, compiled));
             let input = decompiler_input_from_artifact(
                 artifact,
                 function_names,
@@ -216,7 +246,21 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 symbols,
             );
 
-            decompiler.decompile_input(&input)
+            let output = decompiler.decompile_input(&input);
+            if output.trim().is_empty() {
+                return semantic_fallback_output.unwrap_or_else(|| {
+                    cfg_guard_reason
+                        .as_ref()
+                        .map(|reason| decompile_artifact_guard_fallback(&func_name_str, reason))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "/* r2dec fallback: skipped decompilation for {} (empty output) */",
+                                display_func_name
+                            )
+                        })
+                });
+            }
+            output
         });
 
     match handle {

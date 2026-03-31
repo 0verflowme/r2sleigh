@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 
 use r2ssa::cfg::BlockTerminator;
 use r2ssa::{CFGEdge, SSAFunction};
-use r2types::SymbolicReachabilityStatus;
 
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
@@ -427,20 +426,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     fn symbolic_exact_reachable_target(&self, cond_block: u64) -> Option<u64> {
-        let fact = self
-            .fold_ctx
+        self.fold_ctx
             .inputs
             .symbolic_facts
-            .branch_fact_for_block(cond_block)?;
-        match (fact.true_status, fact.false_status) {
-            (SymbolicReachabilityStatus::Reachable, SymbolicReachabilityStatus::Unreachable) => {
-                Some(fact.true_target)
-            }
-            (SymbolicReachabilityStatus::Unreachable, SymbolicReachabilityStatus::Reachable) => {
-                Some(fact.false_target)
-            }
-            _ => None,
-        }
+            .exact_reachable_target_for_block(cond_block)
     }
 
     fn try_structure_symbolic_exact_if(
@@ -2243,7 +2232,9 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::SSAFunction;
     use r2types::{
-        SymbolicInterpreterKind, SymbolicSemanticFacts, SymbolicVmStateUpdate,
+        SymbolicControlFact, SymbolicControlIsland, SymbolicControlIslandKind,
+        SymbolicInterpreterKind, SymbolicReachabilityStatus, SymbolicSemanticConfidence,
+        SymbolicSemanticEvidence, SymbolicSemanticFacts, SymbolicVmStateUpdate,
         SymbolicVmStepSummary,
     };
     use std::collections::BTreeMap;
@@ -2891,8 +2882,15 @@ mod tests {
                         expr: "state + 1".to_string(),
                         value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
                         exact: false,
+                        evidence: r2types::SymbolicSemanticEvidence::heuristic(
+                            r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                        ),
+                        confidence: r2types::SymbolicSemanticConfidence::Heuristic,
                     }],
                 )]),
+                handler_exit_guards: BTreeMap::new(),
+                handler_memory_read_effects: BTreeMap::new(),
+                handler_memory_write_effects: BTreeMap::new(),
                 handler_memory_reads: BTreeMap::from([(0x1004, 1)]),
                 handler_memory_writes: BTreeMap::from([(0x1004, 1)]),
                 handler_calls: BTreeMap::from([(0x1004, 0)]),
@@ -2906,14 +2904,27 @@ mod tests {
                     case_values: vec![1, 2],
                     region_blocks: vec![0x1004, 0x1008],
                     exit_targets: vec![0x1008],
+                    exit_guards: Vec::new(),
                     state_updates: vec![SymbolicVmStateUpdate {
                         output: "state".to_string(),
                         expr: "state + 1".to_string(),
                         value: r2types::SymbolicVmValueExpr::Expr("state + 1".to_string()),
                         exact: false,
+                        evidence: r2types::SymbolicSemanticEvidence::heuristic(
+                            r2types::SymbolicSemanticEvidenceReason::ValueOpaque,
+                        ),
+                        confidence: r2types::SymbolicSemanticConfidence::Heuristic,
                     }],
                     selector_update: None,
+                    memory_reads: Vec::new(),
+                    memory_writes: Vec::new(),
+                    residual_guards: false,
+                    residual_memory_effects: false,
                     exact: false,
+                    evidence: r2types::SymbolicSemanticEvidence::likely(
+                        r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                    ),
+                    confidence: r2types::SymbolicSemanticConfidence::Likely,
                     redispatch: false,
                     may_return: false,
                     truncated: false,
@@ -2927,6 +2938,46 @@ mod tests {
         assert_eq!(
             structurer.get_switch_expression(0x1000),
             CExpr::Var("vm.sel".to_string())
+        );
+    }
+
+    #[test]
+    fn symbolic_exact_reachable_target_uses_control_island_fallback() {
+        let func = function_with_single_block(0x2000);
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.symbolic_facts = Box::leak(Box::new(SymbolicSemanticFacts {
+            control_islands: vec![SymbolicControlIsland {
+                kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
+                anchor_block: 0x2000,
+                frontier_targets: vec![0x2004, 0x2008],
+                facts: vec![
+                    SymbolicControlFact {
+                        target: 0x2004,
+                        status: SymbolicReachabilityStatus::Reachable,
+                        condition: Some("x == 0".to_string()),
+                        compiled: None,
+                        evidence: SymbolicSemanticEvidence::exact(),
+                        confidence: SymbolicSemanticConfidence::Exact,
+                    },
+                    SymbolicControlFact {
+                        target: 0x2008,
+                        status: SymbolicReachabilityStatus::Unreachable,
+                        condition: Some("!(x == 0)".to_string()),
+                        compiled: None,
+                        evidence: SymbolicSemanticEvidence::exact(),
+                        confidence: SymbolicSemanticConfidence::Exact,
+                    },
+                ],
+                evidence: SymbolicSemanticEvidence::exact(),
+                confidence: SymbolicSemanticConfidence::Exact,
+            }],
+            ..SymbolicSemanticFacts::default()
+        }));
+
+        let structurer = ControlFlowStructurer::new(&func, &ctx);
+        assert_eq!(
+            structurer.symbolic_exact_reachable_target(0x2000),
+            Some(0x2004)
         );
     }
 }

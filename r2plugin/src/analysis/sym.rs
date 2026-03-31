@@ -256,6 +256,11 @@ pub(crate) struct CompiledSemanticInfo {
     pub(crate) summary_attempted: usize,
     pub(crate) summary_budget_exhausted: usize,
     pub(crate) summary_scc_count: usize,
+    pub(crate) branch_fact_count: usize,
+    pub(crate) control_island_count: usize,
+    pub(crate) compiled_condition_count: usize,
+    pub(crate) exact_compiled_condition_count: usize,
+    pub(crate) actionable_compiled_condition_count: usize,
     pub(crate) branches_pruned: usize,
     pub(crate) branches_unknown: usize,
     pub(crate) skipped_large_cfg: bool,
@@ -291,6 +296,38 @@ pub(crate) struct VmStateUpdateInfo {
     pub(crate) expr: String,
     pub(crate) value: String,
     pub(crate) exact: bool,
+    pub(crate) confidence: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct VmGuardConditionInfo {
+    pub(crate) expr: String,
+    pub(crate) value: String,
+    pub(crate) expect_nonzero: bool,
+    pub(crate) exact: bool,
+    pub(crate) confidence: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct VmGuardedExitInfo {
+    pub(crate) target: String,
+    pub(crate) guard: VmGuardConditionInfo,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct VmMemoryConditionInfo {
+    pub(crate) region: String,
+    pub(crate) offset_lo: i64,
+    pub(crate) offset_hi: i64,
+    pub(crate) size: u32,
+    pub(crate) exact_offset: bool,
+    pub(crate) confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binding: Option<String>,
+    pub(crate) expr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) value_expr: Option<String>,
+    pub(crate) exact_value: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -299,10 +336,16 @@ pub(crate) struct VmTransferArmInfo {
     pub(crate) case_values: Vec<u64>,
     pub(crate) region_blocks: Vec<String>,
     pub(crate) exit_targets: Vec<String>,
+    pub(crate) exit_guards: Vec<VmGuardedExitInfo>,
     pub(crate) state_updates: Vec<VmStateUpdateInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) selector_update: Option<VmStateUpdateInfo>,
+    pub(crate) memory_reads: Vec<VmMemoryConditionInfo>,
+    pub(crate) memory_writes: Vec<VmMemoryConditionInfo>,
+    pub(crate) residual_guards: bool,
+    pub(crate) residual_memory_effects: bool,
     pub(crate) exact: bool,
+    pub(crate) confidence: String,
     pub(crate) redispatch: bool,
     pub(crate) may_return: bool,
     pub(crate) truncated: bool,
@@ -325,6 +368,9 @@ pub(crate) struct VmStepSummaryInfo {
     pub(crate) handler_state_inputs: BTreeMap<String, Vec<String>>,
     pub(crate) handler_state_outputs: BTreeMap<String, Vec<String>>,
     pub(crate) handler_state_updates: BTreeMap<String, Vec<VmStateUpdateInfo>>,
+    pub(crate) handler_exit_guards: BTreeMap<String, Vec<VmGuardedExitInfo>>,
+    pub(crate) handler_memory_read_effects: BTreeMap<String, Vec<VmMemoryConditionInfo>>,
+    pub(crate) handler_memory_write_effects: BTreeMap<String, Vec<VmMemoryConditionInfo>>,
     pub(crate) handler_memory_reads: BTreeMap<String, usize>,
     pub(crate) handler_memory_writes: BTreeMap<String, usize>,
     pub(crate) handler_calls: BTreeMap<String, usize>,
@@ -340,6 +386,16 @@ fn render_vm_value_expr(value: &SymbolicVmValueExpr) -> String {
     value.render()
 }
 
+fn render_semantic_confidence(confidence: r2sym::SemanticConfidence) -> String {
+    match confidence {
+        r2sym::SemanticConfidence::Exact => "exact",
+        r2sym::SemanticConfidence::Likely => "likely",
+        r2sym::SemanticConfidence::Heuristic => "heuristic",
+        r2sym::SemanticConfidence::Residual => "residual",
+    }
+    .to_string()
+}
+
 fn vm_state_update_info_from_sym(update: &r2sym::VmStateUpdate) -> VmStateUpdateInfo {
     let value = symbolic_vm_value_expr_from_sym(&update.value);
     VmStateUpdateInfo {
@@ -347,6 +403,54 @@ fn vm_state_update_info_from_sym(update: &r2sym::VmStateUpdate) -> VmStateUpdate
         expr: update.expr.clone(),
         value: render_vm_value_expr(&value),
         exact: update.exact,
+        confidence: render_semantic_confidence(update.confidence()),
+    }
+}
+
+fn vm_guard_condition_info_from_sym(guard: &r2sym::VmGuardCondition) -> VmGuardConditionInfo {
+    let value = symbolic_vm_value_expr_from_sym(&guard.value);
+    VmGuardConditionInfo {
+        expr: guard.expr.clone(),
+        value: render_vm_value_expr(&value),
+        expect_nonzero: guard.expect_nonzero,
+        exact: guard.exact,
+        confidence: render_semantic_confidence(guard.confidence()),
+    }
+}
+
+fn vm_guarded_exit_info_from_sym(guarded: &r2sym::VmGuardedExit) -> VmGuardedExitInfo {
+    VmGuardedExitInfo {
+        target: format!("0x{:x}", guarded.target),
+        guard: vm_guard_condition_info_from_sym(&guarded.guard),
+    }
+}
+
+fn vm_memory_condition_info_from_sym(
+    condition: &r2sym::VmMemoryCondition,
+) -> VmMemoryConditionInfo {
+    VmMemoryConditionInfo {
+        region: format!(
+            "{}:{}#{}",
+            match condition.region.kind {
+                r2sym::MemoryRegionKind::Stack => "stack",
+                r2sym::MemoryRegionKind::Global => "global",
+                r2sym::MemoryRegionKind::Input => "input",
+                r2sym::MemoryRegionKind::Heap => "heap",
+                r2sym::MemoryRegionKind::Replay => "replay",
+                r2sym::MemoryRegionKind::EscapedUnknown => "unknown",
+            },
+            condition.region.name,
+            condition.region.id
+        ),
+        offset_lo: condition.offset_lo,
+        offset_hi: condition.offset_hi,
+        size: condition.size,
+        exact_offset: condition.exact_offset,
+        confidence: render_semantic_confidence(condition.confidence()),
+        binding: condition.binding.clone(),
+        expr: condition.expr.clone(),
+        value_expr: condition.value_expr.clone(),
+        exact_value: condition.exact_value,
     }
 }
 
@@ -364,6 +468,11 @@ fn vm_transfer_arm_info_from_sym(transfer: &r2sym::VmTransferArm) -> VmTransferA
             .iter()
             .map(|addr| format!("0x{addr:x}"))
             .collect(),
+        exit_guards: transfer
+            .exit_guards
+            .iter()
+            .map(vm_guarded_exit_info_from_sym)
+            .collect(),
         state_updates: transfer
             .state_updates
             .iter()
@@ -373,7 +482,20 @@ fn vm_transfer_arm_info_from_sym(transfer: &r2sym::VmTransferArm) -> VmTransferA
             .selector_update
             .as_ref()
             .map(vm_state_update_info_from_sym),
+        memory_reads: transfer
+            .memory_reads
+            .iter()
+            .map(vm_memory_condition_info_from_sym)
+            .collect(),
+        memory_writes: transfer
+            .memory_writes
+            .iter()
+            .map(vm_memory_condition_info_from_sym)
+            .collect(),
+        residual_guards: transfer.residual_guards,
+        residual_memory_effects: transfer.residual_memory_effects,
         exact: transfer.exact,
+        confidence: render_semantic_confidence(transfer.confidence()),
         redispatch: transfer.redispatch,
         may_return: transfer.may_return,
         truncated: transfer.truncated,
@@ -439,6 +561,42 @@ fn vm_step_summary_info_from_sym(vm_step: &r2sym::VmStepSummary) -> VmStepSummar
                 (
                     format!("0x{target:x}"),
                     updates.iter().map(vm_state_update_info_from_sym).collect(),
+                )
+            })
+            .collect(),
+        handler_exit_guards: vm_step
+            .handler_exit_guards
+            .iter()
+            .map(|(target, guards)| {
+                (
+                    format!("0x{target:x}"),
+                    guards.iter().map(vm_guarded_exit_info_from_sym).collect(),
+                )
+            })
+            .collect(),
+        handler_memory_read_effects: vm_step
+            .handler_memory_read_effects
+            .iter()
+            .map(|(target, conditions)| {
+                (
+                    format!("0x{target:x}"),
+                    conditions
+                        .iter()
+                        .map(vm_memory_condition_info_from_sym)
+                        .collect(),
+                )
+            })
+            .collect(),
+        handler_memory_write_effects: vm_step
+            .handler_memory_write_effects
+            .iter()
+            .map(|(target, conditions)| {
+                (
+                    format!("0x{target:x}"),
+                    conditions
+                        .iter()
+                        .map(vm_memory_condition_info_from_sym)
+                        .collect(),
                 )
             })
             .collect(),
@@ -607,9 +765,39 @@ fn build_sym_exec_summary(
     }
 }
 
+fn empty_symbolic_summary<'ctx>() -> r2sym::SymbolicFunctionSummary<'ctx> {
+    r2sym::SymbolicFunctionSummary {
+        completion: r2sym::QueryCompletion::Complete,
+        paths: Vec::new(),
+        feasible_paths: 0,
+        stats: r2sym::path::ExploreStats::default(),
+        solver_stats: r2sym::SolverStats::default(),
+    }
+}
+
+fn should_skip_expensive_symbolic_summary(
+    compiled: &r2sym::CompiledSemanticArtifact,
+    prepared: &r2ssa::SsaArtifact,
+) -> bool {
+    compiled.symbolic_facts.diagnostics.skipped_large_cfg
+        || prepared.function().cfg_risk_summary().block_count > 96
+}
+
 pub(crate) fn compiled_semantic_info(
     compiled: &r2sym::CompiledSemanticArtifact,
 ) -> CompiledSemanticInfo {
+    let branch_compiled_conditions = compiled
+        .symbolic_facts
+        .branch_facts
+        .iter()
+        .flat_map(|fact| fact.true_compiled.iter().chain(fact.false_compiled.iter()))
+        .collect::<Vec<_>>();
+    let control_facts = compiled
+        .symbolic_facts
+        .control_islands
+        .iter()
+        .flat_map(|island| island.facts.iter())
+        .collect::<Vec<_>>();
     CompiledSemanticInfo {
         mode: match compiled.mode {
             r2sym::SemanticMode::Raw => "raw".to_string(),
@@ -653,6 +841,17 @@ pub(crate) fn compiled_semantic_info(
         summary_budget_exhausted: compiled.derived_diagnostics.budget_exhausted
             + compiled.derived_diagnostics.scc_budget_exhausted,
         summary_scc_count: compiled.derived_diagnostics.scc_count,
+        branch_fact_count: compiled.symbolic_facts.branch_facts.len(),
+        control_island_count: compiled.symbolic_facts.control_islands.len(),
+        compiled_condition_count: branch_compiled_conditions.len(),
+        exact_compiled_condition_count: control_facts
+            .iter()
+            .filter(|fact| fact.evidence.allows_hard_proof())
+            .count(),
+        actionable_compiled_condition_count: control_facts
+            .iter()
+            .filter(|fact| fact.evidence.allows_narrowing())
+            .count(),
         branches_pruned: compiled.symbolic_facts.diagnostics.branches_pruned,
         branches_unknown: compiled.symbolic_facts.diagnostics.branches_unknown,
         skipped_large_cfg: compiled.symbolic_facts.diagnostics.skipped_large_cfg,
@@ -1016,6 +1215,9 @@ pub extern "C" fn r2sym_function(
             &symbol_map,
             query_config.summary_profile,
         );
+        if should_skip_expensive_symbolic_summary(&compiled, &prepared) {
+            return (empty_symbolic_summary(), compiled);
+        }
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
         let mut explorer = query_config.make_explorer(&z3_ctx);
@@ -1400,6 +1602,9 @@ pub extern "C" fn r2sym_function_scope(
             &symbol_map,
             query_config.summary_profile,
         );
+        if should_skip_expensive_symbolic_summary(&compiled, prepared) {
+            return (empty_symbolic_summary(), compiled);
+        }
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, prepared, ctx_view.arch);
         let mut explorer = query_config.make_explorer(&z3_ctx);

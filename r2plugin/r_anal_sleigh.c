@@ -5900,10 +5900,30 @@ R2ILContext *get_context(RAnal *anal) {
 		sleigh_arch_str = "riscv32";
 	} else if (!strcmp (arch, "riscv64") || !strcmp (arch, "rv64")) {
 		sleigh_arch_str = "riscv64";
-	} else if (!strcmp (arch, "mips")) {
-	        /* Simple heuristic for MIPS (assuming default is 32be/le) */
-	        /* Note: This is partial, better use manual override for complex variants */
-		sleigh_arch_str = "mips"; /* Placeholder - mapped often to general mips */
+	} else if (!strcmp (arch, "mips") || !strcmp (arch, "mips32")
+			|| !strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
+			|| !strcmp (arch, "mipseb") || !strcmp (arch, "mipsel")
+			|| !strcmp (arch, "mips32le") || !strcmp (arch, "mips32el")
+			|| !strcmp (arch, "mips64") || !strcmp (arch, "mips64be")
+			|| !strcmp (arch, "mips64le") || !strcmp (arch, "mips64el")) {
+		bool is64 = bits >= 64
+			|| !strcmp (arch, "mips64")
+			|| !strcmp (arch, "mips64be")
+			|| !strcmp (arch, "mips64le")
+			|| !strcmp (arch, "mips64el");
+		bool big_endian = R_ARCH_CONFIG_IS_BIG_ENDIAN (anal->config);
+		if (!strcmp (arch, "mipsel") || !strcmp (arch, "mips32le")
+				|| !strcmp (arch, "mips32el")
+				|| !strcmp (arch, "mips64le")
+				|| !strcmp (arch, "mips64el")) {
+			big_endian = false;
+		} else if (!strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
+				|| !strcmp (arch, "mipseb") || !strcmp (arch, "mips64be")) {
+			big_endian = true;
+		}
+		sleigh_arch_str = is64
+			? (big_endian ? "mips64be" : "mips64le")
+			: (big_endian ? "mips32be" : "mips32le");
 	} else {
 		return NULL; /* unsupported arch */
 	}

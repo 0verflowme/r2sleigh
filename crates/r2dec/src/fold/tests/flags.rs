@@ -3,8 +3,9 @@ use crate::fold::FoldingContext;
 use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
 use r2types::{
-    SymbolicBranchFact, SymbolicCompiledCondition, SymbolicConditionPrecision,
-    SymbolicReachabilityStatus, SymbolicSemanticFacts,
+    SymbolicBranchFact, SymbolicCompiledCondition, SymbolicConditionPrecision, SymbolicControlFact,
+    SymbolicControlIsland, SymbolicControlIslandKind, SymbolicReachabilityStatus,
+    SymbolicSemanticFacts,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -194,6 +195,8 @@ fn exact_compiled_condition_shortcuts_to_literal_condition() {
             backward_memory_candidate_enumerations: 0,
             backward_memory_residual_fallbacks: 0,
             precision: SymbolicConditionPrecision::Exact,
+            evidence: r2types::SymbolicSemanticEvidence::exact(),
+            confidence: r2types::SymbolicSemanticConfidence::Exact,
             supported_paths: 1,
             total_paths: 1,
         }),
@@ -202,11 +205,167 @@ fn exact_compiled_condition_shortcuts_to_literal_condition() {
 
     let entry = prepared.function().get_block(0x1000).expect("entry");
     assert_eq!(
-        ctx.symbolic_exact_compiled_condition_expr(entry.addr),
+        ctx.symbolic_actionable_compiled_condition_expr(entry.addr),
         Some(CExpr::IntLit(0))
     );
     assert_eq!(
         ctx.extract_condition_from_block(entry),
         Some(CExpr::IntLit(0))
+    );
+}
+
+#[test]
+fn actionable_control_island_shortcuts_when_branch_fact_is_not_decisive() {
+    let arch = make_test_arch_x86_64();
+    let mut entry = R2ILBlock::new(0x2000, 4);
+    entry.push(R2ILOp::IntNotEqual {
+        dst: Varnode::unique(1, 1),
+        a: Varnode::register(0x10, 4),
+        b: Varnode::constant(0, 4),
+    });
+    entry.push(R2ILOp::CBranch {
+        target: Varnode::constant(0x2008, 8),
+        cond: Varnode::unique(1, 1),
+    });
+    let mut fallthrough = R2ILBlock::new(0x2004, 4);
+    fallthrough.push(R2ILOp::Return {
+        target: Varnode::constant(0, 8),
+    });
+    let mut taken = R2ILBlock::new(0x2008, 4);
+    taken.push(R2ILOp::Return {
+        target: Varnode::constant(1, 8),
+    });
+
+    let prepared =
+        prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("control_island");
+    let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+    let mut facts = SymbolicSemanticFacts::default();
+    facts.branch_facts.push(SymbolicBranchFact {
+        block_addr: 0x2000,
+        true_target: 0x2008,
+        false_target: 0x2004,
+        true_status: SymbolicReachabilityStatus::Unknown,
+        false_status: SymbolicReachabilityStatus::Unknown,
+        true_condition: Some("false".to_string()),
+        false_condition: None,
+        true_compiled: Some(SymbolicCompiledCondition {
+            simplified: "false".to_string(),
+            terms: vec!["false".to_string()],
+            memory_terms: vec![],
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: SymbolicConditionPrecision::OverApprox,
+            evidence: r2types::SymbolicSemanticEvidence::likely(
+                r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
+            ),
+            confidence: r2types::SymbolicSemanticConfidence::Likely,
+            supported_paths: 1,
+            total_paths: 2,
+        }),
+        false_compiled: None,
+    });
+    facts.control_islands.push(SymbolicControlIsland {
+        kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
+        anchor_block: 0x2000,
+        frontier_targets: vec![0x2008, 0x2004],
+        facts: vec![
+            SymbolicControlFact {
+                target: 0x2008,
+                status: SymbolicReachabilityStatus::Unknown,
+                condition: Some("false".to_string()),
+                compiled: facts.branch_facts[0].true_compiled.clone(),
+                evidence: r2types::SymbolicSemanticEvidence::likely(
+                    r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
+                ),
+                confidence: r2types::SymbolicSemanticConfidence::Likely,
+            },
+            SymbolicControlFact {
+                target: 0x2004,
+                status: SymbolicReachabilityStatus::Unknown,
+                condition: None,
+                compiled: None,
+                evidence: r2types::SymbolicSemanticEvidence::residual(
+                    r2types::SymbolicSemanticEvidenceReason::GuardOpaque,
+                ),
+                confidence: r2types::SymbolicSemanticConfidence::Residual,
+            },
+        ],
+        evidence: r2types::SymbolicSemanticEvidence::likely(
+            r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
+        ),
+        confidence: r2types::SymbolicSemanticConfidence::Likely,
+    });
+    ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+
+    let entry = prepared.function().get_block(0x2000).expect("entry");
+    assert_eq!(
+        ctx.symbolic_actionable_compiled_condition_expr(entry.addr),
+        Some(CExpr::IntLit(0))
+    );
+}
+
+#[test]
+fn actionable_control_island_parses_non_literal_compiled_condition_expr() {
+    let arch = make_test_arch_x86_64();
+    let mut entry = R2ILBlock::new(0x3000, 4);
+    entry.push(R2ILOp::IntNotEqual {
+        dst: Varnode::unique(1, 1),
+        a: Varnode::register(0x10, 4),
+        b: Varnode::constant(0, 4),
+    });
+    entry.push(R2ILOp::CBranch {
+        target: Varnode::constant(0x3008, 8),
+        cond: Varnode::unique(1, 1),
+    });
+    let mut fallthrough = R2ILBlock::new(0x3004, 4);
+    fallthrough.push(R2ILOp::Return {
+        target: Varnode::constant(0, 8),
+    });
+    let mut taken = R2ILBlock::new(0x3008, 4);
+    taken.push(R2ILOp::Return {
+        target: Varnode::constant(1, 8),
+    });
+
+    let prepared = prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch)
+        .with_name("parsed_control_island");
+    let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+    let mut facts = SymbolicSemanticFacts::default();
+    facts.control_islands.push(SymbolicControlIsland {
+        kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
+        anchor_block: 0x3000,
+        frontier_targets: vec![0x3008],
+        facts: vec![SymbolicControlFact {
+            target: 0x3008,
+            status: SymbolicReachabilityStatus::Reachable,
+            condition: Some("x == 0".to_string()),
+            compiled: Some(SymbolicCompiledCondition {
+                simplified: "x == 0".to_string(),
+                terms: vec!["x == 0".to_string()],
+                memory_terms: vec![],
+                backward_memory_substitutions: 0,
+                backward_memory_candidate_enumerations: 0,
+                backward_memory_residual_fallbacks: 0,
+                precision: SymbolicConditionPrecision::Exact,
+                evidence: r2types::SymbolicSemanticEvidence::exact(),
+                confidence: r2types::SymbolicSemanticConfidence::Exact,
+                supported_paths: 1,
+                total_paths: 1,
+            }),
+            evidence: r2types::SymbolicSemanticEvidence::exact(),
+            confidence: r2types::SymbolicSemanticConfidence::Exact,
+        }],
+        evidence: r2types::SymbolicSemanticEvidence::exact(),
+        confidence: r2types::SymbolicSemanticConfidence::Exact,
+    });
+    ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+
+    assert_eq!(
+        ctx.symbolic_actionable_compiled_condition_expr(0x3000),
+        Some(CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::Var("x".to_string()),
+            CExpr::IntLit(0),
+        ))
     );
 }

@@ -18,7 +18,8 @@ use crate::facts::{
     CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
     CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
     FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics,
-    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    SymbolicMemoryCondition, SymbolicMemoryRegion, SymbolicSemanticFacts, VisibleBinding,
+    VisibleBindingKind, parse_type_like_spec,
 };
 use crate::model::Signedness;
 
@@ -664,6 +665,99 @@ pub fn build_type_writeback_analysis(
         type_facts,
         plan,
     }
+}
+
+pub fn augment_local_struct_artifacts_with_symbolic_facts(
+    local_structs: &mut LocalStructArtifacts,
+    symbolic_facts: &SymbolicSemanticFacts,
+    ptr_bits: u32,
+) {
+    let mut projected_profiles = BTreeMap::<usize, BTreeMap<u64, String>>::new();
+    for compiled in symbolic_facts
+        .branch_facts
+        .iter()
+        .filter_map(|fact| fact.actionable_compiled_condition())
+        .chain(
+            symbolic_facts
+                .control_islands
+                .iter()
+                .filter_map(|island| island.actionable_compiled_condition()),
+        )
+    {
+        if !(compiled.confidence.is_reliable() && compiled.evidence.is_reliable()) {
+            continue;
+        }
+        for term in &compiled.memory_terms {
+            let Some((slot, offset, field_type)) = symbolic_memory_term_slot_field(term, ptr_bits)
+            else {
+                continue;
+            };
+            projected_profiles
+                .entry(slot)
+                .or_default()
+                .entry(offset)
+                .or_insert(field_type);
+        }
+    }
+
+    for (slot, projected) in projected_profiles {
+        let profile = local_structs.slot_field_profiles.entry(slot).or_default();
+        for (offset, field_type) in projected {
+            profile.entry(offset).or_insert(field_type);
+        }
+        if profile.is_empty() || local_structs.slot_type_overrides.contains_key(&slot) {
+            continue;
+        }
+        let struct_name = format!("sla_struct_symbolic_arg{}", slot + 1);
+        let fields = profile
+            .iter()
+            .map(|(offset, field_type)| StructFieldCandidate {
+                name: format!("f_{offset:x}"),
+                offset: *offset,
+                field_type: field_type.clone(),
+                confidence: 84,
+            })
+            .collect::<Vec<_>>();
+        let Some(decl) = build_struct_decl(&struct_name, &fields, ptr_bits) else {
+            continue;
+        };
+        if !local_structs
+            .struct_decls
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(&struct_name))
+        {
+            local_structs.struct_decls.push(StructDeclCandidate {
+                name: struct_name.clone(),
+                decl,
+                confidence: 84,
+                source: StructDeclSource::LocalInferred,
+                fields,
+            });
+        }
+        local_structs
+            .slot_type_overrides
+            .insert(slot, format!("struct {struct_name} *"));
+    }
+}
+
+fn symbolic_memory_term_slot_field(
+    term: &SymbolicMemoryCondition,
+    _ptr_bits: u32,
+) -> Option<(usize, u64, String)> {
+    if !(term.confidence.is_reliable() && term.evidence.is_reliable()) {
+        return None;
+    }
+    let slot = match term.region {
+        SymbolicMemoryRegion::Argument { index } => index,
+        SymbolicMemoryRegion::Region(_) => return None,
+    };
+    if !term.exact_offset && term.offset_lo != term.offset_hi {
+        return None;
+    }
+    if term.offset_lo < 0 || term.offset_hi < 0 || term.offset_lo != term.offset_hi {
+        return None;
+    }
+    Some((slot, term.offset_lo as u64, size_to_type(term.size)))
 }
 
 fn canonicalize_param_home_stack_slots(
@@ -4380,6 +4474,82 @@ mod tests {
                 .and_then(|sig| sig.params.first())
                 .and_then(|param| param.ty.as_ref()),
             Some(&CTypeLike::Pointer(Box::new(CTypeLike::Void)))
+        );
+    }
+
+    #[test]
+    fn symbolic_actionable_memory_terms_seed_local_struct_profiles() {
+        let compiled = crate::facts::SymbolicCompiledCondition {
+            simplified: "arg0->f_8 == 0".to_string(),
+            terms: vec!["arg0->f_8 == 0".to_string()],
+            memory_terms: vec![crate::facts::SymbolicMemoryCondition {
+                region: crate::facts::SymbolicMemoryRegion::Argument { index: 0 },
+                offset_lo: 8,
+                offset_hi: 8,
+                size: 4,
+                exact_offset: true,
+                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+                binding: None,
+                expr: "*(arg0 + 8)".to_string(),
+                value_expr: None,
+                exact_value: false,
+            }],
+            backward_memory_substitutions: 1,
+            backward_memory_candidate_enumerations: 1,
+            backward_memory_residual_fallbacks: 0,
+            precision: crate::facts::SymbolicConditionPrecision::Exact,
+            evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+            confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+            supported_paths: 1,
+            total_paths: 1,
+        };
+        let symbolic_facts = crate::facts::SymbolicSemanticFacts {
+            branch_facts: Vec::new(),
+            control_islands: vec![crate::facts::SymbolicControlIsland {
+                kind: crate::facts::SymbolicControlIslandKind::LargeCfgBranchFrontier,
+                anchor_block: 0x401000,
+                frontier_targets: vec![0x401020],
+                facts: vec![crate::facts::SymbolicControlFact {
+                    target: 0x401020,
+                    status: crate::facts::SymbolicReachabilityStatus::Reachable,
+                    condition: Some("arg0->f_8 == 0".to_string()),
+                    compiled: Some(compiled),
+                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+                }],
+                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
+                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+            }],
+            diagnostics: crate::facts::SymbolicFactDiagnostics::default(),
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+        };
+        let mut local_structs = LocalStructArtifacts::default();
+
+        augment_local_struct_artifacts_with_symbolic_facts(&mut local_structs, &symbolic_facts, 64);
+
+        assert_eq!(
+            local_structs
+                .slot_field_profiles
+                .get(&0)
+                .and_then(|profile| profile.get(&8))
+                .map(String::as_str),
+            Some("int32_t")
+        );
+        assert_eq!(
+            local_structs
+                .slot_type_overrides
+                .get(&0)
+                .map(String::as_str),
+            Some("struct sla_struct_symbolic_arg1 *")
+        );
+        assert!(
+            local_structs
+                .struct_decls
+                .iter()
+                .any(|decl| decl.name == "sla_struct_symbolic_arg1")
         );
     }
 }

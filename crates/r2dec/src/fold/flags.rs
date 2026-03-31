@@ -31,6 +31,347 @@ pub(super) struct CompareTuple {
     context: CompareContext,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SymbolicConditionToken {
+    Atom(String),
+    LParen,
+    RParen,
+    Not,
+    BitNot,
+    Star,
+    Slash,
+    Percent,
+    Plus,
+    Minus,
+    Shl,
+    Shr,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    BitAnd,
+    BitXor,
+    BitOr,
+    And,
+    Or,
+}
+
+struct SymbolicConditionExprParser<'ctx, 'a> {
+    ctx: &'ctx FoldingContext<'a>,
+    tokens: Vec<SymbolicConditionToken>,
+    pos: usize,
+}
+
+impl<'ctx, 'a> SymbolicConditionExprParser<'ctx, 'a> {
+    fn new(ctx: &'ctx FoldingContext<'a>, text: &str) -> Option<Self> {
+        Some(Self {
+            ctx,
+            tokens: tokenize_symbolic_condition(text)?,
+            pos: 0,
+        })
+    }
+
+    fn parse(mut self) -> Option<CExpr> {
+        let expr = self.parse_logical_or()?;
+        (self.pos == self.tokens.len()).then_some(expr)
+    }
+
+    fn peek(&self) -> Option<&SymbolicConditionToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<SymbolicConditionToken> {
+        let token = self.tokens.get(self.pos)?.clone();
+        self.pos += 1;
+        Some(token)
+    }
+
+    fn parse_logical_or(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_logical_and()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::Or)) {
+            self.next();
+            let rhs = self.parse_logical_and()?;
+            expr = CExpr::binary(BinaryOp::Or, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_logical_and(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_bit_or()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::And)) {
+            self.next();
+            let rhs = self.parse_bit_or()?;
+            expr = CExpr::binary(BinaryOp::And, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_bit_or(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_bit_xor()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::BitOr)) {
+            self.next();
+            let rhs = self.parse_bit_xor()?;
+            expr = CExpr::binary(BinaryOp::BitOr, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_bit_xor(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_bit_and()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::BitXor)) {
+            self.next();
+            let rhs = self.parse_bit_and()?;
+            expr = CExpr::binary(BinaryOp::BitXor, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_bit_and(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_equality()?;
+        while matches!(self.peek(), Some(SymbolicConditionToken::BitAnd)) {
+            self.next();
+            let rhs = self.parse_equality()?;
+            expr = CExpr::binary(BinaryOp::BitAnd, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_equality(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_relational()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Eq) => BinaryOp::Eq,
+                Some(SymbolicConditionToken::Ne) => BinaryOp::Ne,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_relational()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_relational(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_shift()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Lt) => BinaryOp::Lt,
+                Some(SymbolicConditionToken::Le) => BinaryOp::Le,
+                Some(SymbolicConditionToken::Gt) => BinaryOp::Gt,
+                Some(SymbolicConditionToken::Ge) => BinaryOp::Ge,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_shift()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_shift(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_additive()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Shl) => BinaryOp::Shl,
+                Some(SymbolicConditionToken::Shr) => BinaryOp::Shr,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_additive()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_additive(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Plus) => BinaryOp::Add,
+                Some(SymbolicConditionToken::Minus) => BinaryOp::Sub,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_multiplicative()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_multiplicative(&mut self) -> Option<CExpr> {
+        let mut expr = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(SymbolicConditionToken::Star) => BinaryOp::Mul,
+                Some(SymbolicConditionToken::Slash) => BinaryOp::Div,
+                Some(SymbolicConditionToken::Percent) => BinaryOp::Mod,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_unary()?;
+            expr = CExpr::binary(op, expr, rhs);
+        }
+        Some(expr)
+    }
+
+    fn parse_unary(&mut self) -> Option<CExpr> {
+        match self.peek() {
+            Some(SymbolicConditionToken::Not) => {
+                self.next();
+                Some(CExpr::unary(UnaryOp::Not, self.parse_unary()?))
+            }
+            Some(SymbolicConditionToken::BitNot) => {
+                self.next();
+                Some(CExpr::unary(UnaryOp::BitNot, self.parse_unary()?))
+            }
+            Some(SymbolicConditionToken::Minus) => {
+                self.next();
+                Some(CExpr::unary(UnaryOp::Neg, self.parse_unary()?))
+            }
+            Some(SymbolicConditionToken::Star) => {
+                self.next();
+                Some(CExpr::deref(self.parse_unary()?))
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(&mut self) -> Option<CExpr> {
+        match self.next()? {
+            SymbolicConditionToken::LParen => {
+                let expr = self.parse_logical_or()?;
+                matches!(self.next(), Some(SymbolicConditionToken::RParen)).then_some(expr)
+            }
+            SymbolicConditionToken::Atom(atom) => {
+                let lower = atom.to_ascii_lowercase();
+                if lower == "true" {
+                    Some(CExpr::IntLit(1))
+                } else if lower == "false" {
+                    Some(CExpr::IntLit(0))
+                } else {
+                    Some(
+                        self.ctx
+                            .parse_expr_from_name(&atom)
+                            .unwrap_or(CExpr::Var(atom)),
+                    )
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+fn tokenize_symbolic_condition(text: &str) -> Option<Vec<SymbolicConditionToken>> {
+    let mut tokens = Vec::new();
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let rest = &chars[i..];
+        let push_two = |token: SymbolicConditionToken, i: &mut usize, tokens: &mut Vec<_>| {
+            tokens.push(token);
+            *i += 2;
+        };
+        if rest.len() >= 2 {
+            match (rest[0], rest[1]) {
+                ('|', '|') => {
+                    push_two(SymbolicConditionToken::Or, &mut i, &mut tokens);
+                    continue;
+                }
+                ('&', '&') => {
+                    push_two(SymbolicConditionToken::And, &mut i, &mut tokens);
+                    continue;
+                }
+                ('=', '=') => {
+                    push_two(SymbolicConditionToken::Eq, &mut i, &mut tokens);
+                    continue;
+                }
+                ('!', '=') => {
+                    push_two(SymbolicConditionToken::Ne, &mut i, &mut tokens);
+                    continue;
+                }
+                ('<', '=') => {
+                    push_two(SymbolicConditionToken::Le, &mut i, &mut tokens);
+                    continue;
+                }
+                ('>', '=') => {
+                    push_two(SymbolicConditionToken::Ge, &mut i, &mut tokens);
+                    continue;
+                }
+                ('<', '<') => {
+                    push_two(SymbolicConditionToken::Shl, &mut i, &mut tokens);
+                    continue;
+                }
+                ('>', '>') => {
+                    push_two(SymbolicConditionToken::Shr, &mut i, &mut tokens);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match ch {
+            '(' => tokens.push(SymbolicConditionToken::LParen),
+            ')' => tokens.push(SymbolicConditionToken::RParen),
+            '!' => tokens.push(SymbolicConditionToken::Not),
+            '~' => tokens.push(SymbolicConditionToken::BitNot),
+            '*' => tokens.push(SymbolicConditionToken::Star),
+            '/' => tokens.push(SymbolicConditionToken::Slash),
+            '%' => tokens.push(SymbolicConditionToken::Percent),
+            '+' => tokens.push(SymbolicConditionToken::Plus),
+            '-' => tokens.push(SymbolicConditionToken::Minus),
+            '<' => tokens.push(SymbolicConditionToken::Lt),
+            '>' => tokens.push(SymbolicConditionToken::Gt),
+            '&' => tokens.push(SymbolicConditionToken::BitAnd),
+            '^' => tokens.push(SymbolicConditionToken::BitXor),
+            '|' => tokens.push(SymbolicConditionToken::BitOr),
+            '=' => return None,
+            _ => {
+                let start = i;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    if ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '(' | ')'
+                                | '!'
+                                | '~'
+                                | '*'
+                                | '/'
+                                | '%'
+                                | '+'
+                                | '-'
+                                | '<'
+                                | '>'
+                                | '&'
+                                | '^'
+                                | '|'
+                                | '='
+                        )
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                if start == i {
+                    return None;
+                }
+                tokens.push(SymbolicConditionToken::Atom(
+                    chars[start..i].iter().collect(),
+                ));
+                continue;
+            }
+        }
+        i += 1;
+    }
+    Some(tokens)
+}
+
 impl<'a> FoldingContext<'a> {
     fn finalize_condition_expr(&self, expr: CExpr) -> CExpr {
         let expr = self.normalize_local_branch_expr(expr);
@@ -104,23 +445,20 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn symbolic_exact_compiled_condition(
+    fn symbolic_actionable_compiled_condition(
         &self,
         block_addr: u64,
     ) -> Option<&r2types::SymbolicCompiledCondition> {
         self.inputs
             .symbolic_facts
-            .branch_fact_for_block(block_addr)
-            .and_then(|fact| fact.exact_compiled_condition())
+            .actionable_compiled_condition_for_block(block_addr)
     }
 
-    fn symbolic_exact_compiled_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
-        let compiled = self.symbolic_exact_compiled_condition(block_addr)?;
-        match compiled.simplified.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" => Some(CExpr::IntLit(1)),
-            "0" | "false" => Some(CExpr::IntLit(0)),
-            _ => None,
-        }
+    fn symbolic_actionable_compiled_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
+        let compiled = self.symbolic_actionable_compiled_condition(block_addr)?;
+        SymbolicConditionExprParser::new(self, compiled.simplified.trim())
+            .and_then(SymbolicConditionExprParser::parse)
+            .map(|expr| self.finalize_condition_expr(expr))
     }
 
     fn prepared_predicate_view(&self) -> Option<Cow<'_, analysis::PreparedSemanticView>> {
@@ -328,7 +666,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
-        if let Some(cond) = self.symbolic_exact_compiled_condition_expr(block.addr) {
+        if let Some(cond) = self.symbolic_actionable_compiled_condition_expr(block.addr) {
             return Some(cond);
         }
 
@@ -350,7 +688,7 @@ impl<'a> FoldingContext<'a> {
         let prepared_block_candidate =
             self.prepared_predicate_candidate_for_branch_block(block.addr, cond);
         let prepared_var_candidate = self.prepared_predicate_candidate_for_var(cond);
-        let exact_compiled = self.symbolic_exact_compiled_condition(block.addr);
+        let exact_compiled = self.symbolic_actionable_compiled_condition(block.addr);
         let allow_legacy_flag_provenance = exact_compiled.is_none()
             && ![
                 prepared_branch_candidate.as_ref(),

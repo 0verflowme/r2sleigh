@@ -305,6 +305,20 @@ pub extern "C" fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         profile.push_str(&format!("gpr\t{}\t.{}\t{}\t0\n", name_lower, bits, offset));
     }
 
+    let mut stripped_aliases = Vec::new();
+    for (original, (bits, offset, _)) in &reg_meta {
+        if let Some(stripped) = original.strip_prefix('$')
+            && !stripped.is_empty()
+            && !reg_meta.contains_key(stripped)
+        {
+            stripped_aliases.push((stripped.to_string(), *bits, *offset));
+        }
+    }
+    for (alias, bits, offset) in stripped_aliases {
+        profile.push_str(&format!("gpr\t{}\t.{}\t{}\t0\n", alias, bits, offset));
+        reg_meta.insert(alias.clone(), (bits, offset, alias));
+    }
+
     // Synthesize missing aliases expected by radare2/ESIL for specific arches.
     let mut add_gpr_alias = |alias_name: &str, source_name: &str| {
         let alias_lower = alias_name.to_ascii_lowercase();
@@ -336,19 +350,19 @@ pub extern "C" fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
             .find_map(|name| reg_meta.get(*name).map(|(_, _, original)| original.clone()))
     };
 
-    let pc = first_existing(&["pc", "rip", "eip", "ip"]);
-    let sp = first_existing(&["sp", "rsp", "esp"]);
-    let bp = first_existing(&["bp", "rbp", "ebp", "fp", "x29"]);
+    let pc = first_existing(&["pc", "$pc", "rip", "eip", "ip"]);
+    let sp = first_existing(&["sp", "$sp", "rsp", "esp"]);
+    let bp = first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "s8", "$s8", "x29"]);
 
     let mut a_roles: [Option<String>; 8] = std::array::from_fn(|_| None);
-    a_roles[0] = first_existing(&["rdi", "a0", "x0", "w0", "r0"]);
-    a_roles[1] = first_existing(&["rsi", "a1", "x1", "w1", "r1"]);
-    a_roles[2] = first_existing(&["rdx", "a2", "x2", "w2", "r2"]);
-    a_roles[3] = first_existing(&["rcx", "a3", "x3", "w3", "r3"]);
+    a_roles[0] = first_existing(&["rdi", "a0", "$a0", "x0", "w0", "r0"]);
+    a_roles[1] = first_existing(&["rsi", "a1", "$a1", "x1", "w1", "r1"]);
+    a_roles[2] = first_existing(&["rdx", "a2", "$a2", "x2", "w2", "r2"]);
+    a_roles[3] = first_existing(&["rcx", "a3", "$a3", "x3", "w3", "r3"]);
 
     let mut r_roles: [Option<String>; 4] = std::array::from_fn(|_| None);
-    r_roles[0] = first_existing(&["r0", "rax", "eax", "v0", "x0", "w0"]);
-    r_roles[1] = first_existing(&["r1", "x1", "w1"]);
+    r_roles[0] = first_existing(&["r0", "rax", "eax", "v0", "$v0", "x0", "w0"]);
+    r_roles[1] = first_existing(&["r1", "v1", "$v1", "x1", "w1"]);
     r_roles[2] = first_existing(&["r2", "x2", "w2"]);
     r_roles[3] = first_existing(&["r3", "x3", "w3"]);
 
@@ -2285,6 +2299,74 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             let (spec, dis) = apply_userop_map(spec, dis, "arm64");
             Ok((spec, dis))
         }
+        #[cfg(feature = "mips")]
+        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32BE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32be",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS32BE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32be",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips32be");
+            Ok((spec, dis))
+        }
+        #[cfg(feature = "mips")]
+        "mipsel" | "mips32le" | "mips32el" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32LE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32le",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS32LE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32le",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips32le");
+            Ok((spec, dis))
+        }
+        #[cfg(feature = "mips")]
+        "mips64" | "mips64be" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS64BE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64be",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS64BE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64be",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips64be");
+            Ok((spec, dis))
+        }
+        #[cfg(feature = "mips")]
+        "mips64el" | "mips64le" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS64LE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64le",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS64LE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64le",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips64le");
+            Ok((spec, dis))
+        }
         #[cfg(feature = "riscv")]
         "riscv64" | "rv64" | "rv64gc" => {
             let spec = build_arch_spec(
@@ -2325,11 +2407,16 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             supported.extend(["x86-64", "x86"]);
             #[cfg(feature = "arm")]
             supported.extend(["arm", "arm64", "aarch64"]);
+            #[cfg(feature = "mips")]
+            supported.extend(["mips32be", "mips32le", "mips64be", "mips64le"]);
             #[cfg(feature = "riscv")]
             supported.extend(["riscv64", "riscv32"]);
 
             if supported.is_empty() {
-                Err("No architectures enabled; build with feature x86, arm, or riscv".to_string())
+                Err(
+                    "No architectures enabled; build with feature x86, arm, mips, or riscv"
+                        .to_string(),
+                )
             } else {
                 Err(format!(
                     "Unknown architecture '{}'. Supported: {}",
@@ -2439,6 +2526,18 @@ fn decompile_semantic_artifact_fallback(
             .iter()
             .filter(|transfer| transfer.exact)
             .count();
+        let likely_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| matches!(transfer.confidence(), r2sym::SemanticConfidence::Likely))
+            .count();
+        let heuristic_transfers = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| {
+                matches!(transfer.confidence(), r2sym::SemanticConfidence::Heuristic)
+            })
+            .count();
         let redispatch_transfers = vm_step
             .transfers
             .iter()
@@ -2454,6 +2553,31 @@ fn decompile_semantic_artifact_fallback(
             .iter()
             .filter(|transfer| transfer.selector_update.is_some())
             .count();
+        let exit_guards = vm_step
+            .transfers
+            .iter()
+            .map(|transfer| transfer.exit_guards.len())
+            .sum::<usize>();
+        let residual_guards = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.residual_guards)
+            .count();
+        let residual_memory = vm_step
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.residual_memory_effects)
+            .count();
+        let read_effects = vm_step
+            .handler_memory_read_effects
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        let write_effects = vm_step
+            .handler_memory_write_effects
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
         let total_reads: usize = vm_step.handler_memory_reads.values().copied().sum();
         let total_writes: usize = vm_step.handler_memory_writes.values().copied().sum();
         let handler_preview = vm_step
@@ -2490,7 +2614,7 @@ fn decompile_semantic_artifact_fallback(
             .collect::<Vec<_>>()
             .join("; ");
         return format!(
-            "/* r2dec semantic summary: vm_summary for {} ({kind} @ 0x{:x}, loop_header=0x{:x}, selector={}, targets={}, redispatch={}, exact_transfers={}, redispatch_transfers={}, returning_transfers={}, selector_updates={}, total_reads={}, total_writes={}, state_inputs=[{}], state_outputs=[{}], handlers={}) */",
+            "/* r2dec semantic summary: vm_summary for {} ({kind} @ 0x{:x}, loop_header=0x{:x}, selector={}, targets={}, redispatch={}, exact_transfers={}, likely_transfers={}, heuristic_transfers={}, redispatch_transfers={}, returning_transfers={}, selector_updates={}, exact_exit_guards={}, residual_guards={}, residual_memory={}, total_reads={}, total_writes={}, read_effects={}, write_effects={}, state_inputs=[{}], state_outputs=[{}], handlers={}) */",
             func_name,
             vm_step.dispatch_header,
             vm_step.loop_header,
@@ -2498,11 +2622,18 @@ fn decompile_semantic_artifact_fallback(
             vm_step.dispatch_targets.len(),
             vm_step.redispatch_handlers.len(),
             exact_transfers,
+            likely_transfers,
+            heuristic_transfers,
             redispatch_transfers,
             returning_transfers,
             selector_updates,
+            exit_guards,
+            residual_guards,
+            residual_memory,
             total_reads,
             total_writes,
+            read_effects,
+            write_effects,
             inputs,
             outputs,
             handler_preview,
@@ -2518,6 +2649,31 @@ fn decompile_semantic_artifact_fallback(
         reason.push_str(" (");
         reason.push_str(&info.residual_reasons.join(", "));
         reason.push(')');
+    }
+    if info.branch_fact_count > 0 {
+        reason.push_str(&format!(
+            "; branch_facts={}, control_islands={}, actionable_conditions={}, exact_conditions={}",
+            info.branch_fact_count,
+            info.control_island_count,
+            info.actionable_compiled_condition_count,
+            info.exact_compiled_condition_count,
+        ));
+    }
+    let actionable_preview = compiled
+        .symbolic_facts
+        .control_islands
+        .iter()
+        .filter_map(|island| {
+            island
+                .actionable_compiled_condition()
+                .map(|condition| format!("0x{:x}: {}", island.anchor_block, condition.simplified))
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+    if !actionable_preview.is_empty() {
+        reason.push_str("; actionable_preview=[");
+        reason.push_str(&actionable_preview.join(" | "));
+        reason.push(']');
     }
     decompile_artifact_guard_fallback(func_name, &reason)
 }
@@ -2535,22 +2691,24 @@ fn should_decompile_from_semantic_fallback(
     function_name: &str,
     compiled: &r2sym::CompiledSemanticArtifact,
 ) -> bool {
-    if compiled.capability.decompile_ready {
-        return false;
-    }
     if matches!(compiled.mode, r2sym::SemanticMode::VmSummary) {
         return true;
     }
     if !is_autogenerated_function_name(function_name) {
         return false;
     }
-    compiled.symbolic_facts.diagnostics.skipped_large_cfg
-        || compiled.residual_reasons.iter().any(|reason| {
-            matches!(
-                reason,
-                r2sym::ResidualReason::InterpreterRequiresStepSummary
-            )
-        })
+    if compiled.symbolic_facts.diagnostics.skipped_large_cfg {
+        return true;
+    }
+    if compiled.capability.decompile_ready {
+        return false;
+    }
+    compiled.residual_reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            r2sym::ResidualReason::InterpreterRequiresStepSummary
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3414,6 +3572,8 @@ struct SymbolicBranchJson {
 #[derive(Debug, serde::Serialize)]
 struct SymbolicFactsJson {
     branches: Vec<SymbolicBranchJson>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    control_islands: Vec<r2types::SymbolicControlIsland>,
     diagnostics: r2types::SymbolicFactDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     interpreter: Option<r2types::SymbolicInterpreterDispatch>,
@@ -3477,6 +3637,7 @@ fn symbolic_facts_json(facts: &r2types::SymbolicSemanticFacts) -> Option<Symboli
                 false_compiled: fact.false_compiled.clone(),
             })
             .collect(),
+        control_islands: facts.control_islands.clone(),
         diagnostics: facts.diagnostics.clone(),
         interpreter: facts.interpreter.clone(),
         vm_step: facts.vm_step.clone(),
@@ -3501,6 +3662,7 @@ fn symbolic_facts_json_forced(facts: &r2types::SymbolicSemanticFacts) -> Symboli
                 false_compiled: fact.false_compiled.clone(),
             })
             .collect(),
+        control_islands: facts.control_islands.clone(),
         diagnostics: facts.diagnostics.clone(),
         interpreter: facts.interpreter.clone(),
         vm_step: facts.vm_step.clone(),
@@ -3659,6 +3821,15 @@ fn semantic_type_fallback_payload(
         warning.push_str(" (");
         warning.push_str(&compiled_info.residual_reasons.join(", "));
         warning.push(')');
+    }
+    if compiled_info.branch_fact_count > 0 {
+        warning.push_str(&format!(
+            "; branch_facts={}, control_islands={}, actionable_conditions={}, exact_conditions={}",
+            compiled_info.branch_fact_count,
+            compiled_info.control_island_count,
+            compiled_info.actionable_compiled_condition_count,
+            compiled_info.exact_compiled_condition_count,
+        ));
     }
     warnings.push(warning);
     if !compiled_info.capability.type_ready {
@@ -7702,6 +7873,99 @@ mod tests {
         assert_eq!(decompiler_cfg_guard_reason_from_summary(&summary), None);
     }
 
+    fn test_compiled_condition(expr: &str) -> r2sym::BackwardConditionSummary {
+        r2sym::BackwardConditionSummary {
+            simplified: expr.to_string(),
+            terms: vec![expr.to_string()],
+            memory_terms: Vec::new(),
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: r2sym::BackwardConditionPrecision::Exact,
+            supported_paths: 1,
+            total_paths: 1,
+        }
+    }
+
+    fn test_large_cfg_semantic_artifact() -> r2sym::CompiledSemanticArtifact {
+        let compiled = test_compiled_condition("x == 0");
+        let control_fact = r2sym::SymbolicControlFact {
+            target: 0x401020,
+            status: r2sym::SymbolicReachabilityStatus::Reachable,
+            condition: Some("x == 0".to_string()),
+            compiled: Some(compiled.clone()),
+            evidence: r2sym::SemanticEvidence::exact(),
+        };
+        let symbolic_facts = r2sym::SymbolicFunctionFacts {
+            branch_facts: vec![r2sym::SymbolicBranchFact {
+                block_addr: 0x401000,
+                true_target: 0x401020,
+                false_target: 0x401030,
+                true_status: r2sym::SymbolicReachabilityStatus::Reachable,
+                false_status: r2sym::SymbolicReachabilityStatus::Unreachable,
+                true_condition: Some("x == 0".to_string()),
+                false_condition: Some("x != 0".to_string()),
+                true_compiled: Some(compiled.clone()),
+                false_compiled: None,
+            }],
+            control_islands: vec![r2sym::SymbolicControlIsland {
+                kind: r2sym::SymbolicControlIslandKind::LargeCfgBranchFrontier,
+                anchor_block: 0x401000,
+                frontier_targets: vec![0x401020],
+                facts: vec![control_fact],
+                evidence: r2sym::SemanticEvidence::exact(),
+            }],
+            diagnostics: r2sym::SymbolicFunctionFactDiagnostics {
+                branches_evaluated: 1,
+                branches_pruned: 0,
+                branches_unknown: 0,
+                skipped_missing_arch: false,
+                skipped_large_cfg: true,
+            },
+        };
+
+        r2sym::CompiledSemanticArtifact {
+            mode: r2sym::SemanticMode::Residual,
+            slice_class: r2sym::SliceClass::Worker,
+            capability: r2sym::SemanticCapability {
+                query_ready: true,
+                type_ready: true,
+                decompile_ready: true,
+            },
+            residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
+            closure_functions: 4,
+            helper_functions: 3,
+            derived_summaries: 0,
+            derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
+            symbolic_facts,
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+            cache_hit: false,
+        }
+    }
+
+    #[test]
+    fn decompile_ready_large_cfg_worker_still_prefers_semantic_fallback() {
+        let compiled = test_large_cfg_semantic_artifact();
+        assert!(should_decompile_from_semantic_fallback(
+            "fcn.401000",
+            &compiled
+        ));
+    }
+
+    #[test]
+    fn semantic_fallback_text_reports_actionable_control_island_counts() {
+        let compiled = test_large_cfg_semantic_artifact();
+        let output = decompile_semantic_artifact_fallback("_401000", &compiled);
+        assert!(output.contains("semantic fallback: worker slice in residual mode"));
+        assert!(output.contains("branch_facts=1"));
+        assert!(output.contains("control_islands=1"));
+        assert!(output.contains("actionable_conditions=1"));
+        assert!(output.contains("exact_conditions=1"));
+        assert!(output.contains("actionable_preview=[0x401000: x == 0]"));
+    }
+
     #[test]
     fn non_x86_strong_evidence_can_clear_signature_threshold() {
         let params = vec![
@@ -7908,7 +8172,7 @@ mod integration_tests {
         r2il_free(ctx_ptr);
     }
 
-    #[cfg(feature = "arm")]
+    #[cfg(any(feature = "arm", feature = "mips"))]
     fn profile_for_arch(arch: &str) -> String {
         let arch_cstr = CString::new(arch).unwrap();
         let ctx_ptr = r2il_arch_init(arch_cstr.as_ptr());
@@ -7929,7 +8193,7 @@ mod integration_tests {
         profile
     }
 
-    #[cfg(feature = "arm")]
+    #[cfg(any(feature = "arm", feature = "mips"))]
     fn role_target(profile: &str, role: &str) -> Option<String> {
         profile
             .lines()
@@ -8040,6 +8304,47 @@ mod integration_tests {
             "riscv32 context should be loaded"
         );
         r2il_free(ctx_ptr);
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn create_disassembler_for_arch_mips32be() {
+        let (spec, disasm) =
+            create_disassembler_for_arch("mips32be").expect("mips32be disassembler");
+        assert_eq!(spec.name, "mips32be");
+        assert!(spec.addr_size > 0);
+        assert_eq!(spec.instruction_endianness, r2il::Endianness::Big);
+        assert_eq!(spec.memory_endianness, r2il::Endianness::Big);
+        assert_eq!(
+            disasm.userop_name(0),
+            userop_map_for_arch("mips32be").get(&0).map(String::as_str)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn r2il_arch_init_mips32be_loaded() {
+        let arch_cstr = CString::new("mips32be").unwrap();
+        let ctx_ptr = r2il_arch_init(arch_cstr.as_ptr());
+        assert!(!ctx_ptr.is_null(), "context pointer should not be null");
+        assert_eq!(
+            r2il_is_loaded(ctx_ptr),
+            1,
+            "mips32be context should be loaded"
+        );
+        r2il_free(ctx_ptr);
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn mips32be_reg_profile_includes_arg_roles() {
+        let profile = profile_for_arch("mips32be");
+        for role in ["PC", "SP", "A0", "A1", "A2", "A3", "R0"] {
+            assert!(
+                role_target(&profile, role).is_some(),
+                "mips32be profile should define ={role}"
+            );
+        }
     }
 
     #[test]

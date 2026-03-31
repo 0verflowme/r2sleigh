@@ -3,7 +3,8 @@
 //! This module provides different strategies for exploring paths
 //! during symbolic execution, including DFS, BFS, and coverage-guided.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,8 @@ use crate::sim::{CallConv, DerivedFunctionSummary, evaluate_derived_summary_guid
 use crate::solver::SymSolver;
 use crate::spec::ExplorationSpec;
 use crate::state::{ExitStatus, SymState};
+
+const TARGET_DISTANCE_CACHE_LIMIT: usize = 128;
 
 /// Configuration for path exploration.
 #[derive(Debug, Clone)]
@@ -168,6 +171,8 @@ pub struct PathExplorer<'ctx> {
     target_guided_queries: bool,
     /// Derived helper summaries registered for direct-call targets.
     derived_call_summaries: HashMap<u64, RegisteredDerivedCallSummary<'ctx>>,
+    /// Cached reverse-distance maps keyed by (function entry, target address).
+    target_distance_cache: HashMap<(u64, u64), HashMap<u64, usize>>,
 }
 
 /// Statistics from path exploration.
@@ -251,13 +256,14 @@ impl<'ctx> StateWorklist<'ctx> {
         }
     }
 
-    fn push(&mut self, state: SymState<'ctx>) {
+    fn push(&mut self, state: SymState<'ctx>) -> usize {
         let id = self.slots.len();
         let pc = state.pc;
         self.slots.push(Some(state));
         self.ready.push_back(id);
         self.same_pc.entry(pc).or_default().push_back(id);
         self.live_states += 1;
+        id
     }
 
     fn state(&self, id: usize) -> Option<&SymState<'ctx>> {
@@ -297,42 +303,46 @@ impl<'ctx> StateWorklist<'ctx> {
         }
     }
 
-    fn pop_best_by_key_with_reorder<K, F>(
-        &mut self,
-        mut key_fn: F,
-    ) -> Option<(SymState<'ctx>, bool)>
-    where
-        K: Ord,
-        F: FnMut(usize, &SymState<'ctx>) -> K,
-    {
-        loop {
-            let default_candidate = match self.strategy {
-                ExploreStrategy::Dfs => self.ready.back().copied(),
-                ExploreStrategy::Bfs => self.ready.front().copied(),
-                ExploreStrategy::Random => {
-                    if self.ready.is_empty() {
-                        None
-                    } else if self.live_states.is_multiple_of(2) {
-                        self.ready.front().copied()
-                    } else {
-                        self.ready.back().copied()
+    fn default_candidate(&mut self) -> Option<usize> {
+        match self.strategy {
+            ExploreStrategy::Dfs => {
+                while let Some(id) = self.ready.back().copied() {
+                    if self.state(id).is_some() {
+                        return Some(id);
+                    }
+                    self.ready.pop_back();
+                }
+                None
+            }
+            ExploreStrategy::Bfs => {
+                while let Some(id) = self.ready.front().copied() {
+                    if self.state(id).is_some() {
+                        return Some(id);
+                    }
+                    self.ready.pop_front();
+                }
+                None
+            }
+            ExploreStrategy::Random => {
+                if self.ready.is_empty() {
+                    return None;
+                }
+                if self.live_states.is_multiple_of(2) {
+                    while let Some(id) = self.ready.front().copied() {
+                        if self.state(id).is_some() {
+                            return Some(id);
+                        }
+                        self.ready.pop_front();
+                    }
+                } else {
+                    while let Some(id) = self.ready.back().copied() {
+                        if self.state(id).is_some() {
+                            return Some(id);
+                        }
+                        self.ready.pop_back();
                     }
                 }
-            };
-            let best = self
-                .ready
-                .iter()
-                .filter_map(|id| self.state(*id).map(|state| (*id, key_fn(*id, state))))
-                .min_by(|a, b| a.1.cmp(&b.1))
-                .map(|(id, _)| id)?;
-            let reordered = default_candidate.is_some_and(|candidate| candidate != best);
-
-            if let Some(pos) = self.ready.iter().position(|queued| *queued == best) {
-                self.ready.remove(pos);
-            }
-
-            if let Some(state) = self.take_slot(best) {
-                return Some((state, reordered));
+                None
             }
         }
     }
@@ -372,6 +382,26 @@ impl<'ctx> StateWorklist<'ctx> {
         let state = slot.take()?;
         self.live_states = self.live_states.saturating_sub(1);
         Some(state)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetGuidedQueueEntry {
+    rank: (bool, usize, usize, usize, usize, usize, usize, usize, usize),
+    id: usize,
+}
+
+impl Ord for TargetGuidedQueueEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for TargetGuidedQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -683,6 +713,7 @@ impl<'ctx> PathExplorer<'ctx> {
             stats: ExploreStats::default(),
             target_guided_queries: false,
             derived_call_summaries: HashMap::new(),
+            target_distance_cache: HashMap::new(),
         }
     }
 
@@ -702,6 +733,7 @@ impl<'ctx> PathExplorer<'ctx> {
             stats: ExploreStats::default(),
             target_guided_queries: false,
             derived_call_summaries: HashMap::new(),
+            target_distance_cache: HashMap::new(),
         }
     }
 
@@ -1033,7 +1065,7 @@ impl<'ctx> PathExplorer<'ctx> {
     }
 
     fn target_guidance_context(
-        &self,
+        &mut self,
         func: &SsaArtifact,
         target_addr: u64,
     ) -> TargetGuidanceContext {
@@ -1166,13 +1198,22 @@ impl<'ctx> PathExplorer<'ctx> {
     ) {
         let start_time = Instant::now();
         let mut worklist = StateWorklist::new(self.config.strategy);
+        let mut target_heap: BinaryHeap<Reverse<TargetGuidedQueueEntry>> = BinaryHeap::new();
         let guidance = self.target_guidance_context(func, target_addr);
-        if self.target_enqueue_allowed(&guidance, &initial_state) {
-            worklist.push(initial_state);
+        if self.target_enqueue_allowed(&guidance, &initial_state)
+            && let Some(state) = self.prune_subsumed_same_pc_state(&mut worklist, initial_state)
+        {
+            let id = worklist.push(state);
+            if let Some(state) = worklist.state(id) {
+                target_heap.push(Reverse(TargetGuidedQueueEntry {
+                    rank: self.state_target_rank(state, id, &guidance),
+                    id,
+                }));
+            }
         }
 
-        while let Some((mut state, reordered)) = worklist
-            .pop_best_by_key_with_reorder(|id, state| self.state_target_rank(state, id, &guidance))
+        while let Some((mut state, reordered)) =
+            self.pop_target_guided_state(&mut worklist, &mut target_heap)
         {
             if reordered {
                 self.stats.target_guided_reorders += 1;
@@ -1242,7 +1283,13 @@ impl<'ctx> PathExplorer<'ctx> {
                             && let Some(forked) =
                                 self.prune_subsumed_same_pc_state(&mut worklist, forked)
                         {
-                            worklist.push(forked);
+                            let id = worklist.push(forked);
+                            if let Some(state) = worklist.state(id) {
+                                target_heap.push(Reverse(TargetGuidedQueueEntry {
+                                    rank: self.state_target_rank(state, id, &guidance),
+                                    id,
+                                }));
+                            }
                         }
                     }
 
@@ -1258,7 +1305,13 @@ impl<'ctx> PathExplorer<'ctx> {
                             && let Some(state) =
                                 self.prune_subsumed_same_pc_state(&mut worklist, state)
                         {
-                            worklist.push(state);
+                            let id = worklist.push(state);
+                            if let Some(state) = worklist.state(id) {
+                                target_heap.push(Reverse(TargetGuidedQueueEntry {
+                                    rank: self.state_target_rank(state, id, &guidance),
+                                    id,
+                                }));
+                            }
                         }
                     } else {
                         match mode.on_terminated_state(
@@ -1288,7 +1341,24 @@ impl<'ctx> PathExplorer<'ctx> {
         self.stats.total_time = start_time.elapsed();
     }
 
-    fn target_distance_map(&self, func: &SsaArtifact, target_addr: u64) -> HashMap<u64, usize> {
+    fn target_distance_map(&mut self, func: &SsaArtifact, target_addr: u64) -> HashMap<u64, usize> {
+        let key = (func.entry, target_addr);
+        if let Some(cached) = self.target_distance_cache.get(&key) {
+            return cached.clone();
+        }
+        let distances = self.compute_target_distance_map(func, target_addr);
+        if self.target_distance_cache.len() >= TARGET_DISTANCE_CACHE_LIMIT {
+            self.target_distance_cache.clear();
+        }
+        self.target_distance_cache.insert(key, distances.clone());
+        distances
+    }
+
+    fn compute_target_distance_map(
+        &self,
+        func: &SsaArtifact,
+        target_addr: u64,
+    ) -> HashMap<u64, usize> {
         let mut predecessors: HashMap<u64, Vec<u64>> = HashMap::new();
         for addr in func.cfg().block_addrs() {
             let Some(block) = func.cfg().get_block(addr) else {
@@ -1316,6 +1386,28 @@ impl<'ctx> PathExplorer<'ctx> {
         }
 
         distances
+    }
+
+    fn pop_target_guided_state(
+        &mut self,
+        worklist: &mut StateWorklist<'ctx>,
+        heap: &mut BinaryHeap<Reverse<TargetGuidedQueueEntry>>,
+    ) -> Option<(SymState<'ctx>, bool)> {
+        loop {
+            while let Some(Reverse(entry)) = heap.peek() {
+                if worklist.state(entry.id).is_some() {
+                    break;
+                }
+                heap.pop();
+            }
+
+            let Reverse(entry) = heap.pop()?;
+            let default_candidate = worklist.default_candidate();
+            let reordered = default_candidate.is_some_and(|candidate| candidate != entry.id);
+            if let Some(state) = worklist.take_slot(entry.id) {
+                return Some((state, reordered));
+            }
+        }
     }
 
     fn state_target_rank(
@@ -1558,6 +1650,101 @@ mod tests {
         assert_eq!(remaining.pc, 0x2000);
         assert!(worklist.pop_next().is_none());
         assert!(worklist.take_same_pc(0x1000).is_none());
+    }
+
+    #[test]
+    fn test_target_guided_heap_prefers_best_and_skips_stale_entries() {
+        let ctx = Context::thread_local();
+        let mut explorer = PathExplorer::new(&ctx);
+        let mut worklist = StateWorklist::new(ExploreStrategy::Dfs);
+
+        let id_a = worklist.push(SymState::new(&ctx, 0x1000));
+        let id_b = worklist.push(SymState::new(&ctx, 0x2000));
+        let id_c = worklist.push(SymState::new(&ctx, 0x3000));
+
+        let guidance = TargetGuidanceContext {
+            distances: HashMap::from([(0x1000, 2), (0x2000, 0), (0x3000, 1)]),
+            reachable_blocks: HashSet::from([0x1000, 0x2000, 0x3000]),
+            call_targets_by_block: HashMap::new(),
+            block_summary_rank: HashMap::new(),
+        };
+
+        let mut heap: BinaryHeap<Reverse<TargetGuidedQueueEntry>> = BinaryHeap::new();
+        for id in [id_a, id_b, id_c] {
+            let state = worklist.state(id).expect("live state");
+            heap.push(Reverse(TargetGuidedQueueEntry {
+                rank: explorer.state_target_rank(state, id, &guidance),
+                id,
+            }));
+        }
+
+        let (state, reordered) = explorer
+            .pop_target_guided_state(&mut worklist, &mut heap)
+            .expect("best state should exist");
+        assert_eq!(state.pc, 0x2000);
+        assert!(
+            reordered,
+            "best state should differ from DFS default candidate"
+        );
+
+        assert!(
+            worklist.remove_slot(id_c).is_some(),
+            "simulate a stale heap entry"
+        );
+
+        let (state, reordered) = explorer
+            .pop_target_guided_state(&mut worklist, &mut heap)
+            .expect("remaining state should exist");
+        assert_eq!(state.pc, 0x1000);
+        assert!(
+            !reordered,
+            "after skipping stale entries, the chosen state should match the live default candidate"
+        );
+    }
+
+    #[test]
+    fn test_target_distance_map_reuses_cache_for_same_entry_and_target() {
+        let ctx = Context::thread_local();
+        let mut explorer = PathExplorer::new(&ctx);
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x1004, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x1008, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("symbolic function");
+
+        let first = explorer.target_distance_map(&func, 0x1008);
+        let second = explorer.target_distance_map(&func, 0x1008);
+
+        assert_eq!(first, second);
+        assert_eq!(explorer.target_distance_cache.len(), 1);
+        assert_eq!(first.get(&0x1008), Some(&0));
+        assert_eq!(first.get(&0x1004), Some(&1));
+        assert_eq!(first.get(&0x1000), Some(&2));
     }
 
     #[test]

@@ -244,9 +244,129 @@ fn symbolic_memory_region_from_sym(
     }
 }
 
+fn symbolic_confidence_from_sym(
+    confidence: r2sym::SemanticConfidence,
+) -> r2types::SymbolicSemanticConfidence {
+    match confidence {
+        r2sym::SemanticConfidence::Exact => r2types::SymbolicSemanticConfidence::Exact,
+        r2sym::SemanticConfidence::Likely => r2types::SymbolicSemanticConfidence::Likely,
+        r2sym::SemanticConfidence::Heuristic => r2types::SymbolicSemanticConfidence::Heuristic,
+        r2sym::SemanticConfidence::Residual => r2types::SymbolicSemanticConfidence::Residual,
+    }
+}
+
+fn symbolic_evidence_reason_from_sym(
+    reason: r2sym::SemanticEvidenceReason,
+) -> r2types::SymbolicSemanticEvidenceReason {
+    match reason {
+        r2sym::SemanticEvidenceReason::LargeCfg => {
+            r2types::SymbolicSemanticEvidenceReason::LargeCfg
+        }
+        r2sym::SemanticEvidenceReason::SummaryBudget => {
+            r2types::SymbolicSemanticEvidenceReason::SummaryBudget
+        }
+        r2sym::SemanticEvidenceReason::AliasAmbiguity => {
+            r2types::SymbolicSemanticEvidenceReason::AliasAmbiguity
+        }
+        r2sym::SemanticEvidenceReason::ReplayOverlap => {
+            r2types::SymbolicSemanticEvidenceReason::ReplayOverlap
+        }
+        r2sym::SemanticEvidenceReason::HeapIdentityWeak => {
+            r2types::SymbolicSemanticEvidenceReason::HeapIdentityWeak
+        }
+        r2sym::SemanticEvidenceReason::GuardOpaque => {
+            r2types::SymbolicSemanticEvidenceReason::GuardOpaque
+        }
+        r2sym::SemanticEvidenceReason::ValueOpaque => {
+            r2types::SymbolicSemanticEvidenceReason::ValueOpaque
+        }
+        r2sym::SemanticEvidenceReason::TruncatedTransfer => {
+            r2types::SymbolicSemanticEvidenceReason::TruncatedTransfer
+        }
+        r2sym::SemanticEvidenceReason::DerivedFromRanking => {
+            r2types::SymbolicSemanticEvidenceReason::DerivedFromRanking
+        }
+        r2sym::SemanticEvidenceReason::PartialPathCoverage => {
+            r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage
+        }
+        r2sym::SemanticEvidenceReason::ResidualSearchRequired => {
+            r2types::SymbolicSemanticEvidenceReason::ResidualSearchRequired
+        }
+    }
+}
+
+fn symbolic_evidence_from_sym(
+    evidence: &r2sym::SemanticEvidence,
+) -> r2types::SymbolicSemanticEvidence {
+    r2types::SymbolicSemanticEvidence {
+        tier: symbolic_confidence_from_sym(evidence.tier),
+        soundness: match evidence.soundness {
+            r2sym::SemanticEvidenceSoundness::Proven => {
+                r2types::SymbolicSemanticEvidenceSoundness::Proven
+            }
+            r2sym::SemanticEvidenceSoundness::OverApprox => {
+                r2types::SymbolicSemanticEvidenceSoundness::OverApprox
+            }
+            r2sym::SemanticEvidenceSoundness::Ranked => {
+                r2types::SymbolicSemanticEvidenceSoundness::Ranked
+            }
+            r2sym::SemanticEvidenceSoundness::Unknown => {
+                r2types::SymbolicSemanticEvidenceSoundness::Unknown
+            }
+        },
+        coverage: match evidence.coverage {
+            r2sym::SemanticEvidenceCoverage::Full => {
+                r2types::SymbolicSemanticEvidenceCoverage::Full
+            }
+            r2sym::SemanticEvidenceCoverage::Partial => {
+                r2types::SymbolicSemanticEvidenceCoverage::Partial
+            }
+            r2sym::SemanticEvidenceCoverage::Bounded => {
+                r2types::SymbolicSemanticEvidenceCoverage::Bounded
+            }
+        },
+        provenance: match evidence.provenance {
+            r2sym::SemanticEvidenceProvenance::Stable => {
+                r2types::SymbolicSemanticEvidenceProvenance::Stable
+            }
+            r2sym::SemanticEvidenceProvenance::Normalized => {
+                r2types::SymbolicSemanticEvidenceProvenance::Normalized
+            }
+            r2sym::SemanticEvidenceProvenance::Ranked => {
+                r2types::SymbolicSemanticEvidenceProvenance::Ranked
+            }
+            r2sym::SemanticEvidenceProvenance::Unstable => {
+                r2types::SymbolicSemanticEvidenceProvenance::Unstable
+            }
+        },
+        ambiguity: match evidence.ambiguity {
+            r2sym::SemanticEvidenceAmbiguity::Single => {
+                r2types::SymbolicSemanticEvidenceAmbiguity::Single
+            }
+            r2sym::SemanticEvidenceAmbiguity::Bounded => {
+                r2types::SymbolicSemanticEvidenceAmbiguity::Bounded
+            }
+            r2sym::SemanticEvidenceAmbiguity::Ranked => {
+                r2types::SymbolicSemanticEvidenceAmbiguity::Ranked
+            }
+            r2sym::SemanticEvidenceAmbiguity::Multiple => {
+                r2types::SymbolicSemanticEvidenceAmbiguity::Multiple
+            }
+        },
+        budget_limited: evidence.budget_limited,
+        reasons: evidence
+            .reasons
+            .iter()
+            .copied()
+            .map(symbolic_evidence_reason_from_sym)
+            .collect(),
+    }
+}
+
 fn symbolic_compiled_condition_from_sym(
     summary: &r2sym::BackwardConditionSummary,
 ) -> r2types::SymbolicCompiledCondition {
+    let evidence = summary.evidence();
     r2types::SymbolicCompiledCondition {
         simplified: summary.simplified.clone(),
         terms: summary.terms.clone(),
@@ -259,15 +379,68 @@ fn symbolic_compiled_condition_from_sym(
                 offset_hi: term.offset_hi,
                 size: term.size,
                 exact_offset: term.exact_offset,
+                evidence: symbolic_evidence_from_sym(&term.evidence()),
+                confidence: symbolic_confidence_from_sym(term.confidence()),
+                binding: None,
                 expr: term.expr.clone(),
+                value_expr: None,
+                exact_value: false,
             })
             .collect(),
         backward_memory_substitutions: summary.backward_memory_substitutions,
         backward_memory_candidate_enumerations: summary.backward_memory_candidate_enumerations,
         backward_memory_residual_fallbacks: summary.backward_memory_residual_fallbacks,
         precision: symbolic_condition_precision_from_sym(summary.precision),
+        evidence: symbolic_evidence_from_sym(&evidence),
+        confidence: symbolic_confidence_from_sym(evidence.tier),
         supported_paths: summary.supported_paths,
         total_paths: summary.total_paths,
+    }
+}
+
+fn symbolic_control_island_kind_from_sym(
+    kind: r2sym::SymbolicControlIslandKind,
+) -> r2types::SymbolicControlIslandKind {
+    match kind {
+        r2sym::SymbolicControlIslandKind::BranchFrontier => {
+            r2types::SymbolicControlIslandKind::BranchFrontier
+        }
+        r2sym::SymbolicControlIslandKind::LargeCfgBranchFrontier => {
+            r2types::SymbolicControlIslandKind::LargeCfgBranchFrontier
+        }
+    }
+}
+
+fn symbolic_control_fact_from_sym(
+    fact: &r2sym::SymbolicControlFact,
+) -> r2types::SymbolicControlFact {
+    r2types::SymbolicControlFact {
+        target: fact.target,
+        status: symbolic_reachability_status_from_sym(fact.status),
+        condition: fact.condition.clone(),
+        compiled: fact
+            .compiled
+            .as_ref()
+            .map(symbolic_compiled_condition_from_sym),
+        evidence: symbolic_evidence_from_sym(&fact.evidence),
+        confidence: symbolic_confidence_from_sym(fact.evidence.tier),
+    }
+}
+
+fn symbolic_control_island_from_sym(
+    island: &r2sym::SymbolicControlIsland,
+) -> r2types::SymbolicControlIsland {
+    r2types::SymbolicControlIsland {
+        kind: symbolic_control_island_kind_from_sym(island.kind),
+        anchor_block: island.anchor_block,
+        frontier_targets: island.frontier_targets.clone(),
+        facts: island
+            .facts
+            .iter()
+            .map(symbolic_control_fact_from_sym)
+            .collect(),
+        evidence: symbolic_evidence_from_sym(&island.evidence),
+        confidence: symbolic_confidence_from_sym(island.evidence.tier),
     }
 }
 
@@ -327,22 +500,77 @@ pub(crate) fn symbolic_vm_value_expr_from_sym(
 fn symbolic_vm_state_update_from_sym(
     update: &r2sym::VmStateUpdate,
 ) -> r2types::SymbolicVmStateUpdate {
+    let evidence = update.evidence();
     r2types::SymbolicVmStateUpdate {
         output: update.output.clone(),
         expr: update.expr.clone(),
         value: symbolic_vm_value_expr_from_sym(&update.value),
         exact: update.exact,
+        evidence: symbolic_evidence_from_sym(&evidence),
+        confidence: symbolic_confidence_from_sym(evidence.tier),
+    }
+}
+
+fn symbolic_vm_guard_condition_from_sym(
+    guard: &r2sym::VmGuardCondition,
+) -> r2types::SymbolicVmGuardCondition {
+    let evidence = guard.evidence();
+    r2types::SymbolicVmGuardCondition {
+        expr: guard.expr.clone(),
+        value: symbolic_vm_value_expr_from_sym(&guard.value),
+        expect_nonzero: guard.expect_nonzero,
+        exact: guard.exact,
+        evidence: symbolic_evidence_from_sym(&evidence),
+        confidence: symbolic_confidence_from_sym(evidence.tier),
+    }
+}
+
+fn symbolic_vm_guarded_exit_from_sym(
+    guarded: &r2sym::VmGuardedExit,
+) -> r2types::SymbolicVmGuardedExit {
+    r2types::SymbolicVmGuardedExit {
+        target: guarded.target,
+        guard: symbolic_vm_guard_condition_from_sym(&guarded.guard),
+    }
+}
+
+fn symbolic_vm_memory_condition_from_sym(
+    condition: &r2sym::VmMemoryCondition,
+) -> r2types::SymbolicMemoryCondition {
+    let evidence = condition.evidence();
+    r2types::SymbolicMemoryCondition {
+        region: r2types::SymbolicMemoryRegion::Region(r2types::SymbolicMemoryRegionRef {
+            id: condition.region.id,
+            kind: symbolic_memory_region_kind_from_sym(&condition.region.kind),
+            name: condition.region.name.clone(),
+        }),
+        offset_lo: condition.offset_lo,
+        offset_hi: condition.offset_hi,
+        size: condition.size,
+        exact_offset: condition.exact_offset,
+        evidence: symbolic_evidence_from_sym(&evidence),
+        confidence: symbolic_confidence_from_sym(evidence.tier),
+        binding: condition.binding.clone(),
+        expr: condition.expr.clone(),
+        value_expr: condition.value_expr.clone(),
+        exact_value: condition.exact_value,
     }
 }
 
 fn symbolic_vm_transfer_arm_from_sym(
     transfer: &r2sym::VmTransferArm,
 ) -> r2types::SymbolicVmTransferArm {
+    let evidence = transfer.evidence();
     r2types::SymbolicVmTransferArm {
         handler_target: transfer.handler_target,
         case_values: transfer.case_values.clone(),
         region_blocks: transfer.region_blocks.clone(),
         exit_targets: transfer.exit_targets.clone(),
+        exit_guards: transfer
+            .exit_guards
+            .iter()
+            .map(symbolic_vm_guarded_exit_from_sym)
+            .collect(),
         state_updates: transfer
             .state_updates
             .iter()
@@ -352,7 +580,21 @@ fn symbolic_vm_transfer_arm_from_sym(
             .selector_update
             .as_ref()
             .map(symbolic_vm_state_update_from_sym),
+        memory_reads: transfer
+            .memory_reads
+            .iter()
+            .map(symbolic_vm_memory_condition_from_sym)
+            .collect(),
+        memory_writes: transfer
+            .memory_writes
+            .iter()
+            .map(symbolic_vm_memory_condition_from_sym)
+            .collect(),
+        residual_guards: transfer.residual_guards,
+        residual_memory_effects: transfer.residual_memory_effects,
         exact: transfer.exact,
+        evidence: symbolic_evidence_from_sym(&evidence),
+        confidence: symbolic_confidence_from_sym(evidence.tier),
         redispatch: transfer.redispatch,
         may_return: transfer.may_return,
         truncated: transfer.truncated,
@@ -386,6 +628,45 @@ fn symbolic_vm_step_summary_from_sym(
                     updates
                         .iter()
                         .map(symbolic_vm_state_update_from_sym)
+                        .collect(),
+                )
+            })
+            .collect(),
+        handler_exit_guards: vm_step
+            .handler_exit_guards
+            .iter()
+            .map(|(target, guards)| {
+                (
+                    *target,
+                    guards
+                        .iter()
+                        .map(symbolic_vm_guarded_exit_from_sym)
+                        .collect(),
+                )
+            })
+            .collect(),
+        handler_memory_read_effects: vm_step
+            .handler_memory_read_effects
+            .iter()
+            .map(|(target, effects)| {
+                (
+                    *target,
+                    effects
+                        .iter()
+                        .map(symbolic_vm_memory_condition_from_sym)
+                        .collect(),
+                )
+            })
+            .collect(),
+        handler_memory_write_effects: vm_step
+            .handler_memory_write_effects
+            .iter()
+            .map(|(target, effects)| {
+                (
+                    *target,
+                    effects
+                        .iter()
+                        .map(symbolic_vm_memory_condition_from_sym)
                         .collect(),
                 )
             })
@@ -432,6 +713,11 @@ pub(crate) fn symbolic_semantic_facts_from_sym(
                     .as_ref()
                     .map(symbolic_compiled_condition_from_sym),
             })
+            .collect(),
+        control_islands: facts
+            .control_islands
+            .iter()
+            .map(symbolic_control_island_from_sym)
             .collect(),
         diagnostics: r2types::SymbolicFactDiagnostics {
             branches_evaluated: facts.diagnostics.branches_evaluated,
@@ -1195,6 +1481,7 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
     );
     let (struct_decls, slot_type_overrides, slot_field_profiles) =
         crate::merge_struct_inference_artifacts(raw_structs, semantic_structs);
+    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
 
     let reg_type_hints = if input.ctx.semantic_metadata_enabled {
         collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
@@ -1208,6 +1495,13 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
         input.ctx.semantic_metadata_enabled,
     );
     let recovered_vars = vars.iter().map(var_prot_to_writeback).collect::<Vec<_>>();
+    let mut local_structs =
+        local_struct_artifacts_to_writeback(struct_decls, slot_type_overrides, slot_field_profiles);
+    r2types::augment_local_struct_artifacts_with_symbolic_facts(
+        &mut local_structs,
+        &symbolic_facts,
+        ptr_bits,
+    );
     let writeback = r2types::build_type_writeback_analysis(r2types::TypeWritebackAnalysisInput {
         function_name: &input.function_name,
         ptr_bits,
@@ -1215,15 +1509,10 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
         recovered_vars: &recovered_vars,
         ssa_blocks: &pattern_ssa_blocks,
         parsed_context,
-        local_structs: local_struct_artifacts_to_writeback(
-            struct_decls,
-            slot_type_overrides,
-            slot_field_profiles,
-        ),
+        local_structs,
         interproc_summary_set: interproc_summary_set.clone(),
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
-    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
     let mut type_facts = writeback.type_facts;
     if symbolic_facts.diagnostics.branches_pruned > 0 {
         type_facts.diagnostics.push(format!(
@@ -1576,6 +1865,10 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
     );
     let (struct_decls, slot_type_overrides, slot_field_profiles) =
         crate::merge_struct_inference_artifacts(raw_structs, semantic_structs);
+    let semantic_artifact = precomputed_semantic_artifact.unwrap_or_else(|| {
+        collect_plugin_semantic_artifact(&analysis.ssa_func, arch, symbolic_scope)
+    });
+    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
     let vars = recover_vars_from_ssa(
         &pattern_ssa_blocks,
         arch,
@@ -1583,6 +1876,13 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
         semantic_metadata_enabled,
     );
     let recovered_vars = vars.iter().map(var_prot_to_writeback).collect::<Vec<_>>();
+    let mut local_structs =
+        local_struct_artifacts_to_writeback(struct_decls, slot_type_overrides, slot_field_profiles);
+    r2types::augment_local_struct_artifacts_with_symbolic_facts(
+        &mut local_structs,
+        &symbolic_facts,
+        ptr_bits,
+    );
     let writeback = r2types::build_type_writeback_analysis(r2types::TypeWritebackAnalysisInput {
         function_name,
         ptr_bits,
@@ -1590,18 +1890,10 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
         recovered_vars: &recovered_vars,
         ssa_blocks: &pattern_ssa_blocks,
         parsed_context,
-        local_structs: local_struct_artifacts_to_writeback(
-            struct_decls,
-            slot_type_overrides,
-            slot_field_profiles,
-        ),
+        local_structs,
         interproc_summary_set: None,
         diagnostics: writeback_diagnostics_from_plugin(diagnostics),
     });
-    let semantic_artifact = precomputed_semantic_artifact.unwrap_or_else(|| {
-        collect_plugin_semantic_artifact(&analysis.ssa_func, arch, symbolic_scope)
-    });
-    let symbolic_facts = symbolic_semantic_facts_from_sym(&semantic_artifact);
     let mut type_facts = writeback.type_facts;
     if symbolic_facts.diagnostics.branches_pruned > 0 {
         type_facts.diagnostics.push(format!(

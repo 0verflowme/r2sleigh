@@ -1,8 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use r2ssa::cfg::BlockTerminator;
-use r2ssa::{CFGEdge, SSAOp, SSAVar, SsaArtifact};
+use r2ssa::{CFGEdge, ObjectKind, SSAOp, SSAVar, SsaArtifact, StackAddressBase};
 use serde::{Deserialize, Serialize};
+
+use super::{
+    SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
+    SemanticEvidenceProvenance, SemanticEvidenceReason,
+};
+use crate::MemoryRegionKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InterpreterKind {
@@ -172,11 +178,115 @@ impl VmValueExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmGuardCondition {
+    pub expr: String,
+    pub value: VmValueExpr,
+    pub expect_nonzero: bool,
+    pub exact: bool,
+}
+
+impl VmGuardCondition {
+    pub(crate) fn evaluate(&self, bindings: &BTreeMap<String, u64>) -> Option<bool> {
+        let value = self.value.evaluate_u64(bindings)?;
+        Some((value != 0) == self.expect_nonzero)
+    }
+
+    pub fn evidence(&self) -> SemanticEvidence {
+        if self.exact {
+            SemanticEvidence::exact()
+        } else if !matches!(self.value, VmValueExpr::Expr(_)) {
+            SemanticEvidence::likely(SemanticEvidenceReason::GuardOpaque)
+                .with_provenance(SemanticEvidenceProvenance::Normalized)
+        } else {
+            SemanticEvidence::heuristic(SemanticEvidenceReason::GuardOpaque)
+                .with_provenance(SemanticEvidenceProvenance::Ranked)
+        }
+    }
+
+    pub fn confidence(&self) -> SemanticConfidence {
+        self.evidence().tier
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmGuardedExit {
+    pub target: u64,
+    pub guard: VmGuardCondition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmMemoryRegionRef {
+    pub id: u32,
+    pub kind: MemoryRegionKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmMemoryCondition {
+    pub region: VmMemoryRegionRef,
+    pub offset_lo: i64,
+    pub offset_hi: i64,
+    pub size: u32,
+    pub exact_offset: bool,
+    pub binding: Option<String>,
+    pub expr: String,
+    pub value_expr: Option<String>,
+    pub value: Option<VmValueExpr>,
+    pub exact_value: bool,
+}
+
+impl VmMemoryCondition {
+    pub fn evidence(&self) -> SemanticEvidence {
+        if self.exact_offset && (self.value.is_none() || self.exact_value) {
+            SemanticEvidence::exact()
+        } else if self.binding.is_some() || self.exact_offset {
+            let reason = if self.exact_offset {
+                SemanticEvidenceReason::ValueOpaque
+            } else {
+                SemanticEvidenceReason::AliasAmbiguity
+            };
+            SemanticEvidence::likely(reason)
+                .with_provenance(SemanticEvidenceProvenance::Normalized)
+                .with_ambiguity(if self.exact_offset {
+                    SemanticEvidenceAmbiguity::Single
+                } else {
+                    SemanticEvidenceAmbiguity::Bounded
+                })
+        } else {
+            SemanticEvidence::heuristic(SemanticEvidenceReason::AliasAmbiguity)
+                .with_coverage(SemanticEvidenceCoverage::Bounded)
+        }
+    }
+
+    pub fn confidence(&self) -> SemanticConfidence {
+        self.evidence().tier
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmStateUpdate {
     pub output: String,
     pub expr: String,
     pub value: VmValueExpr,
     pub exact: bool,
+}
+
+impl VmStateUpdate {
+    pub fn evidence(&self) -> SemanticEvidence {
+        if self.exact {
+            SemanticEvidence::exact()
+        } else if !matches!(self.value, VmValueExpr::Expr(_)) {
+            SemanticEvidence::likely(SemanticEvidenceReason::ValueOpaque)
+                .with_provenance(SemanticEvidenceProvenance::Normalized)
+        } else {
+            SemanticEvidence::heuristic(SemanticEvidenceReason::ValueOpaque)
+                .with_provenance(SemanticEvidenceProvenance::Ranked)
+        }
+    }
+
+    pub fn confidence(&self) -> SemanticConfidence {
+        self.evidence().tier
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,12 +295,96 @@ pub struct VmTransferArm {
     pub case_values: Vec<u64>,
     pub region_blocks: Vec<u64>,
     pub exit_targets: Vec<u64>,
+    pub exit_guards: Vec<VmGuardedExit>,
     pub state_updates: Vec<VmStateUpdate>,
     pub selector_update: Option<VmStateUpdate>,
+    pub memory_reads: Vec<VmMemoryCondition>,
+    pub memory_writes: Vec<VmMemoryCondition>,
+    pub residual_guards: bool,
+    pub residual_memory_effects: bool,
     pub exact: bool,
     pub redispatch: bool,
     pub may_return: bool,
     pub truncated: bool,
+}
+
+impl VmTransferArm {
+    pub fn evidence(&self) -> SemanticEvidence {
+        if self.exact {
+            return SemanticEvidence::exact();
+        }
+        if self.truncated {
+            return if self.case_values.is_empty()
+                && self.exit_targets.is_empty()
+                && self.state_updates.is_empty()
+                && self.memory_reads.is_empty()
+                && self.memory_writes.is_empty()
+            {
+                SemanticEvidence::residual(SemanticEvidenceReason::TruncatedTransfer)
+                    .with_coverage(SemanticEvidenceCoverage::Partial)
+                    .with_budget_limited(true)
+            } else {
+                SemanticEvidence::heuristic(SemanticEvidenceReason::TruncatedTransfer)
+                    .with_coverage(SemanticEvidenceCoverage::Bounded)
+                    .with_budget_limited(true)
+            };
+        }
+        if !self.residual_guards
+            && !self.residual_memory_effects
+            && self
+                .state_updates
+                .iter()
+                .all(|update| update.evidence().is_reliable())
+            && self
+                .selector_update
+                .as_ref()
+                .is_none_or(|update| update.evidence().is_reliable())
+            && self
+                .exit_guards
+                .iter()
+                .all(|guard| guard.guard.evidence().is_reliable())
+            && self
+                .memory_reads
+                .iter()
+                .all(|effect| effect.evidence().is_reliable())
+            && self
+                .memory_writes
+                .iter()
+                .all(|effect| effect.evidence().is_reliable())
+        {
+            let mut evidence =
+                SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
+                    .with_coverage(SemanticEvidenceCoverage::Bounded)
+                    .with_provenance(SemanticEvidenceProvenance::Normalized);
+            if self.redispatch || self.may_return {
+                evidence = evidence.with_coverage(SemanticEvidenceCoverage::Partial);
+            }
+            return evidence;
+        }
+        if self.case_values.is_empty()
+            && self.exit_targets.is_empty()
+            && self.state_updates.is_empty()
+            && self.memory_reads.is_empty()
+            && self.memory_writes.is_empty()
+        {
+            SemanticEvidence::residual(SemanticEvidenceReason::PartialPathCoverage)
+        } else {
+            let mut evidence =
+                SemanticEvidence::heuristic(SemanticEvidenceReason::DerivedFromRanking)
+                    .with_coverage(SemanticEvidenceCoverage::Bounded);
+            if self.residual_guards {
+                evidence = evidence.with_reason(SemanticEvidenceReason::GuardOpaque);
+            }
+            if self.residual_memory_effects {
+                evidence = evidence.with_reason(SemanticEvidenceReason::AliasAmbiguity);
+            }
+            evidence
+        }
+    }
+
+    pub fn confidence(&self) -> SemanticConfidence {
+        self.evidence().tier
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +404,9 @@ pub struct VmStepSummary {
     pub handler_state_inputs: BTreeMap<u64, Vec<String>>,
     pub handler_state_outputs: BTreeMap<u64, Vec<String>>,
     pub handler_state_updates: BTreeMap<u64, Vec<VmStateUpdate>>,
+    pub handler_exit_guards: BTreeMap<u64, Vec<VmGuardedExit>>,
+    pub handler_memory_read_effects: BTreeMap<u64, Vec<VmMemoryCondition>>,
+    pub handler_memory_write_effects: BTreeMap<u64, Vec<VmMemoryCondition>>,
     pub handler_memory_reads: BTreeMap<u64, usize>,
     pub handler_memory_writes: BTreeMap<u64, usize>,
     pub handler_calls: BTreeMap<u64, usize>,
@@ -230,6 +427,9 @@ struct HandlerRegionSummary {
     state_inputs: Vec<String>,
     state_outputs: Vec<String>,
     state_updates: Vec<VmStateUpdate>,
+    exit_guards: Vec<VmGuardedExit>,
+    memory_read_effects: Vec<VmMemoryCondition>,
+    memory_write_effects: Vec<VmMemoryCondition>,
     memory_reads: usize,
     memory_writes: usize,
     calls: usize,
@@ -238,6 +438,8 @@ struct HandlerRegionSummary {
     reenters_dispatch: bool,
     may_return: bool,
     truncated: bool,
+    residual_guards: bool,
+    residual_memory_effects: bool,
 }
 
 fn record_block_state(
@@ -576,6 +778,260 @@ fn classify_vm_op_value(func: &SsaArtifact, op: &SSAOp, depth: u32) -> Option<Vm
     })
 }
 
+fn classify_vm_value_id(func: &SsaArtifact, value_id: r2ssa::ValueId, depth: u32) -> VmValueExpr {
+    if let Some(var) = func.value_var(value_id) {
+        return classify_vm_var_value(func, var, depth);
+    }
+    VmValueExpr::Expr(format!("value:{value_id:?}"))
+}
+
+fn stack_base_name(base: StackAddressBase) -> &'static str {
+    match base {
+        StackAddressBase::FramePointer => "fp",
+        StackAddressBase::StackPointer => "sp",
+    }
+}
+
+fn vm_memory_binding_name(region: &VmMemoryRegionRef, offset: i64, size: u32) -> String {
+    format!("mem:r{}:{offset}:{size}", region.id)
+}
+
+fn vm_memory_region_ref_from_object(
+    func: &SsaArtifact,
+    object_id: r2ssa::ObjectId,
+) -> Option<VmMemoryRegionRef> {
+    let object = func.objects().object(object_id)?;
+    let (kind, name) = match &object.kind {
+        ObjectKind::StackSlot { base, offset } | ObjectKind::FrameObject { base, offset } => (
+            MemoryRegionKind::Stack,
+            format!("stack:{}{:+#x}", stack_base_name(*base), offset),
+        ),
+        ObjectKind::Global { space, address } => {
+            (MemoryRegionKind::Global, format!("{space}:0x{address:x}"))
+        }
+        ObjectKind::HeapAlloc { call_site } => (
+            MemoryRegionKind::Heap,
+            format!("heap_alloc@{}", call_site.0),
+        ),
+        ObjectKind::EscapedUnknown => return None,
+    };
+    Some(VmMemoryRegionRef {
+        id: object_id.0,
+        kind,
+        name,
+    })
+}
+
+fn render_memory_access_expr(op: &SSAOp, func: &SsaArtifact) -> String {
+    match op {
+        SSAOp::Load { addr, .. }
+        | SSAOp::Store { addr, .. }
+        | SSAOp::LoadLinked { addr, .. }
+        | SSAOp::StoreConditional { addr, .. }
+        | SSAOp::AtomicCAS { addr, .. }
+        | SSAOp::LoadGuarded { addr, .. }
+        | SSAOp::StoreGuarded { addr, .. } => render_vm_var_expr(func, addr, 0),
+        _ => "<mem>".to_string(),
+    }
+}
+
+fn vm_memory_write_value(op: &SSAOp, func: &SsaArtifact) -> (Option<VmValueExpr>, bool) {
+    match op {
+        SSAOp::Store { val, .. } => {
+            let value = classify_vm_var_value(func, val, 0);
+            let exact = value.is_exact();
+            (Some(value), exact)
+        }
+        _ => (None, false),
+    }
+}
+
+fn classify_vm_op_value_at_site(
+    func: &SsaArtifact,
+    block_addr: u64,
+    op_idx: usize,
+    op: &SSAOp,
+    depth: u32,
+) -> Option<VmValueExpr> {
+    match op {
+        SSAOp::Load { .. } | SSAOp::LoadLinked { .. } => {
+            let (reads, _writes, residual) =
+                vm_memory_conditions_for_op(func, block_addr, op_idx, op);
+            if !residual
+                && let [read] = reads.as_slice()
+                && let Some(binding) = read.binding.as_ref()
+            {
+                return Some(VmValueExpr::Var(binding.clone()));
+            }
+            classify_vm_op_value(func, op, depth)
+        }
+        _ => classify_vm_op_value(func, op, depth),
+    }
+}
+
+fn vm_memory_conditions_for_op(
+    func: &SsaArtifact,
+    block_addr: u64,
+    op_idx: usize,
+    op: &SSAOp,
+) -> (Vec<VmMemoryCondition>, Vec<VmMemoryCondition>, bool) {
+    let expr = render_memory_access_expr(op, func);
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    let mut residual = false;
+
+    if op.is_memory_read() {
+        let Some(uses) = func.memory_uses_for_op_site(block_addr, op_idx) else {
+            residual = true;
+            return (reads, writes, residual);
+        };
+        for use_fact in uses {
+            let Some(region) = vm_memory_region_ref_from_object(func, use_fact.location.object)
+            else {
+                residual = true;
+                continue;
+            };
+            let binding = Some(vm_memory_binding_name(
+                &region,
+                use_fact.location.offset,
+                use_fact.location.size,
+            ));
+            reads.push(VmMemoryCondition {
+                region,
+                offset_lo: use_fact.location.offset,
+                offset_hi: use_fact.location.offset,
+                size: use_fact.location.size,
+                exact_offset: true,
+                binding,
+                expr: expr.clone(),
+                value_expr: None,
+                value: None,
+                exact_value: false,
+            });
+        }
+    }
+
+    if op.is_memory_write() {
+        let Some(defs) = func.memory_defs_for_op_site(block_addr, op_idx) else {
+            residual = true;
+            return (reads, writes, residual);
+        };
+        let (write_value, exact_value) = vm_memory_write_value(op, func);
+        if matches!(
+            op,
+            SSAOp::StoreConditional { .. } | SSAOp::StoreGuarded { .. } | SSAOp::AtomicCAS { .. }
+        ) {
+            residual = true;
+        }
+        for def in defs {
+            let Some(region) = vm_memory_region_ref_from_object(func, def.location.object) else {
+                residual = true;
+                continue;
+            };
+            let binding = Some(vm_memory_binding_name(
+                &region,
+                def.location.offset,
+                def.location.size,
+            ));
+            writes.push(VmMemoryCondition {
+                region,
+                offset_lo: def.location.offset,
+                offset_hi: def.location.offset,
+                size: def.location.size,
+                exact_offset: true,
+                binding,
+                expr: expr.clone(),
+                value_expr: write_value.as_ref().map(VmValueExpr::render),
+                value: write_value.clone(),
+                exact_value,
+            });
+        }
+    }
+
+    reads.sort_by(|lhs, rhs| {
+        (
+            lhs.region.id,
+            &lhs.region.name,
+            lhs.offset_lo,
+            lhs.size,
+            lhs.binding.as_deref(),
+            &lhs.expr,
+        )
+            .cmp(&(
+                rhs.region.id,
+                &rhs.region.name,
+                rhs.offset_lo,
+                rhs.size,
+                rhs.binding.as_deref(),
+                &rhs.expr,
+            ))
+    });
+    reads.dedup();
+    writes.sort_by(|lhs, rhs| {
+        (
+            lhs.region.id,
+            &lhs.region.name,
+            lhs.offset_lo,
+            lhs.size,
+            lhs.binding.as_deref(),
+            &lhs.expr,
+            lhs.value_expr.as_deref(),
+            lhs.exact_value,
+        )
+            .cmp(&(
+                rhs.region.id,
+                &rhs.region.name,
+                rhs.offset_lo,
+                rhs.size,
+                rhs.binding.as_deref(),
+                &rhs.expr,
+                rhs.value_expr.as_deref(),
+                rhs.exact_value,
+            ))
+    });
+    writes.dedup();
+
+    (reads, writes, residual)
+}
+
+fn vm_exit_guards_for_block(
+    func: &SsaArtifact,
+    block_addr: u64,
+    seen_targets: &mut BTreeSet<(u64, bool, String)>,
+) -> (Vec<VmGuardedExit>, bool) {
+    let Some(predicate) = func
+        .predicates()
+        .predicates
+        .values()
+        .find(|fact| fact.block_addr == block_addr)
+    else {
+        return (Vec::new(), true);
+    };
+    let value = classify_vm_value_id(func, predicate.condition, 0);
+    let base_expr = value.render();
+    let exact = value.is_exact();
+    let true_expr = base_expr.clone();
+    let false_expr = format!("!({base_expr})");
+    let mut guards = Vec::new();
+    for (target, expect_nonzero, expr) in [
+        (predicate.true_target, true, true_expr),
+        (predicate.false_target, false, false_expr),
+    ] {
+        if seen_targets.insert((target, expect_nonzero, expr.clone())) {
+            guards.push(VmGuardedExit {
+                target,
+                guard: VmGuardCondition {
+                    expr,
+                    value: value.clone(),
+                    expect_nonzero,
+                    exact,
+                },
+            });
+        }
+    }
+    (guards, false)
+}
+
 fn summarize_handler_region(
     func: &SsaArtifact,
     entry: u64,
@@ -589,6 +1045,10 @@ fn summarize_handler_region(
     let mut state_inputs = BTreeSet::new();
     let mut state_outputs = BTreeSet::new();
     let mut state_updates = BTreeMap::<String, VmValueExpr>::new();
+    let mut exit_guards = Vec::new();
+    let mut seen_exit_guards = BTreeSet::new();
+    let mut memory_read_effects = Vec::new();
+    let mut memory_write_effects = Vec::new();
     let mut memory_reads = 0usize;
     let mut memory_writes = 0usize;
     let mut calls = 0usize;
@@ -596,6 +1056,8 @@ fn summarize_handler_region(
     let mut reenters_dispatch = false;
     let mut may_return = false;
     let mut truncated = false;
+    let mut residual_guards = false;
+    let mut residual_memory_effects = false;
 
     while let Some((block_addr, depth)) = queue.pop_front() {
         if !visited.insert(block_addr) {
@@ -616,6 +1078,13 @@ fn summarize_handler_region(
             Some(BlockTerminator::ConditionalBranch { .. })
         ) {
             conditional_branches += 1;
+            let (block_guards, residual) =
+                vm_exit_guards_for_block(func, block_addr, &mut seen_exit_guards);
+            if block_guards.is_empty() {
+                residual_guards |= residual;
+            } else {
+                exit_guards.extend(block_guards);
+            }
         }
         if matches!(
             cfg_block.map(|block| &block.terminator),
@@ -625,13 +1094,20 @@ fn summarize_handler_region(
         }
 
         record_block_state(block, &mut state_inputs, &mut state_outputs);
-        for op in &block.ops {
+        for (op_idx, op) in block.ops.iter().enumerate() {
             if op.is_memory_read() {
                 memory_reads += 1;
             }
             if op.is_memory_write() {
                 memory_writes += 1;
             }
+            let (reads, writes, residual) =
+                vm_memory_conditions_for_op(func, block_addr, op_idx, op);
+            if residual {
+                residual_memory_effects = true;
+            }
+            memory_read_effects.extend(reads);
+            memory_write_effects.extend(writes);
             if matches!(
                 op,
                 SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. }
@@ -643,7 +1119,7 @@ fn summarize_handler_region(
                 && !dst.is_temp()
                 && !dst.name.starts_with("ram:")
             {
-                let value = classify_vm_op_value(func, op, 0)
+                let value = classify_vm_op_value_at_site(func, block_addr, op_idx, op, 0)
                     .unwrap_or_else(|| VmValueExpr::Var(dst.display_name()));
                 state_updates.insert(dst.display_name(), value);
             }
@@ -672,6 +1148,48 @@ fn summarize_handler_region(
         }
     }
 
+    exit_guards.sort_by(|lhs, rhs| {
+        (lhs.target, &lhs.guard.expr, lhs.guard.expect_nonzero).cmp(&(
+            rhs.target,
+            &rhs.guard.expr,
+            rhs.guard.expect_nonzero,
+        ))
+    });
+    memory_read_effects.sort_by(|lhs, rhs| {
+        (
+            lhs.region.id,
+            &lhs.region.name,
+            lhs.offset_lo,
+            lhs.size,
+            &lhs.expr,
+        )
+            .cmp(&(
+                rhs.region.id,
+                &rhs.region.name,
+                rhs.offset_lo,
+                rhs.size,
+                &rhs.expr,
+            ))
+    });
+    memory_read_effects.dedup();
+    memory_write_effects.sort_by(|lhs, rhs| {
+        (
+            lhs.region.id,
+            &lhs.region.name,
+            lhs.offset_lo,
+            lhs.size,
+            &lhs.expr,
+        )
+            .cmp(&(
+                rhs.region.id,
+                &rhs.region.name,
+                rhs.offset_lo,
+                rhs.size,
+                &rhs.expr,
+            ))
+    });
+    memory_write_effects.dedup();
+
     HandlerRegionSummary {
         blocks: visited.into_iter().collect(),
         state_inputs: state_inputs.into_iter().collect(),
@@ -685,6 +1203,9 @@ fn summarize_handler_region(
                 value,
             })
             .collect(),
+        exit_guards,
+        memory_read_effects,
+        memory_write_effects,
         memory_reads,
         memory_writes,
         calls,
@@ -693,6 +1214,8 @@ fn summarize_handler_region(
         reenters_dispatch,
         may_return,
         truncated,
+        residual_guards,
+        residual_memory_effects,
     }
 }
 
@@ -920,6 +1443,9 @@ pub(crate) fn build_vm_step_summary(
     let mut handler_state_inputs = BTreeMap::new();
     let mut handler_state_outputs = BTreeMap::new();
     let mut handler_state_updates = BTreeMap::new();
+    let mut handler_exit_guards = BTreeMap::new();
+    let mut handler_memory_read_effects = BTreeMap::new();
+    let mut handler_memory_write_effects = BTreeMap::new();
     let mut handler_memory_reads = BTreeMap::new();
     let mut handler_memory_writes = BTreeMap::new();
     let mut handler_calls = BTreeMap::new();
@@ -960,16 +1486,34 @@ pub(crate) fn build_vm_step_summary(
                 .find(|update| same_logical_name(&update.output, selector))
                 .cloned()
         });
+        let exact_memory_effects = summary
+            .memory_read_effects
+            .iter()
+            .all(|effect| effect.exact_offset)
+            && summary
+                .memory_write_effects
+                .iter()
+                .all(|effect| effect.exact_offset && effect.exact_value);
         let exact = !summary.truncated
+            && summary.calls == 0
             && summary.state_updates.iter().all(|update| update.exact)
-            && selector_update.as_ref().is_none_or(|update| update.exact);
+            && selector_update.as_ref().is_none_or(|update| update.exact)
+            && summary.exit_guards.iter().all(|guard| guard.guard.exact)
+            && !summary.residual_guards
+            && exact_memory_effects
+            && !summary.residual_memory_effects;
         transfers.push(VmTransferArm {
             handler_target: target,
             case_values,
             region_blocks: summary.blocks.clone(),
             exit_targets: summary.exit_targets.clone(),
+            exit_guards: summary.exit_guards.clone(),
             state_updates: summary.state_updates.clone(),
             selector_update,
+            memory_reads: summary.memory_read_effects.clone(),
+            memory_writes: summary.memory_write_effects.clone(),
+            residual_guards: summary.residual_guards,
+            residual_memory_effects: summary.residual_memory_effects,
             exact,
             redispatch: summary.reenters_dispatch,
             may_return: summary.may_return,
@@ -979,6 +1523,9 @@ pub(crate) fn build_vm_step_summary(
         handler_state_inputs.insert(target, summary.state_inputs);
         handler_state_outputs.insert(target, summary.state_outputs);
         handler_state_updates.insert(target, summary.state_updates);
+        handler_exit_guards.insert(target, summary.exit_guards);
+        handler_memory_read_effects.insert(target, summary.memory_read_effects);
+        handler_memory_write_effects.insert(target, summary.memory_write_effects);
         handler_memory_reads.insert(target, summary.memory_reads);
         handler_memory_writes.insert(target, summary.memory_writes);
         handler_calls.insert(target, summary.calls);
@@ -1024,6 +1571,9 @@ pub(crate) fn build_vm_step_summary(
         handler_state_inputs,
         handler_state_outputs,
         handler_state_updates,
+        handler_exit_guards,
+        handler_memory_read_effects,
+        handler_memory_write_effects,
         handler_memory_reads,
         handler_memory_writes,
         handler_calls,

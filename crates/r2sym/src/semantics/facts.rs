@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use r2il::ArchSpec;
 use r2ssa::SsaArtifact;
@@ -12,6 +12,10 @@ use crate::backward::{
 };
 use crate::path::{ExploreConfig, PathExplorer};
 use crate::runtime::seed_default_state_for_arch;
+use crate::semantics::{
+    SemanticConfidence, SemanticEvidence, SemanticEvidenceCoverage, SemanticEvidenceProvenance,
+    SemanticEvidenceReason,
+};
 use crate::sim::{DerivedSummarySet, PreparedFunctionScope, SummaryProfile, SummaryRegistry};
 use crate::solver::SatResult;
 
@@ -37,6 +41,60 @@ pub struct SymbolicBranchFact {
     pub false_compiled: Option<BackwardConditionSummary>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SymbolicControlIslandKind {
+    BranchFrontier,
+    LargeCfgBranchFrontier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolicControlFact {
+    pub target: u64,
+    pub status: SymbolicReachabilityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compiled: Option<BackwardConditionSummary>,
+    #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
+    pub evidence: SemanticEvidence,
+}
+
+impl SymbolicControlFact {
+    pub fn exact_compiled_condition(&self) -> Option<&BackwardConditionSummary> {
+        self.evidence
+            .allows_hard_proof()
+            .then_some(self.compiled.as_ref())
+            .flatten()
+    }
+
+    pub fn actionable_compiled_condition(&self) -> Option<&BackwardConditionSummary> {
+        self.evidence
+            .allows_narrowing()
+            .then_some(self.compiled.as_ref())
+            .flatten()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolicControlIsland {
+    pub kind: SymbolicControlIslandKind,
+    pub anchor_block: u64,
+    pub frontier_targets: Vec<u64>,
+    pub facts: Vec<SymbolicControlFact>,
+    #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
+    pub evidence: SemanticEvidence,
+}
+
+impl SymbolicControlIsland {
+    pub fn exact_compiled_condition(&self) -> Option<&BackwardConditionSummary> {
+        unique_compiled_condition(self.facts.iter(), true)
+    }
+
+    pub fn actionable_compiled_condition(&self) -> Option<&BackwardConditionSummary> {
+        unique_compiled_condition(self.facts.iter(), false)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolicFunctionFactDiagnostics {
     pub branches_evaluated: usize,
@@ -49,6 +107,8 @@ pub struct SymbolicFunctionFactDiagnostics {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolicFunctionFacts {
     pub branch_facts: Vec<SymbolicBranchFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_islands: Vec<SymbolicControlIsland>,
     pub diagnostics: SymbolicFunctionFactDiagnostics,
 }
 
@@ -58,6 +118,161 @@ impl SymbolicFunctionFacts {
             .iter()
             .find(|fact| fact.block_addr == block_addr)
     }
+
+    pub fn control_island_for_block(&self, block_addr: u64) -> Option<&SymbolicControlIsland> {
+        self.control_islands
+            .iter()
+            .find(|island| island.anchor_block == block_addr)
+    }
+}
+
+fn control_fact_evidence(
+    summary: Option<&BackwardConditionSummary>,
+    condition: Option<&str>,
+    diagnostics: &SymbolicFunctionFactDiagnostics,
+) -> SemanticEvidence {
+    let branch_budget_limited = diagnostics.skipped_large_cfg;
+    match summary {
+        Some(summary) => match summary.precision {
+            BackwardConditionPrecision::Exact => summary.evidence(),
+            BackwardConditionPrecision::OverApprox => summary
+                .evidence()
+                .with_budget_limited(branch_budget_limited)
+                .with_reason(SemanticEvidenceReason::PartialPathCoverage),
+            BackwardConditionPrecision::ResidualSearchRequired => {
+                let simplified = summary.simplified.trim();
+                let has_guard = !simplified.is_empty() && simplified != "true" && simplified != "1";
+                if summary.supported_paths > 0
+                    && has_guard
+                    && summary.backward_memory_residual_fallbacks == 0
+                {
+                    SemanticEvidence::likely(SemanticEvidenceReason::ResidualSearchRequired)
+                        .with_coverage(SemanticEvidenceCoverage::Bounded)
+                        .with_provenance(SemanticEvidenceProvenance::Normalized)
+                        .with_budget_limited(branch_budget_limited)
+                        .with_reason(SemanticEvidenceReason::PartialPathCoverage)
+                } else if summary.supported_paths > 0 && has_guard {
+                    SemanticEvidence::heuristic(SemanticEvidenceReason::ResidualSearchRequired)
+                        .with_coverage(SemanticEvidenceCoverage::Bounded)
+                        .with_provenance(SemanticEvidenceProvenance::Normalized)
+                        .with_budget_limited(branch_budget_limited)
+                } else if condition.is_some() {
+                    SemanticEvidence::heuristic(SemanticEvidenceReason::GuardOpaque)
+                        .with_coverage(SemanticEvidenceCoverage::Bounded)
+                        .with_budget_limited(branch_budget_limited)
+                } else {
+                    SemanticEvidence::residual(SemanticEvidenceReason::ResidualSearchRequired)
+                        .with_budget_limited(branch_budget_limited)
+                }
+            }
+            BackwardConditionPrecision::Unsupported => {
+                if condition.is_some() {
+                    SemanticEvidence::heuristic(SemanticEvidenceReason::GuardOpaque)
+                        .with_coverage(SemanticEvidenceCoverage::Bounded)
+                        .with_budget_limited(branch_budget_limited)
+                } else {
+                    SemanticEvidence::residual(SemanticEvidenceReason::ValueOpaque)
+                        .with_budget_limited(branch_budget_limited)
+                }
+            }
+        },
+        None => condition
+            .map(|_| {
+                SemanticEvidence::heuristic(SemanticEvidenceReason::GuardOpaque)
+                    .with_coverage(SemanticEvidenceCoverage::Bounded)
+                    .with_budget_limited(branch_budget_limited)
+            })
+            .unwrap_or_else(|| {
+                SemanticEvidence::residual(SemanticEvidenceReason::GuardOpaque)
+                    .with_budget_limited(branch_budget_limited)
+            }),
+    }
+}
+
+fn island_evidence(facts: &[SymbolicControlFact]) -> SemanticEvidence {
+    facts
+        .iter()
+        .map(|fact| fact.evidence.clone())
+        .max_by_key(|evidence| {
+            (
+                match evidence.tier {
+                    SemanticConfidence::Exact => 3,
+                    SemanticConfidence::Likely => 2,
+                    SemanticConfidence::Heuristic => 1,
+                    SemanticConfidence::Residual => 0,
+                },
+                evidence.allows_hard_proof() as u8,
+                evidence.allows_narrowing() as u8,
+            )
+        })
+        .unwrap_or_else(|| SemanticEvidence::residual(SemanticEvidenceReason::GuardOpaque))
+}
+
+fn unique_compiled_condition<'a>(
+    facts: impl Iterator<Item = &'a SymbolicControlFact>,
+    hard_proof_only: bool,
+) -> Option<&'a BackwardConditionSummary> {
+    let mut candidates = facts.filter_map(|fact| {
+        if hard_proof_only {
+            fact.exact_compiled_condition()
+        } else {
+            fact.actionable_compiled_condition()
+        }
+    });
+    let first = candidates.next()?;
+    candidates.next().is_none().then_some(first)
+}
+
+fn derive_control_islands(
+    branch_facts: &[SymbolicBranchFact],
+    diagnostics: &SymbolicFunctionFactDiagnostics,
+) -> Vec<SymbolicControlIsland> {
+    branch_facts
+        .iter()
+        .map(|branch| {
+            let kind = if diagnostics.skipped_large_cfg {
+                SymbolicControlIslandKind::LargeCfgBranchFrontier
+            } else {
+                SymbolicControlIslandKind::BranchFrontier
+            };
+            let facts = vec![
+                SymbolicControlFact {
+                    target: branch.true_target,
+                    status: branch.true_status,
+                    condition: branch.true_condition.clone(),
+                    compiled: branch.true_compiled.clone(),
+                    evidence: control_fact_evidence(
+                        branch.true_compiled.as_ref(),
+                        branch.true_condition.as_deref(),
+                        diagnostics,
+                    ),
+                },
+                SymbolicControlFact {
+                    target: branch.false_target,
+                    status: branch.false_status,
+                    condition: branch.false_condition.clone(),
+                    compiled: branch.false_compiled.clone(),
+                    evidence: control_fact_evidence(
+                        branch.false_compiled.as_ref(),
+                        branch.false_condition.as_deref(),
+                        diagnostics,
+                    ),
+                },
+            ];
+            SymbolicControlIsland {
+                kind,
+                anchor_block: branch.block_addr,
+                frontier_targets: vec![branch.true_target, branch.false_target],
+                evidence: island_evidence(&facts),
+                facts,
+            }
+        })
+        .collect()
+}
+
+fn finalize_symbolic_function_facts(mut facts: SymbolicFunctionFacts) -> SymbolicFunctionFacts {
+    facts.control_islands = derive_control_islands(&facts.branch_facts, &facts.diagnostics);
+    facts
 }
 
 fn symbolic_condition_hint(summary: Option<&BackwardConditionSummary>) -> Option<String> {
@@ -82,6 +297,74 @@ fn symbolic_fact_explorer<'ctx>(ctx: &'ctx Context) -> PathExplorer<'ctx> {
     explorer
 }
 
+fn collect_branch_blocks(func: &SsaArtifact) -> Vec<(u64, u64, u64)> {
+    func.cfg()
+        .block_addrs()
+        .filter_map(|block_addr| {
+            let block = func.cfg().get_block(block_addr)?;
+            match block.terminator {
+                r2ssa::BlockTerminator::ConditionalBranch {
+                    true_target,
+                    false_target,
+                } => Some((block_addr, true_target, false_target)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn large_cfg_branch_limit(func: &SsaArtifact) -> usize {
+    let summary = func.function().cfg_risk_summary();
+    match summary.switch_block_count {
+        0 => 8,
+        1..=2 => 10,
+        _ => 12,
+    }
+}
+
+fn limited_branch_blocks(func: &SsaArtifact, limit: usize) -> Vec<(u64, u64, u64)> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut queue = VecDeque::from([func.entry]);
+    let mut visited = BTreeSet::new();
+    let mut selected = Vec::new();
+
+    while let Some(block_addr) = queue.pop_front() {
+        if !visited.insert(block_addr) {
+            continue;
+        }
+
+        if let Some(block) = func.cfg().get_block(block_addr)
+            && let r2ssa::BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } = block.terminator
+        {
+            selected.push((block_addr, true_target, false_target));
+            if selected.len() >= limit {
+                break;
+            }
+        }
+
+        for successor in func.successors(block_addr) {
+            if !visited.contains(&successor) {
+                queue.push_back(successor);
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        collect_branch_blocks(func)
+            .into_iter()
+            .take(limit)
+            .collect()
+    } else {
+        selected
+    }
+}
+
 fn symbolic_reachability_status(
     feasible_paths: usize,
     budget_exhausted: bool,
@@ -93,6 +376,102 @@ fn symbolic_reachability_status(
     } else {
         SymbolicReachabilityStatus::Unreachable
     }
+}
+
+fn collect_symbolic_function_facts_for_branch_blocks<'ctx, F>(
+    ctx: &'ctx Context,
+    func: &SsaArtifact,
+    arch: &ArchSpec,
+    branch_blocks: &[(u64, u64, u64)],
+    install_hooks: F,
+) -> SymbolicFunctionFacts
+where
+    F: Fn(&mut PathExplorer<'ctx>),
+{
+    let mut facts = SymbolicFunctionFacts::default();
+
+    for &(block_addr, true_target, false_target) in branch_blocks {
+        facts.diagnostics.branches_evaluated += 1;
+        let predicate_uses_call_result = predicate_depends_on_call_result(func, block_addr);
+
+        let make_state = || {
+            let mut state = SymState::new(ctx, func.entry);
+            seed_default_state_for_arch(&mut state, func, Some(arch));
+            state
+        };
+
+        let mut true_explorer = symbolic_fact_explorer(ctx);
+        install_hooks(&mut true_explorer);
+        let true_initial_state = make_state();
+        let (compiled_true_status, true_compiled) = compiled_branch_reachability_status(
+            &true_explorer,
+            func,
+            &true_initial_state,
+            block_addr,
+            true,
+        );
+        let true_condition = symbolic_condition_hint(true_compiled.as_ref());
+        let true_status = if let Some(status) = compiled_true_status {
+            status
+        } else if predicate_uses_call_result || func_contains_calls(func) {
+            SymbolicReachabilityStatus::Unknown
+        } else {
+            let paths = true_explorer.find_paths_to(func, make_state(), true_target);
+            symbolic_reachability_status(paths.len(), true_explorer.budget_exhausted())
+        };
+
+        let mut false_explorer = symbolic_fact_explorer(ctx);
+        install_hooks(&mut false_explorer);
+        let false_initial_state = make_state();
+        let (compiled_false_status, false_compiled) = compiled_branch_reachability_status(
+            &false_explorer,
+            func,
+            &false_initial_state,
+            block_addr,
+            false,
+        );
+        let false_condition = symbolic_condition_hint(false_compiled.as_ref());
+        let false_status = if let Some(status) = compiled_false_status {
+            status
+        } else if predicate_uses_call_result || func_contains_calls(func) {
+            SymbolicReachabilityStatus::Unknown
+        } else {
+            let paths = false_explorer.find_paths_to(func, make_state(), false_target);
+            symbolic_reachability_status(paths.len(), false_explorer.budget_exhausted())
+        };
+
+        if matches!(true_status, SymbolicReachabilityStatus::Unknown)
+            || matches!(false_status, SymbolicReachabilityStatus::Unknown)
+        {
+            facts.diagnostics.branches_unknown += 1;
+        }
+        if matches!(
+            (true_status, false_status),
+            (
+                SymbolicReachabilityStatus::Reachable,
+                SymbolicReachabilityStatus::Unreachable
+            ) | (
+                SymbolicReachabilityStatus::Unreachable,
+                SymbolicReachabilityStatus::Reachable
+            )
+        ) {
+            facts.diagnostics.branches_pruned += 1;
+        }
+
+        facts.branch_facts.push(SymbolicBranchFact {
+            block_addr,
+            true_target,
+            false_target,
+            true_status,
+            false_status,
+            true_condition,
+            false_condition,
+            true_compiled,
+            false_compiled,
+        });
+    }
+
+    facts
 }
 
 fn install_derived_summary_set<'ctx>(
@@ -283,119 +662,127 @@ pub(super) fn collect_symbolic_function_facts_with_derived<'ctx>(
     registry: &SummaryRegistry<'ctx>,
     derived: &DerivedSummarySet<'ctx>,
 ) -> SymbolicFunctionFacts {
-    let mut facts = SymbolicFunctionFacts::default();
-    let branch_blocks = func
-        .cfg()
-        .block_addrs()
-        .filter_map(|block_addr| {
-            let block = func.cfg().get_block(block_addr)?;
-            match block.terminator {
-                r2ssa::BlockTerminator::ConditionalBranch {
-                    true_target,
-                    false_target,
-                } => Some((block_addr, true_target, false_target)),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>();
+    collect_symbolic_function_facts_with_derived_for_branch_blocks(
+        ctx,
+        func,
+        scope,
+        arch,
+        &collect_branch_blocks(func),
+        summary_profile,
+        registry,
+        derived,
+        symbol_map,
+    )
+}
 
-    for (block_addr, true_target, false_target) in branch_blocks {
-        facts.diagnostics.branches_evaluated += 1;
-        let predicate_uses_call_result = predicate_depends_on_call_result(func, block_addr);
-
-        let make_state = || {
-            let mut state = SymState::new(ctx, func.entry);
-            seed_default_state_for_arch(&mut state, func, Some(arch));
-            state
-        };
-
-        let mut true_explorer = symbolic_fact_explorer(ctx);
-        install_derived_summary_set(
-            &mut true_explorer,
-            registry,
-            func,
-            scope,
-            derived,
-            symbol_map,
-        );
-        let true_initial_state = make_state();
-        let (compiled_true_status, true_compiled) = compiled_branch_reachability_status(
-            &true_explorer,
-            func,
-            &true_initial_state,
-            block_addr,
-            true,
-        );
-        let true_condition = symbolic_condition_hint(true_compiled.as_ref());
-        let true_status = if let Some(status) = compiled_true_status {
-            status
-        } else if predicate_uses_call_result || func_contains_calls(func) {
-            SymbolicReachabilityStatus::Unknown
-        } else {
-            let paths = true_explorer.find_paths_to(func, make_state(), true_target);
-            symbolic_reachability_status(paths.len(), true_explorer.budget_exhausted())
-        };
-
-        let mut false_explorer = symbolic_fact_explorer(ctx);
-        install_derived_summary_set(
-            &mut false_explorer,
-            registry,
-            func,
-            scope,
-            derived,
-            symbol_map,
-        );
-        let false_initial_state = make_state();
-        let (compiled_false_status, false_compiled) = compiled_branch_reachability_status(
-            &false_explorer,
-            func,
-            &false_initial_state,
-            block_addr,
-            false,
-        );
-        let false_condition = symbolic_condition_hint(false_compiled.as_ref());
-        let false_status = if let Some(status) = compiled_false_status {
-            status
-        } else if predicate_uses_call_result || func_contains_calls(func) {
-            SymbolicReachabilityStatus::Unknown
-        } else {
-            let paths = false_explorer.find_paths_to(func, make_state(), false_target);
-            symbolic_reachability_status(paths.len(), false_explorer.budget_exhausted())
-        };
-
-        if matches!(true_status, SymbolicReachabilityStatus::Unknown)
-            || matches!(false_status, SymbolicReachabilityStatus::Unknown)
-        {
-            facts.diagnostics.branches_unknown += 1;
-        }
-        if matches!(
-            (true_status, false_status),
-            (
-                SymbolicReachabilityStatus::Reachable,
-                SymbolicReachabilityStatus::Unreachable
-            ) | (
-                SymbolicReachabilityStatus::Unreachable,
-                SymbolicReachabilityStatus::Reachable
-            )
-        ) {
-            facts.diagnostics.branches_pruned += 1;
-        }
-
-        facts.branch_facts.push(SymbolicBranchFact {
-            block_addr,
-            true_target,
-            false_target,
-            true_status,
-            false_status,
-            true_condition,
-            false_condition,
-            true_compiled,
-            false_compiled,
-        });
-    }
-
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_symbolic_function_facts_with_derived_for_branch_blocks<'ctx>(
+    ctx: &'ctx Context,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    arch: &ArchSpec,
+    branch_blocks: &[(u64, u64, u64)],
+    summary_profile: SummaryProfile,
+    registry: &SummaryRegistry<'ctx>,
+    derived: &DerivedSummarySet<'ctx>,
+    symbol_map: &HashMap<u64, String>,
+) -> SymbolicFunctionFacts {
+    let facts = collect_symbolic_function_facts_for_branch_blocks(
+        ctx,
+        func,
+        arch,
+        branch_blocks,
+        |explorer| {
+            install_derived_summary_set(explorer, registry, func, scope, derived, symbol_map);
+        },
+    );
     let _ = summary_profile;
-    facts
+    finalize_symbolic_function_facts(facts)
+}
+
+fn collect_large_cfg_symbolic_function_facts(
+    ctx: &Context,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    arch: &ArchSpec,
+    symbol_map: &HashMap<u64, String>,
+    summary_profile: SummaryProfile,
+) -> SymbolicFunctionFacts {
+    collect_large_cfg_symbolic_function_facts_with_limit(
+        ctx,
+        func,
+        scope,
+        arch,
+        symbol_map,
+        summary_profile,
+        large_cfg_branch_limit(func),
+    )
+}
+
+pub(super) fn collect_large_cfg_symbolic_function_facts_with_limit(
+    ctx: &Context,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    arch: &ArchSpec,
+    symbol_map: &HashMap<u64, String>,
+    summary_profile: SummaryProfile,
+    branch_limit: usize,
+) -> SymbolicFunctionFacts {
+    let branch_blocks = limited_branch_blocks(func, branch_limit.max(1));
+    let mut facts = if let Some(scope) = scope {
+        if let Some(registry) = SummaryRegistry::with_profile_for_arch(arch, summary_profile) {
+            let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);
+            collect_symbolic_function_facts_with_derived_for_branch_blocks(
+                ctx,
+                func,
+                Some(scope),
+                arch,
+                &branch_blocks,
+                summary_profile,
+                &registry,
+                &derived,
+                symbol_map,
+            )
+        } else {
+            collect_symbolic_function_facts_for_branch_blocks(
+                ctx,
+                func,
+                arch,
+                &branch_blocks,
+                |explorer| {
+                    install_symbolic_fact_hooks(
+                        ctx,
+                        explorer,
+                        func,
+                        None,
+                        arch,
+                        summary_profile,
+                        symbol_map,
+                    );
+                },
+            )
+        }
+    } else {
+        collect_symbolic_function_facts_for_branch_blocks(
+            ctx,
+            func,
+            arch,
+            &branch_blocks,
+            |explorer| {
+                install_symbolic_fact_hooks(
+                    ctx,
+                    explorer,
+                    func,
+                    None,
+                    arch,
+                    summary_profile,
+                    symbol_map,
+                );
+            },
+        )
+    };
+    facts.diagnostics.skipped_large_cfg = true;
+    finalize_symbolic_function_facts(facts)
 }
 
 pub fn collect_symbolic_function_facts(
@@ -404,7 +791,14 @@ pub fn collect_symbolic_function_facts(
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
 ) -> SymbolicFunctionFacts {
-    collect_symbolic_function_facts_with_scope(ctx, func, None, arch, symbol_map)
+    collect_symbolic_function_facts_with_scope_and_profile(
+        ctx,
+        func,
+        None,
+        arch,
+        symbol_map,
+        SummaryProfile::Default,
+    )
 }
 
 pub fn collect_symbolic_function_facts_with_scope(
@@ -414,22 +808,45 @@ pub fn collect_symbolic_function_facts_with_scope(
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
 ) -> SymbolicFunctionFacts {
+    collect_symbolic_function_facts_with_scope_and_profile(
+        ctx,
+        func,
+        scope,
+        arch,
+        symbol_map,
+        SummaryProfile::Default,
+    )
+}
+
+pub fn collect_symbolic_function_facts_with_scope_and_profile(
+    ctx: &Context,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    arch: Option<&ArchSpec>,
+    symbol_map: &HashMap<u64, String>,
+    summary_profile: SummaryProfile,
+) -> SymbolicFunctionFacts {
     let mut facts = SymbolicFunctionFacts::default();
     let Some(arch) = arch else {
         facts.diagnostics.skipped_missing_arch = true;
-        return facts;
+        return finalize_symbolic_function_facts(facts);
     };
 
     let cfg_summary = func.function().cfg_risk_summary();
     if cfg_summary.block_count > 96 || cfg_summary.switch_block_count > 8 {
-        facts.diagnostics.skipped_large_cfg = true;
-        return facts;
+        return collect_large_cfg_symbolic_function_facts(
+            ctx,
+            func,
+            scope,
+            arch,
+            symbol_map,
+            summary_profile,
+        );
     }
 
     if let Some(scope) = scope {
-        let Some(registry) = SummaryRegistry::with_profile_for_arch(arch, SummaryProfile::Default)
-        else {
-            return facts;
+        let Some(registry) = SummaryRegistry::with_profile_for_arch(arch, summary_profile) else {
+            return finalize_symbolic_function_facts(facts);
         };
         let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);
         return collect_symbolic_function_facts_with_derived(
@@ -438,123 +855,121 @@ pub fn collect_symbolic_function_facts_with_scope(
             Some(scope),
             arch,
             symbol_map,
-            SummaryProfile::Default,
+            summary_profile,
             &registry,
             &derived,
         );
     }
+    finalize_symbolic_function_facts(collect_symbolic_function_facts_for_branch_blocks(
+        ctx,
+        func,
+        arch,
+        &collect_branch_blocks(func),
+        |explorer| {
+            install_symbolic_fact_hooks(
+                ctx,
+                explorer,
+                func,
+                None,
+                arch,
+                summary_profile,
+                symbol_map,
+            );
+        },
+    ))
+}
 
-    let branch_blocks = func
-        .cfg()
-        .block_addrs()
-        .filter_map(|block_addr| {
-            let block = func.cfg().get_block(block_addr)?;
-            match block.terminator {
-                r2ssa::BlockTerminator::ConditionalBranch {
-                    true_target,
-                    false_target,
-                } => Some((block_addr, true_target, false_target)),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for (block_addr, true_target, false_target) in branch_blocks {
-        facts.diagnostics.branches_evaluated += 1;
-        let predicate_uses_call_result = predicate_depends_on_call_result(func, block_addr);
-
-        let make_state = || {
-            let mut state = SymState::new(ctx, func.entry);
-            seed_default_state_for_arch(&mut state, func, Some(arch));
-            state
-        };
-
-        let mut true_explorer = symbolic_fact_explorer(ctx);
-        install_symbolic_fact_hooks(
-            ctx,
-            &mut true_explorer,
-            func,
-            None,
-            arch,
-            SummaryProfile::Default,
-            symbol_map,
-        );
-        let true_initial_state = make_state();
-        let (compiled_true_status, true_compiled) = compiled_branch_reachability_status(
-            &true_explorer,
-            func,
-            &true_initial_state,
-            block_addr,
-            true,
-        );
-        let true_condition = symbolic_condition_hint(true_compiled.as_ref());
-        let true_status = if let Some(status) = compiled_true_status {
-            status
-        } else if predicate_uses_call_result || func_contains_calls(func) {
-            SymbolicReachabilityStatus::Unknown
-        } else {
-            let paths = true_explorer.find_paths_to(func, make_state(), true_target);
-            symbolic_reachability_status(paths.len(), true_explorer.budget_exhausted())
-        };
-
-        let mut false_explorer = symbolic_fact_explorer(ctx);
-        install_symbolic_fact_hooks(
-            ctx,
-            &mut false_explorer,
-            func,
-            None,
-            arch,
-            SummaryProfile::Default,
-            symbol_map,
-        );
-        let false_initial_state = make_state();
-        let (compiled_false_status, false_compiled) = compiled_branch_reachability_status(
-            &false_explorer,
-            func,
-            &false_initial_state,
-            block_addr,
-            false,
-        );
-        let false_condition = symbolic_condition_hint(false_compiled.as_ref());
-        let false_status = if let Some(status) = compiled_false_status {
-            status
-        } else if predicate_uses_call_result || func_contains_calls(func) {
-            SymbolicReachabilityStatus::Unknown
-        } else {
-            let paths = false_explorer.find_paths_to(func, make_state(), false_target);
-            symbolic_reachability_status(paths.len(), false_explorer.budget_exhausted())
-        };
-
-        if matches!(true_status, SymbolicReachabilityStatus::Unknown)
-            || matches!(false_status, SymbolicReachabilityStatus::Unknown)
-        {
-            facts.diagnostics.branches_unknown += 1;
+    fn residual_summary(expr: &str) -> BackwardConditionSummary {
+        BackwardConditionSummary {
+            simplified: expr.to_string(),
+            terms: vec![expr.to_string()],
+            memory_terms: Vec::new(),
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: BackwardConditionPrecision::ResidualSearchRequired,
+            supported_paths: 1,
+            total_paths: 2,
         }
-        if matches!(
-            (true_status, false_status),
-            (
-                SymbolicReachabilityStatus::Reachable,
-                SymbolicReachabilityStatus::Unreachable
-            ) | (
-                SymbolicReachabilityStatus::Unreachable,
-                SymbolicReachabilityStatus::Reachable
-            )
-        ) {
-            facts.diagnostics.branches_pruned += 1;
-        }
-
-        facts.branch_facts.push(SymbolicBranchFact {
-            block_addr,
-            true_target,
-            false_target,
-            true_status,
-            false_status,
-            true_condition,
-            false_condition,
-            true_compiled,
-            false_compiled,
-        });
     }
 
-    facts
+    #[test]
+    fn large_cfg_control_island_promotes_single_bounded_guard_to_likely() {
+        let facts = finalize_symbolic_function_facts(SymbolicFunctionFacts {
+            branch_facts: vec![SymbolicBranchFact {
+                block_addr: 0x1000,
+                true_target: 0x1010,
+                false_target: 0x1020,
+                true_status: SymbolicReachabilityStatus::Unknown,
+                false_status: SymbolicReachabilityStatus::Unknown,
+                true_condition: Some("sel == 3".to_string()),
+                false_condition: None,
+                true_compiled: Some(residual_summary("sel == 3")),
+                false_compiled: None,
+            }],
+            control_islands: Vec::new(),
+            diagnostics: SymbolicFunctionFactDiagnostics {
+                skipped_large_cfg: true,
+                ..SymbolicFunctionFactDiagnostics::default()
+            },
+        });
+
+        let island = facts
+            .control_island_for_block(0x1000)
+            .expect("control island");
+        assert_eq!(
+            island.kind,
+            SymbolicControlIslandKind::LargeCfgBranchFrontier
+        );
+        assert_eq!(island.evidence.tier, SemanticConfidence::Likely);
+        assert!(island.actionable_compiled_condition().is_some());
+    }
+
+    #[test]
+    fn control_island_requires_unique_actionable_condition() {
+        let facts = finalize_symbolic_function_facts(SymbolicFunctionFacts {
+            branch_facts: vec![SymbolicBranchFact {
+                block_addr: 0x2000,
+                true_target: 0x2010,
+                false_target: 0x2020,
+                true_status: SymbolicReachabilityStatus::Unknown,
+                false_status: SymbolicReachabilityStatus::Unknown,
+                true_condition: Some("x < 4".to_string()),
+                false_condition: Some("x >= 4".to_string()),
+                true_compiled: Some(BackwardConditionSummary {
+                    simplified: "x < 4".to_string(),
+                    terms: vec!["x < 4".to_string()],
+                    memory_terms: Vec::new(),
+                    backward_memory_substitutions: 0,
+                    backward_memory_candidate_enumerations: 0,
+                    backward_memory_residual_fallbacks: 0,
+                    precision: BackwardConditionPrecision::OverApprox,
+                    supported_paths: 1,
+                    total_paths: 2,
+                }),
+                false_compiled: Some(BackwardConditionSummary {
+                    simplified: "x >= 4".to_string(),
+                    terms: vec!["x >= 4".to_string()],
+                    memory_terms: Vec::new(),
+                    backward_memory_substitutions: 0,
+                    backward_memory_candidate_enumerations: 0,
+                    backward_memory_residual_fallbacks: 0,
+                    precision: BackwardConditionPrecision::OverApprox,
+                    supported_paths: 1,
+                    total_paths: 2,
+                }),
+            }],
+            control_islands: Vec::new(),
+            diagnostics: SymbolicFunctionFactDiagnostics::default(),
+        });
+
+        let island = facts
+            .control_island_for_block(0x2000)
+            .expect("control island");
+        assert!(island.actionable_compiled_condition().is_none());
+    }
 }

@@ -11,7 +11,10 @@ use z3::{SatResult as Z3SatResult, Solver};
 use crate::sim::{CallConv, DerivedFunctionSummary};
 use crate::state::SymState;
 use crate::value::SymValue;
-use crate::{MemoryRegionId, MemoryRegionKind};
+use crate::{
+    MemoryRegionId, MemoryRegionKind, SemanticConfidence, SemanticEvidence,
+    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+};
 
 const DEFAULT_REVERSE_PATH_LIMIT: usize = 16;
 const DEFAULT_MAX_NORMALIZED_OFFSETS: usize = 8;
@@ -37,6 +40,33 @@ pub struct BackwardConditionSummary {
     pub total_paths: usize,
 }
 
+impl BackwardConditionSummary {
+    pub fn evidence(&self) -> SemanticEvidence {
+        match self.precision {
+            BackwardConditionPrecision::Exact => SemanticEvidence::exact(),
+            BackwardConditionPrecision::OverApprox => {
+                SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
+                    .with_provenance(SemanticEvidenceProvenance::Normalized)
+            }
+            BackwardConditionPrecision::ResidualSearchRequired => {
+                if self.supported_paths > 0 {
+                    SemanticEvidence::heuristic(SemanticEvidenceReason::ResidualSearchRequired)
+                        .with_coverage(SemanticEvidenceCoverage::Bounded)
+                } else {
+                    SemanticEvidence::residual(SemanticEvidenceReason::ResidualSearchRequired)
+                }
+            }
+            BackwardConditionPrecision::Unsupported => {
+                SemanticEvidence::residual(SemanticEvidenceReason::ValueOpaque)
+            }
+        }
+    }
+
+    pub fn confidence(&self) -> SemanticConfidence {
+        self.evidence().tier
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackwardMemoryCondition {
     pub region: BackwardMemoryRegion,
@@ -45,6 +75,25 @@ pub struct BackwardMemoryCondition {
     pub size: u32,
     pub exact_offset: bool,
     pub expr: String,
+}
+
+impl BackwardMemoryCondition {
+    pub fn evidence(&self) -> SemanticEvidence {
+        if self.exact_offset {
+            SemanticEvidence::exact()
+        } else if self.offset_hi >= self.offset_lo && (self.offset_hi - self.offset_lo) <= 8 {
+            SemanticEvidence::likely(SemanticEvidenceReason::DerivedFromRanking)
+                .with_coverage(SemanticEvidenceCoverage::Bounded)
+                .with_provenance(SemanticEvidenceProvenance::Normalized)
+        } else {
+            SemanticEvidence::heuristic(SemanticEvidenceReason::AliasAmbiguity)
+                .with_coverage(SemanticEvidenceCoverage::Bounded)
+        }
+    }
+
+    pub fn confidence(&self) -> SemanticConfidence {
+        self.evidence().tier
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -117,6 +166,22 @@ enum SummaryLocationMatch {
     Match(Vec<NormalizedMemoryLocation>),
     NoMatch,
     Residual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LocationGroupRank {
+    region_rank: u8,
+    inexact_offset: bool,
+    span: u64,
+    offset_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LocationGroupTieBreak {
+    region_discriminant: u8,
+    region_id: u32,
+    arg_index: usize,
+    min_offset: i64,
 }
 
 impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
@@ -438,7 +503,16 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         }
         let fallback_summary_locations = summary_memory_locations(call_ctx, addr);
         let substitutions = build_call_substitutions(self.state, call_ctx);
-        for location_group in group_normalized_locations(&actual_locations) {
+        let location_groups = group_normalized_locations(&actual_locations);
+        let candidate_groups = if location_groups.len() <= 1 {
+            location_groups
+        } else if let Some(best_group) = select_best_location_group(location_groups) {
+            vec![best_group]
+        } else {
+            self.memory_residual_fallbacks += 1;
+            return None;
+        };
+        for location_group in candidate_groups {
             let summary_group = match self.summary_match_locations(call_ctx, &location_group) {
                 SummaryLocationMatch::Match(group) => group,
                 SummaryLocationMatch::NoMatch => {
@@ -512,19 +586,23 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         {
             return SummaryLocationMatch::Match(actual_group.to_vec());
         }
-        if actual_group.len() != 1 {
+        let mut actual_regions = actual_group
+            .iter()
+            .filter_map(|location| match &location.region {
+                BackwardMemoryRegion::Region(region) => Some(region.clone()),
+                BackwardMemoryRegion::Argument { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if actual_regions.len() != 1 {
             return SummaryLocationMatch::Residual;
         }
 
-        let actual = &actual_group[0];
-        let BackwardMemoryRegion::Region(actual_region) = &actual.region else {
-            return SummaryLocationMatch::NoMatch;
-        };
+        let actual_region = actual_regions.pop_first().expect("single region");
         if actual_region.kind == MemoryRegionKind::EscapedUnknown {
             return SummaryLocationMatch::NoMatch;
         }
 
-        let mut translated = BTreeSet::new();
+        let mut translated = BTreeMap::<usize, BTreeSet<i64>>::new();
         let pointer_args = summary_pointer_arg_indices(call_ctx);
         for (arg_index, base) in call_ctx.args.iter().enumerate() {
             if !pointer_args.is_empty() && !pointer_args.contains(&arg_index) {
@@ -540,20 +618,28 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 if base_region.kind == MemoryRegionKind::EscapedUnknown {
                     continue;
                 }
-                if base_region != actual_region {
+                if *base_region != actual_region {
                     continue;
                 }
-                translated.insert(NormalizedMemoryLocation {
-                    region: BackwardMemoryRegion::Argument { index: arg_index },
-                    offset: actual.offset.saturating_sub(base_location.offset),
-                });
+                let offsets = translated.entry(arg_index).or_default();
+                for actual in actual_group {
+                    offsets.insert(actual.offset.saturating_sub(base_location.offset));
+                }
             }
         }
 
         match translated.len() {
             0 => SummaryLocationMatch::NoMatch,
-            1 => SummaryLocationMatch::Match(translated.into_iter().collect()),
-            _ => SummaryLocationMatch::Residual,
+            1 => SummaryLocationMatch::Match(translated_arg_locations(
+                translated
+                    .into_iter()
+                    .next()
+                    .expect("single translated arg"),
+            )),
+            _ => select_best_translated_arg(translated)
+                .map(translated_arg_locations)
+                .map(SummaryLocationMatch::Match)
+                .unwrap_or(SummaryLocationMatch::Residual),
         }
     }
 
@@ -1477,6 +1563,129 @@ fn summary_pointer_arg_indices<'ctx>(call_ctx: &CallTransformContext<'ctx>) -> B
     indices
 }
 
+fn translated_arg_locations(
+    (arg_index, offsets): (usize, BTreeSet<i64>),
+) -> Vec<NormalizedMemoryLocation> {
+    offsets
+        .into_iter()
+        .map(|offset| NormalizedMemoryLocation {
+            region: BackwardMemoryRegion::Argument { index: arg_index },
+            offset,
+        })
+        .collect()
+}
+
+fn memory_region_rank(region: &BackwardMemoryRegion) -> u8 {
+    match region {
+        BackwardMemoryRegion::Argument { .. } => 0,
+        BackwardMemoryRegion::Region(region) => match region.kind {
+            MemoryRegionKind::Stack => 1,
+            MemoryRegionKind::Global => 2,
+            MemoryRegionKind::Replay => 3,
+            MemoryRegionKind::Input => 4,
+            MemoryRegionKind::Heap => 5,
+            MemoryRegionKind::EscapedUnknown => 6,
+        },
+    }
+}
+
+fn offsets_span(offsets: &BTreeSet<i64>) -> u64 {
+    match (offsets.first().copied(), offsets.last().copied()) {
+        (Some(lo), Some(hi)) => hi.saturating_sub(lo).unsigned_abs(),
+        _ => 0,
+    }
+}
+
+fn location_group_rank(group: &[NormalizedMemoryLocation]) -> Option<LocationGroupRank> {
+    let region = group.first()?.region.clone();
+    let offsets = group
+        .iter()
+        .map(|location| location.offset)
+        .collect::<BTreeSet<_>>();
+    let span = offsets_span(&offsets);
+    Some(LocationGroupRank {
+        region_rank: memory_region_rank(&region),
+        inexact_offset: span != 0,
+        span,
+        offset_count: offsets.len(),
+    })
+}
+
+fn location_group_tie_break(group: &[NormalizedMemoryLocation]) -> Option<LocationGroupTieBreak> {
+    let region = group.first()?.region.clone();
+    let min_offset = group
+        .iter()
+        .map(|location| location.offset)
+        .min()
+        .unwrap_or(0);
+    Some(match region {
+        BackwardMemoryRegion::Argument { index } => LocationGroupTieBreak {
+            region_discriminant: 0,
+            region_id: 0,
+            arg_index: index,
+            min_offset,
+        },
+        BackwardMemoryRegion::Region(region) => LocationGroupTieBreak {
+            region_discriminant: 1,
+            region_id: region.id.0,
+            arg_index: 0,
+            min_offset,
+        },
+    })
+}
+
+fn select_best_location_group(
+    groups: Vec<Vec<NormalizedMemoryLocation>>,
+) -> Option<Vec<NormalizedMemoryLocation>> {
+    if groups.len() <= 1 {
+        return groups.into_iter().next();
+    }
+
+    let mut ranked = groups
+        .into_iter()
+        .filter_map(|group| {
+            Some((
+                location_group_rank(&group)?,
+                location_group_tie_break(&group)?,
+                group,
+            ))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if ranked.len() > 1 && ranked[0].0 == ranked[1].0 {
+        None
+    } else {
+        ranked.into_iter().next().map(|(_, _, group)| group)
+    }
+}
+
+fn translated_offsets_rank(offsets: &BTreeSet<i64>) -> (bool, u64, usize) {
+    let span = offsets_span(offsets);
+    (span != 0, span, offsets.len())
+}
+
+fn select_best_translated_arg(
+    translated: BTreeMap<usize, BTreeSet<i64>>,
+) -> Option<(usize, BTreeSet<i64>)> {
+    if translated.len() <= 1 {
+        return translated.into_iter().next();
+    }
+
+    let mut ranked = translated
+        .into_iter()
+        .map(|(arg_index, offsets)| (translated_offsets_rank(&offsets), arg_index, offsets))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if ranked.len() > 1 && ranked[0].0 == ranked[1].0 {
+        None
+    } else {
+        ranked
+            .into_iter()
+            .next()
+            .map(|(_, arg_index, offsets)| (arg_index, offsets))
+    }
+}
+
 fn group_normalized_locations(
     locations: &[NormalizedMemoryLocation],
 ) -> Vec<Vec<NormalizedMemoryLocation>> {
@@ -1839,5 +2048,48 @@ mod tests {
             BackwardConditionPrecision::Exact
         );
         assert!(compiled.summary.simplified.contains("1337") || !compiled.summary.terms.is_empty());
+    }
+
+    #[test]
+    fn select_best_location_group_prefers_stable_exact_region() {
+        let global_group = vec![NormalizedMemoryLocation {
+            region: BackwardMemoryRegion::Region(BackwardRegionRef {
+                id: MemoryRegionId(1),
+                kind: MemoryRegionKind::Global,
+                name: "global".to_string(),
+            }),
+            offset: 4,
+        }];
+        let heap_group = vec![
+            NormalizedMemoryLocation {
+                region: BackwardMemoryRegion::Region(BackwardRegionRef {
+                    id: MemoryRegionId(2),
+                    kind: MemoryRegionKind::Heap,
+                    name: "heap".to_string(),
+                }),
+                offset: 4,
+            },
+            NormalizedMemoryLocation {
+                region: BackwardMemoryRegion::Region(BackwardRegionRef {
+                    id: MemoryRegionId(2),
+                    kind: MemoryRegionKind::Heap,
+                    name: "heap".to_string(),
+                }),
+                offset: 8,
+            },
+        ];
+
+        let best =
+            select_best_location_group(vec![heap_group, global_group.clone()]).expect("best group");
+        assert_eq!(best, global_group);
+    }
+
+    #[test]
+    fn select_best_translated_arg_ties_remain_residual() {
+        let translated = BTreeMap::from([
+            (0usize, BTreeSet::from([0i64])),
+            (1usize, BTreeSet::from([0i64])),
+        ]);
+        assert!(select_best_translated_arg(translated).is_none());
     }
 }
