@@ -3,7 +3,7 @@ pub mod context;
 pub mod convert;
 pub mod external;
 pub mod facts;
-pub mod from_sym;
+pub mod function_facts;
 pub mod inference;
 pub mod lattice;
 pub mod model;
@@ -33,21 +33,9 @@ pub use facts::{
     CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
     FunctionSignatureSpec, FunctionType, FunctionTypeFactInputs, FunctionTypeFacts,
     FunctionTypeFactsBuilder, InterprocFactDiagnostics, LocalFieldAccessFact, ResolvedFieldLayout,
-    SymbolicBranchFact, SymbolicCompiledCondition, SymbolicConditionPrecision, SymbolicControlFact,
-    SymbolicControlIsland, SymbolicControlIslandKind, SymbolicFactDiagnostics,
-    SymbolicInterpreterDispatch, SymbolicInterpreterKind, SymbolicMemoryCondition,
-    SymbolicMemoryIsland, SymbolicMemoryIslandKind, SymbolicMemoryRegion, SymbolicMemoryRegionKind,
-    SymbolicMemoryRegionRef, SymbolicReachabilityStatus, SymbolicSemanticCapability,
-    SymbolicSemanticConfidence, SymbolicSemanticEvidence, SymbolicSemanticEvidenceAmbiguity,
-    SymbolicSemanticEvidenceCoverage, SymbolicSemanticEvidenceProvenance,
-    SymbolicSemanticEvidenceReason, SymbolicSemanticEvidenceSoundness, SymbolicSemanticFacts,
-    SymbolicSemanticMode, SymbolicSemanticResidualReason, SymbolicSemanticSliceClass,
-    SymbolicVmBinaryOp, SymbolicVmGuardCondition, SymbolicVmGuardedExit, SymbolicVmStateUpdate,
-    SymbolicVmStepSummary, SymbolicVmTransferArm, SymbolicVmTransferSummary, SymbolicVmUnaryOp,
-    SymbolicVmValueExpr, SymbolicWorkerIsland, VisibleBinding, VisibleBindingKind,
-    parse_type_like_spec,
+    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
-pub use from_sym::{symbolic_semantic_facts_from_artifact, symbolic_vm_value_expr_from_sym};
+pub use function_facts::FunctionFacts;
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
 pub use oracle::{LayoutOracle, TypeOracle};
@@ -74,7 +62,8 @@ pub use writeback::{
     RecoveredVariable, StructDeclCandidate, StructDeclSource, StructFieldCandidate,
     TypeWritebackAnalysis, TypeWritebackAnalysisInput, TypeWritebackDiagnostics, TypeWritebackPlan,
     TypeWritebackSemanticInputs, VarRenameCandidate, VarTypeCandidate, WritebackEvidence,
-    WritebackSource, augment_local_struct_artifacts_with_symbolic_facts,
+    WritebackSource, augment_local_struct_artifacts_with_semantics,
     build_semantic_type_fallback_plan, build_type_writeback_analysis,
     build_type_writeback_analysis_with_semantics, infer_local_struct_artifacts_from_ssa,
+    semantic_artifact_prefers_bounded_type_plan,
 };

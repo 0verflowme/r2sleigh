@@ -42,10 +42,9 @@ pub(crate) struct FunctionAnalysis {
 pub(crate) struct FunctionAnalysisArtifact {
     pub(crate) ssa_func: r2ssa::SsaArtifact,
     pub(crate) pattern_ssa_func: r2ssa::SsaArtifact,
-    pub(crate) type_facts: r2types::FunctionTypeFacts,
+    pub(crate) function_facts: r2types::FunctionFacts,
     pub(crate) writeback_plan: r2types::TypeWritebackPlan,
     pub(crate) interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
-    pub(crate) semantic_artifact: Option<r2sym::CompiledSemanticArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -165,34 +164,17 @@ fn rename_function_analysis_artifact(
     let FunctionAnalysisArtifact {
         ssa_func,
         pattern_ssa_func,
-        type_facts,
+        function_facts,
         writeback_plan,
         interproc_summary_set,
-        semantic_artifact,
     } = artifact;
     FunctionAnalysisArtifact {
         ssa_func: ssa_func.with_name(function_name),
         pattern_ssa_func: pattern_ssa_func.with_name(function_name),
-        type_facts,
+        function_facts,
         writeback_plan,
         interproc_summary_set,
-        semantic_artifact,
     }
-}
-
-#[allow(dead_code)]
-fn collect_plugin_symbolic_facts(
-    prepared: &r2ssa::SsaArtifact,
-    arch: Option<&ArchSpec>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> r2types::SymbolicSemanticFacts {
-    let artifact = r2sym::compile_semantic_artifact_default_with_scope(
-        &z3::Context::thread_local(),
-        prepared,
-        symbolic_scope,
-        arch,
-    );
-    r2types::symbolic_semantic_facts_from_artifact(&artifact)
 }
 
 #[cfg(test)]
@@ -365,7 +347,7 @@ pub(crate) fn collect_detached_semantic_artifact(
     function_name: &str,
     arch: Option<&ArchSpec>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<r2sym::CompiledSemanticArtifact> {
+) -> Option<r2sym::SemanticArtifact> {
     let analysis = build_function_analysis_from_parts(function_name, blocks, arch)?;
     Some(r2sym::compile_semantic_artifact_default_with_scope(
         &z3::Context::thread_local(),
@@ -621,7 +603,7 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
     analysis: FunctionAnalysis,
     external_context_json: &str,
     interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
-    semantic_artifact: r2sym::CompiledSemanticArtifact,
+    semantic_artifact: r2sym::SemanticArtifact,
 ) -> Option<FunctionAnalysisArtifact> {
     let ptr_bits = input
         .ctx
@@ -645,8 +627,6 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
     let local_field_accesses = local_field_accesses_to_writeback(
         r2dec::infer_local_struct_field_accesses(&analysis.pattern_ssa_func, &decompiler_cfg),
     );
-    let symbolic_facts = r2types::symbolic_semantic_facts_from_artifact(&semantic_artifact);
-
     let reg_type_hints = if input.ctx.semantic_metadata_enabled {
         collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
     } else {
@@ -672,17 +652,16 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artif
             diagnostics,
         },
         r2types::TypeWritebackSemanticInputs {
-            symbolic_facts: &symbolic_facts,
+            artifact: &semantic_artifact,
             local_field_accesses: &local_field_accesses,
         },
     );
     Some(FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_func: analysis.pattern_ssa_func,
-        type_facts: writeback.type_facts,
+        function_facts: writeback.function_facts,
         writeback_plan: writeback.plan,
         interproc_summary_set,
-        semantic_artifact: Some(semantic_artifact),
     })
 }
 
@@ -875,7 +854,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
     reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     external_context_json: &str,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    precomputed_semantic_artifact: Option<r2sym::CompiledSemanticArtifact>,
+    precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
 ) -> Option<FunctionAnalysisArtifact> {
     let cache_key = function_artifact_cache_key_parts(
         function_name,
@@ -941,7 +920,6 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
             arch,
         )
     });
-    let symbolic_facts = r2types::symbolic_semantic_facts_from_artifact(&semantic_artifact);
     let vars = recover_vars_from_ssa(
         &pattern_ssa_blocks,
         arch,
@@ -962,17 +940,16 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
             diagnostics,
         },
         r2types::TypeWritebackSemanticInputs {
-            symbolic_facts: &symbolic_facts,
+            artifact: &semantic_artifact,
             local_field_accesses: &local_field_accesses,
         },
     );
     let artifact = FunctionAnalysisArtifact {
         ssa_func: analysis.ssa_func,
         pattern_ssa_func: analysis.pattern_ssa_func,
-        type_facts: writeback.type_facts,
+        function_facts: writeback.function_facts,
         writeback_plan: writeback.plan,
         interproc_summary_set: None,
-        semantic_artifact: Some(semantic_artifact),
     };
     if let Some(cache_key) = cache_key {
         cache_insert_bounded(artifact_cache(), cache_key, Arc::new(artifact.clone()));

@@ -12,7 +12,7 @@ use r2ssa::{
 use r2types::ExternalStackVarSpec;
 use r2types::{
     CalleeFact, ExternalStackSlotSpec, ExternalTypeDb, FunctionType, SignatureRegistry,
-    StackSlotKey, SymbolicSemanticFacts, TypeOracle, VisibleBinding,
+    StackSlotKey, TypeOracle, VisibleBinding,
 };
 
 pub(crate) type SSABlock = FunctionSSABlock;
@@ -65,7 +65,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) external_type_db: &'a ExternalTypeDb,
-    pub(crate) symbolic_facts: &'a SymbolicSemanticFacts,
+    pub(crate) semantic_artifact: Option<&'a r2sym::SemanticArtifact>,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
@@ -208,7 +208,6 @@ impl<'a> FoldingContext<'a> {
         static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
         static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
         static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
-        static EMPTY_SYMBOLIC_FACTS: OnceLock<SymbolicSemanticFacts> = OnceLock::new();
         static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
         static EMPTY_STRING_FNTY: OnceLock<HashMap<String, FunctionType>> = OnceLock::new();
         static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
@@ -234,7 +233,7 @@ impl<'a> FoldingContext<'a> {
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
             external_type_db: EMPTY_TYPE_DB.get_or_init(ExternalTypeDb::default),
-            symbolic_facts: EMPTY_SYMBOLIC_FACTS.get_or_init(SymbolicSemanticFacts::default),
+            semantic_artifact: None,
             param_register_aliases: EMPTY_STRING_STRING.get_or_init(HashMap::new),
             type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),
             type_oracle: None,

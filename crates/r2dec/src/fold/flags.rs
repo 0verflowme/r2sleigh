@@ -5,17 +5,15 @@ use r2ssa::{
     CompareKind as PreparedCompareKind, CompareProvenance, FunctionSSABlock, SSAOp, SSAVar,
 };
 
-use crate::analysis;
-use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
-use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
-use r2types::SymbolicReachabilityStatus;
-
 use super::context::FoldingContext;
 use super::op_lower::parse_const_value;
 use super::{
     MAX_COND_STACK_ALIAS_DEPTH, MAX_PREDICATE_OPERAND_DEPTH, MAX_PREDICATE_SIMPLIFY_DEPTH,
     MAX_SF_SURROGATE_DEPTH, MAX_SUB_LIKE_DEPTH,
 };
+use crate::analysis;
+use crate::analysis::{FlagCompareKind, FlagCompareProvenance, utils};
+use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompareContext {
@@ -430,27 +428,23 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn symbolic_branch_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
-        let fact = self
+        match self
             .inputs
-            .symbolic_facts
-            .branch_fact_for_block(block_addr)?;
-        match (fact.true_status, fact.false_status) {
-            (SymbolicReachabilityStatus::Reachable, SymbolicReachabilityStatus::Unreachable) => {
-                Some(CExpr::IntLit(1))
-            }
-            (SymbolicReachabilityStatus::Unreachable, SymbolicReachabilityStatus::Reachable) => {
-                Some(CExpr::IntLit(0))
-            }
-            _ => None,
+            .semantic_artifact?
+            .exact_branch_truth_for_block(block_addr)
+        {
+            Some(true) => Some(CExpr::IntLit(1)),
+            Some(false) => Some(CExpr::IntLit(0)),
+            None => None,
         }
     }
 
     fn symbolic_actionable_compiled_condition(
         &self,
         block_addr: u64,
-    ) -> Option<&r2types::SymbolicCompiledCondition> {
+    ) -> Option<&r2sym::BackwardConditionSummary> {
         self.inputs
-            .symbolic_facts
+            .semantic_artifact?
             .actionable_compiled_condition_for_block(block_addr)
     }
 
@@ -462,12 +456,12 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn symbolic_actionable_memory_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
-        fn memory_term_rank(term: &r2types::SymbolicMemoryCondition) -> (u8, bool, bool, i64, i64) {
-            let evidence_rank = match term.evidence.tier {
-                r2types::SymbolicSemanticConfidence::Exact => 3,
-                r2types::SymbolicSemanticConfidence::Likely => 2,
-                r2types::SymbolicSemanticConfidence::Heuristic => 1,
-                r2types::SymbolicSemanticConfidence::Residual => 0,
+        fn memory_term_rank(term: &r2sym::BackwardMemoryCondition) -> (u8, bool, bool, i64, i64) {
+            let evidence_rank = match term.evidence().tier {
+                r2sym::SemanticConfidence::Exact => 3,
+                r2sym::SemanticConfidence::Likely => 2,
+                r2sym::SemanticConfidence::Heuristic => 1,
+                r2sym::SemanticConfidence::Residual => 0,
             };
             (
                 evidence_rank,
@@ -480,7 +474,7 @@ impl<'a> FoldingContext<'a> {
 
         let term = self
             .inputs
-            .symbolic_facts
+            .semantic_artifact?
             .actionable_memory_terms_for_block(block_addr)
             .into_iter()
             .filter(|term| {

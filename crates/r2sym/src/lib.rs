@@ -71,16 +71,16 @@ pub use replay::{
 };
 pub use runtime::{seed_default_state_for_arch, seed_memory_regions_for_arch};
 pub use semantics::{
-    CompiledFunctionSemantics, CompiledSemanticArtifact, CompiledSemanticMode,
-    InterpreterDispatchSummary, InterpreterKind, ResidualReason, SemanticCapability,
-    SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
-    SemanticEvidenceProvenance, SemanticEvidenceReason, SemanticEvidenceSoundness, SemanticMode,
-    SliceClass, SymbolicBranchFact, SymbolicControlFact, SymbolicControlIsland,
-    SymbolicControlIslandKind, SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts,
-    SymbolicMemoryIsland, SymbolicMemoryIslandKind, SymbolicReachabilityStatus,
-    SymbolicWorkerIsland, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
+    ArtifactBuildPlan, ArtifactGranularity, ControlFact, DecompilePlan, ExecutionModel,
+    InterpreterDispatchSummary, InterpreterKind, Judged, MemoryFact, NativeArtifactBody,
+    NativeFunctionSummary, QueryGuidanceMode, QueryPlan, RefinementStage, RegionKey,
+    ResidualReason, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticArtifact, SemanticArtifactBody,
+    SemanticArtifactDiagnostics, SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity,
+    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+    SemanticEvidenceSoundness, SemanticPredicate, SemanticRegion, SemanticTargetConditionSource,
+    SliceClass, SymbolicReachabilityStatus, TargetFact, TargetQueryPlan, TargetQueryRoutePlan,
+    TypePlan, VmArtifactBody, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
     VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp, VmValueExpr,
-    collect_symbolic_function_facts, collect_symbolic_function_facts_with_scope,
     compile_function_semantics_with_scope, compile_semantic_artifact_default_with_scope,
     compile_semantic_artifact_with_scope, stable_scope_hash,
 };

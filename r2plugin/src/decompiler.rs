@@ -20,14 +20,14 @@ pub(crate) fn build_decompiler_env(ctx: &PluginCtxView<'_>) -> DecompilerEnv {
 }
 
 pub(crate) fn build_decompiler_context(
-    type_facts: r2types::FunctionTypeFacts,
+    function_facts: r2types::FunctionFacts,
     function_names: HashMap<u64, String>,
     strings: HashMap<u64, String>,
     symbols: HashMap<u64, String>,
     ptr_bits: u32,
 ) -> r2dec::DecompilerContext {
-    r2dec::DecompilerContext::from_analysis_inputs(
-        type_facts,
+    r2dec::DecompilerContext::from_function_facts(
+        function_facts,
         function_names,
         strings,
         symbols,
@@ -44,13 +44,13 @@ pub(crate) fn decompiler_input_from_artifact(
 ) -> r2dec::DecompilerInput {
     let FunctionAnalysisArtifact {
         ssa_func,
-        type_facts,
+        function_facts,
         interproc_summary_set,
         ..
     } = artifact;
     r2dec::DecompilerInput::new(
         ssa_func,
-        build_decompiler_context(type_facts, function_names, strings, symbols, ptr_bits),
+        build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits),
     )
     .with_interproc_summary_set(interproc_summary_set)
 }
@@ -62,18 +62,16 @@ fn rename_function_artifact_for_display(
     let FunctionAnalysisArtifact {
         ssa_func,
         pattern_ssa_func,
-        type_facts,
+        function_facts,
         writeback_plan,
         interproc_summary_set,
-        semantic_artifact,
     } = artifact;
     FunctionAnalysisArtifact {
         ssa_func: ssa_func.with_name(function_name),
         pattern_ssa_func: pattern_ssa_func.with_name(function_name),
-        type_facts,
+        function_facts,
         writeback_plan,
         interproc_summary_set,
-        semantic_artifact,
     }
 }
 
@@ -109,18 +107,19 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 &symbols,
             );
             let mut artifact = if let Some(artifact) = cached_artifact {
-                let allow_semantic_decompile = artifact.type_facts.symbolic_facts.decompile_ready();
-                if let Some(comment) = r2dec::preferred_semantic_fallback_comment(
+                if let Some(route) = r2dec::detached_semantic_route_plan(
                     &display_func_name,
-                    &artifact.type_facts.symbolic_facts,
-                )
-                {
-                    return comment;
-                }
-                if let Some(reason) = cfg_guard_reason.as_ref()
-                    && !allow_semantic_decompile
-                {
-                    return r2dec::artifact_guard_fallback_comment(&func_name_str, reason);
+                    &r2il_blocks,
+                    artifact.function_facts.semantics.as_ref(),
+                ) {
+                    if let r2dec::SemanticRoutePlan::FallbackComment { comment } = route {
+                        return comment;
+                    }
+                    if let Some(reason) = cfg_guard_reason.as_ref()
+                        && matches!(route, r2dec::SemanticRoutePlan::Standard)
+                    {
+                        return r2dec::artifact_guard_fallback_comment(&func_name_str, reason);
+                    }
                 }
                 artifact
             } else {
@@ -135,24 +134,19 @@ pub(crate) fn run_full_decompile_on_large_stack(
                         )
                     },
                 );
-                let precomputed_symbolic_facts = precomputed_semantic_artifact
-                    .as_ref()
-                    .map(r2types::symbolic_semantic_facts_from_artifact);
-                let allow_semantic_decompile = precomputed_symbolic_facts
-                    .as_ref()
-                    .is_some_and(r2types::SymbolicSemanticFacts::decompile_ready);
-                if let Some(symbolic_facts) = precomputed_symbolic_facts.as_ref()
-                    && let Some(comment) = r2dec::preferred_semantic_fallback_comment(
-                        &display_func_name,
-                        symbolic_facts,
-                    )
-                {
-                    return comment;
-                }
-                if let Some(reason) = cfg_guard_reason.as_ref()
-                    && !allow_semantic_decompile
-                {
-                    return r2dec::artifact_guard_fallback_comment(&func_name_str, reason);
+                if let Some(route) = r2dec::detached_semantic_route_plan(
+                    &display_func_name,
+                    &r2il_blocks,
+                    precomputed_semantic_artifact.as_ref(),
+                ) {
+                    if let r2dec::SemanticRoutePlan::FallbackComment { comment } = route {
+                        return comment;
+                    }
+                    if let Some(reason) = cfg_guard_reason.as_ref()
+                        && matches!(route, r2dec::SemanticRoutePlan::Standard)
+                    {
+                        return r2dec::artifact_guard_fallback_comment(&func_name_str, reason);
+                    }
                 }
                 let Some(artifact) =
                     crate::types::build_detached_function_analysis_artifact_with_scope_and_semantics(
@@ -177,8 +171,10 @@ pub(crate) fn run_full_decompile_on_large_stack(
             artifact = rename_function_artifact_for_display(artifact, &display_func_name);
 
             let decompiler = r2dec::Decompiler::new(config);
-            let semantic_fallback_output =
-                r2dec::semantic_fallback_comment(&display_func_name, &artifact.type_facts.symbolic_facts);
+            let semantic_fallback_output = r2dec::semantic_fallback_comment(
+                &display_func_name,
+                artifact.function_facts.semantics.as_ref(),
+            );
             let input = decompiler_input_from_artifact(
                 artifact,
                 function_names,

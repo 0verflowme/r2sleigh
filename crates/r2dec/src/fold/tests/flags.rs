@@ -2,11 +2,6 @@ use super::*;
 use crate::fold::FoldingContext;
 use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
-use r2types::{
-    SymbolicBranchFact, SymbolicCompiledCondition, SymbolicConditionPrecision, SymbolicControlFact,
-    SymbolicControlIsland, SymbolicControlIslandKind, SymbolicReachabilityStatus,
-    SymbolicSemanticFacts,
-};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn make_test_arch_x86_64() -> ArchSpec {
@@ -59,7 +54,7 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
         external_stack_vars: empty_stack,
         visible_bindings: empty_visible,
         external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
-        symbolic_facts: Box::leak(Box::new(r2types::SymbolicSemanticFacts::default())),
+        semantic_artifact: None,
         param_register_aliases: empty_str,
         type_hints: empty_ty,
         type_oracle: None,
@@ -177,31 +172,39 @@ fn exact_compiled_condition_shortcuts_to_literal_condition() {
     let prepared =
         prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("exact_compiled");
     let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-    let mut facts = SymbolicSemanticFacts::default();
-    facts.branch_facts.push(SymbolicBranchFact {
-        block_addr: 0x1000,
-        true_target: 0x1008,
-        false_target: 0x1004,
-        true_status: SymbolicReachabilityStatus::Unreachable,
-        false_status: SymbolicReachabilityStatus::Reachable,
-        true_condition: None,
-        false_condition: Some("false".to_string()),
-        true_compiled: None,
-        false_compiled: Some(SymbolicCompiledCondition {
-            simplified: "false".to_string(),
-            terms: vec!["false".to_string()],
-            memory_terms: vec![],
-            backward_memory_substitutions: 0,
-            backward_memory_candidate_enumerations: 0,
-            backward_memory_residual_fallbacks: 0,
-            precision: SymbolicConditionPrecision::Exact,
-            evidence: r2types::SymbolicSemanticEvidence::exact(),
-            confidence: r2types::SymbolicSemanticConfidence::Exact,
-            supported_paths: 1,
-            total_paths: 1,
-        }),
-    });
-    ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+    let region = crate::test_semantic_region(
+        0x1000,
+        std::collections::BTreeSet::from([0x1004, 0x1008]),
+        vec![crate::test_control_fact(
+            0x1004,
+            r2sym::SymbolicReachabilityStatus::Reachable,
+            Some(false),
+            Some("false"),
+            Some(r2sym::BackwardConditionSummary {
+                simplified: "false".to_string(),
+                terms: vec!["false".to_string()],
+                memory_terms: Vec::new(),
+                backward_memory_substitutions: 0,
+                backward_memory_candidate_enumerations: 0,
+                backward_memory_residual_fallbacks: 0,
+                precision: r2sym::BackwardConditionPrecision::Exact,
+                supported_paths: 1,
+                total_paths: 1,
+            }),
+            r2sym::SemanticEvidence::exact(),
+        )],
+        Vec::new(),
+    );
+    ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
+        crate::test_native_semantic_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::ArtifactGranularity::WholeFunction,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            vec![region],
+        ),
+    ));
 
     let entry = prepared.function().get_block(0x1000).expect("entry");
     assert_eq!(
@@ -239,64 +242,61 @@ fn actionable_control_island_shortcuts_when_branch_fact_is_not_decisive() {
     let prepared =
         prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("control_island");
     let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-    let mut facts = SymbolicSemanticFacts::default();
-    facts.branch_facts.push(SymbolicBranchFact {
-        block_addr: 0x2000,
-        true_target: 0x2008,
-        false_target: 0x2004,
-        true_status: SymbolicReachabilityStatus::Unknown,
-        false_status: SymbolicReachabilityStatus::Unknown,
-        true_condition: Some("false".to_string()),
-        false_condition: None,
-        true_compiled: Some(SymbolicCompiledCondition {
-            simplified: "false".to_string(),
-            terms: vec!["false".to_string()],
-            memory_terms: vec![],
-            backward_memory_substitutions: 0,
-            backward_memory_candidate_enumerations: 0,
-            backward_memory_residual_fallbacks: 0,
-            precision: SymbolicConditionPrecision::OverApprox,
-            evidence: r2types::SymbolicSemanticEvidence::likely(
-                r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
-            ),
-            confidence: r2types::SymbolicSemanticConfidence::Likely,
-            supported_paths: 1,
-            total_paths: 2,
-        }),
-        false_compiled: None,
-    });
-    facts.control_islands.push(SymbolicControlIsland {
-        kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
-        anchor_block: 0x2000,
-        frontier_targets: vec![0x2008, 0x2004],
-        facts: vec![
-            SymbolicControlFact {
+    let frontier = std::collections::BTreeSet::from([0x2004, 0x2008]);
+    let region = r2sym::SemanticRegion {
+        anchor: 0x2000,
+        frontier: frontier.clone(),
+        control: vec![r2sym::Judged::new(
+            r2sym::ControlFact {
                 target: 0x2008,
-                status: SymbolicReachabilityStatus::Unknown,
+                status: r2sym::SymbolicReachabilityStatus::Unknown,
+                branch_truth: Some(true),
                 condition: Some("false".to_string()),
-                compiled: facts.branch_facts[0].true_compiled.clone(),
-                evidence: r2types::SymbolicSemanticEvidence::likely(
-                    r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
-                ),
-                confidence: r2types::SymbolicSemanticConfidence::Likely,
+                compiled: Some(r2sym::BackwardConditionSummary {
+                    simplified: "false".to_string(),
+                    terms: vec!["false".to_string()],
+                    memory_terms: Vec::new(),
+                    backward_memory_substitutions: 0,
+                    backward_memory_candidate_enumerations: 0,
+                    backward_memory_residual_fallbacks: 0,
+                    precision: r2sym::BackwardConditionPrecision::Exact,
+                    supported_paths: 1,
+                    total_paths: 1,
+                }),
             },
-            SymbolicControlFact {
-                target: 0x2004,
-                status: SymbolicReachabilityStatus::Unknown,
-                condition: None,
-                compiled: None,
-                evidence: r2types::SymbolicSemanticEvidence::residual(
-                    r2types::SymbolicSemanticEvidenceReason::GuardOpaque,
-                ),
-                confidence: r2types::SymbolicSemanticConfidence::Residual,
+            r2sym::SemanticEvidence::exact(),
+        )],
+        memory: Vec::new(),
+        pre: Vec::new(),
+        post: Vec::new(),
+        targets: Vec::new(),
+    };
+    let artifact = r2sym::SemanticArtifact {
+        stage: r2sym::RefinementStage::Compiled,
+        granularity: r2sym::ArtifactGranularity::Regioned,
+        execution: r2sym::ExecutionModel::Native,
+        body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
+            summary: r2sym::NativeFunctionSummary {
+                slice_class: r2sym::SliceClass::Worker,
+                closure_functions: 1,
+                helper_functions: 0,
+                derived_summaries: 0,
+                derived_diagnostics: Default::default(),
             },
-        ],
-        evidence: r2types::SymbolicSemanticEvidence::likely(
-            r2types::SymbolicSemanticEvidenceReason::PartialPathCoverage,
-        ),
-        confidence: r2types::SymbolicSemanticConfidence::Likely,
-    });
-    ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+            regions: std::collections::BTreeMap::from([(region.key(), region)]),
+        }),
+        diagnostics: r2sym::SemanticArtifactDiagnostics {
+            branches_evaluated: 0,
+            branches_pruned: 0,
+            branches_unknown: 0,
+            skipped_missing_arch: false,
+            skipped_large_cfg: false,
+            residual_reasons: Vec::new(),
+            ambiguous_targets: Vec::new(),
+            cache_hit: false,
+        },
+    };
+    ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
 
     let entry = prepared.function().get_block(0x2000).expect("entry");
     assert_eq!(
@@ -330,35 +330,39 @@ fn actionable_control_island_parses_non_literal_compiled_condition_expr() {
     let prepared = prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch)
         .with_name("parsed_control_island");
     let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-    let mut facts = SymbolicSemanticFacts::default();
-    facts.control_islands.push(SymbolicControlIsland {
-        kind: SymbolicControlIslandKind::LargeCfgBranchFrontier,
-        anchor_block: 0x3000,
-        frontier_targets: vec![0x3008],
-        facts: vec![SymbolicControlFact {
-            target: 0x3008,
-            status: SymbolicReachabilityStatus::Reachable,
-            condition: Some("x == 0".to_string()),
-            compiled: Some(SymbolicCompiledCondition {
+    let region = crate::test_semantic_region(
+        0x3000,
+        std::collections::BTreeSet::from([0x3008]),
+        vec![crate::test_control_fact(
+            0x3008,
+            r2sym::SymbolicReachabilityStatus::Reachable,
+            None,
+            Some("x == 0"),
+            Some(r2sym::BackwardConditionSummary {
                 simplified: "x == 0".to_string(),
                 terms: vec!["x == 0".to_string()],
-                memory_terms: vec![],
+                memory_terms: Vec::new(),
                 backward_memory_substitutions: 0,
                 backward_memory_candidate_enumerations: 0,
                 backward_memory_residual_fallbacks: 0,
-                precision: SymbolicConditionPrecision::Exact,
-                evidence: r2types::SymbolicSemanticEvidence::exact(),
-                confidence: r2types::SymbolicSemanticConfidence::Exact,
+                precision: r2sym::BackwardConditionPrecision::Exact,
                 supported_paths: 1,
                 total_paths: 1,
             }),
-            evidence: r2types::SymbolicSemanticEvidence::exact(),
-            confidence: r2types::SymbolicSemanticConfidence::Exact,
-        }],
-        evidence: r2types::SymbolicSemanticEvidence::exact(),
-        confidence: r2types::SymbolicSemanticConfidence::Exact,
-    });
-    ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+            r2sym::SemanticEvidence::exact(),
+        )],
+        Vec::new(),
+    );
+    ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
+        crate::test_native_semantic_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::ArtifactGranularity::Regioned,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            vec![region],
+        ),
+    ));
 
     assert_eq!(
         ctx.symbolic_actionable_compiled_condition_expr(0x3000),
@@ -395,27 +399,36 @@ fn actionable_memory_island_parses_memory_condition_expr() {
     let prepared =
         prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("memory_island");
     let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-    let mut facts = SymbolicSemanticFacts::default();
-    facts.memory_islands.push(r2types::SymbolicMemoryIsland {
-        kind: r2types::SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
-        anchor_block: 0x4000,
-        terms: vec![r2types::SymbolicMemoryCondition {
-            region: r2types::SymbolicMemoryRegion::Argument { index: 0 },
-            offset_lo: 8,
-            offset_hi: 8,
-            size: 4,
-            exact_offset: true,
-            evidence: r2types::SymbolicSemanticEvidence::exact(),
-            confidence: r2types::SymbolicSemanticConfidence::Exact,
-            binding: None,
-            expr: "*(arg0 + 0x8)".to_string(),
-            value_expr: Some("0x2a".to_string()),
-            exact_value: true,
-        }],
-        evidence: r2types::SymbolicSemanticEvidence::exact(),
-        confidence: r2types::SymbolicSemanticConfidence::Exact,
-    });
-    ctx.inputs.symbolic_facts = Box::leak(Box::new(facts));
+    let region = crate::test_semantic_region(
+        0x4000,
+        std::collections::BTreeSet::new(),
+        Vec::new(),
+        vec![crate::test_memory_fact(
+            r2sym::BackwardMemoryCondition {
+                region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
+                offset_lo: 8,
+                offset_hi: 8,
+                size: 4,
+                exact_offset: true,
+                evidence: r2sym::SemanticEvidence::exact(),
+                binding: None,
+                expr: "*(arg0 + 0x8)".to_string(),
+                value_expr: Some("0x2a".to_string()),
+                exact_value: true,
+            },
+            r2sym::SemanticEvidence::exact(),
+        )],
+    );
+    ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
+        crate::test_native_semantic_artifact(
+            r2sym::RefinementStage::Residual,
+            r2sym::ArtifactGranularity::Regioned,
+            r2sym::SliceClass::Worker,
+            true,
+            vec![r2sym::ResidualReason::LargeCfg],
+            vec![region],
+        ),
+    ));
 
     assert_eq!(
         ctx.extract_condition_from_block(prepared.function().get_block(0x4000).expect("entry")),

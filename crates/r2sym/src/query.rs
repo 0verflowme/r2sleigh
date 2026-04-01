@@ -19,13 +19,44 @@ use crate::backward::{
 };
 use crate::path::{ExploreConfig, ExploreStats, PathExplorer, PathResult, SolvedPath};
 use crate::semantics::{
-    CompiledSemanticArtifact, VmStepSummary, build_vm_step_summary, classify_interpreter_like,
+    SemanticArtifact, SemanticRegion, VmStepSummary, build_vm_step_summary,
+    classify_interpreter_like,
 };
 use crate::sim::SummaryProfile;
 use crate::solver::{SatResult, SolverStats};
 use crate::state::ExitStatus;
 
 const MAX_VM_COMPILED_STEPS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticTargetConditionSource<'a> {
+    region: &'a SemanticRegion,
+    branch_truth: bool,
+    summary: &'a BackwardConditionSummary,
+}
+
+fn selected_region_for_target(
+    artifact: &SemanticArtifact,
+    target_addr: u64,
+    hard_proof_only: bool,
+) -> Option<&SemanticRegion> {
+    artifact.authoritative_region_for_target(target_addr, hard_proof_only)
+}
+
+fn target_condition_source<'a>(
+    artifact: &'a SemanticArtifact,
+    target_addr: u64,
+    hard_proof_only: bool,
+) -> Option<SemanticTargetConditionSource<'a>> {
+    let native = artifact.native_body()?;
+    let source = artifact.target_condition_source(target_addr, hard_proof_only)?;
+    let region = native.region_for_anchor(source.block_addr)?;
+    Some(SemanticTargetConditionSource {
+        region,
+        branch_truth: source.branch_truth,
+        summary: source.summary,
+    })
+}
 
 /// Query execution strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +259,13 @@ enum PreconditionApplication<'ctx> {
 enum CompiledPreconditionMode {
     Necessary,
     NarrowOnly,
+}
+
+fn compiled_mode_from_guidance(mode: crate::QueryGuidanceMode) -> CompiledPreconditionMode {
+    match mode {
+        crate::QueryGuidanceMode::Necessary => CompiledPreconditionMode::Necessary,
+        crate::QueryGuidanceMode::NarrowOnly => CompiledPreconditionMode::NarrowOnly,
+    }
 }
 
 fn precision_rank(precision: BackwardConditionPrecision) -> u8 {
@@ -663,65 +701,67 @@ where
 fn apply_best_compiled_precondition<'ctx>(
     explorer: &PathExplorer<'ctx>,
     func: &SsaArtifact,
-    artifact: Option<&CompiledSemanticArtifact>,
+    artifact: Option<&SemanticArtifact>,
     initial_state: SymState<'ctx>,
     target_addr: u64,
 ) -> PreconditionApplication<'ctx> {
     let derived_summaries = explorer.derived_call_summary_views();
-    let condition_source =
-        artifact.and_then(|artifact| artifact.actionable_condition_source_for_target(target_addr));
-    let memory_terms = artifact
-        .map(|artifact| artifact.actionable_memory_terms_for_target(target_addr))
-        .unwrap_or_default();
-    let worker_island =
-        artifact.and_then(|artifact| artifact.best_worker_island_for_target(target_addr, false));
-    let source_is_necessary = condition_source.is_some_and(|source| {
-        source.necessary_for_target && source.summary.evidence().allows_narrowing()
+    let route = artifact
+        .map(|artifact| artifact.target_query_route_plan(target_addr))
+        .unwrap_or_else(crate::TargetQueryRoutePlan::dynamic_fallback);
+    let branch_mode = route.branch_guidance.map(compiled_mode_from_guidance);
+    let condition_source = branch_mode.and_then(|_| {
+        artifact.and_then(|artifact| target_condition_source(artifact, target_addr, false))
     });
-    let island_mode = worker_island.and_then(|island| {
-        if island.exact_reachable_target() == Some(target_addr) {
-            Some(CompiledPreconditionMode::Necessary)
-        } else if island.actionable_reachable_target() == Some(target_addr) {
-            Some(CompiledPreconditionMode::NarrowOnly)
-        } else {
-            island
-                .actionable_compiled_condition()
-                .map(|_| CompiledPreconditionMode::NarrowOnly)
-        }
+    let selected_region = branch_mode.and_then(|_| {
+        artifact.and_then(|artifact| selected_region_for_target(artifact, target_addr, false))
     });
-    if !source_is_necessary
-        && matches!(island_mode, Some(CompiledPreconditionMode::NarrowOnly))
+    let memory_region = if route.allow_memory_term_narrowing {
+        artifact.and_then(|artifact| artifact.authoritative_memory_region_for_target(target_addr))
+    } else {
+        None
+    };
+    let memory_terms = if route.allow_memory_term_narrowing {
+        memory_region
+            .map(|region| region.actionable_memory_terms_for_target(target_addr))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if route.allow_memory_term_narrowing
         && let Some(narrowed_state) = apply_memory_term_narrowing(&initial_state, &memory_terms)
     {
         return PreconditionApplication::Continue {
             initial_state: Box::new(initial_state),
             narrowed_state: Some(narrowed_state),
-            compiled_precondition: worker_island
-                .and_then(|island| island.actionable_compiled_condition())
+            compiled_precondition: selected_region
+                .and_then(|region| region.actionable_compiled_condition_for_target(target_addr))
+                .filter(|summary| !summary.evidence().allows_hard_proof())
                 .cloned()
-                .or_else(|| condition_source.map(|source| source.summary.clone())),
+                .or_else(|| {
+                    condition_source
+                        .map(|source| source.summary)
+                        .filter(|summary| !summary.evidence().allows_hard_proof())
+                        .cloned()
+                }),
         };
     }
-    let mut compiled = condition_source.and_then(|source| {
-        let compiled = compile_branch_precondition_with_summaries(
-            func,
-            &initial_state,
-            source.block_addr,
-            source.branch_truth,
-            &derived_summaries,
-        )?;
-        Some((
-            compiled,
-            if source.necessary_for_target {
-                CompiledPreconditionMode::Necessary
-            } else {
-                CompiledPreconditionMode::NarrowOnly
-            },
-        ))
+    let mut compiled = branch_mode.and_then(|mode| {
+        condition_source.and_then(|source| {
+            let compiled = compile_branch_precondition_with_summaries(
+                func,
+                &initial_state,
+                source.region.anchor,
+                source.branch_truth,
+                &derived_summaries,
+            )?;
+            Some((compiled, mode))
+        })
     });
+    let target_compile_mode = branch_mode.unwrap_or(CompiledPreconditionMode::Necessary);
     let mut used_target_compile = false;
     if compiled.is_none()
-        && let Some(mode) = island_mode
+        && route.allow_dynamic_target_compile
         && let Some(target_compiled) = compile_target_precondition_with_summaries(
             func,
             &initial_state,
@@ -729,11 +769,12 @@ fn apply_best_compiled_precondition<'ctx>(
             &derived_summaries,
         )
     {
-        compiled = Some((target_compiled, mode));
+        compiled = Some((target_compiled, target_compile_mode));
         used_target_compile = true;
     }
-    if !source_is_necessary
+    if route.allow_dynamic_target_compile
         && !used_target_compile
+        && !matches!(target_compile_mode, CompiledPreconditionMode::Necessary)
         && let Some(target_compiled) = compile_target_precondition_with_summaries(
             func,
             &initial_state,
@@ -746,20 +787,24 @@ fn apply_best_compiled_precondition<'ctx>(
     {
         compiled = Some((target_compiled, CompiledPreconditionMode::Necessary));
     }
-    if compiled.as_ref().is_none_or(|(compiled, _)| {
-        !matches!(
-            compiled.summary.precision,
-            BackwardConditionPrecision::Exact
+    if route.allow_vm_target_compile
+        && compiled.as_ref().is_none_or(|(compiled, _)| {
+            !matches!(
+                compiled.summary.precision,
+                BackwardConditionPrecision::Exact
+            )
+        })
+        && let Some(vm_compiled) = compile_vm_target_precondition_with_summaries(
+            func,
+            &initial_state,
+            target_addr,
+            &derived_summaries,
         )
-    }) && let Some(vm_compiled) = compile_vm_target_precondition_with_summaries(
-        func,
-        &initial_state,
-        target_addr,
-        &derived_summaries,
-    ) && prefer_compiled_precondition(
-        compiled.as_ref().map(|(compiled, _)| compiled),
-        &vm_compiled,
-    ) {
+        && prefer_compiled_precondition(
+            compiled.as_ref().map(|(compiled, _)| compiled),
+            &vm_compiled,
+        )
+    {
         compiled = Some((vm_compiled, CompiledPreconditionMode::Necessary));
     }
     let Some((compiled, mode)) = compiled else {
@@ -802,7 +847,7 @@ impl<'ctx> PathExplorer<'ctx> {
     pub fn can_reach_with_artifact(
         &mut self,
         func: &SsaArtifact,
-        artifact: Option<&CompiledSemanticArtifact>,
+        artifact: Option<&SemanticArtifact>,
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> ReachabilityResult<'ctx> {
@@ -862,7 +907,7 @@ impl<'ctx> PathExplorer<'ctx> {
     pub fn path_conditions_at_with_artifact(
         &mut self,
         func: &SsaArtifact,
-        artifact: Option<&CompiledSemanticArtifact>,
+        artifact: Option<&SemanticArtifact>,
         initial_state: SymState<'ctx>,
         target_pc: u64,
     ) -> PathConditionResult<'ctx> {
@@ -917,7 +962,7 @@ impl<'ctx> PathExplorer<'ctx> {
     pub fn solve_for_target_with_artifact(
         &mut self,
         func: &SsaArtifact,
-        artifact: Option<&CompiledSemanticArtifact>,
+        artifact: Option<&SemanticArtifact>,
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> SolveResult<'ctx> {
@@ -1003,15 +1048,16 @@ mod tests {
 
     use super::{
         CompiledPreconditionMode, PreconditionApplication, apply_best_compiled_precondition,
-        apply_compiled_precondition_with_mode, prefer_compiled_precondition, vm_target_case_values,
+        apply_compiled_precondition_with_mode, prefer_compiled_precondition,
+        target_condition_source, vm_target_case_values,
     };
     use crate::{
-        BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
-        BackwardMemoryRegion, CompiledSemanticArtifact, ResidualReason, SatResult,
-        SemanticCapability, SemanticEvidence, SemanticEvidenceReason, SliceClass, SymQueryConfig,
-        SymState, SymbolicBranchFact, SymbolicControlFact, SymbolicControlIslandKind,
-        SymbolicFunctionFactDiagnostics, SymbolicFunctionFacts, SymbolicMemoryIsland,
-        SymbolicMemoryIslandKind, SymbolicReachabilityStatus, SymbolicWorkerIsland, VmBinaryOp,
+        ArtifactGranularity, BackwardConditionPrecision, BackwardConditionSummary,
+        BackwardMemoryCondition, BackwardMemoryRegion, ControlFact, ExecutionModel, Judged,
+        MemoryFact, NativeArtifactBody, NativeFunctionSummary, RefinementStage, RegionKey,
+        ResidualReason, SatResult, SemanticArtifact, SemanticArtifactBody,
+        SemanticArtifactDiagnostics, SemanticEvidence, SemanticEvidenceReason, SemanticRegion,
+        SliceClass, SymQueryConfig, SymState, TargetFact, TargetQueryPlan, VmBinaryOp,
         VmGuardCondition, VmGuardedExit, VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
     };
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
@@ -1022,6 +1068,75 @@ mod tests {
     const RDI: u64 = 56;
     const TMP0: u64 = 0x80;
     const TMP1: u64 = 0x88;
+
+    fn test_semantic_artifact(
+        stage: RefinementStage,
+        slice_class: SliceClass,
+        residual_reasons: Vec<ResidualReason>,
+        regions: Vec<SemanticRegion>,
+        diagnostics: SemanticArtifactDiagnostics,
+    ) -> SemanticArtifact {
+        let regions: BTreeMap<RegionKey, SemanticRegion> = regions
+            .into_iter()
+            .map(|region| {
+                (
+                    RegionKey::new(region.anchor, region.frontier.clone()),
+                    region,
+                )
+            })
+            .collect();
+        let granularity = if matches!(stage, RefinementStage::Compiled | RefinementStage::Residual)
+            && !regions.is_empty()
+        {
+            ArtifactGranularity::Regioned
+        } else {
+            ArtifactGranularity::WholeFunction
+        };
+        SemanticArtifact {
+            stage,
+            granularity,
+            execution: ExecutionModel::Native,
+            body: SemanticArtifactBody::Native(NativeArtifactBody {
+                summary: NativeFunctionSummary {
+                    slice_class,
+                    closure_functions: 0,
+                    helper_functions: 0,
+                    derived_summaries: 0,
+                    derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+                },
+                regions,
+            }),
+            diagnostics: SemanticArtifactDiagnostics {
+                residual_reasons,
+                ..diagnostics
+            },
+        }
+    }
+
+    fn make_region(anchor: u64, frontier: &[u64]) -> SemanticRegion {
+        SemanticRegion {
+            anchor,
+            frontier: frontier.iter().copied().collect(),
+            control: Vec::new(),
+            memory: Vec::new(),
+            pre: Vec::new(),
+            post: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
+
+    fn default_diagnostics() -> SemanticArtifactDiagnostics {
+        SemanticArtifactDiagnostics {
+            branches_evaluated: 0,
+            branches_pruned: 0,
+            branches_unknown: 0,
+            skipped_missing_arch: false,
+            skipped_large_cfg: false,
+            residual_reasons: Vec::new(),
+            ambiguous_targets: Vec::new(),
+            cache_hit: false,
+        }
+    }
 
     fn make_reg(offset: u64, size: u32) -> Varnode {
         Varnode {
@@ -1320,68 +1435,109 @@ mod tests {
         let mut state = SymState::new(&ctx, 0x1000);
         state.new_symbolic_input("sym_mem", 8);
         let original_constraints = state.num_constraints();
-
-        let artifact = CompiledSemanticArtifact {
-            mode: crate::SemanticMode::Residual,
-            slice_class: SliceClass::Worker,
-            capability: SemanticCapability {
-                query_ready: true,
-                type_ready: true,
-                decompile_ready: false,
-            },
-            residual_reasons: vec![ResidualReason::LargeCfg],
-            closure_functions: 0,
-            helper_functions: 0,
-            derived_summaries: 0,
-            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
-            symbolic_facts: SymbolicFunctionFacts {
-                branch_facts: vec![SymbolicBranchFact {
-                    block_addr: 0xdead,
-                    true_target: 0x2000,
-                    false_target: 0x2010,
-                    true_status: SymbolicReachabilityStatus::Reachable,
-                    false_status: SymbolicReachabilityStatus::Unreachable,
-                    true_condition: Some("guard".to_string()),
-                    false_condition: None,
-                    true_compiled: Some(BackwardConditionSummary {
-                        simplified: "guard".to_string(),
-                        terms: vec!["guard".to_string()],
-                        memory_terms: Vec::new(),
-                        backward_memory_substitutions: 0,
-                        backward_memory_candidate_enumerations: 0,
-                        backward_memory_residual_fallbacks: 0,
-                        precision: BackwardConditionPrecision::Exact,
-                        supported_paths: 1,
-                        total_paths: 1,
-                    }),
-                    false_compiled: None,
-                }],
-                worker_islands: Vec::new(),
-                control_islands: Vec::new(),
-                memory_islands: vec![SymbolicMemoryIsland {
-                    kind: SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
-                    anchor_block: 0xdead,
-                    terms: vec![BackwardMemoryCondition {
-                        region: BackwardMemoryRegion::Argument { index: 0 },
-                        offset_lo: 0,
-                        offset_hi: 0,
-                        size: 1,
-                        exact_offset: true,
-                        evidence: SemanticEvidence::exact(),
-                        binding: Some("sym_mem".to_string()),
-                        expr: "0x2a".to_string(),
-                        value_expr: Some("0x2a".to_string()),
-                        exact_value: true,
-                    }],
-                    evidence: SemanticEvidence::exact(),
-                }],
-                diagnostics: SymbolicFunctionFactDiagnostics::default(),
-            },
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-            cache_hit: false,
+        let target_term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Argument { index: 0 },
+            offset_lo: 0,
+            offset_hi: 0,
+            size: 1,
+            exact_offset: true,
+            evidence: SemanticEvidence::exact(),
+            binding: Some("sym_mem".to_string()),
+            expr: "0x2a".to_string(),
+            value_expr: Some("0x2a".to_string()),
+            exact_value: true,
         };
+        let other_branch_term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Argument { index: 0 },
+            offset_lo: 0,
+            offset_hi: 0,
+            size: 1,
+            exact_offset: true,
+            evidence: SemanticEvidence::exact(),
+            binding: Some("sym_mem".to_string()),
+            expr: "0x2b".to_string(),
+            value_expr: Some("0x2b".to_string()),
+            exact_value: true,
+        };
+
+        let artifact = test_semantic_artifact(
+            RefinementStage::Residual,
+            SliceClass::Worker,
+            vec![ResidualReason::LargeCfg],
+            vec![{
+                let mut region = make_region(0xdead, &[0x2000, 0x2010]);
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x2000,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                        condition: Some("guard".to_string()),
+                        compiled: Some(BackwardConditionSummary {
+                            simplified: "guard".to_string(),
+                            terms: vec!["guard".to_string()],
+                            memory_terms: vec![target_term.clone()],
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: BackwardConditionPrecision::Exact,
+                            supported_paths: 1,
+                            total_paths: 1,
+                        }),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x2010,
+                        status: crate::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                        condition: Some("!guard".to_string()),
+                        compiled: Some(BackwardConditionSummary {
+                            simplified: "!guard".to_string(),
+                            terms: vec!["!guard".to_string()],
+                            memory_terms: vec![other_branch_term.clone()],
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: BackwardConditionPrecision::Exact,
+                            supported_paths: 1,
+                            total_paths: 1,
+                        }),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.targets.push(Judged::new(
+                    TargetFact {
+                        target: 0x2000,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.targets.push(Judged::new(
+                    TargetFact {
+                        target: 0x2010,
+                        status: crate::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.memory.push(Judged::new(
+                    MemoryFact {
+                        term: target_term.clone(),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.memory.push(Judged::new(
+                    MemoryFact {
+                        term: other_branch_term.clone(),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region
+            }],
+            default_diagnostics(),
+        );
 
         match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
             PreconditionApplication::Continue {
@@ -1435,62 +1591,117 @@ mod tests {
         );
         state.mem_write(&crate::SymValue::concrete(0x2000, 64), &symbolic_byte, 1);
         let original_constraints = state.num_constraints();
-
-        let artifact = CompiledSemanticArtifact {
-            mode: crate::SemanticMode::Residual,
-            slice_class: SliceClass::Worker,
-            capability: SemanticCapability {
-                query_ready: true,
-                type_ready: true,
-                decompile_ready: false,
-            },
-            residual_reasons: vec![ResidualReason::LargeCfg],
-            closure_functions: 0,
-            helper_functions: 0,
-            derived_summaries: 0,
-            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
-            symbolic_facts: SymbolicFunctionFacts {
-                branch_facts: vec![SymbolicBranchFact {
-                    block_addr: 0xdead,
-                    true_target: 0x2000,
-                    false_target: 0x2010,
-                    true_status: SymbolicReachabilityStatus::Reachable,
-                    false_status: SymbolicReachabilityStatus::Unreachable,
-                    true_condition: Some("guard".to_string()),
-                    false_condition: None,
-                    true_compiled: None,
-                    false_compiled: None,
-                }],
-                worker_islands: Vec::new(),
-                control_islands: Vec::new(),
-                memory_islands: vec![SymbolicMemoryIsland {
-                    kind: SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
-                    anchor_block: 0xdead,
-                    terms: vec![BackwardMemoryCondition {
-                        region: BackwardMemoryRegion::Region(crate::backward::BackwardRegionRef {
-                            id: global_region,
-                            kind: crate::MemoryRegionKind::Global,
-                            name: "ram:0x2000".to_string(),
-                        }),
-                        offset_lo: 0,
-                        offset_hi: 0,
-                        size: 1,
-                        exact_offset: true,
-                        evidence: SemanticEvidence::exact(),
-                        binding: None,
-                        expr: "*(ram:0x2000 + 0)".to_string(),
-                        value_expr: Some("0x2a".to_string()),
-                        exact_value: true,
-                    }],
-                    evidence: SemanticEvidence::exact(),
-                }],
-                diagnostics: SymbolicFunctionFactDiagnostics::default(),
-            },
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-            cache_hit: false,
+        let target_term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Region(crate::backward::BackwardRegionRef {
+                id: global_region,
+                kind: crate::MemoryRegionKind::Global,
+                name: "ram:0x2000".to_string(),
+            }),
+            offset_lo: 0,
+            offset_hi: 0,
+            size: 1,
+            exact_offset: true,
+            evidence: SemanticEvidence::exact(),
+            binding: None,
+            expr: "*(ram:0x2000 + 0)".to_string(),
+            value_expr: Some("0x2a".to_string()),
+            exact_value: true,
         };
+        let other_branch_term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Region(crate::backward::BackwardRegionRef {
+                id: global_region,
+                kind: crate::MemoryRegionKind::Global,
+                name: "ram:0x2000".to_string(),
+            }),
+            offset_lo: 0,
+            offset_hi: 0,
+            size: 1,
+            exact_offset: true,
+            evidence: SemanticEvidence::exact(),
+            binding: None,
+            expr: "*(ram:0x2000 + 0)".to_string(),
+            value_expr: Some("0x2b".to_string()),
+            exact_value: true,
+        };
+
+        let artifact = test_semantic_artifact(
+            RefinementStage::Residual,
+            SliceClass::Worker,
+            vec![ResidualReason::LargeCfg],
+            vec![{
+                let mut region = make_region(0xdead, &[0x2000, 0x2010]);
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x2000,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                        condition: Some("guard".to_string()),
+                        compiled: Some(BackwardConditionSummary {
+                            simplified: "guard".to_string(),
+                            terms: vec!["guard".to_string()],
+                            memory_terms: vec![target_term.clone()],
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: BackwardConditionPrecision::Exact,
+                            supported_paths: 1,
+                            total_paths: 1,
+                        }),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x2010,
+                        status: crate::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                        condition: Some("!guard".to_string()),
+                        compiled: Some(BackwardConditionSummary {
+                            simplified: "!guard".to_string(),
+                            terms: vec!["!guard".to_string()],
+                            memory_terms: vec![other_branch_term.clone()],
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: BackwardConditionPrecision::Exact,
+                            supported_paths: 1,
+                            total_paths: 1,
+                        }),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.targets.push(Judged::new(
+                    TargetFact {
+                        target: 0x2000,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.targets.push(Judged::new(
+                    TargetFact {
+                        target: 0x2010,
+                        status: crate::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.memory.push(Judged::new(
+                    MemoryFact {
+                        term: target_term.clone(),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.memory.push(Judged::new(
+                    MemoryFact {
+                        term: other_branch_term.clone(),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region
+            }],
+            default_diagnostics(),
+        );
 
         match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
             PreconditionApplication::Continue {
@@ -1527,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_island_memory_terms_seed_narrowed_state_without_branch_recompile() {
+    fn region_memory_bag_without_target_local_compiled_memory_does_not_seed_narrowed_state() {
         let blocks = make_residual_precondition_blocks();
         let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
         let ctx = Context::thread_local();
@@ -1536,10 +1747,96 @@ mod tests {
         state.new_symbolic_input("sym_mem", 8);
         let original_constraints = state.num_constraints();
 
+        let artifact = test_semantic_artifact(
+            RefinementStage::Residual,
+            SliceClass::Worker,
+            vec![ResidualReason::LargeCfg],
+            vec![{
+                let mut region = make_region(0xdead, &[0x2000, 0x2010]);
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x2000,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                        condition: Some("guard".to_string()),
+                        compiled: Some(BackwardConditionSummary {
+                            simplified: "guard".to_string(),
+                            terms: vec!["guard".to_string()],
+                            memory_terms: Vec::new(),
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: BackwardConditionPrecision::Exact,
+                            supported_paths: 1,
+                            total_paths: 1,
+                        }),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.memory.push(Judged::new(
+                    MemoryFact {
+                        term: BackwardMemoryCondition {
+                            region: BackwardMemoryRegion::Argument { index: 0 },
+                            offset_lo: 0,
+                            offset_hi: 0,
+                            size: 1,
+                            exact_offset: true,
+                            evidence: SemanticEvidence::exact(),
+                            binding: Some("sym_mem".to_string()),
+                            expr: "0x2a".to_string(),
+                            value_expr: Some("0x2a".to_string()),
+                            exact_value: true,
+                        },
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region
+            }],
+            default_diagnostics(),
+        );
+
+        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                assert!(compiled_precondition.is_none());
+                assert_eq!(initial_state.num_constraints(), original_constraints);
+                assert!(narrowed_state.is_none());
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("region-bag-only memory facts should not seed targeted narrowing")
+            }
+        }
+    }
+
+    #[test]
+    fn worker_island_memory_terms_seed_narrowed_state_without_branch_recompile() {
+        let blocks = make_residual_precondition_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.new_symbolic_input("sym_mem", 8);
+        let original_constraints = state.num_constraints();
+        let target_term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Argument { index: 0 },
+            offset_lo: 0,
+            offset_hi: 0,
+            size: 1,
+            exact_offset: true,
+            evidence: SemanticEvidence::exact(),
+            binding: Some("sym_mem".to_string()),
+            expr: "0x2a".to_string(),
+            value_expr: Some("0x2a".to_string()),
+            exact_value: true,
+        };
+
         let actionable = BackwardConditionSummary {
             simplified: "worker_guard".to_string(),
             terms: vec!["worker_guard".to_string()],
-            memory_terms: Vec::new(),
+            memory_terms: vec![target_term.clone()],
             backward_memory_substitutions: 0,
             backward_memory_candidate_enumerations: 0,
             backward_memory_residual_fallbacks: 0,
@@ -1547,58 +1844,32 @@ mod tests {
             supported_paths: 1,
             total_paths: 2,
         };
-        let artifact = CompiledSemanticArtifact {
-            mode: crate::SemanticMode::IslandCompiled,
-            slice_class: SliceClass::Worker,
-            capability: SemanticCapability {
-                query_ready: true,
-                type_ready: true,
-                decompile_ready: true,
-            },
-            residual_reasons: Vec::new(),
-            closure_functions: 0,
-            helper_functions: 0,
-            derived_summaries: 0,
-            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
-            symbolic_facts: SymbolicFunctionFacts {
-                branch_facts: Vec::new(),
-                worker_islands: vec![SymbolicWorkerIsland {
-                    anchor_block: 0xdead,
-                    control_kind: Some(SymbolicControlIslandKind::LargeCfgBranchFrontier),
-                    memory_kind: Some(SymbolicMemoryIslandKind::LargeCfgConditionFrontier),
-                    frontier_targets: vec![0x2000, 0x2010],
-                    control_facts: vec![SymbolicControlFact {
+        let artifact = test_semantic_artifact(
+            RefinementStage::Compiled,
+            SliceClass::Worker,
+            Vec::new(),
+            vec![{
+                let mut region = make_region(0xdead, &[0x2000, 0x2010]);
+                region.control.push(Judged::new(
+                    ControlFact {
                         target: 0x2000,
-                        status: SymbolicReachabilityStatus::Reachable,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: None,
                         condition: Some("worker_guard".to_string()),
                         compiled: Some(actionable.clone()),
-                        evidence: SemanticEvidence::likely(
-                            SemanticEvidenceReason::DerivedFromRanking,
-                        ),
-                    }],
-                    memory_terms: vec![BackwardMemoryCondition {
-                        region: BackwardMemoryRegion::Argument { index: 0 },
-                        offset_lo: 0,
-                        offset_hi: 0,
-                        size: 1,
-                        exact_offset: true,
-                        evidence: SemanticEvidence::exact(),
-                        binding: Some("sym_mem".to_string()),
-                        expr: "0x2a".to_string(),
-                        value_expr: Some("0x2a".to_string()),
-                        exact_value: true,
-                    }],
-                    evidence: SemanticEvidence::likely(SemanticEvidenceReason::DerivedFromRanking),
-                }],
-                control_islands: Vec::new(),
-                memory_islands: Vec::new(),
-                diagnostics: SymbolicFunctionFactDiagnostics::default(),
-            },
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-            cache_hit: false,
-        };
+                    },
+                    SemanticEvidence::likely(SemanticEvidenceReason::DerivedFromRanking),
+                ));
+                region.memory.push(Judged::new(
+                    MemoryFact {
+                        term: target_term.clone(),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region
+            }],
+            default_diagnostics(),
+        );
 
         match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
             PreconditionApplication::Continue {
@@ -1644,75 +1915,63 @@ mod tests {
         state.make_symbolic("reg:56_0", 64);
         let original_constraints = state.num_constraints();
 
-        let artifact = CompiledSemanticArtifact {
-            mode: crate::SemanticMode::IslandCompiled,
-            slice_class: SliceClass::Worker,
-            capability: SemanticCapability {
-                query_ready: true,
-                type_ready: true,
-                decompile_ready: true,
-            },
-            residual_reasons: Vec::new(),
-            closure_functions: 0,
-            helper_functions: 0,
-            derived_summaries: 0,
-            derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
-            symbolic_facts: SymbolicFunctionFacts {
-                branch_facts: Vec::new(),
-                worker_islands: vec![SymbolicWorkerIsland {
-                    anchor_block: 0x1000,
-                    control_kind: Some(SymbolicControlIslandKind::LargeCfgBranchFrontier),
-                    memory_kind: Some(SymbolicMemoryIslandKind::LargeCfgConditionFrontier),
-                    frontier_targets: vec![0x1010, 0x1004],
-                    control_facts: vec![
-                        SymbolicControlFact {
-                            target: 0x1010,
-                            status: SymbolicReachabilityStatus::Reachable,
-                            condition: Some("guard".to_string()),
-                            compiled: Some(BackwardConditionSummary {
-                                simplified: "guard".to_string(),
-                                terms: vec!["guard".to_string()],
-                                memory_terms: Vec::new(),
-                                backward_memory_substitutions: 0,
-                                backward_memory_candidate_enumerations: 0,
-                                backward_memory_residual_fallbacks: 0,
-                                precision: BackwardConditionPrecision::Exact,
-                                supported_paths: 1,
-                                total_paths: 1,
-                            }),
+        let artifact = test_semantic_artifact(
+            RefinementStage::Compiled,
+            SliceClass::Worker,
+            Vec::new(),
+            vec![{
+                let mut region = make_region(0x1000, &[0x1010, 0x1004]);
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x1010,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: None,
+                        condition: Some("guard".to_string()),
+                        compiled: Some(BackwardConditionSummary {
+                            simplified: "guard".to_string(),
+                            terms: vec!["guard".to_string()],
+                            memory_terms: Vec::new(),
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: BackwardConditionPrecision::Exact,
+                            supported_paths: 1,
+                            total_paths: 1,
+                        }),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x1004,
+                        status: crate::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: None,
+                        condition: None,
+                        compiled: None,
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.memory.push(Judged::new(
+                    MemoryFact {
+                        term: BackwardMemoryCondition {
+                            region: BackwardMemoryRegion::Argument { index: 0 },
+                            offset_lo: 0,
+                            offset_hi: 0,
+                            size: 1,
+                            exact_offset: true,
                             evidence: SemanticEvidence::exact(),
+                            binding: Some("reg:56_0".to_string()),
+                            expr: "0x1".to_string(),
+                            value_expr: Some("0x1".to_string()),
+                            exact_value: true,
                         },
-                        SymbolicControlFact {
-                            target: 0x1004,
-                            status: SymbolicReachabilityStatus::Unreachable,
-                            condition: None,
-                            compiled: None,
-                            evidence: SemanticEvidence::exact(),
-                        },
-                    ],
-                    memory_terms: vec![BackwardMemoryCondition {
-                        region: BackwardMemoryRegion::Argument { index: 0 },
-                        offset_lo: 0,
-                        offset_hi: 0,
-                        size: 1,
-                        exact_offset: true,
-                        evidence: SemanticEvidence::exact(),
-                        binding: Some("reg:56_0".to_string()),
-                        expr: "0x1".to_string(),
-                        value_expr: Some("0x1".to_string()),
-                        exact_value: true,
-                    }],
-                    evidence: SemanticEvidence::exact(),
-                }],
-                control_islands: Vec::new(),
-                memory_islands: Vec::new(),
-                diagnostics: SymbolicFunctionFactDiagnostics::default(),
-            },
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-            cache_hit: false,
-        };
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region
+            }],
+            default_diagnostics(),
+        );
 
         match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x1010) {
             PreconditionApplication::Continue {
@@ -1728,6 +1987,304 @@ mod tests {
                 panic!("necessary worker islands should use the real compiled precondition path")
             }
         }
+    }
+
+    #[test]
+    fn target_condition_source_only_marks_unique_region_targets_as_necessary() {
+        let artifact = test_semantic_artifact(
+            RefinementStage::Compiled,
+            SliceClass::Worker,
+            Vec::new(),
+            vec![{
+                let mut region = make_region(0x1000, &[0x1010, 0x1004]);
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x1010,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                        condition: Some("guard".to_string()),
+                        compiled: Some(BackwardConditionSummary {
+                            simplified: "guard".to_string(),
+                            terms: vec!["guard".to_string()],
+                            memory_terms: Vec::new(),
+                            backward_memory_substitutions: 0,
+                            backward_memory_candidate_enumerations: 0,
+                            backward_memory_residual_fallbacks: 0,
+                            precision: BackwardConditionPrecision::Exact,
+                            supported_paths: 1,
+                            total_paths: 1,
+                        }),
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region.control.push(Judged::new(
+                    ControlFact {
+                        target: 0x1004,
+                        status: crate::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(false),
+                        condition: Some("other_guard".to_string()),
+                        compiled: None,
+                    },
+                    SemanticEvidence::exact(),
+                ));
+                region
+            }],
+            default_diagnostics(),
+        );
+
+        let actionable = target_condition_source(&artifact, 0x1010, false)
+            .expect("actionable target condition source");
+        assert!(
+            matches!(
+                artifact.target_query_plan(0x1010),
+                crate::TargetQueryPlan::Ready {
+                    mode: crate::QueryGuidanceMode::NarrowOnly
+                }
+            ),
+            "multi-exit regions must not be treated as necessary-for-target"
+        );
+        assert_eq!(actionable.region.anchor, 0x1000);
+        assert!(
+            target_condition_source(&artifact, 0x1010, true).is_none(),
+            "hard-proof target narrowing must reject non-necessary regions"
+        );
+    }
+
+    #[test]
+    fn target_local_memory_terms_follow_the_authoritative_target_source_region() {
+        let exact = SemanticEvidence::exact();
+        let likely = SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage);
+        let artifact = test_semantic_artifact(
+            RefinementStage::Compiled,
+            SliceClass::Worker,
+            Vec::new(),
+            vec![
+                {
+                    let mut region = make_region(0x1000, &[0x1010]);
+                    region.control.push(Judged::new(
+                        ControlFact {
+                            target: 0x1010,
+                            status: crate::SymbolicReachabilityStatus::Reachable,
+                            branch_truth: Some(true),
+                            condition: Some("exact_guard".to_string()),
+                            compiled: Some(BackwardConditionSummary {
+                                simplified: "exact_guard".to_string(),
+                                terms: vec!["exact_guard".to_string()],
+                                memory_terms: vec![BackwardMemoryCondition {
+                                    region: BackwardMemoryRegion::Argument { index: 0 },
+                                    offset_lo: 0,
+                                    offset_hi: 0,
+                                    size: 1,
+                                    exact_offset: true,
+                                    evidence: exact.clone(),
+                                    binding: Some("sym_mem".to_string()),
+                                    expr: "0x2a".to_string(),
+                                    value_expr: Some("0x2a".to_string()),
+                                    exact_value: true,
+                                }],
+                                backward_memory_substitutions: 0,
+                                backward_memory_candidate_enumerations: 0,
+                                backward_memory_residual_fallbacks: 0,
+                                precision: BackwardConditionPrecision::Exact,
+                                supported_paths: 1,
+                                total_paths: 1,
+                            }),
+                        },
+                        exact.clone(),
+                    ));
+                    region
+                },
+                {
+                    let mut region = make_region(0x1004, &[0x1010]);
+                    region.control.push(Judged::new(
+                        ControlFact {
+                            target: 0x1010,
+                            status: crate::SymbolicReachabilityStatus::Reachable,
+                            branch_truth: Some(true),
+                            condition: Some("weaker_guard".to_string()),
+                            compiled: Some(BackwardConditionSummary {
+                                simplified: "weaker_guard".to_string(),
+                                terms: vec!["weaker_guard".to_string()],
+                                memory_terms: vec![BackwardMemoryCondition {
+                                    region: BackwardMemoryRegion::Argument { index: 0 },
+                                    offset_lo: 0,
+                                    offset_hi: 0,
+                                    size: 1,
+                                    exact_offset: true,
+                                    evidence: likely.clone(),
+                                    binding: Some("sym_mem".to_string()),
+                                    expr: "0x2b".to_string(),
+                                    value_expr: Some("0x2b".to_string()),
+                                    exact_value: true,
+                                }],
+                                backward_memory_substitutions: 0,
+                                backward_memory_candidate_enumerations: 0,
+                                backward_memory_residual_fallbacks: 0,
+                                precision: BackwardConditionPrecision::OverApprox,
+                                supported_paths: 1,
+                                total_paths: 2,
+                            }),
+                        },
+                        likely.clone(),
+                    ));
+                    region
+                },
+            ],
+            default_diagnostics(),
+        );
+
+        assert!(matches!(
+            artifact.target_query_plan(0x1010),
+            crate::TargetQueryPlan::Residual { .. }
+        ));
+        let route = artifact.target_query_route_plan(0x1010);
+        assert!(matches!(
+            route.target_plan,
+            TargetQueryPlan::Residual { .. }
+        ));
+        assert!(!route.allow_memory_term_narrowing);
+        assert!(!route.allow_dynamic_target_compile);
+        assert!(
+            target_condition_source(&artifact, 0x1010, false).is_none(),
+            "materially conflicting target sources must not collapse into one authoritative source"
+        );
+        let memory_terms = artifact.actionable_memory_terms_for_target(0x1010);
+        assert!(
+            memory_terms.is_empty(),
+            "materially conflicting target-local memory terms must refuse narrowing"
+        );
+    }
+
+    #[test]
+    fn weaker_secondary_target_source_does_not_seed_narrowing() {
+        let blocks = make_residual_precondition_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("reg:56_0", 64);
+        state.new_symbolic_input("sym_mem", 8);
+
+        let exact = SemanticEvidence::exact();
+        let likely = SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage);
+        let artifact = test_semantic_artifact(
+            RefinementStage::Compiled,
+            SliceClass::Worker,
+            Vec::new(),
+            vec![
+                {
+                    let mut region = make_region(0x1000, &[0x1010, 0x1004]);
+                    region.control.push(Judged::new(
+                        ControlFact {
+                            target: 0x1010,
+                            status: crate::SymbolicReachabilityStatus::Reachable,
+                            branch_truth: Some(true),
+                            condition: Some("guard".to_string()),
+                            compiled: Some(BackwardConditionSummary {
+                                simplified: "guard".to_string(),
+                                terms: vec!["guard".to_string()],
+                                memory_terms: Vec::new(),
+                                backward_memory_substitutions: 0,
+                                backward_memory_candidate_enumerations: 0,
+                                backward_memory_residual_fallbacks: 0,
+                                precision: BackwardConditionPrecision::Exact,
+                                supported_paths: 1,
+                                total_paths: 1,
+                            }),
+                        },
+                        exact.clone(),
+                    ));
+                    region
+                },
+                {
+                    let mut region = make_region(0x1004, &[0x1010, 0x1008]);
+                    region.control.push(Judged::new(
+                        ControlFact {
+                            target: 0x1010,
+                            status: crate::SymbolicReachabilityStatus::Reachable,
+                            branch_truth: Some(true),
+                            condition: Some("worker_guard".to_string()),
+                            compiled: Some(BackwardConditionSummary {
+                                simplified: "worker_guard".to_string(),
+                                terms: vec!["worker_guard".to_string()],
+                                memory_terms: vec![BackwardMemoryCondition {
+                                    region: BackwardMemoryRegion::Argument { index: 0 },
+                                    offset_lo: 0,
+                                    offset_hi: 0,
+                                    size: 1,
+                                    exact_offset: true,
+                                    evidence: likely.clone(),
+                                    binding: Some("sym_mem".to_string()),
+                                    expr: "0x2a".to_string(),
+                                    value_expr: Some("0x2a".to_string()),
+                                    exact_value: true,
+                                }],
+                                backward_memory_substitutions: 0,
+                                backward_memory_candidate_enumerations: 0,
+                                backward_memory_residual_fallbacks: 0,
+                                precision: BackwardConditionPrecision::OverApprox,
+                                supported_paths: 1,
+                                total_paths: 2,
+                            }),
+                        },
+                        likely.clone(),
+                    ));
+                    region
+                },
+            ],
+            default_diagnostics(),
+        );
+
+        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x1010) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+            } => {
+                assert!(compiled_precondition.is_none());
+                assert!(
+                    narrowed_state.is_none(),
+                    "conflicting source regions must refuse targeted narrowing"
+                );
+                let sym_mem = initial_state
+                    .symbolic_inputs()
+                    .get("sym_mem")
+                    .expect("symbolic input")
+                    .to_bv(&ctx);
+                assert!(matches!(
+                    explorer
+                        .solver()
+                        .sat_with_constraint(&initial_state, &sym_mem.eq(BV::from_u64(0x2a, 8))),
+                    SatResult::Sat
+                ));
+                assert!(matches!(
+                    explorer
+                        .solver()
+                        .sat_with_constraint(&initial_state, &sym_mem.eq(BV::from_u64(0x2b, 8))),
+                    SatResult::Sat
+                ));
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("secondary source disagreement should not shortcut as exact unsat")
+            }
+        }
+    }
+
+    #[test]
+    fn vm_artifacts_preserve_interpreter_slice_class() {
+        let artifact = SemanticArtifact {
+            stage: RefinementStage::Compiled,
+            granularity: ArtifactGranularity::SummaryOnly,
+            execution: ExecutionModel::Vm,
+            body: SemanticArtifactBody::Vm(Box::new(crate::VmArtifactBody {
+                interpreter: None,
+                step_summary: Some(make_vm_step_summary_with_transfers(Vec::new())),
+                transfer_summary: None,
+            })),
+            diagnostics: default_diagnostics(),
+        };
+
+        assert_eq!(artifact.slice_class(), Some(SliceClass::InterpreterSwitch));
     }
 
     #[test]

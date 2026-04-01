@@ -3327,41 +3327,6 @@ struct InterprocSummaryJson {
     scope: Option<serde_json::Value>,
 }
 
-#[derive(Debug, serde::Serialize)]
-struct SymbolicBranchJson {
-    block_addr: u64,
-    true_target: u64,
-    false_target: u64,
-    true_status: String,
-    false_status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    true_condition: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    false_condition: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    true_compiled: Option<r2types::SymbolicCompiledCondition>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    false_compiled: Option<r2types::SymbolicCompiledCondition>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct SymbolicFactsJson {
-    branches: Vec<SymbolicBranchJson>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    worker_islands: Vec<r2types::SymbolicWorkerIsland>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    control_islands: Vec<r2types::SymbolicControlIsland>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    memory_islands: Vec<r2types::SymbolicMemoryIsland>,
-    diagnostics: r2types::SymbolicFactDiagnostics,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    interpreter: Option<r2types::SymbolicInterpreterDispatch>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vm_step: Option<r2types::SymbolicVmStepSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vm_transfer: Option<r2types::SymbolicVmTransferSummary>,
-}
-
 #[derive(Debug, serde::Serialize, Default)]
 struct TypeWritebackDiagnosticsJson {
     conflicts: Vec<String>,
@@ -3385,72 +3350,10 @@ struct InferredTypeWritebackJson {
     global_type_links: Vec<GlobalTypeLinkCandidateJson>,
     interproc: InterprocSummaryJson,
     #[serde(skip_serializing_if = "Option::is_none")]
-    symbolic: Option<SymbolicFactsJson>,
+    semantics: Option<r2sym::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     diagnostics: TypeWritebackDiagnosticsJson,
-}
-
-fn symbolic_reachability_status_json(status: r2types::SymbolicReachabilityStatus) -> String {
-    match status {
-        r2types::SymbolicReachabilityStatus::Reachable => "reachable".to_string(),
-        r2types::SymbolicReachabilityStatus::Unreachable => "unreachable".to_string(),
-        r2types::SymbolicReachabilityStatus::Unknown => "unknown".to_string(),
-    }
-}
-
-fn symbolic_facts_json(facts: &r2types::SymbolicSemanticFacts) -> Option<SymbolicFactsJson> {
-    (!facts.is_empty()).then(|| SymbolicFactsJson {
-        branches: facts
-            .branch_facts
-            .iter()
-            .map(|fact| SymbolicBranchJson {
-                block_addr: fact.block_addr,
-                true_target: fact.true_target,
-                false_target: fact.false_target,
-                true_status: symbolic_reachability_status_json(fact.true_status),
-                false_status: symbolic_reachability_status_json(fact.false_status),
-                true_condition: fact.true_condition.clone(),
-                false_condition: fact.false_condition.clone(),
-                true_compiled: fact.true_compiled.clone(),
-                false_compiled: fact.false_compiled.clone(),
-            })
-            .collect(),
-        worker_islands: facts.worker_islands.clone(),
-        control_islands: facts.control_islands.clone(),
-        memory_islands: facts.memory_islands.clone(),
-        diagnostics: facts.diagnostics.clone(),
-        interpreter: facts.interpreter.clone(),
-        vm_step: facts.vm_step.clone(),
-        vm_transfer: facts.vm_transfer.clone(),
-    })
-}
-
-fn symbolic_facts_json_forced(facts: &r2types::SymbolicSemanticFacts) -> SymbolicFactsJson {
-    SymbolicFactsJson {
-        branches: facts
-            .branch_facts
-            .iter()
-            .map(|fact| SymbolicBranchJson {
-                block_addr: fact.block_addr,
-                true_target: fact.true_target,
-                false_target: fact.false_target,
-                true_status: symbolic_reachability_status_json(fact.true_status),
-                false_status: symbolic_reachability_status_json(fact.false_status),
-                true_condition: fact.true_condition.clone(),
-                false_condition: fact.false_condition.clone(),
-                true_compiled: fact.true_compiled.clone(),
-                false_compiled: fact.false_compiled.clone(),
-            })
-            .collect(),
-        worker_islands: facts.worker_islands.clone(),
-        control_islands: facts.control_islands.clone(),
-        memory_islands: facts.memory_islands.clone(),
-        diagnostics: facts.diagnostics.clone(),
-        interpreter: facts.interpreter.clone(),
-        vm_step: facts.vm_step.clone(),
-        vm_transfer: facts.vm_transfer.clone(),
-    }
 }
 
 fn evidence_json(evidence: &[r2types::WritebackEvidence]) -> Vec<String> {
@@ -3475,7 +3378,8 @@ fn struct_fields_json(fields: &[r2types::StructFieldCandidate]) -> Vec<StructFie
 fn writeback_plan_json(
     plan: r2types::TypeWritebackPlan,
     interproc: InterprocSummaryJson,
-    symbolic: Option<SymbolicFactsJson>,
+    semantics: Option<r2sym::SemanticArtifact>,
+    compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
 ) -> InferredTypeWritebackJson {
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
@@ -3543,8 +3447,8 @@ fn writeback_plan_json(
             })
             .collect(),
         interproc,
-        symbolic,
-        compiled_semantics: None,
+        semantics,
+        compiled_semantics,
         diagnostics: TypeWritebackDiagnosticsJson {
             conflicts: plan.diagnostics.conflicts,
             warnings: plan.diagnostics.warnings,
@@ -3557,6 +3461,10 @@ fn type_writeback_payload_from_artifact(
     artifact: types::FunctionAnalysisArtifact,
     interproc: InterprocInferenceInput<'_>,
 ) -> InferredTypeWritebackJson {
+    let semantics = artifact.function_facts.semantics.clone();
+    let compiled_semantics = semantics
+        .as_ref()
+        .map(analysis::sym::compiled_semantic_info);
     let ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
     let scope = serde_json::from_str::<serde_json::Value>(interproc.scope_json)
         .ok()
@@ -3584,7 +3492,8 @@ fn type_writeback_payload_from_artifact(
             summary_json: current_summary_json,
             scope,
         },
-        symbolic_facts_json(&artifact.type_facts.symbolic_facts),
+        semantics,
+        compiled_semantics,
     )
 }
 
@@ -3593,16 +3502,11 @@ fn semantic_type_fallback_payload(
     arch_name: &str,
     ptr_bits: u32,
     interproc: InterprocInferenceInput<'_>,
-    compiled: &r2sym::CompiledSemanticArtifact,
+    compiled: &r2sym::SemanticArtifact,
 ) -> InferredTypeWritebackJson {
     let compiled_info = analysis::sym::compiled_semantic_info(compiled);
-    let symbolic_facts = r2types::symbolic_semantic_facts_from_artifact(compiled);
-    let plan = r2types::build_semantic_type_fallback_plan(
-        function_name,
-        arch_name,
-        ptr_bits,
-        &symbolic_facts,
-    );
+    let plan =
+        r2types::build_semantic_type_fallback_plan(function_name, arch_name, ptr_bits, compiled);
 
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
@@ -3657,7 +3561,7 @@ fn semantic_type_fallback_payload(
                     !v.is_null() && v.as_object().map(|obj| !obj.is_empty()).unwrap_or(true)
                 }),
         },
-        symbolic: Some(symbolic_facts_json_forced(&symbolic_facts)),
+        semantics: Some(compiled.clone()),
         compiled_semantics: Some(compiled_info),
         diagnostics: TypeWritebackDiagnosticsJson {
             warnings: plan.diagnostics.warnings,
@@ -5586,11 +5490,8 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
             &external_context,
             symbolic_scope.as_ref(),
         ) {
-        if let Some(compiled) = cached_artifact.semantic_artifact.as_ref()
-            && cached_artifact
-                .type_facts
-                .symbolic_facts
-                .prefers_bounded_type_plan()
+        if let Some(compiled) = cached_artifact.function_facts.semantics.as_ref()
+            && r2types::semantic_artifact_prefers_bounded_type_plan(compiled)
         {
             semantic_type_fallback_payload(
                 &function_input.function_name,
@@ -5612,9 +5513,7 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
             symbolic_scope.as_ref(),
             function_input.ctx.arch,
         );
-        if r2types::symbolic_semantic_facts_from_artifact(&semantic_artifact)
-            .prefers_bounded_type_plan()
-        {
+        if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
             semantic_type_fallback_payload(
                 &function_input.function_name,
                 &arch_name,
@@ -5658,7 +5557,7 @@ fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -
         switch_block_count: usize::from(input.max_switch_cases > 0),
         max_switch_cases: input.max_switch_cases,
     };
-    let Some(reason) = r2dec::cfg_guard_reason_from_summary(&summary) else {
+    let Some(_reason) = r2dec::cfg_guard_reason_from_summary(&summary) else {
         return ptr::null_mut();
     };
     let Some(function_input) = types::build_function_input(
@@ -5683,37 +5582,47 @@ fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -
         }
     };
     let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
-    let symbolic_facts = if let Some(cached_artifact) =
+    let semantic_artifact = if let Some(cached_artifact) =
         types::get_cached_function_analysis_artifact_with_scope(
             &function_input,
             "{}",
             symbolic_scope.as_ref(),
         ) {
-        cached_artifact.type_facts.symbolic_facts
+        cached_artifact.function_facts.semantics
     } else {
         let Some(analysis) = types::build_function_analysis(&function_input) else {
             return ptr::null_mut();
         };
-        let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+        Some(r2sym::compile_semantic_artifact_default_with_scope(
             &z3::Context::thread_local(),
             &analysis.ssa_func,
             symbolic_scope.as_ref(),
             function_input.ctx.arch,
-        );
-        r2types::symbolic_semantic_facts_from_artifact(&semantic_artifact)
+        ))
     };
-    if !symbolic_facts.decompile_ready() || symbolic_facts.structured_decompile_ready() {
+    let Some(semantic_artifact) = semantic_artifact else {
         return ptr::null_mut();
-    }
+    };
+    let Some(route) = r2dec::detached_semantic_route_plan(
+        &function_input.function_name,
+        function_input.blocks.as_slice(),
+        Some(&semantic_artifact),
+    ) else {
+        return ptr::null_mut();
+    };
+    let reason = match route {
+        r2dec::SemanticRoutePlan::LinearWorker { reason } => reason,
+        _ => return ptr::null_mut(),
+    };
     let plan = r2types::build_semantic_type_fallback_plan(
         &function_input.function_name,
         &arch_name,
         ptr_bits,
-        &symbolic_facts,
+        &semantic_artifact,
     );
     CString::new(r2dec::render_semantic_worker_linearization(
         &plan,
-        &symbolic_facts,
+        Some(&semantic_artifact),
         &reason,
     ))
     .map_or(ptr::null_mut(), |c| c.into_raw())
@@ -7432,87 +7341,109 @@ mod tests {
         }
     }
 
-    fn test_large_cfg_semantic_artifact() -> r2sym::CompiledSemanticArtifact {
+    fn test_large_cfg_semantic_artifact() -> r2sym::SemanticArtifact {
         let compiled = test_compiled_condition("x == 0");
-        let control_fact = r2sym::SymbolicControlFact {
-            target: 0x401020,
-            status: r2sym::SymbolicReachabilityStatus::Reachable,
-            condition: Some("x == 0".to_string()),
-            compiled: Some(compiled.clone()),
-            evidence: r2sym::SemanticEvidence::exact(),
+        let region = r2sym::SemanticRegion {
+            anchor: 0x401000,
+            frontier: std::collections::BTreeSet::from([0x401020, 0x401030]),
+            control: vec![
+                r2sym::Judged::new(
+                    r2sym::ControlFact {
+                        target: 0x401020,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(compiled.clone()),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+                r2sym::Judged::new(
+                    r2sym::ControlFact {
+                        target: 0x401030,
+                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                        condition: Some("x != 0".to_string()),
+                        compiled: None,
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+                r2sym::Judged::new(
+                    r2sym::ControlFact {
+                        target: 0x401020,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: None,
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(compiled.clone()),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+            ],
+            memory: Vec::new(),
+            pre: Vec::new(),
+            post: Vec::new(),
+            targets: vec![
+                r2sym::Judged::new(
+                    r2sym::TargetFact {
+                        target: 0x401020,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+                r2sym::Judged::new(
+                    r2sym::TargetFact {
+                        target: 0x401030,
+                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+            ],
         };
-        let symbolic_facts = r2sym::SymbolicFunctionFacts {
-            branch_facts: vec![r2sym::SymbolicBranchFact {
-                block_addr: 0x401000,
-                true_target: 0x401020,
-                false_target: 0x401030,
-                true_status: r2sym::SymbolicReachabilityStatus::Reachable,
-                false_status: r2sym::SymbolicReachabilityStatus::Unreachable,
-                true_condition: Some("x == 0".to_string()),
-                false_condition: Some("x != 0".to_string()),
-                true_compiled: Some(compiled.clone()),
-                false_compiled: None,
-            }],
-            worker_islands: Vec::new(),
-            control_islands: vec![r2sym::SymbolicControlIsland {
-                kind: r2sym::SymbolicControlIslandKind::LargeCfgBranchFrontier,
-                anchor_block: 0x401000,
-                frontier_targets: vec![0x401020],
-                facts: vec![control_fact],
-                evidence: r2sym::SemanticEvidence::exact(),
-            }],
-            memory_islands: Vec::new(),
-            diagnostics: r2sym::SymbolicFunctionFactDiagnostics {
+        r2sym::SemanticArtifact {
+            stage: r2sym::RefinementStage::Residual,
+            granularity: r2sym::ArtifactGranularity::Regioned,
+            execution: r2sym::ExecutionModel::Native,
+            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
+                summary: r2sym::NativeFunctionSummary {
+                    slice_class: r2sym::SliceClass::Worker,
+                    closure_functions: 4,
+                    helper_functions: 3,
+                    derived_summaries: 0,
+                    derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
+                },
+                regions: std::iter::once((region.key(), region)).collect(),
+            }),
+            diagnostics: r2sym::SemanticArtifactDiagnostics {
                 branches_evaluated: 1,
                 branches_pruned: 0,
                 branches_unknown: 0,
                 skipped_missing_arch: false,
                 skipped_large_cfg: true,
+                residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
+                ambiguous_targets: Vec::new(),
+                cache_hit: false,
             },
-        };
-
-        r2sym::CompiledSemanticArtifact {
-            mode: r2sym::SemanticMode::Residual,
-            slice_class: r2sym::SliceClass::Worker,
-            capability: r2sym::SemanticCapability {
-                query_ready: true,
-                type_ready: true,
-                decompile_ready: true,
-            },
-            residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
-            closure_functions: 4,
-            helper_functions: 3,
-            derived_summaries: 0,
-            derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
-            symbolic_facts,
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-            cache_hit: false,
         }
     }
 
     #[test]
     fn decompile_ready_large_cfg_worker_keeps_real_decompile_path() {
         let compiled = test_large_cfg_semantic_artifact();
-        let symbolic_facts = r2types::symbolic_semantic_facts_from_artifact(&compiled);
         assert!(
-            r2dec::preferred_semantic_fallback_comment("fcn.401000", &symbolic_facts).is_none()
+            r2dec::preferred_semantic_fallback_comment("fcn.401000", Some(&compiled)).is_none()
         );
     }
 
     #[test]
-    fn semantic_fallback_text_reports_actionable_control_island_counts() {
+    fn semantic_fallback_text_reports_canonical_region_counts() {
         let compiled = test_large_cfg_semantic_artifact();
-        let symbolic_facts = r2types::symbolic_semantic_facts_from_artifact(&compiled);
-        let output = r2dec::semantic_fallback_comment("_401000", &symbolic_facts)
+        let output = r2dec::semantic_fallback_comment("_401000", Some(&compiled))
             .expect("typed semantic fallback comment");
         assert!(output.contains("semantic fallback: worker slice in residual mode"));
-        assert!(output.contains("branch_facts=1"));
-        assert!(output.contains("control_islands=1"));
-        assert!(output.contains("actionable_conditions=1"));
-        assert!(output.contains("exact_conditions=1"));
-        assert!(output.contains("actionable_preview=[0x401000: x == 0]"));
+        assert!(output.contains("regions=1"));
+        assert!(output.contains("actionable_conditions=3"));
+        assert!(output.contains("exact_conditions=3"));
     }
 
     #[test]
@@ -9517,7 +9448,8 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let rendered = artifact
-            .type_facts
+            .function_facts
+            .types
             .merged_signature
             .as_ref()
             .and_then(|sig| sig.params.first())
@@ -9531,10 +9463,10 @@ mod integration_tests {
                 && compact.ends_with('*')
                 && !compact.eq_ignore_ascii_case("void*"),
             "expected lifted-byte x86 artifact to override arg0 to a struct pointer, got signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}, semantic_structs={:?}, semantic_diagnostics={:?}, raw_structs={:?}, raw_diagnostics={:?}, pattern_ssa_blocks={:?}",
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs,
             semantic_structs,
             semantic_diagnostics,
             raw_structs,
@@ -9596,16 +9528,17 @@ mod integration_tests {
 
         assert_eq!(
             artifact
-                .type_facts
+                .function_facts
+                .types
                 .slot_type_overrides
                 .get(&0)
                 .map(String::as_str),
             Some("struct sla_struct_420703e08f70f00e *"),
             "expected live-context detached artifact to keep the local struct override, got merged_signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}",
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
     }
 
@@ -9679,7 +9612,8 @@ mod integration_tests {
         );
 
         let db_struct = artifact
-            .type_facts
+            .function_facts
+            .types
             .external_type_db
             .structs
             .get("sla_struct_420703e08f70f00e")
@@ -9744,7 +9678,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
@@ -9797,72 +9731,72 @@ mod integration_tests {
             .ops = pattern_ssa_blocks[0].ops.clone();
         manual_func = manual_func.with_name("dbg.test_struct_array_index");
         let mut manual_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        manual_decompiler.set_type_facts(artifact.type_facts.clone());
+        manual_decompiler.set_type_facts(artifact.function_facts.types.clone());
         let manual_output = manual_decompiler.decompile(&manual_func);
 
         assert!(
             output.contains("[idx].f_8"),
             "expected detached artifact store rendering in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             output.contains("[idx].f_34"),
             "expected detached artifact load rendering in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             output.contains("return arr[idx].f_8 + arr[idx].f_34;")
                 || output.contains("return arr[idx].f_34 + arr[idx].f_8;"),
             "expected detached artifact return to preserve both member loads, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             !output.contains("local_c ="),
             "dead x86 stack-home index carrier should not leak into decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             !output.contains("local_"),
             "autogenerated x86 stack-home locals should not leak into decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             output.contains("arr[idx].f_8 = v;"),
             "expected detached artifact store to inline the parameter value, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             !output.contains("(int64_t)arr[idx].f_34"),
             "x86 scalar return should not widen the member load in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
     }
 
@@ -9925,7 +9859,8 @@ mod integration_tests {
 
         assert_eq!(
             artifact
-                .type_facts
+                .function_facts
+                .types
                 .merged_signature
                 .as_ref()
                 .expect("merged signature")
@@ -9933,7 +9868,7 @@ mod integration_tests {
                 .len(),
             2,
             "expected authoritative external signature to keep two params, got merged_signature={:?}",
-            artifact.type_facts.merged_signature
+            artifact.function_facts.types.merged_signature
         );
         assert_eq!(
             artifact.writeback_plan.signature.params.len(),
@@ -9944,16 +9879,16 @@ mod integration_tests {
         assert_eq!(
             artifact.writeback_plan.signature.params[0].name, "src",
             "expected first param name to come from external signature, got merged_signature={:?}, writeback_signature={:?}",
-            artifact.type_facts.merged_signature, artifact.writeback_plan.signature
+            artifact.function_facts.types.merged_signature, artifact.writeback_plan.signature
         );
         assert_eq!(
             artifact.writeback_plan.signature.params[1].name, "len",
             "expected second param name to come from external signature, got merged_signature={:?}, writeback_signature={:?}",
-            artifact.type_facts.merged_signature, artifact.writeback_plan.signature
+            artifact.function_facts.types.merged_signature, artifact.writeback_plan.signature
         );
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
@@ -9995,19 +9930,19 @@ mod integration_tests {
         assert!(
             output.contains("sym.imp.memcpy(buf, src, len);"),
             "expected detached x86 alloc_and_copy to keep the malloc owner for memcpy, got:\n{output}\nssa_ops={ssa_ops:?}\nmerged_signature={:?}\nwriteback_signature={:?}",
-            artifact.type_facts.merged_signature,
+            artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
         );
         assert!(
             output.contains("buf[len] = 0;"),
             "expected detached x86 alloc_and_copy to keep the malloc owner for the NUL store, got:\n{output}\nmerged_signature={:?}\nwriteback_signature={:?}",
-            artifact.type_facts.merged_signature,
+            artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
         );
         assert!(
             output.contains("return buf;"),
             "expected detached x86 alloc_and_copy to return the owned malloc result, got:\n{output}\nmerged_signature={:?}\nwriteback_signature={:?}",
-            artifact.type_facts.merged_signature,
+            artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
         );
     }
@@ -10072,7 +10007,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401110, "sym.imp.printf".to_string()),
             (0x401140, "sym.imp.memcpy".to_string()),
@@ -10210,7 +10145,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401130, "sym.imp.strcmp".to_string())]));
         decompiler.set_strings(HashMap::from([(0x403014, "secret123".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
@@ -10348,7 +10283,7 @@ mod integration_tests {
             .collect();
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         let output = decompiler.decompile(&artifact.ssa_func);
         let output_without_types =
             r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64()).decompile(&artifact.ssa_func);
@@ -10443,9 +10378,9 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         let output = decompiler.decompile(&artifact.ssa_func);
-        let visible_bindings = artifact.type_facts.visible_bindings.clone();
+        let visible_bindings = artifact.function_facts.types.visible_bindings.clone();
 
         assert!(
             output.contains("if (x != y)")
@@ -10523,7 +10458,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]));
         decompiler.set_strings(HashMap::from([(0x403040, "C".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
@@ -10746,7 +10681,7 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        let mut type_facts = artifact.type_facts.clone();
+        let mut type_facts = artifact.function_facts.types.clone();
         type_facts.known_function_signatures.extend(HashMap::from([
             (
                 "sym.imp.strlen".to_string(),
@@ -11030,7 +10965,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -11156,7 +11091,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -11277,7 +11212,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -12186,21 +12121,23 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        assert_eq!(
-            artifact
-                .type_facts
-                .symbolic_facts
-                .diagnostics
-                .branches_pruned,
-            1
-        );
-        assert_eq!(artifact.type_facts.symbolic_facts.branch_facts.len(), 1);
-        let symbolic_json =
-            symbolic_facts_json(&artifact.type_facts.symbolic_facts).expect("symbolic json");
-        assert_eq!(symbolic_json.diagnostics.branches_pruned, 1);
-        assert_eq!(symbolic_json.branches.len(), 1);
-        assert_eq!(symbolic_json.branches[0].true_status, "unreachable");
-        assert_eq!(symbolic_json.branches[0].false_status, "reachable");
+        let semantics = artifact
+            .function_facts
+            .semantics
+            .as_ref()
+            .expect("canonical semantics");
+        assert_eq!(semantics.diagnostics.branches_pruned, 1);
+        let native = semantics.native_body().expect("native semantics");
+        assert_eq!(native.regions.len(), 1);
+        let region = native.regions.values().next().expect("semantic region");
+        assert!(region.targets.iter().any(|fact| {
+            fact.value.status == r2sym::SymbolicReachabilityStatus::Unreachable
+                && fact.value.branch_truth == Some(true)
+        }));
+        assert!(region.targets.iter().any(|fact| {
+            fact.value.status == r2sym::SymbolicReachabilityStatus::Reachable
+                && fact.value.branch_truth == Some(false)
+        }));
 
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output =

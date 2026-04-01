@@ -9,33 +9,35 @@ use crate::sim::{
     DerivedSummaryDiagnostics, PreparedFunctionScope, SummaryProfile, SummaryRegistry,
 };
 
-use super::artifact::{
-    CompiledFunctionSemantics, CompiledSemanticArtifact, ResidualReason, SemanticCapability,
-    SemanticMode,
-};
+use super::artifact::{ResidualReason, SemanticArtifact, SemanticArtifactBody};
 use super::cache::{
     SemanticCompilationResult, SemanticSeedMode, cache_insert_bounded,
     coarse_large_slice_cache_key, lookup_semantic_cache, semantic_cache_key,
 };
 use super::classify::classify_slice;
 use super::facts::{
-    SymbolicFunctionFacts, collect_large_cfg_symbolic_function_facts_with_limit,
-    collect_symbolic_function_facts_with_derived,
-    collect_symbolic_function_facts_with_scope_and_profile,
+    CollectedNativeSemanticRegions, SymbolicFunctionFactDiagnostics,
+    collect_canonical_semantic_regions_with_derived,
+    collect_canonical_semantic_regions_with_scope_and_profile,
+    collect_large_cfg_canonical_semantic_regions_with_limit,
+};
+use super::region::{
+    ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
+    RefinementStage, SemanticArtifactDiagnostics,
 };
 use super::vm::{build_vm_step_summary, classify_interpreter_like};
 
 fn residual_reasons(
     diagnostics: &DerivedSummaryDiagnostics,
-    facts: &SymbolicFunctionFacts,
+    fact_diagnostics: &SymbolicFunctionFactDiagnostics,
     interpreter_detected: bool,
     vm_step_ready: bool,
 ) -> Vec<ResidualReason> {
     let mut reasons = Vec::new();
-    if facts.diagnostics.skipped_missing_arch {
+    if fact_diagnostics.skipped_missing_arch {
         reasons.push(ResidualReason::MissingArch);
     }
-    if facts.diagnostics.skipped_large_cfg {
+    if fact_diagnostics.skipped_large_cfg {
         reasons.push(ResidualReason::LargeCfg);
     }
     if diagnostics.budget_exhausted > 0 {
@@ -51,10 +53,10 @@ fn residual_reasons(
 }
 
 fn normalized_residual_reasons(
-    mode: SemanticMode,
+    suppress_large_cfg_reason: bool,
     reasons: Vec<ResidualReason>,
 ) -> Vec<ResidualReason> {
-    if matches!(mode, SemanticMode::IslandCompiled | SemanticMode::VmSummary) {
+    if suppress_large_cfg_reason {
         reasons
             .into_iter()
             .filter(|reason| !matches!(reason, ResidualReason::LargeCfg))
@@ -64,133 +66,145 @@ fn normalized_residual_reasons(
     }
 }
 
-fn semantic_mode_for(
+fn semantic_stage_for(
     helper_functions: usize,
     derived_summaries: usize,
     diagnostics: &DerivedSummaryDiagnostics,
-    facts: &SymbolicFunctionFacts,
+    collected: &CollectedNativeSemanticRegions,
     interpreter_detected: bool,
     vm_step_ready: bool,
-) -> SemanticMode {
+) -> RefinementStage {
     if vm_step_ready {
-        return SemanticMode::VmSummary;
+        return RefinementStage::Compiled;
     }
     if interpreter_detected {
-        return SemanticMode::Residual;
+        return RefinementStage::Residual;
     }
-    if derived_summaries > 0 && !facts.diagnostics.skipped_large_cfg {
-        return SemanticMode::Compiled;
+    if derived_summaries > 0 && !collected.diagnostics.skipped_large_cfg {
+        return RefinementStage::Compiled;
     }
-    if facts.diagnostics.skipped_large_cfg && has_island_compiled_semantics(facts) {
-        return SemanticMode::IslandCompiled;
+    if collected.diagnostics.skipped_large_cfg && has_island_compiled_semantics(collected) {
+        return RefinementStage::Compiled;
     }
     if helper_functions > 0
-        || facts.diagnostics.skipped_large_cfg
+        || collected.diagnostics.skipped_large_cfg
         || diagnostics.budget_exhausted > 0
         || diagnostics.scc_budget_exhausted > 0
     {
-        return SemanticMode::Residual;
+        return RefinementStage::Residual;
     }
-    if facts.diagnostics.skipped_missing_arch {
-        return SemanticMode::Residual;
+    if collected.diagnostics.skipped_missing_arch {
+        return RefinementStage::Residual;
     }
-    SemanticMode::Raw
+    RefinementStage::Raw
 }
 
-fn worker_island_supports_actionable_semantics(
-    island: &super::facts::SymbolicWorkerIsland,
-) -> bool {
-    let supporting_condition = worker_island_supporting_compiled_condition(island);
-    let has_unique_target =
-        island.exact_reachable_target().is_some() || island.actionable_reachable_target().is_some();
-    let has_condition = supporting_condition.is_some();
-    let has_memory_support = !island.actionable_memory_terms().is_empty()
-        || supporting_condition.is_some_and(|compiled| !compiled.memory_terms.is_empty());
-    island.evidence.allows_narrowing() && has_unique_target && has_condition && has_memory_support
+fn has_island_compiled_semantics(collected: &CollectedNativeSemanticRegions) -> bool {
+    collected
+        .regions
+        .values()
+        .any(|region| region.supports_guarded_structuring())
 }
 
-fn worker_island_supports_structured_semantics(
-    island: &super::facts::SymbolicWorkerIsland,
-) -> bool {
-    let supporting_condition = worker_island_supporting_compiled_condition(island);
-    worker_island_supports_actionable_semantics(island)
-        && supporting_condition.is_some_and(|compiled| {
-            !matches!(
-                compiled.precision,
-                crate::backward::BackwardConditionPrecision::ResidualSearchRequired
-            )
-        })
+fn semantic_granularity_for(
+    stage: RefinementStage,
+    execution: ExecutionModel,
+    regions: &std::collections::BTreeMap<super::region::RegionKey, super::region::SemanticRegion>,
+    has_island_compiled_regions: bool,
+) -> ArtifactGranularity {
+    if matches!(execution, ExecutionModel::Vm) {
+        return ArtifactGranularity::SummaryOnly;
+    }
+    if has_island_compiled_regions {
+        return ArtifactGranularity::Regioned;
+    }
+    if matches!(stage, RefinementStage::Residual) && !regions.is_empty() {
+        ArtifactGranularity::Regioned
+    } else {
+        ArtifactGranularity::WholeFunction
+    }
 }
 
-fn worker_island_supporting_compiled_condition(
-    island: &super::facts::SymbolicWorkerIsland,
-) -> Option<&crate::backward::BackwardConditionSummary> {
-    let reachable_target = island
-        .exact_reachable_target()
-        .or_else(|| island.actionable_reachable_target())?;
-    island
-        .control_facts
-        .iter()
-        .find(|fact| fact.target == reachable_target)
-        .and_then(super::facts::SymbolicControlFact::actionable_compiled_condition)
+struct BuildSemanticArtifactInput {
+    stage: RefinementStage,
+    granularity: ArtifactGranularity,
+    execution: ExecutionModel,
+    suppress_large_cfg_reason: bool,
+    slice_class: crate::SliceClass,
+    closure_functions: usize,
+    helper_functions: usize,
+    derived_summaries: usize,
+    derived_diagnostics: DerivedSummaryDiagnostics,
+    collected: CollectedNativeSemanticRegions,
+    interpreter: Option<super::vm::InterpreterDispatchSummary>,
+    vm_step: Option<super::vm::VmStepSummary>,
+    vm_transfer: Option<super::vm::VmStepSummary>,
 }
 
-fn has_island_compiled_semantics(facts: &SymbolicFunctionFacts) -> bool {
-    facts
-        .worker_islands
-        .iter()
-        .any(worker_island_supports_actionable_semantics)
-        || facts.branch_facts.iter().any(|fact| {
-            fact.actionable_compiled_condition().is_some()
-                && (fact.exact_reachable_target().is_some()
-                    || fact.actionable_reachable_target().is_some())
-                && (!facts
-                    .actionable_memory_terms_for_block(fact.block_addr)
-                    .is_empty()
-                    || fact
-                        .actionable_compiled_condition()
-                        .is_some_and(|compiled| !compiled.memory_terms.is_empty()))
-        })
-}
-
-fn has_structured_worker_semantics(facts: &SymbolicFunctionFacts) -> bool {
-    facts
-        .worker_islands
-        .iter()
-        .any(worker_island_supports_structured_semantics)
-}
-
-fn semantic_capability(mode: SemanticMode, facts: &SymbolicFunctionFacts) -> SemanticCapability {
-    let has_bounded_branch_facts = !facts.branch_facts.is_empty();
-    let large_cfg_semantic_decompile =
-        facts.diagnostics.skipped_large_cfg && has_island_compiled_semantics(facts);
-    let large_cfg_structured_decompile =
-        facts.diagnostics.skipped_large_cfg && has_structured_worker_semantics(facts);
-    match mode {
-        SemanticMode::Raw | SemanticMode::Compiled => SemanticCapability {
-            query_ready: true,
-            type_ready: true,
-            decompile_ready: true,
-        },
-        SemanticMode::IslandCompiled => SemanticCapability {
-            query_ready: true,
-            type_ready: true,
-            decompile_ready: large_cfg_semantic_decompile,
-        },
-        SemanticMode::Residual => SemanticCapability {
-            query_ready: true,
-            type_ready: !facts.diagnostics.skipped_large_cfg
-                || has_bounded_branch_facts
-                || !facts.worker_islands.is_empty()
-                || !facts.memory_islands.is_empty(),
-            decompile_ready: large_cfg_structured_decompile,
-        },
-        SemanticMode::VmSummary => SemanticCapability {
-            query_ready: true,
-            type_ready: true,
-            decompile_ready: false,
+fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifact {
+    let BuildSemanticArtifactInput {
+        stage,
+        granularity,
+        execution,
+        suppress_large_cfg_reason,
+        slice_class,
+        closure_functions,
+        helper_functions,
+        derived_summaries,
+        derived_diagnostics,
+        collected,
+        interpreter,
+        vm_step,
+        vm_transfer,
+    } = input;
+    let interpreter_detected = interpreter.is_some();
+    let vm_step_ready = vm_step.is_some();
+    let body = match execution {
+        ExecutionModel::Vm => SemanticArtifactBody::Vm(Box::new(super::region::VmArtifactBody {
+            interpreter,
+            step_summary: vm_step,
+            transfer_summary: vm_transfer,
+        })),
+        ExecutionModel::Native => SemanticArtifactBody::Native(NativeArtifactBody {
+            summary: NativeFunctionSummary {
+                slice_class,
+                closure_functions,
+                helper_functions,
+                derived_summaries,
+                derived_diagnostics: derived_diagnostics.clone(),
+            },
+            regions: collected.regions,
+        }),
+    };
+    let ambiguous_targets = match &body {
+        SemanticArtifactBody::Native(body) => body.conflicting_targets(false).into_iter().collect(),
+        SemanticArtifactBody::Vm(_) => Vec::new(),
+    };
+    SemanticArtifact {
+        stage,
+        granularity,
+        execution,
+        body,
+        diagnostics: SemanticArtifactDiagnostics {
+            branches_evaluated: collected.diagnostics.branches_evaluated,
+            branches_pruned: collected.diagnostics.branches_pruned,
+            branches_unknown: collected.diagnostics.branches_unknown,
+            skipped_missing_arch: collected.diagnostics.skipped_missing_arch,
+            skipped_large_cfg: collected.diagnostics.skipped_large_cfg,
+            residual_reasons: normalized_residual_reasons(
+                suppress_large_cfg_reason,
+                residual_reasons(
+                    &derived_diagnostics,
+                    &collected.diagnostics,
+                    interpreter_detected,
+                    vm_step_ready,
+                ),
+            ),
+            ambiguous_targets,
+            cache_hit: false,
         },
     }
+    .normalized()
 }
 
 fn bounded_large_cfg_branch_limit(func: &SsaArtifact) -> usize {
@@ -256,14 +270,14 @@ fn compile_function_semantics_uncached(
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
     summary_profile: SummaryProfile,
-) -> CompiledSemanticArtifact {
+) -> SemanticArtifact {
     let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
     let helper_functions = scope
         .map(|scope| scope.helper_functions().count())
         .unwrap_or(0);
     let mut derived_diagnostics = DerivedSummaryDiagnostics::default();
     let mut derived_summaries = 0usize;
-    let mut symbolic_facts = SymbolicFunctionFacts::default();
+    let mut collected = CollectedNativeSemanticRegions::default();
     let interpreter = classify_interpreter_like(func);
     let vm_step = interpreter
         .as_ref()
@@ -279,7 +293,7 @@ fn compile_function_semantics_uncached(
         if skip_expensive_branch_compilation {
             if interpreter.is_none() {
                 let bounded_scope = bounded_large_cfg_scope(func, scope);
-                symbolic_facts = collect_large_cfg_symbolic_function_facts_with_limit(
+                collected = collect_large_cfg_canonical_semantic_regions_with_limit(
                     ctx,
                     func,
                     bounded_scope.as_ref(),
@@ -288,18 +302,31 @@ fn compile_function_semantics_uncached(
                     summary_profile,
                     bounded_large_cfg_branch_limit(func),
                 );
-                symbolic_facts.diagnostics.skipped_large_cfg = true;
             } else {
-                symbolic_facts.diagnostics.skipped_large_cfg = true;
+                collected.diagnostics.skipped_large_cfg = true;
             }
 
-            let mode = semantic_mode_for(
+            let execution = if interpreter.is_some() || vm_step.is_some() || vm_transfer.is_some() {
+                ExecutionModel::Vm
+            } else {
+                ExecutionModel::Native
+            };
+            let stage = semantic_stage_for(
                 helper_functions,
                 derived_summaries,
                 &derived_diagnostics,
-                &symbolic_facts,
+                &collected,
                 interpreter.is_some(),
                 vm_transfer.is_some(),
+            );
+            let has_island_compiled_regions = matches!(execution, ExecutionModel::Native)
+                && collected.diagnostics.skipped_large_cfg
+                && has_island_compiled_semantics(&collected);
+            let granularity = semantic_granularity_for(
+                stage,
+                execution,
+                &collected.regions,
+                has_island_compiled_regions,
             );
             let slice_class = classify_slice(
                 func,
@@ -307,30 +334,22 @@ fn compile_function_semantics_uncached(
                 &derived_diagnostics,
                 interpreter.as_ref(),
             );
-
-            return CompiledSemanticArtifact {
-                mode,
+            return build_semantic_artifact(BuildSemanticArtifactInput {
+                stage,
+                granularity,
+                execution,
+                suppress_large_cfg_reason: matches!(execution, ExecutionModel::Vm)
+                    || has_island_compiled_regions,
                 slice_class,
-                capability: semantic_capability(mode, &symbolic_facts),
-                residual_reasons: normalized_residual_reasons(
-                    mode,
-                    residual_reasons(
-                        &derived_diagnostics,
-                        &symbolic_facts,
-                        interpreter.is_some(),
-                        vm_step.is_some(),
-                    ),
-                ),
                 closure_functions,
                 helper_functions,
                 derived_summaries,
-                derived_diagnostics,
-                symbolic_facts,
-                interpreter,
-                vm_step,
-                vm_transfer,
-                cache_hit: false,
-            };
+                derived_diagnostics: derived_diagnostics.clone(),
+                collected,
+                interpreter: interpreter.clone(),
+                vm_step: vm_step.clone(),
+                vm_transfer: vm_transfer.clone(),
+            });
         }
 
         if let Some(scope) = scope
@@ -339,7 +358,7 @@ fn compile_function_semantics_uncached(
             let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);
             derived_summaries = derived.summaries.len();
             derived_diagnostics = derived.diagnostics.clone();
-            symbolic_facts = collect_symbolic_function_facts_with_derived(
+            collected = collect_canonical_semantic_regions_with_derived(
                 ctx,
                 func,
                 Some(scope),
@@ -350,7 +369,7 @@ fn compile_function_semantics_uncached(
                 &derived,
             );
         } else {
-            symbolic_facts = collect_symbolic_function_facts_with_scope_and_profile(
+            collected = collect_canonical_semantic_regions_with_scope_and_profile(
                 ctx,
                 func,
                 None,
@@ -360,15 +379,29 @@ fn compile_function_semantics_uncached(
             );
         }
     } else {
-        symbolic_facts.diagnostics.skipped_missing_arch = true;
+        collected.diagnostics.skipped_missing_arch = true;
     }
-    let mode = semantic_mode_for(
+    let execution = if interpreter.is_some() || vm_step.is_some() || vm_transfer.is_some() {
+        ExecutionModel::Vm
+    } else {
+        ExecutionModel::Native
+    };
+    let stage = semantic_stage_for(
         helper_functions,
         derived_summaries,
         &derived_diagnostics,
-        &symbolic_facts,
+        &collected,
         interpreter.is_some(),
         vm_transfer.is_some(),
+    );
+    let has_island_compiled_regions = matches!(execution, ExecutionModel::Native)
+        && collected.diagnostics.skipped_large_cfg
+        && has_island_compiled_semantics(&collected);
+    let granularity = semantic_granularity_for(
+        stage,
+        execution,
+        &collected.regions,
+        has_island_compiled_regions,
     );
     let slice_class = classify_slice(
         func,
@@ -376,30 +409,22 @@ fn compile_function_semantics_uncached(
         &derived_diagnostics,
         interpreter.as_ref(),
     );
-
-    CompiledSemanticArtifact {
-        mode,
+    build_semantic_artifact(BuildSemanticArtifactInput {
+        stage,
+        granularity,
+        execution,
+        suppress_large_cfg_reason: matches!(execution, ExecutionModel::Vm)
+            || has_island_compiled_regions,
         slice_class,
-        capability: semantic_capability(mode, &symbolic_facts),
-        residual_reasons: normalized_residual_reasons(
-            mode,
-            residual_reasons(
-                &derived_diagnostics,
-                &symbolic_facts,
-                interpreter.is_some(),
-                vm_step.is_some(),
-            ),
-        ),
         closure_functions,
         helper_functions,
         derived_summaries,
-        derived_diagnostics,
-        symbolic_facts,
+        derived_diagnostics: derived_diagnostics.clone(),
+        collected,
         interpreter,
         vm_step,
         vm_transfer,
-        cache_hit: false,
-    }
+    })
 }
 
 pub(crate) fn compile_function_semantics_cached_with_scope(
@@ -439,8 +464,8 @@ pub(crate) fn compile_function_semantics_cached_with_scope(
     ));
     let artifact = cache_insert_bounded(key, artifact);
     let should_cache_coarsely = scope.is_some()
-        && (matches!(artifact.mode, SemanticMode::VmSummary)
-            || artifact.symbolic_facts.diagnostics.skipped_large_cfg);
+        && (matches!(artifact.execution, ExecutionModel::Vm)
+            || artifact.diagnostics.skipped_large_cfg);
     let artifact = if should_cache_coarsely {
         let coarse_key =
             coarse_key.expect("coarse large-slice cache key should exist when scope is present");
@@ -461,7 +486,7 @@ pub fn compile_function_semantics_with_scope(
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
     summary_profile: SummaryProfile,
-) -> CompiledFunctionSemantics {
+) -> SemanticArtifact {
     let result = compile_function_semantics_cached_with_scope(
         ctx,
         func,
@@ -471,7 +496,7 @@ pub fn compile_function_semantics_with_scope(
         summary_profile,
     );
     let mut artifact = (*result.artifact).clone();
-    artifact.cache_hit = result.cache_hit;
+    artifact.diagnostics.cache_hit = result.cache_hit;
     artifact
 }
 
@@ -482,7 +507,7 @@ pub fn compile_semantic_artifact_with_scope(
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
     summary_profile: SummaryProfile,
-) -> CompiledSemanticArtifact {
+) -> SemanticArtifact {
     compile_function_semantics_with_scope(ctx, func, scope, arch, symbol_map, summary_profile)
 }
 
@@ -491,7 +516,7 @@ pub fn compile_semantic_artifact_default_with_scope(
     func: &SsaArtifact,
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
-) -> CompiledSemanticArtifact {
+) -> SemanticArtifact {
     let rebound_scope = scope.and_then(|scope| scope.with_prepared_root(func));
     compile_semantic_artifact_with_scope(
         ctx,
@@ -514,7 +539,6 @@ mod tests {
     use z3::Context;
 
     use super::*;
-
     const RAX: u64 = 0;
 
     fn test_arch() -> ArchSpec {
@@ -757,14 +781,19 @@ mod tests {
             &HashMap::new(),
             SummaryProfile::Default,
         );
-        assert_eq!(artifact.mode, SemanticMode::VmSummary);
+        assert_eq!(artifact.execution, ExecutionModel::Vm);
         assert_eq!(
-            artifact.slice_class,
-            super::super::artifact::SliceClass::InterpreterSwitch
+            artifact.stage,
+            super::super::region::RefinementStage::Compiled
         );
-        assert!(artifact.capability.query_ready);
-        assert!(artifact.interpreter.is_some());
-        let vm_step = artifact.vm_step.expect("vm step");
+        assert_eq!(
+            artifact.granularity,
+            super::super::region::ArtifactGranularity::SummaryOnly
+        );
+        assert!(matches!(artifact.query_plan(), crate::QueryPlan::Ready));
+        let vm_body = artifact.vm_body().expect("vm artifact body");
+        assert!(vm_body.interpreter.is_some());
+        let vm_step = vm_body.step_summary.as_ref().expect("vm step");
         assert_eq!(vm_step.loop_header, 0x1004);
         assert_eq!(vm_step.default_target, Some(0x1018));
         assert_eq!(vm_step.case_values_by_target.get(&0x1008), Some(&vec![0]));
@@ -883,11 +912,17 @@ mod tests {
             &HashMap::new(),
             SummaryProfile::Default,
         );
-        assert_eq!(artifact.mode, SemanticMode::Residual);
-        assert!(artifact.interpreter.is_some());
-        assert!(artifact.vm_step.is_none());
+        assert_eq!(artifact.execution, ExecutionModel::Vm);
+        assert_eq!(
+            artifact.stage,
+            super::super::region::RefinementStage::Residual
+        );
+        let vm_body = artifact.vm_body().expect("vm artifact body");
+        assert!(vm_body.interpreter.is_some());
+        assert!(vm_body.step_summary.is_none());
         assert!(
             artifact
+                .diagnostics
                 .residual_reasons
                 .contains(&ResidualReason::InterpreterRequiresStepSummary)
         );
@@ -1026,9 +1061,16 @@ mod tests {
             SummaryProfile::Default,
         );
 
-        let vm_step = artifact.vm_step.expect("vm step summary");
-        assert_eq!(artifact.mode, SemanticMode::VmSummary);
-        assert!(artifact.capability.query_ready);
+        let vm_step = artifact
+            .vm_body()
+            .and_then(|body| body.step_summary.as_ref())
+            .expect("vm step summary");
+        assert_eq!(artifact.execution, ExecutionModel::Vm);
+        assert_eq!(
+            artifact.stage,
+            super::super::region::RefinementStage::Compiled
+        );
+        assert!(matches!(artifact.query_plan(), crate::QueryPlan::Ready));
         assert_eq!(vm_step.loop_header, 0x3004);
         assert_eq!(vm_step.dispatch_header, 0x3004);
         assert_eq!(vm_step.default_target, Some(0x3018));
@@ -1183,71 +1225,139 @@ mod tests {
             SummaryProfile::Default,
         );
 
-        assert_eq!(artifact.mode, SemanticMode::Residual);
-        assert!(artifact.symbolic_facts.diagnostics.skipped_large_cfg);
-        assert_eq!(artifact.symbolic_facts.branch_facts.len(), 1);
-        assert!(artifact.capability.type_ready);
-        assert!(!artifact.capability.decompile_ready);
-        assert_eq!(artifact.symbolic_facts.diagnostics.branches_evaluated, 1);
+        let native = artifact.native_body().expect("native body");
+        assert_eq!(
+            artifact.stage,
+            super::super::region::RefinementStage::Residual
+        );
+        assert!(artifact.diagnostics.skipped_large_cfg);
+        assert_eq!(native.regions.len(), 1);
+        assert_eq!(native.actionable_control_count(), 2);
+        assert!(matches!(artifact.type_plan(), crate::TypePlan::Ready));
+        assert!(matches!(
+            artifact.decompile_plan(),
+            crate::DecompilePlan::Ready
+        ));
+        assert_eq!(artifact.diagnostics.branches_evaluated, 1);
     }
 
     #[test]
     fn large_cfg_exact_branch_frontier_with_memory_support_is_decompile_ready() {
-        let fact = crate::semantics::facts::SymbolicBranchFact {
-            block_addr: 0x401000,
-            true_target: 0x401010,
-            false_target: 0x401020,
-            true_status: crate::semantics::facts::SymbolicReachabilityStatus::Reachable,
-            false_status: crate::semantics::facts::SymbolicReachabilityStatus::Unreachable,
-            true_condition: Some("flag == 0".to_string()),
-            false_condition: Some("flag != 0".to_string()),
-            true_compiled: Some(crate::backward::BackwardConditionSummary {
-                simplified: "flag == 0".to_string(),
-                terms: vec!["flag == 0".to_string()],
-                memory_terms: vec![crate::backward::BackwardMemoryCondition {
-                    region: crate::backward::BackwardMemoryRegion::Argument { index: 0 },
-                    offset_lo: 0,
-                    offset_hi: 0,
-                    size: 1,
-                    exact_offset: true,
-                    evidence: crate::SemanticEvidence::exact(),
-                    binding: None,
-                    expr: "*arg0".to_string(),
-                    value_expr: Some("0x0:8".to_string()),
-                    exact_value: true,
-                }],
-                backward_memory_substitutions: 0,
-                backward_memory_candidate_enumerations: 0,
-                backward_memory_residual_fallbacks: 0,
-                precision: crate::backward::BackwardConditionPrecision::Exact,
-                supported_paths: 1,
-                total_paths: 1,
-            }),
-            false_compiled: None,
+        let compiled = crate::backward::BackwardConditionSummary {
+            simplified: "flag == 0".to_string(),
+            terms: vec!["flag == 0".to_string()],
+            memory_terms: vec![crate::backward::BackwardMemoryCondition {
+                region: crate::backward::BackwardMemoryRegion::Argument { index: 0 },
+                offset_lo: 0,
+                offset_hi: 0,
+                size: 1,
+                exact_offset: true,
+                evidence: crate::SemanticEvidence::exact(),
+                binding: None,
+                expr: "*arg0".to_string(),
+                value_expr: Some("0x0:8".to_string()),
+                exact_value: true,
+            }],
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: crate::backward::BackwardConditionPrecision::Exact,
+            supported_paths: 1,
+            total_paths: 1,
         };
-        let mut facts = SymbolicFunctionFacts {
-            branch_facts: vec![fact],
-            ..Default::default()
+        let collected = CollectedNativeSemanticRegions {
+            regions: std::iter::once({
+                let region = crate::SemanticRegion {
+                    anchor: 0x401000,
+                    frontier: std::collections::BTreeSet::from([0x401010, 0x401020]),
+                    control: vec![
+                        crate::Judged::new(
+                            crate::ControlFact {
+                                target: 0x401010,
+                                status: crate::SymbolicReachabilityStatus::Reachable,
+                                branch_truth: Some(true),
+                                condition: Some("flag == 0".to_string()),
+                                compiled: Some(compiled.clone()),
+                            },
+                            crate::SemanticEvidence::exact(),
+                        ),
+                        crate::Judged::new(
+                            crate::ControlFact {
+                                target: 0x401020,
+                                status: crate::SymbolicReachabilityStatus::Unreachable,
+                                branch_truth: Some(false),
+                                condition: Some("flag != 0".to_string()),
+                                compiled: None,
+                            },
+                            crate::SemanticEvidence::exact(),
+                        ),
+                    ],
+                    memory: vec![crate::Judged::new(
+                        crate::MemoryFact {
+                            term: compiled.memory_terms[0].clone(),
+                        },
+                        crate::SemanticEvidence::exact(),
+                    )],
+                    pre: Vec::new(),
+                    post: Vec::new(),
+                    targets: vec![
+                        crate::Judged::new(
+                            crate::TargetFact {
+                                target: 0x401010,
+                                status: crate::SymbolicReachabilityStatus::Reachable,
+                                branch_truth: Some(true),
+                            },
+                            crate::SemanticEvidence::exact(),
+                        ),
+                        crate::Judged::new(
+                            crate::TargetFact {
+                                target: 0x401020,
+                                status: crate::SymbolicReachabilityStatus::Unreachable,
+                                branch_truth: Some(false),
+                            },
+                            crate::SemanticEvidence::exact(),
+                        ),
+                    ],
+                };
+                (region.key(), region)
+            })
+            .collect(),
+            diagnostics: SymbolicFunctionFactDiagnostics {
+                skipped_large_cfg: true,
+                ..Default::default()
+            },
         };
-        facts.diagnostics.skipped_large_cfg = true;
 
-        let mode = semantic_mode_for(
+        let stage = semantic_stage_for(
             0,
             0,
             &DerivedSummaryDiagnostics::default(),
-            &facts,
+            &collected,
             false,
             false,
         );
-        assert_eq!(mode, SemanticMode::IslandCompiled);
-        let capability = semantic_capability(mode, &facts);
-        assert!(capability.query_ready);
-        assert!(capability.type_ready);
-        assert!(capability.decompile_ready);
-        let reasons = normalized_residual_reasons(
-            mode,
-            residual_reasons(&DerivedSummaryDiagnostics::default(), &facts, false, false),
-        );
+        let artifact = build_semantic_artifact(BuildSemanticArtifactInput {
+            stage,
+            granularity: ArtifactGranularity::Regioned,
+            execution: ExecutionModel::Native,
+            suppress_large_cfg_reason: true,
+            slice_class: crate::SliceClass::Worker,
+            closure_functions: 0,
+            helper_functions: 0,
+            derived_summaries: 0,
+            derived_diagnostics: DerivedSummaryDiagnostics::default(),
+            collected,
+            interpreter: None,
+            vm_step: None,
+            vm_transfer: None,
+        });
+        assert!(matches!(artifact.query_plan(), crate::QueryPlan::Ready));
+        assert!(matches!(artifact.type_plan(), crate::TypePlan::Ready));
+        assert!(matches!(
+            artifact.decompile_plan(),
+            crate::DecompilePlan::Ready
+        ));
+        let reasons = artifact.diagnostics.residual_reasons;
         assert!(
             !reasons.contains(&ResidualReason::LargeCfg),
             "island-compiled workers should keep large_cfg as provenance, not a residual reason"

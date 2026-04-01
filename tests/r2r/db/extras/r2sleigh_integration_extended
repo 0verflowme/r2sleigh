@@ -48,7 +48,7 @@ CMDS=<<EOF_CMDS
 aaa
 s main
 af- @ $$
-a:sla.sym $$ | jq -c '.semantic.mode != null and .semantic.capability != null'
+a:sla.sym $$ | jq -c '.semantic.stage != null and .semantic.granularity != null and .semantic.execution != null and .semantic.query_plan != null and .semantic.type_plan != null and .semantic.decompile_plan != null'
 EOF_CMDS
 RUN
 
@@ -244,7 +244,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.sym sym.tiny_vm_dispatch | jq -c '.semantic.mode=="vm_summary" and .semantic.slice_class=="interpreter_switch" and .semantic.capability.type_ready==true and .semantic.vm_step != null and (.semantic.vm_step.dispatch_targets|length)>=8 and (.semantic.vm_step.loop_latches|length)>=7 and (.semantic.vm_step.step_blocks|length)>=10 and (.semantic.vm_step.handler_state_updates | to_entries | length) >= 5 and ((.semantic.vm_step.handler_state_updates | to_entries | map(.value | length) | add) >= 5)'
+a:sla.sym sym.tiny_vm_dispatch | jq -c '.semantic.execution=="vm" and .semantic.granularity=="summary_only" and (.semantic.slice_class|startswith("interpreter_")) and .semantic.type_plan=="Ready" and .semantic.vm_step != null and (.semantic.vm_step.dispatch_targets|length)>=8 and (.semantic.vm_step.loop_latches|length)>=7 and (.semantic.vm_step.step_blocks|length)>=10 and (.semantic.vm_step.handler_state_updates | to_entries | length) >= 5 and ((.semantic.vm_step.handler_state_updates | to_entries | map(.value | length) | add) >= 5)'
 EOF_CMDS
 RUN
 
@@ -257,7 +257,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 a:sla.sym sym.tiny_vm_dispatch >/dev/null
-a:sla.sym sym.tiny_vm_dispatch | jq -c '.semantic.mode=="vm_summary" and .semantic.cache_hit==true and .semantic.vm_transfer != null and (.semantic.vm_transfer.transfers | type=="array")'
+a:sla.sym sym.tiny_vm_dispatch | jq -c '.semantic.execution=="vm" and .semantic.cache_hit==true and .semantic.vm_transfer != null and (.semantic.vm_transfer.transfers | type=="array")'
 EOF_CMDS
 RUN
 
@@ -269,7 +269,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.sym sym.interpret_bytecode | jq -c '.semantic.mode=="vm_summary" and .semantic.slice_class=="interpreter_switch" and .semantic.skipped_large_cfg==true and (.semantic.residual_reasons|length)==0 and .semantic.vm_step != null and (.semantic.vm_step.dispatch_targets|length)>=10'
+a:sla.sym sym.interpret_bytecode | jq -c '.semantic.execution=="vm" and .semantic.granularity=="summary_only" and (.semantic.slice_class|startswith("interpreter_")) and .semantic.skipped_large_cfg==true and (.semantic.residual_reasons|length)==0 and .semantic.vm_step != null and (.semantic.vm_step.dispatch_targets|length)>=10'
 EOF_CMDS
 RUN
 
@@ -281,11 +281,11 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.sym sym.interpret_bytecode | jq -c '.semantic.mode=="vm_summary" and .semantic.capability.query_ready==true and .semantic.vm_transfer != null and ((.semantic.vm_transfer.transfers | length) >= 8) and ((.semantic.vm_transfer.transfers | map(select(.redispatch)) | length) >= 4) and (((.semantic.vm_transfer.handler_exit_guards // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_read_effects // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_write_effects // {}) | keys | length) >= 1)'
+a:sla.sym sym.interpret_bytecode | jq -c '.semantic.execution=="vm" and .semantic.query_plan=="Ready" and .semantic.vm_transfer != null and ((.semantic.vm_transfer.transfers | length) >= 8) and ((.semantic.vm_transfer.transfers | map(select(.redispatch)) | length) >= 4) and (((.semantic.vm_transfer.handler_exit_guards // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_read_effects // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_write_effects // {}) | keys | length) >= 1)'
 EOF_CMDS
 RUN
 
-NAME=types_tiny_vm_dispatch_reports_vm_step_payload
+NAME=types_tiny_vm_dispatch_reports_canonical_vm_step_payload
 FILE=bins/stress_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -293,7 +293,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.types sym.tiny_vm_dispatch | jq -c '.symbolic.diagnostics.semantic_mode=="VmSummary" and .symbolic.diagnostics.slice_class=="InterpreterSwitch" and .symbolic.vm_step != null and (.symbolic.vm_step.dispatch_targets|length)>=8 and (.symbolic.vm_step.loop_latches|length)>=7 and (.symbolic.vm_step.step_blocks|length)>=10 and (.symbolic.vm_step.case_values_by_target | keys | length) >= 8 and (.symbolic.vm_step.handler_state_updates | to_entries | length) >= 5'
+a:sla.types sym.tiny_vm_dispatch | jq -c '.compiled_semantics.execution=="vm" and .compiled_semantics.granularity=="summary_only" and (.compiled_semantics.slice_class|startswith("interpreter_")) and .compiled_semantics.vm_step != null and (.compiled_semantics.vm_step.dispatch_targets|length)>=8 and (.compiled_semantics.vm_step.loop_latches|length)>=7 and (.compiled_semantics.vm_step.step_blocks|length)>=10 and (.compiled_semantics.vm_step.case_values_by_target | keys | length) >= 8 and (.compiled_semantics.vm_step.handler_state_updates | to_entries | length) >= 5'
 EOF_CMDS
 RUN
 
@@ -305,7 +305,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.types sym.tiny_vm_dispatch | jq -c '.symbolic.diagnostics.semantic_mode=="VmSummary" and .symbolic.vm_transfer != null and (.symbolic.vm_transfer.dispatch_targets|length)>=8 and (.symbolic.vm_transfer.loop_latches|length)>=7 and (.symbolic.vm_transfer.step_blocks|length)>=10 and (.symbolic.vm_transfer.handler_state_updates | to_entries | length) >= 5 and (.symbolic.vm_transfer.transfers | type=="array") and (((.symbolic.vm_transfer.handler_exit_guards // {}) | keys | length) >= 1) and (((.symbolic.vm_transfer.handler_memory_read_effects // {}) | keys | length) >= 1) and (((.symbolic.vm_transfer.handler_memory_write_effects // {}) | keys | length) >= 1) and (((.symbolic.vm_transfer.transfers // []) | map((.exit_guards // []) | length) | add) > 0) and (((.symbolic.vm_transfer.transfers // []) | map((.memory_reads // []) | length) | add) > 0) and (((.symbolic.vm_transfer.transfers // []) | map((.memory_writes // []) | length) | add) > 0) and (((.symbolic.vm_transfer.transfers // []) | map(((.memory_reads // []) + (.memory_writes // [])) | map(select(.binding != null)) | length) | add) > 0) and (.symbolic.vm_transfer.transfers[0] | has("residual_guards") and has("residual_memory_effects"))'
+a:sla.types sym.tiny_vm_dispatch | jq -c '.compiled_semantics.execution=="vm" and .compiled_semantics.vm_transfer != null and (.compiled_semantics.vm_transfer.dispatch_targets|length)>=8 and (.compiled_semantics.vm_transfer.loop_latches|length)>=7 and (.compiled_semantics.vm_transfer.step_blocks|length)>=10 and (.compiled_semantics.vm_transfer.handler_state_updates | to_entries | length) >= 5 and (.compiled_semantics.vm_transfer.transfers | type=="array") and (((.compiled_semantics.vm_transfer.handler_exit_guards // {}) | keys | length) >= 1) and (((.compiled_semantics.vm_transfer.handler_memory_read_effects // {}) | keys | length) >= 1) and (((.compiled_semantics.vm_transfer.handler_memory_write_effects // {}) | keys | length) >= 1) and (((.compiled_semantics.vm_transfer.transfers // []) | map((.exit_guards // []) | length) | add) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | map((.memory_reads // []) | length) | add) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | map((.memory_writes // []) | length) | add) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | map(((.memory_reads // []) + (.memory_writes // [])) | map(select(.binding != null)) | length) | add) > 0) and (.compiled_semantics.vm_transfer.transfers[0] | has("residual_guards") and has("residual_memory_effects"))'
 EOF_CMDS
 RUN
 
@@ -318,7 +318,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 a:sla.types sym.tiny_vm_dispatch >/dev/null
-a:sla.types sym.tiny_vm_dispatch | jq -c '.symbolic.diagnostics.semantic_mode=="VmSummary" and .symbolic.diagnostics.cache_hit==true and .symbolic.vm_transfer != null'
+a:sla.types sym.tiny_vm_dispatch | jq -c '.compiled_semantics.execution=="vm" and .compiled_semantics.cache_hit==true and .compiled_semantics.vm_transfer != null'
 EOF_CMDS
 RUN
 
@@ -330,11 +330,11 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.sym sym.tiny_vm_dispatch | jq -c '.semantic.mode=="vm_summary" and .semantic.vm_transfer != null and (.semantic.vm_transfer.dispatch_targets|length)>=8 and (.semantic.vm_transfer.loop_latches|length)>=7 and (.semantic.vm_transfer.step_blocks|length)>=10 and (.semantic.vm_transfer.transfers | type=="array") and (((.semantic.vm_transfer.handler_exit_guards // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_read_effects // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_write_effects // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.transfers // []) | map((.exit_guards // []) | length) | add) > 0) and (((.semantic.vm_transfer.transfers // []) | map((.memory_reads // []) | length) | add) > 0) and (((.semantic.vm_transfer.transfers // []) | map((.memory_writes // []) | length) | add) > 0) and (((.semantic.vm_transfer.transfers // []) | map(((.memory_reads // []) + (.memory_writes // [])) | map(select(.binding != null)) | length) | add) > 0) and (.semantic.vm_transfer.transfers[0] | has("residual_guards") and has("residual_memory_effects"))'
+a:sla.sym sym.tiny_vm_dispatch | jq -c '.semantic.execution=="vm" and .semantic.vm_transfer != null and (.semantic.vm_transfer.dispatch_targets|length)>=8 and (.semantic.vm_transfer.loop_latches|length)>=7 and (.semantic.vm_transfer.step_blocks|length)>=10 and (.semantic.vm_transfer.transfers | type=="array") and (((.semantic.vm_transfer.handler_exit_guards // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_read_effects // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.handler_memory_write_effects // {}) | keys | length) >= 1) and (((.semantic.vm_transfer.transfers // []) | map((.exit_guards // []) | length) | add) > 0) and (((.semantic.vm_transfer.transfers // []) | map((.memory_reads // []) | length) | add) > 0) and (((.semantic.vm_transfer.transfers // []) | map((.memory_writes // []) | length) | add) > 0) and (((.semantic.vm_transfer.transfers // []) | map(((.memory_reads // []) + (.memory_writes // [])) | map(select(.binding != null)) | length) | add) > 0) and (.semantic.vm_transfer.transfers[0] | has("residual_guards") and has("residual_memory_effects"))'
 EOF_CMDS
 RUN
 
-NAME=types_stack_symbolic_eq_guard_reports_stack_memory_term
+NAME=types_stack_symbolic_eq_guard_reports_canonical_stack_memory_term
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -342,11 +342,11 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.types sym.test_stack_symbolic_eq_guard | jq -c '.symbolic.diagnostics.branches_pruned==1 and (.symbolic.branches|length)==1 and .symbolic.branches[0].true_compiled.precision=="Exact" and (.symbolic.branches[0].true_compiled.memory_terms|length)==1 and .symbolic.branches[0].true_compiled.memory_terms[0].region.Region.kind=="Stack" and .symbolic.branches[0].true_compiled.memory_terms[0].exact_offset==true'
+a:sla.types sym.test_stack_symbolic_eq_guard | jq -c '.compiled_semantics.branches_pruned==1 and .compiled_semantics.memory_region_count>=1 and ((.semantics.body.Native.regions|length)>=1) and (((.semantics.body.Native.regions[0].control // []) | map(select(.value.compiled.precision=="Exact" and ((.value.compiled.memory_terms|length)>=1) and .value.compiled.memory_terms[0].region.Region.kind=="Stack" and .value.compiled.memory_terms[0].exact_offset==true)) | length) >= 1)'
 EOF_CMDS
 RUN
 
-NAME=types_stack_symbolic_eq_guard_reports_memory_island
+NAME=types_stack_symbolic_eq_guard_reports_canonical_memory_region
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -354,11 +354,11 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.types sym.test_stack_symbolic_eq_guard | jq -c '(.symbolic.memory_islands|length) >= 1 and .symbolic.memory_islands[0].anchor_block != null and ((.symbolic.memory_islands[0].terms|length) >= 1) and .symbolic.memory_islands[0].terms[0].region.Region.kind=="Stack"'
+a:sla.types sym.test_stack_symbolic_eq_guard | jq -c '.compiled_semantics.memory_region_count >= 1 and ((.semantics.body.Native.regions|length) >= 1) and .semantics.body.Native.regions[0].anchor != null and ((.semantics.body.Native.regions[0].memory|length) >= 1) and .semantics.body.Native.regions[0].memory[0].value.term.region.Region.kind=="Stack"'
 EOF_CMDS
 RUN
 
-NAME=sym_stack_symbolic_eq_guard_reports_memory_island_count
+NAME=sym_stack_symbolic_eq_guard_reports_memory_region_count
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -366,7 +366,7 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
-a:sla.sym sym.test_stack_symbolic_eq_guard | jq -c '.semantic.memory_island_count >= 1'
+a:sla.sym sym.test_stack_symbolic_eq_guard | jq -c '.semantic.memory_region_count >= 1'
 EOF_CMDS
 RUN
 
@@ -1055,7 +1055,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s sym.test_symbolic_xor_guard >/dev/null
-a:sla.types | jq -c '.symbolic.diagnostics.branches_pruned == 1 and ((.symbolic.branches | length) == 1) and .symbolic.branches[0].false_status == "unreachable"'
+a:sla.types | jq -c '.compiled_semantics.branches_pruned == 1 and (.compiled_semantics.region_count == 1) and (((.semantics.body.Native.regions[0].targets // []) | map(.value.status) | index("Reachable")) != null) and (((.semantics.body.Native.regions[0].targets // []) | map(.value.status) | index("Unreachable")) != null)'
 EOF_CMDS
 RUN
 
@@ -1068,11 +1068,11 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 af- @ `is~test_symbolic_xor_guard[2]`
-a:sla.types `is~test_symbolic_xor_guard[2]` | jq -c '.symbolic.diagnostics.branches_pruned == 1 and ((.symbolic.branches | length) == 1) and .symbolic.branches[0].false_status == "unreachable"'
+a:sla.types `is~test_symbolic_xor_guard[2]` | jq -c '.compiled_semantics.branches_pruned == 1 and (.compiled_semantics.region_count == 1) and (((.semantics.body.Native.regions[0].targets // []) | map(.value.status) | index("Reachable")) != null) and (((.semantics.body.Native.regions[0].targets // []) | map(.value.status) | index("Unreachable")) != null)'
 EOF_CMDS
 RUN
 
-NAME=types_symbolic_helper_scope_exposes_live_symbolic_facts
+NAME=types_symbolic_helper_scope_exposes_canonical_region_facts
 FILE=bins/vuln_test
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -1081,7 +1081,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s sym.test_symbolic_helper_pure_guard >/dev/null
-a:sla.types | jq -c '.symbolic.diagnostics.branches_pruned == 1 and ((.symbolic.branches | length) == 1) and .symbolic.branches[0].true_status == "reachable" and .symbolic.branches[0].false_status == "unreachable" and ((((.interproc.scope.payloads // []) | map(.function_name) | any(. == "dbg.helper_symbolic_zero_pure")) or (((.interproc.scope.seeds // []) | map(.name) | any(. == "sym.helper_symbolic_zero_pure")))))'
+a:sla.types | jq -c '.compiled_semantics.branches_pruned == 1 and (.compiled_semantics.region_count == 1) and (((.semantics.body.Native.regions[0].targets // []) | map(.value.status) | index("Reachable")) != null) and (((.semantics.body.Native.regions[0].targets // []) | map(.value.status) | index("Unreachable")) != null) and ((((.interproc.scope.payloads // []) | map(.function_name) | any(. == "dbg.helper_symbolic_zero_pure")) or (((.interproc.scope.seeds // []) | map(.name) | any(. == "sym.helper_symbolic_zero_pure")))))'
 EOF_CMDS
 RUN
 
@@ -1095,7 +1095,7 @@ CMDS=<<EOF_CMDS
 aaa
 af- @ `is~test_symbolic_helper_pure_guard[2]`
 af- @ `is~helper_symbolic_zero_pure[2]`
-a:sla.types `is~test_symbolic_helper_pure_guard[2]` | jq -c '.symbolic.diagnostics.branches_pruned == 1 and ((.symbolic.branches | length) == 1) and .symbolic.branches[0].true_status == "reachable" and .symbolic.branches[0].false_status == "unreachable" and ((((.interproc.scope.payloads // []) | map(.function_name) | any(. == "dbg.helper_symbolic_zero_pure")) or (((.interproc.scope.seeds // []) | map(.name) | any(. == "sym.helper_symbolic_zero_pure")))))'
+a:sla.types `is~test_symbolic_helper_pure_guard[2]` | jq -c '.compiled_semantics.branches_pruned == 1 and (.compiled_semantics.region_count == 1) and ((((.interproc.scope.payloads // []) | map(.function_name) | any(. == "dbg.helper_symbolic_zero_pure")) or (((.interproc.scope.seeds // []) | map(.name) | any(. == "sym.helper_symbolic_zero_pure")))))'
 EOF_CMDS
 RUN
 
@@ -1108,7 +1108,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s sym.test_symbolic_helper_pure_guard >/dev/null
-a:sla.types sym.test_symbolic_helper_pure_guard | jq -c '.symbolic.diagnostics.semantic_mode == "Compiled" and (.symbolic.diagnostics.derived_summaries >= 1) and (.symbolic.diagnostics.helper_functions >= 1)'
+a:sla.types sym.test_symbolic_helper_pure_guard | jq -c '.compiled_semantics.stage == "compiled" and .compiled_semantics.execution == "native" and (.compiled_semantics.derived_summaries >= 1) and (.compiled_semantics.helper_functions >= 1)'
 EOF_CMDS
 RUN
 
@@ -1121,7 +1121,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s sym.test_symbolic_helper_pure_guard >/dev/null
-a:sla.sym sym.test_symbolic_helper_pure_guard | jq -c '.semantic.mode == "compiled" and (.semantic.derived_summaries >= 1) and (.semantic.helper_functions >= 1)'
+a:sla.sym sym.test_symbolic_helper_pure_guard | jq -c '.semantic.stage == "compiled" and .semantic.execution == "native" and (.semantic.derived_summaries >= 1) and (.semantic.helper_functions >= 1)'
 EOF_CMDS
 RUN
 
@@ -1134,7 +1134,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
 s sym.test_symbolic_xor_guard >/dev/null
-a:sla.sym sym.test_symbolic_xor_guard | jq -c '.semantic.branch_fact_count == 1 and (.semantic.control_island_count >= 1) and (.semantic.compiled_condition_count >= 1) and (.semantic.actionable_compiled_condition_count >= 1)'
+a:sla.sym sym.test_symbolic_xor_guard | jq -c '.semantic.region_count == 1 and (.semantic.control_region_count >= 1) and (.semantic.compiled_condition_count >= 1) and (.semantic.actionable_compiled_condition_count >= 1)'
 EOF_CMDS
 RUN
 

@@ -1,7 +1,6 @@
 use crate::blocks::BlockSlice;
 use crate::context::require_ctx_view;
 use crate::{ArchSpec, R2ILBlock, R2ILContext, parse_addr_name_map};
-use r2types::SymbolicVmValueExpr;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -245,20 +244,26 @@ struct SymExecSummary {
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct CompiledSemanticInfo {
-    pub(crate) mode: String,
-    pub(crate) capability: SemanticCapabilityInfo,
+    pub(crate) schema_version: u32,
+    pub(crate) stage: String,
+    pub(crate) granularity: String,
+    pub(crate) execution: String,
+    pub(crate) query_plan: r2sym::QueryPlan,
+    pub(crate) type_plan: r2sym::TypePlan,
+    pub(crate) decompile_plan: r2sym::DecompilePlan,
     pub(crate) slice_class: String,
     pub(crate) residual_reasons: Vec<String>,
+    pub(crate) ambiguous_target_count: usize,
+    pub(crate) ambiguous_targets: Vec<String>,
     pub(crate) closure_functions: usize,
     pub(crate) helper_functions: usize,
     pub(crate) derived_summaries: usize,
     pub(crate) summary_attempted: usize,
     pub(crate) summary_budget_exhausted: usize,
     pub(crate) summary_scc_count: usize,
-    pub(crate) branch_fact_count: usize,
-    pub(crate) worker_island_count: usize,
-    pub(crate) control_island_count: usize,
-    pub(crate) memory_island_count: usize,
+    pub(crate) region_count: usize,
+    pub(crate) control_region_count: usize,
+    pub(crate) memory_region_count: usize,
     pub(crate) compiled_condition_count: usize,
     pub(crate) exact_compiled_condition_count: usize,
     pub(crate) actionable_compiled_condition_count: usize,
@@ -272,13 +277,6 @@ pub(crate) struct CompiledSemanticInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) vm_transfer: Option<VmStepSummaryInfo>,
     pub(crate) cache_hit: bool,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct SemanticCapabilityInfo {
-    pub(crate) query_ready: bool,
-    pub(crate) type_ready: bool,
-    pub(crate) decompile_ready: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -383,8 +381,45 @@ pub(crate) struct VmStepSummaryInfo {
     pub(crate) transfers: Vec<VmTransferArmInfo>,
 }
 
-fn render_vm_value_expr(value: &SymbolicVmValueExpr) -> String {
-    value.render()
+fn render_vm_value_expr(value: &r2sym::VmValueExpr) -> String {
+    match value {
+        r2sym::VmValueExpr::Const(value) => format!("0x{value:x}"),
+        r2sym::VmValueExpr::Var(name) | r2sym::VmValueExpr::Expr(name) => name.clone(),
+        r2sym::VmValueExpr::Unary { op, arg } => {
+            let op = match op {
+                r2sym::VmUnaryOp::Neg => "-",
+                r2sym::VmUnaryOp::BitNot => "~",
+                r2sym::VmUnaryOp::BoolNot => "!",
+            };
+            format!("({}{})", op, render_vm_value_expr(arg))
+        }
+        r2sym::VmValueExpr::Binary { op, lhs, rhs } => {
+            let op = match op {
+                r2sym::VmBinaryOp::Add => "+",
+                r2sym::VmBinaryOp::Sub => "-",
+                r2sym::VmBinaryOp::Mul => "*",
+                r2sym::VmBinaryOp::Div => "/",
+                r2sym::VmBinaryOp::Rem => "%",
+                r2sym::VmBinaryOp::And => "&",
+                r2sym::VmBinaryOp::Or => "|",
+                r2sym::VmBinaryOp::Xor => "^",
+                r2sym::VmBinaryOp::Shl => "<<",
+                r2sym::VmBinaryOp::LShr | r2sym::VmBinaryOp::AShr => ">>",
+                r2sym::VmBinaryOp::Eq => "==",
+                r2sym::VmBinaryOp::Ne => "!=",
+                r2sym::VmBinaryOp::Lt | r2sym::VmBinaryOp::SLt => "<",
+                r2sym::VmBinaryOp::Le | r2sym::VmBinaryOp::SLe => "<=",
+                r2sym::VmBinaryOp::BoolAnd => "&&",
+                r2sym::VmBinaryOp::BoolOr => "||",
+            };
+            format!(
+                "({} {} {})",
+                render_vm_value_expr(lhs),
+                op,
+                render_vm_value_expr(rhs)
+            )
+        }
+    }
 }
 
 fn render_semantic_confidence(confidence: r2sym::SemanticConfidence) -> String {
@@ -398,21 +433,19 @@ fn render_semantic_confidence(confidence: r2sym::SemanticConfidence) -> String {
 }
 
 fn vm_state_update_info_from_sym(update: &r2sym::VmStateUpdate) -> VmStateUpdateInfo {
-    let value = SymbolicVmValueExpr::from(&update.value);
     VmStateUpdateInfo {
         output: update.output.clone(),
         expr: update.expr.clone(),
-        value: render_vm_value_expr(&value),
+        value: render_vm_value_expr(&update.value),
         exact: update.exact,
         confidence: render_semantic_confidence(update.confidence()),
     }
 }
 
 fn vm_guard_condition_info_from_sym(guard: &r2sym::VmGuardCondition) -> VmGuardConditionInfo {
-    let value = SymbolicVmValueExpr::from(&guard.value);
     VmGuardConditionInfo {
         expr: guard.expr.clone(),
-        value: render_vm_value_expr(&value),
+        value: render_vm_value_expr(&guard.value),
         expect_nonzero: guard.expect_nonzero,
         exact: guard.exact,
         confidence: render_semantic_confidence(guard.confidence()),
@@ -748,7 +781,7 @@ fn build_sym_exec_summary(
     stats: &r2sym::path::ExploreStats,
     solver_stats: &r2sym::SolverStats,
     paths_feasible: usize,
-    semantic: Option<&r2sym::CompiledSemanticArtifact>,
+    semantic: Option<&r2sym::SemanticArtifact>,
 ) -> SymExecSummary {
     SymExecSummary {
         paths_explored: stats.paths_completed,
@@ -777,50 +810,51 @@ fn empty_symbolic_summary<'ctx>() -> r2sym::SymbolicFunctionSummary<'ctx> {
 }
 
 fn should_skip_expensive_symbolic_summary(
-    compiled: &r2sym::CompiledSemanticArtifact,
+    compiled: &r2sym::SemanticArtifact,
     prepared: &r2ssa::SsaArtifact,
 ) -> bool {
-    compiled.symbolic_facts.diagnostics.skipped_large_cfg
+    compiled.diagnostics.skipped_large_cfg
         || prepared.function().cfg_risk_summary().block_count > 96
 }
 
-pub(crate) fn compiled_semantic_info(
-    compiled: &r2sym::CompiledSemanticArtifact,
-) -> CompiledSemanticInfo {
-    let branch_compiled_conditions = compiled
-        .symbolic_facts
-        .branch_facts
-        .iter()
-        .flat_map(|fact| fact.true_compiled.iter().chain(fact.false_compiled.iter()))
-        .collect::<Vec<_>>();
-    let control_facts = compiled
-        .symbolic_facts
-        .worker_islands
-        .iter()
-        .flat_map(|island| island.control_facts.iter())
-        .collect::<Vec<_>>();
+pub(crate) fn compiled_semantic_info(compiled: &r2sym::SemanticArtifact) -> CompiledSemanticInfo {
+    let native = compiled.native_body();
     CompiledSemanticInfo {
-        mode: match compiled.mode {
-            r2sym::SemanticMode::Raw => "raw".to_string(),
-            r2sym::SemanticMode::Compiled => "compiled".to_string(),
-            r2sym::SemanticMode::IslandCompiled => "island_compiled".to_string(),
-            r2sym::SemanticMode::Residual => "residual".to_string(),
-            r2sym::SemanticMode::VmSummary => "vm_summary".to_string(),
-        },
-        capability: SemanticCapabilityInfo {
-            query_ready: compiled.capability.query_ready,
-            type_ready: compiled.capability.type_ready,
-            decompile_ready: compiled.capability.decompile_ready,
-        },
-        slice_class: match compiled.slice_class {
-            r2sym::SliceClass::Wrapper => "wrapper".to_string(),
-            r2sym::SliceClass::Worker => "worker".to_string(),
-            r2sym::SliceClass::RecursiveGroup => "recursive_group".to_string(),
-            r2sym::SliceClass::InterpreterSwitch => "interpreter_switch".to_string(),
-            r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect".to_string(),
-            r2sym::SliceClass::GenericLarge => "generic_large".to_string(),
-        },
+        schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+        stage: match compiled.stage {
+            r2sym::RefinementStage::Raw => "raw",
+            r2sym::RefinementStage::Compiled => "compiled",
+            r2sym::RefinementStage::Residual => "residual",
+        }
+        .to_string(),
+        granularity: match compiled.granularity {
+            r2sym::ArtifactGranularity::WholeFunction => "whole_function",
+            r2sym::ArtifactGranularity::Regioned => "regioned",
+            r2sym::ArtifactGranularity::SummaryOnly => "summary_only",
+        }
+        .to_string(),
+        execution: match compiled.execution {
+            r2sym::ExecutionModel::Native => "native",
+            r2sym::ExecutionModel::Vm => "vm",
+        }
+        .to_string(),
+        query_plan: compiled.query_plan(),
+        type_plan: compiled.type_plan(),
+        decompile_plan: compiled.decompile_plan(),
+        slice_class: compiled
+            .slice_class()
+            .map(|slice_class| match slice_class {
+                r2sym::SliceClass::Wrapper => "wrapper",
+                r2sym::SliceClass::Worker => "worker",
+                r2sym::SliceClass::RecursiveGroup => "recursive_group",
+                r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
+                r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
+                r2sym::SliceClass::GenericLarge => "generic_large",
+            })
+            .unwrap_or("worker")
+            .to_string(),
         residual_reasons: compiled
+            .diagnostics
             .residual_reasons
             .iter()
             .map(|reason| {
@@ -836,31 +870,65 @@ pub(crate) fn compiled_semantic_info(
                 .to_string()
             })
             .collect(),
-        closure_functions: compiled.closure_functions,
-        helper_functions: compiled.helper_functions,
-        derived_summaries: compiled.derived_summaries,
-        summary_attempted: compiled.derived_diagnostics.attempted,
-        summary_budget_exhausted: compiled.derived_diagnostics.budget_exhausted
-            + compiled.derived_diagnostics.scc_budget_exhausted,
-        summary_scc_count: compiled.derived_diagnostics.scc_count,
-        branch_fact_count: compiled.symbolic_facts.branch_facts.len(),
-        worker_island_count: compiled.symbolic_facts.worker_islands.len(),
-        control_island_count: compiled.symbolic_facts.control_islands.len(),
-        memory_island_count: compiled.symbolic_facts.memory_islands.len(),
-        compiled_condition_count: branch_compiled_conditions.len(),
-        exact_compiled_condition_count: control_facts
-            .iter()
-            .filter(|fact| fact.evidence.allows_hard_proof())
-            .count(),
-        actionable_compiled_condition_count: control_facts
-            .iter()
-            .filter(|fact| fact.evidence.allows_narrowing())
-            .count(),
-        branches_pruned: compiled.symbolic_facts.diagnostics.branches_pruned,
-        branches_unknown: compiled.symbolic_facts.diagnostics.branches_unknown,
-        skipped_large_cfg: compiled.symbolic_facts.diagnostics.skipped_large_cfg,
+        ambiguous_target_count: compiled.ambiguous_targets().len(),
+        ambiguous_targets: compiled
+            .ambiguous_targets()
+            .into_iter()
+            .map(|target| format!("0x{target:x}"))
+            .collect(),
+        closure_functions: compiled
+            .native_body()
+            .map(|body| body.summary.closure_functions)
+            .unwrap_or(0),
+        helper_functions: compiled
+            .native_body()
+            .map(|body| body.summary.helper_functions)
+            .unwrap_or(0),
+        derived_summaries: compiled
+            .native_body()
+            .map(|body| body.summary.derived_summaries)
+            .unwrap_or(0),
+        summary_attempted: compiled
+            .native_body()
+            .map(|body| body.summary.derived_diagnostics.attempted)
+            .unwrap_or(0),
+        summary_budget_exhausted: compiled
+            .native_body()
+            .map(|body| {
+                body.summary.derived_diagnostics.budget_exhausted
+                    + body.summary.derived_diagnostics.scc_budget_exhausted
+            })
+            .unwrap_or(0),
+        summary_scc_count: compiled
+            .native_body()
+            .map(|body| body.summary.derived_diagnostics.scc_count)
+            .unwrap_or(0),
+        region_count: native.map(|body| body.regions.len()).unwrap_or(0),
+        control_region_count: native
+            .map(|body| {
+                body.regions
+                    .values()
+                    .filter(|region| !region.control.is_empty())
+                    .count()
+            })
+            .unwrap_or(0),
+        memory_region_count: native
+            .map(|body| {
+                body.regions
+                    .values()
+                    .filter(|region| !region.memory.is_empty())
+                    .count()
+            })
+            .unwrap_or(0),
+        compiled_condition_count: compiled.actionable_control_count(),
+        exact_compiled_condition_count: compiled.exact_control_count(),
+        actionable_compiled_condition_count: compiled.actionable_control_count(),
+        branches_pruned: compiled.diagnostics.branches_pruned,
+        branches_unknown: compiled.diagnostics.branches_unknown,
+        skipped_large_cfg: compiled.diagnostics.skipped_large_cfg,
         interpreter: compiled
-            .interpreter
+            .vm_body()
+            .and_then(|body| body.interpreter.as_ref())
             .as_ref()
             .map(|interpreter| InterpreterDispatchInfo {
                 kind: match interpreter.kind {
@@ -873,12 +941,15 @@ pub(crate) fn compiled_semantic_info(
                 back_edges: interpreter.back_edges,
                 score: interpreter.score,
             }),
-        vm_step: compiled.vm_step.as_ref().map(vm_step_summary_info_from_sym),
-        vm_transfer: compiled
-            .vm_transfer
-            .as_ref()
+        vm_step: compiled
+            .vm_body()
+            .and_then(|body| body.step_summary.as_ref())
             .map(vm_step_summary_info_from_sym),
-        cache_hit: compiled.cache_hit,
+        vm_transfer: compiled
+            .vm_body()
+            .and_then(|body| body.transfer_summary.as_ref())
+            .map(vm_step_summary_info_from_sym),
+        cache_hit: compiled.diagnostics.cache_hit,
     }
 }
 

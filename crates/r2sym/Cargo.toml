@@ -24,4 +24,5 @@ r2 = ["r2pipe", "serde_json"]
 
 [dev-dependencies]
 criterion = "0.5"
+proptest = "1.6"
 sleigh-config = { version = "1.0", features = ["x86"] }

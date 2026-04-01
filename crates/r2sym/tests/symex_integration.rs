@@ -13,11 +13,10 @@ use r2sym::sim::{
 };
 use r2sym::spec::{AddressValue, ExplorationSpec, InputSpec, PredicateSpec};
 use r2sym::{
-    BackwardConditionPrecision, BackwardMemoryCondition, BackwardMemoryRegion,
-    CompiledSemanticMode, ExploreConfig, PathExplorer, QueryCompletion, ReachabilityStatus,
-    ReplayRegisterOverlay, ReplayRegisterValue, ReplaySeed, SolveStatus, SymQueryConfig, SymState,
-    SymValue, SymbolicReachabilityStatus, collect_symbolic_function_facts,
-    collect_symbolic_function_facts_with_scope, compile_derived_summary_return_postcondition,
+    BackwardConditionPrecision, BackwardMemoryCondition, BackwardMemoryRegion, ExploreConfig,
+    PathExplorer, QueryCompletion, ReachabilityStatus, RefinementStage, ReplayRegisterOverlay,
+    ReplayRegisterValue, ReplaySeed, SolveStatus, SymQueryConfig, SymState, SymValue,
+    SymbolicReachabilityStatus, compile_derived_summary_return_postcondition,
     compile_function_semantics_with_scope,
 };
 use z3::Context;
@@ -40,6 +39,16 @@ fn make_const(val: u64, size: u32) -> Varnode {
         size,
         meta: None,
     }
+}
+
+fn region_for_anchor(artifact: &r2sym::SemanticArtifact, anchor: u64) -> &r2sym::SemanticRegion {
+    artifact
+        .native_body()
+        .expect("native artifact")
+        .regions
+        .values()
+        .find(|region| region.anchor == anchor)
+        .expect("semantic region")
 }
 
 fn assert_argument_memory_term(
@@ -1169,31 +1178,41 @@ fn test_query_target_guided_can_reach_finds_target_under_tight_budget() {
 }
 
 #[test]
-fn collect_symbolic_function_facts_prunes_self_xor_dead_branch() {
+fn compile_function_semantics_prunes_self_xor_dead_branch() {
     let arch = make_x86_64_arch();
     let func = SsaArtifact::for_symbolic(&make_self_xor_guard_blocks(), Some(&arch))
         .expect("symbolic ssa");
     let ctx = Context::thread_local();
 
-    let facts = collect_symbolic_function_facts(
+    let artifact = compile_function_semantics_with_scope(
         &ctx,
         &func,
+        None,
         Some(&arch),
         &std::collections::HashMap::new(),
+        r2sym::SummaryProfile::Default,
     );
-    let branch = facts
-        .branch_fact_for_block(0x1000)
-        .expect("entry branch fact");
+    let region = region_for_anchor(&artifact, 0x1000);
 
-    assert_eq!(branch.true_target, 0x1010);
-    assert_eq!(branch.false_target, 0x1004);
-    assert_eq!(branch.true_status, SymbolicReachabilityStatus::Reachable);
-    assert_eq!(branch.false_status, SymbolicReachabilityStatus::Unreachable);
-    assert_eq!(facts.diagnostics.branches_pruned, 1);
+    assert_eq!(
+        region.frontier,
+        std::collections::BTreeSet::from([0x1004, 0x1010])
+    );
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1010
+            && fact.value.status == SymbolicReachabilityStatus::Reachable
+            && fact.value.branch_truth == Some(true)
+    }));
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1004
+            && fact.value.status == SymbolicReachabilityStatus::Unreachable
+            && fact.value.branch_truth == Some(false)
+    }));
+    assert_eq!(artifact.diagnostics.branches_pruned, 1);
 }
 
 #[test]
-fn collect_symbolic_function_facts_with_scope_prunes_helper_return_dead_branch() {
+fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![
         R2ILBlock {
@@ -1282,30 +1301,30 @@ fn collect_symbolic_function_facts_with_scope_prunes_helper_return_dead_branch()
     .expect("scope");
 
     let ctx = Context::thread_local();
-    let facts = collect_symbolic_function_facts_with_scope(
+    let artifact = compile_function_semantics_with_scope(
         &ctx,
         &root,
         Some(&scope),
         Some(&arch),
         &std::collections::HashMap::new(),
+        r2sym::SummaryProfile::Default,
     );
-    let branch = facts
-        .branch_fact_for_block(0x1004)
-        .expect("post-call branch fact");
-
-    assert_eq!(branch.true_target, 0x1010);
-    assert_eq!(branch.false_target, 0x1008);
+    let region = region_for_anchor(&artifact, 0x1004);
     assert_eq!(
-        branch.true_status,
-        SymbolicReachabilityStatus::Unreachable,
-        "{branch:#?}"
+        region.frontier,
+        std::collections::BTreeSet::from([0x1008, 0x1010])
     );
-    assert_eq!(
-        branch.false_status,
-        SymbolicReachabilityStatus::Reachable,
-        "{branch:#?}"
-    );
-    assert_eq!(facts.diagnostics.branches_pruned, 1);
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1010
+            && fact.value.status == SymbolicReachabilityStatus::Unreachable
+            && fact.value.branch_truth == Some(true)
+    }));
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1008
+            && fact.value.status == SymbolicReachabilityStatus::Reachable
+            && fact.value.branch_truth == Some(false)
+    }));
+    assert_eq!(artifact.diagnostics.branches_pruned, 1);
 }
 
 #[test]
@@ -1407,15 +1426,20 @@ fn compile_function_semantics_with_scope_marks_helper_scope_compiled() {
         r2sym::SummaryProfile::Default,
     );
 
-    assert_eq!(compiled.mode, CompiledSemanticMode::Compiled);
-    assert_eq!(compiled.closure_functions, 2);
-    assert_eq!(compiled.helper_functions, 1);
-    assert!(compiled.derived_summaries >= 1);
-    assert_eq!(compiled.symbolic_facts.diagnostics.branches_pruned, 1);
+    let summary = &compiled
+        .native_body()
+        .expect("native artifact body")
+        .summary;
+
+    assert_eq!(compiled.stage, RefinementStage::Compiled);
+    assert_eq!(summary.closure_functions, 2);
+    assert_eq!(summary.helper_functions, 1);
+    assert!(summary.derived_summaries >= 1);
+    assert_eq!(compiled.diagnostics.branches_pruned, 1);
 }
 
 #[test]
-fn collect_symbolic_function_facts_with_scope_prunes_helper_return_spilled_dead_branch() {
+fn compile_function_semantics_with_scope_prunes_helper_return_spilled_dead_branch() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![
         R2ILBlock {
@@ -1524,34 +1548,34 @@ fn collect_symbolic_function_facts_with_scope_prunes_helper_return_spilled_dead_
     .expect("scope");
 
     let ctx = Context::thread_local();
-    let facts = collect_symbolic_function_facts_with_scope(
+    let artifact = compile_function_semantics_with_scope(
         &ctx,
         &root,
         Some(&scope),
         Some(&arch),
         &std::collections::HashMap::new(),
+        r2sym::SummaryProfile::Default,
     );
-    let branch = facts
-        .branch_fact_for_block(0x1004)
-        .expect("post-call branch fact");
-
-    assert_eq!(branch.true_target, 0x1010);
-    assert_eq!(branch.false_target, 0x1008);
+    let region = region_for_anchor(&artifact, 0x1004);
     assert_eq!(
-        branch.true_status,
-        SymbolicReachabilityStatus::Unreachable,
-        "{branch:#?}"
+        region.frontier,
+        std::collections::BTreeSet::from([0x1008, 0x1010])
     );
-    assert_eq!(
-        branch.false_status,
-        SymbolicReachabilityStatus::Reachable,
-        "{branch:#?}"
-    );
-    assert_eq!(facts.diagnostics.branches_pruned, 1);
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1010
+            && fact.value.status == SymbolicReachabilityStatus::Unreachable
+            && fact.value.branch_truth == Some(true)
+    }));
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1008
+            && fact.value.status == SymbolicReachabilityStatus::Reachable
+            && fact.value.branch_truth == Some(false)
+    }));
+    assert_eq!(artifact.diagnostics.branches_pruned, 1);
 }
 
 #[test]
-fn collect_symbolic_function_facts_with_scope_prunes_helper_return_dead_branch_via_eax_alias() {
+fn compile_function_semantics_with_scope_prunes_helper_return_dead_branch_via_eax_alias() {
     let arch = make_x86_64_arch();
     let root_blocks = vec![
         R2ILBlock {
@@ -1640,30 +1664,30 @@ fn collect_symbolic_function_facts_with_scope_prunes_helper_return_dead_branch_v
     .expect("scope");
 
     let ctx = Context::thread_local();
-    let facts = collect_symbolic_function_facts_with_scope(
+    let artifact = compile_function_semantics_with_scope(
         &ctx,
         &root,
         Some(&scope),
         Some(&arch),
         &std::collections::HashMap::new(),
+        r2sym::SummaryProfile::Default,
     );
-    let branch = facts
-        .branch_fact_for_block(0x1004)
-        .expect("post-call branch fact");
-
-    assert_eq!(branch.true_target, 0x1010);
-    assert_eq!(branch.false_target, 0x1008);
+    let region = region_for_anchor(&artifact, 0x1004);
     assert_eq!(
-        branch.true_status,
-        SymbolicReachabilityStatus::Reachable,
-        "{branch:#?}"
+        region.frontier,
+        std::collections::BTreeSet::from([0x1008, 0x1010])
     );
-    assert_eq!(
-        branch.false_status,
-        SymbolicReachabilityStatus::Unreachable,
-        "{branch:#?}"
-    );
-    assert_eq!(facts.diagnostics.branches_pruned, 1);
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1010
+            && fact.value.status == SymbolicReachabilityStatus::Reachable
+            && fact.value.branch_truth == Some(true)
+    }));
+    assert!(region.control.iter().any(|fact| {
+        fact.value.target == 0x1008
+            && fact.value.status == SymbolicReachabilityStatus::Unreachable
+            && fact.value.branch_truth == Some(false)
+    }));
+    assert_eq!(artifact.diagnostics.branches_pruned, 1);
 }
 
 #[test]

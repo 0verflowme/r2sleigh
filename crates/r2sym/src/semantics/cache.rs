@@ -8,9 +8,10 @@ use r2ssa::{SSAOp, SsaArtifact};
 
 use crate::sim::{PreparedFunctionScope, SummaryProfile};
 
-use super::artifact::CompiledSemanticArtifact;
+use super::artifact::SemanticArtifact;
 
 const SEMANTIC_CACHE_LIMIT: usize = 128;
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,6 +28,7 @@ pub(crate) enum SemanticCacheScopeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SemanticCacheKey {
+    pub schema_version: u32,
     pub root_addr: u64,
     pub scope_hash: u64,
     pub arch_hash: u64,
@@ -37,7 +39,7 @@ pub(crate) struct SemanticCacheKey {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SemanticCompilationResult {
-    pub artifact: Arc<CompiledSemanticArtifact>,
+    pub artifact: Arc<SemanticArtifact>,
     pub cache_hit: bool,
 }
 
@@ -143,6 +145,7 @@ pub(crate) fn semantic_cache_key(
     seed_mode: SemanticSeedMode,
 ) -> SemanticCacheKey {
     SemanticCacheKey {
+        schema_version: SEMANTIC_ARTIFACT_SCHEMA_VERSION,
         root_addr: func.entry,
         scope_hash: if scope.is_some() {
             stable_scope_hash(scope)
@@ -163,6 +166,7 @@ pub(crate) fn coarse_large_slice_cache_key(
     seed_mode: SemanticSeedMode,
 ) -> SemanticCacheKey {
     SemanticCacheKey {
+        schema_version: SEMANTIC_ARTIFACT_SCHEMA_VERSION,
         root_addr,
         scope_hash: 0,
         arch_hash: arch_hash(arch),
@@ -172,15 +176,13 @@ pub(crate) fn coarse_large_slice_cache_key(
     }
 }
 
-fn semantic_cache() -> &'static RwLock<HashMap<SemanticCacheKey, Arc<CompiledSemanticArtifact>>> {
-    static CACHE: OnceLock<RwLock<HashMap<SemanticCacheKey, Arc<CompiledSemanticArtifact>>>> =
+fn semantic_cache() -> &'static RwLock<HashMap<SemanticCacheKey, Arc<SemanticArtifact>>> {
+    static CACHE: OnceLock<RwLock<HashMap<SemanticCacheKey, Arc<SemanticArtifact>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub(crate) fn lookup_semantic_cache(
-    key: &SemanticCacheKey,
-) -> Option<Arc<CompiledSemanticArtifact>> {
+pub(crate) fn lookup_semantic_cache(key: &SemanticCacheKey) -> Option<Arc<SemanticArtifact>> {
     semantic_cache()
         .read()
         .expect("semantic cache read lock poisoned")
@@ -190,8 +192,8 @@ pub(crate) fn lookup_semantic_cache(
 
 pub(crate) fn cache_insert_bounded(
     key: SemanticCacheKey,
-    value: Arc<CompiledSemanticArtifact>,
-) -> Arc<CompiledSemanticArtifact> {
+    value: Arc<SemanticArtifact>,
+) -> Arc<SemanticArtifact> {
     let mut guard = semantic_cache()
         .write()
         .expect("semantic cache write lock poisoned");
@@ -209,7 +211,10 @@ mod display_name_tests {
 
     use crate::sim::{PreparedFunctionScope, ScopedPreparedFunction};
 
-    use super::stable_scope_hash;
+    use super::{
+        SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCacheScopeKind, SemanticSeedMode,
+        coarse_large_slice_cache_key, semantic_cache_key, stable_scope_hash,
+    };
 
     const RAX: u64 = 0;
 
@@ -227,6 +232,46 @@ mod display_name_tests {
             size,
             meta: None,
         }
+    }
+
+    #[test]
+    fn semantic_cache_keys_use_explicit_schema_version() {
+        let func = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x401000,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&test_arch()),
+        )
+        .expect("ssa");
+        let exact_key = semantic_cache_key(
+            &func,
+            None,
+            Some(&test_arch()),
+            crate::sim::SummaryProfile::Default,
+            SemanticSeedMode::Static,
+        );
+        let coarse_key = coarse_large_slice_cache_key(
+            func.entry,
+            Some(&test_arch()),
+            crate::sim::SummaryProfile::Default,
+            SemanticSeedMode::Static,
+        );
+        assert_eq!(exact_key.schema_version, SEMANTIC_ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(coarse_key.schema_version, SEMANTIC_ARTIFACT_SCHEMA_VERSION);
+        assert!(matches!(
+            exact_key.scope_kind,
+            SemanticCacheScopeKind::Exact
+        ));
+        assert!(matches!(
+            coarse_key.scope_kind,
+            SemanticCacheScopeKind::CoarseLargeSlice
+        ));
     }
 
     fn simple_function(entry: u64) -> SsaArtifact {

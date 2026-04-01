@@ -19,9 +19,9 @@ use crate::facts::{
     CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
     CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
     FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics,
-    LocalFieldAccessFact, SymbolicMemoryCondition, SymbolicMemoryRegion, SymbolicSemanticFacts,
-    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    LocalFieldAccessFact, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
+use crate::function_facts::FunctionFacts;
 use crate::model::Signedness;
 use crate::prepare::recover_vars_arch_profile;
 
@@ -193,6 +193,7 @@ pub struct TypeWritebackPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeWritebackAnalysis {
     pub signature: InferredSignature,
+    pub function_facts: FunctionFacts,
     pub type_facts: FunctionTypeFacts,
     pub plan: TypeWritebackPlan,
 }
@@ -210,7 +211,7 @@ pub struct TypeWritebackAnalysisInput<'a> {
 }
 
 pub struct TypeWritebackSemanticInputs<'a> {
-    pub symbolic_facts: &'a SymbolicSemanticFacts,
+    pub artifact: &'a r2sym::SemanticArtifact,
     pub local_field_accesses: &'a [LocalFieldAccessFact],
 }
 
@@ -551,9 +552,9 @@ fn build_type_writeback_analysis_inner(
             semantic.local_field_accesses,
             input.ptr_bits,
         );
-        augment_local_struct_artifacts_with_symbolic_facts(
+        augment_local_struct_artifacts_with_semantics(
             &mut local_structs,
-            semantic.symbolic_facts,
+            semantic.artifact,
             input.ptr_bits,
         );
     }
@@ -650,10 +651,6 @@ fn build_type_writeback_analysis_inner(
         external_type_db: type_db,
         slot_type_overrides: local_structs.slot_type_overrides.clone(),
         slot_field_profiles: local_structs.slot_field_profiles.clone(),
-        symbolic_facts: semantic_inputs
-            .as_ref()
-            .map(|semantic| semantic.symbolic_facts.clone())
-            .unwrap_or_default(),
         local_field_accesses: semantic_inputs
             .as_ref()
             .map(|semantic| semantic.local_field_accesses.to_vec())
@@ -674,11 +671,11 @@ fn build_type_writeback_analysis_inner(
     })
     .build();
     if let Some(semantic) = semantic_inputs.as_ref()
-        && semantic.symbolic_facts.diagnostics.branches_pruned > 0
+        && semantic.artifact.diagnostics.branches_pruned > 0
     {
         type_facts.diagnostics.push(format!(
             "symbolic pruned {} branch arm(s)",
-            semantic.symbolic_facts.diagnostics.branches_pruned
+            semantic.artifact.diagnostics.branches_pruned
         ));
     }
     let global_type_links = score_global_type_links(
@@ -699,6 +696,12 @@ fn build_type_writeback_analysis_inner(
 
     TypeWritebackAnalysis {
         signature: input.inferred_signature,
+        function_facts: FunctionFacts::new(
+            type_facts.clone(),
+            semantic_inputs
+                .as_ref()
+                .map(|semantic| semantic.artifact.clone()),
+        ),
         type_facts,
         plan,
     }
@@ -717,102 +720,105 @@ pub fn build_type_writeback_analysis_with_semantics(
     build_type_writeback_analysis_inner(input, Some(semantic_inputs))
 }
 
-fn symbolic_semantic_mode_label(mode: crate::facts::SymbolicSemanticMode) -> &'static str {
-    match mode {
-        crate::facts::SymbolicSemanticMode::Raw => "raw",
-        crate::facts::SymbolicSemanticMode::Compiled => "compiled",
-        crate::facts::SymbolicSemanticMode::IslandCompiled => "island_compiled",
-        crate::facts::SymbolicSemanticMode::Residual => "residual",
-        crate::facts::SymbolicSemanticMode::VmSummary => "vm_summary",
-    }
-}
-
-fn symbolic_slice_class_label(
-    slice_class: crate::facts::SymbolicSemanticSliceClass,
-) -> &'static str {
-    match slice_class {
-        crate::facts::SymbolicSemanticSliceClass::Wrapper => "wrapper",
-        crate::facts::SymbolicSemanticSliceClass::Worker => "worker",
-        crate::facts::SymbolicSemanticSliceClass::RecursiveGroup => "recursive_group",
-        crate::facts::SymbolicSemanticSliceClass::InterpreterSwitch => "interpreter_switch",
-        crate::facts::SymbolicSemanticSliceClass::InterpreterIndirect => "interpreter_indirect",
-        crate::facts::SymbolicSemanticSliceClass::GenericLarge => "generic_large",
-    }
-}
-
-fn symbolic_residual_reason_label(
-    reason: crate::facts::SymbolicSemanticResidualReason,
-) -> &'static str {
-    match reason {
-        crate::facts::SymbolicSemanticResidualReason::MissingArch => "missing_arch",
-        crate::facts::SymbolicSemanticResidualReason::LargeCfg => "large_cfg",
-        crate::facts::SymbolicSemanticResidualReason::SummaryBudgetExhausted => {
-            "summary_budget_exhausted"
+fn semantic_stage_label(artifact: &r2sym::SemanticArtifact) -> &'static str {
+    match (artifact.execution, artifact.stage, artifact.granularity) {
+        (r2sym::ExecutionModel::Vm, _, _) => "vm_summary",
+        (_, r2sym::RefinementStage::Raw, _) => "raw",
+        (_, r2sym::RefinementStage::Compiled, r2sym::ArtifactGranularity::Regioned) => {
+            "island_compiled"
         }
-        crate::facts::SymbolicSemanticResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
-        crate::facts::SymbolicSemanticResidualReason::InterpreterRequiresStepSummary => {
+        (_, r2sym::RefinementStage::Compiled, _) => "compiled",
+        (_, r2sym::RefinementStage::Residual, _) => "residual",
+    }
+}
+
+fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'static str {
+    match slice_class {
+        r2sym::SliceClass::Wrapper => "wrapper",
+        r2sym::SliceClass::Worker => "worker",
+        r2sym::SliceClass::RecursiveGroup => "recursive_group",
+        r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
+        r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
+        r2sym::SliceClass::GenericLarge => "generic_large",
+    }
+}
+
+fn semantic_residual_reason_label(reason: r2sym::ResidualReason) -> &'static str {
+    match reason {
+        r2sym::ResidualReason::MissingArch => "missing_arch",
+        r2sym::ResidualReason::LargeCfg => "large_cfg",
+        r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
+        r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
+        r2sym::ResidualReason::InterpreterRequiresStepSummary => {
             "interpreter_requires_step_summary"
         }
     }
 }
 
-fn semantic_fallback_warning(symbolic_facts: &SymbolicSemanticFacts) -> String {
-    let slice_class = symbolic_facts
+fn semantic_fallback_warning(artifact: &r2sym::SemanticArtifact) -> String {
+    let slice_class = artifact
         .slice_class()
-        .map(symbolic_slice_class_label)
+        .map(semantic_slice_class_label)
         .unwrap_or("unknown");
-    let mode = symbolic_facts
-        .semantic_mode()
-        .map(symbolic_semantic_mode_label)
-        .unwrap_or("unknown");
+    let mode = semantic_stage_label(artifact);
     let mut warning = format!("semantic fallback: {slice_class} slice in {mode} mode");
-    if !symbolic_facts.diagnostics.residual_reasons.is_empty() {
+    if !artifact.diagnostics.residual_reasons.is_empty() {
         warning.push_str(" (");
         warning.push_str(
-            &symbolic_facts
+            &artifact
                 .diagnostics
                 .residual_reasons
                 .iter()
-                .map(|reason| symbolic_residual_reason_label(*reason))
+                .map(|reason| semantic_residual_reason_label(*reason))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
         warning.push(')');
     }
-    if !symbolic_facts.branch_facts.is_empty()
-        || !symbolic_facts.worker_islands.is_empty()
-        || !symbolic_facts.control_islands.is_empty()
-        || !symbolic_facts.memory_islands.is_empty()
+    if let Some(native) = artifact.native_body()
+        && !native.regions.is_empty()
     {
         warning.push_str(&format!(
-            "; branch_facts={}, worker_islands={}, control_islands={}, memory_islands={}, actionable_conditions={}, exact_conditions={}",
-            symbolic_facts.branch_facts.len(),
-            symbolic_facts.worker_islands.len(),
-            symbolic_facts.control_islands.len(),
-            symbolic_facts.memory_islands.len(),
-            symbolic_facts.actionable_compiled_condition_count(),
-            symbolic_facts.exact_compiled_condition_count(),
+            "; regions={}, actionable_conditions={}, exact_conditions={}",
+            native.regions.len(),
+            native.actionable_control_count(),
+            native.exact_control_count(),
         ));
     }
     warning
+}
+
+pub fn semantic_artifact_prefers_bounded_type_plan(artifact: &r2sym::SemanticArtifact) -> bool {
+    if !matches!(artifact.type_plan(), r2sym::TypePlan::Ready) {
+        return true;
+    }
+    matches!(
+        artifact.stage,
+        r2sym::RefinementStage::Residual | r2sym::RefinementStage::Compiled
+    ) && artifact.diagnostics.skipped_large_cfg
+        && matches!(artifact.slice_class(), Some(r2sym::SliceClass::Worker))
+        && artifact
+            .native_body()
+            .is_some_and(|body| !body.regions.is_empty())
+        && (artifact.actionable_control_count() > 0
+            || artifact
+                .actionable_regions()
+                .into_iter()
+                .any(|region| !region.actionable_memory_terms().is_empty()))
 }
 
 pub fn build_semantic_type_fallback_plan(
     function_name: &str,
     arch_name: &str,
     ptr_bits: u32,
-    symbolic_facts: &SymbolicSemanticFacts,
+    artifact: &r2sym::SemanticArtifact,
 ) -> TypeWritebackPlan {
-    let mut warnings = vec![semantic_fallback_warning(symbolic_facts)];
-    if !symbolic_facts.type_ready() {
+    let mut warnings = vec![semantic_fallback_warning(artifact)];
+    if !matches!(artifact.type_plan(), r2sym::TypePlan::Ready) {
         warnings.push("type analysis not ready from semantic capability".to_string());
     }
     let mut local_structs = LocalStructArtifacts::default();
-    augment_local_struct_artifacts_with_symbolic_facts(
-        &mut local_structs,
-        symbolic_facts,
-        ptr_bits,
-    );
+    augment_local_struct_artifacts_with_semantics(&mut local_structs, artifact, ptr_bits);
     let mut signature = InferredSignature {
         function_name: function_name.to_string(),
         signature: format!("void {}(void)", function_name),
@@ -832,7 +838,7 @@ pub fn build_semantic_type_fallback_plan(
     }
     if !local_structs.struct_decls.is_empty() {
         warnings.push(format!(
-            "semantic worker islands projected {} struct candidate(s)",
+            "semantic regions projected {} struct candidate(s)",
             local_structs.struct_decls.len()
         ));
     }
@@ -1402,18 +1408,23 @@ pub fn infer_local_struct_artifacts_from_ssa(
     }
 }
 
-pub fn augment_local_struct_artifacts_with_symbolic_facts(
+pub fn augment_local_struct_artifacts_with_semantics(
     local_structs: &mut LocalStructArtifacts,
-    symbolic_facts: &SymbolicSemanticFacts,
+    artifact: &r2sym::SemanticArtifact,
     ptr_bits: u32,
 ) {
     let mut projected_profiles = BTreeMap::<usize, BTreeMap<u64, String>>::new();
-    for island in &symbolic_facts.worker_islands {
-        if !(island.confidence.is_reliable() && island.evidence.is_reliable()) {
-            continue;
-        }
-        for term in &island.memory_terms {
-            let Some((slot, offset, field_type)) = symbolic_memory_term_slot_field(term, ptr_bits)
+    let Some(native) = artifact.native_body() else {
+        return;
+    };
+    for region in native.regions.values() {
+        for term in region
+            .memory
+            .iter()
+            .filter(|memory| memory.evidence.is_reliable())
+            .map(|memory| &memory.value.term)
+        {
+            let Some((slot, offset, field_type)) = backward_memory_term_slot_field(term, ptr_bits)
             else {
                 continue;
             };
@@ -1425,48 +1436,19 @@ pub fn augment_local_struct_artifacts_with_symbolic_facts(
         }
     }
     if projected_profiles.is_empty() {
-        for island in &symbolic_facts.memory_islands {
-            if !(island.confidence.is_reliable() && island.evidence.is_reliable()) {
-                continue;
-            }
-            for term in &island.terms {
-                let Some((slot, offset, field_type)) =
-                    symbolic_memory_term_slot_field(term, ptr_bits)
-                else {
-                    continue;
-                };
-                projected_profiles
-                    .entry(slot)
-                    .or_default()
-                    .entry(offset)
-                    .or_insert(field_type);
-            }
-        }
-    }
-    if projected_profiles.is_empty() {
-        for compiled in symbolic_facts
-            .branch_facts
-            .iter()
-            .filter_map(|fact| fact.actionable_compiled_condition())
-            .chain(
-                symbolic_facts
-                    .worker_islands
-                    .iter()
-                    .filter_map(|island| island.actionable_compiled_condition()),
-            )
-            .chain(
-                symbolic_facts
-                    .control_islands
-                    .iter()
-                    .filter_map(|island| island.actionable_compiled_condition()),
-            )
+        for compiled in native
+            .regions
+            .values()
+            .flat_map(|region| region.control.iter())
+            .filter(|fact| fact.evidence.allows_narrowing())
+            .filter_map(|fact| fact.value.compiled.as_ref())
         {
-            if !(compiled.confidence.is_reliable() && compiled.evidence.is_reliable()) {
+            if !compiled.evidence().is_reliable() {
                 continue;
             }
             for term in &compiled.memory_terms {
                 let Some((slot, offset, field_type)) =
-                    symbolic_memory_term_slot_field(term, ptr_bits)
+                    backward_memory_term_slot_field(term, ptr_bits)
                 else {
                     continue;
                 };
@@ -1588,16 +1570,16 @@ fn augment_local_struct_artifacts_with_local_field_accesses(
     }
 }
 
-fn symbolic_memory_term_slot_field(
-    term: &SymbolicMemoryCondition,
+fn backward_memory_term_slot_field(
+    term: &r2sym::BackwardMemoryCondition,
     _ptr_bits: u32,
 ) -> Option<(usize, u64, String)> {
-    if !(term.confidence.is_reliable() && term.evidence.is_reliable()) {
+    if !term.evidence().is_reliable() {
         return None;
     }
-    let slot = match term.region {
-        SymbolicMemoryRegion::Argument { index } => index,
-        SymbolicMemoryRegion::Region(_) => return None,
+    let slot = match &term.region {
+        r2sym::BackwardMemoryRegion::Argument { index } => *index,
+        r2sym::BackwardMemoryRegion::Region(_) => return None,
     };
     if !term.exact_offset && term.offset_lo != term.offset_hi {
         return None;
@@ -3483,6 +3465,114 @@ fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn test_native_summary(slice_class: r2sym::SliceClass) -> r2sym::NativeFunctionSummary {
+        r2sym::NativeFunctionSummary {
+            slice_class,
+            closure_functions: 1,
+            helper_functions: 0,
+            derived_summaries: 0,
+            derived_diagnostics: Default::default(),
+        }
+    }
+
+    fn test_artifact(
+        stage: r2sym::RefinementStage,
+        slice_class: r2sym::SliceClass,
+        skipped_large_cfg: bool,
+        residual_reasons: Vec<r2sym::ResidualReason>,
+        regions: Vec<r2sym::SemanticRegion>,
+    ) -> r2sym::SemanticArtifact {
+        let regions = regions
+            .into_iter()
+            .map(|region| (region.key(), region))
+            .collect::<BTreeMap<_, _>>();
+        r2sym::SemanticArtifact {
+            stage,
+            granularity: r2sym::ArtifactGranularity::Regioned,
+            execution: r2sym::ExecutionModel::Native,
+            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
+                summary: test_native_summary(slice_class),
+                regions,
+            }),
+            diagnostics: r2sym::SemanticArtifactDiagnostics {
+                branches_evaluated: 0,
+                branches_pruned: 0,
+                branches_unknown: 0,
+                skipped_missing_arch: false,
+                skipped_large_cfg,
+                residual_reasons,
+                ambiguous_targets: Vec::new(),
+                cache_hit: false,
+            },
+        }
+    }
+
+    fn test_arg_memory_term(offset: i64, size: u32) -> r2sym::BackwardMemoryCondition {
+        r2sym::BackwardMemoryCondition {
+            region: r2sym::BackwardMemoryRegion::Argument { index: 0 },
+            offset_lo: offset,
+            offset_hi: offset,
+            size,
+            exact_offset: true,
+            evidence: r2sym::SemanticEvidence::exact(),
+            binding: None,
+            expr: format!("*(arg0 + {offset})"),
+            value_expr: None,
+            exact_value: false,
+        }
+    }
+
+    fn test_exact_compiled_condition(
+        simplified: &str,
+        memory_terms: Vec<r2sym::BackwardMemoryCondition>,
+    ) -> r2sym::BackwardConditionSummary {
+        r2sym::BackwardConditionSummary {
+            simplified: simplified.to_string(),
+            terms: vec![simplified.to_string()],
+            memory_terms,
+            backward_memory_substitutions: 1,
+            backward_memory_candidate_enumerations: 1,
+            backward_memory_residual_fallbacks: 0,
+            precision: r2sym::BackwardConditionPrecision::Exact,
+            supported_paths: 1,
+            total_paths: 1,
+        }
+    }
+
+    fn test_region_with_control(
+        anchor: u64,
+        target: u64,
+        condition: &str,
+        compiled: r2sym::BackwardConditionSummary,
+    ) -> r2sym::SemanticRegion {
+        r2sym::SemanticRegion {
+            anchor,
+            frontier: BTreeSet::from([target]),
+            control: vec![r2sym::Judged::new(
+                r2sym::ControlFact {
+                    target,
+                    status: r2sym::SymbolicReachabilityStatus::Reachable,
+                    branch_truth: Some(true),
+                    condition: Some(condition.to_string()),
+                    compiled: Some(compiled),
+                },
+                r2sym::SemanticEvidence::exact(),
+            )],
+            memory: Vec::new(),
+            pre: Vec::new(),
+            post: Vec::new(),
+            targets: vec![r2sym::Judged::new(
+                r2sym::TargetFact {
+                    target,
+                    status: r2sym::SymbolicReachabilityStatus::Reachable,
+                    branch_truth: Some(true),
+                },
+                r2sym::SemanticEvidence::exact(),
+            )],
+        }
+    }
 
     #[test]
     fn main_signature_canonicalization_updates_signature_output() {
@@ -5205,58 +5295,23 @@ mod tests {
 
     #[test]
     fn symbolic_actionable_memory_terms_seed_local_struct_profiles() {
-        let compiled = crate::facts::SymbolicCompiledCondition {
-            simplified: "arg0->f_8 == 0".to_string(),
-            terms: vec!["arg0->f_8 == 0".to_string()],
-            memory_terms: vec![crate::facts::SymbolicMemoryCondition {
-                region: crate::facts::SymbolicMemoryRegion::Argument { index: 0 },
-                offset_lo: 8,
-                offset_hi: 8,
-                size: 4,
-                exact_offset: true,
-                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-                binding: None,
-                expr: "*(arg0 + 8)".to_string(),
-                value_expr: None,
-                exact_value: false,
-            }],
-            backward_memory_substitutions: 1,
-            backward_memory_candidate_enumerations: 1,
-            backward_memory_residual_fallbacks: 0,
-            precision: crate::facts::SymbolicConditionPrecision::Exact,
-            evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-            confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-            supported_paths: 1,
-            total_paths: 1,
-        };
-        let symbolic_facts = crate::facts::SymbolicSemanticFacts {
-            branch_facts: Vec::new(),
-            worker_islands: Vec::new(),
-            control_islands: vec![crate::facts::SymbolicControlIsland {
-                kind: crate::facts::SymbolicControlIslandKind::LargeCfgBranchFrontier,
-                anchor_block: 0x401000,
-                frontier_targets: vec![0x401020],
-                facts: vec![crate::facts::SymbolicControlFact {
-                    target: 0x401020,
-                    status: crate::facts::SymbolicReachabilityStatus::Reachable,
-                    condition: Some("arg0->f_8 == 0".to_string()),
-                    compiled: Some(compiled),
-                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-                }],
-                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-            }],
-            memory_islands: Vec::new(),
-            diagnostics: crate::facts::SymbolicFactDiagnostics::default(),
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-        };
+        let compiled =
+            test_exact_compiled_condition("arg0->f_8 == 0", vec![test_arg_memory_term(8, 4)]);
+        let artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            vec![test_region_with_control(
+                0x401000,
+                0x401020,
+                "arg0->f_8 == 0",
+                compiled,
+            )],
+        );
         let mut local_structs = LocalStructArtifacts::default();
 
-        augment_local_struct_artifacts_with_symbolic_facts(&mut local_structs, &symbolic_facts, 64);
+        augment_local_struct_artifacts_with_semantics(&mut local_structs, &artifact, 64);
 
         assert_eq!(
             local_structs
@@ -5283,37 +5338,29 @@ mod tests {
 
     #[test]
     fn symbolic_memory_islands_seed_local_struct_profiles_without_control_islands() {
-        let symbolic_facts = crate::facts::SymbolicSemanticFacts {
-            branch_facts: Vec::new(),
-            worker_islands: Vec::new(),
-            control_islands: Vec::new(),
-            memory_islands: vec![crate::facts::SymbolicMemoryIsland {
-                kind: crate::facts::SymbolicMemoryIslandKind::ConditionFrontier,
-                anchor_block: 0x401000,
-                terms: vec![crate::facts::SymbolicMemoryCondition {
-                    region: crate::facts::SymbolicMemoryRegion::Argument { index: 0 },
-                    offset_lo: 8,
-                    offset_hi: 8,
-                    size: 4,
-                    exact_offset: true,
-                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-                    binding: None,
-                    expr: "*(arg0 + 8)".to_string(),
-                    value_expr: None,
-                    exact_value: false,
-                }],
-                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
+        let artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            vec![r2sym::SemanticRegion {
+                anchor: 0x401000,
+                frontier: BTreeSet::new(),
+                control: Vec::new(),
+                memory: vec![r2sym::Judged::new(
+                    r2sym::MemoryFact {
+                        term: test_arg_memory_term(8, 4),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                )],
+                pre: Vec::new(),
+                post: Vec::new(),
+                targets: Vec::new(),
             }],
-            diagnostics: crate::facts::SymbolicFactDiagnostics::default(),
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-        };
+        );
         let mut local_structs = LocalStructArtifacts::default();
 
-        augment_local_struct_artifacts_with_symbolic_facts(&mut local_structs, &symbolic_facts, 64);
+        augment_local_struct_artifacts_with_semantics(&mut local_structs, &artifact, 64);
 
         assert_eq!(
             local_structs
@@ -5334,83 +5381,44 @@ mod tests {
 
     #[test]
     fn semantic_type_fallback_plan_uses_typed_symbolic_summary() {
-        let symbolic_facts = crate::facts::SymbolicSemanticFacts {
-            branch_facts: vec![crate::facts::SymbolicBranchFact {
-                block_addr: 0x401000,
-                true_target: 0x401010,
-                false_target: 0x401020,
-                true_status: crate::facts::SymbolicReachabilityStatus::Reachable,
-                false_status: crate::facts::SymbolicReachabilityStatus::Unreachable,
-                true_condition: Some("x == 0".to_string()),
-                false_condition: Some("x != 0".to_string()),
-                true_compiled: None,
-                false_compiled: None,
+        let artifact = test_artifact(
+            r2sym::RefinementStage::Residual,
+            r2sym::SliceClass::Worker,
+            true,
+            vec![r2sym::ResidualReason::LargeCfg],
+            vec![r2sym::SemanticRegion {
+                anchor: 0x401000,
+                frontier: BTreeSet::from([0x401010]),
+                control: vec![r2sym::Judged::new(
+                    r2sym::ControlFact {
+                        target: 0x401010,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(test_exact_compiled_condition("x == 0", Vec::new())),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                )],
+                memory: vec![r2sym::Judged::new(
+                    r2sym::MemoryFact {
+                        term: test_arg_memory_term(8, 4),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                )],
+                pre: Vec::new(),
+                post: Vec::new(),
+                targets: vec![r2sym::Judged::new(
+                    r2sym::TargetFact {
+                        target: 0x401010,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                )],
             }],
-            worker_islands: Vec::new(),
-            control_islands: vec![crate::facts::SymbolicControlIsland {
-                kind: crate::facts::SymbolicControlIslandKind::LargeCfgBranchFrontier,
-                anchor_block: 0x401000,
-                frontier_targets: vec![0x401010],
-                facts: vec![crate::facts::SymbolicControlFact {
-                    target: 0x401010,
-                    status: crate::facts::SymbolicReachabilityStatus::Reachable,
-                    condition: Some("x == 0".to_string()),
-                    compiled: Some(crate::facts::SymbolicCompiledCondition {
-                        simplified: "x == 0".to_string(),
-                        terms: vec!["x == 0".to_string()],
-                        memory_terms: Vec::new(),
-                        backward_memory_substitutions: 0,
-                        backward_memory_candidate_enumerations: 0,
-                        backward_memory_residual_fallbacks: 0,
-                        precision: crate::facts::SymbolicConditionPrecision::Exact,
-                        evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                        confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-                        supported_paths: 1,
-                        total_paths: 1,
-                    }),
-                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-                }],
-                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-            }],
-            memory_islands: vec![crate::facts::SymbolicMemoryIsland {
-                kind: crate::facts::SymbolicMemoryIslandKind::LargeCfgConditionFrontier,
-                anchor_block: 0x401000,
-                terms: vec![crate::facts::SymbolicMemoryCondition {
-                    region: crate::facts::SymbolicMemoryRegion::Argument { index: 0 },
-                    offset_lo: 8,
-                    offset_hi: 8,
-                    size: 4,
-                    exact_offset: true,
-                    evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                    confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-                    binding: None,
-                    expr: "*(arg0 + 8)".to_string(),
-                    value_expr: None,
-                    exact_value: false,
-                }],
-                evidence: crate::facts::SymbolicSemanticEvidence::exact(),
-                confidence: crate::facts::SymbolicSemanticConfidence::Exact,
-            }],
-            diagnostics: crate::facts::SymbolicFactDiagnostics {
-                skipped_large_cfg: true,
-                semantic_mode: Some(crate::facts::SymbolicSemanticMode::Residual),
-                semantic_capability: Some(crate::facts::SymbolicSemanticCapability {
-                    query_ready: true,
-                    type_ready: false,
-                    decompile_ready: true,
-                }),
-                slice_class: Some(crate::facts::SymbolicSemanticSliceClass::Worker),
-                residual_reasons: vec![crate::facts::SymbolicSemanticResidualReason::LargeCfg],
-                ..Default::default()
-            },
-            interpreter: None,
-            vm_step: None,
-            vm_transfer: None,
-        };
+        );
 
-        let plan = build_semantic_type_fallback_plan("fcn.401000", "x86-64", 64, &symbolic_facts);
+        let plan = build_semantic_type_fallback_plan("fcn.401000", "x86-64", 64, &artifact);
 
         assert_eq!(plan.signature.params.len(), 1);
         assert!(plan.signature.params[0].param_type.contains("struct "));
@@ -5424,13 +5432,8 @@ mod tests {
             plan.diagnostics
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("memory_islands=1"))
+                .any(|warning| warning.contains("regions=1"))
         );
-        assert!(plan
-            .diagnostics
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("type analysis not ready from semantic capability")));
         assert!(
             plan.diagnostics
                 .warnings
