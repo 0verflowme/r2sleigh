@@ -179,7 +179,7 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  RUST_TARGET   - 'release' (default) or 'debug'"
-	@echo "  RUST_FEATURES - Sleigh features: 'x86' (default), 'arm' (ARM32 + AArch64), 'riscv', 'all-archs'"
+	@echo "  RUST_FEATURES - Sleigh features: 'x86' (default), 'arm' (ARM32 + AArch64), 'mips', 'riscv', 'all-archs'"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make                           # Build release with x86"

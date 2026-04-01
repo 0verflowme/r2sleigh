@@ -83,6 +83,62 @@ extern char *r2sym_explore_to(const R2ILContext *ctx, const R2ILBlock **blocks, 
 	unsigned long long entry_addr, unsigned long long target_addr);
 extern char *r2sym_solve_to(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long entry_addr, unsigned long long target_addr);
+extern char *r2sym_run_spec_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long entry_addr, const char *spec_json);
+typedef struct {
+	unsigned long long entry_addr;
+	const char *name;
+	const R2ILBlock **blocks;
+	size_t num_blocks;
+} R2ILFunctionBlocks;
+typedef struct {
+	const char *name;
+	unsigned long long value;
+} R2SymReplayRegister;
+typedef struct {
+	unsigned long long addr;
+	const unsigned char *bytes;
+	size_t size;
+	const char *label;
+} R2SymReplayMemoryWindow;
+typedef struct {
+	const char *name;
+	const char *symbol;
+} R2SymReplayRegisterOverlay;
+typedef struct {
+	unsigned long long addr;
+	unsigned int size;
+	const char *name;
+} R2SymReplayMemoryOverlay;
+typedef struct {
+	unsigned long long checkpoint_id;
+	unsigned long long entry_addr;
+	const R2SymReplayRegister *registers;
+	size_t num_registers;
+	const R2SymReplayMemoryWindow *memory;
+	size_t num_memory;
+	const R2SymReplayRegisterOverlay *register_overlays;
+	size_t num_register_overlays;
+	const R2SymReplayMemoryOverlay *memory_overlays;
+	size_t num_memory_overlays;
+	const int *tty_fds;
+	size_t num_tty_fds;
+	int skip_sleep_calls;
+} R2SymReplaySeed;
+extern char *r2sym_function_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr);
+extern char *r2sym_paths_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr);
+extern char *r2sym_explore_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr);
+extern char *r2sym_solve_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr);
+extern char *r2sym_explore_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed);
+extern char *r2sym_solve_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed);
+extern char *r2sym_compile_semantics_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr);
+extern char *r2sym_run_spec_json_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
+	unsigned long long entry_addr, const char *spec_json);
 extern int r2sym_set_symbol_map_json(const char *json);
 extern int r2sym_merge_is_enabled(void);
 extern void r2sym_merge_set_enabled(int enabled);
@@ -92,6 +148,16 @@ extern char *r2dec_function_with_context(const R2ILContext *ctx, const R2ILBlock
                                           const char *func_name, const char *func_names_json,
                                           const char *strings_json, const char *symbols_json,
                                           const char *external_context_json);
+extern char *r2dec_function_with_context_scope(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *func_name, const char *func_names_json,
+	const char *strings_json, const char *symbols_json, const char *external_context_json,
+	const R2ILFunctionBlocks *functions, size_t num_functions);
+extern char *r2dec_semantic_worker_linearization_scope_ffi(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *func_name, size_t block_count, size_t loop_count,
+	size_t back_edge_count, size_t max_switch_cases, const R2ILFunctionBlocks *functions, size_t num_functions);
+extern char *r2dec_block_guard_comment_ffi(const char *func_name, size_t blocks, size_t max_blocks);
+extern char *r2dec_cfg_guard_comment_ffi(const char *func_name, size_t block_count,
+	size_t loop_count, size_t back_edge_count, size_t max_switch_cases);
 
 /* CFG */
 extern char *r2cfg_function_ascii(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks);
@@ -110,6 +176,10 @@ extern char *r2sleigh_infer_type_writeback_json(const R2ILContext *ctx, const R2
 extern char *r2sleigh_infer_type_writeback_json_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
 	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json);
+extern char *r2sleigh_infer_type_writeback_json_scope_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
+	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json,
+	const R2ILFunctionBlocks *functions, size_t num_functions);
 extern char *r2sleigh_get_direct_call_targets_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name);
 extern int r2sleigh_alias_function_analysis_artifact_cache(const R2ILContext *ctx, const R2ILBlock **blocks,
@@ -241,6 +311,18 @@ typedef struct {
 	size_t capacity;
 } BlockArray;
 
+#define SLEIGH_SYM_HELPER_MAX_FUNCTIONS 16
+#define SLEIGH_SCOPE_HELPER_MAX_BLOCKS 64
+#define SLEIGH_SCOPE_HELPER_MAX_COST 256
+
+typedef struct {
+	R2ILFunctionBlocks *functions;
+	BlockArray *owned_blocks;
+	char **owned_names;
+	size_t count;
+	size_t capacity;
+} SymFunctionScope;
+
 static char *build_type_interproc_scope_json(
 	RCore *core,
 	RAnal *anal,
@@ -267,6 +349,21 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	ut64 fcn_addr,
 	const char *fcn_name,
 	size_t *out_count
+);
+static void sym_function_scope_init(SymFunctionScope *scope);
+static void sym_function_scope_free(SymFunctionScope *scope);
+static bool sym_function_scope_ensure_capacity(SymFunctionScope *scope, size_t needed);
+static bool sym_function_scope_append(
+	SymFunctionScope *scope,
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx
+);
+static bool build_symbolic_function_scope(
+	RAnal *anal,
+	RAnalFunction *root_fcn,
+	R2ILContext *ctx,
+	SymFunctionScope *scope
 );
 
 static void block_array_init(BlockArray *arr) {
@@ -951,6 +1048,1878 @@ static bool parse_sym_target_expr(RCore *core, const char *expr, ut64 *target) {
 	return true;
 }
 
+static bool parse_replay_target_and_json(RCore *core, const char *arg, ut64 *target, char **out_json) {
+	char *owned = NULL;
+	char *json = NULL;
+	char *sep;
+	const char *json_start;
+	if (!core || !arg || !*arg || !target || !out_json) {
+		return false;
+	}
+	*out_json = NULL;
+	owned = strdup (arg);
+	if (!owned) {
+		return false;
+	}
+	sep = owned;
+	while (*sep && !isspace ((unsigned char)*sep)) {
+		sep++;
+	}
+	if (!*sep) {
+		free (owned);
+		return false;
+	}
+	*sep++ = '\0';
+	json_start = skip_cmd_spaces (sep);
+	if (!*json_start || !parse_sym_target_expr (core, owned, target)) {
+		free (owned);
+		return false;
+	}
+	json = strdup (json_start);
+	free (owned);
+	if (!json) {
+		return false;
+	}
+	r_str_unescape (json);
+	*out_json = json;
+	return true;
+}
+
+typedef enum {
+	REPLAY_EXPR_CONST = 0,
+	REPLAY_EXPR_REG,
+	REPLAY_EXPR_MEM,
+	REPLAY_EXPR_META,
+	REPLAY_EXPR_UNARY,
+	REPLAY_EXPR_BINARY,
+} ReplayExprKind;
+
+typedef enum {
+	REPLAY_MEM_U8 = 8,
+	REPLAY_MEM_U16 = 16,
+	REPLAY_MEM_U32 = 32,
+	REPLAY_MEM_U64 = 64,
+} ReplayMemWidth;
+
+typedef enum {
+	REPLAY_META_DEPTH = 0,
+	REPLAY_META_INPUT_LEN,
+} ReplayMetaKind;
+
+typedef enum {
+	REPLAY_UN_NEG = 0,
+	REPLAY_UN_NOT,
+} ReplayUnaryOp;
+
+typedef enum {
+	REPLAY_BIN_ADD = 0,
+	REPLAY_BIN_SUB,
+	REPLAY_BIN_MUL,
+	REPLAY_BIN_DIV,
+	REPLAY_BIN_MOD,
+	REPLAY_BIN_SHL,
+	REPLAY_BIN_SHR,
+	REPLAY_BIN_BAND,
+	REPLAY_BIN_BOR,
+	REPLAY_BIN_BXOR,
+	REPLAY_BIN_EQ,
+	REPLAY_BIN_NE,
+	REPLAY_BIN_LT,
+	REPLAY_BIN_LE,
+	REPLAY_BIN_GT,
+	REPLAY_BIN_GE,
+	REPLAY_BIN_AND,
+	REPLAY_BIN_OR,
+	REPLAY_BIN_ABSDIFF,
+} ReplayBinaryOp;
+
+typedef enum {
+	REPLAY_SCORE_MAX = 0,
+	REPLAY_SCORE_MIN,
+} ReplayScoreOrder;
+
+typedef struct replay_expr_t ReplayExpr;
+
+struct replay_expr_t {
+	int kind;
+	union {
+		st64 const_value;
+		char *reg_name;
+		struct {
+			ut64 addr;
+			int width_bits;
+		} mem;
+		int meta_kind;
+		struct {
+			int op;
+			ReplayExpr *arg;
+		} unary;
+		struct {
+			int op;
+			ReplayExpr *lhs;
+			ReplayExpr *rhs;
+		} binary;
+	};
+};
+
+typedef struct {
+	bool ok;
+	bool is_bool;
+	union {
+		st64 i;
+		bool b;
+	};
+} ReplayEvalValue;
+
+typedef struct {
+	const RDebugStateSnapshot *snapshot;
+	size_t depth;
+	size_t input_len;
+	bool big_endian;
+} ReplayEvalContext;
+
+typedef struct {
+	ut64 seed_checkpoint;
+	int replay_fd;
+	char *alphabet;
+	size_t max_depth;
+	size_t beam_width;
+	ReplayExpr **frontier_preds;
+	size_t frontier_count;
+	ReplayExpr **find_preds;
+	size_t find_count;
+	ReplayExpr **avoid_preds;
+	size_t avoid_count;
+	ReplayExpr *score_expr;
+	int score_order;
+	RDebugStateRequest *snapshot_request;
+	ut64 *frontier_stop_addrs;
+	size_t frontier_stop_count;
+	ut64 *stop_addrs;
+	size_t stop_count;
+	bool big_endian;
+} ReplaySearchSpec;
+
+typedef struct {
+	char *name;
+	char *symbol;
+} ReplaySymRegisterOverlay;
+
+typedef struct {
+	ut64 addr;
+	ut32 size;
+	char *name;
+} ReplaySymMemoryOverlay;
+
+typedef struct {
+	ut64 checkpoint_id;
+	ut64 entry_addr;
+	RDebugStateRequest *snapshot_request;
+	ReplaySymRegisterOverlay *register_overlays;
+	size_t register_overlay_count;
+	ReplaySymMemoryOverlay *memory_overlays;
+	size_t memory_overlay_count;
+	int *tty_fds;
+	size_t tty_fd_count;
+	bool skip_sleep_calls;
+} ReplaySymSeedSpec;
+
+typedef struct {
+	ut64 checkpoint_id;
+	char *input;
+	size_t input_len;
+	st64 score;
+	char *snapshot_json;
+} ReplaySearchNode;
+
+typedef struct {
+	ut64 checkpoint_id;
+	char *input;
+	size_t input_len;
+	ut64 hit_addr;
+	st64 score;
+	char *snapshot_json;
+} ReplaySearchMatch;
+
+typedef enum {
+	REPLAY_SEARCH_STOP_NONE = 0,
+	REPLAY_SEARCH_STOP_FRONTIER,
+	REPLAY_SEARCH_STOP_FIND,
+	REPLAY_SEARCH_STOP_AVOID,
+	REPLAY_SEARCH_STOP_OTHER,
+} ReplaySearchStopKind;
+
+typedef struct {
+	ut64 *addrs;
+	size_t count;
+} ReplayTempBpSet;
+
+static bool replay_parse_num_expr(RCore *core, const RJson *value, st64 *out) {
+	if (!core || !value || !out) {
+		return false;
+	}
+	if (value->type == R_JSON_INTEGER) {
+		*out = value->num.s_value;
+		return true;
+	}
+	if (value->type == R_JSON_STRING && value->str_value && *value->str_value) {
+		*out = (st64)r_num_math (core->num, value->str_value);
+		return true;
+	}
+	return false;
+}
+
+static bool replay_parse_addr_expr(RCore *core, const RJson *value, ut64 *out) {
+	st64 signed_value = 0;
+	if (!replay_parse_num_expr (core, value, &signed_value) || signed_value < 0) {
+		return false;
+	}
+	*out = (ut64)signed_value;
+	return true;
+}
+
+static void replay_expr_free(ReplayExpr *expr) {
+	if (!expr) {
+		return;
+	}
+	switch (expr->kind) {
+	case REPLAY_EXPR_REG:
+		free (expr->reg_name);
+		break;
+	case REPLAY_EXPR_UNARY:
+		replay_expr_free (expr->unary.arg);
+		break;
+	case REPLAY_EXPR_BINARY:
+		replay_expr_free (expr->binary.lhs);
+		replay_expr_free (expr->binary.rhs);
+		break;
+	default:
+		break;
+	}
+	free (expr);
+}
+
+static void replay_expr_array_free(ReplayExpr **exprs, size_t count) {
+	size_t i;
+	if (!exprs) {
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		replay_expr_free (exprs[i]);
+	}
+	free (exprs);
+}
+
+static bool replay_is_pc_reg_name(const char *name) {
+	return name && !strcasecmp (name, "pc");
+}
+
+static bool replay_expr_is_const_int(const ReplayExpr *expr, st64 *out) {
+	if (!expr || expr->kind != REPLAY_EXPR_CONST) {
+		return false;
+	}
+	if (out) {
+		*out = expr->const_value;
+	}
+	return true;
+}
+
+static bool replay_expr_extract_pc_eq_addr(const ReplayExpr *expr, ut64 *out_addr) {
+	st64 value = 0;
+	if (!expr || expr->kind != REPLAY_EXPR_BINARY || expr->binary.op != REPLAY_BIN_EQ) {
+		return false;
+	}
+	if (expr->binary.lhs && expr->binary.lhs->kind == REPLAY_EXPR_REG
+		&& replay_is_pc_reg_name (expr->binary.lhs->reg_name)
+		&& replay_expr_is_const_int (expr->binary.rhs, &value)
+		&& value >= 0) {
+		*out_addr = (ut64)value;
+		return true;
+	}
+	if (expr->binary.rhs && expr->binary.rhs->kind == REPLAY_EXPR_REG
+		&& replay_is_pc_reg_name (expr->binary.rhs->reg_name)
+		&& replay_expr_is_const_int (expr->binary.lhs, &value)
+		&& value >= 0) {
+		*out_addr = (ut64)value;
+		return true;
+	}
+	return false;
+}
+
+static bool replay_addr_list_contains(const ut64 *addrs, size_t count, ut64 addr) {
+	size_t i;
+	for (i = 0; i < count; i++) {
+		if (addrs[i] == addr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool replay_addr_list_push_unique(ut64 **addrs, size_t *count, ut64 addr) {
+	ut64 *next;
+	if (!addrs || !count || !addr) {
+		return false;
+	}
+	if (replay_addr_list_contains (*addrs, *count, addr)) {
+		return true;
+	}
+	next = realloc (*addrs, (*count + 1) * sizeof (ut64));
+	if (!next) {
+		return false;
+	}
+	*addrs = next;
+	(*addrs)[(*count)++] = addr;
+	return true;
+}
+
+static const char *replay_json_kind_name(const RJson *value) {
+	if (!value || value->type != R_JSON_OBJECT) {
+		return NULL;
+	}
+	const RJson *kind = r_json_get (value, "kind");
+	return (kind && kind->type == R_JSON_STRING)? kind->str_value: NULL;
+}
+
+static const char *replay_json_op_name(const RJson *value) {
+	if (!value || value->type != R_JSON_OBJECT) {
+		return NULL;
+	}
+	const RJson *op = r_json_get (value, "op");
+	return (op && op->type == R_JSON_STRING)? op->str_value: NULL;
+}
+
+static bool replay_json_get_arg_array(const RJson *value, const RJson **first, const RJson **second, size_t *count) {
+	const RJson *args = r_json_get (value, "args");
+	RJson *child;
+	size_t idx = 0;
+	if (!first || !second || !count) {
+		return false;
+	}
+	*first = NULL;
+	*second = NULL;
+	*count = 0;
+	if (!args || args->type != R_JSON_ARRAY) {
+		return false;
+	}
+	for (child = args->children.first; child; child = child->next) {
+		if (idx == 0) {
+			*first = child;
+		} else if (idx == 1) {
+			*second = child;
+		}
+		idx++;
+	}
+	*count = idx;
+	return true;
+}
+
+static bool replay_parse_unary_op(const char *name, int *out) {
+	if (!name || !out) {
+		return false;
+	}
+	if (!strcmp (name, "neg")) {
+		*out = REPLAY_UN_NEG;
+		return true;
+	}
+	if (!strcmp (name, "not")) {
+		*out = REPLAY_UN_NOT;
+		return true;
+	}
+	return false;
+}
+
+static bool replay_parse_binary_op(const char *name, int *out) {
+	if (!name || !out) {
+		return false;
+	}
+	if (!strcmp (name, "add")) { *out = REPLAY_BIN_ADD; return true; }
+	if (!strcmp (name, "sub")) { *out = REPLAY_BIN_SUB; return true; }
+	if (!strcmp (name, "mul")) { *out = REPLAY_BIN_MUL; return true; }
+	if (!strcmp (name, "div")) { *out = REPLAY_BIN_DIV; return true; }
+	if (!strcmp (name, "mod")) { *out = REPLAY_BIN_MOD; return true; }
+	if (!strcmp (name, "shl")) { *out = REPLAY_BIN_SHL; return true; }
+	if (!strcmp (name, "shr")) { *out = REPLAY_BIN_SHR; return true; }
+	if (!strcmp (name, "band")) { *out = REPLAY_BIN_BAND; return true; }
+	if (!strcmp (name, "bor")) { *out = REPLAY_BIN_BOR; return true; }
+	if (!strcmp (name, "bxor")) { *out = REPLAY_BIN_BXOR; return true; }
+	if (!strcmp (name, "eq")) { *out = REPLAY_BIN_EQ; return true; }
+	if (!strcmp (name, "ne")) { *out = REPLAY_BIN_NE; return true; }
+	if (!strcmp (name, "lt")) { *out = REPLAY_BIN_LT; return true; }
+	if (!strcmp (name, "le")) { *out = REPLAY_BIN_LE; return true; }
+	if (!strcmp (name, "gt")) { *out = REPLAY_BIN_GT; return true; }
+	if (!strcmp (name, "ge")) { *out = REPLAY_BIN_GE; return true; }
+	if (!strcmp (name, "and")) { *out = REPLAY_BIN_AND; return true; }
+	if (!strcmp (name, "or")) { *out = REPLAY_BIN_OR; return true; }
+	if (!strcmp (name, "absdiff")) { *out = REPLAY_BIN_ABSDIFF; return true; }
+	return false;
+}
+
+static bool replay_parse_meta_kind(const char *name, int *out) {
+	if (!name || !out) {
+		return false;
+	}
+	if (!strcmp (name, "depth")) {
+		*out = REPLAY_META_DEPTH;
+		return true;
+	}
+	if (!strcmp (name, "input_len")) {
+		*out = REPLAY_META_INPUT_LEN;
+		return true;
+	}
+	return false;
+}
+
+static bool replay_expr_parse(RCore *core, const RJson *value, ReplayExpr **out_expr) {
+	const char *kind_name;
+	const char *op_name;
+	ReplayExpr *expr = NULL;
+	const RJson *lhs = NULL;
+	const RJson *rhs = NULL;
+	const RJson *arg = NULL;
+	const RJson *first = NULL;
+	const RJson *second = NULL;
+	size_t arg_count = 0;
+
+	R_RETURN_VAL_IF_FAIL (core && value && out_expr, false);
+	*out_expr = NULL;
+	if (value->type != R_JSON_OBJECT) {
+		return false;
+	}
+	expr = R_NEW0 (ReplayExpr);
+	if (!expr) {
+		return false;
+	}
+
+	kind_name = replay_json_kind_name (value);
+	if (kind_name) {
+		if (!strcmp (kind_name, "const")) {
+			expr->kind = REPLAY_EXPR_CONST;
+			if (!replay_parse_num_expr (core, r_json_get (value, "value"), &expr->const_value)) {
+				goto fail;
+			}
+		} else if (!strcmp (kind_name, "reg")) {
+			const RJson *name = r_json_get (value, "name");
+			expr->kind = REPLAY_EXPR_REG;
+			if (!name || name->type != R_JSON_STRING || R_STR_ISEMPTY (name->str_value)) {
+				goto fail;
+			}
+			expr->reg_name = strdup (name->str_value);
+			if (!expr->reg_name) {
+				goto fail;
+			}
+		} else if (!strcmp (kind_name, "mem_u8") || !strcmp (kind_name, "mem_u16")
+			|| !strcmp (kind_name, "mem_u32") || !strcmp (kind_name, "mem_u64")) {
+			expr->kind = REPLAY_EXPR_MEM;
+			if (!replay_parse_addr_expr (core, r_json_get (value, "addr"), &expr->mem.addr)) {
+				goto fail;
+			}
+			if (!strcmp (kind_name, "mem_u8")) {
+				expr->mem.width_bits = REPLAY_MEM_U8;
+			} else if (!strcmp (kind_name, "mem_u16")) {
+				expr->mem.width_bits = REPLAY_MEM_U16;
+			} else if (!strcmp (kind_name, "mem_u32")) {
+				expr->mem.width_bits = REPLAY_MEM_U32;
+			} else {
+				expr->mem.width_bits = REPLAY_MEM_U64;
+			}
+		} else if (!strcmp (kind_name, "meta")) {
+			const RJson *name = r_json_get (value, "name");
+			expr->kind = REPLAY_EXPR_META;
+			if (!name || name->type != R_JSON_STRING || !replay_parse_meta_kind (name->str_value, &expr->meta_kind)) {
+				goto fail;
+			}
+		} else {
+			goto fail;
+		}
+		*out_expr = expr;
+		return true;
+	}
+
+	op_name = replay_json_op_name (value);
+	if (!op_name) {
+		goto fail;
+	}
+	if (replay_parse_unary_op (op_name, &expr->unary.op)) {
+		expr->kind = REPLAY_EXPR_UNARY;
+		arg = r_json_get (value, "arg");
+		if (!arg && replay_json_get_arg_array (value, &first, &second, &arg_count) && arg_count == 1) {
+			arg = first;
+		}
+		if (!arg || !replay_expr_parse (core, arg, &expr->unary.arg)) {
+			goto fail;
+		}
+		*out_expr = expr;
+		return true;
+	}
+	if (!replay_parse_binary_op (op_name, &expr->binary.op)) {
+		goto fail;
+	}
+	expr->kind = REPLAY_EXPR_BINARY;
+	lhs = r_json_get (value, "lhs");
+	rhs = r_json_get (value, "rhs");
+	if ((!lhs || !rhs) && replay_json_get_arg_array (value, &first, &second, &arg_count) && arg_count == 2) {
+		lhs = first;
+		rhs = second;
+	}
+	if (!lhs || !rhs) {
+		goto fail;
+	}
+	if (!replay_expr_parse (core, lhs, &expr->binary.lhs) || !replay_expr_parse (core, rhs, &expr->binary.rhs)) {
+		goto fail;
+	}
+	*out_expr = expr;
+	return true;
+
+fail:
+	replay_expr_free (expr);
+	return false;
+}
+
+static bool replay_parse_predicate_array(RCore *core, const RJson *value, bool allow_empty, ReplayExpr ***out_exprs, size_t *out_count) {
+	ReplayExpr **exprs = NULL;
+	size_t count = 0;
+	RJson *child;
+	if (!out_exprs || !out_count) {
+		return false;
+	}
+	*out_exprs = NULL;
+	*out_count = 0;
+	if (!value || value->type != R_JSON_ARRAY) {
+		return false;
+	}
+	for (child = value->children.first; child; child = child->next) {
+		ReplayExpr *expr = NULL;
+		ReplayExpr **next;
+		if (!replay_expr_parse (core, child, &expr)) {
+			replay_expr_array_free (exprs, count);
+			return false;
+		}
+		next = realloc (exprs, (count + 1) * sizeof (ReplayExpr *));
+		if (!next) {
+			replay_expr_free (expr);
+			replay_expr_array_free (exprs, count);
+			return false;
+		}
+		exprs = next;
+		exprs[count++] = expr;
+	}
+	if (!count) {
+		return allow_empty;
+	}
+	*out_exprs = exprs;
+	*out_count = count;
+	return true;
+}
+
+static RDebugStateRequest *replay_state_request_new(void) {
+	RDebugStateRequest *request = R_NEW0 (RDebugStateRequest);
+	if (!request) {
+		return NULL;
+	}
+	request->registers = r_list_newf ((RListFree)r_debug_state_reg_spec_free);
+	request->memory = r_list_newf ((RListFree)r_debug_state_mem_spec_free);
+	if (!request->registers || !request->memory) {
+		r_debug_state_request_free (request);
+		return NULL;
+	}
+	return request;
+}
+
+static bool replay_state_request_add_reg(RDebugStateRequest *request, const char *name) {
+	RListIter *iter;
+	RDebugStateRegSpec *spec;
+	if (!request || !name || replay_is_pc_reg_name (name)) {
+		return true;
+	}
+	r_list_foreach (request->registers, iter, spec) {
+		if (spec->name && !strcasecmp (spec->name, name)) {
+			return true;
+		}
+	}
+	spec = R_NEW0 (RDebugStateRegSpec);
+	if (!spec) {
+		return false;
+	}
+	spec->name = strdup (name);
+	if (!spec->name) {
+		r_debug_state_reg_spec_free (spec);
+		return false;
+	}
+	r_list_append (request->registers, spec);
+	return true;
+}
+
+static bool replay_state_request_add_mem_range(RDebugStateRequest *request, ut64 addr, ut32 size, const char *label) {
+	RListIter *iter;
+	RDebugStateMemSpec *spec;
+	if (!request || !size) {
+		return false;
+	}
+	r_list_foreach (request->memory, iter, spec) {
+		if (spec->addr == addr && spec->size == size) {
+			return true;
+		}
+	}
+	spec = R_NEW0 (RDebugStateMemSpec);
+	if (!spec) {
+		return false;
+	}
+	spec->addr = addr;
+	spec->size = size;
+	if (label && *label) {
+		spec->label = strdup (label);
+		if (!spec->label) {
+			r_debug_state_mem_spec_free (spec);
+			return false;
+		}
+	}
+	r_list_append (request->memory, spec);
+	return true;
+}
+
+static bool replay_state_request_add_mem(RDebugStateRequest *request, ut64 addr, int width_bits) {
+	ut32 size = (ut32)(width_bits / 8);
+	return replay_state_request_add_mem_range (request, addr, size, NULL);
+}
+
+static bool replay_state_request_add_all_gprs(RDebug *dbg, RDebugStateRequest *request) {
+	RListIter *iter;
+	RRegItem *item;
+	RList *regs;
+	if (!dbg || !dbg->reg || !request) {
+		return false;
+	}
+	regs = r_reg_get_list (dbg->reg, R_REG_TYPE_GPR);
+	if (!regs) {
+		return false;
+	}
+	r_list_foreach (regs, iter, item) {
+		if (item && item->name && !replay_state_request_add_reg (request, item->name)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool replay_expr_collect_state(const ReplayExpr *expr, RDebugStateRequest *request) {
+	if (!expr || !request) {
+		return false;
+	}
+	switch (expr->kind) {
+	case REPLAY_EXPR_REG:
+		return replay_state_request_add_reg (request, expr->reg_name);
+	case REPLAY_EXPR_MEM:
+		return replay_state_request_add_mem (request, expr->mem.addr, expr->mem.width_bits);
+	case REPLAY_EXPR_UNARY:
+		return replay_expr_collect_state (expr->unary.arg, request);
+	case REPLAY_EXPR_BINARY:
+		return replay_expr_collect_state (expr->binary.lhs, request)
+			&& replay_expr_collect_state (expr->binary.rhs, request);
+	default:
+		return true;
+	}
+}
+
+static bool replay_collect_stop_addrs(ReplayExpr **exprs, size_t count, ut64 **out_addrs, size_t *out_count) {
+	size_t i;
+	if (!out_addrs || !out_count) {
+		return false;
+	}
+	*out_addrs = NULL;
+	*out_count = 0;
+	for (i = 0; i < count; i++) {
+		ut64 addr = 0;
+		if (replay_expr_extract_pc_eq_addr (exprs[i], &addr) && !replay_addr_list_push_unique (out_addrs, out_count, addr)) {
+			free (*out_addrs);
+			*out_addrs = NULL;
+			*out_count = 0;
+			return false;
+		}
+	}
+	return true;
+}
+
+static void replay_search_spec_fini(ReplaySearchSpec *spec) {
+	if (!spec) {
+		return;
+	}
+	free (spec->alphabet);
+	spec->alphabet = NULL;
+	replay_expr_array_free (spec->frontier_preds, spec->frontier_count);
+	replay_expr_array_free (spec->find_preds, spec->find_count);
+	replay_expr_array_free (spec->avoid_preds, spec->avoid_count);
+	spec->frontier_preds = NULL;
+	spec->find_preds = NULL;
+	spec->avoid_preds = NULL;
+	spec->frontier_count = 0;
+	spec->find_count = 0;
+	spec->avoid_count = 0;
+	replay_expr_free (spec->score_expr);
+	spec->score_expr = NULL;
+	r_debug_state_request_free (spec->snapshot_request);
+	spec->snapshot_request = NULL;
+	free (spec->frontier_stop_addrs);
+	free (spec->stop_addrs);
+	spec->frontier_stop_addrs = NULL;
+	spec->stop_addrs = NULL;
+	spec->frontier_stop_count = 0;
+	spec->stop_count = 0;
+}
+
+static void replay_sym_seed_spec_fini(ReplaySymSeedSpec *spec) {
+	size_t i;
+	if (!spec) {
+		return;
+	}
+	r_debug_state_request_free (spec->snapshot_request);
+	spec->snapshot_request = NULL;
+	for (i = 0; i < spec->register_overlay_count; i++) {
+		free (spec->register_overlays[i].name);
+		free (spec->register_overlays[i].symbol);
+	}
+	free (spec->register_overlays);
+	spec->register_overlays = NULL;
+	spec->register_overlay_count = 0;
+	for (i = 0; i < spec->memory_overlay_count; i++) {
+		free (spec->memory_overlays[i].name);
+	}
+	free (spec->memory_overlays);
+	spec->memory_overlays = NULL;
+	spec->memory_overlay_count = 0;
+	free (spec->tty_fds);
+	spec->tty_fds = NULL;
+	spec->tty_fd_count = 0;
+	spec->checkpoint_id = 0;
+	spec->entry_addr = 0;
+	spec->skip_sleep_calls = false;
+}
+
+static bool replay_sym_seed_add_register_overlay(ReplaySymSeedSpec *spec, const char *name, const char *symbol) {
+	ReplaySymRegisterOverlay *next;
+	size_t index;
+	if (!spec || !name || !*name || !symbol || !*symbol) {
+		return false;
+	}
+	next = realloc (spec->register_overlays, (spec->register_overlay_count + 1) * sizeof (*next));
+	if (!next) {
+		return false;
+	}
+	spec->register_overlays = next;
+	index = spec->register_overlay_count++;
+	memset (&spec->register_overlays[index], 0, sizeof (spec->register_overlays[index]));
+	spec->register_overlays[index].name = strdup (name);
+	spec->register_overlays[index].symbol = strdup (symbol);
+	if (!spec->register_overlays[index].name || !spec->register_overlays[index].symbol) {
+		free (spec->register_overlays[index].name);
+		free (spec->register_overlays[index].symbol);
+		spec->register_overlays[index].name = NULL;
+		spec->register_overlays[index].symbol = NULL;
+		spec->register_overlay_count--;
+		return false;
+	}
+	return true;
+}
+
+static bool replay_sym_seed_add_memory_overlay(ReplaySymSeedSpec *spec, ut64 addr, ut32 size, const char *name) {
+	ReplaySymMemoryOverlay *next;
+	size_t index;
+	if (!spec || !size || !name || !*name) {
+		return false;
+	}
+	next = realloc (spec->memory_overlays, (spec->memory_overlay_count + 1) * sizeof (*next));
+	if (!next) {
+		return false;
+	}
+	spec->memory_overlays = next;
+	index = spec->memory_overlay_count++;
+	memset (&spec->memory_overlays[index], 0, sizeof (spec->memory_overlays[index]));
+	spec->memory_overlays[index].addr = addr;
+	spec->memory_overlays[index].size = size;
+	spec->memory_overlays[index].name = strdup (name);
+	if (!spec->memory_overlays[index].name) {
+		spec->memory_overlay_count--;
+		return false;
+	}
+	return true;
+}
+
+static bool replay_sym_seed_add_tty_fd(ReplaySymSeedSpec *spec, int fd) {
+	int *next;
+	if (!spec) {
+		return false;
+	}
+	next = realloc (spec->tty_fds, (spec->tty_fd_count + 1) * sizeof (*next));
+	if (!next) {
+		return false;
+	}
+	spec->tty_fds = next;
+	spec->tty_fds[spec->tty_fd_count++] = fd;
+	return true;
+}
+
+static bool replay_sym_seed_spec_parse(RCore *core, const char *json, ReplaySymSeedSpec *spec) {
+	char *json_copy;
+	char *owned_json = NULL;
+	RJson *root;
+	const RJson *value;
+	size_t i;
+
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && json && spec, false);
+	memset (spec, 0, sizeof (*spec));
+	spec->snapshot_request = replay_state_request_new ();
+	if (!spec->snapshot_request || !replay_state_request_add_all_gprs (core->dbg, spec->snapshot_request)) {
+		replay_sym_seed_spec_fini (spec);
+		return false;
+	}
+
+	json_copy = strdup (json);
+	if (!json_copy) {
+		replay_sym_seed_spec_fini (spec);
+		return false;
+	}
+	owned_json = json_copy;
+	root = r_json_parse (json_copy);
+	if (!root || root->type != R_JSON_OBJECT) {
+		R_LOG_ERROR ("r2sleigh replay sym seed: json root parse failed");
+		free (owned_json);
+		r_json_free (root);
+		replay_sym_seed_spec_fini (spec);
+		return false;
+	}
+
+	value = r_json_get (root, "checkpoint");
+	if (!value) {
+		value = r_json_get (root, "seed_checkpoint");
+	}
+	if (!replay_parse_addr_expr (core, value, &spec->checkpoint_id) || !spec->checkpoint_id) {
+		R_LOG_ERROR ("r2sleigh replay sym seed: missing/invalid checkpoint");
+		goto fail;
+	}
+	value = r_json_get (root, "entry");
+	if (value && !replay_parse_addr_expr (core, value, &spec->entry_addr)) {
+		R_LOG_ERROR ("r2sleigh replay sym seed: invalid entry");
+		goto fail;
+	}
+	value = r_json_get (root, "skip_sleep");
+	if (value) {
+		if (value->type != R_JSON_BOOLEAN) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid skip_sleep");
+			goto fail;
+		}
+		spec->skip_sleep_calls = value->num.u_value;
+	}
+	value = r_json_get (root, "tty_fds");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid tty_fds");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			st64 fd = 0;
+			if (!replay_parse_num_expr (core, item, &fd)) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid tty fd");
+				goto fail;
+			}
+			if (!replay_sym_seed_add_tty_fd (spec, (int)fd)) {
+				goto fail;
+			}
+		}
+	}
+	value = r_json_get (root, "memory");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid memory");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			const RJson *label_json;
+			char *label = NULL;
+			ut64 addr = 0;
+			st64 size_value = 0;
+			if (!item || item->type != R_JSON_OBJECT) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid memory item");
+				goto fail;
+			}
+			if (!replay_parse_addr_expr (core, r_json_get (item, "addr"), &addr)
+				|| !replay_parse_num_expr (core, r_json_get (item, "size"), &size_value)
+				|| size_value <= 0 || size_value > UT32_MAX) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid memory window");
+				goto fail;
+			}
+			label_json = r_json_get (item, "label");
+			if (label_json && label_json->type == R_JSON_STRING && label_json->str_value) {
+				label = strdup (label_json->str_value);
+				if (!label) {
+					goto fail;
+				}
+			}
+			if (!replay_state_request_add_mem_range (spec->snapshot_request, addr, (ut32)size_value, label)) {
+				free (label);
+				goto fail;
+			}
+			free (label);
+		}
+	}
+	value = r_json_get (root, "symbolic_registers");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic_registers");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			const char *name = NULL;
+			const char *symbol = NULL;
+			char default_symbol[128];
+			if (!item) {
+				goto fail;
+			}
+			if (item->type == R_JSON_STRING && item->str_value) {
+				name = item->str_value;
+			} else if (item->type == R_JSON_OBJECT) {
+				const RJson *name_json = r_json_get (item, "name");
+				const RJson *symbol_json = r_json_get (item, "symbol");
+				if (name_json && name_json->type == R_JSON_STRING) {
+					name = name_json->str_value;
+				}
+				if (symbol_json && symbol_json->type == R_JSON_STRING) {
+					symbol = symbol_json->str_value;
+				}
+			}
+			if (!name || !*name) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic register");
+				goto fail;
+			}
+			if (!symbol || !*symbol) {
+				snprintf (default_symbol, sizeof (default_symbol), "replay_%s", name);
+				symbol = default_symbol;
+			}
+			if (!replay_sym_seed_add_register_overlay (spec, name, symbol)) {
+				goto fail;
+			}
+		}
+	}
+	value = r_json_get (root, "symbolic_memory");
+	if (value) {
+		if (value->type != R_JSON_ARRAY) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic_memory");
+			goto fail;
+		}
+		for (i = 0; i < value->children.count; i++) {
+			const RJson *item = r_json_item (value, i);
+			const RJson *name_json;
+			char default_name[128];
+			const char *name = NULL;
+			ut64 addr = 0;
+			st64 size_value = 0;
+			if (!item || item->type != R_JSON_OBJECT) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic memory item");
+				goto fail;
+			}
+			if (!replay_parse_addr_expr (core, r_json_get (item, "addr"), &addr)
+				|| !replay_parse_num_expr (core, r_json_get (item, "size"), &size_value)
+				|| size_value <= 0 || size_value > UT32_MAX) {
+				R_LOG_ERROR ("r2sleigh replay sym seed: invalid symbolic memory window");
+				goto fail;
+			}
+			name_json = r_json_get (item, "name");
+			if (name_json && name_json->type == R_JSON_STRING && name_json->str_value) {
+				name = name_json->str_value;
+			} else {
+				snprintf (default_name, sizeof (default_name), "replay_mem_%zu", i);
+				name = default_name;
+			}
+			if (!replay_state_request_add_mem_range (spec->snapshot_request, addr, (ut32)size_value, name)
+				|| !replay_sym_seed_add_memory_overlay (spec, addr, (ut32)size_value, name)) {
+				goto fail;
+			}
+		}
+	}
+
+	free (owned_json);
+	r_json_free (root);
+	return true;
+
+fail:
+	free (owned_json);
+	r_json_free (root);
+	replay_sym_seed_spec_fini (spec);
+	return false;
+}
+
+static RDebugStateSnapshot *replay_sym_collect_seed_snapshot(RCore *core, const ReplaySymSeedSpec *spec) {
+	RDebugStateSnapshot *snapshot;
+	ut64 previous_checkpoint;
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->session && spec && spec->snapshot_request, NULL);
+	previous_checkpoint = core->dbg->session->current_checkpoint_id;
+	if (!r_debug_session_restore_checkpoint (core->dbg, spec->checkpoint_id)) {
+		return NULL;
+	}
+	snapshot = r_debug_state_snapshot_collect (core->dbg, spec->snapshot_request);
+	if (previous_checkpoint != UT64_MAX && previous_checkpoint != spec->checkpoint_id) {
+		r_debug_session_restore_checkpoint (core->dbg, previous_checkpoint);
+	}
+	return snapshot;
+}
+
+static char *replay_sym_query_run(RCore *core, const R2ILContext *ctx, const SymFunctionScope *scope,
+	ut64 entry_addr, ut64 target_addr, const ReplaySymSeedSpec *spec, bool is_explore) {
+	RDebugStateSnapshot *snapshot = NULL;
+	R2SymReplayRegister *registers = NULL;
+	R2SymReplayMemoryWindow *memory = NULL;
+	R2SymReplayRegisterOverlay *register_overlays = NULL;
+	R2SymReplayMemoryOverlay *memory_overlays = NULL;
+	R2SymReplaySeed seed = {0};
+	RListIter *iter;
+	RDebugStateRegValue *reg;
+	RDebugStateMemValue *memv;
+	size_t reg_count = 0;
+	size_t mem_count = 0;
+	size_t idx = 0;
+	char *result = NULL;
+
+	R_RETURN_VAL_IF_FAIL (core && ctx && scope && spec, NULL);
+
+	snapshot = replay_sym_collect_seed_snapshot (core, spec);
+	if (!snapshot) {
+		return NULL;
+	}
+	r_list_foreach (snapshot->registers, iter, reg) {
+		if (reg && reg->found && reg->name) {
+			reg_count++;
+		}
+	}
+	r_list_foreach (snapshot->memory, iter, memv) {
+		if (memv && memv->ok && memv->bytes && memv->size > 0) {
+			mem_count++;
+		}
+	}
+	registers = reg_count? calloc (reg_count, sizeof (*registers)): NULL;
+	memory = mem_count? calloc (mem_count, sizeof (*memory)): NULL;
+	register_overlays = spec->register_overlay_count? calloc (spec->register_overlay_count, sizeof (*register_overlays)): NULL;
+	memory_overlays = spec->memory_overlay_count? calloc (spec->memory_overlay_count, sizeof (*memory_overlays)): NULL;
+	if ((reg_count && !registers) || (mem_count && !memory)
+		|| (spec->register_overlay_count && !register_overlays)
+		|| (spec->memory_overlay_count && !memory_overlays)) {
+		goto cleanup;
+	}
+
+	idx = 0;
+	r_list_foreach (snapshot->registers, iter, reg) {
+		if (!reg || !reg->found || !reg->name) {
+			continue;
+		}
+		registers[idx].name = reg->name;
+		registers[idx].value = reg->value;
+		idx++;
+	}
+	idx = 0;
+	r_list_foreach (snapshot->memory, iter, memv) {
+		if (!memv || !memv->ok || !memv->bytes || !memv->size) {
+			continue;
+		}
+		memory[idx].addr = memv->addr;
+		memory[idx].bytes = memv->bytes;
+		memory[idx].size = memv->size;
+		memory[idx].label = memv->label;
+		idx++;
+	}
+	for (idx = 0; idx < spec->register_overlay_count; idx++) {
+		register_overlays[idx].name = spec->register_overlays[idx].name;
+		register_overlays[idx].symbol = spec->register_overlays[idx].symbol;
+	}
+	for (idx = 0; idx < spec->memory_overlay_count; idx++) {
+		memory_overlays[idx].addr = spec->memory_overlays[idx].addr;
+		memory_overlays[idx].size = spec->memory_overlays[idx].size;
+		memory_overlays[idx].name = spec->memory_overlays[idx].name;
+	}
+
+	seed.checkpoint_id = spec->checkpoint_id;
+	seed.entry_addr = spec->entry_addr? spec->entry_addr: snapshot->pc;
+	seed.registers = registers;
+	seed.num_registers = reg_count;
+	seed.memory = memory;
+	seed.num_memory = mem_count;
+	seed.register_overlays = register_overlays;
+	seed.num_register_overlays = spec->register_overlay_count;
+	seed.memory_overlays = memory_overlays;
+	seed.num_memory_overlays = spec->memory_overlay_count;
+	seed.tty_fds = spec->tty_fds;
+	seed.num_tty_fds = spec->tty_fd_count;
+	seed.skip_sleep_calls = spec->skip_sleep_calls? 1: 0;
+
+	result = is_explore
+		? r2sym_explore_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed)
+		: r2sym_solve_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed);
+
+cleanup:
+	free (registers);
+	free (memory);
+	free (register_overlays);
+	free (memory_overlays);
+	r_debug_state_snapshot_free (snapshot);
+	return result;
+}
+
+static void replay_search_node_free(ReplaySearchNode *node) {
+	if (!node) {
+		return;
+	}
+	free (node->input);
+	free (node->snapshot_json);
+	free (node);
+}
+
+static void replay_search_match_free(ReplaySearchMatch *match) {
+	if (!match) {
+		return;
+	}
+	free (match->input);
+	free (match->snapshot_json);
+	free (match);
+}
+
+static bool replay_eval_snapshot_reg(const ReplayEvalContext *ctx, const char *name, st64 *out) {
+	RListIter *iter;
+	RDebugStateRegValue *reg;
+	if (!ctx || !ctx->snapshot || !name || !out) {
+		return false;
+	}
+	if (replay_is_pc_reg_name (name)) {
+		*out = (st64)ctx->snapshot->pc;
+		return true;
+	}
+	r_list_foreach (ctx->snapshot->registers, iter, reg) {
+		if (reg->name && !strcasecmp (reg->name, name) && reg->found) {
+			*out = (st64)reg->value;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool replay_eval_snapshot_mem(const ReplayEvalContext *ctx, ut64 addr, int width_bits, st64 *out) {
+	RListIter *iter;
+	RDebugStateMemValue *mem;
+	ut32 size = (ut32)(width_bits / 8);
+	if (!ctx || !ctx->snapshot || !out || !size) {
+		return false;
+	}
+	r_list_foreach (ctx->snapshot->memory, iter, mem) {
+		if (mem->addr == addr && mem->size == size && mem->ok && mem->bytes) {
+			*out = (st64)r_read_ble (mem->bytes, ctx->big_endian, size);
+			return true;
+		}
+	}
+	return false;
+}
+
+static ReplayEvalValue replay_eval_error(void) {
+	ReplayEvalValue value = {0};
+	return value;
+}
+
+static ReplayEvalValue replay_eval_int(st64 i) {
+	ReplayEvalValue value = {0};
+	value.ok = true;
+	value.i = i;
+	value.is_bool = false;
+	return value;
+}
+
+static ReplayEvalValue replay_eval_bool(bool b) {
+	ReplayEvalValue value = {0};
+	value.ok = true;
+	value.b = b;
+	value.is_bool = true;
+	return value;
+}
+
+static ReplayEvalValue replay_eval_expr(const ReplayExpr *expr, const ReplayEvalContext *ctx) {
+	ReplayEvalValue lhs;
+	ReplayEvalValue rhs;
+	if (!expr || !ctx) {
+		return replay_eval_error ();
+	}
+	switch (expr->kind) {
+	case REPLAY_EXPR_CONST:
+		return replay_eval_int (expr->const_value);
+	case REPLAY_EXPR_REG: {
+		st64 value = 0;
+		return replay_eval_snapshot_reg (ctx, expr->reg_name, &value)? replay_eval_int (value): replay_eval_error ();
+	}
+	case REPLAY_EXPR_MEM: {
+		st64 value = 0;
+		return replay_eval_snapshot_mem (ctx, expr->mem.addr, expr->mem.width_bits, &value)? replay_eval_int (value): replay_eval_error ();
+	}
+	case REPLAY_EXPR_META:
+		return replay_eval_int (expr->meta_kind == REPLAY_META_DEPTH? (st64)ctx->depth: (st64)ctx->input_len);
+	case REPLAY_EXPR_UNARY: {
+		ReplayEvalValue arg = replay_eval_expr (expr->unary.arg, ctx);
+		if (!arg.ok) {
+			return arg;
+		}
+		if (expr->unary.op == REPLAY_UN_NEG) {
+			return arg.is_bool? replay_eval_error (): replay_eval_int (-arg.i);
+		}
+		if (expr->unary.op == REPLAY_UN_NOT) {
+			return arg.is_bool? replay_eval_bool (!arg.b): replay_eval_error ();
+		}
+		return replay_eval_error ();
+	}
+	case REPLAY_EXPR_BINARY:
+		lhs = replay_eval_expr (expr->binary.lhs, ctx);
+		rhs = replay_eval_expr (expr->binary.rhs, ctx);
+		if (!lhs.ok || !rhs.ok) {
+			return replay_eval_error ();
+		}
+		switch (expr->binary.op) {
+		case REPLAY_BIN_ADD: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_int (lhs.i + rhs.i): replay_eval_error ();
+		case REPLAY_BIN_SUB: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_int (lhs.i - rhs.i): replay_eval_error ();
+		case REPLAY_BIN_MUL: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_int (lhs.i * rhs.i): replay_eval_error ();
+		case REPLAY_BIN_DIV: return (!lhs.is_bool && !rhs.is_bool && rhs.i != 0)? replay_eval_int (lhs.i / rhs.i): replay_eval_error ();
+		case REPLAY_BIN_MOD: return (!lhs.is_bool && !rhs.is_bool && rhs.i != 0)? replay_eval_int (lhs.i % rhs.i): replay_eval_error ();
+		case REPLAY_BIN_SHL: return (!lhs.is_bool && !rhs.is_bool && rhs.i >= 0)? replay_eval_int ((st64)((ut64)lhs.i << rhs.i)): replay_eval_error ();
+		case REPLAY_BIN_SHR: return (!lhs.is_bool && !rhs.is_bool && rhs.i >= 0)? replay_eval_int ((st64)((ut64)lhs.i >> rhs.i)): replay_eval_error ();
+		case REPLAY_BIN_BAND: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_int ((st64)((ut64)lhs.i & (ut64)rhs.i)): replay_eval_error ();
+		case REPLAY_BIN_BOR: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_int ((st64)((ut64)lhs.i | (ut64)rhs.i)): replay_eval_error ();
+		case REPLAY_BIN_BXOR: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_int ((st64)((ut64)lhs.i ^ (ut64)rhs.i)): replay_eval_error ();
+		case REPLAY_BIN_EQ:
+			if (lhs.is_bool != rhs.is_bool) {
+				return replay_eval_error ();
+			}
+			return lhs.is_bool? replay_eval_bool (lhs.b == rhs.b): replay_eval_bool (lhs.i == rhs.i);
+		case REPLAY_BIN_NE:
+			if (lhs.is_bool != rhs.is_bool) {
+				return replay_eval_error ();
+			}
+			return lhs.is_bool? replay_eval_bool (lhs.b != rhs.b): replay_eval_bool (lhs.i != rhs.i);
+		case REPLAY_BIN_LT: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_bool (lhs.i < rhs.i): replay_eval_error ();
+		case REPLAY_BIN_LE: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_bool (lhs.i <= rhs.i): replay_eval_error ();
+		case REPLAY_BIN_GT: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_bool (lhs.i > rhs.i): replay_eval_error ();
+		case REPLAY_BIN_GE: return (!lhs.is_bool && !rhs.is_bool)? replay_eval_bool (lhs.i >= rhs.i): replay_eval_error ();
+		case REPLAY_BIN_AND: return (lhs.is_bool && rhs.is_bool)? replay_eval_bool (lhs.b && rhs.b): replay_eval_error ();
+		case REPLAY_BIN_OR: return (lhs.is_bool && rhs.is_bool)? replay_eval_bool (lhs.b || rhs.b): replay_eval_error ();
+		case REPLAY_BIN_ABSDIFF:
+			if (lhs.is_bool || rhs.is_bool) {
+				return replay_eval_error ();
+			}
+			return replay_eval_int (lhs.i > rhs.i? lhs.i - rhs.i: rhs.i - lhs.i);
+		default:
+			return replay_eval_error ();
+		}
+	default:
+		return replay_eval_error ();
+	}
+}
+
+static bool replay_eval_predicates(ReplayExpr **exprs, size_t count, const ReplayEvalContext *ctx) {
+	size_t i;
+	for (i = 0; i < count; i++) {
+		ReplayEvalValue value = replay_eval_expr (exprs[i], ctx);
+		if (value.ok && value.is_bool && value.b) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool replay_eval_score(const ReplaySearchSpec *spec, const ReplayEvalContext *ctx, st64 *out_score) {
+	ReplayEvalValue value;
+	if (!spec || !spec->score_expr || !out_score) {
+		return false;
+	}
+	value = replay_eval_expr (spec->score_expr, ctx);
+	if (!value.ok || value.is_bool) {
+		return false;
+	}
+	*out_score = value.i;
+	return true;
+}
+
+static RDebugStateSnapshot *replay_collect_snapshot(RCore *core, const ReplaySearchSpec *spec) {
+	if (!core || !spec || !spec->snapshot_request) {
+		return NULL;
+	}
+	return r_debug_state_snapshot_collect (core->dbg, spec->snapshot_request);
+}
+
+static bool replay_search_spec_parse(RCore *core, const char *json, ReplaySearchSpec *spec) {
+	char *json_copy;
+	char *owned_json = NULL;
+	RJson *root;
+	const RJson *value;
+	size_t i;
+
+	R_RETURN_VAL_IF_FAIL (core && json && spec, false);
+	memset (spec, 0, sizeof (*spec));
+	spec->replay_fd = 0;
+	spec->max_depth = 1;
+	spec->beam_width = 16;
+	spec->score_order = REPLAY_SCORE_MAX;
+	spec->big_endian = core->rasm && core->rasm->config
+		? R_ARCH_CONFIG_IS_BIG_ENDIAN (core->rasm->config)
+		: false;
+
+	json_copy = strdup (json);
+	if (!json_copy) {
+		return false;
+	}
+	owned_json = json_copy;
+	root = r_json_parse (json_copy);
+	if (!root || root->type != R_JSON_OBJECT) {
+		R_LOG_ERROR ("r2sleigh replayj: json root parse failed");
+		free (owned_json);
+		r_json_free (root);
+		return false;
+	}
+
+	value = r_json_get (root, "seed_checkpoint");
+	if (!value) {
+		value = r_json_get (root, "seed");
+	}
+	if (!replay_parse_addr_expr (core, value, &spec->seed_checkpoint) || !spec->seed_checkpoint) {
+		R_LOG_ERROR ("r2sleigh replayj: missing/invalid seed_checkpoint");
+		goto fail;
+	}
+	value = r_json_get (root, "replay_fd");
+	if (value) {
+		if (value->type != R_JSON_INTEGER) {
+			R_LOG_ERROR ("r2sleigh replayj: invalid replay_fd");
+			goto fail;
+		}
+		spec->replay_fd = value->num.s_value;
+	}
+	value = r_json_get (root, "alphabet");
+	if (!value || value->type != R_JSON_STRING || !value->str_value || !*value->str_value) {
+		R_LOG_ERROR ("r2sleigh replayj: missing/invalid alphabet");
+		goto fail;
+	}
+	spec->alphabet = strdup (value->str_value);
+	if (!spec->alphabet) {
+		goto fail;
+	}
+	value = r_json_get (root, "max_depth");
+	if (value) {
+		if (value->type != R_JSON_INTEGER || !value->num.u_value) {
+			R_LOG_ERROR ("r2sleigh replayj: invalid max_depth");
+			goto fail;
+		}
+		spec->max_depth = (size_t)value->num.u_value;
+	}
+	value = r_json_get (root, "beam_width");
+	if (value) {
+		if (value->type != R_JSON_INTEGER || !value->num.u_value) {
+			R_LOG_ERROR ("r2sleigh replayj: invalid beam_width");
+			goto fail;
+		}
+		spec->beam_width = (size_t)value->num.u_value;
+	}
+	if (!replay_parse_predicate_array (core, r_json_get (root, "frontier"), false, &spec->frontier_preds, &spec->frontier_count)) {
+		R_LOG_ERROR ("r2sleigh replayj: missing/invalid frontier");
+		goto fail;
+	}
+	if (!replay_parse_predicate_array (core, r_json_get (root, "find"), false, &spec->find_preds, &spec->find_count)) {
+		R_LOG_ERROR ("r2sleigh replayj: missing/invalid find");
+		goto fail;
+	}
+	value = r_json_get (root, "avoid");
+	if (value && !replay_parse_predicate_array (core, value, true, &spec->avoid_preds, &spec->avoid_count)) {
+		R_LOG_ERROR ("r2sleigh replayj: invalid avoid");
+		goto fail;
+	}
+	value = r_json_get (root, "score");
+	if (!value || value->type != R_JSON_OBJECT) {
+		R_LOG_ERROR ("r2sleigh replayj: missing/invalid score");
+		goto fail;
+	}
+	{
+		const RJson *order = r_json_get (value, "order");
+		if (!order || order->type != R_JSON_STRING) {
+			R_LOG_ERROR ("r2sleigh replayj: missing score.order");
+			goto fail;
+		}
+		if (!strcmp (order->str_value, "max")) {
+			spec->score_order = REPLAY_SCORE_MAX;
+		} else if (!strcmp (order->str_value, "min")) {
+			spec->score_order = REPLAY_SCORE_MIN;
+		} else {
+			R_LOG_ERROR ("r2sleigh replayj: invalid score.order");
+			goto fail;
+		}
+		if (!replay_expr_parse (core, r_json_get (value, "expr"), &spec->score_expr)) {
+			R_LOG_ERROR ("r2sleigh replayj: invalid score.expr");
+			goto fail;
+		}
+	}
+
+	spec->snapshot_request = replay_state_request_new ();
+	if (!spec->snapshot_request) {
+		goto fail;
+	}
+	for (i = 0; i < spec->frontier_count; i++) {
+		if (!replay_expr_collect_state (spec->frontier_preds[i], spec->snapshot_request)) {
+			goto fail;
+		}
+	}
+	for (i = 0; i < spec->find_count; i++) {
+		if (!replay_expr_collect_state (spec->find_preds[i], spec->snapshot_request)) {
+			goto fail;
+		}
+	}
+	for (i = 0; i < spec->avoid_count; i++) {
+		if (!replay_expr_collect_state (spec->avoid_preds[i], spec->snapshot_request)) {
+			goto fail;
+		}
+	}
+	if (!replay_expr_collect_state (spec->score_expr, spec->snapshot_request)) {
+		goto fail;
+	}
+
+	if (!replay_collect_stop_addrs (spec->frontier_preds, spec->frontier_count, &spec->frontier_stop_addrs, &spec->frontier_stop_count)
+		|| !spec->frontier_stop_count) {
+		R_LOG_ERROR ("r2sleigh replayj: frontier must contain at least one exact PC == const predicate");
+		goto fail;
+	}
+	for (i = 0; i < spec->frontier_stop_count; i++) {
+		if (!replay_addr_list_push_unique (&spec->stop_addrs, &spec->stop_count, spec->frontier_stop_addrs[i])) {
+			goto fail;
+		}
+	}
+	{
+		ut64 *tmp = NULL;
+		size_t tmp_count = 0;
+		if (!replay_collect_stop_addrs (spec->find_preds, spec->find_count, &tmp, &tmp_count)) {
+			goto fail;
+		}
+		for (i = 0; i < tmp_count; i++) {
+			if (!replay_addr_list_push_unique (&spec->stop_addrs, &spec->stop_count, tmp[i])) {
+				free (tmp);
+				goto fail;
+			}
+		}
+		free (tmp);
+		tmp = NULL;
+		tmp_count = 0;
+		if (spec->avoid_count && !replay_collect_stop_addrs (spec->avoid_preds, spec->avoid_count, &tmp, &tmp_count)) {
+			goto fail;
+		}
+		for (i = 0; i < tmp_count; i++) {
+			if (!replay_addr_list_push_unique (&spec->stop_addrs, &spec->stop_count, tmp[i])) {
+				free (tmp);
+				goto fail;
+			}
+		}
+		free (tmp);
+	}
+
+	free (owned_json);
+	r_json_free (root);
+	return true;
+
+fail:
+	free (owned_json);
+	r_json_free (root);
+	replay_search_spec_fini (spec);
+	return false;
+}
+
+static char *replay_input_append_char(const char *input, size_t input_len, char ch) {
+	char *next = malloc (input_len + 2);
+	if (!next) {
+		return NULL;
+	}
+	if (input_len && input) {
+		memcpy (next, input, input_len);
+	}
+	next[input_len] = ch;
+	next[input_len + 1] = '\0';
+	return next;
+}
+
+static void replay_temp_bps_fini(RCore *core, ReplayTempBpSet *set) {
+	size_t i;
+	if (!core || !set || !set->addrs) {
+		return;
+	}
+	for (i = 0; i < set->count; i++) {
+		r_bp_del (core->dbg->bp, set->addrs[i]);
+	}
+	free (set->addrs);
+	set->addrs = NULL;
+	set->count = 0;
+}
+
+static bool replay_temp_bps_add(RCore *core, ReplayTempBpSet *set, ut64 addr) {
+	ut64 *next;
+	if (!core || !set || !addr) {
+		return false;
+	}
+	if (r_bp_get_in (core->dbg->bp, addr, R_BP_PROT_EXEC)) {
+		return true;
+	}
+	if (!r_bp_add_sw (core->dbg->bp, addr, core->dbg->bpsize, R_BP_PROT_EXEC)) {
+		return false;
+	}
+	next = realloc (set->addrs, (set->count + 1) * sizeof (ut64));
+	if (!next) {
+		r_bp_del (core->dbg->bp, addr);
+		return false;
+	}
+	set->addrs = next;
+	set->addrs[set->count++] = addr;
+	return true;
+}
+
+static ReplaySearchStopKind replay_classify_stop(const ReplaySearchSpec *spec, const ReplayEvalContext *ctx) {
+	if (replay_eval_predicates (spec->find_preds, spec->find_count, ctx)) {
+		return REPLAY_SEARCH_STOP_FIND;
+	}
+	if (replay_eval_predicates (spec->avoid_preds, spec->avoid_count, ctx)) {
+		return REPLAY_SEARCH_STOP_AVOID;
+	}
+	if (replay_eval_predicates (spec->frontier_preds, spec->frontier_count, ctx)) {
+		return REPLAY_SEARCH_STOP_FRONTIER;
+	}
+	return REPLAY_SEARCH_STOP_OTHER;
+}
+
+static ReplaySearchStopKind replay_continue_to_any(RCore *core, const ReplaySearchSpec *spec, size_t depth, size_t input_len,
+	ut64 *hit_addr, RDebugStateSnapshot **out_snapshot) {
+	ReplayTempBpSet temps = {0};
+	size_t i;
+	ut64 pc = 0;
+	RDebugStateSnapshot *snapshot = NULL;
+	ReplayEvalContext eval_ctx;
+
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && spec && hit_addr && out_snapshot, REPLAY_SEARCH_STOP_NONE);
+	*hit_addr = 0;
+	*out_snapshot = NULL;
+
+	snapshot = replay_collect_snapshot (core, spec);
+	if (!snapshot) {
+		goto cleanup;
+	}
+	eval_ctx.snapshot = snapshot;
+	eval_ctx.depth = depth;
+	eval_ctx.input_len = input_len;
+	eval_ctx.big_endian = spec->big_endian;
+	pc = snapshot->pc;
+	if (replay_eval_predicates (spec->find_preds, spec->find_count, &eval_ctx)) {
+		*hit_addr = pc;
+		*out_snapshot = snapshot;
+		return REPLAY_SEARCH_STOP_FIND;
+	}
+	if (replay_eval_predicates (spec->avoid_preds, spec->avoid_count, &eval_ctx)) {
+		*hit_addr = pc;
+		*out_snapshot = snapshot;
+		return REPLAY_SEARCH_STOP_AVOID;
+	}
+	if (replay_addr_list_contains (spec->frontier_stop_addrs, spec->frontier_stop_count, pc)) {
+		r_debug_state_snapshot_free (snapshot);
+		snapshot = NULL;
+		if (r_debug_step (core->dbg, 1) != 1) {
+			goto cleanup;
+		}
+		snapshot = replay_collect_snapshot (core, spec);
+		if (!snapshot) {
+			goto cleanup;
+		}
+		pc = snapshot->pc;
+	}
+
+	for (i = 0; i < spec->stop_count; i++) {
+		if (spec->stop_addrs[i] != pc && !replay_temp_bps_add (core, &temps, spec->stop_addrs[i])) {
+			goto cleanup;
+		}
+	}
+	r_debug_state_snapshot_free (snapshot);
+	snapshot = NULL;
+	if (r_debug_continue (core->dbg) <= 0) {
+		goto cleanup;
+	}
+	snapshot = replay_collect_snapshot (core, spec);
+	if (!snapshot) {
+		goto cleanup;
+	}
+	eval_ctx.snapshot = snapshot;
+	eval_ctx.depth = depth;
+	eval_ctx.input_len = input_len;
+	eval_ctx.big_endian = spec->big_endian;
+	*hit_addr = snapshot->pc;
+	*out_snapshot = snapshot;
+	snapshot = NULL;
+	replay_temp_bps_fini (core, &temps);
+	return replay_classify_stop (spec, &eval_ctx);
+
+cleanup:
+	replay_temp_bps_fini (core, &temps);
+	r_debug_state_snapshot_free (snapshot);
+	return REPLAY_SEARCH_STOP_NONE;
+}
+
+static int replay_search_node_cmp(const ReplaySearchSpec *spec, const ReplaySearchNode *na, const ReplaySearchNode *nb) {
+	if (na->score != nb->score) {
+		if (spec->score_order == REPLAY_SCORE_MAX) {
+			return (na->score < nb->score) - (na->score > nb->score);
+		}
+		return (na->score > nb->score) - (na->score < nb->score);
+	}
+	if (na->input_len != nb->input_len) {
+		return (na->input_len > nb->input_len) - (na->input_len < nb->input_len);
+	}
+	if (!na->input || !nb->input) {
+		return (!na->input && nb->input) ? -1 : (na->input && !nb->input);
+	}
+	return strcmp (na->input, nb->input);
+}
+
+static void replay_search_sort_nodes(const ReplaySearchSpec *spec, ReplaySearchNode **nodes, size_t count) {
+	size_t i;
+	size_t j;
+	for (i = 1; i < count; i++) {
+		ReplaySearchNode *key = nodes[i];
+		j = i;
+		while (j > 0 && replay_search_node_cmp (spec, nodes[j - 1], key) > 0) {
+			nodes[j] = nodes[j - 1];
+			j--;
+		}
+		nodes[j] = key;
+	}
+}
+
+static char *replay_search_run_json(RCore *core, const ReplaySearchSpec *spec) {
+	RList *active = NULL;
+	RList *next = NULL;
+	RList *found = NULL;
+	ReplaySearchNode *seed = NULL;
+	size_t explored = 0;
+	size_t depth;
+	char *out = NULL;
+
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->session && spec && spec->score_expr, NULL);
+
+	active = r_list_newf ((RListFree)replay_search_node_free);
+	next = r_list_newf ((RListFree)replay_search_node_free);
+	found = r_list_newf ((RListFree)replay_search_match_free);
+	if (!active || !next || !found) {
+		goto cleanup;
+	}
+	seed = R_NEW0 (ReplaySearchNode);
+	if (!seed) {
+		goto cleanup;
+	}
+	seed->checkpoint_id = spec->seed_checkpoint;
+	seed->input = strdup ("");
+	if (!seed->input) {
+		replay_search_node_free (seed);
+		goto cleanup;
+	}
+	r_list_append (active, seed);
+
+	for (depth = 0; depth < spec->max_depth && !r_list_empty (active) && r_list_empty (found); depth++) {
+		RListIter *iter;
+		ReplaySearchNode *node;
+		r_list_free (next);
+		next = r_list_newf ((RListFree)replay_search_node_free);
+		if (!next) {
+			goto cleanup;
+		}
+		r_list_foreach (active, iter, node) {
+			const char *alphabet = spec->alphabet;
+			while (alphabet && *alphabet) {
+				ut64 child_checkpoint = 0;
+				ut64 frontier_checkpoint = 0;
+				ut64 hit_addr = 0;
+				ReplaySearchStopKind stop;
+				RDebugStateSnapshot *snapshot = NULL;
+				ReplayEvalContext eval_ctx;
+				char *next_input = NULL;
+				char *snapshot_json = NULL;
+				st64 score = 0;
+
+				if (!r_debug_session_restore_checkpoint (core->dbg, node->checkpoint_id)) {
+					alphabet++;
+					continue;
+				}
+				child_checkpoint = r_debug_checkpoint_create (core->dbg, node->checkpoint_id, NULL);
+				if (!child_checkpoint) {
+					alphabet++;
+					continue;
+				}
+				if (!r_debug_session_checkpoint_replay_append (core->dbg->session, child_checkpoint,
+						spec->replay_fd, (const ut8 *)alphabet, 1, NULL)) {
+					alphabet++;
+					continue;
+				}
+				if (!r_debug_session_restore_checkpoint (core->dbg, child_checkpoint)) {
+					alphabet++;
+					continue;
+				}
+				if (!r_debug_session_checkpoint_replay_apply (core->dbg, child_checkpoint, spec->replay_fd)) {
+					alphabet++;
+					continue;
+				}
+
+				explored++;
+				stop = replay_continue_to_any (core, spec, depth + 1, node->input_len + 1, &hit_addr, &snapshot);
+				next_input = replay_input_append_char (node->input, node->input_len, *alphabet);
+				if (!next_input || !snapshot) {
+					free (next_input);
+					r_debug_state_snapshot_free (snapshot);
+					alphabet++;
+					continue;
+				}
+				eval_ctx.snapshot = snapshot;
+				eval_ctx.depth = depth + 1;
+				eval_ctx.input_len = node->input_len + 1;
+				eval_ctx.big_endian = spec->big_endian;
+				if (!replay_eval_score (spec, &eval_ctx, &score)) {
+					free (next_input);
+					r_debug_state_snapshot_free (snapshot);
+					alphabet++;
+					continue;
+				}
+				snapshot_json = r_debug_state_snapshot_to_json (snapshot);
+				r_debug_state_snapshot_free (snapshot);
+				snapshot = NULL;
+
+				if (stop == REPLAY_SEARCH_STOP_FIND) {
+					ReplaySearchMatch *match = R_NEW0 (ReplaySearchMatch);
+					if (match) {
+						match->checkpoint_id = child_checkpoint;
+						match->input = next_input;
+						match->input_len = node->input_len + 1;
+						match->hit_addr = hit_addr;
+						match->score = score;
+						match->snapshot_json = snapshot_json;
+						r_list_append (found, match);
+						next_input = NULL;
+						snapshot_json = NULL;
+					}
+				} else if (stop == REPLAY_SEARCH_STOP_FRONTIER) {
+					ReplaySearchNode *frontier = R_NEW0 (ReplaySearchNode);
+					frontier_checkpoint = r_debug_checkpoint_create (core->dbg, child_checkpoint, NULL);
+					if (frontier && frontier_checkpoint) {
+						frontier->checkpoint_id = frontier_checkpoint;
+						frontier->input = next_input;
+						frontier->input_len = node->input_len + 1;
+						frontier->score = score;
+						frontier->snapshot_json = snapshot_json;
+						r_list_append (next, frontier);
+						next_input = NULL;
+						snapshot_json = NULL;
+					} else {
+						replay_search_node_free (frontier);
+					}
+				}
+				free (snapshot_json);
+				free (next_input);
+				if (!r_list_empty (found)) {
+					break;
+				}
+				alphabet++;
+			}
+			if (!r_list_empty (found)) {
+				break;
+			}
+		}
+
+		{
+			int next_len = r_list_length (next);
+			if (spec->beam_width && next_len > 0 && (size_t)next_len > spec->beam_width) {
+				size_t count = (size_t)next_len;
+				size_t i;
+				ReplaySearchNode **nodes = calloc (count, sizeof (ReplaySearchNode *));
+				if (!nodes) {
+					goto cleanup;
+				}
+				i = 0;
+				{
+					RListIter *iter;
+					ReplaySearchNode *node;
+					r_list_foreach (next, iter, node) {
+						nodes[i++] = node;
+					}
+				}
+				replay_search_sort_nodes (spec, nodes, count);
+				for (i = spec->beam_width; i < count; i++) {
+					r_list_delete_data (next, nodes[i]);
+				}
+				free (nodes);
+			}
+		}
+
+		{
+			RList *tmp = active;
+			active = next;
+			next = tmp;
+		}
+	}
+
+	{
+		PJ *pj = pj_new ();
+		RListIter *iter;
+		ReplaySearchMatch *match;
+		ReplaySearchNode *node;
+		if (!pj) {
+			goto cleanup;
+		}
+		pj_o (pj);
+		pj_kn (pj, "seed_checkpoint", spec->seed_checkpoint);
+		pj_kn (pj, "replay_fd", spec->replay_fd);
+		pj_ks (pj, "alphabet", spec->alphabet);
+		pj_kn (pj, "max_depth", spec->max_depth);
+		pj_kn (pj, "beam_width", spec->beam_width);
+		pj_ks (pj, "score_order", spec->score_order == REPLAY_SCORE_MAX? "max": "min");
+		pj_kn (pj, "explored_branches", explored);
+		pj_kb (pj, "found", !r_list_empty (found));
+		pj_ka (pj, "matches");
+		r_list_foreach (found, iter, match) {
+			pj_o (pj);
+			pj_kn (pj, "checkpoint", match->checkpoint_id);
+			pj_ks (pj, "input", match->input ? match->input : "");
+			pj_kn (pj, "hit", match->hit_addr);
+			pj_ki (pj, "score", match->score);
+			if (match->snapshot_json) {
+				pj_k (pj, "snapshot");
+				pj_raw (pj, match->snapshot_json);
+			} else {
+				pj_knull (pj, "snapshot");
+			}
+			pj_end (pj);
+		}
+		pj_end (pj);
+		pj_ka (pj, "active");
+		r_list_foreach (active, iter, node) {
+			pj_o (pj);
+			pj_kn (pj, "checkpoint", node->checkpoint_id);
+			pj_ks (pj, "input", node->input ? node->input : "");
+			pj_ki (pj, "score", node->score);
+			if (node->snapshot_json) {
+				pj_k (pj, "snapshot");
+				pj_raw (pj, node->snapshot_json);
+			} else {
+				pj_knull (pj, "snapshot");
+			}
+			pj_end (pj);
+		}
+		pj_end (pj);
+		pj_end (pj);
+		out = strdup (pj_string (pj));
+		pj_free (pj);
+	}
+
+cleanup:
+	r_list_free (active);
+	r_list_free (next);
+	r_list_free (found);
+	return out;
+}
+
 static RAnalFunction *resolve_function_target_by_name(RAnal *anal, const char *target_name) {
 	if (!anal || !target_name || !*target_name) {
 		return NULL;
@@ -1015,7 +2984,224 @@ static RAnalFunction *resolve_function_target_by_name(RAnal *anal, const char *t
 	return fcn;
 }
 
-static RAnalFunction *resolve_function_target(RCore *core, RAnal *anal, const char *target_arg) {
+static int function_bb_count(const RAnalFunction *fcn) {
+	return (fcn && fcn->bbs)? r_list_length (fcn->bbs): 0;
+}
+
+static bool function_exceeds_helper_scope_budget(const RAnalFunction *fcn) {
+	ut32 cost;
+	int bb_count;
+	if (!fcn) {
+		return true;
+	}
+	bb_count = function_bb_count (fcn);
+	if (bb_count > SLEIGH_SCOPE_HELPER_MAX_BLOCKS) {
+		return true;
+	}
+	cost = r_anal_function_cost ((RAnalFunction *)fcn);
+	return cost > SLEIGH_SCOPE_HELPER_MAX_COST;
+}
+
+static bool is_autogenerated_function_name(const char *name) {
+	if (!name || !*name) {
+		return true;
+	}
+	return !strncmp (name, "fcn.", 4)
+		|| !strncmp (name, "fcn_", 4)
+		|| !strncmp (name, "sub.", 4)
+		|| !strncmp (name, "sub_", 4)
+		|| !strncmp (name, "loc.", 4);
+}
+
+static bool should_skip_decompile_symbolic_scope(const RAnalFunction *fcn) {
+	return fcn && is_autogenerated_function_name (fcn->name)
+		&& function_exceeds_helper_scope_budget (fcn);
+}
+
+typedef struct {
+	size_t block_count;
+	size_t loop_count;
+	size_t back_edge_count;
+	size_t max_switch_cases;
+} DecompileCFGRiskSummary;
+
+typedef struct {
+	RAnal *anal;
+	RAnalFunction *fcn;
+	DecompileCFGRiskSummary *summary;
+	HtUP *visited;
+	HtUP *in_stack;
+	HtUP *loop_headers;
+} DecompileCFGRiskWalk;
+
+static void decompile_cfg_risk_visit_block(DecompileCFGRiskWalk *walk, RAnalBlock *bb);
+
+static void decompile_cfg_risk_visit_addr(DecompileCFGRiskWalk *walk, ut64 addr) {
+	RAnalBlock *succ;
+	bool found;
+	if (!walk || !walk->anal || !walk->fcn || addr == UT64_MAX) {
+		return;
+	}
+	succ = r_anal_function_bbget_at (walk->anal, walk->fcn, addr);
+	if (!succ) {
+		succ = r_anal_function_bbget_in (walk->anal, walk->fcn, addr);
+	}
+	if (!succ) {
+		return;
+	}
+	ht_up_find (walk->in_stack, succ->addr, &found);
+	if (found) {
+		bool seen_header;
+		walk->summary->back_edge_count++;
+		ht_up_find (walk->loop_headers, succ->addr, &seen_header);
+		if (!seen_header) {
+			ht_up_insert (walk->loop_headers, succ->addr, (void *)1);
+			walk->summary->loop_count++;
+		}
+		return;
+	}
+	ht_up_find (walk->visited, succ->addr, &found);
+	if (!found) {
+		decompile_cfg_risk_visit_block (walk, succ);
+	}
+}
+
+static void decompile_cfg_risk_visit_block(DecompileCFGRiskWalk *walk, RAnalBlock *bb) {
+	size_t case_count = 0;
+	bool found;
+	RListIter *iter;
+	RAnalCaseOp *caseop;
+	if (!walk || !bb) {
+		return;
+	}
+	ht_up_find (walk->visited, bb->addr, &found);
+	if (found) {
+		return;
+	}
+	ht_up_insert (walk->visited, bb->addr, (void *)1);
+	ht_up_insert (walk->in_stack, bb->addr, (void *)1);
+
+	if (bb->switch_op) {
+		if (bb->switch_op->amount > 0) {
+			case_count = (size_t)bb->switch_op->amount;
+		}
+		if (bb->switch_op->cases) {
+			size_t listed_cases = (size_t)r_list_length (bb->switch_op->cases);
+			if (listed_cases > case_count) {
+				case_count = listed_cases;
+			}
+		}
+		if (case_count > walk->summary->max_switch_cases) {
+			walk->summary->max_switch_cases = case_count;
+		}
+	}
+
+	decompile_cfg_risk_visit_addr (walk, bb->jump);
+	decompile_cfg_risk_visit_addr (walk, bb->fail);
+	if (bb->switch_op && bb->switch_op->cases) {
+		r_list_foreach (bb->switch_op->cases, iter, caseop) {
+			if (!caseop) {
+				continue;
+			}
+			decompile_cfg_risk_visit_addr (walk, caseop->jump);
+		}
+	}
+
+	ht_up_delete (walk->in_stack, bb->addr);
+}
+
+static bool compute_decompile_cfg_risk_summary(RAnal *anal, RAnalFunction *fcn, DecompileCFGRiskSummary *out) {
+	DecompileCFGRiskWalk walk;
+	RAnalBlock *entry;
+	if (!anal || !fcn || !out) {
+		return false;
+	}
+	memset (out, 0, sizeof (*out));
+	out->block_count = (size_t)function_bb_count (fcn);
+	walk.anal = anal;
+	walk.fcn = fcn;
+	walk.summary = out;
+	walk.visited = ht_up_new0 ();
+	walk.in_stack = ht_up_new0 ();
+	walk.loop_headers = ht_up_new0 ();
+	if (!walk.visited || !walk.in_stack || !walk.loop_headers) {
+		ht_up_free (walk.visited);
+		ht_up_free (walk.in_stack);
+		ht_up_free (walk.loop_headers);
+		return false;
+	}
+	entry = r_anal_function_bbget_in (anal, fcn, fcn->addr);
+	if (!entry) {
+		entry = r_anal_function_bbget_at (anal, fcn, fcn->addr);
+	}
+	if (entry) {
+		decompile_cfg_risk_visit_block (&walk, entry);
+	}
+	ht_up_free (walk.visited);
+	ht_up_free (walk.in_stack);
+	ht_up_free (walk.loop_headers);
+	return true;
+}
+
+static size_t decompiler_max_blocks_preflight(void) {
+	const char *raw = getenv ("SLEIGH_DEC_MAX_BLOCKS");
+	char *endptr = NULL;
+	unsigned long long parsed;
+	if (!raw || !*raw) {
+		return 200;
+	}
+	errno = 0;
+	parsed = strtoull (raw, &endptr, 10);
+	if (errno != 0 || endptr == raw || parsed == 0) {
+		return 200;
+	}
+	if (parsed > (unsigned long long)SIZE_MAX) {
+		return SIZE_MAX;
+	}
+	return (size_t)parsed;
+}
+
+static RAnalFunction *materialize_function_at(RAnal *anal, ut64 addr) {
+	RAnalFunction *fcn;
+	int ret;
+	RCore *core;
+
+	if (!anal || addr == UT64_MAX) {
+		return NULL;
+	}
+
+	fcn = r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+	if (fcn) {
+		return fcn;
+	}
+
+	core = anal->coreb.core;
+	if (core) {
+		if (r_core_anal_fcn (core, addr, UT64_MAX, R_ANAL_REF_TYPE_NULL, 1)) {
+			fcn = r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+			if (fcn) {
+				return fcn;
+			}
+		}
+	}
+
+	fcn = r_anal_create_function (anal, NULL, addr, R_ANAL_FCN_TYPE_FCN, NULL);
+	if (!fcn) {
+		return r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+	}
+
+	ret = r_anal_function (anal, fcn, addr, R_ANAL_REF_TYPE_NULL);
+	if ((ret < 0 && ret != R_ANAL_RET_END) || function_bb_count (fcn) <= 0) {
+		if (!r_anal_function_delete (anal, fcn)) {
+			r_anal_function_free (fcn);
+		}
+		return NULL;
+	}
+
+	return r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
+}
+
+static RAnalFunction *resolve_or_materialize_function_target(RCore *core, RAnal *anal, const char *target_arg) {
 	ut64 target_addr = 0;
 	RAnalFunction *fcn;
 
@@ -1031,7 +3217,14 @@ static RAnalFunction *resolve_function_target(RCore *core, RAnal *anal, const ch
 	if (!parse_sym_target_expr (core, target_arg, &target_addr)) {
 		return NULL;
 	}
-	return r_anal_get_fcn_in (anal, target_addr, R_ANAL_FCN_TYPE_ANY);
+	return materialize_function_at (anal, target_addr);
+}
+
+static RAnalFunction *resolve_or_materialize_current_function(RCore *core, RAnal *anal) {
+	if (!core || !anal) {
+		return NULL;
+	}
+	return materialize_function_at (anal, core->addr);
 }
 
 static char *build_sym_symbol_map_json(RCore *core) {
@@ -3872,10 +6065,30 @@ R2ILContext *get_context(RAnal *anal) {
 		sleigh_arch_str = "riscv32";
 	} else if (!strcmp (arch, "riscv64") || !strcmp (arch, "rv64")) {
 		sleigh_arch_str = "riscv64";
-	} else if (!strcmp (arch, "mips")) {
-	        /* Simple heuristic for MIPS (assuming default is 32be/le) */
-	        /* Note: This is partial, better use manual override for complex variants */
-		sleigh_arch_str = "mips"; /* Placeholder - mapped often to general mips */
+	} else if (!strcmp (arch, "mips") || !strcmp (arch, "mips32")
+			|| !strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
+			|| !strcmp (arch, "mipseb") || !strcmp (arch, "mipsel")
+			|| !strcmp (arch, "mips32le") || !strcmp (arch, "mips32el")
+			|| !strcmp (arch, "mips64") || !strcmp (arch, "mips64be")
+			|| !strcmp (arch, "mips64le") || !strcmp (arch, "mips64el")) {
+		bool is64 = bits >= 64
+			|| !strcmp (arch, "mips64")
+			|| !strcmp (arch, "mips64be")
+			|| !strcmp (arch, "mips64le")
+			|| !strcmp (arch, "mips64el");
+		bool big_endian = R_ARCH_CONFIG_IS_BIG_ENDIAN (anal->config);
+		if (!strcmp (arch, "mipsel") || !strcmp (arch, "mips32le")
+				|| !strcmp (arch, "mips32el")
+				|| !strcmp (arch, "mips64le")
+				|| !strcmp (arch, "mips64el")) {
+			big_endian = false;
+		} else if (!strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
+				|| !strcmp (arch, "mipseb") || !strcmp (arch, "mips64be")) {
+			big_endian = true;
+		}
+		sleigh_arch_str = is64
+			? (big_endian ? "mips64be" : "mips64le")
+			: (big_endian ? "mips32be" : "mips32le");
 	} else {
 		return NULL; /* unsupported arch */
 	}
@@ -4112,14 +6325,14 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sla.vars   - Show all varnodes used by instruction");
 			r_cons_println (cons, "| a:sla.ssa    - Show SSA form of instruction");
 			r_cons_println (cons, "| a:sla.defuse - Show def-use analysis of instruction");
-			r_cons_println (cons, "| a:sla.types  - Dump inferred type write-back payload for current function");
+			r_cons_println (cons, "| a:sla.types [name|addr] - Dump inferred type write-back payload (current by default)");
 			r_cons_println (cons, "| a:sla.ssa.func - Show function SSA with phi nodes");
 				r_cons_println (cons, "| a:sla.ssa.func.opt - Show optimized function SSA");
 				r_cons_println (cons, "| a:sla.defuse.func - Show function-wide def-use analysis");
 				r_cons_println (cons, "| a:sla.dom    - Show dominator tree for current function");
 				r_cons_println (cons, "| a:sla.slice <var> - Backward slice from variable (e.g. rax_3)");
-				r_cons_println (cons, "| a:sla.sym    - Symbolic execution summary for current function");
-				r_cons_println (cons, "| a:sla.sym.paths - Explore paths in current function");
+				r_cons_println (cons, "| a:sla.sym [name|addr] - Symbolic execution summary (current by default)");
+				r_cons_println (cons, "| a:sla.sym.paths [name|addr] - Explore paths in function (current by default)");
 			r_cons_println (cons, "| a:sla.sym.merge [on|off] - Toggle symbolic state merging");
 			r_cons_println (cons, "| a:sla.taint  - Taint analysis for current function");
 			r_cons_println (cons, "| a:sla.dec [name|addr] - Decompile function (current by default)");
@@ -4127,6 +6340,10 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sla.cfg.json - Show CFG as JSON for current function");
 			r_cons_println (cons, "| a:sym.explore <target> - Explore symbolic paths reaching target");
 			r_cons_println (cons, "| a:sym.solve <target> - Solve concrete input for target reachability");
+			r_cons_println (cons, "| a:sym.explore.replayj <target> <json-spec> - Explore from a replay checkpoint frontier");
+			r_cons_println (cons, "| a:sym.solve.replayj <target> <json-spec> - Solve from a replay checkpoint frontier");
+			r_cons_println (cons, "| a:sym.runj <json-spec> - Run typed symbolic exploration spec");
+			r_cons_println (cons, "| a:sym.replayj <json-spec> - Search checkpointed replay branches");
 			r_cons_println (cons, "| a:sym.state  - Show last symbolic explore/solve cached result");
 		}
 		return strdup("");
@@ -4141,6 +6358,192 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup("");
 	}
 
+	if (is_sym_ns && !strncmp (cmd, "sym.runj", 8)) {
+		const char *arg = skip_cmd_spaces (cmd + 8);
+		R2ILContext *ctx;
+		RAnalFunction *fcn;
+		SymFunctionScope scope;
+		char *spec_json = NULL;
+		char *result = NULL;
+		bool rust_owned = true;
+
+		if (!arg || !*arg) {
+			if (cons) {
+				r_cons_println (cons, "Usage: a:sym.runj <json-spec>");
+			}
+			return strdup("");
+		}
+
+		ctx = get_context (anal);
+		if (!ctx) {
+			R_LOG_ERROR ("r2sleigh: no context");
+			return strdup("");
+		}
+		fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		if (!fcn) {
+			R_LOG_ERROR ("r2sleigh: no function at current address");
+			return strdup("");
+		}
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
+			return strdup("");
+		}
+		char *sym_map_json = build_sym_symbol_map_json (core);
+		if (sym_map_json) {
+			r2sym_set_symbol_map_json (sym_map_json);
+			free (sym_map_json);
+		}
+
+		spec_json = strdup (arg);
+		if (!spec_json) {
+			sym_function_scope_free (&scope);
+			return strdup("");
+		}
+		r_str_unescape (spec_json);
+		result = r2sym_run_spec_json_scope (ctx, scope.functions, scope.count, fcn->addr, spec_json);
+		free (spec_json);
+		if (!result) {
+			rust_owned = false;
+			result = strdup ("{\"error\":\"symbolic execution failed\"}");
+		}
+
+		if (cons && result) {
+			r_cons_printf (cons, "%s\n", result);
+		}
+		if (result && !sym_result_has_error (result)) {
+			sym_state_cache_update ("runj", fcn->addr, fcn->addr, 0, result);
+		}
+		if (rust_owned) {
+			r2il_string_free (result);
+		} else {
+			free (result);
+		}
+		sym_function_scope_free (&scope);
+		return strdup("");
+	}
+
+	if (is_sym_ns && !strncmp (cmd, "sym.replayj", 11)) {
+		const char *arg = skip_cmd_spaces (cmd + 11);
+		ReplaySearchSpec spec;
+		char *result = NULL;
+
+		if (!arg || !*arg) {
+			if (cons) {
+				r_cons_println (cons, "Usage: a:sym.replayj <json-spec>");
+			}
+			return strdup ("");
+		}
+		if (!core->dbg || !core->dbg->session) {
+			R_LOG_ERROR ("r2sleigh: debug session with checkpoints is required");
+			return strdup ("");
+		}
+		R_LOG_DEBUG ("r2sleigh replayj arg: %s", arg);
+		if (!replay_search_spec_parse (core, arg, &spec)) {
+			R_LOG_ERROR ("r2sleigh: invalid replay search spec");
+			return strdup ("");
+		}
+		result = replay_search_run_json (core, &spec);
+		replay_search_spec_fini (&spec);
+		if (!result) {
+			result = strdup ("{\"error\":\"replay search failed\"}");
+		}
+		if (cons && result) {
+			r_cons_printf (cons, "%s\n", result);
+		}
+		if (result && !sym_result_has_error (result)) {
+			sym_state_cache_update ("replayj", 0, 0, 0, result);
+		}
+		free (result);
+		return strdup ("");
+	}
+
+	if (is_sym_ns && (!strncmp (cmd, "sym.explore.replayj", 19) || !strncmp (cmd, "sym.solve.replayj", 17))) {
+		bool is_explore = r_str_startswith (cmd, "sym.explore.replayj");
+		size_t prefix_len = is_explore ? 19 : 17;
+		const char *arg = skip_cmd_spaces (cmd + prefix_len);
+		ReplaySymSeedSpec spec;
+		ut64 target = 0;
+		R2ILContext *ctx;
+		RAnalFunction *fcn;
+		SymFunctionScope scope;
+		char *spec_json = NULL;
+		char *result = NULL;
+		bool rust_owned = true;
+
+		if (!arg || !*arg) {
+			if (cons) {
+				r_cons_println (cons, is_explore
+					? "Usage: a:sym.explore.replayj <target_addr_expr> <json-spec>"
+					: "Usage: a:sym.solve.replayj <target_addr_expr> <json-spec>");
+			}
+			return strdup ("");
+		}
+		if (!core->dbg || !core->dbg->session) {
+			R_LOG_ERROR ("r2sleigh: debug session with checkpoints is required");
+			return strdup ("");
+		}
+		if (!parse_replay_target_and_json (core, arg, &target, &spec_json)) {
+			R_LOG_ERROR ("r2sleigh: invalid replay symbolic target/spec");
+			if (cons) {
+				r_cons_println (cons, is_explore
+					? "Usage: a:sym.explore.replayj <target_addr_expr> <json-spec>"
+					: "Usage: a:sym.solve.replayj <target_addr_expr> <json-spec>");
+			}
+			return strdup ("");
+		}
+		if (!replay_sym_seed_spec_parse (core, spec_json, &spec)) {
+			R_LOG_ERROR ("r2sleigh: invalid replay symbolic seed spec");
+			free (spec_json);
+			return strdup ("");
+		}
+		free (spec_json);
+
+		ctx = get_context (anal);
+		if (!ctx) {
+			R_LOG_ERROR ("r2sleigh: no context");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		fcn = resolve_or_materialize_current_function (core, anal);
+		if (!fcn) {
+			R_LOG_ERROR ("r2sleigh: no function at current address");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		char *sym_map_json = build_sym_symbol_map_json (core);
+		if (sym_map_json) {
+			r2sym_set_symbol_map_json (sym_map_json);
+			free (sym_map_json);
+		}
+
+		result = replay_sym_query_run (core, ctx, &scope, fcn->addr, target, &spec, is_explore);
+		if (!result) {
+			rust_owned = false;
+			result = strdup ("{\"error\":\"replay symbolic execution failed\"}");
+		}
+
+		if (cons && result) {
+			r_cons_printf (cons, "%s\n", result);
+		}
+		if (result && !sym_result_has_error (result)) {
+			sym_state_cache_update (is_explore ? "explore.replayj" : "solve.replayj",
+				fcn->addr, spec.entry_addr? spec.entry_addr: fcn->addr, target, result);
+		}
+		if (rust_owned) {
+			r2il_string_free (result);
+		} else {
+			free (result);
+		}
+		sym_function_scope_free (&scope);
+		replay_sym_seed_spec_fini (&spec);
+		return strdup ("");
+	}
+
 	if (is_sym_ns && (!strncmp (cmd, "sym.explore", 11) || !strncmp (cmd, "sym.solve", 9))) {
 		bool is_explore = r_str_startswith (cmd, "sym.explore");
 		size_t prefix_len = is_explore ? 11 : 9;
@@ -4148,7 +6551,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		ut64 target = 0;
 		R2ILContext *ctx;
 		RAnalFunction *fcn;
-		BlockArray blocks;
+		SymFunctionScope scope;
 		char *result = NULL;
 		bool rust_owned = true;
 
@@ -4175,13 +6578,13 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: no context");
 			return strdup("");
 		}
-		fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		fcn = resolve_or_materialize_current_function (core, anal);
 		if (!fcn) {
 			R_LOG_ERROR ("r2sleigh: no function at current address");
 			return strdup("");
 		}
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
 		char *sym_map_json = build_sym_symbol_map_json (core);
@@ -4191,9 +6594,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		if (is_explore) {
-			result = r2sym_explore_to (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, target);
+			result = r2sym_explore_to_scope (ctx, scope.functions, scope.count, fcn->addr, target);
 		} else {
-			result = r2sym_solve_to (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, target);
+			result = r2sym_solve_to_scope (ctx, scope.functions, scope.count, fcn->addr, target);
 		}
 		if (!result) {
 			rust_owned = false;
@@ -4212,7 +6615,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		} else {
 			free (result);
 		}
-		block_array_free (&blocks);
+		sym_function_scope_free (&scope);
 		return strdup("");
 	}
 
@@ -4521,32 +6924,41 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup("");
 	}
 
-	if (!strcmp (cmd, "sla.types")) {
+	if (!strncmp (cmd, "sla.types", 9) && (!cmd[9] || isspace ((unsigned char)cmd[9]))) {
 		R2ILContext *ctx = get_context (anal);
 		RAnalFunction *fcn;
 		BlockArray blocks;
 		char *external_context_json = NULL;
 		char *interproc_scope_json = NULL;
 		char *result = NULL;
+		const char *target_arg = skip_cmd_spaces (cmd + 9);
 		ut64 *seen_addrs = NULL;
 		size_t seen_count = 0;
 		size_t seen_cap = 0;
 		int interproc_max_iters = cfg_get_type_interproc_max_iters (anal);
+		bool prefer_bounded_semantic_type_plan = false;
 
 		if (!ctx) {
 			R_LOG_ERROR ("r2sleigh: no context");
 			return strdup ("");
 		}
 
-		fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		fcn = (target_arg && *target_arg)
+			? resolve_or_materialize_function_target (core, anal, target_arg)
+			: resolve_or_materialize_current_function (core, anal);
 		if (!fcn) {
-			R_LOG_ERROR ("r2sleigh: no function at current address");
+			if (target_arg && *target_arg) {
+				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
+			} else {
+				R_LOG_ERROR ("r2sleigh: no function at current address");
+			}
 			return strdup ("");
 		}
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup ("");
 		}
+		prefer_bounded_semantic_type_plan = should_skip_decompile_symbolic_scope (fcn);
 
 		external_context_json = sleigh_collect_external_context_json (anal, fcn);
 		if (!external_context_json || (external_context_json[0] != '{' && external_context_json[0] != '[')) {
@@ -4554,13 +6966,31 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			external_context_json = strdup ("{}");
 		}
 
-		warm_type_payload_cache_for_function (core, anal, ctx, fcn, interproc_max_iters,
-			&seen_addrs, &seen_count, &seen_cap);
-		interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
-		result = r2sleigh_infer_type_writeback_json_ex (ctx,
-			(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
-			external_context_json,
-			1, interproc_max_iters, 1, interproc_scope_json? interproc_scope_json: "{}");
+		if (!prefer_bounded_semantic_type_plan) {
+			warm_type_payload_cache_for_function (core, anal, ctx, fcn, interproc_max_iters,
+				&seen_addrs, &seen_count, &seen_cap);
+			interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
+		}
+		SymFunctionScope sym_scope;
+		if (build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
+			result = r2sleigh_infer_type_writeback_json_scope_ex (ctx,
+				(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+				external_context_json,
+				1,
+				prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
+				prefer_bounded_semantic_type_plan? 0: 1,
+				interproc_scope_json? interproc_scope_json: "{}",
+				sym_scope.functions, sym_scope.count);
+			sym_function_scope_free (&sym_scope);
+		} else {
+			result = r2sleigh_infer_type_writeback_json_ex (ctx,
+				(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+				external_context_json,
+				1,
+				prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
+				prefer_bounded_semantic_type_plan? 0: 1,
+				interproc_scope_json? interproc_scope_json: "{}");
+		}
 		if (cons) {
 			if (result && *result) {
 				r_cons_printf (cons, "%s\n", result);
@@ -4594,6 +7024,25 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
+		if (is_autogenerated_function_name (fcn->name)) {
+			DecompileCFGRiskSummary cfg_summary;
+			char *cfg_guard_comment = NULL;
+			if (compute_decompile_cfg_risk_summary (anal, fcn, &cfg_summary)) {
+				cfg_guard_comment = r2dec_cfg_guard_comment_ffi (
+					fcn->name,
+					cfg_summary.block_count,
+					cfg_summary.loop_count,
+					cfg_summary.back_edge_count,
+					cfg_summary.max_switch_cases);
+			}
+			if (cfg_guard_comment) {
+				if (cons) {
+					r_cons_printf (cons, "%s\n", cfg_guard_comment);
+				}
+				r2il_string_free (cfg_guard_comment);
+				return strdup("");
+			}
+		}
 		/* Lift all blocks */
 		BlockArray blocks;
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
@@ -4790,24 +7239,34 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup("");
 	}
 
-	if (!strcmp (cmd, "sla.sym") || !strcmp (cmd, "sla.sym.paths")) {
+	if ((!strncmp (cmd, "sla.sym.paths", 13) && (!cmd[13] || isspace ((unsigned char)cmd[13])))
+		|| (!strncmp (cmd, "sla.sym", 7) && (!cmd[7] || isspace ((unsigned char)cmd[7])))) {
 		R2ILContext *ctx = get_context (anal);
+		bool is_paths_cmd = r_str_startswith (cmd, "sla.sym.paths");
+		size_t prefix_len = is_paths_cmd ? 13: 7;
+		const char *target_arg = skip_cmd_spaces (cmd + prefix_len);
+		RAnalFunction *fcn;
 		if (!ctx) {
 			R_LOG_ERROR ("r2sleigh: no context");
 			return strdup("");
 		}
 
-		/* Get current function */
-		RAnalFunction *fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+		fcn = (target_arg && *target_arg)
+			? resolve_or_materialize_function_target (core, anal, target_arg)
+			: resolve_or_materialize_current_function (core, anal);
 		if (!fcn) {
-			R_LOG_ERROR ("r2sleigh: no function at current address");
+			if (target_arg && *target_arg) {
+				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
+			} else {
+				R_LOG_ERROR ("r2sleigh: no function at current address");
+			}
 			return strdup("");
 		}
 
-		/* Lift all blocks */
-		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
-			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+		/* Lift root + reachable helper closure */
+		SymFunctionScope scope;
+		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
 		char *sym_map_json = build_sym_symbol_map_json (core);
@@ -4818,10 +7277,10 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Call symbolic execution */
 		char *result;
-		if (!strcmp (cmd, "sla.sym.paths")) {
-			result = r2sym_paths (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr);
+		if (is_paths_cmd) {
+			result = r2sym_paths_scope (ctx, scope.functions, scope.count, fcn->addr);
 		} else {
-			result = r2sym_function (ctx, (const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr);
+			result = r2sym_function_scope (ctx, scope.functions, scope.count, fcn->addr);
 		}
 
 		if (cons && result) {
@@ -4829,7 +7288,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		r2il_string_free (result);
-		block_array_free (&blocks);
+		sym_function_scope_free (&scope);
 		return strdup("");
 	}
 
@@ -4875,16 +7334,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		const char *target_arg = skip_cmd_spaces (cmd + 7);
 		RAnalFunction *fcn = NULL;
 		if (target_arg && *target_arg) {
-			fcn = resolve_function_target (core, anal, target_arg);
+			fcn = resolve_or_materialize_function_target (core, anal, target_arg);
 		} else {
-			fcn = r_anal_get_fcn_in (anal, core->addr, R_ANAL_FCN_TYPE_ANY);
+			fcn = resolve_or_materialize_current_function (core, anal);
 		}
 
 		if (!fcn) {
 			if (target_arg && *target_arg) {
 				if (cons) {
 					r_cons_printf (cons,
-						"/* r2dec: function target '%s' not found. It may be inlined or stripped. Try 'afl' or 'a:sla.dec 0xADDR'. */\n",
+						"/* r2dec: function target '%s' not found or could not be materialized (it may be inlined or stripped). */\n",
 						target_arg);
 				}
 			} else {
@@ -4893,11 +7352,71 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 		}
 
+		size_t decompile_max_blocks = decompiler_max_blocks_preflight ();
+		int bb_count = function_bb_count (fcn);
+		DecompileCFGRiskSummary cfg_summary;
+		bool have_cfg_summary = false;
+		if (is_autogenerated_function_name (fcn->name)) {
+			have_cfg_summary = compute_decompile_cfg_risk_summary (anal, fcn, &cfg_summary);
+		}
+		if (is_autogenerated_function_name (fcn->name)
+			&& bb_count > 0
+			&& (size_t)bb_count > decompile_max_blocks) {
+			char *guard_comment = r2dec_block_guard_comment_ffi (
+				fcn->name, (size_t)bb_count, decompile_max_blocks);
+			if (cons) {
+				if (guard_comment && guard_comment[0]) {
+					r_cons_printf (cons, "%s\n", guard_comment);
+				} else {
+					const char *fname = (fcn && fcn->name) ? fcn->name : "unknown";
+					r_cons_printf (cons,
+						"/* r2dec fallback: skipped decompilation for %s (complex loop graph; block preflight exceeded %zu) */\n",
+						fname, decompile_max_blocks);
+				}
+			}
+			if (guard_comment) {
+				r2il_string_free (guard_comment);
+			}
+			return strdup("");
+		}
 		/* Lift all blocks */
 		BlockArray blocks;
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
+		}
+
+		char *result = NULL;
+		SymFunctionScope sym_scope;
+		bool have_sym_scope = build_symbolic_function_scope (anal, fcn, ctx, &sym_scope);
+		if (have_cfg_summary) {
+			result = r2dec_semantic_worker_linearization_scope_ffi (
+				ctx,
+				(const R2ILBlock **)blocks.blocks,
+				blocks.count,
+				fcn->addr,
+				fcn->name,
+				cfg_summary.block_count,
+				cfg_summary.loop_count,
+				cfg_summary.back_edge_count,
+				cfg_summary.max_switch_cases,
+				have_sym_scope? sym_scope.functions: NULL,
+				have_sym_scope? sym_scope.count: 0);
+			if (result && result[0]) {
+				if (cons) {
+					r_cons_printf (cons, "%s\n", result);
+				}
+				r2il_string_free (result);
+				if (have_sym_scope) {
+					sym_function_scope_free (&sym_scope);
+				}
+				block_array_free (&blocks);
+				return strdup("");
+			}
+			if (result) {
+				r2il_string_free (result);
+				result = NULL;
+			}
 		}
 
 		/* Gather function names from r2 */
@@ -5010,9 +7529,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 
 			/* Decompile with context */
-			char *result = r2dec_function_with_context (ctx, (const R2ILBlock **)blocks.blocks, blocks.count,
-			                                             fcn->name, func_names_json, strings_json, symbols_json,
-			                                             external_context_json);
+			if (have_sym_scope) {
+				result = r2dec_function_with_context_scope (ctx, (const R2ILBlock **)blocks.blocks, blocks.count,
+					fcn->addr, fcn->name, func_names_json, strings_json, symbols_json,
+					external_context_json, sym_scope.functions, sym_scope.count);
+				sym_function_scope_free (&sym_scope);
+			} else {
+				result = r2dec_function_with_context (ctx, (const R2ILBlock **)blocks.blocks, blocks.count,
+					fcn->name, func_names_json, strings_json, symbols_json,
+					external_context_json);
+			}
 
 		if (cons) {
 			if (result && result[0]) {
@@ -6601,6 +9127,140 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	return targets;
 }
 
+static void sym_function_scope_init(SymFunctionScope *scope) {
+	if (!scope) {
+		return;
+	}
+	memset (scope, 0, sizeof (*scope));
+}
+
+static void sym_function_scope_free(SymFunctionScope *scope) {
+	size_t i;
+	if (!scope) {
+		return;
+	}
+	for (i = 0; i < scope->count; i++) {
+		block_array_free (&scope->owned_blocks[i]);
+		free (scope->owned_names[i]);
+	}
+	free (scope->functions);
+	free (scope->owned_blocks);
+	free (scope->owned_names);
+	memset (scope, 0, sizeof (*scope));
+}
+
+static bool sym_function_scope_ensure_capacity(SymFunctionScope *scope, size_t needed) {
+	R2ILFunctionBlocks *functions_next;
+	BlockArray *blocks_next;
+	char **names_next;
+	size_t new_cap;
+	if (!scope) {
+		return false;
+	}
+	if (needed <= scope->capacity) {
+		return true;
+	}
+	new_cap = scope->capacity? scope->capacity * 2: 4;
+	while (new_cap < needed) {
+		new_cap *= 2;
+	}
+	functions_next = realloc (scope->functions, new_cap * sizeof (*scope->functions));
+	blocks_next = realloc (scope->owned_blocks, new_cap * sizeof (*scope->owned_blocks));
+	names_next = realloc (scope->owned_names, new_cap * sizeof (*scope->owned_names));
+	if (!functions_next || !blocks_next || !names_next) {
+		free (functions_next);
+		free (blocks_next);
+		free (names_next);
+		return false;
+	}
+	scope->functions = functions_next;
+	scope->owned_blocks = blocks_next;
+	scope->owned_names = names_next;
+	scope->capacity = new_cap;
+	return true;
+}
+
+static bool sym_function_scope_append(
+	SymFunctionScope *scope,
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx
+) {
+	BlockArray blocks;
+	if (!scope || !anal || !fcn || !ctx) {
+		return false;
+	}
+	if (!sym_function_scope_ensure_capacity (scope, scope->count + 1)) {
+		return false;
+	}
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		return false;
+	}
+	scope->owned_blocks[scope->count] = blocks;
+	scope->owned_names[scope->count] = fcn->name? strdup (fcn->name): NULL;
+	scope->functions[scope->count].entry_addr = fcn->addr;
+	scope->functions[scope->count].name = scope->owned_names[scope->count];
+	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
+	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
+	scope->count++;
+	return true;
+}
+
+static bool build_symbolic_function_scope(
+	RAnal *anal,
+	RAnalFunction *root_fcn,
+	R2ILContext *ctx,
+	SymFunctionScope *scope
+) {
+	size_t queue_count = 0;
+	size_t queue_cap = 0;
+	size_t queue_index = 0;
+	ut64 *queue = NULL;
+	ut64 *seen = NULL;
+	size_t seen_count = 0;
+	size_t seen_cap = 0;
+
+	if (!anal || !root_fcn || !ctx || !scope) {
+		return false;
+	}
+	sym_function_scope_init (scope);
+	if (!append_unique_ut64 (&queue, &queue_count, &queue_cap, root_fcn->addr)) {
+		free (queue);
+		return false;
+	}
+
+	while (queue_index < queue_count && scope->count < SLEIGH_SYM_HELPER_MAX_FUNCTIONS) {
+		RAnalFunction *fcn;
+		ut64 addr = queue[queue_index++];
+		ut64 *targets = NULL;
+		size_t target_count = 0;
+		size_t i;
+		const BlockArray *blocks;
+
+		fcn = materialize_function_at (anal, addr);
+		if (!fcn || !append_unique_ut64 (&seen, &seen_count, &seen_cap, fcn->addr)) {
+			continue;
+		}
+		if (!sym_function_scope_append (scope, anal, fcn, ctx)) {
+			continue;
+		}
+		blocks = &scope->owned_blocks[scope->count - 1];
+		targets = collect_type_interproc_direct_targets_from_blocks (
+			ctx, blocks, fcn->addr, fcn->name, &target_count);
+		for (i = 0; i < target_count; i++) {
+			RAnalFunction *callee = materialize_function_at (anal, targets[i]);
+			if (callee && !function_exceeds_helper_scope_budget (callee)) {
+				append_unique_ut64 (&queue, &queue_count, &queue_cap, callee->addr);
+			}
+		}
+		free (targets);
+	}
+
+	free (queue);
+	free (seen);
+	return scope->count > 0;
+}
+
 static char *build_type_interproc_scope_json_from_targets(
 	RCore *core,
 	RAnal *anal,
@@ -6633,8 +9293,9 @@ static char *build_type_interproc_scope_json_from_targets(
 		if (!target) {
 			continue;
 		}
-		callee_fcn = r_anal_get_fcn_in (anal, target, 0);
-		if (!callee_fcn || !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, callee_fcn->addr)) {
+		callee_fcn = materialize_function_at (anal, target);
+		if (!callee_fcn || function_exceeds_helper_scope_budget (callee_fcn)
+			|| !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, callee_fcn->addr)) {
 			continue;
 		}
 		entry = type_writeback_cache_get (callee_fcn->addr);
@@ -6652,18 +9313,24 @@ static char *build_type_interproc_scope_json_from_targets(
 	pj_k (pj, "seeds");
 	pj_a (pj);
 	for (i = 0; i < target_count; i++) {
+		RAnalFunction *seed_fcn;
 		ut64 seed_addr = targets[i];
 		char *seed_name;
-		if (!seed_addr || !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, seed_addr)) {
+		if (!seed_addr) {
 			continue;
 		}
-		seed_name = resolve_interproc_seed_name (core, anal, seed_addr);
+		seed_fcn = materialize_function_at (anal, seed_addr);
+		if (!seed_fcn || function_exceeds_helper_scope_budget (seed_fcn)
+			|| !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, seed_fcn->addr)) {
+			continue;
+		}
+		seed_name = resolve_interproc_seed_name (core, anal, seed_fcn->addr);
 		if (!seed_name || !*seed_name) {
 			free (seed_name);
 			continue;
 		}
 		pj_o (pj);
-		pj_kn (pj, "id", seed_addr);
+		pj_kn (pj, "id", seed_fcn->addr);
 		pj_ks (pj, "name", seed_name);
 		pj_end (pj);
 		free (seed_name);
@@ -6715,8 +9382,9 @@ static bool warm_type_payload_cache_for_function(
 	direct_targets = collect_type_interproc_direct_targets_from_blocks (
 		ctx, &blocks, fcn->addr, fcn->name, &direct_target_count);
 	for (i = 0; i < direct_target_count; i++) {
-		RAnalFunction *callee_fcn = r_anal_get_fcn_in (anal, direct_targets[i], 0);
-		if (!callee_fcn || callee_fcn->addr == fcn->addr) {
+		RAnalFunction *callee_fcn = materialize_function_at (anal, direct_targets[i]);
+		if (!callee_fcn || callee_fcn->addr == fcn->addr
+			|| function_exceeds_helper_scope_budget (callee_fcn)) {
 			continue;
 		}
 		warm_type_payload_cache_for_function (core, anal, ctx, callee_fcn, max_iters,

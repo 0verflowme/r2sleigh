@@ -6,6 +6,7 @@ license.workspace = true
 description = "Constraint-based type inference primitives for r2sleigh"
 
 [dependencies]
+r2sym = { path = "../r2sym" }
 r2ssa = { path = "../r2ssa" }
 serde.workspace = true
 serde_json.workspace = true

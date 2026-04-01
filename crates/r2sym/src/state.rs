@@ -3,17 +3,123 @@
 //! This module provides the `SymState` type which represents the state
 //! of the program during symbolic execution.
 
+use std::cell::OnceCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use z3::Context;
 use z3::ast::{BV, Bool};
 
-use crate::memory::SymMemory;
+use crate::memory::{MemoryRegionId, MemoryRegionKind, SymMemory};
 use crate::value::SymValue;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ConstraintCursorKey(usize);
+
+impl ConstraintCursorKey {
+    pub(crate) const ROOT: Self = Self(0);
+}
+
+#[derive(Clone, Default)]
+struct ConstraintCursor {
+    node: Option<Rc<ConstraintNode>>,
+}
+
+struct ConstraintNode {
+    id: ConstraintCursorKey,
+    parent: Option<Rc<ConstraintNode>>,
+    constraint: Bool,
+    depth: usize,
+    hash: u64,
+}
+
+impl ConstraintCursor {
+    fn key(&self) -> ConstraintCursorKey {
+        self.node
+            .as_ref()
+            .map_or(ConstraintCursorKey::ROOT, |node| node.id)
+    }
+
+    fn depth(&self) -> usize {
+        self.node.as_ref().map_or(0, |node| node.depth)
+    }
+
+    fn hash(&self) -> u64 {
+        self.node.as_ref().map_or(0, |node| node.hash)
+    }
+
+    fn push(&self, constraint: Bool) -> Self {
+        let constraint_hash = structural_hash(&constraint);
+        let hash = mix_hash(self.hash(), constraint_hash);
+        let depth = self.depth().saturating_add(1);
+        Self {
+            node: Some(Rc::new(ConstraintNode {
+                id: next_constraint_cursor_key(),
+                parent: self.node.clone(),
+                constraint,
+                depth,
+                hash,
+            })),
+        }
+    }
+
+    fn materialize(&self) -> Vec<Bool> {
+        let mut values = Vec::with_capacity(self.depth());
+        let mut current = self.node.as_ref().cloned();
+        while let Some(node) = current {
+            values.push(node.constraint.clone());
+            current = node.parent.clone();
+        }
+        values.reverse();
+        values
+    }
+
+    fn is_descendant_of(&self, ancestor: &Self) -> bool {
+        if ancestor.node.is_none() {
+            return true;
+        }
+        let ancestor_key = ancestor.key();
+        let mut current = self.node.as_ref().cloned();
+        while let Some(node) = current {
+            if node.id == ancestor_key {
+                return true;
+            }
+            current = node.parent.clone();
+        }
+        false
+    }
+
+    fn suffix_from_key(
+        &self,
+        ancestor_key: ConstraintCursorKey,
+    ) -> Option<Vec<(ConstraintCursorKey, Bool)>> {
+        let mut suffix = Vec::new();
+        let mut current = self.node.as_ref().cloned();
+        while let Some(node) = current {
+            if node.id == ancestor_key {
+                suffix.reverse();
+                return Some(suffix);
+            }
+            suffix.push((node.id, node.constraint.clone()));
+            current = node.parent.clone();
+        }
+        if ancestor_key == ConstraintCursorKey::ROOT {
+            suffix.reverse();
+            Some(suffix)
+        } else {
+            None
+        }
+    }
+}
 
 /// A tracked symbolic memory region (usually an input buffer).
 #[derive(Debug, Clone)]
 pub struct SymbolicMemoryRegion<'ctx> {
+    /// Canonical region backing this symbolic buffer.
+    pub region_id: MemoryRegionId,
     /// Name of the symbolic buffer.
     pub name: String,
     /// Concrete address of the buffer.
@@ -24,6 +130,28 @@ pub struct SymbolicMemoryRegion<'ctx> {
     pub value: SymValue<'ctx>,
 }
 
+/// A tracked symbolic input stream for a file descriptor.
+#[derive(Debug, Clone)]
+pub struct SymbolicFdInput<'ctx> {
+    /// Stable user-facing name of the stream.
+    pub name: String,
+    /// File descriptor identifier.
+    pub fd: i32,
+    /// Symbolic bytes available to the runtime model.
+    pub bytes: Vec<SymValue<'ctx>>,
+    /// Current read cursor.
+    pub cursor: usize,
+}
+
+/// Runtime policy carried with each symbolic state.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeState {
+    /// File descriptors that should report tty=true via isatty().
+    pub tty_fds: HashSet<i32>,
+    /// Whether sleep-family calls should become zero-cost no-ops.
+    pub skip_sleep_calls: bool,
+}
+
 /// The state of a symbolic execution.
 ///
 /// Contains registers, memory, path constraints, and program counter.
@@ -31,11 +159,13 @@ pub struct SymState<'ctx> {
     /// The Z3 context.
     ctx: &'ctx Context,
     /// Register values (register name -> value).
-    registers: HashMap<String, SymValue<'ctx>>,
+    registers: Rc<HashMap<String, SymValue<'ctx>>>,
     /// Memory state.
     pub memory: SymMemory<'ctx>,
     /// Path constraints (conditions that must be true for this path).
-    constraints: Vec<Bool>,
+    constraints: ConstraintCursor,
+    /// Materialized constraint list, populated lazily from the shared cursor chain.
+    materialized_constraints: OnceCell<Vec<Bool>>,
     /// Current program counter.
     pub pc: u64,
     /// Previous program counter (block predecessor).
@@ -47,13 +177,17 @@ pub struct SymState<'ctx> {
     /// Execution depth (number of steps taken).
     pub depth: usize,
     /// Named symbolic inputs (registers or buffers).
-    symbolic_inputs: HashMap<String, SymValue<'ctx>>,
+    symbolic_inputs: Rc<HashMap<String, SymValue<'ctx>>>,
     /// Tracked symbolic memory regions.
-    symbolic_memory: Vec<SymbolicMemoryRegion<'ctx>>,
+    symbolic_memory: Rc<Vec<SymbolicMemoryRegion<'ctx>>>,
+    /// Symbolic external input streams keyed by file descriptor.
+    symbolic_fd_inputs: Rc<HashMap<i32, SymbolicFdInput<'ctx>>>,
+    /// Runtime policy/state for summaries.
+    runtime: RuntimeState,
 }
 
 /// Exit status of a symbolic execution path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExitStatus {
     /// Normal return.
     Return,
@@ -74,16 +208,19 @@ impl<'ctx> SymState<'ctx> {
     pub fn new(ctx: &'ctx Context, entry_pc: u64) -> Self {
         Self {
             ctx,
-            registers: HashMap::new(),
+            registers: Rc::new(HashMap::new()),
             memory: SymMemory::new(ctx),
-            constraints: Vec::new(),
+            constraints: ConstraintCursor::default(),
+            materialized_constraints: OnceCell::new(),
             pc: entry_pc,
             prev_pc: None,
             active: true,
             exit_status: None,
             depth: 0,
-            symbolic_inputs: HashMap::new(),
-            symbolic_memory: Vec::new(),
+            symbolic_inputs: Rc::new(HashMap::new()),
+            symbolic_memory: Rc::new(Vec::new()),
+            symbolic_fd_inputs: Rc::new(HashMap::new()),
+            runtime: RuntimeState::default(),
         }
     }
 
@@ -91,16 +228,19 @@ impl<'ctx> SymState<'ctx> {
     pub fn new_symbolic(ctx: &'ctx Context, entry_pc: u64) -> Self {
         Self {
             ctx,
-            registers: HashMap::new(),
+            registers: Rc::new(HashMap::new()),
             memory: SymMemory::new_symbolic(ctx),
-            constraints: Vec::new(),
+            constraints: ConstraintCursor::default(),
+            materialized_constraints: OnceCell::new(),
             pc: entry_pc,
             prev_pc: None,
             active: true,
             exit_status: None,
             depth: 0,
-            symbolic_inputs: HashMap::new(),
-            symbolic_memory: Vec::new(),
+            symbolic_inputs: Rc::new(HashMap::new()),
+            symbolic_memory: Rc::new(Vec::new()),
+            symbolic_fd_inputs: Rc::new(HashMap::new()),
+            runtime: RuntimeState::default(),
         }
     }
 
@@ -124,7 +264,7 @@ impl<'ctx> SymState<'ctx> {
 
     /// Set a register value.
     pub fn set_register(&mut self, name: &str, value: SymValue<'ctx>) {
-        self.registers.insert(name.to_string(), value);
+        Rc::make_mut(&mut self.registers).insert(name.to_string(), value);
     }
 
     /// Make a register symbolic with a given name.
@@ -136,13 +276,13 @@ impl<'ctx> SymState<'ctx> {
     /// Make a register symbolic with an explicit symbol name.
     pub fn make_symbolic_named(&mut self, reg_name: &str, sym_name: &str, bits: u32) {
         let value = SymValue::new_symbolic(self.ctx, sym_name, bits);
-        self.registers.insert(reg_name.to_string(), value.clone());
-        self.symbolic_inputs.insert(sym_name.to_string(), value);
+        Rc::make_mut(&mut self.registers).insert(reg_name.to_string(), value.clone());
+        Rc::make_mut(&mut self.symbolic_inputs).insert(sym_name.to_string(), value);
     }
 
     /// Set a register to a concrete value.
     pub fn set_concrete(&mut self, reg_name: &str, value: u64, bits: u32) {
-        self.registers
+        Rc::make_mut(&mut self.registers)
             .insert(reg_name.to_string(), SymValue::concrete(value, bits));
     }
 
@@ -163,29 +303,88 @@ impl<'ctx> SymState<'ctx> {
 
     /// Get all registers.
     pub fn registers(&self) -> &HashMap<String, SymValue<'ctx>> {
-        &self.registers
+        self.registers.as_ref()
     }
 
     /// Get tracked symbolic inputs.
     pub fn symbolic_inputs(&self) -> &HashMap<String, SymValue<'ctx>> {
-        &self.symbolic_inputs
+        self.symbolic_inputs.as_ref()
     }
 
     /// Get tracked symbolic memory regions.
     pub fn symbolic_memory(&self) -> &[SymbolicMemoryRegion<'ctx>] {
-        &self.symbolic_memory
+        self.symbolic_memory.as_slice()
+    }
+
+    /// Get tracked symbolic file-descriptor inputs.
+    pub fn symbolic_fd_inputs(&self) -> &HashMap<i32, SymbolicFdInput<'ctx>> {
+        self.symbolic_fd_inputs.as_ref()
+    }
+
+    /// Get runtime policy/state.
+    pub fn runtime(&self) -> &RuntimeState {
+        &self.runtime
+    }
+
+    pub(crate) fn semantic_fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.pc.hash(&mut hasher);
+        self.active.hash(&mut hasher);
+        self.exit_status.hash(&mut hasher);
+        self.memory.semantic_fingerprint().hash(&mut hasher);
+        self.runtime.skip_sleep_calls.hash(&mut hasher);
+
+        let mut tty_fds: Vec<_> = self.runtime.tty_fds.iter().copied().collect();
+        tty_fds.sort_unstable();
+        tty_fds.hash(&mut hasher);
+
+        let mut register_names: Vec<_> = self.registers.keys().collect();
+        register_names.sort_unstable();
+        for name in register_names {
+            name.hash(&mut hasher);
+            hash_sym_value(self.ctx, &self.registers[name], &mut hasher);
+        }
+
+        let mut symbolic_input_names: Vec<_> = self.symbolic_inputs.keys().collect();
+        symbolic_input_names.sort_unstable();
+        for name in symbolic_input_names {
+            name.hash(&mut hasher);
+            hash_sym_value(self.ctx, &self.symbolic_inputs[name], &mut hasher);
+        }
+
+        for region in self.symbolic_memory.iter() {
+            region.region_id.hash(&mut hasher);
+            region.name.hash(&mut hasher);
+            region.addr.hash(&mut hasher);
+            region.size.hash(&mut hasher);
+            hash_sym_value(self.ctx, &region.value, &mut hasher);
+        }
+
+        let mut fd_inputs: Vec<_> = self.symbolic_fd_inputs.iter().collect();
+        fd_inputs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (fd, input) in fd_inputs {
+            fd.hash(&mut hasher);
+            input.name.hash(&mut hasher);
+            input.cursor.hash(&mut hasher);
+            for byte in &input.bytes {
+                hash_sym_value(self.ctx, byte, &mut hasher);
+            }
+        }
+
+        hasher.finish()
     }
 
     /// Read from memory.
     pub fn mem_read(&self, addr: &SymValue<'ctx>, size: u32) -> SymValue<'ctx> {
         self.memory
-            .read_with_constraints(addr, size, &self.constraints)
+            .read_with_constraints(addr, size, self.constraints())
     }
 
     /// Write to memory.
     pub fn mem_write(&mut self, addr: &SymValue<'ctx>, value: &SymValue<'ctx>, size: u32) {
+        let constraints = self.constraints().to_vec();
         self.memory
-            .write_with_constraints(addr, value, size, &self.constraints);
+            .write_with_constraints(addr, value, size, &constraints);
     }
 
     /// Set the maximum number of symbolic address targets to enumerate.
@@ -195,7 +394,7 @@ impl<'ctx> SymState<'ctx> {
 
     /// Compute the path condition (AND of all constraints).
     pub fn path_condition(&self) -> Bool {
-        and_all(self.ctx, &self.constraints)
+        and_all(self.ctx, self.constraints())
     }
 
     /// Merge this state with another state at the same program counter.
@@ -213,7 +412,9 @@ impl<'ctx> SymState<'ctx> {
         merged.active = self.active && other.active;
         merged.exit_status = None;
         merged.depth = self.depth.max(other.depth);
-        merged.constraints = vec![cond_self | cond_other.clone()];
+        merged.constraints = ConstraintCursor::default();
+        merged.materialized_constraints = OnceCell::new();
+        merged.add_constraint(cond_self | cond_other.clone());
 
         let mut keys = HashSet::new();
         keys.extend(self.registers.keys().cloned());
@@ -242,57 +443,68 @@ impl<'ctx> SymState<'ctx> {
             let merged_val = merge_values(self.ctx, &cond_other, &val_self, &val_other);
             registers.insert(key, merged_val);
         }
-        merged.registers = registers;
+        merged.registers = Rc::new(registers);
 
-        let mut memory = self.memory.fork();
-        let mut addrs = HashSet::new();
-        addrs.extend(self.memory.merge_addrs());
-        addrs.extend(other.memory.merge_addrs());
-        for addr in addrs {
-            let addr_val = SymValue::concrete(addr, 64);
-            let val_self = self
-                .memory
-                .read_with_constraints(&addr_val, 1, &self.constraints);
-            let val_other = other
-                .memory
-                .read_with_constraints(&addr_val, 1, &other.constraints);
-            let merged_val = merge_values(self.ctx, &cond_other, &val_self, &val_other);
-            memory.write(&addr_val, &merged_val, 1);
-        }
-
-        for (addr, value, size) in other.memory.symbolic_writes() {
-            if addr.as_concrete().is_none() {
-                memory.push_symbolic_write(addr.clone(), value.clone(), *size);
-            }
-        }
-
-        merged.memory = memory;
+        merged.memory = self.memory.merge_with(
+            &other.memory,
+            self.constraints(),
+            other.constraints(),
+            &cond_other,
+        );
 
         merged.symbolic_inputs = self.symbolic_inputs.clone();
-        for (name, value) in &other.symbolic_inputs {
-            merged
-                .symbolic_inputs
+        for (name, value) in other.symbolic_inputs.iter() {
+            Rc::make_mut(&mut merged.symbolic_inputs)
                 .entry(name.clone())
                 .or_insert_with(|| value.clone());
         }
 
         merged.symbolic_memory = self.symbolic_memory.clone();
-        for region in &other.symbolic_memory {
-            let exists = merged
-                .symbolic_memory
-                .iter()
-                .any(|r| r.name == region.name && r.addr == region.addr && r.size == region.size);
+        for region in other.symbolic_memory.iter() {
+            let exists = merged.symbolic_memory.iter().any(|r| {
+                r.region_id == region.region_id
+                    && r.name == region.name
+                    && r.addr == region.addr
+                    && r.size == region.size
+            });
             if !exists {
-                merged.symbolic_memory.push(region.clone());
+                Rc::make_mut(&mut merged.symbolic_memory).push(region.clone());
             }
         }
+
+        merged.symbolic_fd_inputs = self.symbolic_fd_inputs.clone();
+        for (fd, other_input) in other.symbolic_fd_inputs.iter() {
+            let fd_inputs = Rc::make_mut(&mut merged.symbolic_fd_inputs);
+            match fd_inputs.get_mut(fd) {
+                Some(existing) => {
+                    if existing.bytes.len() < other_input.bytes.len() {
+                        existing.bytes = other_input.bytes.clone();
+                    }
+                    existing.cursor = existing.cursor.max(other_input.cursor);
+                }
+                None => {
+                    fd_inputs.insert(*fd, other_input.clone());
+                }
+            }
+        }
+
+        merged.runtime = self.runtime.clone();
+        merged.runtime.skip_sleep_calls |= other.runtime.skip_sleep_calls;
+        merged
+            .runtime
+            .tty_fds
+            .extend(other.runtime.tty_fds.iter().copied());
 
         merged
     }
 
     /// Add a path constraint.
     pub fn add_constraint(&mut self, constraint: Bool) {
-        self.constraints.push(constraint);
+        self.constraints = self.constraints.push(constraint.clone());
+        if let Some(mut cached) = self.materialized_constraints.take() {
+            cached.push(constraint);
+            let _ = self.materialized_constraints.set(cached);
+        }
     }
 
     /// Constrain a value to equal a concrete constant.
@@ -422,7 +634,7 @@ impl<'ctx> SymState<'ctx> {
         let bv = value.to_bv(self.ctx);
         let zero = BV::from_u64(0, value.bits());
         let cond = bv.eq(&zero).not();
-        self.constraints.push(cond);
+        self.add_constraint(cond);
     }
 
     /// Add a constraint that a value is false (zero).
@@ -430,17 +642,34 @@ impl<'ctx> SymState<'ctx> {
         let bv = value.to_bv(self.ctx);
         let zero = BV::from_u64(0, value.bits());
         let cond = bv.eq(&zero);
-        self.constraints.push(cond);
+        self.add_constraint(cond);
     }
 
     /// Get all path constraints.
     pub fn constraints(&self) -> &[Bool] {
-        &self.constraints
+        self.materialized_constraints
+            .get_or_init(|| self.constraints.materialize())
+            .as_slice()
     }
 
     /// Get the number of constraints.
     pub fn num_constraints(&self) -> usize {
-        self.constraints.len()
+        self.constraints.depth()
+    }
+
+    pub(crate) fn constraint_cursor_key(&self) -> ConstraintCursorKey {
+        self.constraints.key()
+    }
+
+    pub(crate) fn constraints_imply_by_prefix(&self, other: &Self) -> bool {
+        self.constraints.is_descendant_of(&other.constraints)
+    }
+
+    pub(crate) fn constraint_suffix_from_cursor(
+        &self,
+        ancestor: ConstraintCursorKey,
+    ) -> Option<Vec<(ConstraintCursorKey, Bool)>> {
+        self.constraints.suffix_from_key(ancestor)
     }
 
     /// Terminate this state with the given status.
@@ -466,6 +695,7 @@ impl<'ctx> SymState<'ctx> {
             registers: self.registers.clone(),
             memory: self.memory.fork(),
             constraints: self.constraints.clone(),
+            materialized_constraints: OnceCell::new(),
             pc: self.pc,
             prev_pc: self.prev_pc,
             active: self.active,
@@ -473,6 +703,8 @@ impl<'ctx> SymState<'ctx> {
             depth: self.depth,
             symbolic_inputs: self.symbolic_inputs.clone(),
             symbolic_memory: self.symbolic_memory.clone(),
+            symbolic_fd_inputs: self.symbolic_fd_inputs.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 
@@ -486,7 +718,7 @@ impl<'ctx> SymState<'ctx> {
     /// Create a named symbolic input value.
     pub fn new_symbolic_input(&mut self, name: &str, bits: u32) -> SymValue<'ctx> {
         let value = SymValue::new_symbolic(self.ctx, name, bits);
-        self.symbolic_inputs.insert(name.to_string(), value.clone());
+        Rc::make_mut(&mut self.symbolic_inputs).insert(name.to_string(), value.clone());
         value
     }
 
@@ -498,7 +730,7 @@ impl<'ctx> SymState<'ctx> {
         taint: u64,
     ) -> SymValue<'ctx> {
         let value = SymValue::new_symbolic_tainted(self.ctx, name, bits, taint);
-        self.symbolic_inputs.insert(name.to_string(), value.clone());
+        Rc::make_mut(&mut self.symbolic_inputs).insert(name.to_string(), value.clone());
         value
     }
 
@@ -520,10 +752,13 @@ impl<'ctx> SymState<'ctx> {
         } else {
             SymValue::new_symbolic_tainted(self.ctx, name, size * 8, taint)
         };
+        let region_id =
+            self.define_memory_region(MemoryRegionKind::Input, name, Some(addr), Some(size as u64));
         let addr_val = SymValue::concrete(addr, 64);
         self.mem_write(&addr_val, &value, size);
-        self.symbolic_inputs.insert(name.to_string(), value.clone());
-        self.symbolic_memory.push(SymbolicMemoryRegion {
+        Rc::make_mut(&mut self.symbolic_inputs).insert(name.to_string(), value.clone());
+        Rc::make_mut(&mut self.symbolic_memory).push(SymbolicMemoryRegion {
+            region_id,
             name: name.to_string(),
             addr,
             size,
@@ -531,6 +766,130 @@ impl<'ctx> SymState<'ctx> {
         });
         value
     }
+
+    /// Define a canonical memory region for the symbolic state.
+    pub fn define_memory_region(
+        &mut self,
+        kind: MemoryRegionKind,
+        name: &str,
+        base_addr: Option<u64>,
+        extent: Option<u64>,
+    ) -> MemoryRegionId {
+        self.memory.define_region(kind, name, base_addr, extent)
+    }
+
+    /// Seed concrete bytes into an existing memory region.
+    pub fn seed_region_bytes(&mut self, region_id: MemoryRegionId, offset: u64, bytes: &[u8]) {
+        self.memory.seed_region_bytes(region_id, offset, bytes);
+    }
+
+    /// Allocate a deterministic heap region and return its concrete base pointer.
+    pub fn allocate_heap_region(&mut self, name: &str, size: u64) -> (MemoryRegionId, u64) {
+        self.memory.allocate_heap_region(name, size)
+    }
+
+    /// Configure tty behavior for a concrete file descriptor.
+    pub fn set_tty_fd(&mut self, fd: i32, is_tty: bool) {
+        if is_tty {
+            self.runtime.tty_fds.insert(fd);
+        } else {
+            self.runtime.tty_fds.remove(&fd);
+        }
+    }
+
+    /// Check whether a file descriptor should behave like a tty.
+    pub fn is_tty_fd(&self, fd: i32) -> bool {
+        self.runtime.tty_fds.contains(&fd)
+    }
+
+    /// Configure whether sleep-family calls should be skipped.
+    pub fn set_skip_sleep_calls(&mut self, enabled: bool) {
+        self.runtime.skip_sleep_calls = enabled;
+    }
+
+    /// Check whether sleep-family calls should be skipped.
+    pub fn skip_sleep_calls(&self) -> bool {
+        self.runtime.skip_sleep_calls
+    }
+
+    /// Register a symbolic byte stream for a file descriptor.
+    pub fn add_symbolic_fd_input(
+        &mut self,
+        fd: i32,
+        len: usize,
+        name: &str,
+        alphabet: Option<&str>,
+    ) {
+        let mut bytes = Vec::with_capacity(len);
+        for idx in 0..len {
+            let byte_name = format!("{}_{}", name, idx);
+            let byte = SymValue::new_symbolic(self.ctx, &byte_name, 8);
+            if let Some(alphabet) = alphabet {
+                constrain_symbolic_byte_to_alphabet(self, &byte, alphabet);
+            }
+            Rc::make_mut(&mut self.symbolic_inputs).insert(byte_name, byte.clone());
+            bytes.push(byte);
+        }
+        Rc::make_mut(&mut self.symbolic_fd_inputs).insert(
+            fd,
+            SymbolicFdInput {
+                name: name.to_string(),
+                fd,
+                bytes,
+                cursor: 0,
+            },
+        );
+    }
+
+    /// Read up to `count` bytes from a tracked symbolic file descriptor.
+    pub fn read_symbolic_fd_bytes(&mut self, fd: i32, count: usize) -> Option<Vec<SymValue<'ctx>>> {
+        let input = Rc::make_mut(&mut self.symbolic_fd_inputs).get_mut(&fd)?;
+        if input.cursor >= input.bytes.len() {
+            return Some(Vec::new());
+        }
+        let end = input.cursor.saturating_add(count).min(input.bytes.len());
+        let bytes = input.bytes[input.cursor..end].to_vec();
+        input.cursor = end;
+        Some(bytes)
+    }
+}
+
+fn mix_hash(seed: u64, value: u64) -> u64 {
+    seed.rotate_left(7) ^ value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+fn next_constraint_cursor_key() -> ConstraintCursorKey {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+    ConstraintCursorKey(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn structural_hash<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_sym_value<'ctx, H: Hasher>(ctx: &'ctx Context, value: &SymValue<'ctx>, hasher: &mut H) {
+    value.bits().hash(hasher);
+    value.get_taint().hash(hasher);
+    value.to_bv(ctx).hash(hasher);
+}
+
+fn constrain_symbolic_byte_to_alphabet<'ctx>(
+    state: &mut SymState<'ctx>,
+    value: &SymValue<'ctx>,
+    alphabet: &str,
+) {
+    let allowed = alphabet.as_bytes();
+    if allowed.is_empty() {
+        return;
+    }
+    let byte_bv = value.to_bv(state.context());
+    let ors: Vec<Bool> = allowed
+        .iter()
+        .map(|byte| byte_bv.eq(BV::from_u64(*byte as u64, 8)))
+        .collect();
+    state.add_constraint(or_all(state.context(), &ors));
 }
 
 fn parse_byte_ranges(pattern: &str) -> Vec<(u8, u8)> {
@@ -619,7 +978,7 @@ impl<'ctx> std::fmt::Debug for SymState<'ctx> {
             .field("pc", &format!("0x{:x}", self.pc))
             .field("prev_pc", &self.prev_pc.map(|pc| format!("0x{:x}", pc)))
             .field("registers", &self.registers.len())
-            .field("constraints", &self.constraints.len())
+            .field("constraints", &self.num_constraints())
             .field("depth", &self.depth)
             .field("symbolic_inputs", &self.symbolic_inputs.len())
             .field("symbolic_memory", &self.symbolic_memory.len())
@@ -764,5 +1123,53 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(val, 2);
+    }
+
+    #[test]
+    fn test_merge_memory_preserves_region_only_present_on_one_side() {
+        let ctx = Context::thread_local();
+
+        let mut state_a = SymState::new(&ctx, 0x1000);
+        let x_a = SymValue::new_symbolic(&ctx, "x", 32);
+        state_a.set_register("x", x_a.clone());
+        state_a.add_constraint(x_a.to_bv(&ctx).eq(BV::from_u64(0, 32)));
+
+        let mut state_b = SymState::new(&ctx, 0x1000);
+        let x_b = SymValue::new_symbolic(&ctx, "x", 32);
+        state_b.set_register("x", x_b.clone());
+        state_b.add_constraint(x_b.to_bv(&ctx).eq(BV::from_u64(1, 32)));
+        state_b.define_memory_region(MemoryRegionKind::Replay, "replay", Some(0x9000), Some(0x10));
+        state_b.mem_write(
+            &SymValue::concrete(0x9000, 64),
+            &SymValue::concrete(0xab, 8),
+            1,
+        );
+
+        let merged = state_a.merge_with(&state_b);
+        let merged_byte = merged.mem_read(&SymValue::concrete(0x9000, 64), 1);
+
+        let solver = Solver::new();
+        solver.assert(merged.path_condition());
+        solver.assert(x_b.to_bv(&ctx).eq(BV::from_u64(0, 32)));
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().unwrap();
+        let value = model
+            .eval(&merged_byte.to_bv(&ctx), true)
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert_eq!(value, 0);
+
+        let solver = Solver::new();
+        solver.assert(merged.path_condition());
+        solver.assert(x_b.to_bv(&ctx).eq(BV::from_u64(1, 32)));
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().unwrap();
+        let value = model
+            .eval(&merged_byte.to_bv(&ctx), true)
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert_eq!(value, 0xab);
     }
 }

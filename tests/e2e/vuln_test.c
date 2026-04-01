@@ -20,10 +20,14 @@
 #include <stdint.h>
 #include <string.h>
 #include <locale.h>
+#include <unistd.h>
+#include <termios.h>
 
 volatile int global_counter = 0;
 volatile int global_limit = 10;
+volatile int global_symbolic_guard = 0;
 volatile int global_tail = 0;
+volatile unsigned long global_region_guard = 0x41UL;
 
 // Test 1: Simple password check (symbolic should find 0xDEAD)
 int check_secret(int x) {
@@ -166,6 +170,69 @@ uint64_t test_piece(uint32_t hi, uint32_t lo) {
 // Test 16: Boolean XOR
 int test_boolxor(int a, int b) {
     return (a > 0) ^ (b > 0);
+}
+
+// Test 16b: Volatile-backed opaque guard for symbolic branch pruning
+int test_symbolic_xor_guard(int x) {
+    global_symbolic_guard = x;
+    if ((global_symbolic_guard ^ global_symbolic_guard) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+__attribute__((noinline))
+static int helper_symbolic_zero(int x) {
+    global_symbolic_guard = x;
+    return global_symbolic_guard ^ global_symbolic_guard;
+}
+
+// Test 16c: Helper-return opaque guard that requires helper-scope symbolic facts
+int test_symbolic_helper_xor_guard(int x) {
+    if (helper_symbolic_zero(x) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+__attribute__((noinline))
+static int helper_symbolic_zero_pure(int x) {
+    return x ^ x;
+}
+
+// Test 16d: Pure helper-return opaque guard for live symbolic fact pruning
+int test_symbolic_helper_pure_guard(int x) {
+    if (helper_symbolic_zero_pure(x) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// Test 16e: Global-backed symbolic guard for region-backed compiled predicates
+int test_global_symbolic_eq_guard(int x) {
+    global_symbolic_guard = x;
+    if (global_symbolic_guard == 7) {
+        return 1;
+    }
+    return 0;
+}
+
+// Test 16f: Stack-backed symbolic guard for region-backed compiled predicates
+int test_stack_symbolic_eq_guard(int x) {
+    volatile int slot = x;
+    volatile int *ptr = &slot;
+    if (*ptr == 7) {
+        return 1;
+    }
+    return 0;
+}
+
+// Test 16g: Global-backed constant guard for region-backed compiled predicates
+int test_global_region_guard(void) {
+    if (global_region_guard == 0x41UL) {
+        return 1;
+    }
+    return 0;
 }
 
 // Test 17: Pointer add (array indexing)
@@ -474,6 +541,50 @@ int test_bool_carrier_chain(int x, int y) {
         return y;
     }
     return x;
+}
+
+// Test 44: Stdin-driven gate for typed symbolic fd input specs.
+__attribute__((noinline)) int stdin_gate(void) {
+    char buf[2] = {0};
+    ssize_t n = read(0, buf, 1);
+    if (n != 1) {
+        return 0;
+    }
+    if (isatty(0)) {
+        global_tail++;
+    }
+    usleep(1000);
+    if (buf[0] == 'k') {
+        return 0x1337;
+    }
+    return 0;
+}
+
+// Test 45: Replay-focused stdin gate without tty-sensitive behavior.
+__attribute__((noinline)) int stdin_gate_replay(void) {
+    char buf[2] = {0};
+    struct termios old_termios;
+    struct termios raw_termios;
+    int has_termios = tcgetattr(0, &old_termios) == 0;
+    if (has_termios) {
+        raw_termios = old_termios;
+        raw_termios.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
+        raw_termios.c_cc[VMIN] = 1;
+        raw_termios.c_cc[VTIME] = 0;
+        tcsetattr(0, TCSANOW, &raw_termios);
+    }
+    ssize_t n = read(0, buf, 1);
+    if (has_termios) {
+        tcsetattr(0, TCSANOW, &old_termios);
+    }
+    if (n != 1) {
+        return 0;
+    }
+    usleep(1000);
+    if (buf[0] == 'k') {
+        return 0x1337;
+    }
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -821,6 +932,55 @@ int main(int argc, char *argv[]) {
                     test_bool_carrier_chain(x, y)
                 );
             }
+            break;
+        case 44:
+            printf("stdin_gate() = %d\n", stdin_gate());
+            break;
+        case 45:
+            (void)stdin_gate_replay();
+            break;
+        case 46:
+            if (argc > 2) {
+                int x = atoi(argv[2]);
+                printf(
+                    "test_symbolic_helper_xor_guard(%d) = %d\n",
+                    x,
+                    test_symbolic_helper_xor_guard(x)
+                );
+            }
+            break;
+        case 47:
+            if (argc > 2) {
+                int x = atoi(argv[2]);
+                printf(
+                    "test_symbolic_helper_pure_guard(%d) = %d\n",
+                    x,
+                    test_symbolic_helper_pure_guard(x)
+                );
+            }
+            break;
+        case 48:
+            if (argc > 2) {
+                int x = atoi(argv[2]);
+                printf(
+                    "test_global_symbolic_eq_guard(%d) = %d\n",
+                    x,
+                    test_global_symbolic_eq_guard(x)
+                );
+            }
+            break;
+        case 49:
+            if (argc > 2) {
+                int x = atoi(argv[2]);
+                printf(
+                    "test_stack_symbolic_eq_guard(%d) = %d\n",
+                    x,
+                    test_stack_symbolic_eq_guard(x)
+                );
+            }
+            break;
+        case 50:
+            printf("test_global_region_guard() = %d\n", test_global_region_guard());
             break;
         default:
             printf("Unknown test: %d\n", test);

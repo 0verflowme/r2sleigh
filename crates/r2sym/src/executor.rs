@@ -3,6 +3,7 @@
 //! This module implements the core symbolic execution logic,
 //! stepping through SSA operations and updating state.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use r2ssa::{FunctionSSABlock, SSAOp, SSAVar};
@@ -888,7 +889,13 @@ impl<'ctx> SymExecutor<'ctx> {
             }
         } else {
             let key = var.display_name();
-            state.get_register_sized(&key, var.size * 8)
+            if let Some(value) = state.registers().get(&key).cloned() {
+                return value;
+            }
+            if let Some(value) = resolve_alias_register_value(state, &key, self.ctx) {
+                return value;
+            }
+            SymValue::unknown(var.size * 8)
         }
     }
 
@@ -934,6 +941,307 @@ impl<'ctx> SymExecutor<'ctx> {
 
         Ok(forked_states)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegisterAliasSpec {
+    family: Cow<'static, str>,
+    offset_bits: u32,
+    width_bits: u32,
+}
+
+fn resolve_alias_register_value<'ctx>(
+    state: &SymState<'ctx>,
+    key: &str,
+    ctx: &'ctx Context,
+) -> Option<SymValue<'ctx>> {
+    let (requested_base, _requested_version) = split_versioned_register(key)?;
+    let requested = x86_register_alias_spec(requested_base)?;
+
+    let mut best: Option<(u32, RegisterAliasSpec, SymValue<'ctx>)> = None;
+    for (candidate_key, candidate_value) in state.registers() {
+        let Some((candidate_base, candidate_version)) = split_versioned_register(candidate_key)
+        else {
+            continue;
+        };
+        let Some(candidate) = x86_register_alias_spec(candidate_base) else {
+            continue;
+        };
+        if candidate.family != requested.family {
+            continue;
+        }
+
+        let candidate_low = candidate.offset_bits;
+        let candidate_high = candidate.offset_bits + candidate.width_bits;
+        let requested_low = requested.offset_bits;
+        let requested_high = requested.offset_bits + requested.width_bits;
+
+        let covers_requested = candidate_low <= requested_low && candidate_high >= requested_high;
+        let can_zero_extend =
+            candidate_low == requested_low && candidate.width_bits < requested.width_bits;
+        if !covers_requested && !can_zero_extend {
+            continue;
+        }
+
+        let should_replace = best.as_ref().is_none_or(|(best_version, best_spec, _)| {
+            candidate_version > *best_version
+                || (candidate_version == *best_version
+                    && candidate.width_bits > best_spec.width_bits)
+        });
+        if should_replace {
+            best = Some((candidate_version, candidate, candidate_value.clone()));
+        }
+    }
+
+    let (_version, candidate, value) = best?;
+    if candidate.offset_bits <= requested.offset_bits
+        && candidate.offset_bits + candidate.width_bits
+            >= requested.offset_bits + requested.width_bits
+    {
+        let low = requested.offset_bits - candidate.offset_bits;
+        let high = low + requested.width_bits - 1;
+        let extracted = value.extract(ctx, high, low);
+        if extracted.bits() == requested.width_bits {
+            Some(extracted)
+        } else if extracted.bits() < requested.width_bits {
+            Some(extracted.zero_extend(ctx, requested.width_bits))
+        } else {
+            Some(extracted.extract(ctx, requested.width_bits - 1, 0))
+        }
+    } else if candidate.offset_bits == requested.offset_bits
+        && candidate.width_bits < requested.width_bits
+    {
+        Some(value.zero_extend(ctx, requested.width_bits))
+    } else {
+        None
+    }
+}
+
+fn split_versioned_register(name: &str) -> Option<(&str, u32)> {
+    let (base, version) = name.rsplit_once('_')?;
+    if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((base, version.parse().ok()?))
+}
+
+fn x86_register_alias_spec(base: &str) -> Option<RegisterAliasSpec> {
+    let upper = base.to_ascii_uppercase();
+    let base = upper.as_str();
+    let fixed = match base {
+        "AL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RAX"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "AH" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RAX"),
+            offset_bits: 8,
+            width_bits: 8,
+        }),
+        "AX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RAX"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "EAX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RAX"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RAX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RAX"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        "BL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBX"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "BH" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBX"),
+            offset_bits: 8,
+            width_bits: 8,
+        }),
+        "BX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBX"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "EBX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBX"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RBX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBX"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        "CL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RCX"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "CH" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RCX"),
+            offset_bits: 8,
+            width_bits: 8,
+        }),
+        "CX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RCX"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "ECX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RCX"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RCX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RCX"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        "DL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDX"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "DH" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDX"),
+            offset_bits: 8,
+            width_bits: 8,
+        }),
+        "DX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDX"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "EDX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDX"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RDX" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDX"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        "SIL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSI"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "SI" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSI"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "ESI" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSI"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RSI" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSI"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        "DIL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDI"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "DI" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDI"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "EDI" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDI"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RDI" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RDI"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        "BPL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBP"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "BP" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBP"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "EBP" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBP"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RBP" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RBP"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        "SPL" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSP"),
+            offset_bits: 0,
+            width_bits: 8,
+        }),
+        "SP" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSP"),
+            offset_bits: 0,
+            width_bits: 16,
+        }),
+        "ESP" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSP"),
+            offset_bits: 0,
+            width_bits: 32,
+        }),
+        "RSP" => Some(RegisterAliasSpec {
+            family: Cow::Borrowed("RSP"),
+            offset_bits: 0,
+            width_bits: 64,
+        }),
+        _ => None,
+    };
+    if fixed.is_some() {
+        return fixed;
+    }
+
+    parse_numbered_x86_register_alias(base)
+}
+
+fn parse_numbered_x86_register_alias(base: &str) -> Option<RegisterAliasSpec> {
+    let (family, width_bits) = if let Some(family) = base.strip_suffix('B') {
+        (family.to_string(), 8)
+    } else if let Some(family) = base.strip_suffix('W') {
+        (family.to_string(), 16)
+    } else if let Some(family) = base.strip_suffix('D') {
+        (family.to_string(), 32)
+    } else {
+        (base.to_string(), 64)
+    };
+
+    if !family.starts_with('R') {
+        return None;
+    }
+    let digits = &family[1..];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(RegisterAliasSpec {
+        family: Cow::Owned(family),
+        offset_bits: 0,
+        width_bits,
+    })
 }
 
 #[cfg(test)]
@@ -1022,5 +1330,93 @@ mod tests {
         assert_eq!(forked.len(), 1); // Fork created
         assert_eq!(forked[0].pc, 0x2000); // True branch goes to target
         // Original state is false branch (PC unchanged in this test)
+    }
+
+    #[test]
+    fn test_read_var_recovers_x86_subregister_alias() {
+        let ctx = Context::thread_local();
+        let executor = SymExecutor::new(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+
+        state.set_register("EAX_4", SymValue::concrete(0x6b, 32));
+
+        let al = SSAVar::new("AL", 0, 1);
+        let value = executor.read_var(&state, &al);
+        assert_eq!(value.as_concrete(), Some(0x6b));
+        assert_eq!(value.bits(), 8);
+    }
+
+    #[test]
+    fn test_realistic_al_compare_path_forks_on_loaded_byte() {
+        let ctx = Context::thread_local();
+        let executor = SymExecutor::new(&ctx);
+        let mut state = SymState::new(&ctx, 0x401c6d);
+
+        let addr = SymValue::concrete(0x2ff6, 64);
+        let byte = SymValue::new_symbolic(&ctx, "stdin_byte", 8);
+        state.mem_write(&addr, &byte, 1);
+        state.set_register("tmp:4700_5", addr.clone());
+
+        let ops = vec![
+            SSAOp::Load {
+                dst: SSAVar::new("tmp:11e00", 1, 1),
+                addr: SSAVar::new("tmp:4700", 5, 8),
+                space: "ram".to_string(),
+            },
+            SSAOp::IntZExt {
+                dst: SSAVar::new("EAX", 4, 4),
+                src: SSAVar::new("tmp:11e00", 1, 1),
+            },
+            SSAOp::IntZExt {
+                dst: SSAVar::new("RAX", 6, 8),
+                src: SSAVar::new("EAX", 4, 4),
+            },
+            SSAOp::IntLess {
+                dst: SSAVar::new("CF", 6, 1),
+                a: SSAVar::new("AL", 0, 1),
+                b: SSAVar::constant(0x6b, 1),
+            },
+            SSAOp::IntSBorrow {
+                dst: SSAVar::new("OF", 6, 1),
+                a: SSAVar::new("AL", 0, 1),
+                b: SSAVar::constant(0x6b, 1),
+            },
+            SSAOp::IntSub {
+                dst: SSAVar::new("tmp:3de00", 1, 1),
+                a: SSAVar::new("AL", 0, 1),
+                b: SSAVar::constant(0x6b, 1),
+            },
+            SSAOp::IntSLess {
+                dst: SSAVar::new("SF", 6, 1),
+                a: SSAVar::new("tmp:3de00", 1, 1),
+                b: SSAVar::constant(0, 1),
+            },
+            SSAOp::IntEqual {
+                dst: SSAVar::new("ZF", 6, 1),
+                a: SSAVar::new("tmp:3de00", 1, 1),
+                b: SSAVar::constant(0, 1),
+            },
+            SSAOp::BoolNot {
+                dst: SSAVar::new("tmp:12800", 1, 1),
+                src: SSAVar::new("ZF", 6, 1),
+            },
+            SSAOp::CBranch {
+                target: SSAVar::constant(0x401c86, 8),
+                cond: SSAVar::new("tmp:12800", 1, 1),
+            },
+        ];
+
+        let mut forked = Vec::new();
+        for op in &ops {
+            let new_states = executor.step(&mut state, op).unwrap();
+            forked.extend(new_states);
+        }
+
+        assert_eq!(forked.len(), 1, "true branch should fork to the target");
+        assert_eq!(forked[0].pc, 0x401c86);
+        assert!(
+            state.get_register("tmp:12800_1").as_concrete().is_none(),
+            "false branch condition should remain symbolic"
+        );
     }
 }

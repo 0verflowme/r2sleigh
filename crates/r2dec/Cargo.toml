@@ -8,6 +8,7 @@ description = "Native decompiler for r2sleigh"
 [dependencies]
 r2il = { path = "../r2il" }
 r2ssa = { path = "../r2ssa" }
+r2sym = { path = "../r2sym" }
 r2types = { path = "../r2types" }
 serde.workspace = true
 thiserror.workspace = true

@@ -731,6 +731,9 @@ fn resolve_return_relation(
     observations: &[SummaryValueObservation],
     current: &BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
 ) -> SummaryReturnRelation {
+    if observations.is_empty() {
+        return SummaryReturnRelation::Unknown;
+    }
     let mut relation: Option<SummaryReturnRelation> = None;
     for observation in observations {
         let next = match observation {
@@ -766,7 +769,7 @@ fn resolve_return_relation(
         }
     }
 
-    relation.unwrap_or(SummaryReturnRelation::Void)
+    relation.unwrap_or(SummaryReturnRelation::Unknown)
 }
 
 fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> LocalSummaryFacts {
@@ -981,34 +984,46 @@ fn classify_memory_access_location_value(
     }
 
     let rooted = canonical_root_value(prepared, value_id);
-    if let Some(var) = prepared.value_var(rooted) {
-        if let Some(idx) = abi.arg_index_for_name(&var.name) {
-            return arg_location(idx, Some(0), Some(width));
-        }
-        if let Some(address) = parse_const_name(&var.name) {
-            return global_location(address, Some(0), Some(width));
-        }
+    let mut candidates = vec![value_id];
+    if rooted != value_id {
+        candidates.push(rooted);
     }
 
-    if let Some(object_id) = prepared.objects().object_for_value(rooted)
-        && let Some(object) = prepared.objects().object(object_id)
-    {
-        match object.kind {
-            ObjectKind::Global { address, .. } => {
+    for candidate in &candidates {
+        if let Some(var) = prepared.value_var(*candidate) {
+            if let Some(idx) = abi.arg_index_for_name(&var.name) {
+                return arg_location(idx, Some(0), Some(width));
+            }
+            if let Some(address) = parse_const_name(&var.name) {
                 return global_location(address, Some(0), Some(width));
             }
-            ObjectKind::HeapAlloc { .. } => {
-                return SummaryMemoryLocation {
-                    region: SummaryMemoryRegion::HeapReturn,
-                    range: exact_range(0, width),
-                };
+        }
+
+        if let Some(object_id) = prepared.objects().object_for_value(*candidate)
+            && let Some(object) = prepared.objects().object(object_id)
+        {
+            match object.kind {
+                ObjectKind::Global { address, .. } => {
+                    return global_location(address, Some(0), Some(width));
+                }
+                ObjectKind::HeapAlloc { .. } => {
+                    return SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::HeapReturn,
+                        range: exact_range(0, width),
+                    };
+                }
+                ObjectKind::EscapedUnknown => {}
+                _ => {}
             }
-            ObjectKind::EscapedUnknown => return unknown_location(),
-            _ => {}
         }
     }
 
-    let Some(def_inst) = prepared.graph().def_inst(rooted) else {
+    let Some((op_value_id, def_inst)) = candidates.iter().find_map(|candidate| {
+        prepared
+            .graph()
+            .def_inst(*candidate)
+            .map(|inst| (*candidate, inst))
+    }) else {
         return unknown_location();
     };
     let Some(inst) = prepared.graph().inst(def_inst) else {
@@ -1058,6 +1073,9 @@ fn classify_memory_access_location_value(
                 AdditiveLocationCtx::new(width, depth + 1, -1, op),
             )
         }
+        _ if op_value_id != value_id => {
+            classify_memory_access_location_value(prepared, abi, value_id, width, depth + 1)
+        }
         _ => unknown_location(),
     }
 }
@@ -1094,12 +1112,8 @@ fn classify_memory_additive_location(
     right_id: ValueId,
     ctx: AdditiveLocationCtx,
 ) -> SummaryMemoryLocation {
-    let left_const = prepared
-        .value_var(canonical_root_value(prepared, left_id))
-        .and_then(|var| parse_const_name(&var.name));
-    let right_const = prepared
-        .value_var(canonical_root_value(prepared, right_id))
-        .and_then(|var| parse_const_name(&var.name));
+    let left_const = summary_const_value(prepared, abi, left_id, ctx.depth);
+    let right_const = summary_const_value(prepared, abi, right_id, ctx.depth);
 
     if let Some(k) = right_const {
         let mut base =
@@ -1120,6 +1134,20 @@ fn classify_memory_additive_location(
         return base;
     }
     unknown_location()
+}
+
+fn summary_const_value(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+    value_id: ValueId,
+    depth: u32,
+) -> Option<u64> {
+    match classify_value_operand(prepared, abi, value_id, depth) {
+        SummaryOperand::Const(value) => Some(value),
+        _ => prepared
+            .value_var(canonical_root_value(prepared, value_id))
+            .and_then(|var| parse_const_name(&var.name)),
+    }
 }
 
 fn record_arg_count_hint(
@@ -1648,6 +1676,15 @@ mod tests {
         Varnode::constant(value, size)
     }
 
+    fn ram(offset: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Ram,
+            offset,
+            size,
+            meta: None,
+        }
+    }
+
     fn block(addr: u64, ops: Vec<R2ILOp>) -> R2ILBlock {
         R2ILBlock {
             addr,
@@ -1784,6 +1821,42 @@ mod tests {
                 .expect("alloc summary")
                 .return_relation,
             SummaryReturnRelation::HeapAlloc
+        );
+    }
+
+    #[test]
+    fn branchind_trampoline_without_return_stays_unknown() {
+        let arch = x86_64_arch();
+        let trampoline = SsaArtifact::for_decompile(
+            &[block(
+                0x3500,
+                vec![R2ILOp::BranchInd {
+                    target: ram(0x406050, 8),
+                }],
+            )],
+            Some(&arch),
+        )
+        .expect("trampoline ssa")
+        .with_name("sym.imp.setlocale");
+
+        let set = solve_interproc_summary_set(
+            &[InterprocFunctionInput {
+                id: InterprocFunctionId(0x3500),
+                name: Some("sym.imp.setlocale".to_string()),
+                prepared: &trampoline,
+            }],
+            Some(&arch),
+            Some(InterprocFunctionId(0x3500)),
+            &BTreeMap::new(),
+            InterprocSolveConfig::default(),
+        );
+
+        assert_eq!(
+            set.summaries
+                .get(&InterprocFunctionId(0x3500))
+                .expect("trampoline summary")
+                .return_relation,
+            SummaryReturnRelation::Unknown
         );
     }
 
@@ -1942,5 +2015,167 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn symbolic_store_plus_constant_preserves_arg_offset_range() {
+        let arch = x86_64_arch();
+        let prepared = SsaArtifact::for_symbolic(
+            &[block(
+                0x4300,
+                vec![
+                    R2ILOp::IntAdd {
+                        dst: reg(0x80, 8),
+                        a: reg(8, 8),
+                        b: c(2, 8),
+                    },
+                    R2ILOp::Store {
+                        addr: reg(0x80, 8),
+                        val: reg(16, 2),
+                        space: SpaceId::Ram,
+                    },
+                    R2ILOp::Return { target: c(0, 8) },
+                ],
+            )],
+            Some(&arch),
+        )
+        .expect("ssa");
+        let abi = AbiProfile::from_arch(Some(&arch));
+        let block = prepared.function().get_block(0x4300).expect("block");
+        let SSAOp::Store { addr, val, .. } = &block.ops[1] else {
+            panic!("expected store");
+        };
+        let addr_id = prepared
+            .graph()
+            .value_id_for_var(addr)
+            .expect("store addr value id");
+        let def_inst = prepared.graph().def_inst(addr_id).expect("store addr def");
+        let inst = prepared.graph().inst(def_inst).expect("store addr inst");
+        let [left_id, right_id] = match inst.inputs.as_slice() {
+            [left, right] => [*left, *right],
+            _ => panic!("expected additive store addr inputs"),
+        };
+        let InstPayload::Op(op) = &inst.payload else {
+            panic!("expected op payload");
+        };
+        assert_eq!(summary_const_value(&prepared, &abi, right_id, 0), Some(2));
+        assert_eq!(
+            classify_memory_access_location_value(&prepared, &abi, left_id, val.size, 0),
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(0, val.size),
+            }
+        );
+        assert_eq!(
+            classify_memory_additive_location(
+                &prepared,
+                &abi,
+                left_id,
+                right_id,
+                AdditiveLocationCtx::new(val.size, 1, 1, op),
+            ),
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(2, val.size),
+            }
+        );
+        assert_eq!(
+            classify_memory_access_location_value(&prepared, &abi, addr_id, val.size, 0),
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(2, val.size),
+            }
+        );
+        let location = classify_memory_access_location(&prepared, &abi, addr, val.size);
+        assert_eq!(
+            location,
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(2, val.size),
+            },
+            "store address should resolve to arg0+2, got {location:?}; addr={addr:?}; ops={:?}",
+            block.ops
+        );
+    }
+
+    #[test]
+    fn symbolic_store_minus_constant_preserves_arg_offset_range() {
+        let arch = x86_64_arch();
+        let prepared = SsaArtifact::for_symbolic(
+            &[block(
+                0x4310,
+                vec![
+                    R2ILOp::IntSub {
+                        dst: reg(0x80, 8),
+                        a: reg(8, 8),
+                        b: c(1, 8),
+                    },
+                    R2ILOp::Store {
+                        addr: reg(0x80, 8),
+                        val: reg(16, 1),
+                        space: SpaceId::Ram,
+                    },
+                    R2ILOp::Return { target: c(0, 8) },
+                ],
+            )],
+            Some(&arch),
+        )
+        .expect("ssa");
+        let abi = AbiProfile::from_arch(Some(&arch));
+        let block = prepared.function().get_block(0x4310).expect("block");
+        let SSAOp::Store { addr, val, .. } = &block.ops[1] else {
+            panic!("expected store");
+        };
+        let addr_id = prepared
+            .graph()
+            .value_id_for_var(addr)
+            .expect("store addr value id");
+        let def_inst = prepared.graph().def_inst(addr_id).expect("store addr def");
+        let inst = prepared.graph().inst(def_inst).expect("store addr inst");
+        let [left_id, right_id] = match inst.inputs.as_slice() {
+            [left, right] => [*left, *right],
+            _ => panic!("expected additive store addr inputs"),
+        };
+        let InstPayload::Op(op) = &inst.payload else {
+            panic!("expected op payload");
+        };
+        assert_eq!(summary_const_value(&prepared, &abi, right_id, 0), Some(1));
+        assert_eq!(
+            classify_memory_access_location_value(&prepared, &abi, left_id, val.size, 0),
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(0, val.size),
+            }
+        );
+        assert_eq!(
+            classify_memory_additive_location(
+                &prepared,
+                &abi,
+                left_id,
+                right_id,
+                AdditiveLocationCtx::new(val.size, 1, -1, op),
+            ),
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(-1, val.size),
+            }
+        );
+        assert_eq!(
+            classify_memory_access_location_value(&prepared, &abi, addr_id, val.size, 0),
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(-1, val.size),
+            }
+        );
+        let location = classify_memory_access_location(&prepared, &abi, addr, val.size);
+        assert_eq!(
+            location,
+            SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 0 },
+                range: exact_range(-1, val.size),
+            },
+            "store address should resolve to arg0-1, got {location:?}; addr={addr:?}; ops={:?}",
+            block.ops
+        );
     }
 }

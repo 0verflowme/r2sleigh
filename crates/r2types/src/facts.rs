@@ -20,6 +20,7 @@ pub struct LocalFieldAccessFact {
     pub slot: usize,
     pub field_offset: u64,
     pub field_name: String,
+    pub field_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -320,7 +321,12 @@ fn merge_local_field_accesses(
             .entry(access.slot)
             .or_default()
             .entry(access.field_offset)
-            .or_insert_with(|| access.field_name.clone());
+            .or_insert_with(|| {
+                access
+                    .field_type
+                    .clone()
+                    .unwrap_or_else(|| access.field_name.clone())
+            });
     }
 }
 
@@ -483,11 +489,13 @@ mod tests {
                     slot: 1,
                     field_offset: 0,
                     field_name: "first".to_string(),
+                    field_type: None,
                 },
                 LocalFieldAccessFact {
                     slot: 1,
                     field_offset: 8,
                     field_name: "second".to_string(),
+                    field_type: None,
                 },
             ],
             ..FunctionTypeFactInputs::default()
@@ -521,6 +529,7 @@ mod tests {
                 slot: 2,
                 field_offset: 0,
                 field_name: "local".to_string(),
+                field_type: None,
             }],
             ..FunctionTypeFactInputs::default()
         })
@@ -532,6 +541,28 @@ mod tests {
                 .get(&2)
                 .and_then(|profile| profile.get(&0)),
             Some(&"explicit".to_string())
+        );
+    }
+
+    #[test]
+    fn builder_prefers_local_field_access_type_when_present() {
+        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+            local_field_accesses: vec![LocalFieldAccessFact {
+                slot: 3,
+                field_offset: 4,
+                field_name: "f_4".to_string(),
+                field_type: Some("int32_t".to_string()),
+            }],
+            ..FunctionTypeFactInputs::default()
+        })
+        .build();
+
+        assert_eq!(
+            facts
+                .slot_field_profiles
+                .get(&3)
+                .and_then(|profile| profile.get(&4)),
+            Some(&"int32_t".to_string())
         );
     }
 

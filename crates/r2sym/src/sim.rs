@@ -3,18 +3,23 @@
 //! These summaries short-circuit into lightweight models to avoid
 //! path explosion from libc implementations.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use r2il::ArchSpec;
 use r2ssa::{
-    FunctionSemanticSummary, InterprocFunctionId, InterprocSummarySet, SsaArtifact,
-    SummaryMemoryEffectKind, SummaryMemoryRegion, SummaryReturnRelation,
+    FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput, InterprocSolveConfig,
+    InterprocSummarySet, SsaArtifact, SummaryMemoryEffectKind, SummaryMemoryRegion,
+    SummaryReturnRelation, solve_interproc_summary_set,
 };
-use z3::ast::BV;
+use serde::{Deserialize, Serialize};
+use z3::ast::{Ast, BV, Bool};
 
 use crate::executor::{CallHookResult, SymExecutor};
 use crate::path::PathExplorer;
+use crate::solver::{SatResult, SymSolver};
 use crate::state::{ExitStatus, SymState};
 use crate::value::SymValue;
 
@@ -30,6 +35,100 @@ pub const DEFAULT_MAX_MEMCMP: u64 = 0x1000;
 pub const DEFAULT_MAX_PRINTF_SCAN: u64 = 0x400;
 /// Default upper bound for generic interproc memory havoc windows.
 pub const DEFAULT_MAX_INTERPROC_HAVOC: u64 = 0x40;
+/// Path-listing upper bound for memory copy operations.
+pub const PATH_LIST_MAX_MEMCPY: u64 = 0x40;
+/// Path-listing upper bound for memory set operations.
+pub const PATH_LIST_MAX_MEMSET: u64 = 0x40;
+/// Path-listing upper bound for string operations.
+pub const PATH_LIST_MAX_STRLEN: u64 = 0x80;
+/// Path-listing upper bound for memcmp operations.
+pub const PATH_LIST_MAX_MEMCMP: u64 = 0x40;
+/// Path-listing upper bound for printf/puts modeled return values.
+pub const PATH_LIST_MAX_PRINTF_SCAN: u64 = 0x40;
+/// Path-listing precise-byte threshold before summaries switch to coarse modeling.
+pub const PATH_LIST_PRECISE_BYTE_LIMIT: u64 = 0x10;
+/// Default state budget for derived symbolic helper summaries.
+pub const DEFAULT_DERIVED_SUMMARY_MAX_STATES: usize = 64;
+/// Default path cap for derived helper summarization.
+pub const DEFAULT_DERIVED_SUMMARY_MAX_PATHS: usize = 8;
+/// Default depth budget for derived helper summarization.
+pub const DEFAULT_DERIVED_SUMMARY_MAX_DEPTH: usize = 128;
+/// Default bounded fixed-point iteration count for derived helper SCCs.
+pub const DEFAULT_DERIVED_SUMMARY_MAX_ITERATIONS: usize = 8;
+
+/// Summary profile used to install function summaries for different workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SummaryProfile {
+    /// Default symbolic execution behavior.
+    Default,
+    /// Fast bounded modeling for path-listing workflows.
+    PathListing,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SummaryBudgets {
+    max_strlen: u64,
+    max_memcpy: u64,
+    max_memset: u64,
+    max_memcmp: u64,
+    max_printf_scan: u64,
+    byte_policy: ByteSummaryPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ByteSummaryPolicy {
+    summarize_symbolic: bool,
+    summarize_large: bool,
+    precise_limit: u64,
+}
+
+impl ByteSummaryPolicy {
+    const fn precise(max_bytes: u64) -> Self {
+        Self {
+            summarize_symbolic: false,
+            summarize_large: false,
+            precise_limit: max_bytes,
+        }
+    }
+
+    const fn summarized(precise_limit: u64) -> Self {
+        Self {
+            summarize_symbolic: true,
+            summarize_large: true,
+            precise_limit,
+        }
+    }
+
+    fn use_precise_model(&self, n_concrete: Option<u64>) -> bool {
+        match n_concrete {
+            Some(len) => !self.summarize_large || len <= self.precise_limit,
+            None => !self.summarize_symbolic,
+        }
+    }
+}
+
+impl SummaryProfile {
+    fn budgets(self) -> SummaryBudgets {
+        match self {
+            SummaryProfile::Default => SummaryBudgets {
+                max_strlen: DEFAULT_MAX_STRLEN,
+                max_memcpy: DEFAULT_MAX_MEMCPY,
+                max_memset: DEFAULT_MAX_MEMSET,
+                max_memcmp: DEFAULT_MAX_MEMCMP,
+                max_printf_scan: DEFAULT_MAX_PRINTF_SCAN,
+                byte_policy: ByteSummaryPolicy::precise(DEFAULT_MAX_MEMCPY),
+            },
+            SummaryProfile::PathListing => SummaryBudgets {
+                max_strlen: PATH_LIST_MAX_STRLEN,
+                max_memcpy: PATH_LIST_MAX_MEMCPY,
+                max_memset: PATH_LIST_MAX_MEMSET,
+                max_memcmp: PATH_LIST_MAX_MEMCMP,
+                max_printf_scan: PATH_LIST_MAX_PRINTF_SCAN,
+                byte_policy: ByteSummaryPolicy::summarized(PATH_LIST_PRECISE_BYTE_LIMIT),
+            },
+        }
+    }
+}
 
 /// Summary execution outcome.
 pub enum SummaryEffect<'ctx> {
@@ -92,7 +191,9 @@ impl CallConv {
     /// Architecture-derived calling convention used by the symbolic runtime.
     pub fn for_arch_spec(arch: &ArchSpec) -> Option<Self> {
         let arch_name = arch.name.to_ascii_lowercase();
-        if arch.addr_size == 8 && arch_name.contains("x86") {
+        let looks_x86 = arch_name.contains("x86") || arch_name == "x64" || arch_name == "amd64";
+        let looks_64 = arch.addr_size == 8 || arch.addr_size == 64 || arch_name.contains("64");
+        if looks_x86 && looks_64 {
             return Some(Self::x86_64_sysv());
         }
 
@@ -112,7 +213,11 @@ impl CallConv {
         None
     }
 
-    fn collect_call_info<'ctx>(&self, state: &SymState<'ctx>, arity: usize) -> CallInfo<'ctx> {
+    pub(crate) fn collect_call_info<'ctx>(
+        &self,
+        state: &SymState<'ctx>,
+        arity: usize,
+    ) -> CallInfo<'ctx> {
         let mut args = Vec::with_capacity(arity);
         for i in 0..arity {
             if let Some(reg) = self.arg_registers.get(i) {
@@ -129,18 +234,50 @@ impl CallConv {
     }
 
     fn read_register<'ctx>(&self, state: &SymState<'ctx>, base: &str) -> SymValue<'ctx> {
-        if let Some(key) = find_register_key(state, base) {
-            state.get_register_sized(&key, self.arg_bits)
-        } else {
-            SymValue::unknown(self.arg_bits)
+        for alias in register_aliases(base) {
+            if let Some(key) = find_register_key(state, alias) {
+                return state.get_register_sized(&key, self.arg_bits);
+            }
         }
+        SymValue::unknown(self.arg_bits)
     }
 
     fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
-        let key = find_register_key(state, self.ret_register)
+        let key = register_aliases(self.ret_register)
+            .into_iter()
+            .find_map(|alias| find_register_key(state, alias))
             .unwrap_or_else(|| format!("{}_0", self.ret_register));
-        let adjusted = adjust_bits(state.context(), value, self.ret_bits);
+        let key_bits = state
+            .registers()
+            .get(&key)
+            .map(|existing| existing.bits())
+            .unwrap_or(self.ret_bits);
+        let adjusted = adjust_bits(state.context(), value, key_bits);
         state.set_register(&key, adjusted);
+    }
+
+    pub(crate) fn arg_register_name(&self, index: usize) -> Option<&'static str> {
+        self.arg_registers.get(index).copied()
+    }
+
+    pub(crate) fn arg_capacity(&self) -> usize {
+        self.arg_registers.len()
+    }
+
+    pub(crate) fn arg_bits(&self) -> u32 {
+        self.arg_bits
+    }
+
+    pub(crate) fn ret_bits(&self) -> u32 {
+        self.ret_bits
+    }
+
+    pub(crate) fn ret_register_name(&self) -> &'static str {
+        self.ret_register
+    }
+
+    pub(crate) fn return_value<'ctx>(&self, state: &SymState<'ctx>) -> SymValue<'ctx> {
+        self.read_register(state, self.ret_register)
     }
 }
 
@@ -150,6 +287,139 @@ pub struct SummaryInstallStats {
     pub installed: usize,
     pub skipped_unknown: usize,
     pub duplicates: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedPreparedFunction {
+    pub id: InterprocFunctionId,
+    pub name: Option<String>,
+    pub prepared: SsaArtifact,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedFunctionScope {
+    root: InterprocFunctionId,
+    functions: BTreeMap<InterprocFunctionId, ScopedPreparedFunction>,
+}
+
+impl PreparedFunctionScope {
+    pub fn new(root_addr: u64, functions: Vec<ScopedPreparedFunction>) -> Option<Self> {
+        let root = InterprocFunctionId(root_addr);
+        let mut by_id = BTreeMap::new();
+        for function in functions {
+            by_id.insert(function.id, function);
+        }
+        by_id.contains_key(&root).then_some(Self {
+            root,
+            functions: by_id,
+        })
+    }
+
+    pub fn root_id(&self) -> InterprocFunctionId {
+        self.root
+    }
+
+    pub fn root(&self) -> Option<&ScopedPreparedFunction> {
+        self.functions.get(&self.root)
+    }
+
+    pub fn functions(&self) -> &BTreeMap<InterprocFunctionId, ScopedPreparedFunction> {
+        &self.functions
+    }
+
+    pub fn helper_functions(&self) -> impl Iterator<Item = &ScopedPreparedFunction> {
+        self.functions
+            .values()
+            .filter(move |function| function.id != self.root)
+    }
+
+    pub fn with_prepared_root(&self, prepared: &SsaArtifact) -> Option<Self> {
+        let mut functions = self.functions.values().cloned().collect::<Vec<_>>();
+        for function in &mut functions {
+            if function.id == self.root {
+                function.prepared = prepared.clone();
+                if function.name.is_none() {
+                    function.name = prepared.function().name.clone();
+                }
+            }
+        }
+        Self::new(self.root.0, functions)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedSummaryCompletion {
+    Exact,
+    OverApprox,
+    BudgetExhausted,
+    Unknown,
+}
+
+#[derive(Clone)]
+pub struct DerivedSummaryInput<'ctx> {
+    pub arg_index: usize,
+    pub symbol: SymValue<'ctx>,
+    pub size: u32,
+}
+
+#[derive(Clone)]
+pub struct DerivedMemoryWrite<'ctx> {
+    pub arg_index: usize,
+    pub offset: i64,
+    pub size: u32,
+    pub value: SymValue<'ctx>,
+}
+
+#[derive(Clone)]
+pub struct DerivedSummaryCase<'ctx> {
+    pub guard: Bool,
+    pub return_value: Option<SymValue<'ctx>>,
+    pub memory_writes: Vec<DerivedMemoryWrite<'ctx>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DerivedSummaryGuidance {
+    pub summary_known: bool,
+    pub exact: bool,
+    pub feasible_cases: usize,
+    pub contradictory: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PointerInputWindow {
+    headroom: u32,
+    forward_size: u32,
+}
+
+#[derive(Clone)]
+pub struct DerivedFunctionSummary<'ctx> {
+    pub id: InterprocFunctionId,
+    pub name: Option<String>,
+    pub arg_count_hint: usize,
+    pub arg_symbols: Vec<(usize, SymValue<'ctx>)>,
+    pub memory_inputs: Vec<DerivedSummaryInput<'ctx>>,
+    pub cases: Vec<DerivedSummaryCase<'ctx>>,
+    pub completion: DerivedSummaryCompletion,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedSummaryDiagnostics {
+    pub attempted: usize,
+    pub derived: usize,
+    pub budget_exhausted: usize,
+    pub skipped_core: usize,
+    pub skipped_missing: usize,
+    pub scc_count: usize,
+    pub max_scc_size: usize,
+    pub scc_converged: usize,
+    pub scc_budget_exhausted: usize,
+}
+
+#[derive(Clone)]
+pub struct DerivedSummarySet<'ctx> {
+    pub interproc: InterprocSummarySet,
+    pub summaries: BTreeMap<InterprocFunctionId, Rc<DerivedFunctionSummary<'ctx>>>,
+    pub diagnostics: DerivedSummaryDiagnostics,
 }
 
 /// Summary registry that can install summaries as call hooks.
@@ -169,23 +439,48 @@ impl<'ctx> SummaryRegistry<'ctx> {
 
     /// Create a registry pre-populated with core summaries.
     pub fn with_core(callconv: CallConv) -> Self {
+        Self::with_profile(callconv, SummaryProfile::Default)
+    }
+
+    /// Create a registry pre-populated with summaries for a typed workflow profile.
+    pub fn with_profile(callconv: CallConv, profile: SummaryProfile) -> Self {
+        let budgets = profile.budgets();
         let mut registry = Self::new(callconv);
-        registry.register_summary(MemcpySummary::new(DEFAULT_MAX_MEMCPY));
-        registry.register_summary(MemsetSummary::new(DEFAULT_MAX_MEMSET));
-        registry.register_summary(StrlenSummary::new(DEFAULT_MAX_STRLEN));
+        registry.register_summary(MemcpySummary::with_policy(
+            budgets.max_memcpy,
+            budgets.byte_policy,
+        ));
+        registry.register_summary(MemsetSummary::with_policy(
+            budgets.max_memset,
+            budgets.byte_policy,
+        ));
+        registry.register_summary(StrlenSummary::new(budgets.max_strlen));
         registry.register_summary(StrcmpSummary::new());
-        registry.register_summary(MemcmpSummary::new(DEFAULT_MAX_MEMCMP));
+        registry.register_summary(MemcmpSummary::new(budgets.max_memcmp));
         registry.register_summary(MallocSummary::new());
         registry.register_summary(FreeSummary::new());
-        registry.register_summary(PutsSummary::new(DEFAULT_MAX_PRINTF_SCAN));
-        registry.register_summary(PrintfSummaryBasic::new(DEFAULT_MAX_PRINTF_SCAN));
+        registry.register_summary(PutsSummary::new(budgets.max_printf_scan));
+        registry.register_summary(PrintfSummaryBasic::new(budgets.max_printf_scan));
+        registry.register_summary(ReadSummary::new());
+        registry.register_summary(IsattySummary::new());
+        registry.register_summary(SleepSummary::sleep());
+        registry.register_summary(SleepSummary::usleep());
+        registry.register_summary(SleepSummary::nanosleep());
         registry.register_summary(ExitSummary::new());
         registry
     }
 
     /// Create a registry pre-populated with core summaries for a known architecture.
     pub fn with_core_for_arch(arch: &ArchSpec) -> Option<Self> {
-        Some(Self::with_core(CallConv::for_arch_spec(arch)?))
+        Some(Self::with_profile(
+            CallConv::for_arch_spec(arch)?,
+            SummaryProfile::Default,
+        ))
+    }
+
+    /// Create a registry pre-populated with summaries for a typed workflow profile.
+    pub fn with_profile_for_arch(arch: &ArchSpec, profile: SummaryProfile) -> Option<Self> {
+        Some(Self::with_profile(CallConv::for_arch_spec(arch)?, profile))
     }
 
     /// Register a function summary.
@@ -327,6 +622,842 @@ impl<'ctx> SummaryRegistry<'ctx> {
 
         stats
     }
+
+    pub fn has_core_summary_name(&self, name: &str) -> bool {
+        normalize_core_summary_name(name)
+            .is_some_and(|summary_name| self.summaries.contains_key(summary_name))
+    }
+
+    pub fn derive_symbolic_summaries(
+        &self,
+        ctx: &'ctx z3::Context,
+        scope: &PreparedFunctionScope,
+        arch: Option<&ArchSpec>,
+        symbol_map: &HashMap<u64, String>,
+    ) -> DerivedSummarySet<'ctx> {
+        let interproc = build_interproc_summary_set(scope, arch, symbol_map);
+        let mut summaries: BTreeMap<InterprocFunctionId, Rc<DerivedFunctionSummary<'ctx>>> =
+            BTreeMap::new();
+        let mut diagnostics = DerivedSummaryDiagnostics::default();
+
+        let helper_scope = scope
+            .helper_functions()
+            .map(|helper| (helper.id, helper))
+            .collect::<BTreeMap<_, _>>();
+        let sccs = compute_derived_summary_sccs(&helper_scope);
+        diagnostics.scc_count = sccs.len();
+
+        for scc in sccs {
+            diagnostics.max_scc_size = diagnostics.max_scc_size.max(scc.len());
+            let mut converged = false;
+            for _ in 0..DEFAULT_DERIVED_SUMMARY_MAX_ITERATIONS {
+                let mut changed = false;
+                for function_id in &scc {
+                    let Some(helper) = helper_scope.get(function_id).copied() else {
+                        continue;
+                    };
+                    diagnostics.attempted += 1;
+                    if helper
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| self.has_core_summary_name(name))
+                    {
+                        diagnostics.skipped_core += 1;
+                        continue;
+                    }
+
+                    let Some(static_summary) = interproc.summaries.get(function_id).cloned() else {
+                        diagnostics.skipped_missing += 1;
+                        continue;
+                    };
+
+                    let derived = derive_symbolic_summary_for_function(DerivedSummaryBuildInputs {
+                        ctx,
+                        registry: self,
+                        arch,
+                        function: helper,
+                        static_summary: &static_summary,
+                        interproc: &interproc,
+                        derived_summaries: &summaries,
+                        symbol_map,
+                    });
+                    let next = Rc::new(derived);
+                    let previous = summaries.get(function_id);
+                    if previous.map(|current| derived_summary_fingerprint(current))
+                        != Some(derived_summary_fingerprint(&next))
+                    {
+                        summaries.insert(*function_id, next);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    converged = true;
+                    diagnostics.scc_converged += 1;
+                    break;
+                }
+            }
+
+            if !converged {
+                diagnostics.scc_budget_exhausted += 1;
+                for function_id in &scc {
+                    if let Some(summary) = summaries.get_mut(function_id) {
+                        let next = with_budget_exhausted_completion(summary.as_ref());
+                        *summary = Rc::new(next);
+                    }
+                }
+            }
+        }
+
+        for summary in summaries.values() {
+            match summary.completion {
+                DerivedSummaryCompletion::BudgetExhausted => diagnostics.budget_exhausted += 1,
+                DerivedSummaryCompletion::Unknown => diagnostics.skipped_missing += 1,
+                _ => diagnostics.derived += 1,
+            }
+        }
+
+        DerivedSummarySet {
+            interproc,
+            summaries,
+            diagnostics,
+        }
+    }
+
+    pub fn install_scope_summaries_for_explorer(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        ctx: &'ctx z3::Context,
+        scope: &PreparedFunctionScope,
+        arch: Option<&ArchSpec>,
+        symbol_map: &HashMap<u64, String>,
+    ) -> DerivedSummaryDiagnostics {
+        let derived = self.derive_symbolic_summaries(ctx, scope, arch, symbol_map);
+        if let Some(root) = scope.root() {
+            let _ = self.install_interproc_summaries_for_function(
+                explorer,
+                &root.prepared,
+                &derived.interproc,
+                symbol_map,
+            );
+            let _ = self.install_derived_summaries_for_function(
+                explorer,
+                &root.prepared,
+                &derived.summaries,
+                symbol_map,
+            );
+            let _ = self.install_known_symbols_for_function(explorer, &root.prepared, symbol_map);
+        }
+        derived.diagnostics
+    }
+
+    pub fn install_derived_summaries_for_function(
+        &self,
+        explorer: &mut PathExplorer<'ctx>,
+        prepared: &SsaArtifact,
+        summaries: &BTreeMap<InterprocFunctionId, Rc<DerivedFunctionSummary<'ctx>>>,
+        symbol_map: &HashMap<u64, String>,
+    ) -> SummaryInstallStats {
+        let mut stats = SummaryInstallStats::default();
+        let mut targets = BTreeSet::new();
+        for call in prepared.call_sites().by_id.values() {
+            if let Some(target) = call.direct_target {
+                targets.insert(target);
+            }
+        }
+        for target in targets {
+            stats.attempted += 1;
+            if let Some(raw_name) = symbol_map.get(&target)
+                && self.has_core_summary_name(raw_name)
+            {
+                stats.skipped_unknown += 1;
+                continue;
+            }
+            let Some(summary) = summaries.get(&InterprocFunctionId(target)).cloned() else {
+                stats.skipped_unknown += 1;
+                continue;
+            };
+            if summary.cases.is_empty()
+                || matches!(
+                    summary.completion,
+                    DerivedSummaryCompletion::Unknown | DerivedSummaryCompletion::BudgetExhausted
+                )
+            {
+                stats.skipped_unknown += 1;
+                continue;
+            }
+            let callconv = self.callconv.clone();
+            explorer.register_derived_call_hook(
+                target,
+                summary.clone(),
+                callconv.clone(),
+                move |state| apply_derived_summary(state, &summary, &callconv),
+            );
+            stats.installed += 1;
+        }
+        stats
+    }
+}
+
+fn compute_derived_summary_sccs(
+    helpers: &BTreeMap<InterprocFunctionId, &ScopedPreparedFunction>,
+) -> Vec<Vec<InterprocFunctionId>> {
+    let node_ids: Vec<InterprocFunctionId> = helpers.keys().copied().collect();
+    let node_set = node_ids.iter().copied().collect::<BTreeSet<_>>();
+    let mut succs = BTreeMap::<InterprocFunctionId, Vec<InterprocFunctionId>>::new();
+    let mut rev = BTreeMap::<InterprocFunctionId, Vec<InterprocFunctionId>>::new();
+
+    for node in &node_ids {
+        succs.entry(*node).or_default();
+        rev.entry(*node).or_default();
+    }
+
+    for (id, helper) in helpers {
+        let mut out = helper
+            .prepared
+            .call_sites()
+            .by_id
+            .values()
+            .filter_map(|call| call.direct_target.map(InterprocFunctionId))
+            .filter(|target| node_set.contains(target))
+            .collect::<Vec<_>>();
+        out.sort_unstable();
+        out.dedup();
+        succs.insert(*id, out.clone());
+        for succ in out {
+            rev.entry(succ).or_default().push(*id);
+        }
+    }
+
+    for preds in rev.values_mut() {
+        preds.sort_unstable();
+        preds.dedup();
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut order = Vec::new();
+    for node in &node_ids {
+        dfs_summary_postorder(*node, &succs, &mut visited, &mut order);
+    }
+
+    visited.clear();
+    let mut sccs = Vec::new();
+    while let Some(node) = order.pop() {
+        if visited.contains(&node) {
+            continue;
+        }
+        let mut component = Vec::new();
+        dfs_summary_component(node, &rev, &mut visited, &mut component);
+        component.sort_unstable();
+        sccs.push(component);
+    }
+
+    sccs.reverse();
+    sccs
+}
+
+fn dfs_summary_postorder(
+    node: InterprocFunctionId,
+    succs: &BTreeMap<InterprocFunctionId, Vec<InterprocFunctionId>>,
+    visited: &mut BTreeSet<InterprocFunctionId>,
+    order: &mut Vec<InterprocFunctionId>,
+) {
+    if !visited.insert(node) {
+        return;
+    }
+    if let Some(nexts) = succs.get(&node) {
+        for next in nexts {
+            dfs_summary_postorder(*next, succs, visited, order);
+        }
+    }
+    order.push(node);
+}
+
+fn dfs_summary_component(
+    node: InterprocFunctionId,
+    rev: &BTreeMap<InterprocFunctionId, Vec<InterprocFunctionId>>,
+    visited: &mut BTreeSet<InterprocFunctionId>,
+    component: &mut Vec<InterprocFunctionId>,
+) {
+    if !visited.insert(node) {
+        return;
+    }
+    component.push(node);
+    if let Some(preds) = rev.get(&node) {
+        for pred in preds {
+            dfs_summary_component(*pred, rev, visited, component);
+        }
+    }
+}
+
+fn derived_summary_fingerprint(summary: &DerivedFunctionSummary<'_>) -> Vec<String> {
+    let mut out = vec![
+        format!("{:?}", summary.completion),
+        summary.arg_count_hint.to_string(),
+        summary.arg_symbols.len().to_string(),
+        summary.memory_inputs.len().to_string(),
+        summary.cases.len().to_string(),
+    ];
+    out.extend(
+        summary
+            .arg_symbols
+            .iter()
+            .map(|(index, symbol)| format!("arg:{index}:{}", symbol)),
+    );
+    out.extend(
+        summary
+            .memory_inputs
+            .iter()
+            .map(|input| format!("mem:{}:{}:{}", input.arg_index, input.size, input.symbol)),
+    );
+    out.extend(summary.cases.iter().map(|case| {
+        let writes = case
+            .memory_writes
+            .iter()
+            .map(|write| {
+                format!(
+                    "{}:{}:{}:{}",
+                    write.arg_index, write.offset, write.size, write.value
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        format!(
+            "case:{}:{}:{}",
+            case.guard.simplify(),
+            case.return_value
+                .as_ref()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<void>".to_string()),
+            writes
+        )
+    }));
+    out
+}
+
+fn with_budget_exhausted_completion<'ctx>(
+    summary: &DerivedFunctionSummary<'ctx>,
+) -> DerivedFunctionSummary<'ctx> {
+    let mut next = summary.clone();
+    next.completion = DerivedSummaryCompletion::BudgetExhausted;
+    next
+}
+
+fn build_interproc_summary_set(
+    scope: &PreparedFunctionScope,
+    arch: Option<&ArchSpec>,
+    symbol_map: &HashMap<u64, String>,
+) -> InterprocSummarySet {
+    let mut inputs = Vec::new();
+    let mut seeds = BTreeMap::new();
+    for function in scope.functions().values() {
+        inputs.push(InterprocFunctionInput {
+            id: function.id,
+            name: function.name.clone(),
+            prepared: &function.prepared,
+        });
+        if let Some(name) = symbol_map.get(&function.id.0)
+            && let Some(summary) = FunctionSemanticSummary::seed_for_name(function.id, name)
+        {
+            seeds.insert(function.id, summary);
+        } else if let Some(name) = function.name.as_deref()
+            && let Some(summary) = FunctionSemanticSummary::seed_for_name(function.id, name)
+        {
+            seeds.insert(function.id, summary);
+        }
+    }
+
+    solve_interproc_summary_set(
+        &inputs,
+        arch,
+        Some(scope.root_id()),
+        &seeds,
+        InterprocSolveConfig::default(),
+    )
+}
+
+struct DerivedSummaryBuildInputs<'a, 'ctx> {
+    ctx: &'ctx z3::Context,
+    registry: &'a SummaryRegistry<'ctx>,
+    arch: Option<&'a ArchSpec>,
+    function: &'a ScopedPreparedFunction,
+    static_summary: &'a FunctionSemanticSummary,
+    interproc: &'a InterprocSummarySet,
+    derived_summaries: &'a BTreeMap<InterprocFunctionId, Rc<DerivedFunctionSummary<'ctx>>>,
+    symbol_map: &'a HashMap<u64, String>,
+}
+
+fn derive_symbolic_summary_for_function<'ctx>(
+    inputs: DerivedSummaryBuildInputs<'_, 'ctx>,
+) -> DerivedFunctionSummary<'ctx> {
+    let DerivedSummaryBuildInputs {
+        ctx,
+        registry,
+        arch,
+        function,
+        static_summary,
+        interproc,
+        derived_summaries,
+        symbol_map,
+    } = inputs;
+    let mut state = SymState::new(ctx, function.prepared.entry);
+    crate::runtime::seed_default_state_for_arch(&mut state, &function.prepared, arch);
+    let defines_return_value = function_defines_return_value(function, &registry.callconv);
+    let opaque_return = matches!(
+        static_summary.return_relation,
+        SummaryReturnRelation::Unknown
+    ) && !defines_return_value;
+
+    let mut arg_symbols = Vec::new();
+    let helper_name = function
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("sub_{:x}", function.id.0));
+    let mut memory_inputs = Vec::new();
+    let pointer_inputs = collect_pointer_memory_windows(static_summary);
+
+    for index in 0..registry.callconv.arg_capacity() {
+        if let Some(reg) = registry.callconv.arg_register_name(index) {
+            let key = find_register_key(&state, reg)
+                .unwrap_or_else(|| format!("{}_0", reg.to_ascii_uppercase()));
+            let arg_bits = static_summary_arg_bits(&registry.callconv);
+            if let Some(window) = pointer_inputs.get(&index).copied() {
+                let ptr_base = helper_arg_region_base(function.id, index);
+                let region_start = ptr_base.saturating_sub(window.headroom as u64);
+                let region_size = window.headroom.saturating_add(window.forward_size.max(1));
+                let _ = state.make_symbolic_memory(
+                    region_start,
+                    region_size.max(1),
+                    &format!("{}_arg{}_mem", helper_name, index),
+                );
+                let symbol = state.mem_read(
+                    &SymValue::concrete(ptr_base, arg_bits),
+                    window.forward_size.max(1),
+                );
+                state.set_register(&key, SymValue::concrete(ptr_base, arg_bits));
+                memory_inputs.push(DerivedSummaryInput {
+                    arg_index: index,
+                    symbol,
+                    size: window.forward_size.max(1),
+                });
+            } else {
+                if !state.registers().contains_key(&key) {
+                    state.make_symbolic_named(
+                        &key,
+                        &format!("{}_arg{}", helper_name, index),
+                        arg_bits,
+                    );
+                }
+                arg_symbols.push((index, state.get_register_sized(&key, arg_bits)));
+            }
+        }
+    }
+
+    let config = crate::path::ExploreConfig {
+        max_states: DEFAULT_DERIVED_SUMMARY_MAX_STATES,
+        max_completed_paths: Some(DEFAULT_DERIVED_SUMMARY_MAX_PATHS),
+        max_depth: DEFAULT_DERIVED_SUMMARY_MAX_DEPTH,
+        timeout: None,
+        prune_infeasible: true,
+        merge_states: true,
+        subsumption_states: true,
+        ..crate::path::ExploreConfig::default()
+    };
+    let mut explorer = PathExplorer::with_config(ctx, config);
+    let _ = registry.install_interproc_summaries_for_function(
+        &mut explorer,
+        &function.prepared,
+        interproc,
+        symbol_map,
+    );
+    let _ = registry.install_derived_summaries_for_function(
+        &mut explorer,
+        &function.prepared,
+        derived_summaries,
+        symbol_map,
+    );
+    let _ =
+        registry.install_known_symbols_for_function(&mut explorer, &function.prepared, symbol_map);
+    let summary = explorer.summarize_function(&function.prepared, state);
+
+    let completion = if opaque_return {
+        DerivedSummaryCompletion::Unknown
+    } else if summary.stats.timed_out || summary.stats.max_states_exhausted {
+        DerivedSummaryCompletion::BudgetExhausted
+    } else if summary.paths.is_empty() {
+        DerivedSummaryCompletion::Unknown
+    } else if summary.paths.iter().all(|path| path.feasible) {
+        DerivedSummaryCompletion::Exact
+    } else {
+        DerivedSummaryCompletion::OverApprox
+    };
+
+    let mut cases = Vec::new();
+    let mut write_locations = collect_tracked_memory_writes(static_summary);
+    write_locations.sort_unstable();
+    write_locations.dedup();
+    for path in summary.paths.iter().filter(|path| path.feasible) {
+        let mut memory_writes = Vec::new();
+        for (arg_index, offset, size) in &write_locations {
+            let base_addr = helper_arg_region_base(function.id, *arg_index);
+            let addr = SymValue::concrete(
+                concrete_with_signed_offset(base_addr, *offset),
+                static_summary_arg_bits(&registry.callconv),
+            );
+            let value = path.state.mem_read(&addr, *size);
+            memory_writes.push(DerivedMemoryWrite {
+                arg_index: *arg_index,
+                offset: *offset,
+                size: *size,
+                value,
+            });
+        }
+        memory_writes = coalesce_adjacent_memory_writes(ctx, memory_writes);
+
+        let return_value = match static_summary.return_relation {
+            SummaryReturnRelation::Void => None,
+            SummaryReturnRelation::Unknown if opaque_return => None,
+            _ => Some(registry.callconv.return_value(&path.state)),
+        };
+        cases.push(DerivedSummaryCase {
+            guard: path.state.path_condition(),
+            return_value,
+            memory_writes,
+        });
+    }
+
+    DerivedFunctionSummary {
+        id: function.id,
+        name: function.name.clone(),
+        arg_count_hint: summary_arity(static_summary),
+        arg_symbols,
+        memory_inputs,
+        cases,
+        completion,
+    }
+}
+
+fn function_defines_return_value(function: &ScopedPreparedFunction, callconv: &CallConv) -> bool {
+    let aliases = register_aliases(callconv.ret_register_name());
+    function.prepared.blocks().any(|block| {
+        block.ops.iter().any(|op| {
+            op.dst().is_some_and(|dst| {
+                aliases
+                    .iter()
+                    .any(|alias| dst.name.eq_ignore_ascii_case(alias))
+            })
+        })
+    })
+}
+
+fn coalesce_adjacent_memory_writes<'ctx>(
+    ctx: &'ctx z3::Context,
+    mut writes: Vec<DerivedMemoryWrite<'ctx>>,
+) -> Vec<DerivedMemoryWrite<'ctx>> {
+    writes.sort_by_key(|write| (write.arg_index, write.offset, write.size));
+
+    let mut merged: Vec<DerivedMemoryWrite<'ctx>> = Vec::with_capacity(writes.len());
+    for write in writes {
+        if let Some(last) = merged.last_mut()
+            && last.arg_index == write.arg_index
+            && last.offset.checked_add(last.size as i64) == Some(write.offset)
+            && let Some(new_size) = last.size.checked_add(write.size)
+        {
+            last.value = write.value.concat(ctx, &last.value);
+            last.size = new_size;
+            continue;
+        }
+        merged.push(write);
+    }
+    merged
+}
+
+fn helper_arg_region_base(function: InterprocFunctionId, arg_index: usize) -> u64 {
+    0x5000_0000u64
+        .wrapping_add((function.0 & 0xffff) << 12)
+        .wrapping_add((arg_index as u64) << 8)
+        .wrapping_add(0x80)
+}
+
+fn static_summary_arg_bits(callconv: &CallConv) -> u32 {
+    callconv.arg_bits
+}
+
+fn collect_pointer_memory_windows(
+    summary: &FunctionSemanticSummary,
+) -> BTreeMap<usize, PointerInputWindow> {
+    let mut inputs = BTreeMap::new();
+    for (index, effect) in &summary.arg_effects {
+        if !(effect.read || effect.write || effect.escape || effect.free) {
+            continue;
+        }
+        let mut window = PointerInputWindow {
+            headroom: 0,
+            forward_size: DEFAULT_MAX_INTERPROC_HAVOC as u32,
+        };
+        let mut saw_precise_range = false;
+        for effect in &summary.memory_effects {
+            let SummaryMemoryRegion::Arg {
+                index: effect_index,
+            } = effect.location.region
+            else {
+                continue;
+            };
+            if effect_index != *index {
+                continue;
+            }
+            let Some(range) = effect.location.range else {
+                continue;
+            };
+            let width = range.width.unwrap_or(1).max(1);
+            let start = range.offset_lo.min(range.offset_hi);
+            let end = range.offset_hi.max(range.offset_lo);
+            let forward = if end >= 0 {
+                (end as u32).saturating_add(width)
+            } else {
+                width
+            };
+            let headroom = if start < 0 {
+                start.checked_abs().unwrap_or(i64::MAX).min(u32::MAX as i64) as u32
+            } else {
+                0
+            };
+            window.forward_size = window.forward_size.max(forward.max(1));
+            window.headroom = window.headroom.max(headroom);
+            saw_precise_range = true;
+        }
+        if !saw_precise_range {
+            window.forward_size = DEFAULT_MAX_INTERPROC_HAVOC as u32;
+        }
+        inputs.insert(*index, window);
+    }
+    inputs
+}
+
+fn collect_tracked_memory_writes(summary: &FunctionSemanticSummary) -> Vec<(usize, i64, u32)> {
+    let mut writes = Vec::new();
+    for effect in &summary.memory_effects {
+        if !matches!(
+            effect.kind,
+            SummaryMemoryEffectKind::Write
+                | SummaryMemoryEffectKind::Escape
+                | SummaryMemoryEffectKind::Free
+        ) {
+            continue;
+        }
+        let SummaryMemoryRegion::Arg { index } = effect.location.region else {
+            continue;
+        };
+        let range = effect.location.range.unwrap_or(r2ssa::SummaryMemoryRange {
+            offset_lo: 0,
+            offset_hi: 0,
+            width: Some(1),
+        });
+        let width = range.width.unwrap_or(1).max(1);
+        let start = range.offset_lo.min(range.offset_hi);
+        let end = range.offset_hi.max(range.offset_lo);
+        let mut offset = start;
+        while offset <= end {
+            writes.push((index, offset, width));
+            let Some(next) = offset.checked_add(width as i64) else {
+                break;
+            };
+            offset = next;
+        }
+    }
+    writes
+}
+
+fn apply_derived_summary<'ctx>(
+    state: &mut SymState<'ctx>,
+    summary: &DerivedFunctionSummary<'ctx>,
+    callconv: &CallConv,
+) -> CallHookResult {
+    let call =
+        callconv.collect_call_info(state, summary.arg_count_hint.max(callconv.arg_capacity()));
+    if summary.cases.is_empty() {
+        return CallHookResult::Fallthrough;
+    }
+
+    let substitutions = build_summary_substitutions(state, summary, &call);
+
+    if summary.cases.iter().any(|case| case.return_value.is_some()) {
+        let mut merged = SymValue::unknown(call.ret_bits);
+        for case in summary.cases.iter().rev() {
+            let Some(return_value) = &case.return_value else {
+                continue;
+            };
+            let guard = substitute_bool(&case.guard, &substitutions);
+            let value = substitute_value(state.context(), return_value, &substitutions);
+            merged = ite_value(state.context(), &guard, &value, &merged);
+        }
+        callconv.write_return(state, merged);
+    }
+
+    let mut writes = BTreeMap::<(usize, i64, u32), Vec<(Bool, SymValue<'ctx>)>>::new();
+    for case in &summary.cases {
+        let guard = substitute_bool(&case.guard, &substitutions);
+        for write in &case.memory_writes {
+            let value = substitute_value(state.context(), &write.value, &substitutions);
+            writes
+                .entry((write.arg_index, write.offset, write.size))
+                .or_default()
+                .push((guard.clone(), value));
+        }
+    }
+
+    for ((arg_index, offset, size), cases) in writes {
+        let Some(base) = call.args.get(arg_index) else {
+            continue;
+        };
+        let addr = add_signed_offset(state.context(), base, offset, call.arg_bits);
+        let mut merged = state.mem_read(&addr, size);
+        for (guard, value) in cases.into_iter().rev() {
+            merged = ite_value(state.context(), &guard, &value, &merged);
+        }
+        state.mem_write(&addr, &merged, size);
+    }
+
+    CallHookResult::Fallthrough
+}
+
+pub(crate) fn evaluate_derived_summary_guidance<'ctx>(
+    state: &SymState<'ctx>,
+    summary: &DerivedFunctionSummary<'ctx>,
+    callconv: &CallConv,
+    solver: &SymSolver<'ctx>,
+) -> DerivedSummaryGuidance {
+    let exact = matches!(summary.completion, DerivedSummaryCompletion::Exact);
+    if summary.cases.is_empty() {
+        return DerivedSummaryGuidance {
+            summary_known: true,
+            exact,
+            feasible_cases: 0,
+            contradictory: false,
+        };
+    }
+
+    let call =
+        callconv.collect_call_info(state, summary.arg_count_hint.max(callconv.arg_capacity()));
+    let substitutions = build_summary_substitutions(state, summary, &call);
+    let mut feasible_cases = 0;
+    let mut saw_unknown = false;
+
+    for case in &summary.cases {
+        let Some(guard) = try_substitute_bool(&case.guard, &substitutions) else {
+            saw_unknown = true;
+            continue;
+        };
+        match solver.sat_with_constraint(state, &guard) {
+            SatResult::Sat => feasible_cases += 1,
+            SatResult::Unknown => saw_unknown = true,
+            SatResult::Unsat => {}
+        }
+    }
+
+    DerivedSummaryGuidance {
+        summary_known: true,
+        exact,
+        feasible_cases,
+        contradictory: exact && feasible_cases == 0 && !saw_unknown,
+    }
+}
+
+fn concrete_with_signed_offset(base: u64, offset: i64) -> u64 {
+    if offset >= 0 {
+        base.wrapping_add(offset as u64)
+    } else {
+        base.wrapping_sub(offset.unsigned_abs())
+    }
+}
+
+fn add_signed_offset<'ctx>(
+    ctx: &'ctx z3::Context,
+    base: &SymValue<'ctx>,
+    offset: i64,
+    bits: u32,
+) -> SymValue<'ctx> {
+    if offset >= 0 {
+        base.add(ctx, &SymValue::concrete(offset as u64, bits))
+    } else {
+        base.sub(ctx, &SymValue::concrete(offset.unsigned_abs(), bits))
+    }
+}
+
+fn build_summary_substitutions<'ctx>(
+    state: &SymState<'ctx>,
+    summary: &DerivedFunctionSummary<'ctx>,
+    call: &CallInfo<'ctx>,
+) -> Vec<(BV, BV)> {
+    let mut substitutions = Vec::new();
+    for (index, symbol) in &summary.arg_symbols {
+        let Some(actual) = call.args.get(*index) else {
+            continue;
+        };
+        let adjusted = adjust_bits(state.context(), actual.clone(), symbol.bits());
+        substitutions.push((
+            symbol.to_bv(state.context()),
+            adjusted.to_bv(state.context()),
+        ));
+    }
+    for input in &summary.memory_inputs {
+        let Some(base) = call.args.get(input.arg_index) else {
+            continue;
+        };
+        let actual = adjust_bits(
+            state.context(),
+            state.mem_read(base, input.size),
+            input.symbol.bits(),
+        );
+        substitutions.push((
+            input.symbol.to_bv(state.context()),
+            actual.to_bv(state.context()),
+        ));
+    }
+    substitutions
+}
+
+fn substitute_bool(ast: &Bool, substitutions: &[(BV, BV)]) -> Bool {
+    let pairs = substitutions
+        .iter()
+        .map(|(from, to)| (from, to))
+        .collect::<Vec<_>>();
+    ast.substitute(&pairs)
+}
+
+fn try_substitute_bool(ast: &Bool, substitutions: &[(BV, BV)]) -> Option<Bool> {
+    catch_unwind(AssertUnwindSafe(|| substitute_bool(ast, substitutions))).ok()
+}
+
+fn substitute_value<'ctx>(
+    _ctx: &'ctx z3::Context,
+    value: &SymValue<'ctx>,
+    substitutions: &[(BV, BV)],
+) -> SymValue<'ctx> {
+    match value {
+        SymValue::Concrete { .. } | SymValue::Unknown { .. } => value.clone(),
+        SymValue::Symbolic {
+            ast, bits, taint, ..
+        } => {
+            let pairs = substitutions
+                .iter()
+                .map(|(from, to)| (from, to))
+                .collect::<Vec<_>>();
+            SymValue::symbolic_tainted(ast.substitute(&pairs), *bits, *taint)
+        }
+    }
+}
+
+fn ite_value<'ctx>(
+    ctx: &'ctx z3::Context,
+    guard: &Bool,
+    when_true: &SymValue<'ctx>,
+    when_false: &SymValue<'ctx>,
+) -> SymValue<'ctx> {
+    let bits = when_true.bits().max(when_false.bits());
+    let taint = when_true.get_taint() | when_false.get_taint();
+    let true_bv = adjust_bits(ctx, when_true.clone(), bits).to_bv(ctx);
+    let false_bv = adjust_bits(ctx, when_false.clone(), bits).to_bv(ctx);
+    SymValue::symbolic_tainted(guard.ite(&true_bv, &false_bv), bits, taint)
 }
 
 fn apply_summary<'ctx>(
@@ -391,10 +1522,14 @@ fn interproc_return_value<'ctx>(
         SummaryReturnRelation::Const(value) => Some(SymValue::concrete(value, call.ret_bits)),
         SummaryReturnRelation::Global(address) => Some(SymValue::concrete(address, call.ret_bits)),
         SummaryReturnRelation::HeapAlloc => {
-            let ret_ast = BV::fresh_const("interproc_heap_ptr", call.ret_bits);
-            let ret = SymValue::symbolic(ret_ast, call.ret_bits);
-            state.constrain_ne(&ret, 0);
-            Some(ret)
+            let size = call
+                .args
+                .first()
+                .and_then(SymValue::as_concrete)
+                .filter(|size| *size > 0)
+                .unwrap_or(0x100);
+            let (_region, base_addr) = state.allocate_heap_region("interproc_heap", size);
+            Some(SymValue::concrete(base_addr, call.ret_bits))
         }
         SummaryReturnRelation::Unknown => Some(SymValue::unknown(call.ret_bits)),
     }
@@ -467,6 +1602,21 @@ fn arch_has_register(arch: &ArchSpec, name: &str) -> bool {
         .any(|reg| reg.name.eq_ignore_ascii_case(name))
 }
 
+fn register_aliases(base: &str) -> Vec<&str> {
+    match base {
+        "RAX" => vec!["RAX", "EAX"],
+        "RDI" => vec!["RDI", "EDI"],
+        "RSI" => vec!["RSI", "ESI"],
+        "RDX" => vec!["RDX", "EDX"],
+        "RCX" => vec!["RCX", "ECX"],
+        "R8" => vec!["R8", "R8D"],
+        "R9" => vec!["R9", "R9D"],
+        "RSP" => vec!["RSP", "ESP"],
+        "RBP" => vec!["RBP", "EBP"],
+        _ => vec![base],
+    }
+}
+
 fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
     let normalized_owned = name.trim().to_ascii_lowercase();
     let mut normalized = normalized_owned.as_str();
@@ -504,6 +1654,11 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
         "free" => Some("free"),
         "puts" => Some("puts"),
         "printf" | "__printf_chk" => Some("printf"),
+        "read" | "__read_chk" => Some("read"),
+        "isatty" => Some("isatty"),
+        "sleep" => Some("sleep"),
+        "usleep" => Some("usleep"),
+        "nanosleep" => Some("nanosleep"),
         "exit" | "_exit" => Some("exit"),
         _ => {
             if normalized.starts_with("strlen") {
@@ -518,6 +1673,16 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
                 Some("memset")
             } else if normalized.starts_with("printf") || normalized == "__printf_chk" {
                 Some("printf")
+            } else if normalized.starts_with("read") {
+                Some("read")
+            } else if normalized.starts_with("isatty") {
+                Some("isatty")
+            } else if normalized == "sleep" || normalized.ends_with("sleep") {
+                Some("sleep")
+            } else if normalized.starts_with("usleep") {
+                Some("usleep")
+            } else if normalized.starts_with("nanosleep") {
+                Some("nanosleep")
             } else if normalized.starts_with("puts") {
                 Some("puts")
             } else if normalized == "malloc" || normalized.ends_with("malloc") {
@@ -574,12 +1739,20 @@ fn adjust_bits<'ctx>(ctx: &'ctx z3::Context, value: SymValue<'ctx>, bits: u32) -
 /// memcpy(dst, src, n) summary.
 pub struct MemcpySummary {
     max_copy: u64,
+    byte_policy: ByteSummaryPolicy,
 }
 
 impl MemcpySummary {
     /// Create a memcpy summary with an upper bound on copy size.
     pub fn new(max_copy: u64) -> Self {
-        Self { max_copy }
+        Self::with_policy(max_copy, ByteSummaryPolicy::precise(max_copy))
+    }
+
+    fn with_policy(max_copy: u64, byte_policy: ByteSummaryPolicy) -> Self {
+        Self {
+            max_copy,
+            byte_policy,
+        }
     }
 }
 
@@ -608,7 +1781,7 @@ impl<'ctx> FunctionSummary<'ctx> for MemcpySummary {
             .get(2)
             .cloned()
             .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
-        copy_bytes(state, &dst, &src, &n, self.max_copy);
+        copy_bytes(state, &dst, &src, &n, self.max_copy, self.byte_policy);
         SummaryEffect::Return(Some(dst))
     }
 }
@@ -776,12 +1949,20 @@ impl<'ctx> FunctionSummary<'ctx> for MemcmpSummary {
 /// memset(dst, c, n) summary.
 pub struct MemsetSummary {
     max_set: u64,
+    byte_policy: ByteSummaryPolicy,
 }
 
 impl MemsetSummary {
     /// Create a memset summary with an upper bound on set size.
     pub fn new(max_set: u64) -> Self {
-        Self { max_set }
+        Self::with_policy(max_set, ByteSummaryPolicy::precise(max_set))
+    }
+
+    fn with_policy(max_set: u64, byte_policy: ByteSummaryPolicy) -> Self {
+        Self {
+            max_set,
+            byte_policy,
+        }
     }
 }
 
@@ -811,7 +1992,7 @@ impl<'ctx> FunctionSummary<'ctx> for MemsetSummary {
             .cloned()
             .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
 
-        set_bytes(state, &dst, &c, &n, self.max_set);
+        set_bytes(state, &dst, &c, &n, self.max_set, self.byte_policy);
         SummaryEffect::Return(Some(dst))
     }
 }
@@ -892,6 +2073,141 @@ impl<'ctx> FunctionSummary<'ctx> for PrintfSummaryBasic {
         let ret_ast = BV::fresh_const("printf_ret", call.ret_bits);
         let ret = SymValue::symbolic_tainted(ret_ast, call.ret_bits, taint);
         state.constrain_range(&ret, 0, self.max_ret);
+        SummaryEffect::Return(Some(ret))
+    }
+}
+
+/// read(fd, buf, count) summary.
+#[derive(Default)]
+pub struct ReadSummary;
+
+impl ReadSummary {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for ReadSummary {
+    fn name(&self) -> &'static str {
+        "read"
+    }
+
+    fn arity(&self) -> usize {
+        3
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let fd = call
+            .args
+            .first()
+            .and_then(SymValue::as_concrete)
+            .map(|value| value as i32);
+        let buf = call
+            .args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
+        let count = call
+            .args
+            .get(2)
+            .and_then(SymValue::as_concrete)
+            .unwrap_or(0) as usize;
+
+        let Some(fd) = fd else {
+            let ret = SymValue::unknown(call.ret_bits);
+            return SummaryEffect::Return(Some(ret));
+        };
+
+        let Some(bytes) = state.read_symbolic_fd_bytes(fd, count) else {
+            return SummaryEffect::Return(Some(SymValue::concrete(0, call.ret_bits)));
+        };
+
+        if let Some(base) = buf.as_concrete() {
+            for (idx, byte) in bytes.iter().enumerate() {
+                let addr = SymValue::concrete(base.saturating_add(idx as u64), call.arg_bits);
+                state.mem_write(&addr, byte, 1);
+            }
+        }
+
+        SummaryEffect::Return(Some(SymValue::concrete(bytes.len() as u64, call.ret_bits)))
+    }
+}
+
+/// isatty(fd) summary.
+#[derive(Default)]
+pub struct IsattySummary;
+
+impl IsattySummary {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for IsattySummary {
+    fn name(&self) -> &'static str {
+        "isatty"
+    }
+
+    fn arity(&self) -> usize {
+        1
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let fd = call
+            .args
+            .first()
+            .and_then(SymValue::as_concrete)
+            .map(|value| value as i32)
+            .unwrap_or(-1);
+        let ret = if state.is_tty_fd(fd) { 1 } else { 0 };
+        SummaryEffect::Return(Some(SymValue::concrete(ret, call.ret_bits)))
+    }
+}
+
+/// sleep/usleep/nanosleep summary.
+pub struct SleepSummary {
+    name: &'static str,
+    arity: usize,
+}
+
+impl SleepSummary {
+    pub fn sleep() -> Self {
+        Self {
+            name: "sleep",
+            arity: 1,
+        }
+    }
+
+    pub fn usleep() -> Self {
+        Self {
+            name: "usleep",
+            arity: 1,
+        }
+    }
+
+    pub fn nanosleep() -> Self {
+        Self {
+            name: "nanosleep",
+            arity: 2,
+        }
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for SleepSummary {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        self.arity
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let ret = if state.skip_sleep_calls() {
+            SymValue::concrete(0, call.ret_bits)
+        } else {
+            SymValue::unknown(call.ret_bits)
+        };
         SummaryEffect::Return(Some(ret))
     }
 }
@@ -991,13 +2307,32 @@ fn copy_bytes<'ctx>(
     src: &SymValue<'ctx>,
     n: &SymValue<'ctx>,
     max_copy: u64,
+    byte_policy: ByteSummaryPolicy,
 ) {
     let ctx = state.context();
     let n_concrete = n.as_concrete();
+    if n_concrete == Some(0) {
+        return;
+    }
     let copy_len = n_concrete.unwrap_or(max_copy).min(max_copy);
 
     if n_concrete.is_none() {
         state.constrain_range(n, 0, max_copy);
+    }
+
+    if !byte_policy.use_precise_model(n_concrete) {
+        let src_byte = if src.as_concrete().is_some() {
+            let read = state.mem_read(src, 1);
+            read.with_taint(read.get_taint() | src.get_taint() | n.get_taint())
+        } else {
+            SymValue::symbolic_tainted(
+                BV::fresh_const("memcpy_byte", 8),
+                8,
+                src.get_taint() | n.get_taint(),
+            )
+        };
+        state.mem_write(dst, &src_byte, 1);
+        return;
     }
 
     for offset in 0..copy_len {
@@ -1029,9 +2364,13 @@ fn set_bytes<'ctx>(
     c: &SymValue<'ctx>,
     n: &SymValue<'ctx>,
     max_set: u64,
+    byte_policy: ByteSummaryPolicy,
 ) {
     let ctx = state.context();
     let n_concrete = n.as_concrete();
+    if n_concrete == Some(0) {
+        return;
+    }
     let set_len = n_concrete.unwrap_or(max_set).min(max_set);
 
     if n_concrete.is_none() {
@@ -1043,6 +2382,11 @@ fn set_bytes<'ctx>(
     } else {
         c.extract(ctx, 7, 0).with_taint(c.get_taint())
     };
+
+    if !byte_policy.use_precise_model(n_concrete) {
+        state.mem_write(dst, &c_byte, 1);
+        return;
+    }
 
     for offset in 0..set_len {
         let offset_val = SymValue::concrete(offset, dst.bits());
@@ -1072,4 +2416,191 @@ fn constrain_ret_tristate<'ctx>(state: &mut SymState<'ctx>, ret: &SymValue<'ctx>
     let one = BV::from_u64(1, ret_bits);
     let cond = ret_bv.eq(&neg_one) | ret_bv.eq(&zero) | ret_bv.eq(&one);
     state.add_constraint(cond);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use r2il::{R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    fn test_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch
+    }
+
+    fn const_vn(value: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Const,
+            offset: value,
+            size,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn callconv_accepts_x86_64_arch_specs_with_bit_sized_addr_width() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 64;
+        assert!(CallConv::for_arch_spec(&arch).is_some());
+        assert!(SummaryRegistry::with_core_for_arch(&arch).is_some());
+        assert!(
+            SummaryRegistry::with_profile_for_arch(&arch, SummaryProfile::PathListing).is_some()
+        );
+    }
+
+    #[test]
+    fn memcpy_summary_path_listing_summarizes_symbolic_lengths() {
+        let ctx = z3::Context::thread_local();
+        let src = SymValue::concrete(0x1000, 64);
+        let dst = SymValue::concrete(0x2000, 64);
+        let n = SymValue::symbolic(BV::fresh_const("n", 64), 64);
+
+        let mut precise_state = SymState::new(&ctx, 0);
+        precise_state.mem_write(
+            &src,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_base", 8), 8, 0x20),
+            1,
+        );
+        let src_far = src.add(&ctx, &SymValue::concrete(5, 64));
+        precise_state.mem_write(
+            &src_far,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_far", 8), 8, 0x40),
+            1,
+        );
+        let precise_summary = MemcpySummary::new(0x40);
+        let call = CallInfo {
+            args: vec![dst.clone(), src.clone(), n.clone()],
+            arg_bits: 64,
+            ret_bits: 64,
+        };
+        let _ = precise_summary.execute(&mut precise_state, &call);
+        let precise_far = precise_state.mem_read(&dst.add(&ctx, &SymValue::concrete(5, 64)), 1);
+        assert_eq!(precise_far.get_taint(), 0x40);
+
+        let mut path_listing_state = SymState::new(&ctx, 0);
+        path_listing_state.mem_write(
+            &src,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_base_pl", 8), 8, 0x20),
+            1,
+        );
+        let src_far = src.add(&ctx, &SymValue::concrete(5, 64));
+        path_listing_state.mem_write(
+            &src_far,
+            &SymValue::symbolic_tainted(BV::fresh_const("src_far_pl", 8), 8, 0x40),
+            1,
+        );
+        let path_listing_summary = MemcpySummary::with_policy(
+            0x40,
+            ByteSummaryPolicy::summarized(PATH_LIST_PRECISE_BYTE_LIMIT),
+        );
+        let _ = path_listing_summary.execute(&mut path_listing_state, &call);
+        let path_listing_far =
+            path_listing_state.mem_read(&dst.add(&ctx, &SymValue::concrete(5, 64)), 1);
+        assert_eq!(path_listing_far.get_taint(), 0);
+        let path_listing_base = path_listing_state.mem_read(&dst, 1);
+        assert_eq!(path_listing_base.get_taint(), 0x20);
+    }
+
+    #[test]
+    fn prepared_function_scope_with_prepared_root_rebinds_root_only() {
+        let blocks_a = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: const_vn(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let blocks_b = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: const_vn(1, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let helper_blocks = vec![R2ILBlock {
+            addr: 0x2000,
+            size: 1,
+            ops: vec![R2ILOp::Return {
+                target: const_vn(2, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let root_a = SsaArtifact::for_symbolic(&blocks_a, Some(&test_arch())).expect("root a");
+        let root_b = SsaArtifact::for_symbolic(&blocks_b, Some(&test_arch())).expect("root b");
+        let helper = SsaArtifact::for_symbolic(&helper_blocks, Some(&test_arch())).expect("helper");
+
+        let scope = PreparedFunctionScope::new(
+            0x1000,
+            vec![
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x1000),
+                    name: None,
+                    prepared: root_a,
+                },
+                ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x2000),
+                    name: Some("helper".to_string()),
+                    prepared: helper.clone(),
+                },
+            ],
+        )
+        .expect("scope");
+
+        let rebound = scope.with_prepared_root(&root_b).expect("rebound scope");
+        let rebound_root = rebound.root().expect("rebound root");
+        assert_eq!(rebound_root.prepared.entry, root_b.entry);
+        assert_eq!(rebound_root.prepared.function().blocks().count(), 1);
+        assert_eq!(
+            rebound
+                .functions()
+                .get(&InterprocFunctionId(0x2000))
+                .expect("helper")
+                .prepared
+                .entry,
+            helper.entry
+        );
+    }
+
+    #[test]
+    fn derived_summary_guidance_adjusts_arg_widths_before_substitution() {
+        let ctx = z3::Context::thread_local();
+        let mut state = SymState::new(&ctx, 0);
+        state.set_register(
+            "RDI_0",
+            SymValue::symbolic(BV::fresh_const("call_arg", 64), 64),
+        );
+
+        let helper_arg = SymValue::symbolic(BV::fresh_const("helper_arg", 32), 32);
+        let summary = DerivedFunctionSummary {
+            id: InterprocFunctionId(0x401000),
+            name: Some("sym.helper_symbolic_zero".to_string()),
+            arg_count_hint: 1,
+            arg_symbols: vec![(0, helper_arg.clone())],
+            memory_inputs: Vec::new(),
+            cases: vec![DerivedSummaryCase {
+                guard: helper_arg.to_bv(&ctx).eq(helper_arg.to_bv(&ctx)),
+                return_value: Some(SymValue::concrete(0, 32)),
+                memory_writes: Vec::new(),
+            }],
+            completion: DerivedSummaryCompletion::Exact,
+        };
+
+        let guidance = evaluate_derived_summary_guidance(
+            &state,
+            &summary,
+            &CallConv::x86_64_sysv(),
+            &SymSolver::new(&ctx),
+        );
+
+        assert!(guidance.summary_known);
+        assert_eq!(guidance.feasible_cases, 1);
+        assert!(!guidance.contradictory);
+    }
 }

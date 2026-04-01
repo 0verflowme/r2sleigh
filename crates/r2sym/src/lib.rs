@@ -33,26 +33,69 @@
 //! }
 //! ```
 
+pub mod backward;
 pub mod executor;
 pub mod memory;
 pub mod path;
+pub mod query;
 pub mod r2api;
+pub mod replay;
 pub mod runtime;
+pub mod semantics;
 pub mod sim;
 pub mod solver;
+pub mod spec;
 pub mod state;
 pub mod value;
 
-pub use executor::{CallHookResult, SymExecutor};
-pub use memory::SymMemory;
-pub use path::{ExploreConfig, PathExplorer, PathResult, SolvedPath};
-pub use r2api::{R2Api, R2Error};
-pub use runtime::seed_default_state_for_arch;
-pub use sim::{
-    CallConv, CallInfo, FunctionSummary, SummaryEffect, SummaryInstallStats, SummaryRegistry,
+pub use backward::{
+    BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
+    BackwardMemoryRegion, BackwardRegionRef, CompiledBackwardCondition,
+    compile_derived_summary_return_postcondition, compile_target_precondition,
 };
-pub use solver::{SatResult, SymModel, SymSolver};
-pub use state::{SymState, SymbolicMemoryRegion};
+pub use executor::{CallHookResult, SymExecutor};
+pub use memory::{
+    MemoryRegionId, MemoryRegionKind, RegionPointer, ResolvedPointerSet, SymMemory,
+    SymbolicMemoryRegionDef,
+};
+pub use path::{ExploreConfig, PathExplorer, PathResult, SolvedPath};
+pub use query::{
+    PathConditionResult, PathConditionSummary, PathConditionTerm, QueryCompletion, QueryMode,
+    ReachabilityResult, ReachabilityStatus, SolveResult, SolveStatus, SymQueryConfig,
+    SymbolicConditionSet, SymbolicFunctionSummary,
+};
+pub use r2api::{R2Api, R2Error};
+pub use replay::{
+    ReplayMemoryOverlay, ReplayMemoryWindow, ReplayRegisterOverlay, ReplayRegisterValue,
+    ReplaySeed, apply_replay_seed_to_state, seed_replay_state_for_arch,
+};
+pub use runtime::{seed_default_state_for_arch, seed_memory_regions_for_arch};
+pub use semantics::{
+    ArtifactBuildPlan, ArtifactGranularity, ControlFact, DecompilePlan, ExecutionModel,
+    InterpreterDispatchSummary, InterpreterKind, Judged, MemoryFact, NativeArtifactBody,
+    NativeFunctionSummary, QueryGuidanceMode, QueryPlan, RefinementStage, RegionKey,
+    ResidualReason, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticArtifact, SemanticArtifactBody,
+    SemanticArtifactDiagnostics, SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity,
+    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+    SemanticEvidenceSoundness, SemanticPredicate, SemanticRegion, SemanticTargetConditionSource,
+    SliceClass, SymbolicReachabilityStatus, TargetFact, TargetQueryPlan, TargetQueryRoutePlan,
+    TypePlan, VmArtifactBody, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
+    VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp, VmValueExpr,
+    compile_function_semantics_with_scope, compile_semantic_artifact_default_with_scope,
+    compile_semantic_artifact_with_scope, stable_scope_hash,
+};
+pub use sim::{
+    CallConv, CallInfo, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,
+    DerivedSummaryDiagnostics, DerivedSummaryInput, DerivedSummarySet, FunctionSummary,
+    PreparedFunctionScope, ScopedPreparedFunction, SummaryEffect, SummaryInstallStats,
+    SummaryProfile, SummaryRegistry,
+};
+pub use solver::{SatResult, SolverStats, SymModel, SymSolver};
+pub use spec::{
+    AddressValue, BudgetSpec, ExplorationSpec, InputSpec, MergeSpec, PredicateSpec, RuntimeSpec,
+    StartSpec, StrategySpec,
+};
+pub use state::{RuntimeState, SymState, SymbolicFdInput, SymbolicMemoryRegion};
 pub use value::SymValue;
 
 /// Error types for symbolic execution.

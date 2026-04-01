@@ -17,6 +17,8 @@ mod decompiler;
 mod helpers;
 mod types;
 
+#[cfg(test)]
+use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
 use r2il::serialize::UserOpDef;
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, Varnode, serialize, validate_block_full};
 use r2sleigh_export::{
@@ -28,12 +30,10 @@ use std::os::raw::c_char;
 use std::path::Path;
 use std::ptr;
 use std::slice;
-use types::{recover_vars_arch_profile, size_to_type, ssa_var_block_key};
-
-#[cfg(test)]
-use analysis::ssa::{r2il_block_defuse_json, r2il_block_to_ssa_json};
 #[cfg(test)]
 use types::parse_const_value;
+#[cfg(test)]
+use types::{recover_vars_arch_profile, size_to_type, ssa_var_block_key};
 
 /// Opaque context handle for C API.
 pub struct R2ILContext {
@@ -305,6 +305,20 @@ pub extern "C" fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         profile.push_str(&format!("gpr\t{}\t.{}\t{}\t0\n", name_lower, bits, offset));
     }
 
+    let mut stripped_aliases = Vec::new();
+    for (original, (bits, offset, _)) in &reg_meta {
+        if let Some(stripped) = original.strip_prefix('$')
+            && !stripped.is_empty()
+            && !reg_meta.contains_key(stripped)
+        {
+            stripped_aliases.push((stripped.to_string(), *bits, *offset));
+        }
+    }
+    for (alias, bits, offset) in stripped_aliases {
+        profile.push_str(&format!("gpr\t{}\t.{}\t{}\t0\n", alias, bits, offset));
+        reg_meta.insert(alias.clone(), (bits, offset, alias));
+    }
+
     // Synthesize missing aliases expected by radare2/ESIL for specific arches.
     let mut add_gpr_alias = |alias_name: &str, source_name: &str| {
         let alias_lower = alias_name.to_ascii_lowercase();
@@ -336,19 +350,19 @@ pub extern "C" fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
             .find_map(|name| reg_meta.get(*name).map(|(_, _, original)| original.clone()))
     };
 
-    let pc = first_existing(&["pc", "rip", "eip", "ip"]);
-    let sp = first_existing(&["sp", "rsp", "esp"]);
-    let bp = first_existing(&["bp", "rbp", "ebp", "fp", "x29"]);
+    let pc = first_existing(&["pc", "$pc", "rip", "eip", "ip"]);
+    let sp = first_existing(&["sp", "$sp", "rsp", "esp"]);
+    let bp = first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "s8", "$s8", "x29"]);
 
     let mut a_roles: [Option<String>; 8] = std::array::from_fn(|_| None);
-    a_roles[0] = first_existing(&["rdi", "a0", "x0", "w0", "r0"]);
-    a_roles[1] = first_existing(&["rsi", "a1", "x1", "w1", "r1"]);
-    a_roles[2] = first_existing(&["rdx", "a2", "x2", "w2", "r2"]);
-    a_roles[3] = first_existing(&["rcx", "a3", "x3", "w3", "r3"]);
+    a_roles[0] = first_existing(&["rdi", "a0", "$a0", "x0", "w0", "r0"]);
+    a_roles[1] = first_existing(&["rsi", "a1", "$a1", "x1", "w1", "r1"]);
+    a_roles[2] = first_existing(&["rdx", "a2", "$a2", "x2", "w2", "r2"]);
+    a_roles[3] = first_existing(&["rcx", "a3", "$a3", "x3", "w3", "r3"]);
 
     let mut r_roles: [Option<String>; 4] = std::array::from_fn(|_| None);
-    r_roles[0] = first_existing(&["r0", "rax", "eax", "v0", "x0", "w0"]);
-    r_roles[1] = first_existing(&["r1", "x1", "w1"]);
+    r_roles[0] = first_existing(&["r0", "rax", "eax", "v0", "$v0", "x0", "w0"]);
+    r_roles[1] = first_existing(&["r1", "v1", "$v1", "x1", "w1"]);
     r_roles[2] = first_existing(&["r2", "x2", "w2"]);
     r_roles[3] = first_existing(&["r3", "x3", "w3"]);
 
@@ -2285,6 +2299,74 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             let (spec, dis) = apply_userop_map(spec, dis, "arm64");
             Ok((spec, dis))
         }
+        #[cfg(feature = "mips")]
+        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32BE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32be",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS32BE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32be",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips32be");
+            Ok((spec, dis))
+        }
+        #[cfg(feature = "mips")]
+        "mipsel" | "mips32le" | "mips32el" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS32LE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32le",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS32LE,
+                sleigh_config::processor_mips::PSPEC_MIPS32,
+                "mips32le",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips32le");
+            Ok((spec, dis))
+        }
+        #[cfg(feature = "mips")]
+        "mips64" | "mips64be" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS64BE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64be",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS64BE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64be",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips64be");
+            Ok((spec, dis))
+        }
+        #[cfg(feature = "mips")]
+        "mips64el" | "mips64le" => {
+            let spec = build_arch_spec(
+                sleigh_config::processor_mips::SLA_MIPS64LE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64le",
+            )
+            .map_err(|e| e.to_string())?;
+            let dis = Disassembler::from_sla(
+                sleigh_config::processor_mips::SLA_MIPS64LE,
+                sleigh_config::processor_mips::PSPEC_MIPS64,
+                "mips64le",
+            )
+            .map_err(|e| e.to_string())?;
+            let (spec, dis) = apply_userop_map(spec, dis, "mips64le");
+            Ok((spec, dis))
+        }
         #[cfg(feature = "riscv")]
         "riscv64" | "rv64" | "rv64gc" => {
             let spec = build_arch_spec(
@@ -2325,11 +2407,16 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             supported.extend(["x86-64", "x86"]);
             #[cfg(feature = "arm")]
             supported.extend(["arm", "arm64", "aarch64"]);
+            #[cfg(feature = "mips")]
+            supported.extend(["mips32be", "mips32le", "mips64be", "mips64le"]);
             #[cfg(feature = "riscv")]
             supported.extend(["riscv64", "riscv32"]);
 
             if supported.is_empty() {
-                Err("No architectures enabled; build with feature x86, arm, or riscv".to_string())
+                Err(
+                    "No architectures enabled; build with feature x86, arm, mips, or riscv"
+                        .to_string(),
+                )
             } else {
                 Err(format!(
                     "Unknown architecture '{}'. Supported: {}",
@@ -2375,41 +2462,54 @@ fn decompiler_max_blocks() -> usize {
         .unwrap_or(200)
 }
 
-fn decompiler_cfg_guard_reason_from_summary(summary: &r2ssa::CFGRiskSummary) -> Option<String> {
-    if summary.loop_count > 8 || summary.back_edge_count > 16 {
-        return Some(format!(
-            "complex loop graph (loops={}, back_edges={})",
-            summary.loop_count, summary.back_edge_count
-        ));
-    }
-
-    if summary.loop_count > 4 && summary.block_count >= 96 && summary.max_switch_cases >= 32 {
-        return Some(format!(
-            "large dense switch in looped CFG (blocks={}, loops={}, max_switch_cases={})",
-            summary.block_count, summary.loop_count, summary.max_switch_cases
-        ));
-    }
-
-    None
+#[unsafe(no_mangle)]
+pub extern "C" fn r2dec_block_guard_comment_ffi(
+    func_name: *const c_char,
+    blocks: usize,
+    max_blocks: usize,
+) -> *mut c_char {
+    let func_name = if func_name.is_null() {
+        "unknown".to_string()
+    } else {
+        unsafe { CStr::from_ptr(func_name) }
+            .to_str()
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    CString::new(r2dec::block_guard_fallback_comment(
+        &func_name, blocks, max_blocks,
+    ))
+    .map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
-fn decompiler_cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
-    let ssa_func = r2ssa::SSAFunction::from_blocks_raw_no_arch(blocks)?;
-    decompiler_cfg_guard_reason_from_summary(&ssa_func.cfg_risk_summary())
-}
-
-fn decompile_block_guard_fallback(func_name: &str, blocks: usize, max_blocks: usize) -> String {
-    format!(
-        "/* r2dec fallback: skipped decompilation for {} ({} blocks > limit {}). Set SLEIGH_DEC_MAX_BLOCKS to override. */",
-        func_name, blocks, max_blocks
-    )
-}
-
-fn decompile_artifact_guard_fallback(func_name: &str, reason: &str) -> String {
-    format!(
-        "/* r2dec fallback: skipped decompilation for {} ({}) */",
-        func_name, reason
-    )
+#[unsafe(no_mangle)]
+pub extern "C" fn r2dec_cfg_guard_comment_ffi(
+    func_name: *const c_char,
+    block_count: usize,
+    loop_count: usize,
+    back_edge_count: usize,
+    max_switch_cases: usize,
+) -> *mut c_char {
+    let func_name = if func_name.is_null() {
+        "unknown".to_string()
+    } else {
+        unsafe { CStr::from_ptr(func_name) }
+            .to_str()
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let summary = r2ssa::CFGRiskSummary {
+        block_count,
+        loop_count,
+        back_edge_count,
+        switch_block_count: usize::from(max_switch_cases > 0),
+        max_switch_cases,
+    };
+    let Some(reason) = r2dec::cfg_guard_reason_from_summary(&summary) else {
+        return ptr::null_mut();
+    };
+    CString::new(r2dec::artifact_guard_fallback_comment(&func_name, &reason))
+        .map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
 #[cfg(test)]
@@ -2564,6 +2664,7 @@ fn parse_addr_name_map(json_str: &str) -> std::collections::HashMap<u64, String>
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn sanitize_c_identifier(name: &str) -> Option<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -2590,6 +2691,7 @@ fn sanitize_c_identifier(name: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn uniquify_name(base: String, used: &mut std::collections::HashSet<String>) -> String {
     if used.insert(base.clone()) {
         return base;
@@ -2623,6 +2725,7 @@ fn is_low_quality_stack_name(name: &str) -> bool {
         || is_generic_arg_name(&lower)
 }
 
+#[cfg(test)]
 fn parse_external_type(raw_ty: &str, ptr_bits: u32) -> Option<r2dec::CType> {
     let normalized = normalize_external_type_name(raw_ty);
     let parsed = r2types::parse_type_like_spec(&normalized, ptr_bits)?;
@@ -2905,6 +3008,35 @@ pub extern "C" fn r2dec_function_with_context(
     symbols_json: *const c_char,
     external_context_json: *const c_char,
 ) -> *mut c_char {
+    r2dec_function_with_context_impl(R2DecFunctionWithContextInputs {
+        ctx,
+        blocks,
+        num_blocks,
+        fcn_addr: 0,
+        func_name,
+        func_names_json,
+        strings_json,
+        symbols_json,
+        external_context_json,
+        scope_functions: ptr::null(),
+        scope_num_functions: 0,
+    })
+}
+
+fn r2dec_function_with_context_impl(inputs: R2DecFunctionWithContextInputs) -> *mut c_char {
+    let R2DecFunctionWithContextInputs {
+        ctx,
+        blocks,
+        num_blocks,
+        fcn_addr,
+        func_name,
+        func_names_json,
+        strings_json,
+        symbols_json,
+        external_context_json,
+        scope_functions,
+        scope_num_functions,
+    } = inputs;
     let Some(ctx_view) = context::require_ctx_view(ctx) else {
         return ptr::null_mut();
     };
@@ -2916,7 +3048,8 @@ pub extern "C" fn r2dec_function_with_context(
     let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
     let max_blocks = decompiler_max_blocks();
     if block_slice.len() > max_blocks {
-        let output = decompile_block_guard_fallback(&func_name_str, block_slice.len(), max_blocks);
+        let output =
+            r2dec::block_guard_fallback_comment(&func_name_str, block_slice.len(), max_blocks);
         return CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw());
     }
 
@@ -2926,9 +3059,25 @@ pub extern "C" fn r2dec_function_with_context(
     let strings_str = helpers::cstr_or_default(strings_json, "{}");
     let symbols_str = helpers::cstr_or_default(symbols_json, "{}");
     let external_context_str = helpers::cstr_or_default(external_context_json, "{}");
-    let cached_artifact = types::build_function_input(ctx, blocks, num_blocks, 0, func_name)
+    let symbolic_scope = if scope_functions.is_null() || scope_num_functions == 0 {
+        None
+    } else {
+        unsafe {
+            analysis::sym::build_symbolic_scope_from_ffi(
+                scope_functions,
+                scope_num_functions,
+                ctx_view.arch,
+                fcn_addr,
+            )
+        }
+    };
+    let cached_artifact = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, func_name)
         .and_then(|input| {
-            types::get_cached_function_analysis_artifact(&input, &external_context_str)
+            types::get_cached_function_analysis_artifact_with_scope(
+                &input,
+                &external_context_str,
+                symbolic_scope.as_ref(),
+            )
         });
     let semantic_metadata_enabled = ctx_view.semantic_metadata_enabled;
     let reg_type_hints = if semantic_metadata_enabled {
@@ -2943,6 +3092,7 @@ pub extern "C" fn r2dec_function_with_context(
     // stack to prevent stack overflow on complex O2-optimized CFGs.
     let output = decompiler::run_full_decompile_on_large_stack(
         block_slice.into_inner(),
+        fcn_addr,
         func_name_str,
         arch_clone,
         ptr_bits,
@@ -2953,9 +3103,55 @@ pub extern "C" fn r2dec_function_with_context(
         symbols_str,
         external_context_str,
         cached_artifact,
+        symbolic_scope,
     );
 
     CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
+struct R2DecFunctionWithContextInputs {
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    func_name: *const c_char,
+    func_names_json: *const c_char,
+    strings_json: *const c_char,
+    symbols_json: *const c_char,
+    external_context_json: *const c_char,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
+}
+
+/// Decompile a function with external context and a prepared symbolic helper scope.
+/// Returns C code as a string. Caller must free with r2il_string_free().
+#[unsafe(no_mangle)]
+pub extern "C" fn r2dec_function_with_context_scope(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    func_name: *const c_char,
+    func_names_json: *const c_char,
+    strings_json: *const c_char,
+    symbols_json: *const c_char,
+    external_context_json: *const c_char,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
+) -> *mut c_char {
+    r2dec_function_with_context_impl(R2DecFunctionWithContextInputs {
+        ctx,
+        blocks,
+        num_blocks,
+        fcn_addr,
+        func_name,
+        func_names_json,
+        strings_json,
+        symbols_json,
+        external_context_json,
+        scope_functions,
+        scope_num_functions,
+    })
 }
 
 /// Decompile a single basic block to C code.
@@ -3034,6 +3230,7 @@ pub extern "C" fn r2dec_block_ast_json(
 // ============================================================================
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct InferredParam {
     name: String,
     ty: r2dec::CType,
@@ -3042,39 +3239,8 @@ pub(crate) struct InferredParam {
     evidence: TypeEvidence,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TypeEvidence {
-    pointer_proven: u8,
-    pointer_likely: u8,
-    scalar_proven: u8,
-    scalar_likely: u8,
-    bool_like: u8,
-    width_bits: u32,
-}
-
-impl TypeEvidence {
-    fn pointer_score(&self) -> u16 {
-        (self.pointer_proven as u16) * 4 + (self.pointer_likely as u16) * 2
-    }
-
-    fn scalar_score(&self) -> u16 {
-        (self.scalar_proven as u16) * 4
-            + (self.scalar_likely as u16) * 2
-            + (self.bool_like as u16) * 3
-    }
-
-    fn has_pointer_signal(&self) -> bool {
-        self.pointer_proven > 0 || self.pointer_likely > 0
-    }
-
-    fn has_scalar_signal(&self) -> bool {
-        self.scalar_proven > 0 || self.scalar_likely > 0 || self.bool_like > 0
-    }
-
-    fn has_conflict(&self) -> bool {
-        self.has_pointer_signal() && self.has_scalar_signal()
-    }
-}
+#[cfg(test)]
+type TypeEvidence = r2types::SignatureTypeEvidence;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct InferredParamJson {
@@ -3183,6 +3349,10 @@ struct InferredTypeWritebackJson {
     struct_decls: Vec<StructDeclCandidateJson>,
     global_type_links: Vec<GlobalTypeLinkCandidateJson>,
     interproc: InterprocSummaryJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantics: Option<r2sym::SemanticArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     diagnostics: TypeWritebackDiagnosticsJson,
 }
 
@@ -3208,6 +3378,8 @@ fn struct_fields_json(fields: &[r2types::StructFieldCandidate]) -> Vec<StructFie
 fn writeback_plan_json(
     plan: r2types::TypeWritebackPlan,
     interproc: InterprocSummaryJson,
+    semantics: Option<r2sym::SemanticArtifact>,
+    compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
 ) -> InferredTypeWritebackJson {
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
@@ -3275,10 +3447,125 @@ fn writeback_plan_json(
             })
             .collect(),
         interproc,
+        semantics,
+        compiled_semantics,
         diagnostics: TypeWritebackDiagnosticsJson {
             conflicts: plan.diagnostics.conflicts,
             warnings: plan.diagnostics.warnings,
             solver_warnings: plan.diagnostics.solver_warnings,
+        },
+    }
+}
+
+fn type_writeback_payload_from_artifact(
+    artifact: types::FunctionAnalysisArtifact,
+    interproc: InterprocInferenceInput<'_>,
+) -> InferredTypeWritebackJson {
+    let semantics = artifact.function_facts.semantics.clone();
+    let compiled_semantics = semantics
+        .as_ref()
+        .map(analysis::sym::compiled_semantic_info);
+    let ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
+    let scope = serde_json::from_str::<serde_json::Value>(interproc.scope_json)
+        .ok()
+        .filter(|v| !v.is_null() && v.as_object().map(|obj| !obj.is_empty()).unwrap_or(true));
+    let current_summary = artifact
+        .interproc_summary_set
+        .as_ref()
+        .and_then(|summary_set| {
+            summary_set
+                .root
+                .and_then(|root| summary_set.summaries.get(&root).cloned())
+        });
+    let current_summary_json = current_summary
+        .as_ref()
+        .and_then(|summary| serde_json::to_string(summary).ok());
+
+    writeback_plan_json(
+        artifact.writeback_plan,
+        InterprocSummaryJson {
+            callsite_count: count_callsites(&ssa_blocks),
+            iterations: interproc.iter.max(1),
+            max_iterations: interproc.max_iters.max(interproc.iter.max(1)),
+            converged: interproc.converged,
+            summary: current_summary,
+            summary_json: current_summary_json,
+            scope,
+        },
+        semantics,
+        compiled_semantics,
+    )
+}
+
+fn semantic_type_fallback_payload(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    interproc: InterprocInferenceInput<'_>,
+    compiled: &r2sym::SemanticArtifact,
+) -> InferredTypeWritebackJson {
+    let compiled_info = analysis::sym::compiled_semantic_info(compiled);
+    let plan =
+        r2types::build_semantic_type_fallback_plan(function_name, arch_name, ptr_bits, compiled);
+
+    InferredTypeWritebackJson {
+        function_name: plan.signature.function_name,
+        signature: plan.signature.signature,
+        ret_type: plan.signature.ret_type,
+        params: plan
+            .signature
+            .params
+            .into_iter()
+            .map(|param| InferredParamJson {
+                name: param.name,
+                param_type: param.param_type,
+            })
+            .collect(),
+        callconv: plan.signature.callconv,
+        arch: plan.signature.arch,
+        confidence: plan.signature.confidence,
+        callconv_confidence: plan.signature.callconv_confidence,
+        var_type_candidates: Vec::new(),
+        var_rename_candidates: Vec::new(),
+        struct_decls: plan
+            .struct_decls
+            .into_iter()
+            .map(|decl| StructDeclCandidateJson {
+                name: decl.name,
+                decl: decl.decl,
+                confidence: decl.confidence,
+                source: decl.source.as_str().to_string(),
+                fields: struct_fields_json(&decl.fields),
+            })
+            .collect(),
+        global_type_links: plan
+            .global_type_links
+            .into_iter()
+            .map(|candidate| GlobalTypeLinkCandidateJson {
+                addr: candidate.addr,
+                target_type: candidate.target_type,
+                confidence: candidate.confidence,
+                source: candidate.source.as_str().to_string(),
+            })
+            .collect(),
+        interproc: InterprocSummaryJson {
+            callsite_count: 0,
+            iterations: interproc.iter.max(1),
+            max_iterations: interproc.max_iters.max(interproc.iter.max(1)),
+            converged: interproc.converged,
+            summary: None,
+            summary_json: None,
+            scope: serde_json::from_str::<serde_json::Value>(interproc.scope_json)
+                .ok()
+                .filter(|v| {
+                    !v.is_null() && v.as_object().map(|obj| !obj.is_empty()).unwrap_or(true)
+                }),
+        },
+        semantics: Some(compiled.clone()),
+        compiled_semantics: Some(compiled_info),
+        diagnostics: TypeWritebackDiagnosticsJson {
+            warnings: plan.diagnostics.warnings,
+            ..TypeWritebackDiagnosticsJson::default()
         },
     }
 }
@@ -3288,297 +3575,48 @@ const SIG_WRITEBACK_CONFIDENCE_MIN: u8 = 70;
 #[cfg(test)]
 const CC_WRITEBACK_CONFIDENCE_MIN: u8 = 80;
 
-#[derive(Debug, Default)]
-struct SignatureTypeEvidenceContext {
-    pointer_vars: std::collections::HashSet<String>,
-    scalar_proven_vars: std::collections::HashSet<String>,
-    scalar_likely_vars: std::collections::HashSet<String>,
-    bool_like_vars: std::collections::HashSet<String>,
-    width_bits: std::collections::HashMap<String, u32>,
-}
-
+#[cfg(test)]
 fn merge_initial_type_evidence(initial_ty: &r2dec::CType, evidence: &mut TypeEvidence) {
-    match initial_ty {
-        r2dec::CType::Pointer(_) => evidence.pointer_likely = evidence.pointer_likely.max(1),
-        r2dec::CType::Bool => evidence.bool_like = evidence.bool_like.max(1),
-        r2dec::CType::Int(bits) | r2dec::CType::UInt(bits) => {
-            evidence.scalar_likely = evidence.scalar_likely.max(1);
-            if !(evidence.has_scalar_signal()
-                && !evidence.has_pointer_signal()
-                && evidence.width_bits > 0
-                && evidence.width_bits < *bits)
-            {
-                evidence.width_bits = evidence.width_bits.max(*bits);
-            }
-        }
-        r2dec::CType::Float(bits) => {
-            evidence.scalar_proven = evidence.scalar_proven.max(1);
-            evidence.width_bits = evidence.width_bits.max(*bits);
-        }
-        _ => {}
-    }
+    r2types::merge_initial_signature_type_evidence(&ctype_to_type_like(initial_ty), evidence);
 }
 
-fn fallback_scalar_type(
-    var_size_bytes: u32,
-    evidence: &TypeEvidence,
-    ptr_bits: u32,
-) -> r2dec::CType {
-    if evidence.bool_like > 0
-        && evidence.pointer_score() == 0
-        && evidence.scalar_proven == 0
-        && evidence.scalar_likely <= 1
-    {
-        return r2dec::CType::Bool;
-    }
-
-    let carrier_bits = var_size_bytes.saturating_mul(8);
-    let width_bits = if evidence.has_scalar_signal()
-        && !evidence.has_pointer_signal()
-        && evidence.width_bits > 0
-    {
-        evidence.width_bits
-    } else {
-        evidence.width_bits.max(carrier_bits)
-    };
-    let width_bits = match width_bits {
-        0 => {
-            if ptr_bits >= 64 {
-                64
-            } else {
-                32
-            }
-        }
-        1 => 8,
-        2..=8 => 8,
-        9..=16 => 16,
-        17..=32 => 32,
-        _ => 64,
-    };
-
-    r2dec::CType::Int(width_bits)
-}
-
+#[cfg(test)]
 fn materialize_signature_ctype(ty: r2dec::CType, ptr_bits: u32) -> r2dec::CType {
-    match ty {
-        r2dec::CType::Pointer(inner) => {
-            if matches!(*inner, r2dec::CType::Unknown | r2dec::CType::Void)
-                || matches!(
-                    inner.as_ref(),
-                    r2dec::CType::Struct(name)
-                        | r2dec::CType::Union(name)
-                        | r2dec::CType::Enum(name)
-                        if is_unmaterialized_aggregate_name(name)
-                )
-            {
-                return r2dec::CType::void_ptr();
-            }
-            let inner = materialize_signature_ctype(*inner, ptr_bits);
-            r2dec::CType::ptr(inner)
-        }
-        r2dec::CType::Array(inner, len) => {
-            if matches!(*inner, r2dec::CType::Unknown | r2dec::CType::Void) {
-                return r2dec::CType::Array(Box::new(r2dec::CType::u8()), len);
-            }
-            let inner = materialize_signature_ctype(*inner, ptr_bits);
-            r2dec::CType::Array(Box::new(inner), len)
-        }
-        r2dec::CType::Function { ret, params } => {
-            let ret = materialize_signature_ctype(*ret, ptr_bits);
-            let ret = if matches!(ret, r2dec::CType::Unknown) {
-                fallback_scalar_type((ptr_bits / 8).max(1), &TypeEvidence::default(), ptr_bits)
-            } else {
-                ret
-            };
-            let params = params
-                .into_iter()
-                .map(|param| materialize_signature_ctype(param, ptr_bits))
-                .collect();
-            r2dec::CType::Function {
-                ret: Box::new(ret),
-                params,
-            }
-        }
-        r2dec::CType::Unknown => {
-            fallback_scalar_type((ptr_bits / 8).max(1), &TypeEvidence::default(), ptr_bits)
-        }
-        r2dec::CType::Struct(name) if is_unmaterialized_aggregate_name(&name) => {
-            fallback_scalar_type((ptr_bits / 8).max(1), &TypeEvidence::default(), ptr_bits)
-        }
-        r2dec::CType::Union(name) if is_unmaterialized_aggregate_name(&name) => {
-            fallback_scalar_type((ptr_bits / 8).max(1), &TypeEvidence::default(), ptr_bits)
-        }
-        r2dec::CType::Enum(name) if is_unmaterialized_aggregate_name(&name) => {
-            fallback_scalar_type((ptr_bits / 8).max(1), &TypeEvidence::default(), ptr_bits)
-        }
-        other => other,
-    }
+    type_like_to_ctype(&r2types::materialize_signature_type_like(
+        ctype_to_type_like(&ty),
+        ptr_bits,
+    ))
 }
 
+#[cfg(test)]
 fn resolve_evidence_driven_type(
     initial_ty: r2dec::CType,
     var_size_bytes: u32,
     ptr_bits: u32,
     evidence: &TypeEvidence,
 ) -> r2dec::CType {
-    if matches!(initial_ty, r2dec::CType::Float(_)) {
-        return initial_ty;
-    }
-
-    let pointer_score = evidence.pointer_score();
-    let scalar_score = evidence.scalar_score();
-    let initial_is_pointer = matches!(initial_ty, r2dec::CType::Pointer(_));
-    let initial_is_scalar = matches!(
-        initial_ty,
-        r2dec::CType::Bool | r2dec::CType::Int(_) | r2dec::CType::UInt(_)
-    );
-    let preferred_scalar = fallback_scalar_type(var_size_bytes, evidence, ptr_bits);
-    let scalar_width_narrows = match (&initial_ty, &preferred_scalar) {
-        (r2dec::CType::Bool, r2dec::CType::Bool) => false,
-        (r2dec::CType::Int(initial_bits), r2dec::CType::Int(preferred_bits))
-        | (r2dec::CType::Int(initial_bits), r2dec::CType::UInt(preferred_bits))
-        | (r2dec::CType::UInt(initial_bits), r2dec::CType::Int(preferred_bits))
-        | (r2dec::CType::UInt(initial_bits), r2dec::CType::UInt(preferred_bits)) => {
-            preferred_bits < initial_bits
-        }
-        (r2dec::CType::Int(_), r2dec::CType::Bool)
-        | (r2dec::CType::UInt(_), r2dec::CType::Bool) => true,
-        _ => false,
-    };
-
-    if initial_is_pointer && pointer_score.saturating_add(1) >= scalar_score {
-        return initial_ty;
-    }
-    if initial_is_scalar && scalar_score.saturating_add(1) >= pointer_score {
-        if scalar_width_narrows
-            && evidence.has_scalar_signal()
-            && !evidence.has_pointer_signal()
-            && !evidence.has_conflict()
-        {
-            return preferred_scalar;
-        }
-        return initial_ty;
-    }
-
-    match initial_ty {
-        r2dec::CType::Struct(_)
-        | r2dec::CType::Union(_)
-        | r2dec::CType::Enum(_)
-        | r2dec::CType::Typedef(_) => {
-            if pointer_score > scalar_score.saturating_add(1) {
-                return r2dec::CType::void_ptr();
-            }
-            if scalar_score > pointer_score.saturating_add(2) {
-                return fallback_scalar_type(var_size_bytes, evidence, ptr_bits);
-            }
-            return initial_ty;
-        }
-        _ => {}
-    }
-
-    if pointer_score > scalar_score.saturating_add(1) {
-        return r2dec::CType::void_ptr();
-    }
-    if scalar_score > pointer_score
-        || matches!(initial_ty, r2dec::CType::Void | r2dec::CType::Unknown)
-    {
-        return preferred_scalar;
-    }
-
-    sanitize_inferred_param_type(initial_ty, var_size_bytes, ptr_bits)
+    type_like_to_ctype(&r2types::resolve_evidence_driven_signature_type(
+        ctype_to_type_like(&initial_ty),
+        var_size_bytes,
+        ptr_bits,
+        evidence,
+    ))
 }
 
+#[cfg(test)]
 fn collect_type_evidence_for_var(
-    evidence_ctx: &SignatureTypeEvidenceContext,
+    evidence_ctx: &r2types::SignatureTypeEvidenceContext,
     var: &r2ssa::SSAVar,
     initial_ty: &r2dec::CType,
 ) -> TypeEvidence {
-    let key = types::ssa_var_key(var);
-    let family = types::scalar_register_family_key(&var.name);
-    let mut evidence = TypeEvidence::default();
-    if evidence_ctx.pointer_vars.contains(&key) {
-        evidence.pointer_proven = 1;
-    }
-    if evidence_ctx.scalar_proven_vars.contains(&key) {
-        evidence.scalar_proven = 1;
-    }
-    if evidence_ctx.scalar_likely_vars.contains(&key) {
-        evidence.scalar_likely = 1;
-    }
-    if evidence_ctx.bool_like_vars.contains(&key) {
-        evidence.bool_like = 1;
-    }
-    if let Some(bits) = evidence_ctx.width_bits.get(&key) {
-        evidence.width_bits = *bits;
-    }
-    if evidence.pointer_proven == 0
-        && signal_present_for_register_family(&evidence_ctx.pointer_vars, &family, var.version)
-    {
-        evidence.pointer_proven = 1;
-    }
-    if evidence.scalar_proven == 0
-        && signal_present_for_register_family(
-            &evidence_ctx.scalar_proven_vars,
-            &family,
-            var.version,
-        )
-    {
-        evidence.scalar_proven = 1;
-    }
-    if evidence.scalar_likely == 0
-        && signal_present_for_register_family(
-            &evidence_ctx.scalar_likely_vars,
-            &family,
-            var.version,
-        )
-    {
-        evidence.scalar_likely = 1;
-    }
-    if evidence.bool_like == 0
-        && signal_present_for_register_family(&evidence_ctx.bool_like_vars, &family, var.version)
-    {
-        evidence.bool_like = 1;
-    }
-    if evidence.width_bits == 0
-        && let Some(bits) =
-            width_hint_for_register_family(&evidence_ctx.width_bits, &family, var.version)
-    {
-        evidence.width_bits = bits;
-    }
-    merge_initial_type_evidence(initial_ty, &mut evidence);
-    evidence
+    r2types::collect_signature_type_evidence_for_var(
+        evidence_ctx,
+        var,
+        &ctype_to_type_like(initial_ty),
+    )
 }
 
-fn signal_present_for_register_family(
-    keys: &std::collections::HashSet<String>,
-    family: &str,
-    version: u32,
-) -> bool {
-    keys.iter()
-        .any(|key| key_matches_register_family_version(key, family, version))
-}
-
-fn width_hint_for_register_family(
-    hints: &std::collections::HashMap<String, u32>,
-    family: &str,
-    version: u32,
-) -> Option<u32> {
-    hints
-        .iter()
-        .filter(|(key, _)| key_matches_register_family_version(key, family, version))
-        .map(|(_, bits)| *bits)
-        .filter(|bits| *bits > 0)
-        .min()
-}
-
-fn key_matches_register_family_version(key: &str, family: &str, version: u32) -> bool {
-    let Some((name, version_str)) = key.rsplit_once('_') else {
-        return false;
-    };
-    version_str.parse::<u32>().ok() == Some(version)
-        && types::scalar_register_family_key(name) == family
-}
-
+#[cfg(test)]
 fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
     match ty {
         r2types::CTypeLike::Void => r2dec::CType::Void,
@@ -3601,7 +3639,6 @@ fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
     }
 }
 
-#[cfg(test)]
 fn ctype_to_type_like(ty: &r2dec::CType) -> r2types::CTypeLike {
     match ty {
         r2dec::CType::Void => r2types::CTypeLike::Void,
@@ -3630,248 +3667,95 @@ fn ctype_to_type_like(ty: &r2dec::CType) -> r2types::CTypeLike {
     }
 }
 
+#[cfg(test)]
+fn fallback_scalar_type(
+    var_size_bytes: u32,
+    evidence: &TypeEvidence,
+    ptr_bits: u32,
+) -> r2dec::CType {
+    type_like_to_ctype(&r2types::resolve_evidence_driven_signature_type(
+        r2types::CTypeLike::Unknown,
+        var_size_bytes,
+        ptr_bits,
+        evidence,
+    ))
+}
+
+#[cfg(test)]
+fn sanitize_inferred_param_type(
+    ty: r2dec::CType,
+    var_size_bytes: u32,
+    ptr_bits: u32,
+) -> r2dec::CType {
+    type_like_to_ctype(&r2types::resolve_evidence_driven_signature_type(
+        ctype_to_type_like(&ty),
+        var_size_bytes,
+        ptr_bits,
+        &TypeEvidence::default(),
+    ))
+}
+
+#[cfg(test)]
+fn infer_callconv_x86_64_from_counts(
+    counts: &std::collections::HashMap<String, u32>,
+) -> (String, u8) {
+    r2types::compute_callconv_inference("x86-64", counts)
+}
+
+#[cfg(test)]
 fn infer_signature_return_type(
     func: &r2ssa::SSAFunction,
     type_inference: &r2types::TypeInference,
     ptr_bits: u32,
-    evidence_ctx: &SignatureTypeEvidenceContext,
+    evidence_ctx: &r2types::SignatureTypeEvidenceContext,
 ) -> (r2dec::CType, TypeEvidence) {
-    let mut candidates = Vec::new();
-    let mut candidate_evidence = Vec::new();
-
-    for block in func.blocks() {
-        for op in &block.ops {
-            let r2ssa::SSAOp::Return { target } = op else {
-                continue;
-            };
-
-            let target_name = target.name.to_ascii_lowercase();
-            if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
-                let bits = if target.size.saturating_mul(8) <= 32 {
-                    32
-                } else {
-                    64
-                };
-                let ty = r2dec::CType::Float(bits);
-                let mut evidence = TypeEvidence::default();
-                merge_initial_type_evidence(&ty, &mut evidence);
-                evidence.width_bits = bits;
-                candidates.push(ty);
-                candidate_evidence.push(evidence);
-                continue;
-            }
-
-            let initial_ty = type_like_to_ctype(&type_inference.get_type(target));
-            let evidence = collect_type_evidence_for_var(evidence_ctx, target, &initial_ty);
-            let ty = resolve_evidence_driven_type(initial_ty, target.size, ptr_bits, &evidence);
-            candidates.push(ty);
-            candidate_evidence.push(evidence);
-        }
-    }
-
-    if candidates.is_empty() {
-        return (r2dec::CType::Void, TypeEvidence::default());
-    }
-
-    let mut meaningful: Vec<r2dec::CType> = candidates
-        .iter()
-        .filter(|ty| !matches!(ty, r2dec::CType::Unknown))
-        .cloned()
-        .collect();
-    if meaningful.is_empty() {
-        let fallback_evidence = candidate_evidence.into_iter().next().unwrap_or_default();
-        return (
-            fallback_scalar_type((ptr_bits / 8).max(1), &fallback_evidence, ptr_bits),
-            fallback_evidence,
-        );
-    }
-    if meaningful.iter().all(|ty| ty == &meaningful[0]) {
-        return (
-            meaningful.remove(0),
-            candidate_evidence.into_iter().next().unwrap_or_default(),
-        );
-    }
-    if let Some(float_ty) = meaningful
-        .iter()
-        .find(|ty| matches!(ty, r2dec::CType::Float(_)))
-        .cloned()
-    {
-        let evidence = candidate_evidence
-            .into_iter()
-            .find(|e| e.width_bits >= 32)
-            .unwrap_or_default();
-        return (float_ty, evidence);
-    }
-    let evidence = candidate_evidence.into_iter().next().unwrap_or_default();
-    (meaningful.remove(0), evidence)
+    let (ty, evidence) =
+        r2types::infer_signature_return_type(func, type_inference, ptr_bits, evidence_ctx);
+    (type_like_to_ctype(&ty), evidence)
 }
 
-fn canonical_x86_64_arg_reg(name: &str) -> Option<&'static str> {
-    match name.to_ascii_lowercase().as_str() {
-        "rdi" | "edi" | "di" | "dil" => Some("rdi"),
-        "rsi" | "esi" | "si" | "sil" => Some("rsi"),
-        "rdx" | "edx" | "dx" | "dl" | "dh" => Some("rdx"),
-        "rcx" | "ecx" | "cx" | "cl" | "ch" => Some("rcx"),
-        "r8" | "r8d" | "r8w" | "r8b" => Some("r8"),
-        "r9" | "r9d" | "r9w" | "r9b" => Some("r9"),
-        _ => None,
-    }
-}
-
+#[cfg(test)]
+#[allow(dead_code)]
 fn collect_version0_input_regs(
     func: &r2ssa::SSAFunction,
 ) -> std::collections::HashMap<String, u32> {
-    let mut counts = std::collections::HashMap::new();
-    for block in func.blocks() {
-        for op in &block.ops {
-            for src in op.sources() {
-                if src.version != 0 {
-                    continue;
-                }
-                if src.name.starts_with("tmp:") || src.name.starts_with("const:") {
-                    continue;
-                }
-                let key = src.name.to_ascii_lowercase();
-                *counts.entry(key).or_insert(0) += 1;
-            }
-        }
-    }
-    counts
+    r2types::collect_version0_input_regs(func)
 }
 
-fn infer_callconv_x86_64_from_counts(
-    counts: &std::collections::HashMap<String, u32>,
-) -> (&'static str, u8) {
-    let mut canonical = std::collections::BTreeMap::new();
-    for (reg, count) in counts {
-        if let Some(name) = canonical_x86_64_arg_reg(reg) {
-            *canonical.entry(name).or_insert(0u32) += *count;
-        }
-    }
-
-    let rdi = *canonical.get("rdi").unwrap_or(&0);
-    let rsi = *canonical.get("rsi").unwrap_or(&0);
-    let rcx = *canonical.get("rcx").unwrap_or(&0);
-    let rdx = *canonical.get("rdx").unwrap_or(&0);
-    let r8 = *canonical.get("r8").unwrap_or(&0);
-    let r9 = *canonical.get("r9").unwrap_or(&0);
-
-    let sysv_primary = rdi + rsi;
-    let sysv_total = rdi + rsi + rdx + rcx + r8 + r9;
-    let ms_total = rcx + rdx + r8 + r9;
-    let ms_regs_used = [rcx, rdx, r8, r9].iter().filter(|&&v| v > 0).count();
-    let ms_dominant = sysv_primary == 0
-        && rcx > 0
-        && ms_regs_used >= 2
-        && ms_total >= 3
-        && ms_total >= (rdi + rsi + rdx + 1);
-
-    if ms_dominant {
-        let confidence = if ms_total >= 3 { 90 } else { 76 };
-        ("ms", confidence)
-    } else {
-        let confidence = if sysv_primary > 0 {
-            92
-        } else if sysv_total > 0 {
-            76
-        } else {
-            60
-        };
-        ("amd64", confidence)
-    }
-}
-
-fn sanitize_inferred_param_type(
-    mut ty: r2dec::CType,
-    var_size_bytes: u32,
-    ptr_bits: u32,
-) -> r2dec::CType {
-    if matches!(ty, r2dec::CType::Void | r2dec::CType::Unknown) {
-        ty = match var_size_bytes {
-            1 => r2dec::CType::Int(8),
-            2 => r2dec::CType::Int(16),
-            4 => r2dec::CType::Int(32),
-            8 => r2dec::CType::Int(64),
-            _ => r2dec::CType::Unknown,
-        };
-    }
-
-    if matches!(ty, r2dec::CType::Void | r2dec::CType::Unknown) {
-        ty = if ptr_bits >= 64 {
-            r2dec::CType::Int(64)
-        } else {
-            r2dec::CType::Int(32)
-        };
-    }
-
-    ty
-}
-
-fn is_informative_type(ty: &r2dec::CType) -> bool {
-    !matches!(ty, r2dec::CType::Void | r2dec::CType::Unknown)
-}
-
+#[cfg(test)]
 fn compute_signature_confidence(
     params: &[InferredParam],
     ret_type: &r2dec::CType,
     ret_evidence: &TypeEvidence,
 ) -> u8 {
-    let mut confidence: i32 = 48;
-    if !params.is_empty() {
-        confidence += 8;
-    }
-
-    for param in params {
-        let evidence = &param.evidence;
-        if evidence.pointer_proven > 0 || evidence.scalar_proven > 0 {
-            confidence += 6;
-        } else if evidence.bool_like > 0
-            || evidence.pointer_likely > 0
-            || evidence.scalar_likely > 0
-        {
-            confidence += 3;
-        } else if is_informative_type(&param.ty) {
-            confidence += 2;
-        } else {
-            confidence -= 2;
-        }
-
-        if evidence.has_conflict() {
-            confidence -= 4;
-        }
-    }
-
-    if is_informative_type(ret_type) {
-        confidence += 4;
-        if ret_evidence.pointer_proven > 0
-            || ret_evidence.scalar_proven > 0
-            || ret_evidence.bool_like > 0
-        {
-            confidence += 2;
-        }
-    } else if ret_evidence.has_pointer_signal() || ret_evidence.has_scalar_signal() {
-        confidence += 2;
-    }
-
-    if ret_evidence.has_conflict() {
-        confidence -= 3;
-    }
-
-    confidence.clamp(0, 100) as u8
+    let canonical_params = params
+        .iter()
+        .map(|param| r2types::SignatureParamCandidate {
+            name: param.name.clone(),
+            ty: ctype_to_type_like(&param.ty),
+            arg_index: param.arg_index,
+            size_bytes: param.size_bytes,
+            evidence: param.evidence.clone(),
+        })
+        .collect::<Vec<_>>();
+    r2types::compute_signature_confidence(
+        &canonical_params,
+        &ctype_to_type_like(ret_type),
+        ret_evidence,
+    )
 }
 
+#[cfg(test)]
 fn compute_callconv_inference(
     arch_name: &str,
     input_counts: &std::collections::HashMap<String, u32>,
 ) -> (String, u8) {
-    match arch_name {
-        "x86-64" => {
-            let (callconv, confidence) = infer_callconv_x86_64_from_counts(input_counts);
-            (callconv.to_string(), confidence)
-        }
-        "x86" => ("cdecl".to_string(), 64),
-        _ => (String::new(), 0),
-    }
+    r2types::compute_callconv_inference(arch_name, input_counts)
+}
+
+#[cfg(test)]
+fn is_informative_type(ty: &r2dec::CType) -> bool {
+    !matches!(ty, r2dec::CType::Void | r2dec::CType::Unknown)
 }
 
 #[cfg(test)]
@@ -3901,6 +3785,7 @@ fn explicit_signature_context_strength(sig: &r2types::FunctionSignatureSpec) -> 
     confidence
 }
 
+#[cfg(test)]
 fn normalize_inferred_param_name(
     raw_name: &str,
     fallback_idx: usize,
@@ -3912,6 +3797,7 @@ fn normalize_inferred_param_name(
     uniquify_name(clean, used)
 }
 
+#[cfg(test)]
 fn format_afs_signature(
     function_name: &str,
     ret_type: &str,
@@ -3933,6 +3819,7 @@ fn cstr_or_default(ptr: *const c_char, default: &str) -> String {
     helpers::cstr_or_default(ptr, default)
 }
 
+#[cfg(test)]
 fn is_opaque_placeholder_type_name(ty: &str) -> bool {
     let lower = ty.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -3950,6 +3837,7 @@ fn is_opaque_placeholder_type_name(ty: &str) -> bool {
         || lower.contains(" type_0x")
 }
 
+#[cfg(test)]
 fn is_unmaterialized_aggregate_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     lower.is_empty() || lower == "anon" || lower.starts_with("anon_")
@@ -3982,6 +3870,7 @@ fn is_generic_type_string(ty: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn normalize_external_type_name(ty: &str) -> String {
     let normalized = r2types::normalize_external_type_name(ty);
     if normalized.is_empty() || is_opaque_placeholder_type_name(&normalized) {
@@ -3991,6 +3880,7 @@ fn normalize_external_type_name(ty: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn estimate_parsed_c_type_size_bytes(ty: &r2dec::CType, ptr_bits: u32) -> Option<u64> {
     match ty {
         r2dec::CType::Void => Some(0),
@@ -4014,6 +3904,7 @@ fn estimate_parsed_c_type_size_bytes(ty: &r2dec::CType, ptr_bits: u32) -> Option
     }
 }
 
+#[cfg(test)]
 fn estimate_c_type_size_bytes(ty: &str, ptr_bits: u32) -> u64 {
     if let Some(parsed) = parse_external_type(ty, ptr_bits)
         && let Some(size) = estimate_parsed_c_type_size_bytes(&parsed, ptr_bits)
@@ -4032,6 +3923,7 @@ fn estimate_c_type_size_bytes(ty: &str, ptr_bits: u32) -> u64 {
     1
 }
 
+#[cfg(test)]
 fn build_struct_decl(
     name: &str,
     fields: &[StructFieldCandidateJson],
@@ -4092,6 +3984,7 @@ fn parse_existing_var_types(json_str: &str) -> std::collections::HashMap<String,
     out
 }
 
+#[cfg(test)]
 fn collect_pointer_arg_slot_map(
     arch: Option<&ArchSpec>,
     ptr_bits: u32,
@@ -4123,7 +4016,7 @@ fn collect_pointer_arg_slot_map(
             if is_riscv64 {
                 return alias.starts_with('x') || alias.starts_with('a');
             }
-            alias == canonical.to_ascii_lowercase()
+            alias == (*canonical).to_ascii_lowercase()
         };
 
         if include_alias(canonical) {
@@ -4139,6 +4032,7 @@ fn collect_pointer_arg_slot_map(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct ArgAddrExpr {
     slot: usize,
     offset: i64,
@@ -4154,6 +4048,7 @@ struct GlobalAddrExpr {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct StructFieldEvidence {
     reads: u32,
     writes: u32,
@@ -4161,16 +4056,21 @@ struct StructFieldEvidence {
     type_votes: std::collections::BTreeMap<String, u32>,
 }
 
+#[cfg(test)]
 type SlotTypeOverrides = std::collections::HashMap<usize, String>;
+#[cfg(test)]
 type SlotFieldProfiles = std::collections::HashMap<usize, std::collections::BTreeMap<u64, String>>;
+#[cfg(test)]
 type SlotFieldEvidenceMap =
     std::collections::HashMap<usize, std::collections::BTreeMap<u64, StructFieldEvidence>>;
+#[cfg(test)]
 type StructInferenceArtifacts = (
     Vec<StructDeclCandidateJson>,
     SlotTypeOverrides,
     SlotFieldProfiles,
 );
 
+#[cfg(test)]
 fn build_struct_inference_artifacts_from_field_evidence(
     slot_field_evidence: SlotFieldEvidenceMap,
     ptr_bits: u32,
@@ -4257,6 +4157,7 @@ fn build_struct_inference_artifacts_from_field_evidence(
     (struct_decls, slot_type_overrides, slot_fields_for_links)
 }
 
+#[cfg(test)]
 fn infer_structs_from_semantic_accesses(
     ssa_func: &r2ssa::SSAFunction,
     cfg: &r2dec::DecompilerConfig,
@@ -4284,6 +4185,8 @@ fn infer_structs_from_semantic_accesses(
     build_struct_inference_artifacts_from_field_evidence(slot_field_evidence, ptr_bits, diagnostics)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn merge_struct_inference_artifacts(
     mut base: StructInferenceArtifacts,
     supplement: StructInferenceArtifacts,
@@ -4310,6 +4213,7 @@ fn merge_struct_inference_artifacts(
     base
 }
 
+#[cfg(test)]
 fn parse_ssa_const_offset(name: &str, ptr_bits: u32) -> Option<i64> {
     let val_str = name
         .strip_prefix("const:")
@@ -4333,6 +4237,7 @@ fn parse_ssa_const_offset(name: &str, ptr_bits: u32) -> Option<i64> {
     Some(signed_offset_from_const(raw, ptr_bits))
 }
 
+#[cfg(test)]
 fn signed_offset_from_const(raw: u64, ptr_bits: u32) -> i64 {
     let bits = ptr_bits.clamp(8, 64);
     if bits == 64 {
@@ -4348,6 +4253,7 @@ fn signed_offset_from_const(raw: u64, ptr_bits: u32) -> i64 {
     }
 }
 
+#[cfg(test)]
 fn infer_structs_from_ssa(
     ssa_blocks: &[r2ssa::SSABlock],
     arch: Option<&ArchSpec>,
@@ -4357,9 +4263,7 @@ fn infer_structs_from_ssa(
     use std::collections::HashMap;
 
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch, ptr_bits);
-    let arch_name =
-        crate::decompiler::normalize_sig_arch_name(arch).unwrap_or_else(|| "unknown".to_string());
-    let cfg = crate::decompiler::decompiler_config_for_arch_name(&arch_name, ptr_bits);
+    let (_, _, cfg) = r2dec::DecompilerConfig::for_arch(arch);
     let sp_name = cfg.sp_name.to_ascii_lowercase();
     let fp_name = cfg.fp_name.to_ascii_lowercase();
     let mut addr_exprs: HashMap<String, ArgAddrExpr> = HashMap::new();
@@ -5476,11 +5380,11 @@ pub extern "C" fn r2sleigh_infer_signature_cc_json(
     let Some(analysis) = types::build_function_analysis(&input) else {
         return ptr::null_mut();
     };
-    let Some(signature_cc) = types::infer_signature_cc_from_analysis(&input, &analysis) else {
+    let Some(signature) = types::infer_signature_cc_from_analysis(&input, &analysis) else {
         return ptr::null_mut();
     };
 
-    match serde_json::to_string(&signature_cc) {
+    match serde_json::to_string(&types::signature_to_json(&signature)) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
     }
@@ -5522,6 +5426,7 @@ pub extern "C" fn r2sleigh_get_direct_call_targets_json(
 ///
 /// Returns JSON suitable for plugin-side confidence/conflict policy.
 /// Caller must free with r2il_string_free().
+#[derive(Clone, Copy)]
 struct InterprocInferenceInput<'a> {
     iter: usize,
     max_iters: usize,
@@ -5536,7 +5441,23 @@ struct TypeWritebackInferenceInput<'a> {
     fcn_addr: u64,
     fcn_name: *const c_char,
     external_context_json: *const c_char,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
     interproc: InterprocInferenceInput<'a>,
+}
+
+struct SemanticWorkerLinearizationInput {
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    block_count: usize,
+    loop_count: usize,
+    back_edge_count: usize,
+    max_switch_cases: usize,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
 }
 
 fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
@@ -5550,51 +5471,161 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
         return ptr::null_mut();
     };
     let external_context = cstr_or_default(input.external_context_json, "{}");
-    let Some(artifact) = types::build_function_analysis_artifact(
-        &function_input,
-        &external_context,
-        input.interproc.scope_json,
-        input.interproc.max_iters,
-    ) else {
-        return ptr::null_mut();
+    let symbolic_scope = if input.scope_functions.is_null() || input.scope_num_functions == 0 {
+        None
+    } else {
+        unsafe {
+            analysis::sym::build_symbolic_scope_from_ffi(
+                input.scope_functions,
+                input.scope_num_functions,
+                function_input.ctx.arch,
+                function_input.function_addr,
+            )
+        }
     };
-    let ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
-    if ssa_blocks.is_empty() {
-        return ptr::null_mut();
-    }
-    let scope = serde_json::from_str::<serde_json::Value>(input.interproc.scope_json)
-        .ok()
-        .filter(|v| !v.is_null() && v.as_object().map(|obj| !obj.is_empty()).unwrap_or(true));
-
-    let current_summary = artifact
-        .interproc_summary_set
-        .as_ref()
-        .and_then(|summary_set| {
-            summary_set
-                .root
-                .and_then(|root| summary_set.summaries.get(&root).cloned())
-        });
-    let current_summary_json = current_summary
-        .as_ref()
-        .and_then(|summary| serde_json::to_string(summary).ok());
-
-    let payload = writeback_plan_json(
-        artifact.writeback_plan,
-        InterprocSummaryJson {
-            callsite_count: count_callsites(&ssa_blocks),
-            iterations: input.interproc.iter.max(1),
-            max_iterations: input.interproc.max_iters.max(input.interproc.iter.max(1)),
-            converged: input.interproc.converged,
-            summary: current_summary,
-            summary_json: current_summary_json,
-            scope,
-        },
-    );
+    let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
+    let payload = if let Some(cached_artifact) =
+        types::get_cached_function_analysis_artifact_with_scope(
+            &function_input,
+            &external_context,
+            symbolic_scope.as_ref(),
+        ) {
+        if let Some(compiled) = cached_artifact.function_facts.semantics.as_ref()
+            && r2types::semantic_artifact_prefers_bounded_type_plan(compiled)
+        {
+            semantic_type_fallback_payload(
+                &function_input.function_name,
+                &arch_name,
+                ptr_bits,
+                input.interproc,
+                compiled,
+            )
+        } else {
+            type_writeback_payload_from_artifact(cached_artifact, input.interproc)
+        }
+    } else {
+        let Some(analysis) = types::build_function_analysis(&function_input) else {
+            return ptr::null_mut();
+        };
+        let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+            &z3::Context::thread_local(),
+            &analysis.ssa_func,
+            symbolic_scope.as_ref(),
+            function_input.ctx.arch,
+        );
+        if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
+            semantic_type_fallback_payload(
+                &function_input.function_name,
+                &arch_name,
+                ptr_bits,
+                input.interproc,
+                &semantic_artifact,
+            )
+        } else {
+            let interproc_summary_set = types::build_interproc_summary_set(
+                &function_input,
+                &analysis,
+                input.interproc.scope_json,
+                input.interproc.max_iters,
+            );
+            let Some(artifact) =
+                types::build_function_analysis_artifact_from_analysis_with_semantic_artifact(
+                    &function_input,
+                    analysis,
+                    &external_context,
+                    Some(interproc_summary_set),
+                    semantic_artifact,
+                )
+            else {
+                return ptr::null_mut();
+            };
+            type_writeback_payload_from_artifact(artifact, input.interproc)
+        }
+    };
 
     match serde_json::to_string(&payload) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
     }
+}
+
+fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -> *mut c_char {
+    let summary = r2ssa::CFGRiskSummary {
+        block_count: input.block_count,
+        loop_count: input.loop_count,
+        back_edge_count: input.back_edge_count,
+        switch_block_count: usize::from(input.max_switch_cases > 0),
+        max_switch_cases: input.max_switch_cases,
+    };
+    let Some(_reason) = r2dec::cfg_guard_reason_from_summary(&summary) else {
+        return ptr::null_mut();
+    };
+    let Some(function_input) = types::build_function_input(
+        input.ctx,
+        input.blocks,
+        input.num_blocks,
+        input.fcn_addr,
+        input.fcn_name,
+    ) else {
+        return ptr::null_mut();
+    };
+    let symbolic_scope = if input.scope_functions.is_null() || input.scope_num_functions == 0 {
+        None
+    } else {
+        unsafe {
+            analysis::sym::build_symbolic_scope_from_ffi(
+                input.scope_functions,
+                input.scope_num_functions,
+                function_input.ctx.arch,
+                function_input.function_addr,
+            )
+        }
+    };
+    let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
+    let semantic_artifact = if let Some(cached_artifact) =
+        types::get_cached_function_analysis_artifact_with_scope(
+            &function_input,
+            "{}",
+            symbolic_scope.as_ref(),
+        ) {
+        cached_artifact.function_facts.semantics
+    } else {
+        let Some(analysis) = types::build_function_analysis(&function_input) else {
+            return ptr::null_mut();
+        };
+        Some(r2sym::compile_semantic_artifact_default_with_scope(
+            &z3::Context::thread_local(),
+            &analysis.ssa_func,
+            symbolic_scope.as_ref(),
+            function_input.ctx.arch,
+        ))
+    };
+    let Some(semantic_artifact) = semantic_artifact else {
+        return ptr::null_mut();
+    };
+    let Some(route) = r2dec::detached_semantic_route_plan(
+        &function_input.function_name,
+        function_input.blocks.as_slice(),
+        Some(&semantic_artifact),
+    ) else {
+        return ptr::null_mut();
+    };
+    let reason = match route {
+        r2dec::SemanticRoutePlan::LinearWorker { reason } => reason,
+        _ => return ptr::null_mut(),
+    };
+    let plan = r2types::build_semantic_type_fallback_plan(
+        &function_input.function_name,
+        &arch_name,
+        ptr_bits,
+        &semantic_artifact,
+    );
+    CString::new(r2dec::render_semantic_worker_linearization(
+        &plan,
+        Some(&semantic_artifact),
+        &reason,
+    ))
+    .map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
 #[unsafe(no_mangle)]
@@ -5613,6 +5644,8 @@ pub extern "C" fn r2sleigh_infer_type_writeback_json(
         fcn_addr,
         fcn_name,
         external_context_json,
+        scope_functions: ptr::null(),
+        scope_num_functions: 0,
         interproc: InterprocInferenceInput {
             iter: 1,
             max_iters: 1,
@@ -5643,12 +5676,77 @@ pub extern "C" fn r2sleigh_infer_type_writeback_json_ex(
         fcn_addr,
         fcn_name,
         external_context_json,
+        scope_functions: ptr::null(),
+        scope_num_functions: 0,
         interproc: InterprocInferenceInput {
             iter: interproc_iter.max(1),
             max_iters: interproc_max_iters.max(1),
             converged: interproc_converged != 0,
             scope_json: &scope,
         },
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_infer_type_writeback_json_scope_ex(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    external_context_json: *const c_char,
+    interproc_iter: usize,
+    interproc_max_iters: usize,
+    interproc_converged: i32,
+    interproc_scope_json: *const c_char,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
+) -> *mut c_char {
+    let scope = cstr_or_default(interproc_scope_json, "{}");
+    infer_type_writeback_json_impl(TypeWritebackInferenceInput {
+        ctx,
+        blocks,
+        num_blocks,
+        fcn_addr,
+        fcn_name,
+        external_context_json,
+        scope_functions,
+        scope_num_functions,
+        interproc: InterprocInferenceInput {
+            iter: interproc_iter.max(1),
+            max_iters: interproc_max_iters.max(1),
+            converged: interproc_converged != 0,
+            scope_json: &scope,
+        },
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2dec_semantic_worker_linearization_scope_ffi(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    block_count: usize,
+    loop_count: usize,
+    back_edge_count: usize,
+    max_switch_cases: usize,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
+) -> *mut c_char {
+    semantic_worker_linearization_impl(SemanticWorkerLinearizationInput {
+        ctx,
+        blocks,
+        num_blocks,
+        fcn_addr,
+        fcn_name,
+        block_count,
+        loop_count,
+        back_edge_count,
+        max_switch_cases,
+        scope_functions,
+        scope_num_functions,
     })
 }
 
@@ -7174,8 +7272,7 @@ mod tests {
             max_switch_cases: 40,
         };
 
-        let reason =
-            decompiler_cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
+        let reason = r2dec::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
         assert!(
             reason.contains("dense switch") || reason.contains("max_switch_cases"),
             "unexpected reason: {reason}"
@@ -7192,8 +7289,7 @@ mod tests {
             max_switch_cases: 0,
         };
 
-        let reason =
-            decompiler_cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
+        let reason = r2dec::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
         assert!(
             reason.contains("back_edges=38"),
             "expected back-edge detail in reason, got: {reason}"
@@ -7210,7 +7306,144 @@ mod tests {
             max_switch_cases: 0,
         };
 
-        assert_eq!(decompiler_cfg_guard_reason_from_summary(&summary), None);
+        assert_eq!(r2dec::cfg_guard_reason_from_summary(&summary), None);
+    }
+
+    #[test]
+    fn r2dec_cfg_guard_comment_ffi_reports_complex_loop_graph() {
+        let name = CString::new("fcn.140010138").unwrap();
+        let out = r2dec_cfg_guard_comment_ffi(name.as_ptr(), 107, 9, 17, 0);
+        assert!(!out.is_null());
+        let rendered = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_string();
+        assert!(rendered.contains("r2dec fallback"));
+        assert!(rendered.contains("complex loop graph"));
+        r2il_string_free(out);
+    }
+
+    #[test]
+    fn r2dec_cfg_guard_comment_ffi_returns_null_for_benign_summary() {
+        let name = CString::new("sym.small").unwrap();
+        let out = r2dec_cfg_guard_comment_ffi(name.as_ptr(), 12, 1, 1, 0);
+        assert!(out.is_null());
+    }
+
+    fn test_compiled_condition(expr: &str) -> r2sym::BackwardConditionSummary {
+        r2sym::BackwardConditionSummary {
+            simplified: expr.to_string(),
+            terms: vec![expr.to_string()],
+            memory_terms: Vec::new(),
+            backward_memory_substitutions: 0,
+            backward_memory_candidate_enumerations: 0,
+            backward_memory_residual_fallbacks: 0,
+            precision: r2sym::BackwardConditionPrecision::Exact,
+            supported_paths: 1,
+            total_paths: 1,
+        }
+    }
+
+    fn test_large_cfg_semantic_artifact() -> r2sym::SemanticArtifact {
+        let compiled = test_compiled_condition("x == 0");
+        let region = r2sym::SemanticRegion {
+            anchor: 0x401000,
+            frontier: std::collections::BTreeSet::from([0x401020, 0x401030]),
+            control: vec![
+                r2sym::Judged::new(
+                    r2sym::ControlFact {
+                        target: 0x401020,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(compiled.clone()),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+                r2sym::Judged::new(
+                    r2sym::ControlFact {
+                        target: 0x401030,
+                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                        condition: Some("x != 0".to_string()),
+                        compiled: None,
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+                r2sym::Judged::new(
+                    r2sym::ControlFact {
+                        target: 0x401020,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: None,
+                        condition: Some("x == 0".to_string()),
+                        compiled: Some(compiled.clone()),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+            ],
+            memory: Vec::new(),
+            pre: Vec::new(),
+            post: Vec::new(),
+            targets: vec![
+                r2sym::Judged::new(
+                    r2sym::TargetFact {
+                        target: 0x401020,
+                        status: r2sym::SymbolicReachabilityStatus::Reachable,
+                        branch_truth: Some(true),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+                r2sym::Judged::new(
+                    r2sym::TargetFact {
+                        target: 0x401030,
+                        status: r2sym::SymbolicReachabilityStatus::Unreachable,
+                        branch_truth: Some(false),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                ),
+            ],
+        };
+        r2sym::SemanticArtifact {
+            stage: r2sym::RefinementStage::Residual,
+            granularity: r2sym::ArtifactGranularity::Regioned,
+            execution: r2sym::ExecutionModel::Native,
+            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
+                summary: r2sym::NativeFunctionSummary {
+                    slice_class: r2sym::SliceClass::Worker,
+                    closure_functions: 4,
+                    helper_functions: 3,
+                    derived_summaries: 0,
+                    derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
+                },
+                regions: std::iter::once((region.key(), region)).collect(),
+            }),
+            diagnostics: r2sym::SemanticArtifactDiagnostics {
+                branches_evaluated: 1,
+                branches_pruned: 0,
+                branches_unknown: 0,
+                skipped_missing_arch: false,
+                skipped_large_cfg: true,
+                residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
+                ambiguous_targets: Vec::new(),
+                cache_hit: false,
+            },
+        }
+    }
+
+    #[test]
+    fn decompile_ready_large_cfg_worker_keeps_real_decompile_path() {
+        let compiled = test_large_cfg_semantic_artifact();
+        assert!(
+            r2dec::preferred_semantic_fallback_comment("fcn.401000", Some(&compiled)).is_none()
+        );
+    }
+
+    #[test]
+    fn semantic_fallback_text_reports_canonical_region_counts() {
+        let compiled = test_large_cfg_semantic_artifact();
+        let output = r2dec::semantic_fallback_comment("_401000", Some(&compiled))
+            .expect("typed semantic fallback comment");
+        assert!(output.contains("semantic fallback: worker slice in residual mode"));
+        assert!(output.contains("regions=1"));
+        assert!(output.contains("actionable_conditions=3"));
+        assert!(output.contains("exact_conditions=3"));
     }
 
     #[test]
@@ -7419,7 +7652,7 @@ mod integration_tests {
         r2il_free(ctx_ptr);
     }
 
-    #[cfg(feature = "arm")]
+    #[cfg(any(feature = "arm", feature = "mips"))]
     fn profile_for_arch(arch: &str) -> String {
         let arch_cstr = CString::new(arch).unwrap();
         let ctx_ptr = r2il_arch_init(arch_cstr.as_ptr());
@@ -7440,7 +7673,7 @@ mod integration_tests {
         profile
     }
 
-    #[cfg(feature = "arm")]
+    #[cfg(any(feature = "arm", feature = "mips"))]
     fn role_target(profile: &str, role: &str) -> Option<String> {
         profile
             .lines()
@@ -7551,6 +7784,47 @@ mod integration_tests {
             "riscv32 context should be loaded"
         );
         r2il_free(ctx_ptr);
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn create_disassembler_for_arch_mips32be() {
+        let (spec, disasm) =
+            create_disassembler_for_arch("mips32be").expect("mips32be disassembler");
+        assert_eq!(spec.name, "mips32be");
+        assert!(spec.addr_size > 0);
+        assert_eq!(spec.instruction_endianness, r2il::Endianness::Big);
+        assert_eq!(spec.memory_endianness, r2il::Endianness::Big);
+        assert_eq!(
+            disasm.userop_name(0),
+            userop_map_for_arch("mips32be").get(&0).map(String::as_str)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn r2il_arch_init_mips32be_loaded() {
+        let arch_cstr = CString::new("mips32be").unwrap();
+        let ctx_ptr = r2il_arch_init(arch_cstr.as_ptr());
+        assert!(!ctx_ptr.is_null(), "context pointer should not be null");
+        assert_eq!(
+            r2il_is_loaded(ctx_ptr),
+            1,
+            "mips32be context should be loaded"
+        );
+        r2il_free(ctx_ptr);
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn mips32be_reg_profile_includes_arg_roles() {
+        let profile = profile_for_arch("mips32be");
+        for role in ["PC", "SP", "A0", "A1", "A2", "A3", "R0"] {
+            assert!(
+                role_target(&profile, role).is_some(),
+                "mips32be profile should define ={role}"
+            );
+        }
     }
 
     #[test]
@@ -7820,9 +8094,8 @@ mod integration_tests {
             Some("HeapAlloc"),
             "payload={output}"
         );
-        assert_eq!(
-            payload["ret_type"].as_str(),
-            Some("void*"),
+        assert!(
+            matches!(payload["ret_type"].as_str(), Some("void *" | "void*")),
             "payload={output}"
         );
     }
@@ -9175,7 +9448,8 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let rendered = artifact
-            .type_facts
+            .function_facts
+            .types
             .merged_signature
             .as_ref()
             .and_then(|sig| sig.params.first())
@@ -9189,10 +9463,10 @@ mod integration_tests {
                 && compact.ends_with('*')
                 && !compact.eq_ignore_ascii_case("void*"),
             "expected lifted-byte x86 artifact to override arg0 to a struct pointer, got signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}, semantic_structs={:?}, semantic_diagnostics={:?}, raw_structs={:?}, raw_diagnostics={:?}, pattern_ssa_blocks={:?}",
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs,
             semantic_structs,
             semantic_diagnostics,
             raw_structs,
@@ -9254,16 +9528,17 @@ mod integration_tests {
 
         assert_eq!(
             artifact
-                .type_facts
+                .function_facts
+                .types
                 .slot_type_overrides
                 .get(&0)
                 .map(String::as_str),
             Some("struct sla_struct_420703e08f70f00e *"),
             "expected live-context detached artifact to keep the local struct override, got merged_signature={:?}, slot_overrides={:?}, slot_fields={:?}, type_db={:?}",
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
     }
 
@@ -9337,7 +9612,8 @@ mod integration_tests {
         );
 
         let db_struct = artifact
-            .type_facts
+            .function_facts
+            .types
             .external_type_db
             .structs
             .get("sla_struct_420703e08f70f00e")
@@ -9402,7 +9678,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
@@ -9455,72 +9731,72 @@ mod integration_tests {
             .ops = pattern_ssa_blocks[0].ops.clone();
         manual_func = manual_func.with_name("dbg.test_struct_array_index");
         let mut manual_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        manual_decompiler.set_type_facts(artifact.type_facts.clone());
+        manual_decompiler.set_type_facts(artifact.function_facts.types.clone());
         let manual_output = manual_decompiler.decompile(&manual_func);
 
         assert!(
             output.contains("[idx].f_8"),
             "expected detached artifact store rendering in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             output.contains("[idx].f_34"),
             "expected detached artifact load rendering in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             output.contains("return arr[idx].f_8 + arr[idx].f_34;")
                 || output.contains("return arr[idx].f_34 + arr[idx].f_8;"),
             "expected detached artifact return to preserve both member loads, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             !output.contains("local_c ="),
             "dead x86 stack-home index carrier should not leak into decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             !output.contains("local_"),
             "autogenerated x86 stack-home locals should not leak into decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             output.contains("arr[idx].f_8 = v;"),
             "expected detached artifact store to inline the parameter value, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
         assert!(
             !output.contains("(int64_t)arr[idx].f_34"),
             "x86 scalar return should not widen the member load in decompiled output, got:\n{output}\nmanual_output:\n{manual_output}\ntail_ops={tail_ops:?}\nregister_params={:?}\nmerged_signature={:?}\nslot_overrides={:?}\nslot_fields={:?}\ntype_db={:?}",
-            artifact.type_facts.register_params,
-            artifact.type_facts.merged_signature,
-            artifact.type_facts.slot_type_overrides,
-            artifact.type_facts.slot_field_profiles,
-            artifact.type_facts.external_type_db.structs
+            artifact.function_facts.types.register_params,
+            artifact.function_facts.types.merged_signature,
+            artifact.function_facts.types.slot_type_overrides,
+            artifact.function_facts.types.slot_field_profiles,
+            artifact.function_facts.types.external_type_db.structs
         );
     }
 
@@ -9583,7 +9859,8 @@ mod integration_tests {
 
         assert_eq!(
             artifact
-                .type_facts
+                .function_facts
+                .types
                 .merged_signature
                 .as_ref()
                 .expect("merged signature")
@@ -9591,7 +9868,7 @@ mod integration_tests {
                 .len(),
             2,
             "expected authoritative external signature to keep two params, got merged_signature={:?}",
-            artifact.type_facts.merged_signature
+            artifact.function_facts.types.merged_signature
         );
         assert_eq!(
             artifact.writeback_plan.signature.params.len(),
@@ -9602,16 +9879,16 @@ mod integration_tests {
         assert_eq!(
             artifact.writeback_plan.signature.params[0].name, "src",
             "expected first param name to come from external signature, got merged_signature={:?}, writeback_signature={:?}",
-            artifact.type_facts.merged_signature, artifact.writeback_plan.signature
+            artifact.function_facts.types.merged_signature, artifact.writeback_plan.signature
         );
         assert_eq!(
             artifact.writeback_plan.signature.params[1].name, "len",
             "expected second param name to come from external signature, got merged_signature={:?}, writeback_signature={:?}",
-            artifact.type_facts.merged_signature, artifact.writeback_plan.signature
+            artifact.function_facts.types.merged_signature, artifact.writeback_plan.signature
         );
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
@@ -9653,19 +9930,19 @@ mod integration_tests {
         assert!(
             output.contains("sym.imp.memcpy(buf, src, len);"),
             "expected detached x86 alloc_and_copy to keep the malloc owner for memcpy, got:\n{output}\nssa_ops={ssa_ops:?}\nmerged_signature={:?}\nwriteback_signature={:?}",
-            artifact.type_facts.merged_signature,
+            artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
         );
         assert!(
             output.contains("buf[len] = 0;"),
             "expected detached x86 alloc_and_copy to keep the malloc owner for the NUL store, got:\n{output}\nmerged_signature={:?}\nwriteback_signature={:?}",
-            artifact.type_facts.merged_signature,
+            artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
         );
         assert!(
             output.contains("return buf;"),
             "expected detached x86 alloc_and_copy to return the owned malloc result, got:\n{output}\nmerged_signature={:?}\nwriteback_signature={:?}",
-            artifact.type_facts.merged_signature,
+            artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
         );
     }
@@ -9730,7 +10007,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401110, "sym.imp.printf".to_string()),
             (0x401140, "sym.imp.memcpy".to_string()),
@@ -9868,7 +10145,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401130, "sym.imp.strcmp".to_string())]));
         decompiler.set_strings(HashMap::from([(0x403014, "secret123".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
@@ -10006,7 +10283,7 @@ mod integration_tests {
             .collect();
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         let output = decompiler.decompile(&artifact.ssa_func);
         let output_without_types =
             r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64()).decompile(&artifact.ssa_func);
@@ -10101,9 +10378,9 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         let output = decompiler.decompile(&artifact.ssa_func);
-        let visible_bindings = artifact.type_facts.visible_bindings.clone();
+        let visible_bindings = artifact.function_facts.types.visible_bindings.clone();
 
         assert!(
             output.contains("if (x != y)")
@@ -10181,7 +10458,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]));
         decompiler.set_strings(HashMap::from([(0x403040, "C".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
@@ -10290,7 +10567,7 @@ mod integration_tests {
         })
         .to_string();
 
-        let mut artifact = crate::types::build_detached_function_analysis_artifact(
+        let artifact = crate::types::build_detached_function_analysis_artifact(
             &blocks,
             "dbg.test_setlocale_wrapper",
             Some(&arch),
@@ -10303,16 +10580,12 @@ mod integration_tests {
 
         let function_names = HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]);
         let strings = HashMap::from([(0x403040, "C".to_string())]);
-        crate::types::enrich_known_function_signatures_from_names(
-            &mut artifact.type_facts,
-            &function_names,
-            64,
-        );
         let input = crate::decompiler::decompiler_input_from_artifact(
             artifact,
             function_names,
             strings,
             HashMap::new(),
+            64,
         );
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
@@ -10408,7 +10681,7 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        let mut type_facts = artifact.type_facts.clone();
+        let mut type_facts = artifact.function_facts.types.clone();
         type_facts.known_function_signatures.extend(HashMap::from([
             (
                 "sym.imp.strlen".to_string(),
@@ -10584,6 +10857,7 @@ mod integration_tests {
             function_names,
             HashMap::new(),
             HashMap::new(),
+            64,
         );
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
@@ -10691,7 +10965,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -10817,7 +11091,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -10938,7 +11212,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.type_facts.clone());
+        decompiler.set_type_facts(artifact.function_facts.types.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -11053,12 +11327,14 @@ mod integration_tests {
             HashMap::from([(0x401100, "sym.imp.strlen".to_string())]),
             HashMap::new(),
             HashMap::new(),
+            64,
         );
         let empty_input = crate::decompiler::decompiler_input_from_artifact(
             artifact.clone(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            64,
         );
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
@@ -11757,6 +12033,133 @@ mod integration_tests {
                 && !output.contains("stack_4 =")
                 && !output.contains("stack ="),
             "dead synthetic stack argument spills should not leak into final output, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn detached_symbolic_branch_facts_prune_self_xor_guard_in_decompiler() {
+        use r2il::{R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+        fn reg(offset: u64, size: u32) -> Varnode {
+            Varnode {
+                space: SpaceId::Register,
+                offset,
+                size,
+                meta: None,
+            }
+        }
+
+        fn konst(value: u64, size: u32) -> Varnode {
+            Varnode {
+                space: SpaceId::Const,
+                offset: value,
+                size,
+                meta: None,
+            }
+        }
+
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::new("EDI", 56, 4));
+        arch.add_register(RegisterDef::new("RDI", 56, 8));
+
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntXor {
+                        dst: reg(0x80, 8),
+                        a: reg(56, 8),
+                        b: reg(56, 8),
+                    },
+                    R2ILOp::CBranch {
+                        target: konst(0x1010, 8),
+                        cond: reg(0x80, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: reg(0, 8),
+                        src: konst(0, 8),
+                    },
+                    R2ILOp::Return { target: reg(0, 8) },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1010,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: reg(0, 8),
+                        src: konst(1, 8),
+                    },
+                    R2ILOp::Return { target: reg(0, 8) },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &blocks,
+            "dbg.test_symbolic_xor_guard",
+            Some(&arch),
+            64,
+            false,
+            &HashMap::new(),
+            "{}",
+        )
+        .expect("analysis artifact");
+
+        let semantics = artifact
+            .function_facts
+            .semantics
+            .as_ref()
+            .expect("canonical semantics");
+        assert_eq!(semantics.diagnostics.branches_pruned, 1);
+        let native = semantics.native_body().expect("native semantics");
+        assert_eq!(native.regions.len(), 1);
+        let region = native.regions.values().next().expect("semantic region");
+        assert!(region.targets.iter().any(|fact| {
+            fact.value.status == r2sym::SymbolicReachabilityStatus::Unreachable
+                && fact.value.branch_truth == Some(true)
+        }));
+        assert!(region.targets.iter().any(|fact| {
+            fact.value.status == r2sym::SymbolicReachabilityStatus::Reachable
+                && fact.value.branch_truth == Some(false)
+        }));
+
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output =
+            decompiler.decompile_input(&crate::decompiler::decompiler_input_from_artifact(
+                artifact,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                64,
+            ));
+
+        assert!(
+            output.contains("return 1;") || output.contains("return 0;"),
+            "expected decompiled function body, got:\n{output}"
+        );
+        assert!(
+            !output.contains("if ("),
+            "symbolic branch facts should collapse the impossible guard, got:\n{output}"
+        );
+        assert!(
+            !output.contains("return 1;"),
+            "impossible self-xor branch should be removed, got:\n{output}"
         );
     }
 
