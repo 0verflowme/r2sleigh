@@ -1233,10 +1233,13 @@ mod tests {
         assert!(artifact.diagnostics.skipped_large_cfg);
         assert_eq!(native.regions.len(), 1);
         assert_eq!(native.actionable_control_count(), 2);
-        assert!(matches!(artifact.type_plan(), crate::TypePlan::Ready));
+        assert!(matches!(
+            artifact.type_plan(),
+            crate::TypePlan::NativeAugmentation
+        ));
         assert!(matches!(
             artifact.decompile_plan(),
-            crate::DecompilePlan::Ready
+            crate::DecompilePlan::NativeStructured | crate::DecompilePlan::NativeLinear { .. }
         ));
         assert_eq!(artifact.diagnostics.branches_evaluated, 1);
     }
@@ -1352,10 +1355,13 @@ mod tests {
             vm_transfer: None,
         });
         assert!(matches!(artifact.query_plan(), crate::QueryPlan::Ready));
-        assert!(matches!(artifact.type_plan(), crate::TypePlan::Ready));
+        assert!(matches!(
+            artifact.type_plan(),
+            crate::TypePlan::NativeAugmentation
+        ));
         assert!(matches!(
             artifact.decompile_plan(),
-            crate::DecompilePlan::Ready
+            crate::DecompilePlan::NativeStructured
         ));
         let reasons = artifact.diagnostics.residual_reasons;
         assert!(

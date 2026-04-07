@@ -170,6 +170,24 @@ pub(crate) fn run_full_decompile_on_large_stack(
             };
             artifact = rename_function_artifact_for_display(artifact, &display_func_name);
 
+            if let Some(route) = r2dec::detached_semantic_route_plan(
+                &display_func_name,
+                &r2il_blocks,
+                artifact.function_facts.semantics.as_ref(),
+            ) {
+                match route {
+                    r2dec::SemanticRoutePlan::VmSummary { .. } => {
+                        if let Some(output) =
+                            r2dec::render_vm_semantic_summary(&display_func_name, &artifact.function_facts)
+                        {
+                            return output;
+                        }
+                    }
+                    r2dec::SemanticRoutePlan::FallbackComment { comment } => return comment,
+                    _ => {}
+                }
+            }
+
             let decompiler = r2dec::Decompiler::new(config);
             let semantic_fallback_output = r2dec::semantic_fallback_comment(
                 &display_func_name,

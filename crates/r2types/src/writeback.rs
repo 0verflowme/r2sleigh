@@ -789,7 +789,7 @@ fn semantic_fallback_warning(artifact: &r2sym::SemanticArtifact) -> String {
 }
 
 pub fn semantic_artifact_prefers_bounded_type_plan(artifact: &r2sym::SemanticArtifact) -> bool {
-    if !matches!(artifact.type_plan(), r2sym::TypePlan::Ready) {
+    if !artifact.type_plan().allows_native_augmentation() {
         return true;
     }
     matches!(
@@ -814,7 +814,7 @@ pub fn build_semantic_type_fallback_plan(
     artifact: &r2sym::SemanticArtifact,
 ) -> TypeWritebackPlan {
     let mut warnings = vec![semantic_fallback_warning(artifact)];
-    if !matches!(artifact.type_plan(), r2sym::TypePlan::Ready) {
+    if !artifact.type_plan().allows_native_augmentation() {
         warnings.push("type analysis not ready from semantic capability".to_string());
     }
     let mut local_structs = LocalStructArtifacts::default();
@@ -1413,11 +1413,73 @@ pub fn augment_local_struct_artifacts_with_semantics(
     artifact: &r2sym::SemanticArtifact,
     ptr_bits: u32,
 ) {
+    fn reliable_post_memory_terms(
+        region: &r2sym::SemanticRegion,
+    ) -> impl Iterator<Item = &r2sym::BackwardMemoryCondition> {
+        region
+            .post
+            .iter()
+            .filter(|predicate| predicate.evidence.is_reliable())
+            .filter_map(|predicate| predicate.value.compiled.as_ref())
+            .filter(|compiled| compiled.evidence().is_reliable())
+            .flat_map(|compiled| compiled.memory_terms.iter())
+    }
+
+    fn has_reliable_preconditions(region: &r2sym::SemanticRegion) -> bool {
+        region
+            .pre
+            .iter()
+            .any(|predicate| predicate.evidence.is_reliable())
+    }
+
+    fn has_decisive_target_support(region: &r2sym::SemanticRegion) -> bool {
+        region.actionable_reachable_target().is_some() || {
+            let actionable_targets = region
+                .targets
+                .iter()
+                .filter(|fact| fact.evidence.allows_narrowing())
+                .filter(|fact| {
+                    matches!(
+                        fact.value.status,
+                        r2sym::SymbolicReachabilityStatus::Reachable
+                    )
+                })
+                .map(|fact| fact.value.target)
+                .collect::<BTreeSet<_>>();
+            actionable_targets.len() == 1
+        }
+    }
+
+    fn supports_conservative_type_projection(region: &r2sym::SemanticRegion) -> bool {
+        let decisive_target = has_decisive_target_support(region);
+        let has_post_support = region.post.iter().any(|predicate| {
+            predicate.evidence.allows_narrowing()
+                && predicate
+                    .value
+                    .compiled
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.evidence().is_reliable())
+        });
+        if !decisive_target && !has_post_support {
+            return false;
+        }
+        if has_reliable_preconditions(region) && !decisive_target {
+            return false;
+        }
+        true
+    }
+
     let mut projected_profiles = BTreeMap::<usize, BTreeMap<u64, String>>::new();
+    if artifact.vm_summary_only_type_plan() {
+        return;
+    }
     let Some(native) = artifact.native_body() else {
         return;
     };
     for region in native.regions.values() {
+        if !supports_conservative_type_projection(region) {
+            continue;
+        }
         for term in region
             .memory
             .iter()
@@ -1434,29 +1496,48 @@ pub fn augment_local_struct_artifacts_with_semantics(
                 .entry(offset)
                 .or_insert(field_type);
         }
+        for term in reliable_post_memory_terms(region) {
+            let Some((slot, offset, field_type)) = backward_memory_term_slot_field(term, ptr_bits)
+            else {
+                continue;
+            };
+            projected_profiles
+                .entry(slot)
+                .or_default()
+                .entry(offset)
+                .or_insert(field_type);
+        }
     }
     if projected_profiles.is_empty() {
-        for compiled in native
-            .regions
-            .values()
-            .flat_map(|region| region.control.iter())
-            .filter(|fact| fact.evidence.allows_narrowing())
-            .filter_map(|fact| fact.value.compiled.as_ref())
-        {
-            if !compiled.evidence().is_reliable() {
+        for region in native.regions.values() {
+            if !supports_conservative_type_projection(region) {
                 continue;
             }
-            for term in &compiled.memory_terms {
-                let Some((slot, offset, field_type)) =
-                    backward_memory_term_slot_field(term, ptr_bits)
-                else {
+            let Some(target) = region.actionable_reachable_target() else {
+                continue;
+            };
+            for compiled in region
+                .control
+                .iter()
+                .filter(|fact| fact.evidence.allows_narrowing())
+                .filter(|fact| fact.value.target == target)
+                .filter_map(|fact| fact.value.compiled.as_ref())
+            {
+                if !compiled.evidence().is_reliable() {
                     continue;
-                };
-                projected_profiles
-                    .entry(slot)
-                    .or_default()
-                    .entry(offset)
-                    .or_insert(field_type);
+                }
+                for term in &compiled.memory_terms {
+                    let Some((slot, offset, field_type)) =
+                        backward_memory_term_slot_field(term, ptr_bits)
+                    else {
+                        continue;
+                    };
+                    projected_profiles
+                        .entry(slot)
+                        .or_default()
+                        .entry(offset)
+                        .or_insert(field_type);
+                }
             }
         }
     }
@@ -5337,7 +5418,7 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_memory_islands_seed_local_struct_profiles_without_control_islands() {
+    fn symbolic_memory_without_control_or_post_support_is_rejected() {
         let artifact = test_artifact(
             r2sym::RefinementStage::Compiled,
             r2sym::SliceClass::Worker,
@@ -5362,6 +5443,42 @@ mod tests {
 
         augment_local_struct_artifacts_with_semantics(&mut local_structs, &artifact, 64);
 
+        assert!(
+            local_structs.slot_field_profiles.is_empty(),
+            "memory-only regions without control/post support must not project struct fields"
+        );
+    }
+
+    #[test]
+    fn symbolic_postconditions_seed_local_struct_profiles_without_control_islands() {
+        let artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            vec![r2sym::SemanticRegion {
+                anchor: 0x401000,
+                frontier: BTreeSet::new(),
+                control: Vec::new(),
+                memory: Vec::new(),
+                pre: Vec::new(),
+                post: vec![r2sym::Judged::new(
+                    r2sym::SemanticPredicate {
+                        expr: "post(arg0->f_8)".to_string(),
+                        compiled: Some(test_exact_compiled_condition(
+                            "post(arg0->f_8)",
+                            vec![test_arg_memory_term(8, 4)],
+                        )),
+                    },
+                    r2sym::SemanticEvidence::exact(),
+                )],
+                targets: Vec::new(),
+            }],
+        );
+        let mut local_structs = LocalStructArtifacts::default();
+
+        augment_local_struct_artifacts_with_semantics(&mut local_structs, &artifact, 64);
+
         assert_eq!(
             local_structs
                 .slot_field_profiles
@@ -5369,13 +5486,6 @@ mod tests {
                 .and_then(|profile| profile.get(&8))
                 .map(String::as_str),
             Some("int32_t")
-        );
-        assert_eq!(
-            local_structs
-                .slot_type_overrides
-                .get(&0)
-                .map(String::as_str),
-            Some("struct sla_struct_symbolic_arg1 *")
         );
     }
 

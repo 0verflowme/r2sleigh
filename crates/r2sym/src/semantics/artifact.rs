@@ -399,6 +399,11 @@ impl SemanticArtifact {
             .is_some_and(|body| !body.regions.is_empty())
     }
 
+    fn supports_native_semantic_structuring(&self) -> bool {
+        self.native_body()
+            .is_some_and(NativeArtifactBody::supports_guarded_structuring)
+    }
+
     fn has_query_support(&self) -> bool {
         self.native_body()
             .is_some_and(NativeArtifactBody::supports_query_guidance)
@@ -487,6 +492,7 @@ impl SemanticArtifact {
             self.execution,
             &self.diagnostics,
             self.has_native_semantics(),
+            self.supports_native_semantic_structuring(),
         )
     }
 
@@ -649,8 +655,19 @@ impl SemanticArtifact {
     }
 
     pub fn supports_guarded_structuring(&self) -> bool {
-        self.native_body()
-            .is_some_and(NativeArtifactBody::supports_guarded_structuring)
+        self.decompile_plan().allows_native_structuring()
+    }
+
+    pub fn supports_native_semantic_linearization(&self) -> bool {
+        self.decompile_plan().allows_native_linearization()
+    }
+
+    pub fn vm_summary_only_type_plan(&self) -> bool {
+        self.type_plan().is_vm_summary_only()
+    }
+
+    pub fn vm_summary_only_decompile_plan(&self) -> bool {
+        self.decompile_plan().is_vm_summary_only()
     }
 }
 

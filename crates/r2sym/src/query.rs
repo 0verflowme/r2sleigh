@@ -1981,7 +1981,10 @@ mod tests {
             } => {
                 assert!(initial_state.num_constraints() >= original_constraints);
                 assert!(narrowed_state.is_none());
-                assert!(compiled_precondition.is_some());
+                assert!(
+                    compiled_precondition.is_none(),
+                    "exact artifact-guided branch narrowing should not surface fallback compiled metadata"
+                );
             }
             PreconditionApplication::ExactUnsat { .. } => {
                 panic!("necessary worker islands should use the real compiled precondition path")

@@ -433,6 +433,17 @@ pub fn render_semantic_worker_linearization(
     consumer_linear::render_semantic_worker_linearization(plan, semantic_artifact, reason)
 }
 
+pub fn render_vm_semantic_summary(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+) -> Option<String> {
+    consumer_vm::render_vm_semantic_summary(
+        func_name,
+        &function_facts.types,
+        function_facts.semantics.as_ref()?,
+    )
+}
+
 fn merge_params_with_external_signature(
     recovered_params: Vec<ast::CParam>,
     signature: Option<&FunctionSignatureSpec>,
@@ -992,8 +1003,37 @@ impl Decompiler {
         self.context = self.context.clone().with_function_facts(function_facts);
     }
 
+    fn vm_summary_output_for_route(
+        &self,
+        func_name: &str,
+        route: &planner::SemanticRoutePlan,
+    ) -> Option<String> {
+        match route {
+            planner::SemanticRoutePlan::VmSummary { .. } => {
+                crate::consumer_vm::render_vm_semantic_summary(
+                    func_name,
+                    self.context.type_facts(),
+                    self.context.semantic_artifact()?,
+                )
+            }
+            _ => None,
+        }
+    }
+
     /// Decompile an SSA function to C code.
     pub fn decompile(&self, func: &SSAFunction) -> String {
+        let func_name = func
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        let semantic_route = planner::semantic_route_plan(
+            &func_name,
+            self.context.semantic_artifact(),
+            &func.cfg_risk_summary(),
+        );
+        if let Some(output) = self.vm_summary_output_for_route(&func_name, &semantic_route) {
+            return output;
+        }
         // Build the C function
         let c_func = self.build_function(func);
 
@@ -1004,6 +1044,19 @@ impl Decompiler {
 
     /// Decompile a prepared function with an explicit typed context payload.
     pub fn decompile_input(&self, input: &DecompilerInput) -> String {
+        let func = input.prepared_ssa.function();
+        let func_name = func
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        let semantic_route = planner::semantic_route_plan(
+            &func_name,
+            self.context.semantic_artifact(),
+            &func.cfg_risk_summary(),
+        );
+        if let Some(output) = self.vm_summary_output_for_route(&func_name, &semantic_route) {
+            return output;
+        }
         let c_func = self.build_function_from_input(input);
         let mut codegen = CodeGenerator::new(self.config.codegen.clone());
         codegen.generate_function(&c_func)
@@ -4964,16 +5017,16 @@ mod tests {
         let output = decompiler.decompile(&func);
         assert!(
             output.contains("r2dec semantic summary: vm_summary"),
-            "expected VM semantic summary comment, got:\n{output}"
+            "expected VM semantic summary output, got:\n{output}"
         );
         assert!(
-            output.contains("dispatch_header=0x1000")
+            output.contains("switch (vm.sel)")
+                && output.contains("case 0x1:")
                 && output.contains("handler 0x1004")
-                && output.contains("guards=")
-                && output.contains("residual_memory=")
-                && output.contains("read_effects=")
-                && output.contains("write_effects="),
-            "expected richer VM details in summary comment, got:\n{output}"
+                && output.contains("state = state + 1;")
+                && output.contains("read ram:0x2000")
+                && output.contains("vm.sel = 3;"),
+            "expected structured VM summary rendering, got:\n{output}"
         );
     }
 

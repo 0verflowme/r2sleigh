@@ -34,13 +34,13 @@ where
             use_conservative_locals: true,
             is_linear_fallback: true,
         },
-        crate::SemanticRoutePlan::FallbackComment { .. } | crate::SemanticRoutePlan::Standard => {
-            RoutedBody {
-                body_stmt: structurer.structure(),
-                use_conservative_locals: false,
-                is_linear_fallback: false,
-            }
-        }
+        crate::SemanticRoutePlan::VmSummary { .. }
+        | crate::SemanticRoutePlan::FallbackComment { .. }
+        | crate::SemanticRoutePlan::Standard => RoutedBody {
+            body_stmt: structurer.structure(),
+            use_conservative_locals: false,
+            is_linear_fallback: false,
+        },
     }
 }
 

@@ -3356,6 +3356,90 @@ struct InferredTypeWritebackJson {
     diagnostics: TypeWritebackDiagnosticsJson,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct CfgRiskSummaryJson {
+    block_count: usize,
+    loop_count: usize,
+    back_edge_count: usize,
+    switch_block_count: usize,
+    max_switch_cases: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SemanticRoutePlanJson {
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct FunctionFactsReportJson {
+    function_name: String,
+    function_addr: u64,
+    cfg_risk: CfgRiskSummaryJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_route: Option<SemanticRoutePlanJson>,
+    type_writeback: InferredTypeWritebackJson,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct FunctionPlanReportJson {
+    function_name: String,
+    function_addr: u64,
+    cfg_risk: CfgRiskSummaryJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic: Option<analysis::sym::CompiledSemanticInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_route: Option<SemanticRoutePlanJson>,
+    prefer_bounded_type_plan: bool,
+}
+
+fn cfg_risk_summary_json(summary: r2ssa::CFGRiskSummary) -> CfgRiskSummaryJson {
+    CfgRiskSummaryJson {
+        block_count: summary.block_count,
+        loop_count: summary.loop_count,
+        back_edge_count: summary.back_edge_count,
+        switch_block_count: summary.switch_block_count,
+        max_switch_cases: summary.max_switch_cases,
+    }
+}
+
+fn semantic_route_plan_json(route: r2dec::SemanticRoutePlan) -> SemanticRoutePlanJson {
+    match route {
+        r2dec::SemanticRoutePlan::Standard => SemanticRoutePlanJson {
+            kind: "standard".to_string(),
+            reason: None,
+            comment: None,
+        },
+        r2dec::SemanticRoutePlan::StructuredWorker { reason } => SemanticRoutePlanJson {
+            kind: "structured_worker".to_string(),
+            reason: Some(reason),
+            comment: None,
+        },
+        r2dec::SemanticRoutePlan::LinearWorker { reason } => SemanticRoutePlanJson {
+            kind: "linear_worker".to_string(),
+            reason: Some(reason),
+            comment: None,
+        },
+        r2dec::SemanticRoutePlan::VmSummary { reason } => SemanticRoutePlanJson {
+            kind: "vm_summary".to_string(),
+            reason: Some(reason),
+            comment: None,
+        },
+        r2dec::SemanticRoutePlan::FallbackComment { comment } => SemanticRoutePlanJson {
+            kind: "fallback_comment".to_string(),
+            reason: None,
+            comment: Some(comment),
+        },
+    }
+}
+
 fn evidence_json(evidence: &[r2types::WritebackEvidence]) -> Vec<String> {
     evidence
         .iter()
@@ -5549,6 +5633,202 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
     }
 }
 
+fn function_facts_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
+    let Some(function_input) = types::build_function_input(
+        input.ctx,
+        input.blocks,
+        input.num_blocks,
+        input.fcn_addr,
+        input.fcn_name,
+    ) else {
+        return ptr::null_mut();
+    };
+    let external_context = cstr_or_default(input.external_context_json, "{}");
+    let symbolic_scope = if input.scope_functions.is_null() || input.scope_num_functions == 0 {
+        None
+    } else {
+        unsafe {
+            analysis::sym::build_symbolic_scope_from_ffi(
+                input.scope_functions,
+                input.scope_num_functions,
+                function_input.ctx.arch,
+                function_input.function_addr,
+            )
+        }
+    };
+    let Some(function_analysis) = types::build_function_analysis(&function_input) else {
+        return ptr::null_mut();
+    };
+    let cfg_risk = cfg_risk_summary_json(function_analysis.ssa_func.function().cfg_risk_summary());
+    let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
+    let cached_artifact = types::get_cached_function_analysis_artifact_with_scope(
+        &function_input,
+        &external_context,
+        symbolic_scope.as_ref(),
+    );
+
+    let (type_writeback, semantic_artifact) = if let Some(cached_artifact) = cached_artifact {
+        let semantics = cached_artifact.function_facts.semantics.clone();
+        let payload = if let Some(compiled) = semantics.as_ref()
+            && r2types::semantic_artifact_prefers_bounded_type_plan(compiled)
+        {
+            semantic_type_fallback_payload(
+                &function_input.function_name,
+                &arch_name,
+                ptr_bits,
+                input.interproc,
+                compiled,
+            )
+        } else {
+            type_writeback_payload_from_artifact(cached_artifact.clone(), input.interproc)
+        };
+        (payload, semantics)
+    } else {
+        let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+            &z3::Context::thread_local(),
+            &function_analysis.ssa_func,
+            symbolic_scope.as_ref(),
+            function_input.ctx.arch,
+        );
+        if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
+            let payload = semantic_type_fallback_payload(
+                &function_input.function_name,
+                &arch_name,
+                ptr_bits,
+                input.interproc,
+                &semantic_artifact,
+            );
+            (payload, Some(semantic_artifact))
+        } else {
+            let interproc_summary_set = types::build_interproc_summary_set(
+                &function_input,
+                &function_analysis,
+                input.interproc.scope_json,
+                input.interproc.max_iters,
+            );
+            let Some(artifact) =
+                types::build_function_analysis_artifact_from_analysis_with_semantic_artifact(
+                    &function_input,
+                    function_analysis,
+                    &external_context,
+                    Some(interproc_summary_set),
+                    semantic_artifact,
+                )
+            else {
+                return ptr::null_mut();
+            };
+            let semantics = artifact.function_facts.semantics.clone();
+            (
+                type_writeback_payload_from_artifact(artifact, input.interproc),
+                semantics,
+            )
+        }
+    };
+
+    let semantic_route = semantic_artifact
+        .as_ref()
+        .and_then(|artifact| {
+            r2dec::detached_semantic_route_plan(
+                &function_input.function_name,
+                function_input.blocks.as_slice(),
+                Some(artifact),
+            )
+        })
+        .map(semantic_route_plan_json);
+
+    let payload = FunctionFactsReportJson {
+        function_name: function_input.function_name.clone(),
+        function_addr: function_input.function_addr,
+        cfg_risk,
+        semantic_build_plan: semantic_artifact
+            .as_ref()
+            .map(r2sym::SemanticArtifact::build_plan),
+        semantic_route,
+        type_writeback,
+    };
+
+    match serde_json::to_string(&payload) {
+        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+fn function_plan_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
+    let Some(function_input) = types::build_function_input(
+        input.ctx,
+        input.blocks,
+        input.num_blocks,
+        input.fcn_addr,
+        input.fcn_name,
+    ) else {
+        return ptr::null_mut();
+    };
+    let external_context = cstr_or_default(input.external_context_json, "{}");
+    let symbolic_scope = if input.scope_functions.is_null() || input.scope_num_functions == 0 {
+        None
+    } else {
+        unsafe {
+            analysis::sym::build_symbolic_scope_from_ffi(
+                input.scope_functions,
+                input.scope_num_functions,
+                function_input.ctx.arch,
+                function_input.function_addr,
+            )
+        }
+    };
+    let Some(function_analysis) = types::build_function_analysis(&function_input) else {
+        return ptr::null_mut();
+    };
+    let cfg_risk = cfg_risk_summary_json(function_analysis.ssa_func.function().cfg_risk_summary());
+    let semantic_artifact = types::get_cached_function_analysis_artifact_with_scope(
+        &function_input,
+        &external_context,
+        symbolic_scope.as_ref(),
+    )
+    .and_then(|artifact| artifact.function_facts.semantics)
+    .or_else(|| {
+        Some(r2sym::compile_semantic_artifact_default_with_scope(
+            &z3::Context::thread_local(),
+            &function_analysis.ssa_func,
+            symbolic_scope.as_ref(),
+            function_input.ctx.arch,
+        ))
+    });
+
+    let semantic_route = semantic_artifact
+        .as_ref()
+        .and_then(|artifact| {
+            r2dec::detached_semantic_route_plan(
+                &function_input.function_name,
+                function_input.blocks.as_slice(),
+                Some(artifact),
+            )
+        })
+        .map(semantic_route_plan_json);
+    let prefer_bounded_type_plan = semantic_artifact
+        .as_ref()
+        .is_some_and(r2types::semantic_artifact_prefers_bounded_type_plan);
+
+    let payload = FunctionPlanReportJson {
+        function_name: function_input.function_name.clone(),
+        function_addr: function_input.function_addr,
+        cfg_risk,
+        semantic: semantic_artifact
+            .as_ref()
+            .map(analysis::sym::compiled_semantic_info),
+        semantic_build_plan: semantic_artifact
+            .as_ref()
+            .map(r2sym::SemanticArtifact::build_plan),
+        semantic_route,
+        prefer_bounded_type_plan,
+    };
+
+    match serde_json::to_string(&payload) {
+        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
 fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -> *mut c_char {
     let summary = r2ssa::CFGRiskSummary {
         block_count: input.block_count,
@@ -5704,6 +5984,74 @@ pub extern "C" fn r2sleigh_infer_type_writeback_json_scope_ex(
 ) -> *mut c_char {
     let scope = cstr_or_default(interproc_scope_json, "{}");
     infer_type_writeback_json_impl(TypeWritebackInferenceInput {
+        ctx,
+        blocks,
+        num_blocks,
+        fcn_addr,
+        fcn_name,
+        external_context_json,
+        scope_functions,
+        scope_num_functions,
+        interproc: InterprocInferenceInput {
+            iter: interproc_iter.max(1),
+            max_iters: interproc_max_iters.max(1),
+            converged: interproc_converged != 0,
+            scope_json: &scope,
+        },
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_function_facts_json_scope_ex(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    external_context_json: *const c_char,
+    interproc_iter: usize,
+    interproc_max_iters: usize,
+    interproc_converged: i32,
+    interproc_scope_json: *const c_char,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
+) -> *mut c_char {
+    let scope = cstr_or_default(interproc_scope_json, "{}");
+    function_facts_json_impl(TypeWritebackInferenceInput {
+        ctx,
+        blocks,
+        num_blocks,
+        fcn_addr,
+        fcn_name,
+        external_context_json,
+        scope_functions,
+        scope_num_functions,
+        interproc: InterprocInferenceInput {
+            iter: interproc_iter.max(1),
+            max_iters: interproc_max_iters.max(1),
+            converged: interproc_converged != 0,
+            scope_json: &scope,
+        },
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_function_plan_json_scope_ex(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    external_context_json: *const c_char,
+    interproc_iter: usize,
+    interproc_max_iters: usize,
+    interproc_converged: i32,
+    interproc_scope_json: *const c_char,
+    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
+    scope_num_functions: usize,
+) -> *mut c_char {
+    let scope = cstr_or_default(interproc_scope_json, "{}");
+    function_plan_json_impl(TypeWritebackInferenceInput {
         ctx,
         blocks,
         num_blocks,

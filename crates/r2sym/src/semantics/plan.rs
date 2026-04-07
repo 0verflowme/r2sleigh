@@ -21,7 +21,8 @@ pub enum QueryPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypePlan {
-    Ready,
+    NativeAugmentation,
+    VmSummaryOnly { reason: String },
     Fallback { reason: String },
     Residual { reasons: Vec<String> },
     Refuse { reason: String },
@@ -29,7 +30,9 @@ pub enum TypePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DecompilePlan {
-    Ready,
+    NativeStructured,
+    NativeLinear { reason: String },
+    VmSummaryOnly { reason: String },
     Fallback { reason: String },
     Residual { reasons: Vec<String> },
     Refuse { reason: String },
@@ -55,7 +58,11 @@ pub struct TargetQueryRoutePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_guidance: Option<QueryGuidanceMode>,
     pub allow_memory_term_narrowing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_target_compile_reason: Option<String>,
     pub allow_dynamic_target_compile: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_target_compile_reason: Option<String>,
     pub allow_vm_target_compile: bool,
 }
 
@@ -67,9 +74,35 @@ impl TargetQueryRoutePlan {
             },
             branch_guidance: None,
             allow_memory_term_narrowing: false,
+            dynamic_target_compile_reason: Some("semantic artifact unavailable".to_string()),
             allow_dynamic_target_compile: true,
+            vm_target_compile_reason: Some("semantic artifact unavailable".to_string()),
             allow_vm_target_compile: true,
         }
+    }
+}
+
+impl TypePlan {
+    pub fn allows_native_augmentation(&self) -> bool {
+        matches!(self, Self::NativeAugmentation)
+    }
+
+    pub fn is_vm_summary_only(&self) -> bool {
+        matches!(self, Self::VmSummaryOnly { .. })
+    }
+}
+
+impl DecompilePlan {
+    pub fn allows_native_linearization(&self) -> bool {
+        matches!(self, Self::NativeStructured | Self::NativeLinear { .. })
+    }
+
+    pub fn allows_native_structuring(&self) -> bool {
+        matches!(self, Self::NativeStructured)
+    }
+
+    pub fn is_vm_summary_only(&self) -> bool {
+        matches!(self, Self::VmSummaryOnly { .. })
     }
 }
 
@@ -131,11 +164,12 @@ pub fn derive_type_plan(
     diagnostics: &SemanticArtifactDiagnostics,
     has_native_semantics: bool,
 ) -> TypePlan {
-    if matches!(execution, ExecutionModel::Vm)
-        || !diagnostics.skipped_large_cfg
-        || has_native_semantics
-    {
-        TypePlan::Ready
+    if matches!(execution, ExecutionModel::Vm) {
+        TypePlan::VmSummaryOnly {
+            reason: "vm artifacts expose summary-only type hints".to_string(),
+        }
+    } else if !diagnostics.skipped_large_cfg || has_native_semantics {
+        TypePlan::NativeAugmentation
     } else if matches!(stage, RefinementStage::Residual) {
         TypePlan::Residual {
             reasons: residual_reason_strings(diagnostics),
@@ -152,20 +186,26 @@ pub fn derive_decompile_plan(
     execution: ExecutionModel,
     diagnostics: &SemanticArtifactDiagnostics,
     has_native_semantics: bool,
+    supports_guarded_structuring: bool,
 ) -> DecompilePlan {
-    if matches!(execution, ExecutionModel::Native)
-        && (!diagnostics.skipped_large_cfg || has_native_semantics)
+    if matches!(execution, ExecutionModel::Vm) {
+        DecompilePlan::VmSummaryOnly {
+            reason: "vm artifacts currently support summary rendering only".to_string(),
+        }
+    } else if matches!(execution, ExecutionModel::Native)
+        && has_native_semantics
+        && supports_guarded_structuring
     {
-        DecompilePlan::Ready
+        DecompilePlan::NativeStructured
+    } else if matches!(execution, ExecutionModel::Native) && has_native_semantics {
+        DecompilePlan::NativeLinear {
+            reason: "guarded structuring unavailable".to_string(),
+        }
     } else if matches!(stage, RefinementStage::Residual)
         && !has_large_cfg_only_residual(diagnostics)
     {
         DecompilePlan::Residual {
             reasons: residual_reason_strings(diagnostics),
-        }
-    } else if matches!(execution, ExecutionModel::Vm) {
-        DecompilePlan::Fallback {
-            reason: "vm consumer required".to_string(),
         }
     } else {
         DecompilePlan::Fallback {
@@ -218,35 +258,62 @@ pub fn derive_target_query_route_plan(
                 target_plan: target_plan.clone(),
                 branch_guidance: Some(*mode),
                 allow_memory_term_narrowing: has_authoritative_source && has_memory_guidance,
-                allow_dynamic_target_compile: true,
-                allow_vm_target_compile: true,
+                dynamic_target_compile_reason: None,
+                allow_dynamic_target_compile: false,
+                vm_target_compile_reason: None,
+                allow_vm_target_compile: false,
             },
             TargetQueryPlan::Fallback { .. } => TargetQueryRoutePlan {
                 target_plan: target_plan.clone(),
                 branch_guidance: None,
                 allow_memory_term_narrowing: has_authoritative_source && has_memory_guidance,
-                allow_dynamic_target_compile: true,
-                allow_vm_target_compile: true,
+                dynamic_target_compile_reason: None,
+                allow_dynamic_target_compile: false,
+                vm_target_compile_reason: None,
+                allow_vm_target_compile: false,
             },
             TargetQueryPlan::Residual { .. } | TargetQueryPlan::Refuse { .. } => {
                 TargetQueryRoutePlan {
                     target_plan: target_plan.clone(),
                     branch_guidance: None,
                     allow_memory_term_narrowing: false,
+                    dynamic_target_compile_reason: None,
                     allow_dynamic_target_compile: false,
+                    vm_target_compile_reason: None,
                     allow_vm_target_compile: false,
                 }
             }
         },
-        QueryPlan::Fallback { .. } | QueryPlan::Residual { .. } | QueryPlan::Refuse { .. } => {
+        QueryPlan::Fallback { reason } => TargetQueryRoutePlan {
+            target_plan: target_plan.clone(),
+            branch_guidance: None,
+            allow_memory_term_narrowing: false,
+            dynamic_target_compile_reason: Some(reason.clone()),
+            allow_dynamic_target_compile: true,
+            vm_target_compile_reason: Some(reason.clone()),
+            allow_vm_target_compile: true,
+        },
+        QueryPlan::Residual { reasons } => {
+            let reason = reasons.join(", ");
             TargetQueryRoutePlan {
                 target_plan: target_plan.clone(),
                 branch_guidance: None,
                 allow_memory_term_narrowing: false,
-                allow_dynamic_target_compile: false,
-                allow_vm_target_compile: false,
+                dynamic_target_compile_reason: Some(reason.clone()),
+                allow_dynamic_target_compile: true,
+                vm_target_compile_reason: Some(reason),
+                allow_vm_target_compile: true,
             }
         }
+        QueryPlan::Refuse { .. } => TargetQueryRoutePlan {
+            target_plan: target_plan.clone(),
+            branch_guidance: None,
+            allow_memory_term_narrowing: false,
+            dynamic_target_compile_reason: None,
+            allow_dynamic_target_compile: false,
+            vm_target_compile_reason: None,
+            allow_vm_target_compile: false,
+        },
     }
 }
 
@@ -255,8 +322,9 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        DecompilePlan, QueryPlan, TargetQueryPlan, TargetQueryRoutePlan, derive_decompile_plan,
-        derive_query_plan, derive_target_query_plan, derive_target_query_route_plan,
+        DecompilePlan, QueryPlan, TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
+        derive_decompile_plan, derive_query_plan, derive_target_query_plan,
+        derive_target_query_route_plan, derive_type_plan,
     };
     use crate::{ExecutionModel, RefinementStage, SemanticArtifactDiagnostics};
 
@@ -297,20 +365,47 @@ mod tests {
         }
 
         #[test]
-        fn decompile_plan_derivation_is_total(
+        fn type_plan_derivation_is_total(
             is_vm in any::<bool>(),
             is_residual in any::<bool>(),
             skipped_large_cfg in any::<bool>(),
             has_native_semantics in any::<bool>(),
         ) {
-            let plan = derive_decompile_plan(
+            let plan = derive_type_plan(
                 if is_residual { RefinementStage::Residual } else { RefinementStage::Compiled },
                 if is_vm { ExecutionModel::Vm } else { ExecutionModel::Native },
                 &diagnostics(skipped_large_cfg),
                 has_native_semantics,
             );
             let is_valid = match plan {
-                DecompilePlan::Ready
+                TypePlan::NativeAugmentation
+                | TypePlan::VmSummaryOnly { .. }
+                | TypePlan::Fallback { .. }
+                | TypePlan::Residual { .. }
+                | TypePlan::Refuse { .. } => true,
+            };
+            prop_assert!(is_valid);
+        }
+
+        #[test]
+        fn decompile_plan_derivation_is_total(
+            is_vm in any::<bool>(),
+            is_residual in any::<bool>(),
+            skipped_large_cfg in any::<bool>(),
+            has_native_semantics in any::<bool>(),
+            supports_guarded_structuring in any::<bool>(),
+        ) {
+            let plan = derive_decompile_plan(
+                if is_residual { RefinementStage::Residual } else { RefinementStage::Compiled },
+                if is_vm { ExecutionModel::Vm } else { ExecutionModel::Native },
+                &diagnostics(skipped_large_cfg),
+                has_native_semantics,
+                supports_guarded_structuring,
+            );
+            let is_valid = match plan {
+                DecompilePlan::NativeStructured
+                | DecompilePlan::NativeLinear { .. }
+                | DecompilePlan::VmSummaryOnly { .. }
                 | DecompilePlan::Fallback { .. }
                 | DecompilePlan::Residual { .. }
                 | DecompilePlan::Refuse { .. } => true,
@@ -340,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn target_query_route_plan_allows_dynamic_fallback_without_branch_guidance() {
+    fn target_query_route_plan_keeps_ready_paths_artifact_authoritative() {
         let target_plan = derive_target_query_plan(&QueryPlan::Ready, false, false, false);
         let route = derive_target_query_route_plan(&QueryPlan::Ready, &target_plan, false, false);
         assert!(matches!(
@@ -349,7 +444,21 @@ mod tests {
         ));
         assert!(route.branch_guidance.is_none());
         assert!(!route.allow_memory_term_narrowing);
+        assert!(!route.allow_dynamic_target_compile);
+        assert!(!route.allow_vm_target_compile);
+    }
+
+    #[test]
+    fn target_query_route_plan_allows_dynamic_fallback_on_residual_routes() {
+        let query_plan = QueryPlan::Residual {
+            reasons: vec!["budget".to_string()],
+        };
+        let target_plan = derive_target_query_plan(&query_plan, false, false, false);
+        let route = derive_target_query_route_plan(&query_plan, &target_plan, false, false);
+        assert!(route.branch_guidance.is_none());
+        assert!(route.dynamic_target_compile_reason.is_some());
         assert!(route.allow_dynamic_target_compile);
+        assert!(route.vm_target_compile_reason.is_some());
         assert!(route.allow_vm_target_compile);
     }
 
@@ -389,6 +498,10 @@ mod tests {
                     route.allow_memory_term_narrowing,
                     has_authoritative_source && has_memory_guidance
                 );
+            }
+            if ready {
+                prop_assert!(!route.allow_dynamic_target_compile);
+                prop_assert!(!route.allow_vm_target_compile);
             }
             if matches!(target_plan, TargetQueryPlan::Residual { .. } | TargetQueryPlan::Refuse { .. }) || !ready {
                 prop_assert!(route.branch_guidance.is_none());

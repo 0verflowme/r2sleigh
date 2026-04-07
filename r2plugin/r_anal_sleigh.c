@@ -180,6 +180,14 @@ extern char *r2sleigh_infer_type_writeback_json_scope_ex(const R2ILContext *ctx,
 	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
 	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json,
 	const R2ILFunctionBlocks *functions, size_t num_functions);
+extern char *r2sleigh_function_facts_json_scope_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
+	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json,
+	const R2ILFunctionBlocks *functions, size_t num_functions);
+extern char *r2sleigh_function_plan_json_scope_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
+	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json,
+	const R2ILFunctionBlocks *functions, size_t num_functions);
 extern char *r2sleigh_get_direct_call_targets_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name);
 extern int r2sleigh_alias_function_analysis_artifact_cache(const R2ILContext *ctx, const R2ILBlock **blocks,
@@ -6326,6 +6334,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sla.ssa    - Show SSA form of instruction");
 			r_cons_println (cons, "| a:sla.defuse - Show def-use analysis of instruction");
 			r_cons_println (cons, "| a:sla.types [name|addr] - Dump inferred type write-back payload (current by default)");
+			r_cons_println (cons, "| a:sla.facts [name|addr] - Dump combined typed/semantic fact payload (current by default)");
+			r_cons_println (cons, "| a:sla.plan [name|addr] - Dump canonical analysis/decompile plan payload (current by default)");
 			r_cons_println (cons, "| a:sla.ssa.func - Show function SSA with phi nodes");
 				r_cons_println (cons, "| a:sla.ssa.func.opt - Show optimized function SSA");
 				r_cons_println (cons, "| a:sla.defuse.func - Show function-wide def-use analysis");
@@ -6922,6 +6932,112 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		r2il_string_free (defuse_json);
 		r2il_block_free (block);
 		return strdup("");
+	}
+
+	if ((!strncmp (cmd, "sla.facts", 9) && (!cmd[9] || isspace ((unsigned char)cmd[9])))
+		|| (!strncmp (cmd, "sla.plan", 8) && (!cmd[8] || isspace ((unsigned char)cmd[8])))) {
+		R2ILContext *ctx = get_context (anal);
+		RAnalFunction *fcn;
+		BlockArray blocks;
+		char *external_context_json = NULL;
+		char *interproc_scope_json = NULL;
+		char *result = NULL;
+		bool is_plan_cmd = r_str_startswith (cmd, "sla.plan");
+		size_t prefix_len = is_plan_cmd? 8: 9;
+		const char *target_arg = skip_cmd_spaces (cmd + prefix_len);
+		ut64 *seen_addrs = NULL;
+		size_t seen_count = 0;
+		size_t seen_cap = 0;
+		int interproc_max_iters = cfg_get_type_interproc_max_iters (anal);
+		bool prefer_bounded_semantic_type_plan = false;
+
+		if (!ctx) {
+			R_LOG_ERROR ("r2sleigh: no context");
+			return strdup ("");
+		}
+
+		fcn = (target_arg && *target_arg)
+			? resolve_or_materialize_function_target (core, anal, target_arg)
+			: resolve_or_materialize_current_function (core, anal);
+		if (!fcn) {
+			if (target_arg && *target_arg) {
+				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
+			} else {
+				R_LOG_ERROR ("r2sleigh: no function at current address");
+			}
+			return strdup ("");
+		}
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+			return strdup ("");
+		}
+		prefer_bounded_semantic_type_plan = should_skip_decompile_symbolic_scope (fcn);
+
+		external_context_json = sleigh_collect_external_context_json (anal, fcn);
+		if (!external_context_json || (external_context_json[0] != '{' && external_context_json[0] != '[')) {
+			free (external_context_json);
+			external_context_json = strdup ("{}");
+		}
+
+		if (!prefer_bounded_semantic_type_plan) {
+			warm_type_payload_cache_for_function (core, anal, ctx, fcn, interproc_max_iters,
+				&seen_addrs, &seen_count, &seen_cap);
+			interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
+		}
+		SymFunctionScope sym_scope;
+		if (build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
+			result = is_plan_cmd
+				? r2sleigh_function_plan_json_scope_ex (ctx,
+					(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+					external_context_json,
+					1,
+					prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
+					prefer_bounded_semantic_type_plan? 0: 1,
+					interproc_scope_json? interproc_scope_json: "{}",
+					sym_scope.functions, sym_scope.count)
+				: r2sleigh_function_facts_json_scope_ex (ctx,
+					(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+					external_context_json,
+					1,
+					prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
+					prefer_bounded_semantic_type_plan? 0: 1,
+					interproc_scope_json? interproc_scope_json: "{}",
+					sym_scope.functions, sym_scope.count);
+			sym_function_scope_free (&sym_scope);
+		} else {
+			result = is_plan_cmd
+				? r2sleigh_function_plan_json_scope_ex (ctx,
+					(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+					external_context_json,
+					1,
+					prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
+					prefer_bounded_semantic_type_plan? 0: 1,
+					interproc_scope_json? interproc_scope_json: "{}",
+					NULL, 0)
+				: r2sleigh_function_facts_json_scope_ex (ctx,
+					(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
+					external_context_json,
+					1,
+					prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
+					prefer_bounded_semantic_type_plan? 0: 1,
+					interproc_scope_json? interproc_scope_json: "{}",
+					NULL, 0);
+		}
+		if (cons) {
+			if (result && *result) {
+				r_cons_printf (cons, "%s\n", result);
+			} else {
+				r_cons_println (cons, "{}");
+			}
+		}
+		if (result) {
+			r2il_string_free (result);
+		}
+		free (seen_addrs);
+		free (interproc_scope_json);
+		free (external_context_json);
+		block_array_free (&blocks);
+		return strdup ("");
 	}
 
 	if (!strncmp (cmd, "sla.types", 9) && (!cmd[9] || isspace ((unsigned char)cmd[9]))) {
