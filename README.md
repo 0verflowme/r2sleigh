@@ -110,6 +110,7 @@ Documentation
 | [doc/taint.md](doc/taint.md) | Taint analysis |
 | [doc/symex.md](doc/symex.md) | Symbolic execution |
 | [doc/plugin.md](doc/plugin.md) | radare2 plugin and commands |
+| [doc/plugin-rfe-2026.md](doc/plugin-rfe-2026.md) | plugin feature and integration RFE |
 | [doc/types.md](doc/types.md) | Type inference |
 | [doc/testing.md](doc/testing.md) | Testing strategy |
 

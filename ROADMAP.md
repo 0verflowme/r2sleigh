@@ -1,277 +1,389 @@
 r2sleigh Roadmap
 ================
 
-> Vision: r2sleigh is not a separate plugin the user needs to know about.
-> It is the **analysis brain** of radare2 — transparently lifting, typing,
-> decompiling, tainting, and solving every function the user touches.
-> The user runs `aaa`, `a:sla.dec`, or just browses code, and the best
-> analysis in the industry happens automatically behind the scenes.
+> Vision: `r2sleigh` is not a sidecar plugin with many commands.
+> It is the analysis brain of radare2: one typed subsystem that lifts,
+> structures, solves, types, summarizes, and renders functions coherently.
 
-Current State (Feb 2026)
--------------------------
+North Star
+----------
 
-~200 tests passing across 8 crates. 20+ plugin commands working in radare2.
+The system we are aiming for has these properties:
 
-Working features:
-- 60+ R2IL opcodes from Ghidra Sleigh specifications
-- Full SSA pipeline: CFG, dominator tree, phi nodes, optimization (SCCP, DCE, CSE, copy-prop, inst-combine)
-- Z3-backed symbolic execution with path exploration
-- SSA-based taint analysis with automatic radare2 integration during aaaa
-- Decompiler producing C code with expression folding, predicate simplification, for-loops, switches, string literals, and symbol resolution
-- Constraint-based type inference with struct/signature support
-- Backward slicing
-- 20+ radare2 plugin commands with automatic analysis hooks
-- Deep integration callbacks: `analyze_fcn`, `recover_vars`, `get_data_refs`, `post_analysis`
+- one canonical IL substrate
+- one canonical SSA/dataflow layer
+- one canonical semantic artifact with explicit evidence
+- one canonical combined `FunctionFacts` contract
+- one planner surface for query, types, and decompilation
+- one replay/trace validation loop
+- one small public plugin surface that feels native to radare2
 
-Supported architectures: x86, x86-64, ARM, MIPS.
+The metric is not command count. The metric is whether radare2 feels like it
+gained one coherent, mathematically disciplined analysis engine.
 
-Planned Features
-----------------
-
-### 2026 Priority Reset (Maintainer Feedback, Execution Order)
-
-This section defines the actual implementation order for upcoming work.
-Phase numbering below remains as thematic grouping, but delivery priority is:
-`P0 (Now) -> P1 (Next) -> P2 (Later)`.
-
-| Priority | Theme | Why now | Concrete deliverables |
-|---|---|---|---|
-| P0 | **R2IL Foundation Hardening** | Avoid design debt before adding major features | Keep core IL minimal, add optional metadata (`storage_class`, pointer/type hints, memory attributes, richer endianness model), document semantics and compatibility rules |
-| P0 | **Unified Output + One-Liner UX** | Fast iteration for developers and easier maintainer review | Single export pipeline for C-like / r2-command-like / JSON outputs, plus CLI one-liners to run lift/SSA/defuse/dec actions directly |
-| P0 | **RISC-V Support** | Higher ecosystem value than MIPS for new users | Add riscv feature flag, disassembler wiring, register profile/calling convention integration, plugin + e2e coverage |
-| P1 | **Memory Semantics Extensions (VEX-inspired, scoped)** | Improves analysis fidelity without overhauling IL | Add `MemoryOrdering` + atomic/fence/guarded ops where liftable; compare behavior with VEX and document differences |
-| P1 | **Float/Vector + Encoding Path** | Needed for correctness on modern binaries | Integrate r2 float encoding model, add float/vector metadata and staged SIMD support |
-| P1 | **Hardware/Memory Topology Modeling** | Needed for firmware and embedded workflows | MMIO/IO port classification, const/permission/range attributes, segmented/banked memory policy and tests |
-| P2 | **VM Architecture Perspective** | Valuable long-term but high scope | Prototype Dalvik/VM support as separate lifter module, validate whether core IL needs extension |
-| P2 | **Advanced Execution Models** | Niche/high-complexity | VLIW parallel group representation and deeper scheduling semantics |
-
-#### Maintainer Points -> Priority Mapping
-
-| Maintainer point | Priority | Decision |
-|---|---|---|
-| Multiple address spaces + TLS | P0 | Keep `SpaceId` stable; represent TLS via optional storage metadata first |
-| RISC-V over MIPS | P0 | Promote RISC-V to immediate architecture milestone |
-| VM archs (Dalvik/JVM) | P2 | Explore in separate lifter crate, avoid premature core IL changes |
-| FPU/vector + any float encoding | P1 | Stage through metadata + encoding integration, then expand op support |
-| Atomic ops / guards / VEX comparison | P1 | Add scoped memory-ordering features with explicit doc comparison |
-| MMIO + IO ports | P1 | Add memory-class metadata and explicit IO semantics where available |
-| Complex endianness modes | P0 | Replace binary endianness assumptions with richer enum/override model |
-| VLIW parallel execution | P2 | Model as block-level parallel groups first |
-| Pointer as attribute, not base type | P0 | Treat pointer-ness as semantic metadata/type hint |
-| Const attrs (permissions, valid ranges) | P1 | Add optional memory attribute model |
-| Memory banks / segmented memory | P1 | Keep `SegmentOp`; add policy/docs/tests for banks/segments |
-| Switch as operation | P2 | Keep `switch_info` for now; revisit after SSA/CFG simplification pass |
-
-#### Near-Term Milestones (Next 3)
-
-1. **Milestone A (P0)**: R2IL metadata foundation + docs + compatibility tests.
-2. **Milestone B (P0)**: Unified export formats + CLI one-liners for lift/ssa/defuse/dec.
-3. **Milestone C (P0)**: End-to-end RISC-V support with plugin and e2e coverage.
-
-### Phase 1 — Seamless r2 Integration (make the seams invisible)
-
-The user should never feel they are using a separate tool. r2sleigh must
-consume everything radare2 already knows and push results back into r2's
-native data structures so every existing r2 command benefits.
-
-| # | Feature | Description | Effort | Impact |
-|---|---------|-------------|--------|--------|
-| 1.1 | **DWARF signature pipeline** | Verify DWARF-imported function signatures (via r2 `sdb_types` / `afcfj`) flow end-to-end into r2dec's `VariableRecovery` and `TypeInference`. DWARF variable names, parameter types, and return types must appear in decompiled output automatically. | Low | High |
-| 1.2 | **DWARF struct/enum type feeding** | In `sleigh_cmd` (`a:sla.dec`), query r2's `tsj` for DWARF-imported structs/unions/enums and feed into `ExternalTypeDb`. The type solver already has `FieldAccess` constraints and `lookup_field_name`; wire them to real DWARF data. | Medium | High |
-| 1.3 | **DWARF-assisted struct field recovery** | When type inference resolves `*(ptr+offset)` and the `ExternalTypeDb` has a matching struct with a field at that offset, emit `ptr->field` in decompiled C. Combines DWARF data + existing `detect_addr_pattern` + `lookup_field_name`. | Medium | High |
-| 1.4 | **Transparent `pdd` alias** | Register `pdd` (or `pdD`) as an r2 command alias that calls `a:sla.dec` for the current function. Users get decompilation from the standard r2 command vocabulary without knowing r2sleigh exists. | Low | High |
-| 1.5 | **Write-back inferred types to r2** | After decompilation or `aaaa`, push inferred struct shapes, function signatures, and variable types back into `sdb_types` (via `r_anal_save_parsed_type`/`r_anal_import_c_decls`). This means `t` commands, `afvt`, and future analysis passes all benefit. | Medium | High |
-| 1.6 | **Global variable recognition** | Use SSA data-flow analysis to detect accesses to fixed RAM addresses, cross-reference with r2's `r_anal_global_get`/flags, and emit named globals in decompiled output instead of raw hex constants. | Low | Medium |
-| 1.7 | **Autoname functions from decompiler** | After decompilation, heuristically derive function names from string arguments to known calls (e.g., a function whose first call is `printf("usage: ...")` → `print_usage`). Feed names back via `r_anal_function_rename`. Integrate with `aan`. | Medium | Medium |
-| 1.8 | **Calling convention auto-detection** | During `analyze_fcn`, determine calling convention (cdecl/stdcall/fastcall/sysv/win64/arm-aapcs) from SSA parameter-register usage patterns. Write back to r2's `afcc` so all downstream commands agree. Currently hardcoded to SysV x86-64. | Medium | Medium |
-
-### Phase 2 — Decompiler Quality (match Ghidra, exceed it)
-
-| # | Feature | Description | Effort | Impact |
-|---|---------|-------------|--------|--------|
-| 2.1 | **Phi node elimination** | Convert `phi(x1,x2)` to proper variable assignments at predecessor edges. Removes the last SSA artifacts from decompiled output. | Medium | High |
-| 2.2 | **Register coalescing** | Merge `RAX_1`, `RAX_2`, ... into a single C variable when the live ranges don't interfere. Dramatically reduces variable clutter. | Medium | High |
-| 2.3 | **Short-circuit operators** | Detect `if(a) { if(b) { X } }` → `if(a && b) { X }` and the OR variant. | Low | Medium |
-| 2.4 | **Condition inversion / early return** | Prefer `if(!x) return;` over `if(x) { ...long body... }`. Reduces nesting. | Low | Medium |
-| 2.5 | **No More Gotos** | Handle irreducible CFGs with region-based restructuring instead of gotos. The `structure.rs` already has region analysis; extend with node splitting or controlled duplication. | High | High |
-| 2.6 | **Pointer type propagation** | Track pointer types through Load/Store chains. When `p = malloc(sizeof(Foo))`, propagate `Foo*` to all uses of `p`. | Medium | High |
-| 2.7 | **Array access patterns** | Detect `base + i*stride` as `arr[i]`. The type solver already has `stride` detection in `detect_addr_pattern`; surface it in codegen. | Medium | Medium |
-| 2.8 | **Enum constant folding** | When a comparison operand matches an enum variant from `ExternalTypeDb`, emit the enum name instead of the raw integer. | Low | Medium |
-| 2.9 | **String constant propagation** | When a local variable is assigned a string address and only used in one call, inline the string literal at the call site. | Low | Medium |
-| 2.10 | **sizeof() recovery** | Detect `malloc(N)` where N matches `sizeof(struct X)` from the type DB. Emit `malloc(sizeof(X))`. | Low | Low |
-
-### Phase 3 — Vulnerability Intelligence (the killer feature)
-
-No other open-source tool provides automatic, per-function vulnerability
-assessment integrated directly into the reversing workflow.
-
-| # | Feature | Description | Effort | Impact |
-|---|---------|-------------|--------|--------|
-| 3.1 | **Vulnerability pattern library** | Detect buffer overflow, format string, UAF, double-free, integer overflow at IL/SSA level. Each pattern is a taint policy + SSA matcher. Ship as data files, not code. | Medium | Critical |
-| 3.2 | **Risk scoring engine** | Assign per-function risk scores based on: sink severity × input reachability × sanitizer presence. Rank all functions by exploitability during `aaaa`. Write `sla.risk` flag + comment. | Medium | Critical |
-| 3.3 | **Guided vuln discovery** | `a:sym.vuln <sink>` — use symbolic execution to find concrete input reaching a dangerous sink (e.g., `gets()` or unchecked `memcpy`). Output includes input constraints in SMT-LIB2 and concrete model. | Medium | High |
-| 3.4 | **Crypto detection** | Detect crypto algorithms by IL patterns: S-box constants (AES), round constants (SHA), Feistel structure. Flag functions as `sla.crypto.aes`, etc. | Medium | Medium |
-| 3.5 | **Integer overflow detection** | Flag arithmetic operations on user-controlled values that lack bounds checks before use as array indices or allocation sizes. | Medium | High |
-| 3.6 | **Path predicate export** | Export path constraints as SMT-LIB2 for external solvers or integration with fuzzing harnesses. | Low | Medium |
-
-### Phase 4 — Inter-Procedural Analysis (the hard problems)
-
-| # | Feature | Description | Effort | Impact |
-|---|---------|-------------|--------|--------|
-| 4.1 | **Function summaries** | Cache per-function symbolic summaries: which inputs affect which outputs, what gets tainted, what's returned. Enables inter-procedural without full inlining. | High | Critical |
-| 4.2 | **Inter-procedural taint** | Taint analysis spanning function boundaries using summaries. `input:argv` reaching `strcpy` in a callee three levels deep. | High | Critical |
-| 4.3 | **Call graph with data flow** | Build a call graph where edges carry data-flow information (which args of caller flow to which params of callee). | High | High |
-| 4.4 | **Whole-program type inference** | Unify types across function boundaries: if `foo()` returns a `struct stat*` and `bar()` receives it, propagate the struct type into `bar`'s parameter. | High | High |
-| 4.5 | **Context-sensitive decompilation** | When decompiling `foo(x)`, look at callers to determine likely type/range of `x`. Annotate decompiled output with "called from: ..." context. | High | Medium |
-
-### Phase 5 — Symbolic Execution & Concolic (the smart engine)
-
-| # | Feature | Description | Effort | Impact |
-|---|---------|-------------|--------|--------|
-| 5.1 | **Interactive symbolic execution** | `a:sym.explore` and `a:sym.solve` commands with user-specified targets, constraints, and hooks. | Medium | High |
-| 5.2 | **Memory in solutions** | Include concrete memory layout (heap, stack, globals) in symbolic path output, not just register values. | Low | Medium |
-| 5.3 | **Concolic execution** | Concrete + symbolic hybrid guided by ESIL traces from r2's debugger. Run the binary, record a trace, symbolically explore alternatives. | High | High |
-| 5.4 | **Symbolic call stubs** | Auto-generate symbolic stubs for common libc functions (`strlen` returns symbolic length, `malloc` returns fresh symbolic pointer). | Medium | High |
-| 5.5 | **Constraint caching** | Cache Z3 queries per function so repeated solves (e.g., during fuzzing integration) don't redundantly re-solve. | Medium | Medium |
-
-### Phase 6 — Platform & Architecture Expansion
-
-| # | Feature | Description | Effort | Impact |
-|---|---------|-------------|--------|--------|
-| 6.1 | **ABI/calling-convention model** | Abstract architecture-specific assumptions (arg registers, stack direction, alignment) into a data model. Currently hardcoded for SysV x86-64 in `variable.rs`, `types.rs`, `taint.rs`. | Medium | High |
-| 6.2 | **RISC-V support** | Add RISC-V Sleigh spec + register profile + calling convention. **Execution priority: P0 (Milestone C).** | Medium | Medium |
-| 6.3 | **AArch64 / ARM64 support** | Full ARM64 support with AAPCS64 calling convention. | Medium | Medium |
-| 6.4 | **PPC / AVR / SPARC** | Additional architecture support with per-arch test fixtures. | Medium | Low |
-| 6.5 | **Register naming policy** | Normalize register names, resolve overlapping aliases (RAX vs EAX vs AX vs AL). Use canonical names in decompiled output. | Low | Medium |
-| 6.6 | **Floating-point type inference** | Properly distinguish float/double from integer types using SSA float opcodes. | Low | Low |
-
-### Phase 7 — Advanced Analysis & Research
-
-| # | Feature | Description | Effort | Impact |
-|---|---------|-------------|--------|--------|
-| 7.1 | **Memory/value-set analysis** | Alias-aware abstract interpretation tracking value ranges and pointer targets. Enables more precise taint, slicing, and decompilation. | High | High |
-| 7.2 | **R2IL VM + event tracing** | Make R2IL executable with concrete values. Record execution traces with events (mem read/write, branch taken). Compare static vs dynamic analysis. | High | Medium |
-| 7.3 | **Semantic diff** | Compare two functions (or two versions of a binary) for semantic differences at the SSA level. Highlight what changed in the decompiled output. | High | Medium |
-| 7.4 | **Pattern matching DSL** | User-defined IL patterns for custom detection. "Find all functions that read from `[user_input + *]` and pass it to `exec*`." | Medium | Medium |
-| 7.5 | **Incremental analysis** | When the user annotates a type or renames a variable, incrementally update SSA/taint/decompilation without re-lifting the whole function. | High | Medium |
-| 7.6 | **Decompiler output diffing** | When types/signatures change, show a diff of the decompiled C output. Useful for iterative reverse engineering. | Low | Low |
-
-Integration Architecture
+Current State (Apr 2026)
 ------------------------
 
-The key insight: r2sleigh hooks into radare2's analysis pipeline at every
-stage, consuming r2's metadata and pushing results back. The user never
-invokes r2sleigh directly — it's just "r2 but smarter."
+The core architecture reset is done.
 
-```
-radare2 analysis pipeline          r2sleigh hooks
-─────────────────────────          ──────────────
-aa  (basic analysis)
- └─ af (find functions)     ──→   analyze_fcn: SSA + annotations
- └─ afva (find vars)        ──→   recover_vars: SSA-derived stack vars + reg args
- └─ aar (find refs)         ──→   get_data_refs: SSA-derived data/code/string refs
+Completed high-value work:
 
-aaa (deeper analysis)
- └─ aan (autoname)          ──→   [NEW] autoname from decompiler heuristics
- └─ DWARF integration       ──→   [NEW] DWARF types → ExternalTypeDb → decompiler
- └─ afcfj (signatures)      ──→   already consumed by a:sla.dec
- └─ tsj (type structs)      ──→   already consumed by a:sla.dec
+- canonical `r2sym::SemanticArtifact` ownership
+- canonical evidence and plan surfaces in `r2sym`
+- `FunctionFacts` as the combined type+semantic contract
+- removal of legacy mirrored symbolic/type ownership
+- planner-gated symbolic query routing
+- target-local narrowing with explicit ambiguity handling
+- decompiler planner/consumer split
+- canonical VM summary routing in decompiler/plugin
+- explicit semantic schema/cache versioning
+- end-to-end plugin transport on canonical facts/plans
+- strong `r2r` coverage and full validation bar
 
-aaaa (experimental)
- └─ post_analysis            ──→   taint analysis + risk scoring + xrefs
- └─ [NEW]                   ──→   write-back inferred types to sdb_types
- └─ [NEW]                   ──→   write-back function signatures to afcc
- └─ [NEW]                   ──→   flag risky functions with sla.risk.*
+The system is no longer missing foundations. The next work is about using those
+foundations better across the whole stack.
 
-User commands (transparent)
- └─ pdd / pdD               ──→   [NEW] alias to a:sla.dec
- └─ a:sla.dec               ──→   decompile with full context from r2
- └─ a:sla.taint             ──→   taint current function
- └─ a:sym.solve <addr>      ──→   solve for reachability
-```
+Strategic Principles
+--------------------
 
-### Data Flow: r2 → r2sleigh → r2
+1. One subsystem, not many tools.
+   - `r2il`, `r2ssa`, `r2sym`, `r2types`, `r2dec`, `r2plugin`, and
+     `../radare2` should behave like one analysis engine.
 
-```
-                    ┌──────────────┐
-                    │   radare2    │
-                    │              │
-  ┌─────────────────┤  sdb_types   │◄──────── DWARF / PDB / user annotations
-  │                 │  flags       │
-  │                 │  xrefs       │
-  │                 │  afcfj       │
-  │                 │  afvj        │
-  │                 │  tsj         │
-  │                 │  aflj        │
-  │                 └──────┬───────┘
-  │                        │ JSON
-  │                        ▼
-  │                 ┌──────────────┐
-  │                 │  r2sleigh    │
-  │                 │              │
-  │                 │  R2IL lift   │
-  │                 │  SSA build   │
-  │                 │  Type infer  │
-  │                 │  Decompile   │
-  │                 │  Taint       │
-  │                 │  SymExec     │
-  │                 └──────┬───────┘
-  │                        │ JSON + C strings
-  │                        ▼
-  │                 ┌──────────────┐
-  │ write-back ────►│   radare2    │
-  │  types          │              │
-  │  signatures     │  sdb_types ← inferred struct shapes
-  │  variables      │  afcc     ← detected calling convention
-  │  names          │  flags    ← taint/risk/crypto flags
-  │  xrefs          │  xrefs   ← taint-flow + data refs
-  │  comments       │  comments ← taint summaries, risk scores
-  └─────────────────┤  afn     ← auto-named functions
-                    └──────────────┘
-```
+2. Optimize for typed ownership, not command growth.
+   - The best improvements are deeper integration and stronger facts, not
+     additional verbs.
 
-Comparison
+3. Optimize for practical asymptotics.
+   - aim for `O(1)` / `O(log n)` lookups
+   - `O(n)` passes where possible
+   - bounded search where unavoidable
+   - summaries and incremental reuse everywhere else
+
+4. Prefer principled rewrites over downstream patchwork.
+
+5. Determinism beats cleverness.
+
+What Is Done
+------------
+
+### 1. Canonical Semantic Rewrite
+
+Done:
+
+- `r2sym` is the semantic owner
+- evidence and ambiguity are first-class
+- query routing is planner-gated
+- target-local narrowing is authoritative and source-consistent
+- symbolic artifact transport is canonical across plugin/export surfaces
+
+### 2. Consumer Hardening
+
+Done:
+
+- `r2types` consumes canonical semantics through `FunctionFacts`
+- `r2dec` routes through planner + consumer modules
+- VM decompile path is honest summary mode instead of pretending to be native
+- plugin JSON/reporting is on canonical facts and plan fields
+
+### 3. Decompiler/Plugin Integration
+
+Done:
+
+- canonical semantic route planning
+- VM summary rendering route
+- combined facts/plan reporting
+- strong `r2r` coverage for the new paths
+
+What Is Not Done
+----------------
+
+The biggest remaining gains are not foundational rewrites. They are whole-stack
+intelligence improvements:
+
+- shared assumption model
+- deeper reuse of interprocedural summaries across all consumers
+- trace/replay as a first-class validation loop
+- richer semantic type algebra
+- stronger VM semantic rendering
+- narrower and more native plugin surface
+
+Priority Order
+--------------
+
+The real implementation order from here is:
+
+`P0 assumptions -> P1 summary reuse -> P2 replay loop -> P3 semantic typing ->
+P4 VM semantics -> P5 command-surface rationalization -> P6 incremental/perf`
+
+### P0 — Shared Assumption Model
+
+Goal:
+
+Turn the subsystem into an interactive reasoning engine instead of a static
+batch analyzer.
+
+Deliverables:
+
+- canonical typed assumption model across `r2ssa`, `r2sym`, and `r2types`
+- explicit persistence or transport seam through plugin and, if needed,
+  `../radare2`
+- incremental recomputation of affected analyses
+- assumptions influence:
+  - query narrowing
+  - branch feasibility
+  - type/layout recovery
+  - decompiler simplification
+
+Why this is highest ROI:
+
+- users often know one critical fact the engine does not
+- this amplifies every existing subsystem instead of adding a silo
+
+Success criteria:
+
+- one assumption set changes query, types, and decompiler coherently
+- assumptions are explicit, typed, serializable, and test-covered
+
+### P1 — Promote Interprocedural Summaries To Whole-Stack Inputs
+
+Goal:
+
+The summaries already present in `r2sym` should stop being mostly query power
+and start being a shared strength across the subsystem.
+
+Deliverables:
+
+- summary-driven return/value-shape hints for `r2types`
+- summary-driven helper-call simplification for `r2dec`
+- summary-backed applicability/evidence surfaced in function facts
+- stricter reuse of library and derived summaries instead of rediscovery
+
+Why:
+
+- interproc summary work already exists in `r2sym`
+- downstream consumers currently leave too much value on the table
+
+Success criteria:
+
+- better out-param inference
+- better return-shape inference
+- better helper-call rendering
+- fewer downstream local heuristics
+
+### P2 — Replay And Trace As First-Class Validation
+
+Goal:
+
+Make debugger state and replay checkpoints part of the normal semantic loop.
+
+Deliverables:
+
+- replay seeds as canonical engine input, not just expert-only path control
+- typed import of debugger/trace state
+- witness validation against replayed state
+- static-vs-observed semantic mismatch reporting
+
+Why:
+
+- this is the cleanest bridge between static and dynamic reasoning
+- replay infrastructure already exists and needs promotion, not reinvention
+
+Success criteria:
+
+- replay and witness validation share canonical semantic state
+- observed state can refine confidence without becoming semantic owner
+
+### P3 — Semantic Type Algebra V2
+
+Goal:
+
+Make `r2types` consume more of the semantic artifact than memory terms alone.
+
+Deliverables:
+
+- use `pre`, `post`, `control`, and `targets` alongside memory facts
+- use diagnostics and residual reasons to refuse unsafe projections
+- infer:
+  - out-params
+  - return shape
+  - field applicability
+  - layout confidence
+
+Why:
+
+- current type recovery is useful but still too memory-led
+- this is the biggest non-query value gap
+
+Success criteria:
+
+- fewer unsafe struct candidates
+- stronger return/out-param recovery
+- cleaner agreement between types and decompiler output
+
+### P4 — VM Semantic Rendering V2
+
+Goal:
+
+Move VM analysis from summary comments toward structured semantic rendering.
+
+Deliverables:
+
+- selector recovery
+- handler graph summaries
+- guarded transfer summaries
+- switch-like pseudo-C from canonical VM semantics
+
+Non-goal:
+
+- do not start with a fake "full VM decompiler"
+
+Why:
+
+- current VM path is honest but leaves value on the table
+
+Success criteria:
+
+- VM functions render as structured semantic summaries, not just comments
+- VM routes remain explicitly marked as summary-driven where appropriate
+
+### P5 — Public Surface Rationalization
+
+Goal:
+
+Make the plugin feel native to radare2 instead of exposing every internal stage
+as a first-class user command.
+
+Deliverables:
+
+- define public vs debug command tiers
+- move config-like behaviors to `e anal.sleigh.*`
+- enrich existing radare2 views instead of growing more plugin verbs
+- keep expert inspection surfaces available, but demoted
+
+Why:
+
+- command count is not a quality metric
+- intelligent integration should reduce, not expand, user-visible surface area
+
+Success criteria:
+
+- fewer public commands
+- stronger existing radare2 workflows
+- less need for users to think in crate boundaries
+
+### P6 — Incremental And Performance Discipline
+
+Goal:
+
+Turn the subsystem into a cheaper engine to run repeatedly.
+
+Deliverables:
+
+- stronger summary caches
+- fewer repeated full-function passes
+- explicit invalidation and reuse boundaries
+- budget-aware scheduling
+- deterministic cache keys and cost-aware planners
+
+Why:
+
+- the architecture is now clean enough that the next gains come from reuse
+
+Success criteria:
+
+- repeated analysis gets cheaper
+- large-CFG behavior stays bounded
+- downstream consumers reuse upstream work instead of re-deriving it
+
+Per-Crate Direction
+-------------------
+
+### `r2il` / `r2sleigh-lift`
+
+Keep the IL small, typed, and architecture-faithful. Extend only when new
+semantics are truly canonical across the stack.
+
+### `r2ssa`
+
+Focus on:
+
+- prepared facts
+- deterministic SSA
+- incremental recomputation hooks
+- assumption-aware control/dataflow preparation
+
+### `r2sym`
+
+Focus on:
+
+- semantic artifact authority
+- evidence algebra
+- query planning
+- summaries
+- replay
+- witness generation
+- summary composition across consumers
+
+### `r2types`
+
+Focus on:
+
+- semantic type algebra
+- stronger `FunctionFacts`
+- candidate ranking and refusal logic
+- struct/signature/layout confidence
+
+### `r2dec`
+
+Focus on:
+
+- rendering from canonical plans/facts
+- less local planning
+- stronger helper/summary interpretation
+- VM structured summary rendering
+
+### `r2plugin`
+
+Focus on:
+
+- orchestration
+- JSON shaping
+- radare2-native integration
+- shrinking the public surface over time
+
+### `../radare2`
+
+Focus on:
+
+- typed collectors
+- persistence of shared analysis metadata
+- debugger/trace seams that should exist for all consumers
+
+Anti-Goals
 ----------
 
-### vs radare2 (stock)
+Do not spend roadmap energy on:
 
-r2sleigh adds: SSA form, phi nodes, def-use chains, dominator tree,
-symbolic execution, taint analysis, path exploration, Z3 solving, typed
-decompilation, constraint-based type inference, vulnerability detection,
-risk scoring, automatic function naming from decompiler heuristics.
+- command count inflation
+- plugin-side reparsing of existing commands
+- parallel type or semantic owners
+- decompiler-local policy that should live upstream
+- pretending hard analyses are "`O(1)`"
 
-### vs angr
+If a change improves the subsystem by deleting a command, moving an owner, or
+rewriting a seam, that is progress.
 
-r2sleigh provides: zero-friction radare2 integration (no Python, no
-separate process), CLI-first workflow, Sleigh specs (vs VEX), JSON
-output for scripting, per-function taint during `aaaa`, decompiler
-output, no Python overhead. angr has: mature inter-procedural analysis,
-larger community, more memory models.
+Acceptance Standard
+-------------------
 
-### vs Ghidra
+The target plugin system should eventually have these properties:
 
-r2sleigh provides: exposed SSA for scripting, integrated symbolic
-execution, automatic taint analysis with risk scoring, vulnerability
-pattern detection, native CLI operation, no JVM dependency, incremental
-results during analysis. Ghidra has: more mature decompiler,
-inter-procedural type propagation (which we're building in Phase 4),
-larger architecture coverage.
+- a user can rely on normal radare2 workflows and quietly get better analysis
+- symex, types, decompiler, and replay agree on the same facts
+- assumptions update the whole subsystem coherently
+- summaries are reused across crates instead of being rediscovered
+- evidence and fallback reasons are visible and honest
+- the public command surface is smaller and smarter, not larger
 
-### vs Binary Ninja
-
-r2sleigh provides: fully open source, no license cost, Sleigh specs
-(broadest architecture coverage), integrated symbolic execution and
-taint analysis, CLI-native workflow, r2pipe scriptability. Binary Ninja
-has: polished GUI, MLIL/HLIL abstraction layers, commercial support.
-
-**The goal**: combine the best of all four — Ghidra's Sleigh specs,
-angr's symbolic execution, Binary Ninja's type inference quality, and
-radare2's CLI-first hackability — into a single transparent analysis
-engine that just works when you type `aaa`.
-
-References
-----------
-
-- radare2 ESIL: https://book.rada.re/disassembling/esil.html
-- Ghidra Sleigh: https://ghidra.re/courses/languages/html/sleigh.html
-- P-code reference: https://ghidra.re/courses/languages/html/pcoderef.html
+That is the gold standard we should optimize toward.
