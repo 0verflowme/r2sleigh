@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use r2il::{ArchSpec, R2ILBlock};
 use serde::{Deserialize, Serialize};
 
+use crate::AssumptionSet;
 use crate::block::SSABlock as LocalSSABlock;
 use crate::cfg::{CFG, CFGEdge};
 use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_slice_from_var};
@@ -156,6 +157,20 @@ impl SsaArtifact {
         &self.facts
     }
 
+    pub fn with_assumptions(&self, assumptions: &AssumptionSet) -> Self {
+        let facts = PreparedFunctionFacts::collect_with_assumptions(
+            &self.function,
+            &self.graph,
+            assumptions,
+        );
+        Self {
+            function: self.function.clone(),
+            graph: self.graph.clone(),
+            mode: self.mode,
+            facts,
+        }
+    }
+
     pub fn objects(&self) -> &ObjectModel {
         &self.facts.objects
     }
@@ -170,6 +185,14 @@ impl SsaArtifact {
 
     pub fn call_sites(&self) -> &CallSiteFacts {
         &self.facts.call_sites
+    }
+
+    pub fn resolved_call_target(&self, call: &crate::semantic::CallSiteFact) -> Option<u64> {
+        call.direct_target.or_else(|| {
+            let value_id = canonical_root_value_id(self, call.target);
+            let var = self.value_var(value_id)?;
+            parse_literal_value_name(&var.name)
+        })
     }
 
     pub fn value_var(&self, value_id: crate::graph::ValueId) -> Option<&SSAVar> {
@@ -223,6 +246,58 @@ impl SsaArtifact {
             })
             .collect()
     }
+}
+
+fn canonical_root_value_id(
+    prepared: &SsaArtifact,
+    value_id: crate::graph::ValueId,
+) -> crate::graph::ValueId {
+    let Some(facts) = prepared.function().decompile_prep_facts() else {
+        return value_id;
+    };
+    let Some(start) = prepared.value_var(value_id) else {
+        return value_id;
+    };
+    let mut current = start.clone();
+    let mut current_id = value_id;
+    for _ in 0..32 {
+        let Some(next) = facts.canonical_root_of(&current) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        let Some(next_id) = prepared.graph().value_id_for_var(next) else {
+            break;
+        };
+        current = next.clone();
+        current_id = next_id;
+    }
+    current_id
+}
+
+fn parse_literal_value_name(name: &str) -> Option<u64> {
+    let value_str = if let Some(value) = name.strip_prefix("const:") {
+        value
+    } else if let Some(value) = name.strip_prefix("ram:") {
+        value
+    } else {
+        return None;
+    };
+    let value_str = value_str.split('_').next().unwrap_or(value_str);
+    if let Some(dec) = value_str
+        .strip_prefix("0d")
+        .or_else(|| value_str.strip_prefix("0D"))
+    {
+        return dec.parse().ok();
+    }
+    if let Some(hex) = value_str
+        .strip_prefix("0x")
+        .or_else(|| value_str.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    value_str.parse().ok()
 }
 
 impl Deref for SsaArtifact {
@@ -2856,6 +2931,51 @@ mod tests {
             .expect("call site fact");
         assert_eq!(call.direct_target, Some(0x401239));
         assert_eq!(call.fallthrough, Some(0x1304));
+    }
+
+    #[test]
+    fn symbolic_function_ssa_recovers_indirect_call_target_from_copied_ram_literal() {
+        let tmp = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x10,
+            size: 8,
+            meta: None,
+        };
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1310,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: tmp.clone(),
+                        src: make_ram(0x1400a6010, 8),
+                    },
+                    R2ILOp::CallInd { target: tmp },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1314,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared =
+            SsaArtifact::for_symbolic(&blocks, None).expect("symbolic prepared SSA should build");
+        let call = prepared
+            .call_sites()
+            .by_id
+            .values()
+            .next()
+            .expect("call site fact");
+        assert_eq!(call.direct_target, Some(0x1400a6010));
+        assert_eq!(call.fallthrough, Some(0x1314));
     }
 
     #[test]

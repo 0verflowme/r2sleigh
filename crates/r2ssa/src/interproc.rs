@@ -322,6 +322,18 @@ impl AbiProfile {
         }
     }
 
+    pub fn windows_x64() -> Self {
+        Self::new(
+            vec![
+                ("rcx", 8, &["ecx", "cx", "cl"][..]),
+                ("rdx", 8, &["edx", "dx", "dl"][..]),
+                ("r8", 8, &["r8d", "r8w", "r8b"][..]),
+                ("r9", 8, &["r9d", "r9w", "r9b"][..]),
+            ],
+            &[("rax", &["eax", "ax", "al"][..])],
+        )
+    }
+
     fn new(
         args: Vec<(&'static str, u32, &'static [&'static str])>,
         rets: &[(&'static str, &'static [&'static str])],
@@ -363,6 +375,13 @@ impl AbiProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SummaryOperand {
+    Arg(usize),
+    Const(u64),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallArgObservation {
     Arg(usize),
     Const(u64),
     Unknown,
@@ -1277,6 +1296,26 @@ fn collect_call_arg_state(
     by_call
 }
 
+pub fn observe_call_arguments(
+    prepared: &SsaArtifact,
+    abi: &AbiProfile,
+) -> BTreeMap<CallSiteId, Vec<CallArgObservation>> {
+    collect_call_arg_state(prepared, abi)
+        .into_iter()
+        .map(|(call_id, args)| {
+            let args = args
+                .into_iter()
+                .map(|arg| match arg {
+                    SummaryOperand::Arg(idx) => CallArgObservation::Arg(idx),
+                    SummaryOperand::Const(value) => CallArgObservation::Const(value),
+                    SummaryOperand::Unknown => CallArgObservation::Unknown,
+                })
+                .collect();
+            (call_id, args)
+        })
+        .collect()
+}
+
 fn merge_pred_states(
     in_states: &BTreeMap<u64, BTreeMap<usize, ValueId>>,
     preds: &[u64],
@@ -1656,6 +1695,18 @@ mod tests {
         arch.add_register(RegisterDef::new("rax", 0, 8));
         arch.add_register(RegisterDef::new("rdi", 8, 8));
         arch.add_register(RegisterDef::new("rip", 16, 8));
+        arch
+    }
+
+    fn windows_x64_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rcx", 8, 8));
+        arch.add_register(RegisterDef::new("rdx", 16, 8));
+        arch.add_register(RegisterDef::new("r8", 24, 8));
+        arch.add_register(RegisterDef::new("r9", 32, 8));
+        arch.add_register(RegisterDef::new("rip", 40, 8));
         arch
     }
 
@@ -2177,5 +2228,43 @@ mod tests {
             "store address should resolve to arg0-1, got {location:?}; addr={addr:?}; ops={:?}",
             block.ops
         );
+    }
+
+    #[test]
+    fn windows_x64_call_arg_observer_tracks_registration_handler_constant() {
+        let arch = windows_x64_arch();
+        let prepared = SsaArtifact::for_symbolic(
+            &[block(
+                0x5000,
+                vec![
+                    R2ILOp::Copy {
+                        dst: reg(8, 8),
+                        src: c(1, 8),
+                    },
+                    R2ILOp::Copy {
+                        dst: reg(16, 8),
+                        src: c(0x1400_3d0f, 8),
+                    },
+                    R2ILOp::Call {
+                        target: c(0x1800_1000, 8),
+                    },
+                    R2ILOp::Return { target: c(0, 8) },
+                ],
+            )],
+            Some(&arch),
+        )
+        .expect("ssa");
+
+        let observations = observe_call_arguments(&prepared, &AbiProfile::windows_x64());
+        let call_id = prepared
+            .call_sites()
+            .by_id
+            .keys()
+            .next()
+            .copied()
+            .expect("callsite");
+        let args = observations.get(&call_id).expect("call args");
+        assert_eq!(args.first(), Some(&CallArgObservation::Const(1)));
+        assert_eq!(args.get(1), Some(&CallArgObservation::Const(0x1400_3d0f)));
     }
 }

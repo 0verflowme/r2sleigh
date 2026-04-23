@@ -8,6 +8,7 @@ use crate::external::{
     normalize_external_type_name,
 };
 use crate::facts::{FunctionParamSpec, FunctionSignatureSpec, FunctionType, parse_type_like_spec};
+use crate::signature_infer::render_signature_type;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternalRegisterParamSpec {
@@ -39,6 +40,7 @@ pub struct ParsedExternalContext {
     // Legacy compatibility view derived from canonical stack_slots.
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
+    pub assumptions: r2ssa::AssumptionSet,
     pub diagnostics: Vec<String>,
     pub callconv: Option<String>,
     pub noreturn: bool,
@@ -206,6 +208,8 @@ pub struct ExternalContextJson {
     pub base_types: Vec<ExternalBaseTypeJson>,
     #[serde(default)]
     pub known_signatures: Vec<KnownSignatureJson>,
+    #[serde(default)]
+    pub assumptions: Vec<r2ssa::AnalysisAssumption>,
 }
 
 pub fn normalize_function_basename(name: &str) -> String {
@@ -338,8 +342,77 @@ pub fn parse_external_context_json(json_str: &str, ptr_bits: u32) -> ParsedExter
         parsed.current_signature.clone(),
         &parsed.register_params,
     );
+    parsed.assumptions = imported_assumptions_from_context(
+        &raw.assumptions,
+        &parsed.register_params,
+        &parsed.stack_slots,
+        &parsed.external_type_db,
+        ptr_bits,
+    );
 
     parsed
+}
+
+fn imported_assumptions_from_context(
+    explicit: &[r2ssa::AnalysisAssumption],
+    register_params: &[ExternalRegisterParamSpec],
+    stack_slots: &BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    type_db: &ExternalTypeDb,
+    ptr_bits: u32,
+) -> r2ssa::AssumptionSet {
+    let mut assumptions = r2ssa::AssumptionSet::new(explicit.to_vec());
+    let mut maybe_push_type_hints = |subject: r2ssa::AssumptionSubject, ty: &CTypeLike| {
+        let ty_name = render_signature_type(ty, ptr_bits);
+        assumptions.push(r2ssa::AnalysisAssumption {
+            id: None,
+            subject: subject.clone(),
+            value: r2ssa::AssumptionValue::TypeHint { ty: ty_name },
+            scope: r2ssa::AssumptionScope::Function,
+            provenance: r2ssa::AssumptionProvenance::ImportedContext,
+        });
+        if let CTypeLike::Enum(name) = ty
+            && let Some(external_enum) = type_db.enums.get(name)
+        {
+            assumptions.push(r2ssa::AnalysisAssumption {
+                id: None,
+                subject,
+                value: r2ssa::AssumptionValue::EnumDomain {
+                    name: Some(external_enum.name.clone()),
+                    values: external_enum.variants.keys().copied().collect(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::ImportedContext,
+            });
+        }
+    };
+    for reg in register_params {
+        if let Some(ty) = reg.ty.as_ref() {
+            maybe_push_type_hints(
+                r2ssa::AssumptionSubject::Register {
+                    name: reg.reg.clone(),
+                },
+                ty,
+            );
+        }
+    }
+    for (slot_key, slot) in stack_slots {
+        if let Some(ty) = slot.ty.as_ref() {
+            maybe_push_type_hints(
+                r2ssa::AssumptionSubject::StackSlot {
+                    base: slot_key
+                        .base
+                        .legacy_name()
+                        .unwrap_or_else(|| "stack".to_string()),
+                    offset: slot_key.offset,
+                },
+                ty,
+            );
+            if let Some(index) = slot.param_index {
+                maybe_push_type_hints(r2ssa::AssumptionSubject::Parameter { index }, ty);
+            }
+        }
+    }
+    assumptions
 }
 
 fn parse_signature_json(

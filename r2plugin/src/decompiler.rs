@@ -45,14 +45,12 @@ pub(crate) fn decompiler_input_from_artifact(
     let FunctionAnalysisArtifact {
         ssa_func,
         function_facts,
-        interproc_summary_set,
         ..
     } = artifact;
     r2dec::DecompilerInput::new(
         ssa_func,
         build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits),
     )
-    .with_interproc_summary_set(interproc_summary_set)
 }
 
 fn rename_function_artifact_for_display(
@@ -64,14 +62,13 @@ fn rename_function_artifact_for_display(
         pattern_ssa_func,
         function_facts,
         writeback_plan,
-        interproc_summary_set,
+        ..
     } = artifact;
     FunctionAnalysisArtifact {
         ssa_func: ssa_func.with_name(function_name),
         pattern_ssa_func: pattern_ssa_func.with_name(function_name),
         function_facts,
         writeback_plan,
-        interproc_summary_set,
     }
 }
 
@@ -110,7 +107,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 if let Some(route) = r2dec::detached_semantic_route_plan(
                     &display_func_name,
                     &r2il_blocks,
-                    artifact.function_facts.semantics.as_ref(),
+                    &artifact.function_facts,
                 ) {
                     if let r2dec::SemanticRoutePlan::FallbackComment { comment } = route {
                         return comment;
@@ -137,7 +134,10 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 if let Some(route) = r2dec::detached_semantic_route_plan(
                     &display_func_name,
                     &r2il_blocks,
-                    precomputed_semantic_artifact.as_ref(),
+                    &r2types::FunctionFacts::new(
+                        r2types::FunctionTypeFacts::default(),
+                        precomputed_semantic_artifact.clone(),
+                    ),
                 ) {
                     if let r2dec::SemanticRoutePlan::FallbackComment { comment } = route {
                         return comment;
@@ -173,7 +173,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
             if let Some(route) = r2dec::detached_semantic_route_plan(
                 &display_func_name,
                 &r2il_blocks,
-                artifact.function_facts.semantics.as_ref(),
+                &artifact.function_facts,
             ) {
                 match route {
                     r2dec::SemanticRoutePlan::VmSummary { .. } => {

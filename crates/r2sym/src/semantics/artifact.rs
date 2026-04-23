@@ -1,15 +1,23 @@
 use serde::{Deserialize, Serialize};
 
 use super::plan::{
-    ArtifactBuildPlan, DecompilePlan, QueryPlan, TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
-    derive_artifact_build_plan, derive_decompile_plan, derive_query_plan, derive_target_query_plan,
-    derive_target_query_route_plan, derive_type_plan,
+    ArtifactBuildPlan, DecompilePlan, QueryPlan, TargetQueryExecutionRoute, TargetQueryPlan,
+    TargetQueryRoutePlan, TypePlan, derive_artifact_build_plan, derive_decompile_plan,
+    derive_query_plan, derive_target_query_plan, derive_target_query_route_plan, derive_type_plan,
 };
 use super::region::{
     ArtifactGranularity, ExecutionModel, NativeArtifactBody, RefinementStage,
     SemanticArtifactDiagnostics, SemanticRegion, SemanticTargetConditionSource, VmArtifactBody,
 };
 use super::vm::InterpreterKind;
+
+#[derive(Debug, Clone)]
+pub(crate) struct TargetQueryRouteInput<'a> {
+    pub(crate) route: TargetQueryRoutePlan,
+    pub(crate) condition_source: Option<SemanticTargetConditionSource<'a>>,
+    pub(crate) memory_terms: Vec<&'a crate::backward::BackwardMemoryCondition>,
+    pub(crate) allow_exact_proof: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SliceClass {
@@ -394,6 +402,22 @@ impl SemanticArtifact {
         self
     }
 
+    fn downgrade_query_route_to_residual(
+        route: TargetQueryRoutePlan,
+        reason: impl Into<String>,
+    ) -> TargetQueryRoutePlan {
+        let mut reasons = match route.execution {
+            TargetQueryExecutionRoute::ResidualOnly { reasons } => reasons,
+            TargetQueryExecutionRoute::Refuse { reason } => vec![reason],
+            _ => Vec::new(),
+        };
+        reasons.push(reason.into());
+        TargetQueryRoutePlan {
+            target_plan: route.target_plan,
+            execution: TargetQueryExecutionRoute::ResidualOnly { reasons },
+        }
+    }
+
     fn has_native_semantics(&self) -> bool {
         self.native_body()
             .is_some_and(|body| !body.regions.is_empty())
@@ -462,7 +486,7 @@ impl SemanticArtifact {
     pub fn target_query_route_plan(&self, target_addr: u64) -> TargetQueryRoutePlan {
         let query_plan = self.query_plan();
         let target_plan = self.target_query_plan(target_addr);
-        let authoritative_region = self.authoritative_region_for_target(target_addr, false);
+        let condition_source = self.target_condition_source(target_addr, false);
         let authoritative_memory_region = self.authoritative_memory_region_for_target(target_addr);
         let has_memory_guidance = authoritative_memory_region.is_some_and(|region| {
             !region
@@ -472,9 +496,40 @@ impl SemanticArtifact {
         derive_target_query_route_plan(
             &query_plan,
             &target_plan,
-            authoritative_region.is_some() || authoritative_memory_region.is_some(),
+            self.execution,
+            condition_source.is_some(),
             has_memory_guidance,
         )
+    }
+
+    pub(crate) fn target_query_route_input<'a>(
+        &'a self,
+        target_addr: u64,
+        assumption_conflicted: bool,
+    ) -> TargetQueryRouteInput<'a> {
+        let mut route = self.target_query_route_plan(target_addr);
+        let canonical_source = self.target_condition_source(target_addr, false);
+        let memory_terms = self
+            .authoritative_memory_region_for_target(target_addr)
+            .map(|region| region.actionable_memory_terms_for_target(target_addr))
+            .unwrap_or_default();
+        if assumption_conflicted {
+            route = Self::downgrade_query_route_to_residual(route, "assumption conflict");
+        }
+        if self.target_has_ambiguous_sources(target_addr) {
+            route = Self::downgrade_query_route_to_residual(
+                route,
+                "conflicting target guidance sources",
+            );
+        }
+        let allow_exact_proof =
+            !assumption_conflicted && !self.target_has_ambiguous_sources(target_addr);
+        TargetQueryRouteInput {
+            route,
+            condition_source: canonical_source,
+            memory_terms,
+            allow_exact_proof,
+        }
     }
 
     pub fn type_plan(&self) -> TypePlan {

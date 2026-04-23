@@ -3,7 +3,7 @@
 //! This module provides a CFG data structure built from r2il blocks,
 //! which is the foundation for inter-procedural SSA analysis.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -203,6 +203,136 @@ impl BasicBlock {
     }
 }
 
+fn op_direct_control_target(op: &R2ILOp) -> Option<u64> {
+    match op {
+        R2ILOp::Branch { target } | R2ILOp::CBranch { target, .. } => {
+            BasicBlock::extract_const_addr(target)
+        }
+        _ => None,
+    }
+}
+
+fn op_terminates_basic_block(op: &R2ILOp) -> bool {
+    matches!(
+        op,
+        R2ILOp::Branch { .. }
+            | R2ILOp::CBranch { .. }
+            | R2ILOp::BranchInd { .. }
+            | R2ILOp::Return { .. }
+    )
+}
+
+fn op_instruction_addr(block: &R2ILBlock, op_idx: usize) -> Option<u64> {
+    block
+        .op_metadata
+        .get(&op_idx)
+        .and_then(|metadata| metadata.instruction_addr)
+}
+
+fn split_internal_control_flow_targets(block: &R2ILBlock) -> Vec<R2ILBlock> {
+    if block.switch_info.is_some() || block.ops.is_empty() {
+        return vec![block.clone()];
+    }
+
+    let block_end = block.addr.saturating_add(block.size as u64);
+    if block_end <= block.addr {
+        return vec![block.clone()];
+    }
+
+    let instruction_addrs = block
+        .op_metadata
+        .values()
+        .filter_map(|metadata| metadata.instruction_addr)
+        .collect::<BTreeSet<_>>();
+    if instruction_addrs.is_empty() {
+        return vec![block.clone()];
+    }
+
+    let mut op_instruction_addrs = Vec::with_capacity(block.ops.len());
+    let mut last_instruction_addr = block.addr;
+    for op_idx in 0..block.ops.len() {
+        if let Some(instruction_addr) = op_instruction_addr(block, op_idx) {
+            last_instruction_addr = instruction_addr;
+        }
+        op_instruction_addrs.push(last_instruction_addr);
+    }
+
+    let mut split_points = BTreeSet::new();
+    for (op_idx, op) in block.ops.iter().enumerate() {
+        if let Some(target) = op_direct_control_target(op)
+            && target > block.addr
+            && target < block_end
+            && instruction_addrs.contains(&target)
+        {
+            split_points.insert(target);
+        }
+
+        if op_terminates_basic_block(op) {
+            let current_addr = op_instruction_addrs
+                .get(op_idx)
+                .copied()
+                .unwrap_or(block.addr);
+            let fallthrough = op_instruction_addrs
+                .iter()
+                .skip(op_idx + 1)
+                .copied()
+                .find(|addr| *addr > current_addr);
+            if let Some(fallthrough) = fallthrough
+                && fallthrough > block.addr
+                && fallthrough < block_end
+                && instruction_addrs.contains(&fallthrough)
+            {
+                split_points.insert(fallthrough);
+            }
+        }
+    }
+    if split_points.is_empty() {
+        return vec![block.clone()];
+    }
+
+    let mut starts = Vec::with_capacity(split_points.len() + 1);
+    starts.push(block.addr);
+    starts.extend(split_points);
+
+    let mut chunks = starts
+        .iter()
+        .enumerate()
+        .map(|(idx, &start)| {
+            let end = starts.get(idx + 1).copied().unwrap_or(block_end);
+            R2ILBlock {
+                addr: start,
+                size: end.saturating_sub(start).min(u32::MAX as u64) as u32,
+                ops: Vec::new(),
+                switch_info: None,
+                op_metadata: Default::default(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (op_idx, op) in block.ops.iter().cloned().enumerate() {
+        let instruction_addr = op_instruction_addrs
+            .get(op_idx)
+            .copied()
+            .unwrap_or(block.addr);
+        let chunk_idx = starts
+            .partition_point(|start| *start <= instruction_addr)
+            .saturating_sub(1)
+            .min(chunks.len().saturating_sub(1));
+        let next_op_idx = chunks[chunk_idx].ops.len();
+        chunks[chunk_idx].ops.push(op);
+        if let Some(metadata) = block.op_metadata.get(&op_idx) {
+            chunks[chunk_idx]
+                .op_metadata
+                .insert(next_op_idx, metadata.clone());
+        }
+    }
+
+    chunks
+        .into_iter()
+        .filter(|chunk| !chunk.ops.is_empty())
+        .collect()
+}
+
 /// A Control Flow Graph for a function.
 #[derive(Debug, Clone)]
 pub struct CFG {
@@ -257,8 +387,13 @@ impl CFG {
         let entry = blocks[0].addr;
         let mut cfg = Self::new(entry);
 
+        let normalized_blocks = blocks
+            .iter()
+            .flat_map(split_internal_control_flow_targets)
+            .collect::<Vec<_>>();
+
         // First pass: add all blocks as nodes
-        for block in blocks {
+        for block in &normalized_blocks {
             let bb = BasicBlock::from_r2il(block);
             cfg.add_block(bb);
         }
@@ -301,11 +436,17 @@ impl CFG {
                 true_target,
                 false_target,
             } => {
-                if let Some(&true_idx) = self.addr_to_node.get(&true_target) {
-                    self.graph.add_edge(node_idx, true_idx, CFGEdge::True);
-                }
-                if let Some(&false_idx) = self.addr_to_node.get(&false_target) {
-                    self.graph.add_edge(node_idx, false_idx, CFGEdge::False);
+                if true_target == false_target {
+                    if let Some(&target_idx) = self.addr_to_node.get(&true_target) {
+                        self.graph.add_edge(node_idx, target_idx, CFGEdge::Normal);
+                    }
+                } else {
+                    if let Some(&true_idx) = self.addr_to_node.get(&true_target) {
+                        self.graph.add_edge(node_idx, true_idx, CFGEdge::True);
+                    }
+                    if let Some(&false_idx) = self.addr_to_node.get(&false_target) {
+                        self.graph.add_edge(node_idx, false_idx, CFGEdge::False);
+                    }
                 }
             }
             BlockTerminator::Call { fallthrough, .. }
@@ -526,7 +667,7 @@ impl CFG {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
+    use r2il::{OpMetadata, R2ILBlock, R2ILOp, SpaceId, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
         Varnode {
@@ -886,5 +1027,125 @@ mod tests {
             cfg.block_addrs().collect::<Vec<_>>(),
             vec![0x1000, 0x1004, 0x1008]
         );
+    }
+
+    #[test]
+    fn test_internal_pcode_branch_target_splits_block() {
+        let mut op_metadata = std::collections::BTreeMap::new();
+        for op_idx in 0..3 {
+            op_metadata.insert(
+                op_idx,
+                OpMetadata {
+                    instruction_addr: Some(0x1000),
+                    ..Default::default()
+                },
+            );
+        }
+        op_metadata.insert(
+            3,
+            OpMetadata {
+                instruction_addr: Some(0x1004),
+                ..Default::default()
+            },
+        );
+
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 8,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_ram(0x3000, 8),
+                    src: make_const(1, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_ram(0x1004, 8),
+                    cond: make_const(1, 1),
+                },
+                R2ILOp::Copy {
+                    dst: make_ram(0x3008, 8),
+                    src: make_const(2, 8),
+                },
+                R2ILOp::Return {
+                    target: make_ram(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata,
+        }];
+
+        let cfg = CFG::from_blocks(&blocks).expect("cfg");
+        assert_eq!(cfg.block_addrs().collect::<Vec<_>>(), vec![0x1000, 0x1004]);
+        assert_eq!(cfg.get_block(0x1000).expect("entry").ops.len(), 3);
+        assert_eq!(cfg.get_block(0x1004).expect("target").ops.len(), 1);
+        assert_eq!(cfg.successors(0x1000), vec![0x1004]);
+        assert_eq!(cfg.predecessors(0x1004), vec![0x1000]);
+    }
+
+    #[test]
+    fn test_internal_conditional_fallthrough_splits_block() {
+        let mut op_metadata = std::collections::BTreeMap::new();
+        for (op_idx, instruction_addr) in [
+            (0, 0x1000),
+            (1, 0x1004),
+            (2, 0x1008),
+            (3, 0x100c),
+            (4, 0x1010),
+            (5, 0x1014),
+        ] {
+            op_metadata.insert(
+                op_idx,
+                OpMetadata {
+                    instruction_addr: Some(instruction_addr),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 0x18,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_ram(0x3000, 8),
+                    src: make_const(1, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_ram(0x1010, 8),
+                    cond: make_const(1, 1),
+                },
+                R2ILOp::Copy {
+                    dst: make_ram(0x3000, 8),
+                    src: make_const(0, 8),
+                },
+                R2ILOp::Branch {
+                    target: make_ram(0x1014, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_ram(0x3000, 8),
+                    src: make_const(2, 8),
+                },
+                R2ILOp::Return {
+                    target: make_ram(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata,
+        }];
+
+        let cfg = CFG::from_blocks(&blocks).expect("cfg");
+        assert_eq!(
+            cfg.block_addrs().collect::<Vec<_>>(),
+            vec![0x1000, 0x1008, 0x1010, 0x1014]
+        );
+        assert_eq!(
+            cfg.get_block(0x1000).expect("entry").terminator,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1010,
+                false_target: 0x1008
+            }
+        );
+        assert_eq!(cfg.successors(0x1000), vec![0x1010, 0x1008]);
+        assert_eq!(cfg.successors(0x1008), vec![0x1014]);
+        assert_eq!(cfg.successors(0x1010), vec![0x1014]);
     }
 }

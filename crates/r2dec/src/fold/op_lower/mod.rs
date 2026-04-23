@@ -23,9 +23,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use r2ssa::{
-    CallSiteFact, CallSiteFacts, DecompilePrepFacts, FunctionSemanticSummary, InterprocSummarySet,
-    MemoryDefFact, MemoryLocation, MemoryUseFact, ObjectKind, ObjectModel, PredicateFacts,
-    PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar, SsaArtifact,
+    CallSiteFact, CallSiteFacts, DecompilePrepFacts, MemoryDefFact, MemoryLocation, MemoryUseFact,
+    ObjectKind, ObjectModel, PredicateFacts, PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar,
+    SsaArtifact,
 };
 #[cfg(test)]
 use r2types::StackSlotKey;
@@ -172,8 +172,15 @@ impl<'a> FoldingContext<'a> {
         self.inputs.prepared_ssa
     }
 
-    pub(crate) fn interproc_summary_set(&self) -> Option<&InterprocSummarySet> {
-        self.inputs.interproc_summary_set
+    pub(crate) fn summary_view(&self) -> Option<&r2types::InterprocSummaryView> {
+        self.inputs.summary_view
+    }
+
+    pub(crate) fn summary_helper_view_for_name(
+        &self,
+        name: &str,
+    ) -> Option<&r2types::SummaryHelperView> {
+        self.summary_view()?.helper_view_for_name(name)
     }
 
     pub(crate) fn prepared_semantic_view(&self) -> Option<&analysis::PreparedSemanticView> {
@@ -275,22 +282,6 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<&analysis::PreparedCallView> {
         self.prepared_semantic_view()
             .and_then(|view| view.call_view_for_site((block_addr, op_idx)))
-    }
-
-    pub(crate) fn interproc_summary_for_name(
-        &self,
-        name: &str,
-    ) -> Option<&FunctionSemanticSummary> {
-        let normalized = normalize_callee_name(name);
-        self.interproc_summary_set()?
-            .summaries
-            .values()
-            .find(|summary| {
-                summary
-                    .name
-                    .as_deref()
-                    .is_some_and(|summary_name| normalize_callee_name(summary_name) == normalized)
-            })
     }
 
     pub(crate) fn prepared_memory_uses_for_current_op(&self) -> Option<&[MemoryUseFact]> {

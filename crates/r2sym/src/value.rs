@@ -277,6 +277,13 @@ impl<'ctx> SymValue<'ctx> {
         }
     }
 
+    pub(crate) fn symbolic_key(&self) -> Option<String> {
+        match self {
+            Self::Symbolic { ast, bits, .. } => Some(format!("{bits}:{}", ast)),
+            _ => None,
+        }
+    }
+
     fn is_concrete_value(&self, expected: u64) -> bool {
         matches!(self, Self::Concrete { value, .. } if *value == expected)
     }
@@ -287,6 +294,20 @@ impl<'ctx> SymValue<'ctx> {
         } else {
             (1u64 << bits) - 1
         }
+    }
+
+    fn concrete_logical_shift_left(value: u64, bits: u32, amount: u64) -> u64 {
+        if bits == 0 || amount >= u64::from(bits) {
+            return 0;
+        }
+        value.wrapping_shl(amount as u32) & Self::mask_for_bits(bits)
+    }
+
+    fn concrete_logical_shift_right(value: u64, bits: u32, amount: u64) -> u64 {
+        if bits == 0 || amount >= u64::from(bits) {
+            return 0;
+        }
+        value >> (amount as u32)
     }
 
     fn is_all_ones_for(&self, bits: u32) -> bool {
@@ -965,13 +986,8 @@ impl<'ctx> SymValue<'ctx> {
         match (self, amount) {
             (_, amt) if amt.is_zero() => self.clone().with_taint(taint),
             (Self::Concrete { value, bits, .. }, Self::Concrete { value: amt, .. }) => {
-                let mask = if *bits >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << *bits) - 1
-                };
                 Self::Concrete {
-                    value: (*value << (*amt as u32)) & mask,
+                    value: Self::concrete_logical_shift_left(*value, *bits, *amt),
                     bits: *bits,
                     taint,
                 }
@@ -996,7 +1012,7 @@ impl<'ctx> SymValue<'ctx> {
             (_, amt) if amt.is_zero() => self.clone().with_taint(taint),
             (Self::Concrete { value, bits, .. }, Self::Concrete { value: amt, .. }) => {
                 Self::Concrete {
-                    value: *value >> (*amt as u32),
+                    value: Self::concrete_logical_shift_right(*value, *bits, *amt),
                     bits: *bits,
                     taint,
                 }
@@ -1482,6 +1498,25 @@ mod bitwidth_tests {
         let result = val64.shl(&ctx, &shift8);
         assert_eq!(result.as_concrete(), Some(20)); // 5 << 2 = 20
         assert_eq!(result.bits(), 64); // Result keeps value's width
+    }
+
+    #[test]
+    fn test_concrete_shifts_past_bitwidth_zero_fill_instead_of_panicking() {
+        let ctx = Context::thread_local();
+
+        let val64 = SymValue::concrete(0x1234_5678_9abc_def0, 64);
+        let shift64 = SymValue::concrete(64, 64);
+        let shift65 = SymValue::concrete(65, 8);
+
+        assert_eq!(val64.shl(&ctx, &shift64).as_concrete(), Some(0));
+        assert_eq!(val64.lshr(&ctx, &shift64).as_concrete(), Some(0));
+        assert_eq!(val64.shl(&ctx, &shift65).as_concrete(), Some(0));
+        assert_eq!(val64.lshr(&ctx, &shift65).as_concrete(), Some(0));
+
+        let val8 = SymValue::concrete(0b1111_0000, 8);
+        let shift8 = SymValue::concrete(8, 8);
+        assert_eq!(val8.shl(&ctx, &shift8).as_concrete(), Some(0));
+        assert_eq!(val8.lshr(&ctx, &shift8).as_concrete(), Some(0));
     }
 
     #[test]

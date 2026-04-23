@@ -91,25 +91,23 @@ fn normalize_callee_name(name: &str) -> String {
     out
 }
 
-fn prefer_symbolic_large_worker_decompile(
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
-) -> bool {
-    planner::prefer_symbolic_large_worker_decompile(semantic_artifact)
+fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) -> bool {
+    planner::prefer_symbolic_large_worker_decompile(function_facts)
 }
 
 fn should_skip_runtime_type_inference(
     prepared: Option<&r2ssa::SsaArtifact>,
     _type_facts: &FunctionTypeFacts,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
+    function_facts: &FunctionFacts,
 ) -> bool {
-    planner::should_skip_runtime_type_inference(prepared, _type_facts, semantic_artifact)
+    planner::should_skip_runtime_type_inference(prepared, _type_facts, function_facts)
 }
 
 fn should_use_prepared_semantic_view(
     prepared: Option<&r2ssa::SsaArtifact>,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
+    function_facts: &FunctionFacts,
 ) -> bool {
-    planner::should_use_prepared_semantic_view(prepared, semantic_artifact)
+    planner::should_use_prepared_semantic_view(prepared, function_facts)
 }
 
 fn seed_runtime_type_hints_from_facts_and_recovery(
@@ -361,30 +359,38 @@ pub fn semantic_fallback_comment(
     func_name: &str,
     semantic_artifact: Option<&r2sym::SemanticArtifact>,
 ) -> Option<String> {
-    consumer_fallback::semantic_fallback_comment(func_name, semantic_artifact)
+    let function_facts = r2types::FunctionFacts::new(
+        r2types::FunctionTypeFacts::default(),
+        semantic_artifact.cloned(),
+    );
+    consumer_fallback::semantic_fallback_comment(func_name, &function_facts)
 }
 
 pub fn preferred_semantic_fallback_comment(
     func_name: &str,
     semantic_artifact: Option<&r2sym::SemanticArtifact>,
 ) -> Option<String> {
-    planner::preferred_semantic_fallback_comment(func_name, semantic_artifact)
+    let function_facts = r2types::FunctionFacts::new(
+        r2types::FunctionTypeFacts::default(),
+        semantic_artifact.cloned(),
+    );
+    planner::preferred_semantic_fallback_comment(func_name, &function_facts)
 }
 
 pub fn detached_semantic_linearization_reason(
     func_name: &str,
     blocks: &[R2ILBlock],
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
+    function_facts: &FunctionFacts,
 ) -> Option<String> {
-    planner::detached_semantic_linearization_reason(func_name, blocks, semantic_artifact)
+    planner::detached_semantic_linearization_reason(func_name, blocks, function_facts)
 }
 
 pub fn detached_semantic_route_plan(
     func_name: &str,
     blocks: &[R2ILBlock],
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
+    function_facts: &FunctionFacts,
 ) -> Option<SemanticRoutePlan> {
-    planner::detached_semantic_route_plan(func_name, blocks, semantic_artifact)
+    planner::detached_semantic_route_plan(func_name, blocks, function_facts)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -393,7 +399,11 @@ fn preferred_semantic_linearization_reason(
     semantic_artifact: Option<&r2sym::SemanticArtifact>,
     cfg_summary: &r2ssa::CFGRiskSummary,
 ) -> Option<String> {
-    planner::preferred_semantic_linearization_reason(func_name, semantic_artifact, cfg_summary)
+    let function_facts = r2types::FunctionFacts::new(
+        r2types::FunctionTypeFacts::default(),
+        semantic_artifact.cloned(),
+    );
+    planner::preferred_semantic_linearization_reason(func_name, &function_facts, cfg_summary)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -402,7 +412,11 @@ fn preferred_semantic_structuring_reason(
     semantic_artifact: Option<&r2sym::SemanticArtifact>,
     cfg_summary: &r2ssa::CFGRiskSummary,
 ) -> Option<String> {
-    planner::preferred_semantic_structuring_reason(func_name, semantic_artifact, cfg_summary)
+    let function_facts = r2types::FunctionFacts::new(
+        r2types::FunctionTypeFacts::default(),
+        semantic_artifact.cloned(),
+    );
+    planner::preferred_semantic_structuring_reason(func_name, &function_facts, cfg_summary)
 }
 
 fn preferred_semantic_worker_reason(cfg_summary: &r2ssa::CFGRiskSummary) -> String {
@@ -806,6 +820,7 @@ pub struct DecompilerContext {
 impl DecompilerContext {
     fn canonicalize_function_facts(mut function_facts: FunctionFacts) -> FunctionFacts {
         function_facts.types = function_facts.types.canonicalized();
+        function_facts.refresh_plans();
         function_facts
     }
 
@@ -887,6 +902,7 @@ impl DecompilerContext {
 
     pub fn with_type_facts(mut self, type_facts: FunctionTypeFacts) -> Self {
         self.function_facts.types = type_facts.canonicalized();
+        self.function_facts.refresh_plans();
         self
     }
 
@@ -894,7 +910,7 @@ impl DecompilerContext {
         mut self,
         semantic_artifact: Option<r2sym::SemanticArtifact>,
     ) -> Self {
-        self.function_facts.semantics = semantic_artifact;
+        self.function_facts.set_semantics(semantic_artifact);
         self
     }
 
@@ -915,9 +931,10 @@ impl DecompilerInput {
     pub fn new(prepared_ssa: r2ssa::SsaArtifact, mut context: DecompilerContext) -> Self {
         context.function_facts =
             DecompilerContext::canonicalize_function_facts(context.function_facts);
+        let interproc_summary_set = context.function_facts.interproc_summary_set().cloned();
         Self {
             prepared_ssa,
-            interproc_summary_set: None,
+            interproc_summary_set,
             context,
         }
     }
@@ -925,6 +942,7 @@ impl DecompilerInput {
     pub fn with_context(mut self, mut context: DecompilerContext) -> Self {
         context.function_facts =
             DecompilerContext::canonicalize_function_facts(context.function_facts);
+        self.interproc_summary_set = context.function_facts.interproc_summary_set().cloned();
         self.context = context;
         self
     }
@@ -933,6 +951,8 @@ impl DecompilerInput {
         mut self,
         interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
     ) -> Self {
+        self.context.function_facts.summary_view =
+            r2types::InterprocSummaryView::new(interproc_summary_set.clone());
         self.interproc_summary_set = interproc_summary_set;
         self
     }
@@ -997,6 +1017,7 @@ impl Decompiler {
     /// Set externally recovered type facts.
     pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
         self.context.function_facts.types = type_facts.canonicalized();
+        self.context.function_facts.refresh_plans();
     }
 
     pub fn set_function_facts(&mut self, function_facts: FunctionFacts) {
@@ -1028,7 +1049,7 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let semantic_route = planner::semantic_route_plan(
             &func_name,
-            self.context.semantic_artifact(),
+            &self.context.function_facts,
             &func.cfg_risk_summary(),
         );
         if let Some(output) = self.vm_summary_output_for_route(&func_name, &semantic_route) {
@@ -1051,7 +1072,7 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let semantic_route = planner::semantic_route_plan(
             &func_name,
-            self.context.semantic_artifact(),
+            &input.context.function_facts,
             &func.cfg_risk_summary(),
         );
         if let Some(output) = self.vm_summary_output_for_route(&func_name, &semantic_route) {
@@ -1363,7 +1384,7 @@ impl Decompiler {
         let skip_runtime_type_inference = should_skip_runtime_type_inference(
             prepared,
             self.context.type_facts(),
-            self.context.semantic_artifact(),
+            &self.context.function_facts,
         );
         let type_inference = (!skip_runtime_type_inference).then(|| {
             let mut type_inference = TypeInference::new_with_abi(
@@ -1507,24 +1528,21 @@ impl Decompiler {
             arg_regs: self.config.arg_regs.clone(),
             caller_saved_regs: self.config.caller_saved_regs.clone(),
         };
-        let prepared_semantic_view = should_use_prepared_semantic_view(
-            prepared,
-            self.context.semantic_artifact(),
-        )
-        .then(|| {
-            analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
-                prepared: prepared.expect("prepared semantic view requires prepared artifact"),
-                interproc_summary_set,
-                abi_arg_regs: &self.config.arg_regs,
-                ret_reg_name: &fold_arch.ret_reg_name,
-                function_names: &self.context.function_names,
-                symbols: &self.context.symbols,
-                callee_facts: &self.context.type_facts().callee_facts,
-                stack_slots: &self.context.type_facts().stack_slots,
-                visible_bindings: &self.context.type_facts().visible_bindings,
-                param_register_aliases: &param_register_aliases,
-            })
-        });
+        let prepared_semantic_view =
+            should_use_prepared_semantic_view(prepared, &self.context.function_facts).then(|| {
+                analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
+                    prepared: prepared.expect("prepared semantic view requires prepared artifact"),
+                    interproc_summary_set,
+                    abi_arg_regs: &self.config.arg_regs,
+                    ret_reg_name: &fold_arch.ret_reg_name,
+                    function_names: &self.context.function_names,
+                    symbols: &self.context.symbols,
+                    callee_facts: &self.context.type_facts().callee_facts,
+                    stack_slots: &self.context.type_facts().stack_slots,
+                    visible_bindings: &self.context.type_facts().visible_bindings,
+                    param_register_aliases: &param_register_aliases,
+                })
+            });
         let fold_inputs = FoldInputs {
             arch: &fold_arch,
             function_names: &self.context.function_names,
@@ -1544,6 +1562,7 @@ impl Decompiler {
             function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
             prepared_ssa: prepared,
             interproc_summary_set,
+            summary_view: Some(&self.context.function_facts.summary_view),
             prepared_semantic_view: prepared_semantic_view.as_ref(),
             prepared_objects: prepared.map(|artifact| artifact.objects()),
             prepared_memory: prepared.map(|artifact| artifact.memory()),
@@ -1560,7 +1579,7 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let semantic_route = planner::semantic_route_plan(
             &func_name,
-            self.context.semantic_artifact(),
+            &self.context.function_facts,
             &func.cfg_risk_summary(),
         );
 
@@ -1589,7 +1608,7 @@ impl Decompiler {
                 func,
                 &fold_ctx,
                 folded_reason,
-                prefer_symbolic_large_worker_decompile(self.context.semantic_artifact())
+                prefer_symbolic_large_worker_decompile(&self.context.function_facts)
                     .then(|| preferred_semantic_worker_reason(&func.cfg_risk_summary()))
                     .as_deref(),
                 || self.linearize_function_body(func, &fold_ctx),
@@ -4474,6 +4493,7 @@ mod tests {
             function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
             prepared_ssa: None,
             interproc_summary_set: None,
+            summary_view: Some(&decompiler.context.function_facts.summary_view),
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
@@ -5283,6 +5303,93 @@ mod tests {
     }
 
     #[test]
+    fn preferred_semantic_structuring_reason_blocks_conflicting_assumptions_and_downgrades_linearization()
+     {
+        let likely =
+            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
+        let memory_term = arg_memory_term(0, 1, likely.clone(), Some("0x0:8"), true);
+        let region = test_semantic_region(
+            0x401000,
+            BTreeSet::from([0x401010, 0x401020]),
+            vec![test_control_fact(
+                0x401010,
+                r2sym::SymbolicReachabilityStatus::Reachable,
+                None,
+                Some("x == 0"),
+                Some(compiled_summary(
+                    "x == 0",
+                    r2sym::BackwardConditionPrecision::OverApprox,
+                    1,
+                    2,
+                    vec![memory_term.clone()],
+                )),
+                likely.clone(),
+            )],
+            vec![test_memory_fact(memory_term, likely.clone())],
+        );
+        let summary = r2ssa::CFGRiskSummary {
+            block_count: 107,
+            loop_count: 16,
+            back_edge_count: 16,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let semantic_artifact = large_cfg_worker_artifact(
+            r2sym::RefinementStage::Compiled,
+            vec![r2sym::ResidualReason::LargeCfg],
+            vec![region],
+        );
+        let mut assumption_usage = r2ssa::AssumptionUsageReport::default();
+        assumption_usage.mark_conflict(
+            &r2ssa::AnalysisAssumption {
+                id: Some("assumption_a".to_string()),
+                subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "int32_t".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            },
+            "parameter type conflict",
+        );
+        assumption_usage.mark_conflict(
+            &r2ssa::AnalysisAssumption {
+                id: Some("assumption_b".to_string()),
+                subject: r2ssa::AssumptionSubject::Register {
+                    name: "rax".to_string(),
+                },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "int64_t".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            },
+            "register type conflict",
+        );
+        let function_facts = r2types::FunctionFacts::new(
+            r2types::FunctionTypeFacts::default(),
+            Some(semantic_artifact),
+        )
+        .with_assumption_usage(assumption_usage);
+        assert!(
+            crate::planner::preferred_semantic_structuring_reason(
+                "fcn.401000",
+                &function_facts,
+                &summary,
+            )
+            .is_none(),
+            "assumption conflicts must block semantic structuring"
+        );
+        let linear_reason = crate::planner::preferred_semantic_linearization_reason(
+            "fcn.401000",
+            &function_facts,
+            &summary,
+        )
+        .expect("assumption conflicts should downgrade to linearization");
+        assert!(linear_reason.contains("complex loop graph"));
+    }
+
+    #[test]
     fn autogenerated_name_detection_accepts_underscore_hex_labels() {
         assert!(is_autogenerated_function_name("_140010138"));
         assert!(is_autogenerated_function_name("_401000"));
@@ -5405,5 +5512,53 @@ mod tests {
         assert!(output.contains("actionable_conditions=1"));
         assert!(output.contains("exact_conditions=1"));
         assert!(output.contains("actionable_preview=[0x401000: x == 0]"));
+    }
+
+    #[test]
+    fn semantic_fallback_comment_reports_assumption_conflicts() {
+        let semantic_artifact = large_cfg_worker_artifact(
+            r2sym::RefinementStage::Residual,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let mut assumption_usage = r2ssa::AssumptionUsageReport::default();
+        assumption_usage.mark_conflict(
+            &r2ssa::AnalysisAssumption {
+                id: Some("assumption_c".to_string()),
+                subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "int32_t".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            },
+            "parameter type conflict",
+        );
+        assumption_usage.mark_conflict(
+            &r2ssa::AnalysisAssumption {
+                id: Some("assumption_d".to_string()),
+                subject: r2ssa::AssumptionSubject::Register {
+                    name: "rdi".to_string(),
+                },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "int64_t".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            },
+            "register type conflict",
+        );
+        let function_facts = r2types::FunctionFacts::new(
+            r2types::FunctionTypeFacts::default(),
+            Some(semantic_artifact),
+        )
+        .with_assumption_usage(assumption_usage);
+        let output =
+            crate::consumer_fallback::semantic_fallback_comment("_401000", &function_facts)
+                .expect("typed semantic fallback comment");
+        assert!(
+            output.contains("assumption_conflicts=2"),
+            "expected fallback comment to report the assumption conflict count, got:\n{output}"
+        );
     }
 }

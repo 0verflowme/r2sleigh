@@ -11,8 +11,8 @@ use r2ssa::{
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
 use r2types::{
-    CalleeFact, ExternalStackSlotSpec, ExternalTypeDb, FunctionType, SignatureRegistry,
-    StackSlotKey, TypeOracle, VisibleBinding,
+    CalleeFact, ExternalStackSlotSpec, ExternalTypeDb, FunctionType, InterprocSummaryView,
+    SignatureRegistry, StackSlotKey, TypeOracle, VisibleBinding,
 };
 
 pub(crate) type SSABlock = FunctionSSABlock;
@@ -72,6 +72,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
     pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
+    pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
     pub(crate) prepared_objects: Option<&'a ObjectModel>,
     #[allow(dead_code)]
@@ -240,6 +241,7 @@ impl<'a> FoldingContext<'a> {
             function_return_type: None,
             prepared_ssa: None,
             interproc_summary_set: None,
+            summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,

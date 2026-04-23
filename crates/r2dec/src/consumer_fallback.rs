@@ -73,9 +73,9 @@ where
 
 pub(crate) fn semantic_fallback_comment(
     func_name: &str,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
+    function_facts: &r2types::FunctionFacts,
 ) -> Option<String> {
-    let semantic_artifact = semantic_artifact?;
+    let semantic_artifact = function_facts.semantic_artifact()?;
     if let Some(comment) =
         crate::consumer_vm::render_vm_semantic_fallback_comment(func_name, semantic_artifact)
     {
@@ -136,6 +136,29 @@ pub(crate) fn semantic_fallback_comment(
         reason.push_str("; actionable_preview=[");
         reason.push_str(&actionable_preview.join(" | "));
         reason.push(']');
+    }
+    if function_facts.has_assumption_conflicts() {
+        reason.push_str(&format!(
+            "; assumption_conflicts={}",
+            function_facts.assumption_usage.conflicts.len()
+        ));
+    }
+    if let Some(rollup) = function_facts.summary_rollup() {
+        if let Some(return_relation) = rollup.root_return_relation.as_ref() {
+            reason.push_str(&format!("; summary_return={return_relation:?}"));
+        }
+        if !rollup.out_param_indices.is_empty() {
+            reason.push_str("; out_params=[");
+            reason.push_str(
+                &rollup
+                    .out_param_indices
+                    .iter()
+                    .map(|idx| idx.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            reason.push(']');
+        }
     }
     Some(format!(
         "/* r2dec fallback: skipped decompilation for {} ({}) */",

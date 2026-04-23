@@ -21,7 +21,7 @@ use crate::facts::{
     FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics,
     LocalFieldAccessFact, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
-use crate::function_facts::FunctionFacts;
+use crate::function_facts::{FunctionFacts, InterprocSummaryView};
 use crate::model::Signedness;
 use crate::prepare::recover_vars_arch_profile;
 
@@ -219,6 +219,51 @@ pub struct TypeWritebackSemanticInputs<'a> {
 struct SignatureContextMaps {
     param_types: HashMap<usize, String>,
     param_names: HashMap<usize, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SemanticTypeProjection {
+    pointer_param_indices: BTreeSet<usize>,
+    out_param_indices: BTreeSet<usize>,
+    slot_field_profiles: BTreeMap<usize, BTreeMap<u64, String>>,
+}
+
+impl SemanticTypeProjection {
+    fn from_inputs(
+        summary_view: &InterprocSummaryView,
+        semantic_artifact: Option<&r2sym::SemanticArtifact>,
+        ptr_bits: u32,
+    ) -> Self {
+        let mut projection = Self::default();
+        if let Some(summary) = summary_view.root_summary() {
+            for idx in 0..=summary.arg_effects.keys().copied().max().unwrap_or(0) {
+                if summary_suggests_pointer_param(summary, idx) {
+                    projection.pointer_param_indices.insert(idx);
+                }
+            }
+            for (idx, effect) in &summary.arg_effects {
+                if effect.write || effect.escape {
+                    projection.out_param_indices.insert(*idx);
+                }
+            }
+        }
+        projection.slot_field_profiles =
+            collect_semantic_slot_profiles(semantic_artifact, ptr_bits);
+        projection
+    }
+
+    fn corroborates_param_type_hint(&self, index: usize, hint: &CTypeLike) -> bool {
+        if !matches!(hint, CTypeLike::Pointer(_)) {
+            return false;
+        }
+        self.pointer_param_indices.contains(&index)
+            || self.out_param_indices.contains(&index)
+            || self.slot_field_profiles.contains_key(&index)
+    }
+
+    fn corroborates_stack_slot_type_hint(&self, slot: usize, hint: &CTypeLike) -> bool {
+        matches!(hint, CTypeLike::Pointer(_)) && self.slot_field_profiles.contains_key(&slot)
+    }
 }
 
 struct VarTypeCandidateContext<'a> {
@@ -437,22 +482,90 @@ fn maybe_upgrade_param_to_pointer(
     }
 }
 
+fn upgrade_param_indices_to_pointer(
+    indices: impl IntoIterator<Item = usize>,
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    inferred_signature: &mut InferredSignature,
+    ptr_bits: u32,
+) {
+    let pointer_ty = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+
+    if merged_signature.is_none() {
+        *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
+    }
+
+    let Some(signature) = merged_signature.as_mut() else {
+        return;
+    };
+
+    for idx in indices {
+        let merged_param = signature.params.get_mut(idx);
+        let inferred_param = inferred_signature.params.get_mut(idx);
+
+        let merged_is_generic = merged_param.as_ref().is_some_and(|param| {
+            param.ty.as_ref().is_none_or(|ty| {
+                is_generic_signature_type(Some(ty))
+                    || matches!(
+                        ty,
+                        CTypeLike::Int {
+                            bits,
+                            signedness: Signedness::Signed
+                                | Signedness::Unsigned
+                                | Signedness::Unknown,
+                        } if *bits == ptr_bits
+                    )
+            })
+        });
+
+        let inferred_is_generic = inferred_param.as_ref().is_some_and(|param| {
+            is_generic_type_string(&param.param_type)
+                || matches!(
+                    parse_type_like_spec(&param.param_type, ptr_bits),
+                    Some(CTypeLike::Int {
+                        bits,
+                        signedness: Signedness::Signed
+                            | Signedness::Unsigned
+                            | Signedness::Unknown,
+                    }) if bits == ptr_bits
+                )
+        });
+
+        if merged_is_generic && let Some(param) = merged_param {
+            param.ty = Some(pointer_ty.clone());
+        }
+        if inferred_is_generic && let Some(param) = inferred_param {
+            param.param_type = render_signature_type(&pointer_ty, ptr_bits);
+        }
+    }
+}
+
 fn apply_interproc_summary_to_signature(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
-    summary_set: Option<&InterprocSummarySet>,
+    summary_view: &InterprocSummaryView,
+    semantic_projection: Option<&SemanticTypeProjection>,
     ptr_bits: u32,
 ) {
-    let Some(summary_set) = summary_set else {
-        return;
-    };
-    let Some(root) = summary_set.root else {
-        return;
-    };
-    let Some(summary) = summary_set.summaries.get(&root) else {
+    let Some(summary) = summary_view.root_summary() else {
+        if let Some(projection) = semantic_projection {
+            upgrade_param_indices_to_pointer(
+                projection.pointer_param_indices.iter().copied(),
+                merged_signature,
+                inferred_signature,
+                ptr_bits,
+            );
+        }
         return;
     };
     maybe_upgrade_param_to_pointer(summary, merged_signature, inferred_signature, ptr_bits);
+    if let Some(projection) = semantic_projection {
+        upgrade_param_indices_to_pointer(
+            projection.pointer_param_indices.iter().copied(),
+            merged_signature,
+            inferred_signature,
+            ptr_bits,
+        );
+    }
     let Some(ret_ty) = infer_interproc_return_type(
         summary,
         merged_signature.as_ref(),
@@ -502,6 +615,246 @@ fn apply_interproc_summary_to_signature(
     }
 }
 
+fn assumption_type_hint(
+    assumption: &r2ssa::AnalysisAssumption,
+    ptr_bits: u32,
+) -> Option<CTypeLike> {
+    let r2ssa::AssumptionValue::TypeHint { ty } = &assumption.value else {
+        return None;
+    };
+    parse_type_like_spec(ty, ptr_bits)
+}
+
+fn type_hint_conflicts(existing: &CTypeLike, hint: &CTypeLike, ptr_bits: u32) -> bool {
+    render_signature_type(existing, ptr_bits) != render_signature_type(hint, ptr_bits)
+}
+
+fn apply_type_hint_to_signature_param(
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    inferred_signature: &mut InferredSignature,
+    index: usize,
+    hint: &CTypeLike,
+    ptr_bits: u32,
+) -> Result<bool, String> {
+    if merged_signature.is_none() {
+        *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
+    }
+
+    let mut applied = false;
+    if let Some(signature) = merged_signature.as_mut() {
+        let Some(param) = signature.params.get_mut(index) else {
+            return Ok(false);
+        };
+        match param.ty.as_ref() {
+            None => {
+                param.ty = Some(hint.clone());
+                applied = true;
+            }
+            Some(existing) if is_generic_signature_type(Some(existing)) => {
+                param.ty = Some(hint.clone());
+                applied = true;
+            }
+            Some(existing) if !type_hint_conflicts(existing, hint, ptr_bits) => {
+                applied = true;
+            }
+            Some(existing) => {
+                return Err(format!(
+                    "parameter {} already has incompatible type {}",
+                    index,
+                    render_signature_type(existing, ptr_bits)
+                ));
+            }
+        }
+    }
+
+    if let Some(param) = inferred_signature.params.get_mut(index)
+        && is_generic_type_string(&param.param_type)
+    {
+        param.param_type = render_signature_type(hint, ptr_bits);
+        applied = true;
+    }
+
+    Ok(applied)
+}
+
+fn assumption_stack_base(base: &str) -> Option<ExternalStackBase> {
+    match base.trim().to_ascii_lowercase().as_str() {
+        "bp" | "rbp" | "ebp" | "frame" | "fp" => Some(ExternalStackBase::FramePointer),
+        "sp" | "rsp" | "esp" | "stack" => Some(ExternalStackBase::StackPointer),
+        "" => None,
+        other => Some(ExternalStackBase::Named(other.to_string())),
+    }
+}
+
+fn apply_type_hint_assumptions_to_context(
+    parsed_context: &mut ParsedExternalContext,
+    inferred_signature: &mut InferredSignature,
+    ptr_bits: u32,
+    semantic_projection: Option<&SemanticTypeProjection>,
+) -> r2ssa::AssumptionUsageReport {
+    let mut usage = r2ssa::AssumptionUsageReport::default();
+    let assumptions = parsed_context.assumptions.items.clone();
+    for assumption in &assumptions {
+        let Some(hint) = assumption_type_hint(assumption, ptr_bits) else {
+            continue;
+        };
+        match &assumption.subject {
+            r2ssa::AssumptionSubject::Parameter { index } => {
+                let corroborated = semantic_projection.is_some_and(|projection| {
+                    projection.corroborates_param_type_hint(*index, &hint)
+                });
+                if !corroborated {
+                    usage.mark_ignored(assumption);
+                    continue;
+                }
+                match apply_type_hint_to_signature_param(
+                    &mut parsed_context.merged_signature,
+                    inferred_signature,
+                    *index,
+                    &hint,
+                    ptr_bits,
+                ) {
+                    Ok(true) => usage.mark_applied(assumption),
+                    Ok(false) => usage.mark_ignored(assumption),
+                    Err(reason) => usage.mark_conflict(assumption, reason),
+                }
+            }
+            r2ssa::AssumptionSubject::Register { name } => {
+                let Some((idx, reg_param)) = parsed_context
+                    .register_params
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, param)| {
+                        param.reg.eq_ignore_ascii_case(name)
+                            || param.name.eq_ignore_ascii_case(name)
+                    })
+                else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                let corroborated = semantic_projection
+                    .is_some_and(|projection| projection.corroborates_param_type_hint(idx, &hint));
+                if !corroborated {
+                    usage.mark_ignored(assumption);
+                    continue;
+                }
+
+                let reg_applied = match reg_param.ty.as_ref() {
+                    None => {
+                        reg_param.ty = Some(hint.clone());
+                        true
+                    }
+                    Some(existing) if is_generic_signature_type(Some(existing)) => {
+                        reg_param.ty = Some(hint.clone());
+                        true
+                    }
+                    Some(existing) if !type_hint_conflicts(existing, &hint, ptr_bits) => true,
+                    Some(existing) => {
+                        usage.mark_conflict(
+                            assumption,
+                            format!(
+                                "register {} already has incompatible type {}",
+                                name,
+                                render_signature_type(existing, ptr_bits)
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                match apply_type_hint_to_signature_param(
+                    &mut parsed_context.merged_signature,
+                    inferred_signature,
+                    idx,
+                    &hint,
+                    ptr_bits,
+                ) {
+                    Ok(true) => usage.mark_applied(assumption),
+                    Ok(false) if reg_applied => usage.mark_applied(assumption),
+                    Ok(false) => usage.mark_ignored(assumption),
+                    Err(reason) => usage.mark_conflict(assumption, reason),
+                }
+            }
+            r2ssa::AssumptionSubject::StackSlot { base, offset } => {
+                let Some(base) = assumption_stack_base(base) else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                let key = StackSlotKey {
+                    base,
+                    offset: *offset,
+                };
+                let corroborated = semantic_projection.is_some_and(|projection| {
+                    parsed_context
+                        .stack_slots
+                        .get(&key)
+                        .and_then(|slot| slot.param_index)
+                        .is_some_and(|slot| {
+                            projection.corroborates_stack_slot_type_hint(slot, &hint)
+                        })
+                });
+                if !corroborated {
+                    usage.mark_ignored(assumption);
+                    continue;
+                }
+                let Some(slot) = parsed_context.stack_slots.get_mut(&key) else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                let mut applied = match slot.ty.as_ref() {
+                    None => {
+                        slot.ty = Some(hint.clone());
+                        true
+                    }
+                    Some(existing) if is_generic_signature_type(Some(existing)) => {
+                        slot.ty = Some(hint.clone());
+                        true
+                    }
+                    Some(existing) if !type_hint_conflicts(existing, &hint, ptr_bits) => true,
+                    Some(existing) => {
+                        usage.mark_conflict(
+                            assumption,
+                            format!(
+                                "stack slot {}@{} already has incompatible type {}",
+                                match &key.base {
+                                    ExternalStackBase::FramePointer => "bp",
+                                    ExternalStackBase::StackPointer => "sp",
+                                    ExternalStackBase::Named(name) => name.as_str(),
+                                },
+                                key.offset,
+                                render_signature_type(existing, ptr_bits)
+                            ),
+                        );
+                        continue;
+                    }
+                };
+
+                if let Some(index) = slot.param_index {
+                    match apply_type_hint_to_signature_param(
+                        &mut parsed_context.merged_signature,
+                        inferred_signature,
+                        index,
+                        &hint,
+                        ptr_bits,
+                    ) {
+                        Ok(result) => applied |= result,
+                        Err(reason) => {
+                            usage.mark_conflict(assumption, reason);
+                            continue;
+                        }
+                    }
+                }
+                if applied {
+                    usage.mark_applied(assumption);
+                } else {
+                    usage.mark_ignored(assumption);
+                }
+            }
+            _ => {}
+        }
+    }
+    usage
+}
+
 fn build_type_writeback_analysis_inner(
     mut input: TypeWritebackAnalysisInput<'_>,
     semantic_inputs: Option<TypeWritebackSemanticInputs<'_>>,
@@ -512,6 +865,20 @@ fn build_type_writeback_analysis_inner(
         input.parsed_context.stack_slots =
             stack_slots_from_legacy_external_stack_vars(&input.parsed_context.external_stack_vars);
     }
+    let summary_view = InterprocSummaryView::new(input.interproc_summary_set.clone());
+
+    let semantic_projection = SemanticTypeProjection::from_inputs(
+        &summary_view,
+        semantic_inputs.as_ref().map(|semantic| semantic.artifact),
+        input.ptr_bits,
+    );
+
+    let type_assumption_usage = apply_type_hint_assumptions_to_context(
+        &mut input.parsed_context,
+        &mut input.inferred_signature,
+        input.ptr_bits,
+        Some(&semantic_projection),
+    );
 
     let mut merged_signature = merge_local_signature_into_merged_signature(
         input.parsed_context.merged_signature.clone(),
@@ -534,27 +901,37 @@ fn build_type_writeback_analysis_inner(
     apply_interproc_summary_to_signature(
         &mut merged_signature,
         &mut input.inferred_signature,
-        input.interproc_summary_set.as_ref(),
+        &summary_view,
+        Some(&semantic_projection),
         input.ptr_bits,
     );
 
     let mut diagnostics = input.diagnostics;
     diagnostics.solver_warnings = input.parsed_context.diagnostics.clone();
+    if summary_view
+        .diagnostics()
+        .is_some_and(|diagnostics| !diagnostics.converged)
+    {
+        diagnostics.warnings.push(
+            "interprocedural summary did not converge; downgraded summary-driven type hints"
+                .to_string(),
+        );
+    }
 
     let external_structs = collect_external_struct_candidates_from_db(
         &input.parsed_context.external_type_db,
         input.ptr_bits,
     );
     let mut local_structs = input.local_structs;
+    augment_local_struct_artifacts_with_projection(
+        &mut local_structs,
+        &semantic_projection,
+        input.ptr_bits,
+    );
     if let Some(semantic) = semantic_inputs.as_ref() {
         augment_local_struct_artifacts_with_local_field_accesses(
             &mut local_structs,
             semantic.local_field_accesses,
-            input.ptr_bits,
-        );
-        augment_local_struct_artifacts_with_semantics(
-            &mut local_structs,
-            semantic.artifact,
             input.ptr_bits,
         );
     }
@@ -701,7 +1078,11 @@ fn build_type_writeback_analysis_inner(
             semantic_inputs
                 .as_ref()
                 .map(|semantic| semantic.artifact.clone()),
-        ),
+        )
+        .with_assumptions(input.parsed_context.assumptions.clone())
+        .with_summary_view(summary_view)
+        .with_diagnostics(type_facts.diagnostics.clone())
+        .with_assumption_usage(type_assumption_usage),
         type_facts,
         plan,
     }
@@ -718,6 +1099,147 @@ pub fn build_type_writeback_analysis_with_semantics(
     semantic_inputs: TypeWritebackSemanticInputs<'_>,
 ) -> TypeWritebackAnalysis {
     build_type_writeback_analysis_inner(input, Some(semantic_inputs))
+}
+
+fn collect_semantic_slot_profiles(
+    artifact: Option<&r2sym::SemanticArtifact>,
+    ptr_bits: u32,
+) -> BTreeMap<usize, BTreeMap<u64, String>> {
+    fn reliable_post_memory_terms(
+        region: &r2sym::SemanticRegion,
+    ) -> impl Iterator<Item = &r2sym::BackwardMemoryCondition> {
+        region
+            .post
+            .iter()
+            .filter(|predicate| predicate.evidence.is_reliable())
+            .filter_map(|predicate| predicate.value.compiled.as_ref())
+            .filter(|compiled| compiled.evidence().is_reliable())
+            .flat_map(|compiled| compiled.memory_terms.iter())
+    }
+
+    fn has_reliable_preconditions(region: &r2sym::SemanticRegion) -> bool {
+        region
+            .pre
+            .iter()
+            .any(|predicate| predicate.evidence.is_reliable())
+    }
+
+    fn has_decisive_target_support(region: &r2sym::SemanticRegion) -> bool {
+        region.actionable_reachable_target().is_some() || {
+            let actionable_targets = region
+                .targets
+                .iter()
+                .filter(|fact| fact.evidence.allows_narrowing())
+                .filter(|fact| {
+                    matches!(
+                        fact.value.status,
+                        r2sym::SymbolicReachabilityStatus::Reachable
+                    )
+                })
+                .map(|fact| fact.value.target)
+                .collect::<BTreeSet<_>>();
+            actionable_targets.len() == 1
+        }
+    }
+
+    fn supports_conservative_type_projection(region: &r2sym::SemanticRegion) -> bool {
+        let decisive_target = has_decisive_target_support(region);
+        let has_post_support = region.post.iter().any(|predicate| {
+            predicate.evidence.allows_narrowing()
+                && predicate
+                    .value
+                    .compiled
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.evidence().is_reliable())
+        });
+        if !decisive_target && !has_post_support {
+            return false;
+        }
+        if has_reliable_preconditions(region) && !decisive_target {
+            return false;
+        }
+        true
+    }
+
+    let Some(artifact) = artifact else {
+        return BTreeMap::new();
+    };
+    if artifact.vm_summary_only_type_plan() {
+        return BTreeMap::new();
+    }
+    let Some(native) = artifact.native_body() else {
+        return BTreeMap::new();
+    };
+
+    let mut projected_profiles = BTreeMap::<usize, BTreeMap<u64, String>>::new();
+    for region in native.regions.values() {
+        if !supports_conservative_type_projection(region) {
+            continue;
+        }
+        for term in region
+            .memory
+            .iter()
+            .filter(|memory| memory.evidence.is_reliable())
+            .map(|memory| &memory.value.term)
+        {
+            let Some((slot, offset, field_type)) = backward_memory_term_slot_field(term, ptr_bits)
+            else {
+                continue;
+            };
+            projected_profiles
+                .entry(slot)
+                .or_default()
+                .entry(offset)
+                .or_insert(field_type);
+        }
+        for term in reliable_post_memory_terms(region) {
+            let Some((slot, offset, field_type)) = backward_memory_term_slot_field(term, ptr_bits)
+            else {
+                continue;
+            };
+            projected_profiles
+                .entry(slot)
+                .or_default()
+                .entry(offset)
+                .or_insert(field_type);
+        }
+    }
+
+    if projected_profiles.is_empty() {
+        for region in native.regions.values() {
+            if !supports_conservative_type_projection(region) {
+                continue;
+            }
+            let Some(target) = region.actionable_reachable_target() else {
+                continue;
+            };
+            for compiled in region
+                .control
+                .iter()
+                .filter(|fact| fact.evidence.allows_narrowing())
+                .filter(|fact| fact.value.target == target)
+                .filter_map(|fact| fact.value.compiled.as_ref())
+            {
+                if !compiled.evidence().is_reliable() {
+                    continue;
+                }
+                for term in &compiled.memory_terms {
+                    let Some((slot, offset, field_type)) =
+                        backward_memory_term_slot_field(term, ptr_bits)
+                    else {
+                        continue;
+                    };
+                    projected_profiles
+                        .entry(slot)
+                        .or_default()
+                        .entry(offset)
+                        .or_insert(field_type);
+                }
+            }
+        }
+    }
+
+    projected_profiles
 }
 
 fn semantic_stage_label(artifact: &r2sym::SemanticArtifact) -> &'static str {
@@ -1413,141 +1935,25 @@ pub fn augment_local_struct_artifacts_with_semantics(
     artifact: &r2sym::SemanticArtifact,
     ptr_bits: u32,
 ) {
-    fn reliable_post_memory_terms(
-        region: &r2sym::SemanticRegion,
-    ) -> impl Iterator<Item = &r2sym::BackwardMemoryCondition> {
-        region
-            .post
-            .iter()
-            .filter(|predicate| predicate.evidence.is_reliable())
-            .filter_map(|predicate| predicate.value.compiled.as_ref())
-            .filter(|compiled| compiled.evidence().is_reliable())
-            .flat_map(|compiled| compiled.memory_terms.iter())
-    }
+    let projection = SemanticTypeProjection::from_inputs(
+        &InterprocSummaryView::default(),
+        Some(artifact),
+        ptr_bits,
+    );
+    augment_local_struct_artifacts_with_projection(local_structs, &projection, ptr_bits);
+}
 
-    fn has_reliable_preconditions(region: &r2sym::SemanticRegion) -> bool {
-        region
-            .pre
-            .iter()
-            .any(|predicate| predicate.evidence.is_reliable())
-    }
-
-    fn has_decisive_target_support(region: &r2sym::SemanticRegion) -> bool {
-        region.actionable_reachable_target().is_some() || {
-            let actionable_targets = region
-                .targets
-                .iter()
-                .filter(|fact| fact.evidence.allows_narrowing())
-                .filter(|fact| {
-                    matches!(
-                        fact.value.status,
-                        r2sym::SymbolicReachabilityStatus::Reachable
-                    )
-                })
-                .map(|fact| fact.value.target)
-                .collect::<BTreeSet<_>>();
-            actionable_targets.len() == 1
-        }
-    }
-
-    fn supports_conservative_type_projection(region: &r2sym::SemanticRegion) -> bool {
-        let decisive_target = has_decisive_target_support(region);
-        let has_post_support = region.post.iter().any(|predicate| {
-            predicate.evidence.allows_narrowing()
-                && predicate
-                    .value
-                    .compiled
-                    .as_ref()
-                    .is_some_and(|compiled| compiled.evidence().is_reliable())
-        });
-        if !decisive_target && !has_post_support {
-            return false;
-        }
-        if has_reliable_preconditions(region) && !decisive_target {
-            return false;
-        }
-        true
-    }
-
-    let mut projected_profiles = BTreeMap::<usize, BTreeMap<u64, String>>::new();
-    if artifact.vm_summary_only_type_plan() {
-        return;
-    }
-    let Some(native) = artifact.native_body() else {
-        return;
-    };
-    for region in native.regions.values() {
-        if !supports_conservative_type_projection(region) {
-            continue;
-        }
-        for term in region
-            .memory
-            .iter()
-            .filter(|memory| memory.evidence.is_reliable())
-            .map(|memory| &memory.value.term)
-        {
-            let Some((slot, offset, field_type)) = backward_memory_term_slot_field(term, ptr_bits)
-            else {
-                continue;
-            };
-            projected_profiles
-                .entry(slot)
-                .or_default()
-                .entry(offset)
-                .or_insert(field_type);
-        }
-        for term in reliable_post_memory_terms(region) {
-            let Some((slot, offset, field_type)) = backward_memory_term_slot_field(term, ptr_bits)
-            else {
-                continue;
-            };
-            projected_profiles
-                .entry(slot)
-                .or_default()
-                .entry(offset)
-                .or_insert(field_type);
-        }
-    }
-    if projected_profiles.is_empty() {
-        for region in native.regions.values() {
-            if !supports_conservative_type_projection(region) {
-                continue;
-            }
-            let Some(target) = region.actionable_reachable_target() else {
-                continue;
-            };
-            for compiled in region
-                .control
-                .iter()
-                .filter(|fact| fact.evidence.allows_narrowing())
-                .filter(|fact| fact.value.target == target)
-                .filter_map(|fact| fact.value.compiled.as_ref())
-            {
-                if !compiled.evidence().is_reliable() {
-                    continue;
-                }
-                for term in &compiled.memory_terms {
-                    let Some((slot, offset, field_type)) =
-                        backward_memory_term_slot_field(term, ptr_bits)
-                    else {
-                        continue;
-                    };
-                    projected_profiles
-                        .entry(slot)
-                        .or_default()
-                        .entry(offset)
-                        .or_insert(field_type);
-                }
-            }
-        }
-    }
-
-    for (slot, projected) in projected_profiles {
-        let profile = local_structs.slot_field_profiles.entry(slot).or_default();
+fn augment_local_struct_artifacts_with_projection(
+    local_structs: &mut LocalStructArtifacts,
+    projection: &SemanticTypeProjection,
+    ptr_bits: u32,
+) {
+    for (slot, projected) in &projection.slot_field_profiles {
+        let profile = local_structs.slot_field_profiles.entry(*slot).or_default();
         for (offset, field_type) in projected {
-            profile.entry(offset).or_insert(field_type);
+            profile.entry(*offset).or_insert(field_type.clone());
         }
-        if profile.is_empty() || local_structs.slot_type_overrides.contains_key(&slot) {
+        if profile.is_empty() || local_structs.slot_type_overrides.contains_key(slot) {
             continue;
         }
         let struct_name = format!("sla_struct_symbolic_arg{}", slot + 1);
@@ -1578,7 +1984,7 @@ pub fn augment_local_struct_artifacts_with_semantics(
         }
         local_structs
             .slot_type_overrides
-            .insert(slot, format!("struct {struct_name} *"));
+            .insert(*slot, format!("struct {struct_name} *"));
     }
 }
 
@@ -1678,7 +2084,7 @@ fn canonicalize_param_home_stack_slots(
     ssa_blocks: &[SSABlock],
     ptr_bits: u32,
 ) {
-    if register_params.is_empty() || stack_slots.is_empty() || ssa_blocks.is_empty() {
+    if register_params.is_empty() || ssa_blocks.is_empty() {
         return;
     }
 
@@ -1713,20 +2119,34 @@ fn canonicalize_param_home_stack_slots(
                     if rooted_val.version != 0 {
                         continue;
                     }
-                    let Some(slot) = stack_slots.get_mut(&slot_key) else {
-                        continue;
-                    };
-                    if !matches!(
-                        slot.role,
-                        ExternalStackSlotRole::Unknown | ExternalStackSlotRole::Local
-                    ) {
-                        continue;
-                    }
                     let param_name = merged_signature
                         .and_then(|sig| sig.params.get(param_index))
                         .map(|param| param.name.clone())
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| format!("arg{}", param_index + 1));
+                    let slot_base = slot_key.base.clone();
+                    let slot =
+                        stack_slots
+                            .entry(slot_key)
+                            .or_insert_with(|| ExternalStackVarSpec {
+                                name: format!("{param_name}_home"),
+                                ty: merged_signature
+                                    .and_then(|sig| sig.params.get(param_index))
+                                    .and_then(|param| param.ty.clone()),
+                                base: slot_base,
+                                role: ExternalStackSlotRole::Unknown,
+                                param_index: None,
+                                param_name: None,
+                                source_reg: None,
+                            });
+                    if !matches!(
+                        slot.role,
+                        ExternalStackSlotRole::Unknown
+                            | ExternalStackSlotRole::Local
+                            | ExternalStackSlotRole::StackArg
+                    ) {
+                        continue;
+                    }
                     slot.role = ExternalStackSlotRole::ParamHome;
                     slot.param_index = Some(param_index);
                     slot.param_name = Some(param_name.clone());
@@ -3691,6 +4111,138 @@ mod tests {
                 .params[1]
                 .name,
             "argv"
+        );
+    }
+
+    #[test]
+    fn uncorroborated_type_hint_assumptions_are_ignored() {
+        let mut parsed_context = ParsedExternalContext {
+            assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+                id: Some("param0-char-ptr".to_string()),
+                subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "char *".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            }]),
+            ..ParsedExternalContext::default()
+        };
+        let mut inferred_signature = InferredSignature {
+            function_name: "sym.demo".to_string(),
+            signature: "void sym.demo(void *)".to_string(),
+            ret_type: "void".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "arg1".to_string(),
+                param_type: "void *".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 80,
+            callconv_confidence: 80,
+        };
+
+        let usage = apply_type_hint_assumptions_to_context(
+            &mut parsed_context,
+            &mut inferred_signature,
+            64,
+            Some(&SemanticTypeProjection::default()),
+        );
+
+        assert!(usage.applied.is_empty());
+        assert_eq!(usage.ignored.len(), 1);
+        assert!(usage.conflicts.is_empty());
+        assert_eq!(inferred_signature.params[0].param_type, "void *");
+        assert!(parsed_context.merged_signature.is_none());
+    }
+
+    #[test]
+    fn corroborated_type_hint_assumptions_update_signature_and_usage() {
+        let mut parsed_context = ParsedExternalContext {
+            assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+                id: Some("param0-char-ptr".to_string()),
+                subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "char *".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            }]),
+            ..ParsedExternalContext::default()
+        };
+        let mut inferred_signature = InferredSignature {
+            function_name: "sym.demo".to_string(),
+            signature: "void sym.demo(void *)".to_string(),
+            ret_type: "void".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "arg1".to_string(),
+                param_type: "void *".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 80,
+            callconv_confidence: 80,
+        };
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let summary_set = InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(
+                root,
+                FunctionSemanticSummary {
+                    id: root,
+                    name: Some("sym.demo".to_string()),
+                    arg_count_hint: Some(1),
+                    direct_callees: BTreeSet::new(),
+                    callsite_count: 0,
+                    has_unknown_calls: false,
+                    arg_effects: BTreeMap::from([(
+                        0,
+                        SummaryArgEffect {
+                            read: true,
+                            write: true,
+                            escape: false,
+                            free: false,
+                        },
+                    )]),
+                    memory_effects: Vec::new(),
+                    return_relation: SummaryReturnRelation::Void,
+                    reads_global_memory: false,
+                    writes_global_memory: false,
+                    touches_unknown_memory: false,
+                },
+            )]),
+            diagnostics: Default::default(),
+        };
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(Some(summary_set)),
+            None,
+            64,
+        );
+
+        let usage = apply_type_hint_assumptions_to_context(
+            &mut parsed_context,
+            &mut inferred_signature,
+            64,
+            Some(&projection),
+        );
+
+        assert_eq!(usage.applied.len(), 1);
+        assert!(usage.ignored.is_empty());
+        assert!(usage.conflicts.is_empty());
+        assert_eq!(inferred_signature.params[0].param_type, "int8_t*");
+        assert_eq!(
+            render_signature_type(
+                parsed_context
+                    .merged_signature
+                    .as_ref()
+                    .expect("merged signature")
+                    .params[0]
+                    .ty
+                    .as_ref()
+                    .expect("hinted param type"),
+                64
+            ),
+            "int8_t*"
         );
     }
 

@@ -233,6 +233,7 @@ mod tests {
             function_return_type: None,
             prepared_ssa: None,
             interproc_summary_set: None,
+            summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
@@ -283,6 +284,7 @@ mod tests {
             function_return_type: None,
             prepared_ssa: None,
             interproc_summary_set: None,
+            summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
@@ -16231,6 +16233,95 @@ mod tests {
                 CExpr::Var("arg1".to_string()),
                 CExpr::IntLit(0),
             ))
+        );
+    }
+
+    #[test]
+    fn prepared_predicate_candidate_for_branch_block_uses_block_assumptions_fallback() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x5000, 4);
+        entry.push(R2ILOp::IntEqual {
+            dst: Varnode::unique(1, 1),
+            a: Varnode::register(0x00, 8),
+            b: Varnode::register(0x18, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x5008, 8),
+            cond: Varnode::unique(1, 1),
+        });
+        let mut fallthrough = R2ILBlock::new(0x5004, 4);
+        fallthrough.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut taken = R2ILBlock::new(0x5008, 4);
+        taken.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch)
+            .with_name("branch_assumption");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let cond = make_var("tmp:pred", 1, 1);
+        let lhs_value_id = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.eq_ignore_ascii_case("rax") && value.var.version == 0)
+            .map(|value| value.id)
+            .expect("lhs value id");
+        let rhs_value_id = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.eq_ignore_ascii_case("rsi") && value.var.version == 0)
+            .map(|value| value.id)
+            .expect("rhs value id");
+        let cond_value_id = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.is_temp())
+            .map(|value| value.id)
+            .expect("cond value id");
+        let mut predicate_facts = r2ssa::PredicateFacts::default();
+        predicate_facts.predicates.insert(
+            r2ssa::PredicateId(1),
+            r2ssa::PredicateFact {
+                id: r2ssa::PredicateId(1),
+                block_addr: 0x5000,
+                condition: lhs_value_id,
+                comparison: Some(r2ssa::CompareProvenance {
+                    kind: r2ssa::CompareKind::Equal,
+                    lhs: lhs_value_id,
+                    rhs: rhs_value_id,
+                }),
+                true_target: 0x5008,
+                false_target: 0x5004,
+            },
+        );
+        predicate_facts.block_assumptions.insert(
+            0x5000,
+            vec![r2ssa::BlockAssumption {
+                predecessor: 0x5000,
+                predicate: r2ssa::PredicateId(1),
+                truth: true,
+            }],
+        );
+        ctx.inputs.prepared_predicates = Some(Box::leak(Box::new(predicate_facts)));
+
+        assert_ne!(
+            lhs_value_id, cond_value_id,
+            "test setup must force the direct predicate match to miss"
+        );
+        assert!(
+            matches!(
+                ctx.prepared_predicate_candidate_for_branch_block_for_test(0x5000, &cond),
+                Some(CExpr::Binary {
+                    op: BinaryOp::Eq,
+                    ..
+                })
+            ),
+            "expected block_assumptions fallback to recover a compare expression"
         );
     }
 }

@@ -5,19 +5,22 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
+use crate::assumption::{AssumptionSet, AssumptionSubject, AssumptionUsageReport, AssumptionValue};
 use crate::cfg::BlockTerminator;
 use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
 use crate::graph::{InstId, SsaGraph, ValueId};
 use crate::op::SSAOp;
 use crate::var::SSAVar;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PredicateId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallSiteId(pub u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,26 +188,229 @@ pub struct CallSiteFacts {
     pub by_inst: BTreeMap<InstId, CallSiteId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedAssumptionBindingKind {
+    Predicate {
+        predicate: PredicateId,
+        block_addr: u64,
+        predecessor: Option<u64>,
+        truth: bool,
+    },
+    Register {
+        name: String,
+        state_name: String,
+        symbol_name: String,
+        bits: u32,
+    },
+    StackSlot {
+        base: StackAddressBase,
+        offset: i64,
+        object: ObjectId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedAssumptionBinding {
+    pub assumption: crate::AnalysisAssumption,
+    pub binding: PreparedAssumptionBindingKind,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PreparedFunctionFacts {
     pub objects: ObjectModel,
     pub memory: MemorySSAFacts,
     pub predicates: PredicateFacts,
     pub call_sites: CallSiteFacts,
+    pub assumptions: AssumptionSet,
+    pub applied_assumption_bindings: Vec<PreparedAssumptionBinding>,
+    pub assumption_usage: AssumptionUsageReport,
 }
 
 impl PreparedFunctionFacts {
     pub fn collect(function: &SSAFunction, graph: &SsaGraph) -> Self {
-        let call_sites = collect_call_sites(function, graph);
+        Self::collect_with_assumptions(function, graph, &AssumptionSet::default())
+    }
+
+    pub fn collect_with_assumptions(
+        function: &SSAFunction,
+        graph: &SsaGraph,
+        assumptions: &AssumptionSet,
+    ) -> Self {
+        let call_sites = collect_call_sites(function, graph, function.decompile_prep_facts());
         let (objects, memory) = collect_object_and_memory_facts(function, graph, &call_sites);
-        let predicates = collect_predicate_facts(function, graph);
+        let predicates = apply_assumptions_to_predicate_facts(
+            collect_predicate_facts(function, graph),
+            assumptions,
+        );
+        let (applied_assumption_bindings, assumption_usage) =
+            collect_prepared_assumption_usage(graph, &objects, &predicates, assumptions);
         Self {
             objects,
             memory,
             predicates,
             call_sites,
+            assumptions: assumptions.clone(),
+            applied_assumption_bindings,
+            assumption_usage,
         }
     }
+}
+
+fn apply_assumptions_to_predicate_facts(
+    mut predicates: PredicateFacts,
+    assumptions: &AssumptionSet,
+) -> PredicateFacts {
+    for assumption in assumptions.iter() {
+        let (predicate_id, block_addr, predecessor, truth) =
+            match (&assumption.subject, &assumption.value) {
+                (
+                    AssumptionSubject::Predicate {
+                        predicate,
+                        block_addr,
+                        predecessor,
+                    },
+                    AssumptionValue::Branch { truth },
+                ) => (*predicate, *block_addr, *predecessor, *truth),
+                _ => continue,
+            };
+        if !predicates.predicates.contains_key(&predicate_id) {
+            continue;
+        }
+        let entry = predicates.block_assumptions.entry(block_addr).or_default();
+        if entry.iter().any(|existing| {
+            existing.predicate == predicate_id
+                && existing.predecessor == predecessor.unwrap_or(existing.predecessor)
+                && existing.truth == truth
+        }) {
+            continue;
+        }
+        entry.push(BlockAssumption {
+            predecessor: predecessor.unwrap_or(block_addr),
+            predicate: predicate_id,
+            truth,
+        });
+    }
+    predicates
+}
+
+fn collect_prepared_assumption_usage(
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    predicates: &PredicateFacts,
+    assumptions: &AssumptionSet,
+) -> (Vec<PreparedAssumptionBinding>, AssumptionUsageReport) {
+    let mut bindings = Vec::new();
+    let mut usage = AssumptionUsageReport::default();
+
+    for assumption in assumptions.iter() {
+        match (&assumption.subject, &assumption.value) {
+            (
+                AssumptionSubject::Predicate {
+                    predicate,
+                    block_addr,
+                    predecessor,
+                },
+                AssumptionValue::Branch { truth },
+            ) => {
+                let Some(fact) = predicates.predicates.get(predicate) else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                if fact.block_addr != *block_addr {
+                    usage.mark_conflict(
+                        assumption,
+                        format!(
+                            "predicate block mismatch (expected 0x{block_addr:x}, observed 0x{:x})",
+                            fact.block_addr
+                        ),
+                    );
+                    continue;
+                }
+                if let Some(pred) = predecessor {
+                    let expected = if *truth {
+                        fact.true_target
+                    } else {
+                        fact.false_target
+                    };
+                    if *pred != expected {
+                        usage.mark_conflict(
+                            assumption,
+                            format!(
+                                "branch predecessor 0x{pred:x} does not match selected edge 0x{expected:x}"
+                            ),
+                        );
+                        continue;
+                    }
+                }
+                usage.mark_applied(assumption);
+                bindings.push(PreparedAssumptionBinding {
+                    assumption: assumption.clone(),
+                    binding: PreparedAssumptionBindingKind::Predicate {
+                        predicate: *predicate,
+                        block_addr: *block_addr,
+                        predecessor: *predecessor,
+                        truth: *truth,
+                    },
+                });
+            }
+            (AssumptionSubject::Register { name }, _) => {
+                let Some(value) = graph.values.iter().find(|value| {
+                    value.var.version == 0
+                        && value.var.is_register()
+                        && value.var.name.eq_ignore_ascii_case(name)
+                }) else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                usage.mark_applied(assumption);
+                bindings.push(PreparedAssumptionBinding {
+                    assumption: assumption.clone(),
+                    binding: PreparedAssumptionBindingKind::Register {
+                        name: value.var.name.clone(),
+                        state_name: value.var.display_name(),
+                        symbol_name: value
+                            .var
+                            .name
+                            .strip_prefix("reg:")
+                            .unwrap_or(&value.var.name)
+                            .to_ascii_lowercase(),
+                        bits: value.var.size.saturating_mul(8),
+                    },
+                });
+            }
+            (AssumptionSubject::StackSlot { base, offset }, _) => {
+                let Some((root, object)) =
+                    objects.stack_objects.iter().find_map(|(root, object)| {
+                        let matches_base = matches!(
+                            (base.as_str(), root.base),
+                            ("bp", StackAddressBase::FramePointer)
+                                | ("frame", StackAddressBase::FramePointer)
+                                | ("rbp", StackAddressBase::FramePointer)
+                                | ("sp", StackAddressBase::StackPointer)
+                                | ("stack", StackAddressBase::StackPointer)
+                                | ("rsp", StackAddressBase::StackPointer)
+                        );
+                        (matches_base && root.offset == *offset).then_some((*root, *object))
+                    })
+                else {
+                    usage.mark_ignored(assumption);
+                    continue;
+                };
+                usage.mark_applied(assumption);
+                bindings.push(PreparedAssumptionBinding {
+                    assumption: assumption.clone(),
+                    binding: PreparedAssumptionBindingKind::StackSlot {
+                        base: root.base,
+                        offset: root.offset,
+                        object,
+                    },
+                });
+            }
+            _ => usage.mark_ignored(assumption),
+        }
+    }
+
+    (bindings, usage)
 }
 
 #[derive(Debug, Clone)]
@@ -731,7 +937,11 @@ fn collect_predicate_facts(function: &SSAFunction, graph: &SsaGraph) -> Predicat
     }
 }
 
-fn collect_call_sites(function: &SSAFunction, graph: &SsaGraph) -> CallSiteFacts {
+fn collect_call_sites(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    prep_facts: Option<&DecompilePrepFacts>,
+) -> CallSiteFacts {
     let mut by_id = BTreeMap::new();
     let mut by_inst = BTreeMap::new();
     let mut next_id = 0u32;
@@ -763,7 +973,7 @@ fn collect_call_sites(function: &SSAFunction, graph: &SsaGraph) -> CallSiteFacts
             };
             let id = CallSiteId(next_id);
             next_id = next_id.saturating_add(1);
-            let direct_target = resolve_const_value(None, &target);
+            let direct_target = resolve_const_value(prep_facts, &target);
             by_inst.insert(inst_id, id);
             by_id.insert(
                 id,

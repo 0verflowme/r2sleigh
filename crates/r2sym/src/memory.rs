@@ -237,7 +237,11 @@ impl<'ctx> MemoryRegion<'ctx> {
         if let Some(concrete_value) = value.as_concrete() {
             for index in 0..size {
                 let byte_offset = offset.wrapping_add(index as u64);
-                let byte_value = ((concrete_value >> (index * 8)) & 0xff) as u8;
+                let byte_value = if index < 8 {
+                    ((concrete_value >> (index * 8)) & 0xff) as u8
+                } else {
+                    0
+                };
                 self.concrete.insert(byte_offset, byte_value);
             }
         } else {
@@ -1286,6 +1290,32 @@ mod tests {
             .and_then(|value| value.as_u64())
             .unwrap();
         assert_eq!(value, 0x1122_aa44);
+    }
+
+    #[test]
+    fn test_wide_concrete_region_write_does_not_shift_overflow() {
+        let ctx = Context::thread_local();
+        let mut mem = SymMemory::new(&ctx);
+        let globals = mem.define_region(
+            MemoryRegionKind::Global,
+            "globals",
+            Some(0x5000),
+            Some(0x100),
+        );
+
+        let ptr = RegionPointer {
+            region_id: globals,
+            offset: 0,
+            ptr_bits: 64,
+        };
+        mem.region_write(&ptr, &SymValue::concrete(0x1122_3344_5566_7788, 128), 16);
+
+        assert_eq!(
+            mem.read_bytes(0x5000, 16),
+            Some(vec![
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])
+        );
     }
 
     #[test]

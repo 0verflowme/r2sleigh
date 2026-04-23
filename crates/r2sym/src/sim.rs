@@ -20,7 +20,7 @@ use z3::ast::{Ast, BV, Bool};
 use crate::executor::{CallHookResult, SymExecutor};
 use crate::path::PathExplorer;
 use crate::solver::{SatResult, SymSolver};
-use crate::state::{ExitStatus, SymState};
+use crate::state::{ExitStatus, RuntimeValueProvenance, SymState};
 use crate::value::SymValue;
 
 /// Default upper bound for string operations.
@@ -188,6 +188,11 @@ impl CallConv {
         Self::new(vec!["RDI", "RSI", "RDX", "RCX", "R8", "R9"], "RAX", 64, 64)
     }
 
+    /// x86-64 Windows ABI (RCX, RDX, R8, R9; return in RAX).
+    pub fn x86_64_windows() -> Self {
+        Self::new(vec!["RCX", "RDX", "R8", "R9"], "RAX", 64, 64)
+    }
+
     /// Architecture-derived calling convention used by the symbolic runtime.
     pub fn for_arch_spec(arch: &ArchSpec) -> Option<Self> {
         let arch_name = arch.name.to_ascii_lowercase();
@@ -211,6 +216,20 @@ impl CallConv {
         }
 
         None
+    }
+
+    /// Architecture-derived calling convention with binary-environment hints.
+    pub fn for_arch_spec_and_symbols(
+        arch: &ArchSpec,
+        symbol_map: &HashMap<u64, String>,
+    ) -> Option<Self> {
+        let arch_name = arch.name.to_ascii_lowercase();
+        let looks_x86 = arch_name.contains("x86") || arch_name == "x64" || arch_name == "amd64";
+        let looks_64 = arch.addr_size == 8 || arch.addr_size == 64 || arch_name.contains("64");
+        if looks_x86 && looks_64 && symbol_map_looks_windows(symbol_map) {
+            return Some(Self::x86_64_windows());
+        }
+        Self::for_arch_spec(arch)
     }
 
     pub(crate) fn collect_call_info<'ctx>(
@@ -242,7 +261,7 @@ impl CallConv {
         SymValue::unknown(self.arg_bits)
     }
 
-    fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
+    pub(crate) fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
         let key = register_aliases(self.ret_register)
             .into_iter()
             .find_map(|alias| find_register_key(state, alias))
@@ -279,6 +298,19 @@ impl CallConv {
     pub(crate) fn return_value<'ctx>(&self, state: &SymState<'ctx>) -> SymValue<'ctx> {
         self.read_register(state, self.ret_register)
     }
+}
+
+fn symbol_map_looks_windows(symbol_map: &HashMap<u64, String>) -> bool {
+    symbol_map.values().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.contains(".dll_")
+            || lower.contains("kernel32")
+            || lower.contains("ntdll")
+            || lower.contains("msvcrt")
+            || lower.ends_with("addvectoredexceptionhandler")
+            || lower.ends_with("raiseexception")
+            || lower.ends_with("virtualalloc")
+    })
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +359,16 @@ impl PreparedFunctionScope {
         &self.functions
     }
 
+    pub fn function_containing_block(&self, pc: u64) -> Option<&ScopedPreparedFunction> {
+        self.functions
+            .values()
+            .find(|function| function.prepared.get_block(pc).is_some())
+    }
+
+    pub fn contains_block(&self, pc: u64) -> bool {
+        self.function_containing_block(pc).is_some()
+    }
+
     pub fn helper_functions(&self) -> impl Iterator<Item = &ScopedPreparedFunction> {
         self.functions
             .values()
@@ -345,6 +387,13 @@ impl PreparedFunctionScope {
         }
         Self::new(self.root.0, functions)
     }
+}
+
+fn is_runtime_materialized_scope_function(function: &ScopedPreparedFunction) -> bool {
+    function
+        .name
+        .as_deref()
+        .is_some_and(|name| name.starts_with("runtime.materialized."))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +530,18 @@ impl<'ctx> SummaryRegistry<'ctx> {
     /// Create a registry pre-populated with summaries for a typed workflow profile.
     pub fn with_profile_for_arch(arch: &ArchSpec, profile: SummaryProfile) -> Option<Self> {
         Some(Self::with_profile(CallConv::for_arch_spec(arch)?, profile))
+    }
+
+    /// Create a registry using symbol-map environment hints when the architecture is ambiguous.
+    pub fn with_profile_for_arch_and_symbols(
+        arch: &ArchSpec,
+        symbol_map: &HashMap<u64, String>,
+        profile: SummaryProfile,
+    ) -> Option<Self> {
+        Some(Self::with_profile(
+            CallConv::for_arch_spec_and_symbols(arch, symbol_map)?,
+            profile,
+        ))
     }
 
     /// Register a function summary.
@@ -642,6 +703,7 @@ impl<'ctx> SummaryRegistry<'ctx> {
 
         let helper_scope = scope
             .helper_functions()
+            .filter(|helper| !is_runtime_materialized_scope_function(helper))
             .map(|helper| (helper.id, helper))
             .collect::<BTreeMap<_, _>>();
         let sccs = compute_derived_summary_sccs(&helper_scope);
@@ -950,6 +1012,9 @@ fn build_interproc_summary_set(
     let mut inputs = Vec::new();
     let mut seeds = BTreeMap::new();
     for function in scope.functions().values() {
+        if is_runtime_materialized_scope_function(function) {
+            continue;
+        }
         inputs.push(InterprocFunctionInput {
             id: function.id,
             name: function.name.clone(),
@@ -1277,6 +1342,9 @@ fn apply_derived_summary<'ctx>(
     if summary.cases.is_empty() {
         return CallHookResult::Fallthrough;
     }
+    if apply_derived_runtime_materialization_copy(state, summary, &call, callconv) {
+        return CallHookResult::Fallthrough;
+    }
 
     let substitutions = build_summary_substitutions(state, summary, &call);
 
@@ -1318,6 +1386,66 @@ fn apply_derived_summary<'ctx>(
     }
 
     CallHookResult::Fallthrough
+}
+
+const DERIVED_RUNTIME_COPY_MIN_SIZE: u32 = 0x100;
+
+fn apply_derived_runtime_materialization_copy<'ctx>(
+    state: &mut SymState<'ctx>,
+    summary: &DerivedFunctionSummary<'ctx>,
+    call: &CallInfo<'ctx>,
+    callconv: &CallConv,
+) -> bool {
+    let [case] = summary.cases.as_slice() else {
+        return false;
+    };
+    if case.guard.simplify().as_bool() != Some(true) {
+        return false;
+    }
+    let Some(write) = case
+        .memory_writes
+        .iter()
+        .find(|write| write.arg_index == 0 && write.offset == 0)
+    else {
+        return false;
+    };
+    if write.size < DERIVED_RUNTIME_COPY_MIN_SIZE {
+        return false;
+    }
+    if !summary
+        .memory_inputs
+        .iter()
+        .any(|input| input.arg_index == 1 && input.size >= write.size)
+    {
+        return false;
+    }
+    let Some(dst) = call.args.first().and_then(SymValue::as_concrete) else {
+        return false;
+    };
+    let Some(src) = call.args.get(1).and_then(SymValue::as_concrete) else {
+        return false;
+    };
+    let len = call
+        .args
+        .get(2)
+        .and_then(SymValue::as_concrete)
+        .unwrap_or(write.size as u64);
+    if len == 0 || len > write.size as u64 || len > u32::MAX as u64 {
+        return false;
+    }
+    if state.runtime_region_for_pc(dst).is_none() {
+        return false;
+    }
+
+    let provenance = RuntimeValueProvenance {
+        source_addr: src,
+        size: len as u32,
+    };
+    state.note_runtime_store_copy(dst, len as u32, Some(&provenance));
+    if case.return_value.is_some() {
+        callconv.write_return(state, SymValue::concrete(dst, call.ret_bits));
+    }
+    true
 }
 
 pub(crate) fn evaluate_derived_summary_guidance<'ctx>(
@@ -1782,6 +1910,18 @@ impl<'ctx> FunctionSummary<'ctx> for MemcpySummary {
             .cloned()
             .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
         copy_bytes(state, &dst, &src, &n, self.max_copy, self.byte_policy);
+        if let (Some(dst_addr), Some(src_addr), Some(n)) =
+            (dst.as_concrete(), src.as_concrete(), n.as_concrete())
+            && n > 0
+            && n <= self.max_copy
+            && n <= u32::MAX as u64
+        {
+            let provenance = RuntimeValueProvenance {
+                source_addr: src_addr,
+                size: n as u32,
+            };
+            state.note_runtime_store_copy(dst_addr, n as u32, Some(&provenance));
+        }
         SummaryEffect::Return(Some(dst))
     }
 }
@@ -2501,6 +2641,31 @@ mod tests {
         assert_eq!(path_listing_far.get_taint(), 0);
         let path_listing_base = path_listing_state.mem_read(&dst, 1);
         assert_eq!(path_listing_base.get_taint(), 0x20);
+    }
+
+    #[test]
+    fn memcpy_summary_records_runtime_materialization_provenance() {
+        let ctx = z3::Context::thread_local();
+        let mut state = SymState::new(&ctx, 0);
+        let (_region, runtime_base) = state.allocate_heap_region("jit", 0x1000);
+        state.register_runtime_region_alias(runtime_base, 0x1000, true);
+
+        let summary = MemcpySummary::new(0x1000);
+        let call = CallInfo {
+            args: vec![
+                SymValue::concrete(runtime_base, 64),
+                SymValue::concrete(0x14009c000, 64),
+                SymValue::concrete(0x1000, 64),
+            ],
+            arg_bits: 64,
+            ret_bits: 64,
+        };
+        let _ = summary.execute(&mut state, &call);
+
+        let region = state
+            .runtime_region_for_pc(runtime_base)
+            .expect("runtime region should remain registered");
+        assert_eq!(region.source_base, Some(0x14009c000));
     }
 
     #[test]

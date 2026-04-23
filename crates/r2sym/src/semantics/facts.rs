@@ -609,7 +609,9 @@ fn install_symbolic_fact_hooks<'ctx>(
     summary_profile: SummaryProfile,
     symbol_map: &HashMap<u64, String>,
 ) {
-    let Some(registry) = SummaryRegistry::with_profile_for_arch(arch, summary_profile) else {
+    let Some(registry) =
+        SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
+    else {
         return;
     };
     if let Some(scope) = scope {
@@ -812,7 +814,9 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
 ) -> CollectedNativeSemanticRegions {
     let branch_blocks = limited_branch_blocks(func, branch_limit.max(1));
     let mut collected = if let Some(scope) = scope {
-        if let Some(registry) = SummaryRegistry::with_profile_for_arch(arch, summary_profile) {
+        if let Some(registry) =
+            SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
+        {
             let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);
             collect_canonical_semantic_regions_with_derived_for_branch_blocks(
                 ctx,
@@ -907,7 +911,9 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
     }
 
     if let Some(scope) = scope {
-        let Some(registry) = SummaryRegistry::with_profile_for_arch(arch, summary_profile) else {
+        let Some(registry) =
+            SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
+        else {
             return CollectedNativeSemanticRegions::default();
         };
         let derived = registry.derive_symbolic_summaries(ctx, scope, Some(arch), symbol_map);

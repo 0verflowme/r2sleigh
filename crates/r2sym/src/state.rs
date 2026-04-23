@@ -5,7 +5,7 @@
 
 use std::cell::OnceCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +15,22 @@ use z3::ast::{BV, Bool};
 
 use crate::memory::{MemoryRegionId, MemoryRegionKind, SymMemory};
 use crate::value::SymValue;
+
+fn debug_runtime_continuation_log(message: &str) {
+    if std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_CONTINUATION").is_none() {
+        return;
+    }
+    let path = std::env::var("R2SLEIGH_DEBUG_RUNTIME_CONTINUATION_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_runtime_continuation.log".to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{message}");
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ConstraintCursorKey(usize);
@@ -143,13 +159,61 @@ pub struct SymbolicFdInput<'ctx> {
     pub cursor: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuntimeBlockReason {
+    MissingExceptionHandler,
+    MissingRuntimeMaterializedCode,
+    MissingContinuationSeed,
+    RuntimeRegionProvenanceUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeValueProvenance {
+    pub source_addr: u64,
+    pub size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeRegionAlias {
+    pub runtime_base: u64,
+    pub size: u64,
+    pub source_base: Option<u64>,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PendingExceptionContinuation {
+    pub handler_addr: u64,
+    pub exception_code: u64,
+    pub exception_pointers_addr: u64,
+    pub exception_record_addr: u64,
+    pub context_addr: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeBreakpointContinuation<'ctx> {
+    pub handler_addr: u64,
+    pub exception_code: u64,
+    pub breakpoint: SymValue<'ctx>,
+}
+
 /// Runtime policy carried with each symbolic state.
 #[derive(Debug, Clone, Default)]
-pub struct RuntimeState {
+pub struct RuntimeState<'ctx> {
     /// File descriptors that should report tty=true via isatty().
     pub tty_fds: HashSet<i32>,
     /// Whether sleep-family calls should become zero-cost no-ops.
     pub skip_sleep_calls: bool,
+    /// Registered exception handlers discovered by runtime hooks.
+    pub exception_handlers: BTreeSet<u64>,
+    /// Runtime regions that may alias materialized executable code.
+    pub runtime_regions: BTreeMap<u64, RuntimeRegionAlias>,
+    /// Provenance for recently loaded values used to detect copy loops.
+    pub value_provenance: BTreeMap<String, RuntimeValueProvenance>,
+    /// Pending exception continuation state that should resume on handler return.
+    pub pending_exception: Option<PendingExceptionContinuation>,
+    /// Active runtime breakpoint that re-enters an exception handler when reached.
+    pub active_breakpoint: Option<RuntimeBreakpointContinuation<'ctx>>,
 }
 
 /// The state of a symbolic execution.
@@ -166,6 +230,9 @@ pub struct SymState<'ctx> {
     constraints: ConstraintCursor,
     /// Materialized constraint list, populated lazily from the shared cursor chain.
     materialized_constraints: OnceCell<Vec<Bool>>,
+    /// Syntactic value facts derived while adding constraints.
+    known_zero_values: Rc<BTreeSet<String>>,
+    known_nonzero_values: Rc<BTreeSet<String>>,
     /// Current program counter.
     pub pc: u64,
     /// Previous program counter (block predecessor).
@@ -183,7 +250,7 @@ pub struct SymState<'ctx> {
     /// Symbolic external input streams keyed by file descriptor.
     symbolic_fd_inputs: Rc<HashMap<i32, SymbolicFdInput<'ctx>>>,
     /// Runtime policy/state for summaries.
-    runtime: RuntimeState,
+    runtime: RuntimeState<'ctx>,
 }
 
 /// Exit status of a symbolic execution path.
@@ -195,6 +262,8 @@ pub enum ExitStatus {
     Exit(u64),
     /// Hit an error/exception.
     Error(String),
+    /// Runtime execution was blocked because a required dynamic fact was missing.
+    RuntimeBlocked(RuntimeBlockReason),
     /// Hit an unimplemented operation.
     Unimplemented,
     /// Reached maximum depth.
@@ -212,6 +281,8 @@ impl<'ctx> SymState<'ctx> {
             memory: SymMemory::new(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
+            known_zero_values: Rc::new(BTreeSet::new()),
+            known_nonzero_values: Rc::new(BTreeSet::new()),
             pc: entry_pc,
             prev_pc: None,
             active: true,
@@ -232,6 +303,8 @@ impl<'ctx> SymState<'ctx> {
             memory: SymMemory::new_symbolic(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
+            known_zero_values: Rc::new(BTreeSet::new()),
+            known_nonzero_values: Rc::new(BTreeSet::new()),
             pc: entry_pc,
             prev_pc: None,
             active: true,
@@ -316,14 +389,379 @@ impl<'ctx> SymState<'ctx> {
         self.symbolic_memory.as_slice()
     }
 
+    /// Return whether every byte in a concrete address range is known concrete.
+    pub fn is_concrete_memory_range(&self, addr: u64, size: u32) -> bool {
+        self.memory.is_concrete_range(addr, size)
+    }
+
+    /// Read concrete bytes from memory when the full range is concrete.
+    pub fn read_memory_bytes(&self, addr: u64, size: usize) -> Option<Vec<u8>> {
+        self.memory.read_bytes(addr, size)
+    }
+
     /// Get tracked symbolic file-descriptor inputs.
     pub fn symbolic_fd_inputs(&self) -> &HashMap<i32, SymbolicFdInput<'ctx>> {
         self.symbolic_fd_inputs.as_ref()
     }
 
     /// Get runtime policy/state.
-    pub fn runtime(&self) -> &RuntimeState {
+    pub fn runtime(&self) -> &RuntimeState<'ctx> {
         &self.runtime
+    }
+
+    pub fn register_exception_handler(&mut self, addr: u64) {
+        self.runtime.exception_handlers.insert(addr);
+    }
+
+    pub fn primary_exception_handler(&self) -> Option<u64> {
+        self.runtime.exception_handlers.iter().next().copied()
+    }
+
+    pub fn define_runtime_region(
+        &mut self,
+        name: &str,
+        base_addr: u64,
+        size: u64,
+        executable: bool,
+    ) -> MemoryRegionId {
+        let region_id =
+            self.define_memory_region(MemoryRegionKind::Heap, name, Some(base_addr), Some(size));
+        self.runtime
+            .runtime_regions
+            .entry(base_addr)
+            .or_insert(RuntimeRegionAlias {
+                runtime_base: base_addr,
+                size,
+                source_base: None,
+                executable,
+            });
+        region_id
+    }
+
+    pub fn register_runtime_region_alias(&mut self, base_addr: u64, size: u64, executable: bool) {
+        self.runtime
+            .runtime_regions
+            .entry(base_addr)
+            .and_modify(|region| {
+                region.size = region.size.max(size);
+                region.executable |= executable;
+            })
+            .or_insert(RuntimeRegionAlias {
+                runtime_base: base_addr,
+                size,
+                source_base: None,
+                executable,
+            });
+    }
+
+    pub fn mark_runtime_region_executable(&mut self, base_addr: u64, size: u64) -> bool {
+        let mut updated = false;
+        for region in self.runtime.runtime_regions.values_mut() {
+            let region_end = region.runtime_base.saturating_add(region.size);
+            let end = base_addr.saturating_add(size);
+            if base_addr < region_end && region.runtime_base < end {
+                region.executable = true;
+                updated = true;
+            }
+        }
+        updated
+    }
+
+    pub fn runtime_region_for_pc(&self, pc: u64) -> Option<&RuntimeRegionAlias> {
+        self.runtime.runtime_regions.values().find(|region| {
+            pc >= region.runtime_base && pc < region.runtime_base.saturating_add(region.size)
+        })
+    }
+
+    pub fn resolve_runtime_pc(&self, pc: u64) -> Option<u64> {
+        let region = self.runtime_region_for_pc(pc)?;
+        if !region.executable {
+            return None;
+        }
+        let source_base = region.source_base?;
+        let offset = pc.checked_sub(region.runtime_base)?;
+        (offset < region.size).then_some(source_base.saturating_add(offset))
+    }
+
+    pub fn remap_static_pc_to_runtime(&self, static_pc: u64) -> Option<u64> {
+        self.runtime.runtime_regions.values().find_map(|region| {
+            let source_base = region.source_base?;
+            let offset = static_pc.checked_sub(source_base)?;
+            (offset < region.size && region.executable)
+                .then_some(region.runtime_base.saturating_add(offset))
+        })
+    }
+
+    pub fn set_value_provenance(&mut self, name: &str, provenance: Option<RuntimeValueProvenance>) {
+        if let Some(provenance) = provenance {
+            self.runtime
+                .value_provenance
+                .insert(name.to_string(), provenance);
+        } else {
+            self.runtime.value_provenance.remove(name);
+        }
+    }
+
+    pub fn value_provenance(&self, name: &str) -> Option<&RuntimeValueProvenance> {
+        self.runtime.value_provenance.get(name)
+    }
+
+    pub fn note_runtime_store_copy(
+        &mut self,
+        store_addr: u64,
+        size: u32,
+        provenance: Option<&RuntimeValueProvenance>,
+    ) {
+        let Some(provenance) = provenance else {
+            return;
+        };
+        let Some(region_base) = self
+            .runtime
+            .runtime_regions
+            .values()
+            .find(|region| {
+                store_addr >= region.runtime_base
+                    && store_addr < region.runtime_base.saturating_add(region.size)
+            })
+            .map(|region| region.runtime_base)
+        else {
+            return;
+        };
+        let Some(region) = self.runtime.runtime_regions.get_mut(&region_base) else {
+            return;
+        };
+        let Some(offset) = store_addr.checked_sub(region.runtime_base) else {
+            return;
+        };
+        let Some(candidate_source_base) = provenance.source_addr.checked_sub(offset) else {
+            return;
+        };
+        match region.source_base {
+            None => region.source_base = Some(candidate_source_base),
+            Some(existing) if existing == candidate_source_base => {}
+            Some(_) => region.source_base = None,
+        }
+        let copied_extent = offset.saturating_add(size as u64);
+        if copied_extent > region.size {
+            region.size = copied_extent;
+        }
+    }
+
+    pub fn set_pending_exception(&mut self, pending: PendingExceptionContinuation) {
+        self.runtime.pending_exception = Some(pending);
+    }
+
+    pub fn pending_exception(&self) -> Option<&PendingExceptionContinuation> {
+        self.runtime.pending_exception.as_ref()
+    }
+
+    pub(crate) fn clear_pending_exception(&mut self) {
+        self.runtime.pending_exception = None;
+    }
+
+    fn write_u32(&mut self, addr: u64, value: u32) {
+        self.mem_write(
+            &SymValue::concrete(addr, 64),
+            &SymValue::concrete(value as u64, 32),
+            4,
+        );
+    }
+
+    fn write_u64(&mut self, addr: u64, value: u64) {
+        self.mem_write(
+            &SymValue::concrete(addr, 64),
+            &SymValue::concrete(value, 64),
+            8,
+        );
+    }
+
+    fn read_register_family(&self, base: &str) -> SymValue<'ctx> {
+        let lower = base.to_ascii_lowercase();
+        let mut best: Option<(u64, &String)> = None;
+        for key in self.registers.keys() {
+            let key_lower = key.to_ascii_lowercase();
+            if let Some((prefix, suffix)) = key_lower.rsplit_once('_')
+                && prefix == lower
+                && let Ok(version) = suffix.parse::<u64>()
+            {
+                if best.is_none_or(|(best_version, _)| version > best_version) {
+                    best = Some((version, key));
+                }
+            } else if key_lower == lower {
+                return self.get_register_sized(key, 64);
+            }
+        }
+        best.map_or_else(
+            || SymValue::unknown(64),
+            |(_, key)| self.get_register_sized(key, 64),
+        )
+    }
+
+    fn write_register_to_context(&mut self, context_addr: u64, base: &str, offset: u64) {
+        let value = self.read_register_family(base);
+        self.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(offset), 64),
+            &value,
+            8,
+        );
+    }
+
+    pub(crate) fn seed_exception_continuation(&mut self, exception_code: u64, handler_addr: u64) {
+        let (_, record_addr) = self.allocate_heap_region("veh_exception_record", 0x20);
+        let (_, context_addr) = self.allocate_heap_region("veh_exception_context", 0x400);
+        let (_, pointers_addr) = self.allocate_heap_region("veh_exception_pointers", 0x10);
+
+        self.write_u32(record_addr, exception_code as u32);
+        self.write_u64(pointers_addr, record_addr);
+        self.write_u64(pointers_addr.saturating_add(8), context_addr);
+        self.write_register_to_context(context_addr, "RAX", 0x78);
+        self.write_register_to_context(context_addr, "RCX", 0x80);
+        self.write_register_to_context(context_addr, "RDX", 0x88);
+        self.write_register_to_context(context_addr, "RBX", 0x90);
+        self.write_register_to_context(context_addr, "RSP", 0x98);
+        self.write_register_to_context(context_addr, "RBP", 0xA0);
+        self.write_register_to_context(context_addr, "RSI", 0xA8);
+        self.write_register_to_context(context_addr, "RDI", 0xB0);
+        self.write_register_to_context(context_addr, "R8", 0xB8);
+        self.write_register_to_context(context_addr, "R9", 0xC0);
+        self.write_register_to_context(context_addr, "R10", 0xC8);
+        self.write_register_to_context(context_addr, "R11", 0xD0);
+        self.write_register_to_context(context_addr, "R12", 0xD8);
+        self.write_register_to_context(context_addr, "R13", 0xE0);
+        self.write_register_to_context(context_addr, "R14", 0xE8);
+        self.write_register_to_context(context_addr, "R15", 0xF0);
+        self.write_u64(context_addr.saturating_add(0xF8), self.pc);
+        self.set_concrete("RCX_0", pointers_addr, 64);
+        self.set_pending_exception(PendingExceptionContinuation {
+            handler_addr,
+            exception_code,
+            exception_pointers_addr: pointers_addr,
+            exception_record_addr: record_addr,
+            context_addr,
+        });
+    }
+
+    pub(crate) fn dispatch_runtime_breakpoint_if_ready(&mut self) -> bool {
+        let Some(breakpoint) = self.runtime.active_breakpoint.clone() else {
+            return false;
+        };
+        let Some(breakpoint_addr) = breakpoint.breakpoint.as_concrete() else {
+            return false;
+        };
+        if self.pc != breakpoint_addr {
+            return false;
+        }
+        self.runtime.active_breakpoint = None;
+        self.seed_exception_continuation(breakpoint.exception_code, breakpoint.handler_addr);
+        self.pc = breakpoint.handler_addr;
+        debug_runtime_continuation_log(&format!(
+            "runtime_breakpoint_dispatch pc=0x{:x} handler=0x{:x} code=0x{:x}",
+            breakpoint_addr, breakpoint.handler_addr, breakpoint.exception_code
+        ));
+        true
+    }
+
+    pub(crate) fn fork_symbolic_runtime_breakpoint_at(&mut self, pc: u64) -> Option<Self> {
+        let breakpoint = self.runtime.active_breakpoint.clone()?;
+        if breakpoint.breakpoint.as_concrete().is_some() {
+            return None;
+        }
+        self.runtime_region_for_pc(pc)?;
+
+        let mut dispatched = self.fork();
+        dispatched.constrain_eq(&breakpoint.breakpoint, pc);
+        dispatched.runtime.active_breakpoint = None;
+        dispatched.seed_exception_continuation(breakpoint.exception_code, breakpoint.handler_addr);
+        dispatched.pc = breakpoint.handler_addr;
+        self.constrain_ne(&breakpoint.breakpoint, pc);
+
+        debug_runtime_continuation_log(&format!(
+            "runtime_breakpoint_symbolic_fork pc=0x{:x} handler=0x{:x} code=0x{:x}",
+            pc, breakpoint.handler_addr, breakpoint.exception_code
+        ));
+        Some(dispatched)
+    }
+
+    pub fn set_pending_exception_resume_pc(&mut self, resume_pc: u64) -> bool {
+        let Some(pending) = self.runtime.pending_exception.as_ref() else {
+            return false;
+        };
+        self.mem_write(
+            &SymValue::concrete(pending.context_addr.saturating_add(0xF8), 64),
+            &SymValue::concrete(resume_pc, 64),
+            8,
+        );
+        true
+    }
+
+    pub fn resume_pending_exception_continuation(
+        &mut self,
+    ) -> Result<Option<u64>, RuntimeBlockReason> {
+        let Some(pending) = self.runtime.pending_exception.clone() else {
+            return Ok(None);
+        };
+        let read_u32 = |state: &Self, addr: u64| state.mem_read(&SymValue::concrete(addr, 64), 4);
+        let read_u64 = |state: &Self, addr: u64| state.mem_read(&SymValue::concrete(addr, 64), 8);
+        let restore_register = |state: &mut Self, name: &str, offset: u64| {
+            let value = read_u64(state, pending.context_addr.saturating_add(offset));
+            state.set_register(&format!("{name}_0"), value);
+        };
+        restore_register(self, "RAX", 0x78);
+        restore_register(self, "RCX", 0x80);
+        restore_register(self, "RDX", 0x88);
+        restore_register(self, "RBX", 0x90);
+        restore_register(self, "RSP", 0x98);
+        restore_register(self, "RBP", 0xA0);
+        restore_register(self, "RSI", 0xA8);
+        restore_register(self, "RDI", 0xB0);
+        restore_register(self, "R8", 0xB8);
+        restore_register(self, "R9", 0xC0);
+        restore_register(self, "R10", 0xC8);
+        restore_register(self, "R11", 0xD0);
+        restore_register(self, "R12", 0xD8);
+        restore_register(self, "R13", 0xE0);
+        restore_register(self, "R14", 0xE8);
+        restore_register(self, "R15", 0xF0);
+        let rip = read_u64(self, pending.context_addr.saturating_add(0xF8));
+        let Some(rip) = rip.as_concrete() else {
+            return Err(RuntimeBlockReason::MissingContinuationSeed);
+        };
+        let breakpoint = read_u64(self, pending.context_addr.saturating_add(0x48));
+        let debug_context_requested = read_u32(self, pending.context_addr.saturating_add(0x30))
+            .as_concrete()
+            .is_some_and(|value| value & 0x10 != 0);
+        let dr7_enabled = read_u64(self, pending.context_addr.saturating_add(0x70))
+            .as_concrete()
+            .is_some_and(|value| value != 0);
+        let breakpoint_enabled = debug_context_requested || dr7_enabled;
+        self.runtime.active_breakpoint = if pending.exception_code == 0x8000_0004
+            && breakpoint_enabled
+            && self.runtime_region_for_pc(rip).is_some()
+            && !breakpoint.is_unknown()
+        {
+            Some(RuntimeBreakpointContinuation {
+                handler_addr: pending.handler_addr,
+                exception_code: pending.exception_code,
+                breakpoint: breakpoint.clone(),
+            })
+        } else {
+            None
+        };
+        debug_runtime_continuation_log(&format!(
+            "runtime_resume handler=0x{:x} code=0x{:x} rip=0x{:x} breakpoint={} debug_context={} dr7={} active={}",
+            pending.handler_addr,
+            pending.exception_code,
+            rip,
+            breakpoint.as_concrete().map_or_else(
+                || format!("symbolic:{}b", breakpoint.bits()),
+                |value| format!("0x{value:x}")
+            ),
+            debug_context_requested,
+            dr7_enabled,
+            self.runtime.active_breakpoint.is_some()
+        ));
+        self.runtime.pending_exception = None;
+        Ok(Some(rip))
     }
 
     pub(crate) fn semantic_fingerprint(&self) -> u64 {
@@ -338,12 +776,33 @@ impl<'ctx> SymState<'ctx> {
         tty_fds.sort_unstable();
         tty_fds.hash(&mut hasher);
 
+        self.runtime.exception_handlers.hash(&mut hasher);
+        for (base, region) in &self.runtime.runtime_regions {
+            base.hash(&mut hasher);
+            region.hash(&mut hasher);
+        }
+        let mut provenance = self.runtime.value_provenance.iter().collect::<Vec<_>>();
+        provenance.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (name, source) in provenance {
+            name.hash(&mut hasher);
+            source.hash(&mut hasher);
+        }
+        self.runtime.pending_exception.hash(&mut hasher);
+        if let Some(breakpoint) = &self.runtime.active_breakpoint {
+            breakpoint.handler_addr.hash(&mut hasher);
+            breakpoint.exception_code.hash(&mut hasher);
+            hash_sym_value(self.ctx, &breakpoint.breakpoint, &mut hasher);
+        }
+
         let mut register_names: Vec<_> = self.registers.keys().collect();
         register_names.sort_unstable();
         for name in register_names {
             name.hash(&mut hasher);
             hash_sym_value(self.ctx, &self.registers[name], &mut hasher);
         }
+
+        self.known_zero_values.hash(&mut hasher);
+        self.known_nonzero_values.hash(&mut hasher);
 
         let mut symbolic_input_names: Vec<_> = self.symbolic_inputs.keys().collect();
         symbolic_input_names.sort_unstable();
@@ -415,6 +874,18 @@ impl<'ctx> SymState<'ctx> {
         merged.constraints = ConstraintCursor::default();
         merged.materialized_constraints = OnceCell::new();
         merged.add_constraint(cond_self | cond_other.clone());
+        merged.known_zero_values = Rc::new(
+            self.known_zero_values
+                .intersection(&other.known_zero_values)
+                .cloned()
+                .collect(),
+        );
+        merged.known_nonzero_values = Rc::new(
+            self.known_nonzero_values
+                .intersection(&other.known_nonzero_values)
+                .cloned()
+                .collect(),
+        );
 
         let mut keys = HashSet::new();
         keys.extend(self.registers.keys().cloned());
@@ -494,6 +965,47 @@ impl<'ctx> SymState<'ctx> {
             .runtime
             .tty_fds
             .extend(other.runtime.tty_fds.iter().copied());
+        merged
+            .runtime
+            .exception_handlers
+            .extend(other.runtime.exception_handlers.iter().copied());
+        for (base, other_region) in &other.runtime.runtime_regions {
+            match merged.runtime.runtime_regions.get_mut(base) {
+                Some(existing) => {
+                    existing.size = existing.size.max(other_region.size);
+                    existing.executable |= other_region.executable;
+                    if existing.source_base != other_region.source_base {
+                        existing.source_base = None;
+                    }
+                }
+                None => {
+                    merged
+                        .runtime
+                        .runtime_regions
+                        .insert(*base, other_region.clone());
+                }
+            }
+        }
+        merged.runtime.pending_exception = (self.runtime.pending_exception
+            == other.runtime.pending_exception)
+            .then(|| self.runtime.pending_exception.clone())
+            .flatten();
+        merged.runtime.active_breakpoint = match (
+            &self.runtime.active_breakpoint,
+            &other.runtime.active_breakpoint,
+        ) {
+            (Some(left), Some(right)) if runtime_breakpoint_equal(self.ctx, left, right) => {
+                Some(left.clone())
+            }
+            _ => None,
+        };
+        merged.runtime.value_provenance.retain(|name, source| {
+            other
+                .runtime
+                .value_provenance
+                .get(name)
+                .is_some_and(|other_source| other_source == source)
+        });
 
         merged
     }
@@ -507,11 +1019,42 @@ impl<'ctx> SymState<'ctx> {
         }
     }
 
+    fn mark_value_zero(&mut self, value: &SymValue<'ctx>) {
+        let Some(key) = value.symbolic_key() else {
+            return;
+        };
+        Rc::make_mut(&mut self.known_nonzero_values).remove(&key);
+        Rc::make_mut(&mut self.known_zero_values).insert(key);
+    }
+
+    fn mark_value_nonzero(&mut self, value: &SymValue<'ctx>) {
+        let Some(key) = value.symbolic_key() else {
+            return;
+        };
+        Rc::make_mut(&mut self.known_zero_values).remove(&key);
+        Rc::make_mut(&mut self.known_nonzero_values).insert(key);
+    }
+
+    pub(crate) fn value_known_zero(&self, value: &SymValue<'ctx>) -> bool {
+        value
+            .symbolic_key()
+            .is_some_and(|key| self.known_zero_values.contains(&key))
+    }
+
+    pub(crate) fn value_known_nonzero(&self, value: &SymValue<'ctx>) -> bool {
+        value
+            .symbolic_key()
+            .is_some_and(|key| self.known_nonzero_values.contains(&key))
+    }
+
     /// Constrain a value to equal a concrete constant.
     pub fn constrain_eq(&mut self, value: &SymValue<'ctx>, rhs: u64) {
         let bv = value.to_bv(self.ctx);
         let rhs_bv = BV::from_u64(rhs, value.bits());
         self.add_constraint(bv.eq(&rhs_bv));
+        if rhs == 0 {
+            self.mark_value_zero(value);
+        }
     }
 
     /// Constrain a value to not equal a concrete constant.
@@ -519,6 +1062,9 @@ impl<'ctx> SymState<'ctx> {
         let bv = value.to_bv(self.ctx);
         let rhs_bv = BV::from_u64(rhs, value.bits());
         self.add_constraint(bv.eq(&rhs_bv).not());
+        if rhs == 0 {
+            self.mark_value_nonzero(value);
+        }
     }
 
     /// Constrain a value to be within an unsigned range [min, max].
@@ -635,6 +1181,7 @@ impl<'ctx> SymState<'ctx> {
         let zero = BV::from_u64(0, value.bits());
         let cond = bv.eq(&zero).not();
         self.add_constraint(cond);
+        self.mark_value_nonzero(value);
     }
 
     /// Add a constraint that a value is false (zero).
@@ -643,6 +1190,7 @@ impl<'ctx> SymState<'ctx> {
         let zero = BV::from_u64(0, value.bits());
         let cond = bv.eq(&zero);
         self.add_constraint(cond);
+        self.mark_value_zero(value);
     }
 
     /// Get all path constraints.
@@ -688,6 +1236,11 @@ impl<'ctx> SymState<'ctx> {
         self.depth += 1;
     }
 
+    /// Increment the execution depth by a known number of concrete steps.
+    pub fn step_by(&mut self, steps: usize) {
+        self.depth = self.depth.saturating_add(steps);
+    }
+
     /// Fork this state (for branching).
     pub fn fork(&self) -> Self {
         Self {
@@ -696,6 +1249,8 @@ impl<'ctx> SymState<'ctx> {
             memory: self.memory.fork(),
             constraints: self.constraints.clone(),
             materialized_constraints: OnceCell::new(),
+            known_zero_values: self.known_zero_values.clone(),
+            known_nonzero_values: self.known_nonzero_values.clone(),
             pc: self.pc,
             prev_pc: self.prev_pc,
             active: self.active,
@@ -867,6 +1422,21 @@ fn structural_hash<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn runtime_breakpoint_equal<'ctx>(
+    ctx: &'ctx Context,
+    left: &RuntimeBreakpointContinuation<'ctx>,
+    right: &RuntimeBreakpointContinuation<'ctx>,
+) -> bool {
+    if left.handler_addr != right.handler_addr || left.exception_code != right.exception_code {
+        return false;
+    }
+    let mut left_hasher = DefaultHasher::new();
+    hash_sym_value(ctx, &left.breakpoint, &mut left_hasher);
+    let mut right_hasher = DefaultHasher::new();
+    hash_sym_value(ctx, &right.breakpoint, &mut right_hasher);
+    left_hasher.finish() == right_hasher.finish()
 }
 
 fn hash_sym_value<'ctx, H: Hasher>(ctx: &'ctx Context, value: &SymValue<'ctx>, hasher: &mut H) {
@@ -1171,5 +1741,184 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(value, 0xab);
+    }
+
+    #[test]
+    fn test_runtime_region_copy_alias_resolves_runtime_pc() {
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+
+        let _ = state.define_runtime_region("jit_blob", 0x6000_0000, 0x1000, true);
+        state.note_runtime_store_copy(
+            0x6000_0010,
+            1,
+            Some(&RuntimeValueProvenance {
+                source_addr: 0x1400_1000,
+                size: 1,
+            }),
+        );
+
+        assert_eq!(state.resolve_runtime_pc(0x6000_0010), Some(0x1400_1000));
+        assert_eq!(
+            state.remap_static_pc_to_runtime(0x1400_1010),
+            Some(0x6000_0020)
+        );
+    }
+
+    #[test]
+    fn test_resume_pending_exception_continuation_restores_rip() {
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let (_, context_addr) = state.allocate_heap_region("context", 0x400);
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0x80), 64),
+            &SymValue::concrete(0x1122_3344_5566_7788, 64),
+            8,
+        );
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0xF8), 64),
+            &SymValue::concrete(0x6000_1234, 64),
+            8,
+        );
+        state.set_pending_exception(PendingExceptionContinuation {
+            handler_addr: 0x401000,
+            exception_code: 0x8000_0004,
+            exception_pointers_addr: 0x7000_0000,
+            exception_record_addr: 0x7000_0100,
+            context_addr,
+        });
+
+        let resumed = state
+            .resume_pending_exception_continuation()
+            .expect("continuation should resume");
+
+        assert_eq!(resumed, Some(0x6000_1234));
+        assert_eq!(
+            state.get_register("RCX_0").as_concrete(),
+            Some(0x1122_3344_5566_7788)
+        );
+        assert!(state.pending_exception().is_none());
+    }
+
+    #[test]
+    fn test_set_pending_exception_resume_pc_updates_context_rip() {
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let (_, context_addr) = state.allocate_heap_region("context", 0x400);
+        state.set_pending_exception(PendingExceptionContinuation {
+            handler_addr: 0x401000,
+            exception_code: 0x8000_0004,
+            exception_pointers_addr: 0x7000_0000,
+            exception_record_addr: 0x7000_0100,
+            context_addr,
+        });
+
+        assert!(state.set_pending_exception_resume_pc(0x6000_5678));
+        assert_eq!(
+            state
+                .mem_read(
+                    &SymValue::concrete(context_addr.saturating_add(0xF8), 64),
+                    8
+                )
+                .as_concrete(),
+            Some(0x6000_5678)
+        );
+    }
+
+    #[test]
+    fn test_runtime_breakpoint_continuation_reenters_handler() {
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let _ = state.define_runtime_region("jit", 0x6000_0000, 0x1000, true);
+        state.note_runtime_store_copy(
+            0x6000_0000,
+            0x1000,
+            Some(&RuntimeValueProvenance {
+                source_addr: 0x1400_0000,
+                size: 0x1000,
+            }),
+        );
+        let (_, context_addr) = state.allocate_heap_region("context", 0x400);
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0x48), 64),
+            &SymValue::concrete(0x6000_0020, 64),
+            8,
+        );
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0x70), 64),
+            &SymValue::concrete(1, 64),
+            8,
+        );
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0xF8), 64),
+            &SymValue::concrete(0x6000_0010, 64),
+            8,
+        );
+        state.set_pending_exception(PendingExceptionContinuation {
+            handler_addr: 0x401000,
+            exception_code: 0x8000_0004,
+            exception_pointers_addr: 0x7000_0000,
+            exception_record_addr: 0x7000_0100,
+            context_addr,
+        });
+
+        let resumed = state
+            .resume_pending_exception_continuation()
+            .expect("runtime continuation should resume");
+
+        assert_eq!(resumed, Some(0x6000_0010));
+        state.pc = 0x6000_0020;
+        assert!(state.dispatch_runtime_breakpoint_if_ready());
+        assert_eq!(state.pc, 0x401000);
+        assert!(state.pending_exception().is_some());
+    }
+
+    #[test]
+    fn test_runtime_breakpoint_continuation_accepts_debug_context_flag() {
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        let _ = state.define_runtime_region("jit", 0x6000_0000, 0x1000, true);
+        state.note_runtime_store_copy(
+            0x6000_0000,
+            0x1000,
+            Some(&RuntimeValueProvenance {
+                source_addr: 0x1400_0000,
+                size: 0x1000,
+            }),
+        );
+        let (_, context_addr) = state.allocate_heap_region("context", 0x400);
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0x30), 64),
+            &SymValue::concrete(0x100010, 32),
+            4,
+        );
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0x48), 64),
+            &SymValue::concrete(0x6000_0030, 64),
+            8,
+        );
+        state.mem_write(
+            &SymValue::concrete(context_addr.saturating_add(0xF8), 64),
+            &SymValue::concrete(0x6000_0010, 64),
+            8,
+        );
+        state.set_pending_exception(PendingExceptionContinuation {
+            handler_addr: 0x401000,
+            exception_code: 0x8000_0004,
+            exception_pointers_addr: 0x7000_0000,
+            exception_record_addr: 0x7000_0100,
+            context_addr,
+        });
+
+        assert_eq!(
+            state
+                .resume_pending_exception_continuation()
+                .expect("debug-register continuation should resume"),
+            Some(0x6000_0010)
+        );
+        state.pc = 0x6000_0030;
+        assert!(state.dispatch_runtime_breakpoint_if_ready());
+        assert_eq!(state.pc, 0x401000);
+        assert!(state.pending_exception().is_some());
     }
 }

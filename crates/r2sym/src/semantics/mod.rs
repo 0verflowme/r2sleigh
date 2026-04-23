@@ -7,18 +7,27 @@ mod plan;
 mod region;
 mod vm;
 
+pub(crate) use artifact::TargetQueryRouteInput;
 pub use artifact::{
     ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticConfidence, SemanticEvidence,
     SemanticEvidenceAmbiguity, SemanticEvidenceCoverage, SemanticEvidenceProvenance,
     SemanticEvidenceReason, SemanticEvidenceSoundness, SliceClass,
 };
-pub use cache::{SEMANTIC_ARTIFACT_SCHEMA_VERSION, stable_scope_hash};
+pub use cache::{
+    SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCompilationResult, SemanticSeedMode,
+    stable_scope_hash,
+};
 pub use compiler::compile_semantic_artifact_default_with_scope;
-pub use compiler::{compile_function_semantics_with_scope, compile_semantic_artifact_with_scope};
+pub use compiler::{
+    compile_function_semantics_with_scope, compile_function_semantics_with_scope_and_replay_seed,
+    compile_query_semantic_artifact_with_scope,
+    compile_query_semantic_artifact_with_scope_and_replay_seed,
+    compile_semantic_artifact_with_scope, compile_semantic_artifact_with_scope_and_replay_seed,
+};
 pub use facts::SymbolicReachabilityStatus;
 pub use plan::{
-    ArtifactBuildPlan, DecompilePlan, QueryGuidanceMode, QueryPlan, TargetQueryPlan,
-    TargetQueryRoutePlan, TypePlan,
+    ArtifactBuildPlan, DecompilePlan, QueryGuidanceMode, QueryPlan, TargetQueryExecutionRoute,
+    TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
 };
 pub use region::{
     ArtifactGranularity, ControlFact, ExecutionModel, Judged, MemoryFact, NativeArtifactBody,

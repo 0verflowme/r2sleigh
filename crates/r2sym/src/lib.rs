@@ -34,7 +34,10 @@
 //! ```
 
 pub mod backward;
+pub mod constraints;
 pub mod executor;
+pub mod kernel;
+pub mod loops;
 pub mod memory;
 pub mod path;
 pub mod query;
@@ -46,43 +49,83 @@ pub mod sim;
 pub mod solver;
 pub mod spec;
 pub mod state;
+pub mod tactics;
 pub mod value;
+pub mod verification;
 
 pub use backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
     BackwardMemoryRegion, BackwardRegionRef, CompiledBackwardCondition,
     compile_derived_summary_return_postcondition, compile_target_precondition,
 };
+pub use constraints::{
+    FinalConstraint, FinalConstraintGraph, FinalConstraintPrecision, FinalConstraintSource,
+    FoldAggregateConstraint, FoldAggregateRangeConstraint, InputByteConstraint,
+    InputLengthConstraint, RecurrenceAggregateConstraint, RecurrenceAggregateRangeConstraint,
+    aggregate_exact_fold_bytes, build_exact_fold_constraint_graph,
+    build_final_constraint_graph_for_path, build_model_conditioned_recurrence_constraint_graph,
+    exact_fold_model_bytes,
+};
 pub use executor::{CallHookResult, SymExecutor};
+pub use kernel::{
+    CallEdgePolicy, ConcreteExecutionBackend, ConcreteMemorySeed, ConcreteRunRequest,
+    ConcreteRunResult, ConcreteStopReason, ConcreteTraceEvidence, EdgeId, FactPrecision,
+    FunctionClosureBudget, FunctionClosureEntry, FunctionClosureExclusion,
+    FunctionClosureExclusionReason, FunctionClosurePlan, FunctionClosureReason, FunctionId,
+    NodeId as SemanticNodeId, RegionId as SemanticRegionId, RuntimeRegionFact, SemanticEdge,
+    SemanticEdgeAction, SemanticEdgeKind, SemanticEvidenceKind, SemanticEvidenceRecord,
+    SemanticNode, SemanticNodeKind, SemanticProgramGraph,
+};
+pub use loops::{
+    ExactLoopFoldEvidence, ExactLoopRecurrenceEvidence, ExactLoopRecurrenceKind, LoopCarriedVar,
+    LoopFoldOperation, LoopMemoryTerm, LoopMemoryTermKind, LoopRecurrence, LoopRecurrenceKind,
+    LoopRotateDirection, LoopSummary, LoopSummaryKind, LoopTransitionExpr, LoopTransitionSystem,
+    LoopVarRole, RuntimeLoopBranch, exact_fold_evidence_from_recurrences,
+};
 pub use memory::{
     MemoryRegionId, MemoryRegionKind, RegionPointer, ResolvedPointerSet, SymMemory,
     SymbolicMemoryRegionDef,
 };
-pub use path::{ExploreConfig, PathExplorer, PathResult, SolvedPath};
+pub use path::{
+    ExploreConfig, PathExplorer, PathResult, SolvedPath, SolvedPathGeneration,
+    SolvedPathGenerationKind,
+};
 pub use query::{
-    PathConditionResult, PathConditionSummary, PathConditionTerm, QueryCompletion, QueryMode,
-    ReachabilityResult, ReachabilityStatus, SolveResult, SolveStatus, SymQueryConfig,
-    SymbolicConditionSet, SymbolicFunctionSummary,
+    PathConditionResult, PathConditionSummary, PathConditionTerm, QueryCompletion,
+    QueryExecutionPolicy, QueryMode, ReachabilityResult, ReachabilityStatus, SolveResult,
+    SymQueryConfig, SymbolicConditionSet, SymbolicFunctionSummary, apply_query_execution_policy,
+    install_symbolic_hooks_for_query_policy, recommended_query_max_depth,
+    recommended_query_max_depth_for_route, recommended_query_max_states_for_route,
+    recommended_query_timeout, recommended_query_timeout_for_route,
+    route_skips_eager_scope_summaries, selected_target_query_route_in_scope,
 };
 pub use r2api::{R2Api, R2Error};
 pub use replay::{
     ReplayMemoryOverlay, ReplayMemoryWindow, ReplayRegisterOverlay, ReplayRegisterValue,
     ReplaySeed, apply_replay_seed_to_state, seed_replay_state_for_arch,
+    stable_replay_seed_fingerprint,
 };
-pub use runtime::{seed_default_state_for_arch, seed_memory_regions_for_arch};
+pub use runtime::{
+    install_runtime_hooks_for_scope, seed_default_state_for_arch, seed_memory_regions_for_arch,
+    seed_scope_state_for_arch,
+};
 pub use semantics::{
     ArtifactBuildPlan, ArtifactGranularity, ControlFact, DecompilePlan, ExecutionModel,
     InterpreterDispatchSummary, InterpreterKind, Judged, MemoryFact, NativeArtifactBody,
     NativeFunctionSummary, QueryGuidanceMode, QueryPlan, RefinementStage, RegionKey,
     ResidualReason, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticArtifact, SemanticArtifactBody,
-    SemanticArtifactDiagnostics, SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity,
-    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
-    SemanticEvidenceSoundness, SemanticPredicate, SemanticRegion, SemanticTargetConditionSource,
-    SliceClass, SymbolicReachabilityStatus, TargetFact, TargetQueryPlan, TargetQueryRoutePlan,
-    TypePlan, VmArtifactBody, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
+    SemanticArtifactDiagnostics, SemanticCompilationResult, SemanticConfidence, SemanticEvidence,
+    SemanticEvidenceAmbiguity, SemanticEvidenceCoverage, SemanticEvidenceProvenance,
+    SemanticEvidenceReason, SemanticEvidenceSoundness, SemanticPredicate, SemanticRegion,
+    SemanticSeedMode, SemanticTargetConditionSource, SliceClass, SymbolicReachabilityStatus,
+    TargetFact, TargetQueryExecutionRoute, TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
+    VmArtifactBody, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition,
     VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp, VmValueExpr,
-    compile_function_semantics_with_scope, compile_semantic_artifact_default_with_scope,
-    compile_semantic_artifact_with_scope, stable_scope_hash,
+    compile_function_semantics_with_scope, compile_function_semantics_with_scope_and_replay_seed,
+    compile_query_semantic_artifact_with_scope,
+    compile_query_semantic_artifact_with_scope_and_replay_seed,
+    compile_semantic_artifact_default_with_scope, compile_semantic_artifact_with_scope,
+    compile_semantic_artifact_with_scope_and_replay_seed, stable_scope_hash,
 };
 pub use sim::{
     CallConv, CallInfo, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,
@@ -95,8 +138,26 @@ pub use spec::{
     AddressValue, BudgetSpec, ExplorationSpec, InputSpec, MergeSpec, PredicateSpec, RuntimeSpec,
     StartSpec, StrategySpec,
 };
-pub use state::{RuntimeState, SymState, SymbolicFdInput, SymbolicMemoryRegion};
+pub use state::{
+    PendingExceptionContinuation, RuntimeBlockReason, RuntimeRegionAlias, RuntimeState,
+    RuntimeValueProvenance, SymState, SymbolicFdInput, SymbolicMemoryRegion,
+};
+pub use tactics::{
+    InputByteDomain, SolveTacticCandidate, SolveTacticConfig, TacticConstraintReport,
+    algebraic_preimage_candidate, algebraic_preimage_for_target, constrain_exact_fold_candidate,
+    constrain_exact_fold_inputs, constrain_exact_recurrence_candidate,
+    tactic_candidates_for_constraint_graph,
+};
 pub use value::SymValue;
+pub use verification::{
+    CandidateReplayBackend, CandidateReplayRequest, EvidenceSummary, LiftedReplayBackend,
+    ModelValidation, SolveCandidateShape, SolveStatus, SolveTacticEvidence, SolveTacticKind,
+    SolveTacticStatus, SolveVerification, SolveVerificationRequest, SolveWitness,
+    UnavailableReplayBackend, VerificationRequirement, evidence_summary_for_route_and_stats,
+    solution_extraction_allowed, solve_tactics_for_exact_folds,
+    solve_tactics_for_exact_recurrences, verification_requirement_for_route_and_stats,
+    verify_solve_result,
+};
 
 /// Error types for symbolic execution.
 #[derive(Debug, thiserror::Error)]

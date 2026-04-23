@@ -53,17 +53,34 @@ pub enum TargetQueryPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetQueryExecutionRoute {
+    ContinuationSeeded {
+        bridge_target: u64,
+        route: Box<TargetQueryExecutionRoute>,
+    },
+    ArtifactCondition {
+        mode: QueryGuidanceMode,
+    },
+    ArtifactMemoryOnly,
+    DynamicTargetCompile {
+        reason: String,
+        mode: QueryGuidanceMode,
+    },
+    VmTargetCompile {
+        reason: String,
+    },
+    ResidualOnly {
+        reasons: Vec<String>,
+    },
+    Refuse {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetQueryRoutePlan {
     pub target_plan: TargetQueryPlan,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch_guidance: Option<QueryGuidanceMode>,
-    pub allow_memory_term_narrowing: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dynamic_target_compile_reason: Option<String>,
-    pub allow_dynamic_target_compile: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vm_target_compile_reason: Option<String>,
-    pub allow_vm_target_compile: bool,
+    pub execution: TargetQueryExecutionRoute,
 }
 
 impl TargetQueryRoutePlan {
@@ -72,12 +89,10 @@ impl TargetQueryRoutePlan {
             target_plan: TargetQueryPlan::Fallback {
                 reason: "semantic artifact unavailable".to_string(),
             },
-            branch_guidance: None,
-            allow_memory_term_narrowing: false,
-            dynamic_target_compile_reason: Some("semantic artifact unavailable".to_string()),
-            allow_dynamic_target_compile: true,
-            vm_target_compile_reason: Some("semantic artifact unavailable".to_string()),
-            allow_vm_target_compile: true,
+            execution: TargetQueryExecutionRoute::DynamicTargetCompile {
+                reason: "semantic artifact unavailable".to_string(),
+                mode: QueryGuidanceMode::NarrowOnly,
+            },
         }
     }
 }
@@ -112,6 +127,14 @@ fn residual_reason_strings(diagnostics: &SemanticArtifactDiagnostics) -> Vec<Str
         .iter()
         .map(|reason| format!("{reason:?}"))
         .collect()
+}
+
+fn joined_residual_reason(reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        "residual semantic guidance required".to_string()
+    } else {
+        reasons.join(", ")
+    }
 }
 
 fn has_large_cfg_only_residual(diagnostics: &SemanticArtifactDiagnostics) -> bool {
@@ -249,71 +272,68 @@ pub fn derive_target_query_plan(
 pub fn derive_target_query_route_plan(
     query_plan: &QueryPlan,
     target_plan: &TargetQueryPlan,
+    execution: ExecutionModel,
     has_authoritative_source: bool,
     has_memory_guidance: bool,
 ) -> TargetQueryRoutePlan {
-    match query_plan {
+    let execution = match query_plan {
         QueryPlan::Ready => match target_plan {
-            TargetQueryPlan::Ready { mode } => TargetQueryRoutePlan {
-                target_plan: target_plan.clone(),
-                branch_guidance: Some(*mode),
-                allow_memory_term_narrowing: has_authoritative_source && has_memory_guidance,
-                dynamic_target_compile_reason: None,
-                allow_dynamic_target_compile: false,
-                vm_target_compile_reason: None,
-                allow_vm_target_compile: false,
-            },
-            TargetQueryPlan::Fallback { .. } => TargetQueryRoutePlan {
-                target_plan: target_plan.clone(),
-                branch_guidance: None,
-                allow_memory_term_narrowing: has_authoritative_source && has_memory_guidance,
-                dynamic_target_compile_reason: None,
-                allow_dynamic_target_compile: false,
-                vm_target_compile_reason: None,
-                allow_vm_target_compile: false,
-            },
-            TargetQueryPlan::Residual { .. } | TargetQueryPlan::Refuse { .. } => {
-                TargetQueryRoutePlan {
-                    target_plan: target_plan.clone(),
-                    branch_guidance: None,
-                    allow_memory_term_narrowing: false,
-                    dynamic_target_compile_reason: None,
-                    allow_dynamic_target_compile: false,
-                    vm_target_compile_reason: None,
-                    allow_vm_target_compile: false,
+            TargetQueryPlan::Ready { mode } => match execution {
+                ExecutionModel::Vm => TargetQueryExecutionRoute::VmTargetCompile {
+                    reason: "vm target compilation selected".to_string(),
+                },
+                ExecutionModel::Native if has_authoritative_source => {
+                    TargetQueryExecutionRoute::ArtifactCondition { mode: *mode }
                 }
-            }
+                ExecutionModel::Native if has_memory_guidance => {
+                    TargetQueryExecutionRoute::ArtifactMemoryOnly
+                }
+                ExecutionModel::Native => TargetQueryExecutionRoute::DynamicTargetCompile {
+                    reason: "target guidance unavailable".to_string(),
+                    mode: *mode,
+                },
+            },
+            TargetQueryPlan::Fallback { reason } => match execution {
+                ExecutionModel::Vm => TargetQueryExecutionRoute::VmTargetCompile {
+                    reason: reason.clone(),
+                },
+                ExecutionModel::Native => TargetQueryExecutionRoute::DynamicTargetCompile {
+                    reason: reason.clone(),
+                    mode: QueryGuidanceMode::NarrowOnly,
+                },
+            },
+            TargetQueryPlan::Residual { reasons } => TargetQueryExecutionRoute::ResidualOnly {
+                reasons: reasons.clone(),
+            },
+            TargetQueryPlan::Refuse { reason } => TargetQueryExecutionRoute::Refuse {
+                reason: reason.clone(),
+            },
         },
-        QueryPlan::Fallback { reason } => TargetQueryRoutePlan {
-            target_plan: target_plan.clone(),
-            branch_guidance: None,
-            allow_memory_term_narrowing: false,
-            dynamic_target_compile_reason: Some(reason.clone()),
-            allow_dynamic_target_compile: true,
-            vm_target_compile_reason: Some(reason.clone()),
-            allow_vm_target_compile: true,
+        QueryPlan::Fallback { reason } => match execution {
+            ExecutionModel::Vm => TargetQueryExecutionRoute::VmTargetCompile {
+                reason: reason.clone(),
+            },
+            ExecutionModel::Native => TargetQueryExecutionRoute::DynamicTargetCompile {
+                reason: reason.clone(),
+                mode: QueryGuidanceMode::NarrowOnly,
+            },
         },
-        QueryPlan::Residual { reasons } => {
-            let reason = reasons.join(", ");
-            TargetQueryRoutePlan {
-                target_plan: target_plan.clone(),
-                branch_guidance: None,
-                allow_memory_term_narrowing: false,
-                dynamic_target_compile_reason: Some(reason.clone()),
-                allow_dynamic_target_compile: true,
-                vm_target_compile_reason: Some(reason),
-                allow_vm_target_compile: true,
-            }
-        }
-        QueryPlan::Refuse { .. } => TargetQueryRoutePlan {
-            target_plan: target_plan.clone(),
-            branch_guidance: None,
-            allow_memory_term_narrowing: false,
-            dynamic_target_compile_reason: None,
-            allow_dynamic_target_compile: false,
-            vm_target_compile_reason: None,
-            allow_vm_target_compile: false,
+        QueryPlan::Residual { reasons } => match execution {
+            ExecutionModel::Vm => TargetQueryExecutionRoute::ResidualOnly {
+                reasons: reasons.clone(),
+            },
+            ExecutionModel::Native => TargetQueryExecutionRoute::DynamicTargetCompile {
+                reason: joined_residual_reason(reasons),
+                mode: QueryGuidanceMode::NarrowOnly,
+            },
         },
+        QueryPlan::Refuse { reason } => TargetQueryExecutionRoute::Refuse {
+            reason: reason.clone(),
+        },
+    };
+    TargetQueryRoutePlan {
+        target_plan: target_plan.clone(),
+        execution,
     }
 }
 
@@ -322,8 +342,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        DecompilePlan, QueryPlan, TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
-        derive_decompile_plan, derive_query_plan, derive_target_query_plan,
+        DecompilePlan, QueryPlan, TargetQueryExecutionRoute, TargetQueryPlan, TargetQueryRoutePlan,
+        TypePlan, derive_decompile_plan, derive_query_plan, derive_target_query_plan,
         derive_target_query_route_plan, derive_type_plan,
     };
     use crate::{ExecutionModel, RefinementStage, SemanticArtifactDiagnostics};
@@ -423,29 +443,41 @@ mod tests {
     #[test]
     fn target_query_route_plan_blocks_conflicting_guidance() {
         let target_plan = derive_target_query_plan(&QueryPlan::Ready, true, true, true);
-        let route = derive_target_query_route_plan(&QueryPlan::Ready, &target_plan, true, true);
+        let route = derive_target_query_route_plan(
+            &QueryPlan::Ready,
+            &target_plan,
+            ExecutionModel::Native,
+            true,
+            true,
+        );
         assert!(matches!(
             route.target_plan,
             TargetQueryPlan::Residual { .. }
         ));
-        assert!(route.branch_guidance.is_none());
-        assert!(!route.allow_memory_term_narrowing);
-        assert!(!route.allow_dynamic_target_compile);
-        assert!(!route.allow_vm_target_compile);
+        assert!(matches!(
+            route.execution,
+            TargetQueryExecutionRoute::ResidualOnly { .. }
+        ));
     }
 
     #[test]
     fn target_query_route_plan_keeps_ready_paths_artifact_authoritative() {
         let target_plan = derive_target_query_plan(&QueryPlan::Ready, false, false, false);
-        let route = derive_target_query_route_plan(&QueryPlan::Ready, &target_plan, false, false);
+        let route = derive_target_query_route_plan(
+            &QueryPlan::Ready,
+            &target_plan,
+            ExecutionModel::Native,
+            false,
+            false,
+        );
         assert!(matches!(
             route.target_plan,
             TargetQueryPlan::Fallback { .. }
         ));
-        assert!(route.branch_guidance.is_none());
-        assert!(!route.allow_memory_term_narrowing);
-        assert!(!route.allow_dynamic_target_compile);
-        assert!(!route.allow_vm_target_compile);
+        assert!(matches!(
+            route.execution,
+            TargetQueryExecutionRoute::DynamicTargetCompile { .. }
+        ));
     }
 
     #[test]
@@ -454,17 +486,23 @@ mod tests {
             reasons: vec!["budget".to_string()],
         };
         let target_plan = derive_target_query_plan(&query_plan, false, false, false);
-        let route = derive_target_query_route_plan(&query_plan, &target_plan, false, false);
-        assert!(route.branch_guidance.is_none());
-        assert!(route.dynamic_target_compile_reason.is_some());
-        assert!(route.allow_dynamic_target_compile);
-        assert!(route.vm_target_compile_reason.is_some());
-        assert!(route.allow_vm_target_compile);
+        let route = derive_target_query_route_plan(
+            &query_plan,
+            &target_plan,
+            ExecutionModel::Native,
+            false,
+            false,
+        );
+        assert!(matches!(
+            route.execution,
+            TargetQueryExecutionRoute::DynamicTargetCompile { .. }
+        ));
     }
 
     proptest! {
         #[test]
         fn target_query_route_plan_is_total(
+            is_vm in any::<bool>(),
             ready in any::<bool>(),
             conflict in any::<bool>(),
             has_guidance in any::<bool>(),
@@ -481,30 +519,23 @@ mod tests {
             let route = derive_target_query_route_plan(
                 &query_plan,
                 &target_plan,
+                if is_vm {
+                    ExecutionModel::Vm
+                } else {
+                    ExecutionModel::Native
+                },
                 has_authoritative_source,
                 has_memory_guidance,
             );
             let TargetQueryRoutePlan { .. } = route;
-            let valid = true;
-            prop_assert!(valid);
-            if matches!(target_plan, TargetQueryPlan::Ready { .. }) {
-                prop_assert_eq!(
-                    route.allow_memory_term_narrowing,
-                    has_authoritative_source && has_memory_guidance
-                );
-            }
-            if matches!(target_plan, TargetQueryPlan::Fallback { .. }) && ready {
-                prop_assert_eq!(
-                    route.allow_memory_term_narrowing,
-                    has_authoritative_source && has_memory_guidance
-                );
-            }
-            if ready {
-                prop_assert!(!route.allow_dynamic_target_compile);
-                prop_assert!(!route.allow_vm_target_compile);
-            }
-            if matches!(target_plan, TargetQueryPlan::Residual { .. } | TargetQueryPlan::Refuse { .. }) || !ready {
-                prop_assert!(route.branch_guidance.is_none());
+            match route.execution {
+                TargetQueryExecutionRoute::ContinuationSeeded { .. }
+                | TargetQueryExecutionRoute::ArtifactCondition { .. }
+                | TargetQueryExecutionRoute::ArtifactMemoryOnly
+                | TargetQueryExecutionRoute::DynamicTargetCompile { .. }
+                | TargetQueryExecutionRoute::VmTargetCompile { .. }
+                | TargetQueryExecutionRoute::ResidualOnly { .. }
+                | TargetQueryExecutionRoute::Refuse { .. } => {}
             }
         }
     }

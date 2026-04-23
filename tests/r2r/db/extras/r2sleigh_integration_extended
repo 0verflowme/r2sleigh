@@ -505,6 +505,36 @@ a:sym.solve.replayj 0x40132a {"checkpoint":2,"entry":"sym.check_secret","symboli
 EOF_CMDS
 RUN
 
+NAME=sym_explore_state_check_secret_rdi_overlay_reaches_win
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+dor stdout=/dev/null
+ood 1 0
+dcu sym.check_secret
+a:sym.explore.state 0x40132a {"symbolic_registers":["rdi"]} | head -n1 | jq -c '.target=="0x40132a" and .matched_paths>0 and (.paths|length)>0 and any(.paths[]; .final_pc=="0x40132a" and ((.solution.inputs.replay_rdi // .solution.inputs.EDI_0)=="0xdead"))'
+EOF_CMDS
+RUN
+
+NAME=sym_solve_state_check_secret_rdi_overlay_finds_0xdead
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+dor stdout=/dev/null
+ood 1 0
+dcu sym.check_secret
+a:sym.solve.state 0x40132a {"symbolic_registers":["rdi"]} | head -n1 | jq -c '.found==true and .matched_paths>0 and .target=="0x40132a" and (.selected_path|has("solution")) and .selected_path.final_pc=="0x40132a" and ((.selected_path.solution.inputs.replay_rdi // .selected_path.solution.inputs.EDI_0)=="0xdead")'
+EOF_CMDS
+RUN
+
 NAME=paths_check_secret_structure
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -1133,6 +1163,39 @@ CMDS=<<EOF_CMDS
 aaa
 s sym.test_symbolic_helper_pure_guard >/dev/null
 a:sla.types sym.test_symbolic_helper_pure_guard | jq -c '.compiled_semantics.stage == "compiled" and .compiled_semantics.execution == "native" and (.compiled_semantics.derived_summaries >= 1) and (.compiled_semantics.helper_functions >= 1)'
+EOF_CMDS
+RUN
+
+NAME=types_symbolic_helper_scope_roundtrips_persisted_assumptions_key
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s sym.test_symbolic_helper_pure_guard >/dev/null
+af
+a:sla.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}}] >/dev/null
+a:sla.types | jq -c 'tostring|contains("\"subject\":{\"register\":{\"name\":\"rdi\"}}") and contains("\"type_hint\":{\"ty\":\"int32_t\"}")'
+EOF_CMDS
+RUN
+
+NAME=types_symbolic_helper_scope_assumption_commands_roundtrip
+FILE=bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s sym.test_symbolic_helper_pure_guard >/dev/null
+af
+a:sla.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}}] >/dev/null
+a:sla.assumptions | jq -c 'length==1 and .[0].subject.register.name=="rdi" and .[0].value.type_hint.ty=="int32_t"'
+a:sla.assumptions- >/dev/null
+a:sla.assumptions | jq -c 'type=="array" and length==0'
 EOF_CMDS
 RUN
 

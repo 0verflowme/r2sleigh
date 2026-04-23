@@ -5,57 +5,309 @@
 //! analysis layers without exposing command-shaped policy.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::Duration;
 
+use r2il::ArchSpec;
 use z3::Context;
 use z3::ast::{Ast, BV, Bool};
 
-use r2ssa::SsaArtifact;
+use r2ssa::{
+    AssumptionSubject, AssumptionUsageReport, AssumptionValue, CompareKind,
+    PreparedAssumptionBindingKind, SSAOp, SSAVar, SsaArtifact,
+};
 
+#[cfg(test)]
+use crate::BackwardConditionPrecision;
 use crate::SymState;
 use crate::backward::{
-    BackwardConditionPrecision, BackwardConditionSummary, CompiledBackwardCondition,
+    BackwardConditionSummary, CompiledBackwardCondition,
     compile_branch_precondition_with_summaries, compile_target_precondition_with_summaries,
     compile_value_postcondition_with_summaries,
 };
+use crate::constraints::build_final_constraint_graph_for_path;
 use crate::path::{ExploreConfig, ExploreStats, PathExplorer, PathResult, SolvedPath};
+use crate::runtime::install_runtime_hooks_for_scope;
 use crate::semantics::{
-    SemanticArtifact, SemanticRegion, VmStepSummary, build_vm_step_summary,
-    classify_interpreter_like,
+    SemanticArtifact, TargetQueryExecutionRoute, TargetQueryRouteInput, VmStepSummary,
+    build_vm_step_summary, classify_interpreter_like,
 };
-use crate::sim::SummaryProfile;
+use crate::sim::{PreparedFunctionScope, SummaryProfile, SummaryRegistry};
 use crate::solver::{SatResult, SolverStats};
 use crate::state::ExitStatus;
+use crate::tactics::SolveTacticConfig;
+use crate::verification::{
+    EvidenceSummary, LiftedReplayBackend, SolveStatus, SolveVerification, SolveVerificationRequest,
+    SolveWitness, VerificationRequirement, evidence_summary_for_route_and_stats,
+    solution_extraction_allowed, verification_requirement_for_route_and_stats, verify_solve_result,
+};
 
 const MAX_VM_COMPILED_STEPS: usize = 8;
 
-#[derive(Debug, Clone, Copy)]
-struct SemanticTargetConditionSource<'a> {
-    region: &'a SemanticRegion,
-    branch_truth: bool,
-    summary: &'a BackwardConditionSummary,
+fn debug_query_route_enabled() -> bool {
+    std::env::var_os("R2SLEIGH_DEBUG_QUERY_ROUTE").is_some()
 }
 
-fn selected_region_for_target(
-    artifact: &SemanticArtifact,
-    target_addr: u64,
-    hard_proof_only: bool,
-) -> Option<&SemanticRegion> {
-    artifact.authoritative_region_for_target(target_addr, hard_proof_only)
+fn debug_query_route_log(message: &str) {
+    if !debug_query_route_enabled() {
+        return;
+    }
+    let path = std::env::var("R2SLEIGH_DEBUG_QUERY_ROUTE_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_query_route.log".to_string());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
 }
 
-fn target_condition_source<'a>(
-    artifact: &'a SemanticArtifact,
-    target_addr: u64,
-    hard_proof_only: bool,
-) -> Option<SemanticTargetConditionSource<'a>> {
-    let native = artifact.native_body()?;
-    let source = artifact.target_condition_source(target_addr, hard_proof_only)?;
-    let region = native.region_for_anchor(source.block_addr)?;
-    Some(SemanticTargetConditionSource {
-        region,
-        branch_truth: source.branch_truth,
-        summary: source.summary,
-    })
+fn debug_query_phase_enabled() -> bool {
+    std::env::var_os("R2SLEIGH_DEBUG_QUERY_PHASES").is_some()
+}
+
+fn debug_query_phase_log(message: &str) {
+    if !debug_query_phase_enabled() {
+        return;
+    }
+    let path = std::env::var("R2SLEIGH_DEBUG_QUERY_PHASES_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_query_phases.log".to_string());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct QueryAssumptionOutcome {
+    usage: AssumptionUsageReport,
+    conditioned: bool,
+    conflicted: bool,
+}
+
+fn apply_predicate_assumption_to_state<'ctx>(
+    explorer: &PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    state: &mut SymState<'ctx>,
+    block_addr: u64,
+    truth: bool,
+) -> Result<bool, String> {
+    let derived_summaries = explorer.derived_call_summary_views();
+    let Some(compiled) = compile_branch_precondition_with_summaries(
+        func,
+        state,
+        block_addr,
+        truth,
+        &derived_summaries,
+    ) else {
+        return Ok(false);
+    };
+    match explorer
+        .solver()
+        .sat_with_constraint(state, &compiled.predicate)
+    {
+        SatResult::Sat
+            if compiled.summary.evidence().allows_hard_proof()
+                || compiled.summary.evidence().allows_narrowing() =>
+        {
+            state.add_constraint(compiled.predicate);
+            Ok(true)
+        }
+        SatResult::Sat | SatResult::Unknown => Ok(false),
+        SatResult::Unsat => Err(format!(
+            "branch assumption for block 0x{block_addr:x} contradicts symbolic state"
+        )),
+    }
+}
+
+fn assumption_usage_for_query<'ctx>(
+    explorer: &PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    state: &mut SymState<'ctx>,
+) -> QueryAssumptionOutcome {
+    let mut usage = AssumptionUsageReport::default();
+    let mut conditioned = false;
+    let mut conflicted = false;
+
+    for binding in &func.facts().applied_assumption_bindings {
+        match (&binding.binding, &binding.assumption.value) {
+            (
+                PreparedAssumptionBindingKind::Predicate {
+                    block_addr, truth, ..
+                },
+                AssumptionValue::Branch { .. },
+            ) => match apply_predicate_assumption_to_state(
+                explorer,
+                func,
+                state,
+                *block_addr,
+                *truth,
+            ) {
+                Ok(true) => {
+                    usage.mark_applied(&binding.assumption);
+                    conditioned = true;
+                }
+                Ok(false) => usage.mark_ignored(&binding.assumption),
+                Err(reason) => {
+                    usage.mark_conflict(&binding.assumption, reason);
+                    conflicted = true;
+                }
+            },
+            (
+                PreparedAssumptionBindingKind::Register {
+                    state_name, bits, ..
+                },
+                value,
+            ) => {
+                let Some(current) = state.registers().get(state_name).cloned() else {
+                    usage.mark_ignored(&binding.assumption);
+                    continue;
+                };
+                match apply_assumption_value_to_sym(
+                    state,
+                    &binding.assumption,
+                    &current,
+                    *bits,
+                    value,
+                ) {
+                    Ok(true) => {
+                        usage.mark_applied(&binding.assumption);
+                        conditioned = true;
+                    }
+                    Ok(false) => usage.mark_ignored(&binding.assumption),
+                    Err(reason) => {
+                        usage.mark_conflict(&binding.assumption, reason);
+                        conflicted = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for assumption in func.facts().assumptions.iter() {
+        if matches!(assumption.subject, AssumptionSubject::MemoryWindow { .. }) {
+            match apply_memory_window_assumption(state, assumption) {
+                Ok(true) => {
+                    usage.mark_applied(assumption);
+                    conditioned = true;
+                }
+                Ok(false) => usage.mark_ignored(assumption),
+                Err(reason) => {
+                    usage.mark_conflict(assumption, reason);
+                    conflicted = true;
+                }
+            }
+        }
+    }
+
+    for assumption in func.facts().assumptions.iter() {
+        usage.mark_ignored(assumption);
+    }
+
+    QueryAssumptionOutcome {
+        usage,
+        conditioned,
+        conflicted,
+    }
+}
+
+fn apply_assumption_value_to_sym<'ctx>(
+    state: &mut SymState<'ctx>,
+    assumption: &r2ssa::AnalysisAssumption,
+    value: &crate::value::SymValue<'ctx>,
+    bits: u32,
+    assumption_value: &AssumptionValue,
+) -> Result<bool, String> {
+    match assumption_value {
+        AssumptionValue::Constant { value: rhs } => {
+            if let Some(existing) = value.as_concrete() {
+                if existing != *rhs {
+                    return Err(format!(
+                        "assumption constant 0x{rhs:x} contradicts concrete value 0x{existing:x}"
+                    ));
+                }
+                return Ok(true);
+            }
+            state.constrain_eq(value, *rhs);
+            Ok(true)
+        }
+        AssumptionValue::Range { min, max } => {
+            if min > max {
+                return Err("invalid range assumption".to_string());
+            }
+            if let Some(existing) = value.as_concrete() {
+                if existing < *min || existing > *max {
+                    return Err(format!(
+                        "assumption range [{min:#x}, {max:#x}] excludes concrete value {existing:#x}"
+                    ));
+                }
+                return Ok(true);
+            }
+            state.constrain_range(value, *min, *max);
+            Ok(true)
+        }
+        AssumptionValue::FiniteSet { values } => {
+            if values.is_empty() {
+                return Err("empty finite-set assumption".to_string());
+            }
+            if let Some(existing) = value.as_concrete() {
+                if !values.contains(&existing) {
+                    return Err(format!(
+                        "finite-set assumption excludes concrete value {existing:#x}"
+                    ));
+                }
+                return Ok(true);
+            }
+            let bv = value.to_bv(state.context());
+            let ors = values
+                .iter()
+                .map(|item| bv.eq(BV::from_u64(*item, bits.max(1))))
+                .collect::<Vec<_>>();
+            let refs = ors.iter().collect::<Vec<_>>();
+            state.add_constraint(Bool::or(&refs));
+            Ok(true)
+        }
+        AssumptionValue::EnumDomain { values, .. } => {
+            let values = values.iter().map(|value| *value as u64).collect::<Vec<_>>();
+            apply_assumption_value_to_sym(
+                state,
+                assumption,
+                value,
+                bits,
+                &AssumptionValue::FiniteSet { values },
+            )
+        }
+        AssumptionValue::TypeHint { .. } => Ok(false),
+        AssumptionValue::Branch { .. } => match &assumption.subject {
+            AssumptionSubject::Predicate { .. } => Ok(true),
+            _ => Ok(false),
+        },
+    }
+}
+
+fn apply_memory_window_assumption<'ctx>(
+    state: &mut SymState<'ctx>,
+    assumption: &r2ssa::AnalysisAssumption,
+) -> Result<bool, String> {
+    let AssumptionSubject::MemoryWindow { addr, size } = &assumption.subject else {
+        return Ok(false);
+    };
+    let Some(region) = state
+        .symbolic_memory()
+        .iter()
+        .find(|region| region.addr == *addr && region.size == *size)
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    if *size > 8 {
+        return Ok(false);
+    }
+    apply_assumption_value_to_sym(
+        state,
+        assumption,
+        &region.value,
+        region.value.bits(),
+        &assumption.value,
+    )
 }
 
 /// Query execution strategy.
@@ -76,6 +328,8 @@ pub struct SymQueryConfig {
     pub mode: QueryMode,
     /// Summary profile to use when installing function summaries.
     pub summary_profile: SummaryProfile,
+    /// Candidate-generation tactics used after exact semantic summaries.
+    pub solve_tactics: SolveTacticConfig,
 }
 
 impl Default for SymQueryConfig {
@@ -88,6 +342,7 @@ impl Default for SymQueryConfig {
             explore,
             mode: QueryMode::ForwardOnly,
             summary_profile: SummaryProfile::Default,
+            solve_tactics: SolveTacticConfig::default(),
         }
     }
 }
@@ -97,8 +352,268 @@ impl SymQueryConfig {
     pub fn make_explorer<'ctx>(&self, ctx: &'ctx Context) -> PathExplorer<'ctx> {
         let mut explorer = PathExplorer::with_config(ctx, self.explore.clone());
         explorer.set_target_guided_queries(matches!(self.mode, QueryMode::TargetGuided));
+        explorer.set_solve_tactic_config(self.solve_tactics.clone());
         explorer
     }
+}
+
+/// Recommend a query-depth budget based on the SSA op count and symbolic input surface.
+///
+/// Depth is currently counted per executed SSA op, not per basic block. A flat budget
+/// can therefore under-approximate string/hash loops and other byte-at-a-time workers.
+/// This helper keeps the budget tied to concrete function cost and the current symbolic
+/// input surface instead of hard-coding sample-specific constants downstream.
+pub fn recommended_query_max_depth(func: &SsaArtifact, initial_state: &SymState<'_>) -> usize {
+    let cfg_risk = func.function().cfg_risk_summary();
+    let total_ops = func
+        .blocks()
+        .map(|block| block.ops.len())
+        .sum::<usize>()
+        .max(1);
+    let max_block_ops = func
+        .blocks()
+        .map(|block| block.ops.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let symbolic_surface = initial_state.symbolic_inputs().len().clamp(1, 16);
+    let bounded_copy_loop_work = estimated_bounded_copy_loop_work(func);
+    let loop_multiplier = if func.function().cfg_risk_summary().back_edge_count == 0 {
+        symbolic_surface.saturating_add(4)
+    } else {
+        symbolic_surface.saturating_add(2)
+    };
+    let base_budget = total_ops
+        .saturating_mul(loop_multiplier)
+        .max(max_block_ops.saturating_mul(loop_multiplier.saturating_mul(2)));
+    let budget = base_budget.max(
+        total_ops
+            .saturating_add(bounded_copy_loop_work)
+            .saturating_add(max_block_ops.saturating_mul(loop_multiplier)),
+    );
+    if cfg_risk.block_count >= 64 || cfg_risk.back_edge_count > 0 {
+        budget.max(4096)
+    } else {
+        budget
+    }
+}
+
+/// Recommend a query timeout budget for the current function shape.
+///
+/// Large bounded copy loops often materialize runtime code byte-by-byte before any
+/// symbolic branching happens. Those routes need more wall-clock time even when the
+/// actual search frontier stays small.
+pub fn recommended_query_timeout(func: &SsaArtifact) -> Duration {
+    let cfg_risk = func.function().cfg_risk_summary();
+    let bounded_copy_loop_work = estimated_bounded_copy_loop_work(func);
+    if bounded_copy_loop_work >= 32 * 1024 {
+        Duration::from_secs(180)
+    } else if bounded_copy_loop_work >= 8 * 1024 {
+        Duration::from_secs(120)
+    } else if cfg_risk.block_count >= 64 || cfg_risk.back_edge_count > 0 {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(20)
+    }
+}
+
+const CONTINUATION_QUERY_MAX_DEPTH_CAP: usize = 8_192;
+const CONTINUATION_QUERY_MAX_STATES_CAP: usize = 256;
+const CONTINUATION_QUERY_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+const CONTINUATION_SEEDED_STATE_CAP: usize = 1;
+
+#[derive(Debug, Clone)]
+pub struct QueryExecutionPolicy {
+    pub route: crate::TargetQueryRoutePlan,
+    pub evidence_summary: EvidenceSummary,
+    pub verification_requirement: VerificationRequirement,
+    pub max_states: usize,
+    pub max_depth: usize,
+    pub timeout: Option<Duration>,
+    pub install_scope_summaries: bool,
+    pub install_runtime_hooks: bool,
+}
+
+impl QueryExecutionPolicy {
+    pub fn for_route(
+        config: &SymQueryConfig,
+        func: &SsaArtifact,
+        initial_state: &SymState<'_>,
+        route: crate::TargetQueryRoutePlan,
+    ) -> Self {
+        let max_states =
+            recommended_query_max_states_for_route(config.explore.max_states, Some(&route));
+        let max_depth = config
+            .explore
+            .max_depth
+            .max(recommended_query_max_depth_for_route(
+                func,
+                initial_state,
+                Some(&route),
+            ));
+        let current_timeout = config
+            .explore
+            .timeout
+            .unwrap_or_else(|| Duration::from_secs(20));
+        let recommended_timeout = recommended_query_timeout_for_route(func, Some(&route));
+        let timeout = if route_is_continuation_seeded(Some(&route)) {
+            current_timeout.min(recommended_timeout)
+        } else {
+            current_timeout.max(recommended_timeout)
+        };
+        let route_only_stats = ExploreStats::default();
+        let evidence_summary =
+            evidence_summary_for_route_and_stats(&route, &route_only_stats, None);
+        let verification_requirement =
+            verification_requirement_for_route_and_stats(&route, &route_only_stats, None);
+        Self {
+            install_scope_summaries: !route_skips_eager_scope_summaries(&route),
+            install_runtime_hooks: true,
+            evidence_summary,
+            verification_requirement,
+            route,
+            max_states,
+            max_depth,
+            timeout: Some(timeout),
+        }
+    }
+}
+
+pub fn apply_query_execution_policy(config: &mut SymQueryConfig, policy: &QueryExecutionPolicy) {
+    config.explore.max_states = policy.max_states;
+    config.explore.max_depth = policy.max_depth;
+    config.explore.timeout = policy.timeout;
+}
+
+pub fn route_skips_eager_scope_summaries(route: &crate::TargetQueryRoutePlan) -> bool {
+    matches!(
+        &route.target_plan,
+        crate::TargetQueryPlan::Residual { reasons }
+            if reasons.iter().any(|reason| reason == "LargeCfg")
+    )
+}
+
+pub fn install_symbolic_hooks_for_query_policy<'ctx>(
+    explorer: &mut PathExplorer<'ctx>,
+    z3_ctx: &'ctx Context,
+    scope: &PreparedFunctionScope,
+    arch: Option<&ArchSpec>,
+    symbol_map: &std::collections::HashMap<u64, String>,
+    summary_profile: SummaryProfile,
+    policy: &QueryExecutionPolicy,
+) {
+    if policy.install_scope_summaries
+        && let Some(arch) = arch
+        && let Some(registry) =
+            SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
+    {
+        let _ = registry.install_scope_summaries_for_explorer(
+            explorer,
+            z3_ctx,
+            scope,
+            Some(arch),
+            symbol_map,
+        );
+    }
+    if policy.install_runtime_hooks {
+        install_runtime_hooks_for_scope(explorer, scope, arch, symbol_map);
+    }
+}
+
+fn route_is_continuation_seeded(route: Option<&crate::TargetQueryRoutePlan>) -> bool {
+    route.is_some_and(|route| {
+        matches!(
+            route.execution,
+            TargetQueryExecutionRoute::ContinuationSeeded { .. }
+        )
+    })
+}
+
+pub fn recommended_query_max_depth_for_route(
+    func: &SsaArtifact,
+    initial_state: &SymState<'_>,
+    route: Option<&crate::TargetQueryRoutePlan>,
+) -> usize {
+    let budget = recommended_query_max_depth(func, initial_state);
+    if route_is_continuation_seeded(route) {
+        budget.min(CONTINUATION_QUERY_MAX_DEPTH_CAP)
+    } else {
+        budget
+    }
+}
+
+pub fn recommended_query_max_states_for_route(
+    current_max_states: usize,
+    route: Option<&crate::TargetQueryRoutePlan>,
+) -> usize {
+    if route_is_continuation_seeded(route) {
+        current_max_states.min(CONTINUATION_QUERY_MAX_STATES_CAP)
+    } else {
+        current_max_states
+    }
+}
+
+pub fn recommended_query_timeout_for_route(
+    func: &SsaArtifact,
+    route: Option<&crate::TargetQueryRoutePlan>,
+) -> Duration {
+    let timeout = recommended_query_timeout(func);
+    if route_is_continuation_seeded(route) {
+        timeout.min(CONTINUATION_QUERY_TIMEOUT_CAP)
+    } else {
+        timeout
+    }
+}
+
+fn estimated_bounded_copy_loop_work(func: &SsaArtifact) -> usize {
+    func.predicates()
+        .predicates
+        .values()
+        .filter_map(|predicate| estimate_bounded_copy_loop_work(func, predicate))
+        .sum()
+}
+
+fn estimate_bounded_copy_loop_work(
+    func: &SsaArtifact,
+    predicate: &r2ssa::PredicateFact,
+) -> Option<usize> {
+    let self_loop = predicate.true_target == predicate.block_addr
+        || predicate.false_target == predicate.block_addr;
+    if !self_loop {
+        return None;
+    }
+
+    let block = func.function().get_block(predicate.block_addr)?;
+    let has_load = block.ops.iter().any(|op| matches!(op, SSAOp::Load { .. }));
+    let has_store = block.ops.iter().any(|op| matches!(op, SSAOp::Store { .. }));
+    if !has_load || !has_store {
+        return None;
+    }
+
+    let comparison = predicate.comparison.as_ref()?;
+    let bound = [comparison.lhs, comparison.rhs]
+        .into_iter()
+        .filter_map(|value_id| func.value_var(value_id))
+        .filter_map(ssa_const_value)
+        .max()?;
+
+    let trip_count = match comparison.kind {
+        CompareKind::Less => bound,
+        CompareKind::LessEqual => bound.saturating_add(1),
+        _ => return None,
+    };
+
+    if trip_count == 0 {
+        return None;
+    }
+
+    let capped_trip_count = trip_count.min(1 << 20) as usize;
+    Some(block.ops.len().max(1).saturating_mul(capped_trip_count))
+}
+
+fn ssa_const_value(var: &SSAVar) -> Option<u64> {
+    let value = var.name.strip_prefix("const:")?;
+    u64::from_str_radix(value, 16).ok()
 }
 
 /// Completion state for queries that may stop on budgets.
@@ -115,15 +630,6 @@ pub enum QueryCompletion {
 pub enum ReachabilityStatus {
     Reachable,
     Unreachable,
-    Unknown,
-    BudgetExhausted,
-}
-
-/// Solve result status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SolveStatus {
-    Solved,
-    Unsat,
     Unknown,
     BudgetExhausted,
 }
@@ -159,8 +665,12 @@ pub struct PathConditionSummary {
 pub struct ReachabilityResult<'ctx> {
     pub status: ReachabilityStatus,
     pub target_addr: u64,
+    pub selected_route: crate::TargetQueryRoutePlan,
     pub compiled_precondition: Option<BackwardConditionSummary>,
     pub paths: Vec<PathResult<'ctx>>,
+    pub assumption_usage: AssumptionUsageReport,
+    pub assumption_conditioned: bool,
+    pub summary_conditioned: bool,
     pub stats: ExploreStats,
     pub solver_stats: SolverStats,
 }
@@ -170,9 +680,13 @@ pub struct ReachabilityResult<'ctx> {
 pub struct PathConditionResult<'ctx> {
     pub completion: QueryCompletion,
     pub target_pc: u64,
+    pub selected_route: crate::TargetQueryRoutePlan,
     pub compiled_precondition: Option<BackwardConditionSummary>,
     pub conditions: Vec<PathConditionSummary>,
     pub matching_paths: Vec<PathResult<'ctx>>,
+    pub assumption_usage: AssumptionUsageReport,
+    pub assumption_conditioned: bool,
+    pub summary_conditioned: bool,
     pub stats: ExploreStats,
     pub solver_stats: SolverStats,
 }
@@ -182,10 +696,16 @@ pub struct PathConditionResult<'ctx> {
 pub struct SolveResult<'ctx> {
     pub status: SolveStatus,
     pub target_addr: u64,
+    pub selected_route: crate::TargetQueryRoutePlan,
     pub compiled_precondition: Option<BackwardConditionSummary>,
     pub matched_paths: Vec<PathResult<'ctx>>,
     pub selected_path_index: Option<usize>,
     pub solution: Option<SolvedPath>,
+    pub assumption_usage: AssumptionUsageReport,
+    pub assumption_conditioned: bool,
+    pub summary_conditioned: bool,
+    pub verification: SolveVerification,
+    pub witness: SolveWitness,
     pub stats: ExploreStats,
     pub solver_stats: SolverStats,
 }
@@ -198,6 +718,14 @@ pub struct SymbolicFunctionSummary<'ctx> {
     pub feasible_paths: usize,
     pub stats: ExploreStats,
     pub solver_stats: SolverStats,
+}
+
+struct TargetQueryPaths<'ctx> {
+    selected_route: crate::TargetQueryRoutePlan,
+    compiled_precondition: Option<BackwardConditionSummary>,
+    matched_paths: Vec<PathResult<'ctx>>,
+    exact_unsat: bool,
+    summary_conditioned: bool,
 }
 
 fn completion_from_stats(stats: &ExploreStats) -> QueryCompletion {
@@ -249,9 +777,11 @@ enum PreconditionApplication<'ctx> {
         initial_state: Box<SymState<'ctx>>,
         narrowed_state: Option<Box<SymState<'ctx>>>,
         compiled_precondition: Option<BackwardConditionSummary>,
+        summary_conditioned: bool,
     },
     ExactUnsat {
         compiled_precondition: BackwardConditionSummary,
+        summary_conditioned: bool,
     },
 }
 
@@ -268,6 +798,98 @@ fn compiled_mode_from_guidance(mode: crate::QueryGuidanceMode) -> CompiledPrecon
     }
 }
 
+fn build_target_query_inputs<'a>(
+    explorer: &mut PathExplorer<'_>,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    artifact: Option<&'a SemanticArtifact>,
+    target_addr: u64,
+    assumption_conflicted: bool,
+    allow_continuation_bridge: bool,
+) -> TargetQueryRouteInput<'a> {
+    let mut inputs = artifact
+        .map(|artifact| artifact.target_query_route_input(target_addr, assumption_conflicted))
+        .unwrap_or_else(|| TargetQueryRouteInput {
+            route: crate::TargetQueryRoutePlan::dynamic_fallback(),
+            condition_source: None,
+            memory_terms: Vec::new(),
+            allow_exact_proof: !assumption_conflicted,
+        });
+    if allow_continuation_bridge
+        && let Some(bridge_target) =
+            explorer.exception_bridge_target_in_scope(func, scope, target_addr)
+        && bridge_target != target_addr
+        && !matches!(
+            inputs.route.execution,
+            TargetQueryExecutionRoute::Refuse { .. }
+        )
+    {
+        inputs.route.execution = TargetQueryExecutionRoute::ContinuationSeeded {
+            bridge_target,
+            route: Box::new(inputs.route.execution.clone()),
+        };
+        debug_query_route_log(&format!(
+            "target=0x{target_addr:x} route=ContinuationSeeded bridge=0x{bridge_target:x}"
+        ));
+    } else {
+        debug_query_route_log(&format!(
+            "target=0x{target_addr:x} route={:?}",
+            inputs.route.execution
+        ));
+    }
+    inputs
+}
+
+pub fn selected_target_query_route_in_scope(
+    explorer: &mut PathExplorer<'_>,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    artifact: Option<&SemanticArtifact>,
+    target_addr: u64,
+    assumption_conflicted: bool,
+) -> crate::TargetQueryRoutePlan {
+    build_target_query_inputs(
+        explorer,
+        func,
+        scope,
+        artifact,
+        target_addr,
+        assumption_conflicted,
+        true,
+    )
+    .route
+}
+
+fn route_uses_summary_guidance(
+    route: &TargetQueryExecutionRoute,
+    has_derived_summaries: bool,
+) -> bool {
+    if !has_derived_summaries {
+        return false;
+    }
+    match route {
+        TargetQueryExecutionRoute::ContinuationSeeded { route, .. } => {
+            route_uses_summary_guidance(route, has_derived_summaries)
+        }
+        TargetQueryExecutionRoute::ArtifactCondition { .. }
+        | TargetQueryExecutionRoute::DynamicTargetCompile { .. }
+        | TargetQueryExecutionRoute::VmTargetCompile { .. } => true,
+        TargetQueryExecutionRoute::ArtifactMemoryOnly
+        | TargetQueryExecutionRoute::ResidualOnly { .. }
+        | TargetQueryExecutionRoute::Refuse { .. } => false,
+    }
+}
+
+fn state_is_continuation_seed<'ctx>(state: &SymState<'ctx>) -> bool {
+    state.pending_exception().is_some() || state.runtime_region_for_pc(state.pc).is_some()
+}
+
+fn stats_show_summary_guidance(stats: &ExploreStats) -> bool {
+    stats.target_summary_rank_hits > 0 || stats.target_pruned_summary_contradiction > 0
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[cfg(test)]
 fn precision_rank(precision: BackwardConditionPrecision) -> u8 {
     match precision {
         BackwardConditionPrecision::Exact => 3,
@@ -504,6 +1126,8 @@ fn compile_vm_target_precondition_with_summaries<'ctx>(
     )
 }
 
+#[cfg_attr(test, allow(dead_code))]
+#[cfg(test)]
 fn prefer_compiled_precondition(
     current: Option<&CompiledBackwardCondition>,
     candidate: &CompiledBackwardCondition,
@@ -634,6 +1258,7 @@ fn apply_compiled_precondition_with_mode<'ctx>(
     mut initial_state: SymState<'ctx>,
     compiled: crate::CompiledBackwardCondition,
     mode: CompiledPreconditionMode,
+    allow_exact_proof: bool,
 ) -> PreconditionApplication<'ctx> {
     let summary = compiled.summary.clone();
     let evidence = summary.evidence();
@@ -642,19 +1267,26 @@ fn apply_compiled_precondition_with_mode<'ctx>(
         .sat_with_constraint(&initial_state, &compiled.predicate)
     {
         SatResult::Unsat
-            if mode == CompiledPreconditionMode::Necessary && evidence.allows_hard_proof() =>
+            if mode == CompiledPreconditionMode::Necessary
+                && allow_exact_proof
+                && evidence.allows_hard_proof() =>
         {
             PreconditionApplication::ExactUnsat {
                 compiled_precondition: summary,
+                summary_conditioned: false,
             }
         }
         SatResult::Sat => {
-            if mode == CompiledPreconditionMode::Necessary && evidence.allows_hard_proof() {
+            if mode == CompiledPreconditionMode::Necessary
+                && allow_exact_proof
+                && evidence.allows_hard_proof()
+            {
                 initial_state.add_constraint(compiled.predicate);
                 PreconditionApplication::Continue {
                     initial_state: Box::new(initial_state),
                     narrowed_state: None,
                     compiled_precondition: Some(summary),
+                    summary_conditioned: false,
                 }
             } else if evidence.allows_narrowing() {
                 let mut narrowed_state = initial_state.fork();
@@ -663,12 +1295,14 @@ fn apply_compiled_precondition_with_mode<'ctx>(
                     initial_state: Box::new(initial_state),
                     narrowed_state: Some(Box::new(narrowed_state)),
                     compiled_precondition: Some(summary),
+                    summary_conditioned: false,
                 }
             } else {
                 PreconditionApplication::Continue {
                     initial_state: Box::new(initial_state),
                     narrowed_state: None,
                     compiled_precondition: Some(summary),
+                    summary_conditioned: false,
                 }
             }
         }
@@ -676,6 +1310,7 @@ fn apply_compiled_precondition_with_mode<'ctx>(
             initial_state: Box::new(initial_state),
             narrowed_state: None,
             compiled_precondition: Some(summary),
+            summary_conditioned: false,
         },
     }
 }
@@ -698,139 +1333,675 @@ where
     search(explorer, initial_state)
 }
 
+fn find_first_path_with_compiled_narrowing<'ctx, F>(
+    explorer: &mut PathExplorer<'ctx>,
+    initial_state: SymState<'ctx>,
+    narrowed_state: Option<Box<SymState<'ctx>>>,
+    mut search: F,
+) -> Option<PathResult<'ctx>>
+where
+    F: FnMut(&mut PathExplorer<'ctx>, SymState<'ctx>) -> Option<PathResult<'ctx>>,
+{
+    if let Some(narrowed_state) = narrowed_state {
+        let matched = search(explorer, *narrowed_state);
+        if matched.is_some() || explorer.budget_exhausted() {
+            return matched;
+        }
+    }
+    search(explorer, initial_state)
+}
+
+fn apply_best_compiled_precondition_for_inputs<'ctx>(
+    explorer: &PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    initial_state: SymState<'ctx>,
+    target_addr: u64,
+    query_inputs: &TargetQueryRouteInput<'_>,
+) -> PreconditionApplication<'ctx> {
+    let derived_summaries = explorer.derived_call_summary_views();
+    let memory_terms = query_inputs.memory_terms.clone();
+    let target_is_local = func.get_block(target_addr).is_some();
+    let route_summary_conditioned =
+        route_uses_summary_guidance(&query_inputs.route.execution, !derived_summaries.is_empty());
+    match query_inputs.route.execution {
+        TargetQueryExecutionRoute::ContinuationSeeded { .. } => PreconditionApplication::Continue {
+            initial_state: Box::new(initial_state),
+            narrowed_state: None,
+            compiled_precondition: None,
+            summary_conditioned: route_summary_conditioned,
+        },
+        TargetQueryExecutionRoute::ArtifactCondition { mode } => {
+            let compiled = query_inputs.condition_source.and_then(|source| {
+                compile_branch_precondition_with_summaries(
+                    func,
+                    &initial_state,
+                    source.block_addr,
+                    source.branch_truth,
+                    &derived_summaries,
+                )
+                .map(|compiled| (compiled, mode))
+            });
+            if compiled.is_none()
+                && let Some(narrowed_state) =
+                    apply_memory_term_narrowing(&initial_state, &memory_terms)
+            {
+                let compiled_precondition = query_inputs
+                    .condition_source
+                    .map(|source| source.summary)
+                    .filter(|summary| !summary.evidence().allows_hard_proof())
+                    .cloned();
+                return PreconditionApplication::Continue {
+                    initial_state: Box::new(initial_state),
+                    narrowed_state: Some(narrowed_state),
+                    compiled_precondition,
+                    summary_conditioned: route_summary_conditioned,
+                };
+            }
+            let Some((compiled, mode)) = compiled else {
+                let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
+                return PreconditionApplication::Continue {
+                    initial_state: Box::new(initial_state),
+                    narrowed_state,
+                    compiled_precondition: None,
+                    summary_conditioned: route_summary_conditioned,
+                };
+            };
+            match apply_compiled_precondition_with_mode(
+                explorer,
+                initial_state,
+                compiled,
+                compiled_mode_from_guidance(mode),
+                query_inputs.allow_exact_proof,
+            ) {
+                PreconditionApplication::Continue {
+                    initial_state,
+                    narrowed_state,
+                    compiled_precondition,
+                    ..
+                } => {
+                    let narrowed_state = narrowed_state.or_else(|| {
+                        apply_memory_term_narrowing(initial_state.as_ref(), &memory_terms)
+                    });
+                    PreconditionApplication::Continue {
+                        initial_state,
+                        narrowed_state,
+                        compiled_precondition,
+                        summary_conditioned: route_summary_conditioned,
+                    }
+                }
+                PreconditionApplication::ExactUnsat {
+                    compiled_precondition,
+                    ..
+                } => PreconditionApplication::ExactUnsat {
+                    compiled_precondition,
+                    summary_conditioned: route_summary_conditioned,
+                },
+            }
+        }
+        TargetQueryExecutionRoute::ArtifactMemoryOnly => {
+            let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
+            let compiled_precondition = query_inputs
+                .condition_source
+                .map(|source| source.summary)
+                .filter(|summary| !summary.evidence().allows_hard_proof())
+                .cloned();
+            PreconditionApplication::Continue {
+                initial_state: Box::new(initial_state),
+                narrowed_state,
+                compiled_precondition,
+                summary_conditioned: false,
+            }
+        }
+        TargetQueryExecutionRoute::DynamicTargetCompile { reason: _, mode } => {
+            if !target_is_local {
+                let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
+                return PreconditionApplication::Continue {
+                    initial_state: Box::new(initial_state),
+                    narrowed_state,
+                    compiled_precondition: None,
+                    summary_conditioned: false,
+                };
+            }
+            let compiled = compile_target_precondition_with_summaries(
+                func,
+                &initial_state,
+                target_addr,
+                &derived_summaries,
+            );
+            match compiled {
+                Some(compiled) => match apply_compiled_precondition_with_mode(
+                    explorer,
+                    initial_state,
+                    compiled,
+                    compiled_mode_from_guidance(mode),
+                    query_inputs.allow_exact_proof,
+                ) {
+                    PreconditionApplication::Continue {
+                        initial_state,
+                        narrowed_state,
+                        compiled_precondition,
+                        ..
+                    } => {
+                        let narrowed_state = narrowed_state.or_else(|| {
+                            apply_memory_term_narrowing(initial_state.as_ref(), &memory_terms)
+                        });
+                        PreconditionApplication::Continue {
+                            initial_state,
+                            narrowed_state,
+                            compiled_precondition,
+                            summary_conditioned: route_summary_conditioned,
+                        }
+                    }
+                    PreconditionApplication::ExactUnsat {
+                        compiled_precondition,
+                        ..
+                    } => PreconditionApplication::ExactUnsat {
+                        compiled_precondition,
+                        summary_conditioned: route_summary_conditioned,
+                    },
+                },
+                None => {
+                    let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
+                    PreconditionApplication::Continue {
+                        initial_state: Box::new(initial_state),
+                        narrowed_state,
+                        compiled_precondition: None,
+                        summary_conditioned: false,
+                    }
+                }
+            }
+        }
+        TargetQueryExecutionRoute::VmTargetCompile { reason: _ } => {
+            if !target_is_local {
+                let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
+                return PreconditionApplication::Continue {
+                    initial_state: Box::new(initial_state),
+                    narrowed_state,
+                    compiled_precondition: None,
+                    summary_conditioned: false,
+                };
+            }
+            let compiled = compile_vm_target_precondition_with_summaries(
+                func,
+                &initial_state,
+                target_addr,
+                &derived_summaries,
+            );
+            match compiled {
+                Some(compiled) => match apply_compiled_precondition_with_mode(
+                    explorer,
+                    initial_state,
+                    compiled,
+                    CompiledPreconditionMode::Necessary,
+                    query_inputs.allow_exact_proof,
+                ) {
+                    PreconditionApplication::Continue {
+                        initial_state,
+                        narrowed_state,
+                        compiled_precondition,
+                        ..
+                    } => {
+                        let narrowed_state = narrowed_state.or_else(|| {
+                            apply_memory_term_narrowing(initial_state.as_ref(), &memory_terms)
+                        });
+                        PreconditionApplication::Continue {
+                            initial_state,
+                            narrowed_state,
+                            compiled_precondition,
+                            summary_conditioned: route_summary_conditioned,
+                        }
+                    }
+                    PreconditionApplication::ExactUnsat {
+                        compiled_precondition,
+                        ..
+                    } => PreconditionApplication::ExactUnsat {
+                        compiled_precondition,
+                        summary_conditioned: route_summary_conditioned,
+                    },
+                },
+                None => {
+                    let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
+                    PreconditionApplication::Continue {
+                        initial_state: Box::new(initial_state),
+                        narrowed_state,
+                        compiled_precondition: None,
+                        summary_conditioned: false,
+                    }
+                }
+            }
+        }
+        TargetQueryExecutionRoute::ResidualOnly { .. }
+        | TargetQueryExecutionRoute::Refuse { .. } => PreconditionApplication::Continue {
+            initial_state: Box::new(initial_state),
+            narrowed_state: None,
+            compiled_precondition: None,
+            summary_conditioned: false,
+        },
+    }
+}
+
+#[cfg(test)]
 fn apply_best_compiled_precondition<'ctx>(
     explorer: &PathExplorer<'ctx>,
     func: &SsaArtifact,
     artifact: Option<&SemanticArtifact>,
     initial_state: SymState<'ctx>,
     target_addr: u64,
+    assumption_conflicted: bool,
 ) -> PreconditionApplication<'ctx> {
-    let derived_summaries = explorer.derived_call_summary_views();
-    let route = artifact
-        .map(|artifact| artifact.target_query_route_plan(target_addr))
-        .unwrap_or_else(crate::TargetQueryRoutePlan::dynamic_fallback);
-    let branch_mode = route.branch_guidance.map(compiled_mode_from_guidance);
-    let condition_source = branch_mode.and_then(|_| {
-        artifact.and_then(|artifact| target_condition_source(artifact, target_addr, false))
-    });
-    let selected_region = branch_mode.and_then(|_| {
-        artifact.and_then(|artifact| selected_region_for_target(artifact, target_addr, false))
-    });
-    let memory_region = if route.allow_memory_term_narrowing {
-        artifact.and_then(|artifact| artifact.authoritative_memory_region_for_target(target_addr))
-    } else {
-        None
-    };
-    let memory_terms = if route.allow_memory_term_narrowing {
-        memory_region
-            .map(|region| region.actionable_memory_terms_for_target(target_addr))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if route.allow_memory_term_narrowing
-        && let Some(narrowed_state) = apply_memory_term_narrowing(&initial_state, &memory_terms)
-    {
-        return PreconditionApplication::Continue {
-            initial_state: Box::new(initial_state),
-            narrowed_state: Some(narrowed_state),
-            compiled_precondition: selected_region
-                .and_then(|region| region.actionable_compiled_condition_for_target(target_addr))
-                .filter(|summary| !summary.evidence().allows_hard_proof())
-                .cloned()
-                .or_else(|| {
-                    condition_source
-                        .map(|source| source.summary)
-                        .filter(|summary| !summary.evidence().allows_hard_proof())
-                        .cloned()
-                }),
-        };
-    }
-    let mut compiled = branch_mode.and_then(|mode| {
-        condition_source.and_then(|source| {
-            let compiled = compile_branch_precondition_with_summaries(
-                func,
-                &initial_state,
-                source.region.anchor,
-                source.branch_truth,
-                &derived_summaries,
-            )?;
-            Some((compiled, mode))
-        })
-    });
-    let target_compile_mode = branch_mode.unwrap_or(CompiledPreconditionMode::Necessary);
-    let mut used_target_compile = false;
-    if compiled.is_none()
-        && route.allow_dynamic_target_compile
-        && let Some(target_compiled) = compile_target_precondition_with_summaries(
-            func,
-            &initial_state,
-            target_addr,
-            &derived_summaries,
-        )
-    {
-        compiled = Some((target_compiled, target_compile_mode));
-        used_target_compile = true;
-    }
-    if route.allow_dynamic_target_compile
-        && !used_target_compile
-        && !matches!(target_compile_mode, CompiledPreconditionMode::Necessary)
-        && let Some(target_compiled) = compile_target_precondition_with_summaries(
-            func,
-            &initial_state,
-            target_addr,
-            &derived_summaries,
-        )
-        && compiled.as_ref().is_none_or(|(current, _)| {
-            prefer_compiled_precondition(Some(current), &target_compiled)
-        })
-    {
-        compiled = Some((target_compiled, CompiledPreconditionMode::Necessary));
-    }
-    if route.allow_vm_target_compile
-        && compiled.as_ref().is_none_or(|(compiled, _)| {
-            !matches!(
-                compiled.summary.precision,
-                BackwardConditionPrecision::Exact
-            )
-        })
-        && let Some(vm_compiled) = compile_vm_target_precondition_with_summaries(
-            func,
-            &initial_state,
-            target_addr,
-            &derived_summaries,
-        )
-        && prefer_compiled_precondition(
-            compiled.as_ref().map(|(compiled, _)| compiled),
-            &vm_compiled,
-        )
-    {
-        compiled = Some((vm_compiled, CompiledPreconditionMode::Necessary));
-    }
-    let Some((compiled, mode)) = compiled else {
-        let narrowed_state = apply_memory_term_narrowing(&initial_state, &memory_terms);
-        return PreconditionApplication::Continue {
-            initial_state: Box::new(initial_state),
-            narrowed_state,
-            compiled_precondition: None,
-        };
-    };
-    match apply_compiled_precondition_with_mode(explorer, initial_state, compiled, mode) {
+    let query_inputs = artifact
+        .map(|artifact| artifact.target_query_route_input(target_addr, assumption_conflicted))
+        .unwrap_or_else(|| TargetQueryRouteInput {
+            route: crate::TargetQueryRoutePlan::dynamic_fallback(),
+            condition_source: None,
+            memory_terms: Vec::new(),
+            allow_exact_proof: !assumption_conflicted,
+        });
+    apply_best_compiled_precondition_for_inputs(
+        explorer,
+        func,
+        initial_state,
+        target_addr,
+        &query_inputs,
+    )
+}
+
+fn execute_target_query_paths_from_inputs<'ctx>(
+    explorer: &mut PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    initial_state: SymState<'ctx>,
+    target_addr: u64,
+    query_inputs: &TargetQueryRouteInput<'_>,
+) -> TargetQueryPaths<'ctx> {
+    let selected_route = query_inputs.route.clone();
+    match apply_best_compiled_precondition_for_inputs(
+        explorer,
+        func,
+        initial_state,
+        target_addr,
+        query_inputs,
+    ) {
         PreconditionApplication::Continue {
             initial_state,
             narrowed_state,
             compiled_precondition,
-        } => {
-            let narrowed_state = narrowed_state
-                .or_else(|| apply_memory_term_narrowing(initial_state.as_ref(), &memory_terms));
-            PreconditionApplication::Continue {
-                initial_state,
+            summary_conditioned,
+        } => TargetQueryPaths {
+            selected_route,
+            compiled_precondition,
+            matched_paths: find_paths_with_compiled_narrowing(
+                explorer,
+                *initial_state,
                 narrowed_state,
-                compiled_precondition,
+                |explorer, state| explorer.find_paths_to_in_scope(func, scope, state, target_addr),
+            ),
+            exact_unsat: false,
+            summary_conditioned,
+        },
+        PreconditionApplication::ExactUnsat {
+            compiled_precondition,
+            summary_conditioned,
+        } => TargetQueryPaths {
+            selected_route,
+            compiled_precondition: Some(compiled_precondition),
+            matched_paths: Vec::new(),
+            exact_unsat: true,
+            summary_conditioned,
+        },
+    }
+}
+
+fn execute_target_query_first_path_from_inputs<'ctx>(
+    explorer: &mut PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    initial_state: SymState<'ctx>,
+    target_addr: u64,
+    query_inputs: &TargetQueryRouteInput<'_>,
+) -> TargetQueryPaths<'ctx> {
+    let selected_route = query_inputs.route.clone();
+    match apply_best_compiled_precondition_for_inputs(
+        explorer,
+        func,
+        initial_state,
+        target_addr,
+        query_inputs,
+    ) {
+        PreconditionApplication::Continue {
+            initial_state,
+            narrowed_state,
+            compiled_precondition,
+            summary_conditioned,
+        } => TargetQueryPaths {
+            selected_route,
+            compiled_precondition,
+            matched_paths: find_first_path_with_compiled_narrowing(
+                explorer,
+                *initial_state,
+                narrowed_state,
+                |explorer, state| explorer.find_path_to_in_scope(func, scope, state, target_addr),
+            )
+            .into_iter()
+            .collect(),
+            exact_unsat: false,
+            summary_conditioned,
+        },
+        PreconditionApplication::ExactUnsat {
+            compiled_precondition,
+            summary_conditioned,
+        } => TargetQueryPaths {
+            selected_route,
+            compiled_precondition: Some(compiled_precondition),
+            matched_paths: Vec::new(),
+            exact_unsat: true,
+            summary_conditioned,
+        },
+    }
+}
+
+fn continuation_seed_states<'ctx>(
+    explorer: &mut PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    bridge_paths: Vec<PathResult<'ctx>>,
+) -> Vec<SymState<'ctx>> {
+    let mut seeds = Vec::new();
+    for path in bridge_paths {
+        if let Ok(next_states) = explorer.advance_current_block_in_scope(func, scope, path.state) {
+            seeds.extend(next_states.into_iter().filter(state_is_continuation_seed));
+        }
+        if explorer.budget_exhausted() {
+            break;
+        }
+    }
+    seeds
+}
+
+fn rank_continuation_seeds<'ctx>(mut seeds: Vec<SymState<'ctx>>) -> Vec<SymState<'ctx>> {
+    seeds.sort_by_key(|state| (state.num_constraints(), state.depth, state.pc));
+    seeds.truncate(CONTINUATION_SEEDED_STATE_CAP);
+    seeds
+}
+
+fn continuation_followup_execution_route(
+    route: &TargetQueryExecutionRoute,
+) -> TargetQueryExecutionRoute {
+    match route {
+        TargetQueryExecutionRoute::DynamicTargetCompile { reason, .. } => {
+            TargetQueryExecutionRoute::ResidualOnly {
+                reasons: vec![
+                    format!(
+                        "continuation-seeded follow-up downgraded dynamic target compile: {reason}"
+                    ),
+                    "continuation-seeded runtime execution".to_string(),
+                ],
             }
         }
-        unsat => unsat,
+        TargetQueryExecutionRoute::VmTargetCompile { reason } => {
+            TargetQueryExecutionRoute::ResidualOnly {
+                reasons: vec![
+                    format!("continuation-seeded follow-up downgraded vm target compile: {reason}"),
+                    "continuation-seeded runtime execution".to_string(),
+                ],
+            }
+        }
+        other => other.clone(),
     }
+}
+
+fn execute_target_query_paths<'ctx>(
+    explorer: &mut PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    artifact: Option<&SemanticArtifact>,
+    initial_state: SymState<'ctx>,
+    target_addr: u64,
+    assumption_conflicted: bool,
+) -> TargetQueryPaths<'ctx> {
+    let query_inputs = build_target_query_inputs(
+        explorer,
+        func,
+        scope,
+        artifact,
+        target_addr,
+        assumption_conflicted,
+        true,
+    );
+    if let TargetQueryExecutionRoute::ContinuationSeeded {
+        bridge_target,
+        route,
+    } = &query_inputs.route.execution
+    {
+        let mut bridge_inputs = build_target_query_inputs(
+            explorer,
+            func,
+            scope,
+            artifact,
+            *bridge_target,
+            assumption_conflicted,
+            false,
+        );
+        bridge_inputs.route.execution = TargetQueryExecutionRoute::ResidualOnly {
+            reasons: vec!["continuation bridge search".to_string()],
+        };
+        let bridge_paths = explorer.with_prune_infeasible(false, |explorer| {
+            execute_target_query_paths_from_inputs(
+                explorer,
+                func,
+                scope,
+                initial_state,
+                *bridge_target,
+                &bridge_inputs,
+            )
+        });
+        let mut summary_conditioned = bridge_paths.summary_conditioned;
+        if bridge_paths.exact_unsat || bridge_paths.matched_paths.is_empty() {
+            return TargetQueryPaths {
+                selected_route: query_inputs.route.clone(),
+                compiled_precondition: bridge_paths.compiled_precondition,
+                matched_paths: Vec::new(),
+                exact_unsat: bridge_paths.exact_unsat,
+                summary_conditioned,
+            };
+        }
+
+        let bridge_compiled_precondition = bridge_paths.compiled_precondition;
+        let seeded_states = rank_continuation_seeds(continuation_seed_states(
+            explorer,
+            func,
+            scope,
+            bridge_paths.matched_paths,
+        ));
+        if seeded_states.is_empty() {
+            return TargetQueryPaths {
+                selected_route: query_inputs.route.clone(),
+                compiled_precondition: bridge_compiled_precondition,
+                matched_paths: Vec::new(),
+                exact_unsat: false,
+                summary_conditioned,
+            };
+        }
+
+        let mut final_inputs = query_inputs.clone();
+        final_inputs.route.execution = continuation_followup_execution_route(route);
+        let mut matched_paths = Vec::new();
+        let mut compiled_precondition = None;
+        let mut any_exact_unsat = false;
+        for state in seeded_states {
+            let next = explorer.with_exception_bridge_guidance(false, |explorer| {
+                execute_target_query_paths_from_inputs(
+                    explorer,
+                    func,
+                    scope,
+                    state,
+                    target_addr,
+                    &final_inputs,
+                )
+            });
+            if compiled_precondition.is_none() {
+                compiled_precondition = next.compiled_precondition;
+            }
+            summary_conditioned |= next.summary_conditioned;
+            any_exact_unsat |= next.exact_unsat;
+            matched_paths.extend(next.matched_paths);
+            if explorer.budget_exhausted() {
+                break;
+            }
+        }
+        let no_matches = matched_paths.is_empty();
+
+        return TargetQueryPaths {
+            selected_route: query_inputs.route,
+            compiled_precondition: compiled_precondition.or(bridge_compiled_precondition),
+            matched_paths,
+            exact_unsat: no_matches && any_exact_unsat,
+            summary_conditioned,
+        };
+    }
+
+    execute_target_query_paths_from_inputs(
+        explorer,
+        func,
+        scope,
+        initial_state,
+        target_addr,
+        &query_inputs,
+    )
+}
+
+fn execute_target_query_first_path<'ctx>(
+    explorer: &mut PathExplorer<'ctx>,
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    artifact: Option<&SemanticArtifact>,
+    initial_state: SymState<'ctx>,
+    target_addr: u64,
+    assumption_conflicted: bool,
+) -> TargetQueryPaths<'ctx> {
+    let query_inputs = build_target_query_inputs(
+        explorer,
+        func,
+        scope,
+        artifact,
+        target_addr,
+        assumption_conflicted,
+        true,
+    );
+    if let TargetQueryExecutionRoute::ContinuationSeeded {
+        bridge_target,
+        route,
+    } = &query_inputs.route.execution
+    {
+        debug_query_phase_log(&format!(
+            "continuation:start target=0x{target_addr:x} bridge=0x{bridge_target:x}"
+        ));
+        let mut bridge_inputs = build_target_query_inputs(
+            explorer,
+            func,
+            scope,
+            artifact,
+            *bridge_target,
+            assumption_conflicted,
+            false,
+        );
+        bridge_inputs.route.execution = TargetQueryExecutionRoute::ResidualOnly {
+            reasons: vec!["continuation bridge search".to_string()],
+        };
+        debug_query_phase_log(&format!(
+            "continuation:bridge_search target=0x{bridge_target:x} route={:?}",
+            bridge_inputs.route.execution
+        ));
+        let bridge_selected_route = bridge_inputs.route.clone();
+        let bridge_paths = explorer.with_prune_infeasible(false, |explorer| TargetQueryPaths {
+            selected_route: bridge_selected_route,
+            compiled_precondition: None,
+            matched_paths: explorer
+                .find_path_to_in_scope(func, scope, initial_state, *bridge_target)
+                .into_iter()
+                .collect(),
+            exact_unsat: false,
+            summary_conditioned: false,
+        });
+        debug_query_phase_log(&format!(
+            "continuation:bridge_done target=0x{bridge_target:x} matched={} exact_unsat={} budget_exhausted={}",
+            bridge_paths.matched_paths.len(),
+            bridge_paths.exact_unsat,
+            explorer.budget_exhausted(),
+        ));
+        let mut summary_conditioned = bridge_paths.summary_conditioned;
+        let Some(bridge_path) = bridge_paths.matched_paths.into_iter().next() else {
+            return TargetQueryPaths {
+                selected_route: query_inputs.route.clone(),
+                compiled_precondition: bridge_paths.compiled_precondition,
+                matched_paths: Vec::new(),
+                exact_unsat: bridge_paths.exact_unsat,
+                summary_conditioned,
+            };
+        };
+
+        let bridge_compiled_precondition = bridge_paths.compiled_precondition;
+        let seeded_states = rank_continuation_seeds(continuation_seed_states(
+            explorer,
+            func,
+            scope,
+            vec![bridge_path],
+        ));
+        debug_query_phase_log(&format!(
+            "continuation:seeded count={} budget_exhausted={}",
+            seeded_states.len(),
+            explorer.budget_exhausted(),
+        ));
+        let Some(state) = seeded_states.into_iter().next() else {
+            return TargetQueryPaths {
+                selected_route: query_inputs.route.clone(),
+                compiled_precondition: bridge_compiled_precondition,
+                matched_paths: Vec::new(),
+                exact_unsat: false,
+                summary_conditioned,
+            };
+        };
+
+        let mut final_inputs = query_inputs.clone();
+        final_inputs.route.execution = continuation_followup_execution_route(route);
+        debug_query_phase_log(&format!(
+            "continuation:final_search target=0x{target_addr:x} route={:?}",
+            final_inputs.route.execution
+        ));
+        let next = explorer.with_exception_bridge_guidance(false, |explorer| {
+            execute_target_query_first_path_from_inputs(
+                explorer,
+                func,
+                scope,
+                state,
+                target_addr,
+                &final_inputs,
+            )
+        });
+        debug_query_phase_log(&format!(
+            "continuation:final_done target=0x{target_addr:x} matched={} exact_unsat={} budget_exhausted={}",
+            next.matched_paths.len(),
+            next.exact_unsat,
+            explorer.budget_exhausted(),
+        ));
+        summary_conditioned |= next.summary_conditioned;
+        return TargetQueryPaths {
+            selected_route: query_inputs.route,
+            compiled_precondition: next.compiled_precondition.or(bridge_compiled_precondition),
+            matched_paths: next.matched_paths,
+            exact_unsat: next.exact_unsat,
+            summary_conditioned,
+        };
+    }
+
+    execute_target_query_first_path_from_inputs(
+        explorer,
+        func,
+        scope,
+        initial_state,
+        target_addr,
+        &query_inputs,
+    )
 }
 
 impl<'ctx> PathExplorer<'ctx> {
@@ -841,7 +2012,17 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> ReachabilityResult<'ctx> {
-        self.can_reach_with_artifact(func, None, initial_state, target_addr)
+        self.can_reach_with_artifact_in_scope(func, None, None, initial_state, target_addr)
+    }
+
+    pub fn can_reach_in_scope(
+        &mut self,
+        func: &SsaArtifact,
+        scope: Option<&PreparedFunctionScope>,
+        initial_state: SymState<'ctx>,
+        target_addr: u64,
+    ) -> ReachabilityResult<'ctx> {
+        self.can_reach_with_artifact_in_scope(func, scope, None, initial_state, target_addr)
     }
 
     pub fn can_reach_with_artifact(
@@ -851,33 +2032,31 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> ReachabilityResult<'ctx> {
-        let (paths, compiled_precondition) = match apply_best_compiled_precondition(
+        self.can_reach_with_artifact_in_scope(func, None, artifact, initial_state, target_addr)
+    }
+
+    pub fn can_reach_with_artifact_in_scope(
+        &mut self,
+        func: &SsaArtifact,
+        scope: Option<&PreparedFunctionScope>,
+        artifact: Option<&SemanticArtifact>,
+        mut initial_state: SymState<'ctx>,
+        target_addr: u64,
+    ) -> ReachabilityResult<'ctx> {
+        let assumption_outcome = assumption_usage_for_query(self, func, &mut initial_state);
+        let query = execute_target_query_paths(
             self,
             func,
+            scope,
             artifact,
             initial_state,
             target_addr,
-        ) {
-            PreconditionApplication::Continue {
-                initial_state,
-                narrowed_state,
-                compiled_precondition,
-            } => (
-                find_paths_with_compiled_narrowing(
-                    self,
-                    *initial_state,
-                    narrowed_state,
-                    |explorer, state| explorer.find_paths_to(func, state, target_addr),
-                ),
-                compiled_precondition,
-            ),
-            PreconditionApplication::ExactUnsat {
-                compiled_precondition,
-            } => (Vec::new(), Some(compiled_precondition)),
-        };
+            assumption_outcome.conflicted,
+        );
         let stats = self.stats().clone();
         let solver_stats = self.solver().stats();
-        let status = if !paths.is_empty() {
+        let summary_conditioned = query.summary_conditioned || stats_show_summary_guidance(&stats);
+        let status = if !query.matched_paths.is_empty() {
             ReachabilityStatus::Reachable
         } else if self.budget_exhausted() {
             ReachabilityStatus::BudgetExhausted
@@ -887,8 +2066,12 @@ impl<'ctx> PathExplorer<'ctx> {
         ReachabilityResult {
             status,
             target_addr,
-            compiled_precondition,
-            paths,
+            selected_route: query.selected_route,
+            compiled_precondition: query.compiled_precondition,
+            paths: query.matched_paths,
+            assumption_usage: assumption_outcome.usage,
+            assumption_conditioned: assumption_outcome.conditioned,
+            summary_conditioned,
             stats,
             solver_stats,
         }
@@ -901,7 +2084,17 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_pc: u64,
     ) -> PathConditionResult<'ctx> {
-        self.path_conditions_at_with_artifact(func, None, initial_state, target_pc)
+        self.path_conditions_at_with_artifact_in_scope(func, None, None, initial_state, target_pc)
+    }
+
+    pub fn path_conditions_at_in_scope(
+        &mut self,
+        func: &SsaArtifact,
+        scope: Option<&PreparedFunctionScope>,
+        initial_state: SymState<'ctx>,
+        target_pc: u64,
+    ) -> PathConditionResult<'ctx> {
+        self.path_conditions_at_with_artifact_in_scope(func, scope, None, initial_state, target_pc)
     }
 
     pub fn path_conditions_at_with_artifact(
@@ -911,39 +2104,47 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_pc: u64,
     ) -> PathConditionResult<'ctx> {
-        let (matching_paths, compiled_precondition) = match apply_best_compiled_precondition(
-            self,
+        self.path_conditions_at_with_artifact_in_scope(
             func,
+            None,
             artifact,
             initial_state,
             target_pc,
-        ) {
-            PreconditionApplication::Continue {
-                initial_state,
-                narrowed_state,
-                compiled_precondition,
-            } => (
-                find_paths_with_compiled_narrowing(
-                    self,
-                    *initial_state,
-                    narrowed_state,
-                    |explorer, state| explorer.find_paths_to(func, state, target_pc),
-                ),
-                compiled_precondition,
-            ),
-            PreconditionApplication::ExactUnsat {
-                compiled_precondition,
-            } => (Vec::new(), Some(compiled_precondition)),
-        };
+        )
+    }
+
+    pub fn path_conditions_at_with_artifact_in_scope(
+        &mut self,
+        func: &SsaArtifact,
+        scope: Option<&PreparedFunctionScope>,
+        artifact: Option<&SemanticArtifact>,
+        mut initial_state: SymState<'ctx>,
+        target_pc: u64,
+    ) -> PathConditionResult<'ctx> {
+        let assumption_outcome = assumption_usage_for_query(self, func, &mut initial_state);
+        let query = execute_target_query_paths(
+            self,
+            func,
+            scope,
+            artifact,
+            initial_state,
+            target_pc,
+            assumption_outcome.conflicted,
+        );
         let stats = self.stats().clone();
         let solver_stats = self.solver().stats();
-        let conditions = matching_paths.iter().map(condition_summary).collect();
+        let summary_conditioned = query.summary_conditioned || stats_show_summary_guidance(&stats);
+        let conditions = query.matched_paths.iter().map(condition_summary).collect();
         PathConditionResult {
             completion: completion_from_stats(&stats),
             target_pc,
-            compiled_precondition,
+            selected_route: query.selected_route,
+            compiled_precondition: query.compiled_precondition,
             conditions,
-            matching_paths,
+            matching_paths: query.matched_paths,
+            assumption_usage: assumption_outcome.usage,
+            assumption_conditioned: assumption_outcome.conditioned,
+            summary_conditioned,
             stats,
             solver_stats,
         }
@@ -956,7 +2157,17 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> SolveResult<'ctx> {
-        self.solve_for_target_with_artifact(func, None, initial_state, target_addr)
+        self.solve_for_target_with_artifact_in_scope(func, None, None, initial_state, target_addr)
+    }
+
+    pub fn solve_for_target_in_scope(
+        &mut self,
+        func: &SsaArtifact,
+        scope: Option<&PreparedFunctionScope>,
+        initial_state: SymState<'ctx>,
+        target_addr: u64,
+    ) -> SolveResult<'ctx> {
+        self.solve_for_target_with_artifact_in_scope(func, scope, None, initial_state, target_addr)
     }
 
     pub fn solve_for_target_with_artifact(
@@ -966,57 +2177,101 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> SolveResult<'ctx> {
-        let (matched_paths, compiled_precondition, exact_unsat) =
-            match apply_best_compiled_precondition(self, func, artifact, initial_state, target_addr)
-            {
-                PreconditionApplication::Continue {
-                    initial_state,
-                    narrowed_state,
-                    compiled_precondition,
-                } => (
-                    find_paths_with_compiled_narrowing(
-                        self,
-                        *initial_state,
-                        narrowed_state,
-                        |explorer, state| explorer.find_paths_to(func, state, target_addr),
-                    ),
-                    compiled_precondition,
-                    false,
-                ),
-                PreconditionApplication::ExactUnsat {
-                    compiled_precondition,
-                } => (Vec::new(), Some(compiled_precondition), true),
-            };
+        self.solve_for_target_with_artifact_in_scope(
+            func,
+            None,
+            artifact,
+            initial_state,
+            target_addr,
+        )
+    }
+
+    pub fn solve_for_target_with_artifact_in_scope(
+        &mut self,
+        func: &SsaArtifact,
+        scope: Option<&PreparedFunctionScope>,
+        artifact: Option<&SemanticArtifact>,
+        mut initial_state: SymState<'ctx>,
+        target_addr: u64,
+    ) -> SolveResult<'ctx> {
+        let assumption_outcome = assumption_usage_for_query(self, func, &mut initial_state);
+        let validation_initial_state = initial_state.fork();
+        let query = execute_target_query_first_path(
+            self,
+            func,
+            scope,
+            artifact,
+            initial_state,
+            target_addr,
+            assumption_outcome.conflicted,
+        );
         let stats = self.stats().clone();
         let solver_stats = self.solver().stats();
-        let selected_path_index = matched_paths
+        let summary_conditioned = query.summary_conditioned || stats_show_summary_guidance(&stats);
+        let selected_path_index = query
+            .matched_paths
             .iter()
             .enumerate()
             .min_by_key(|(idx, path)| (path.num_constraints(), path.depth, *idx))
             .map(|(idx, _)| idx);
-        let solution = selected_path_index.and_then(|idx| self.solve_path(&matched_paths[idx]));
-        let status = match (
-            exact_unsat,
-            selected_path_index,
-            solution.as_ref(),
-            completion_from_stats(&stats),
-        ) {
-            (true, _, _, _) => SolveStatus::Unsat,
-            (false, _, Some(_), _) => SolveStatus::Solved,
-            (false, None, _, QueryCompletion::BudgetExhausted) => SolveStatus::BudgetExhausted,
-            (false, None, _, QueryCompletion::Complete) => SolveStatus::Unsat,
-            (false, Some(_), None, QueryCompletion::BudgetExhausted) => {
-                SolveStatus::BudgetExhausted
-            }
-            (false, Some(_), None, _) => SolveStatus::Unknown,
+        let constraint_graph = selected_path_index
+            .map(|idx| &query.matched_paths[idx])
+            .map(|path| {
+                build_final_constraint_graph_for_path(
+                    func,
+                    path,
+                    &stats.runtime_loop_exact_recurrences,
+                    target_addr,
+                    None,
+                )
+            })
+            .unwrap_or_default();
+        let solution = if solution_extraction_allowed(&query.selected_route, &stats) {
+            selected_path_index.and_then(|idx| self.solve_path(&query.matched_paths[idx]))
+        } else {
+            None
         };
+        let tactic_solution = if solution_extraction_allowed(&query.selected_route, &stats) {
+            selected_path_index.and_then(|idx| {
+                self.solve_path_with_constraint_graph_tactics(
+                    &query.matched_paths[idx],
+                    &constraint_graph,
+                    &stats.runtime_loop_exact_recurrences,
+                )
+            })
+        } else {
+            None
+        };
+        let solution = tactic_solution.or(solution);
+        let mut replay_backend = LiftedReplayBackend::new(self);
+        let (status, verification, witness) = verify_solve_result(
+            SolveVerificationRequest {
+                func,
+                scope,
+                selected_route: &query.selected_route,
+                stats: &stats,
+                validation_initial_state,
+                target_addr,
+                exact_unsat: query.exact_unsat,
+                selected_path_index,
+                solution: solution.as_ref(),
+                constraint_graph: &constraint_graph,
+            },
+            &mut replay_backend,
+        );
         SolveResult {
             status,
             target_addr,
-            compiled_precondition,
-            matched_paths,
+            selected_route: query.selected_route,
+            compiled_precondition: query.compiled_precondition,
+            matched_paths: query.matched_paths,
             selected_path_index,
             solution,
+            assumption_usage: assumption_outcome.usage,
+            assumption_conditioned: assumption_outcome.conditioned,
+            summary_conditioned,
+            verification,
+            witness,
             stats,
             solver_stats,
         }
@@ -1048,8 +2303,7 @@ mod tests {
 
     use super::{
         CompiledPreconditionMode, PreconditionApplication, apply_best_compiled_precondition,
-        apply_compiled_precondition_with_mode, prefer_compiled_precondition,
-        target_condition_source, vm_target_case_values,
+        apply_compiled_precondition_with_mode, prefer_compiled_precondition, vm_target_case_values,
     };
     use crate::{
         ArtifactGranularity, BackwardConditionPrecision, BackwardConditionSummary,
@@ -1057,11 +2311,15 @@ mod tests {
         MemoryFact, NativeArtifactBody, NativeFunctionSummary, RefinementStage, RegionKey,
         ResidualReason, SatResult, SemanticArtifact, SemanticArtifactBody,
         SemanticArtifactDiagnostics, SemanticEvidence, SemanticEvidenceReason, SemanticRegion,
-        SliceClass, SymQueryConfig, SymState, TargetFact, TargetQueryPlan, VmBinaryOp,
-        VmGuardCondition, VmGuardedExit, VmStateUpdate, VmStepSummary, VmTransferArm, VmValueExpr,
+        SliceClass, SymQueryConfig, SymState, TargetFact, TargetQueryExecutionRoute,
+        TargetQueryPlan, VmBinaryOp, VmGuardCondition, VmGuardedExit, VmStateUpdate, VmStepSummary,
+        VmTransferArm, VmValueExpr,
     };
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
-    use r2ssa::SsaArtifact;
+    use r2ssa::{
+        AnalysisAssumption, AssumptionProvenance, AssumptionScope, AssumptionSet,
+        AssumptionSubject, AssumptionValue, SsaArtifact,
+    };
     use z3::Context;
     use z3::ast::BV;
 
@@ -1213,6 +2471,47 @@ mod tests {
         ]
     }
 
+    fn make_bounded_copy_loop_blocks() -> Vec<R2ILBlock> {
+        vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                switch_info: None,
+                op_metadata: Default::default(),
+                ops: vec![
+                    R2ILOp::Load {
+                        dst: make_reg(TMP0, 1),
+                        space: SpaceId::Ram,
+                        addr: make_const(0x2000, 8),
+                    },
+                    R2ILOp::Store {
+                        space: SpaceId::Ram,
+                        addr: make_const(0x3000, 8),
+                        val: make_reg(TMP0, 1),
+                    },
+                    R2ILOp::IntLess {
+                        dst: make_reg(TMP1, 1),
+                        a: make_reg(RDI, 8),
+                        b: make_const(0x1000, 8),
+                    },
+                    R2ILOp::CBranch {
+                        target: make_const(0x1000, 8),
+                        cond: make_reg(TMP1, 1),
+                    },
+                ],
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 1,
+                switch_info: None,
+                op_metadata: Default::default(),
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+            },
+        ]
+    }
+
     fn make_vm_step_summary_with_transfers(transfers: Vec<VmTransferArm>) -> VmStepSummary {
         VmStepSummary {
             kind: crate::InterpreterKind::SwitchDispatch,
@@ -1259,17 +2558,13 @@ mod tests {
 
         let explorer = SymQueryConfig::default().make_explorer(&ctx);
         let original_constraints = state.num_constraints();
-        match apply_best_compiled_precondition(&explorer, &func, None, state, 0x1010) {
+        match apply_best_compiled_precondition(&explorer, &func, None, state, 0x1010, false) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
-                compiled_precondition,
+                compiled_precondition: _,
+                ..
             } => {
-                let compiled = compiled_precondition.expect("compiled precondition");
-                assert_eq!(
-                    compiled.precision,
-                    crate::BackwardConditionPrecision::ResidualSearchRequired
-                );
                 assert_eq!(initial_state.num_constraints(), original_constraints);
                 assert!(narrowed_state.is_none());
             }
@@ -1277,6 +2572,82 @@ mod tests {
                 panic!("residual precondition should not shortcut as exact unsat")
             }
         }
+    }
+
+    #[test]
+    fn non_local_targets_skip_dynamic_precondition_compile() {
+        let blocks = make_residual_precondition_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic("reg:56_0", 64);
+
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let original_constraints = state.num_constraints();
+        match apply_best_compiled_precondition(&explorer, &func, None, state, 0x4000, false) {
+            PreconditionApplication::Continue {
+                initial_state,
+                narrowed_state,
+                compiled_precondition,
+                ..
+            } => {
+                assert!(compiled_precondition.is_none());
+                assert!(narrowed_state.is_none());
+                assert_eq!(initial_state.num_constraints(), original_constraints);
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("non-local targets should bypass dynamic backward compilation")
+            }
+        }
+    }
+
+    #[test]
+    fn register_assumptions_condition_query_results() {
+        let blocks = make_residual_precondition_blocks();
+        let base = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let reg_name = base
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.version == 0 && value.var.is_register() && value.var.size == 8)
+            .expect("version-zero input register")
+            .var
+            .name
+            .clone();
+        let func = base.with_assumptions(&AssumptionSet::new(vec![AnalysisAssumption {
+            id: Some("force-rdi".to_string()),
+            subject: AssumptionSubject::Register { name: reg_name },
+            value: AssumptionValue::Constant { value: 1 },
+            scope: AssumptionScope::Query,
+            provenance: AssumptionProvenance::User,
+        }]));
+        let (state_name, bits) = func
+            .facts()
+            .applied_assumption_bindings
+            .iter()
+            .find_map(|binding| match &binding.binding {
+                r2ssa::PreparedAssumptionBindingKind::Register {
+                    state_name, bits, ..
+                } => Some((state_name.clone(), *bits)),
+                _ => None,
+            })
+            .expect("register assumption binding");
+        let ctx = Context::thread_local();
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.make_symbolic(&state_name, bits);
+
+        let mut explorer = SymQueryConfig::default().make_explorer(&ctx);
+        let reach = explorer.can_reach(&func, state, 0x1010);
+        assert_eq!(reach.status, super::ReachabilityStatus::Reachable);
+        assert!(reach.assumption_conditioned);
+        assert!(!reach.summary_conditioned);
+        assert_eq!(reach.assumption_usage.applied.len(), 1);
+        assert!(reach.assumption_usage.ignored.is_empty());
+        assert!(reach.assumption_usage.conflicts.is_empty());
+        assert!(matches!(
+            reach.assumption_usage.applied[0].value,
+            AssumptionValue::Constant { value: 1 }
+        ));
     }
 
     #[test]
@@ -1307,11 +2678,13 @@ mod tests {
             state,
             compiled,
             CompiledPreconditionMode::Necessary,
+            true,
         ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
                 compiled_precondition,
+                ..
             } => {
                 let compiled = compiled_precondition.expect("compiled precondition");
                 assert_eq!(compiled.precision, BackwardConditionPrecision::OverApprox);
@@ -1354,6 +2727,7 @@ mod tests {
             state,
             compiled,
             CompiledPreconditionMode::NarrowOnly,
+            true,
         ) {
             PreconditionApplication::Continue {
                 narrowed_state,
@@ -1402,11 +2776,13 @@ mod tests {
             state,
             compiled,
             CompiledPreconditionMode::NarrowOnly,
+            true,
         ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
                 compiled_precondition,
+                ..
             } => {
                 assert_eq!(initial_state.num_constraints(), original_constraints);
                 assert_eq!(
@@ -1424,6 +2800,177 @@ mod tests {
                 panic!("narrow-only exact precondition should not shortcut as exact unsat")
             }
         }
+    }
+
+    #[test]
+    fn exact_preconditions_disable_unsat_shortcuts_when_exact_proof_is_disallowed() {
+        let ctx = Context::thread_local();
+        let state = SymState::new(&ctx, 0x1000);
+        let explorer = SymQueryConfig::default().make_explorer(&ctx);
+
+        let compiled = crate::CompiledBackwardCondition {
+            predicate: z3::ast::Bool::from_bool(false),
+            summary: BackwardConditionSummary {
+                simplified: "guard".to_string(),
+                terms: vec!["guard".to_string()],
+                memory_terms: Vec::new(),
+                backward_memory_substitutions: 0,
+                backward_memory_candidate_enumerations: 0,
+                backward_memory_residual_fallbacks: 0,
+                precision: BackwardConditionPrecision::Exact,
+                supported_paths: 1,
+                total_paths: 1,
+            },
+        };
+        match apply_compiled_precondition_with_mode(
+            &explorer,
+            state,
+            compiled,
+            CompiledPreconditionMode::Necessary,
+            false,
+        ) {
+            PreconditionApplication::Continue {
+                compiled_precondition,
+                ..
+            } => {
+                assert_eq!(
+                    compiled_precondition
+                        .expect("compiled precondition")
+                        .precision,
+                    BackwardConditionPrecision::Exact
+                );
+            }
+            PreconditionApplication::ExactUnsat { .. } => {
+                panic!("exact-proof downgrade must disable exact unsat shortcuts")
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_copy_loops_raise_recommended_query_max_depth() {
+        let blocks = make_bounded_copy_loop_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let state = SymState::new(&ctx, 0x1000);
+
+        let budget = super::recommended_query_max_depth(&func, &state);
+
+        assert!(
+            budget >= 16_384,
+            "bounded copy loop budget should scale with trip count, got {budget}"
+        );
+    }
+
+    #[test]
+    fn bounded_copy_loops_raise_recommended_query_timeout() {
+        let blocks = make_bounded_copy_loop_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+
+        assert!(
+            super::recommended_query_timeout(&func) >= std::time::Duration::from_secs(120),
+            "bounded copy loop timeout should exceed default budget"
+        );
+    }
+
+    #[test]
+    fn continuation_seeded_routes_cap_recommended_query_max_depth() {
+        let blocks = make_bounded_copy_loop_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let ctx = Context::thread_local();
+        let state = SymState::new(&ctx, 0x1000);
+        let route = crate::TargetQueryRoutePlan {
+            target_plan: crate::TargetQueryPlan::Ready {
+                mode: crate::QueryGuidanceMode::NarrowOnly,
+            },
+            execution: crate::TargetQueryExecutionRoute::ContinuationSeeded {
+                bridge_target: 0x1010,
+                route: Box::new(crate::TargetQueryExecutionRoute::DynamicTargetCompile {
+                    reason: "test".to_string(),
+                    mode: crate::QueryGuidanceMode::NarrowOnly,
+                }),
+            },
+        };
+
+        let budget = super::recommended_query_max_depth_for_route(&func, &state, Some(&route));
+
+        assert!(
+            budget <= super::CONTINUATION_QUERY_MAX_DEPTH_CAP,
+            "continuation-seeded route should cap inflated depth budget, got {budget}"
+        );
+    }
+
+    #[test]
+    fn continuation_seeded_routes_cap_recommended_query_max_states() {
+        let route = crate::TargetQueryRoutePlan {
+            target_plan: crate::TargetQueryPlan::Ready {
+                mode: crate::QueryGuidanceMode::NarrowOnly,
+            },
+            execution: crate::TargetQueryExecutionRoute::ContinuationSeeded {
+                bridge_target: 0x1010,
+                route: Box::new(crate::TargetQueryExecutionRoute::DynamicTargetCompile {
+                    reason: "test".to_string(),
+                    mode: crate::QueryGuidanceMode::NarrowOnly,
+                }),
+            },
+        };
+
+        let max_states = super::recommended_query_max_states_for_route(1_000, Some(&route));
+
+        assert_eq!(max_states, super::CONTINUATION_QUERY_MAX_STATES_CAP);
+    }
+
+    #[test]
+    fn continuation_seeded_routes_cap_recommended_query_timeout() {
+        let blocks = make_bounded_copy_loop_blocks();
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("ssa");
+        let route = crate::TargetQueryRoutePlan {
+            target_plan: crate::TargetQueryPlan::Ready {
+                mode: crate::QueryGuidanceMode::NarrowOnly,
+            },
+            execution: crate::TargetQueryExecutionRoute::ContinuationSeeded {
+                bridge_target: 0x1010,
+                route: Box::new(crate::TargetQueryExecutionRoute::DynamicTargetCompile {
+                    reason: "test".to_string(),
+                    mode: crate::QueryGuidanceMode::NarrowOnly,
+                }),
+            },
+        };
+
+        let timeout = super::recommended_query_timeout_for_route(&func, Some(&route));
+
+        assert!(
+            timeout <= std::time::Duration::from_secs(30),
+            "continuation-seeded route should cap inflated timeout, got {timeout:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_followup_downgrades_dynamic_target_compile() {
+        let route = crate::TargetQueryExecutionRoute::DynamicTargetCompile {
+            reason: "LargeCfg".to_string(),
+            mode: crate::QueryGuidanceMode::NarrowOnly,
+        };
+
+        match super::continuation_followup_execution_route(&route) {
+            crate::TargetQueryExecutionRoute::ResidualOnly { reasons } => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|reason| reason.contains("dynamic target compile")),
+                    "expected dynamic compile downgrade reason, got {reasons:?}"
+                );
+            }
+            other => panic!("expected residual-only continuation follow-up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continuation_followup_keeps_artifact_guided_routes() {
+        let route = crate::TargetQueryExecutionRoute::ArtifactCondition {
+            mode: crate::QueryGuidanceMode::Necessary,
+        };
+
+        assert_eq!(super::continuation_followup_execution_route(&route), route);
     }
 
     #[test]
@@ -1539,11 +3086,19 @@ mod tests {
             default_diagnostics(),
         );
 
-        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+        match apply_best_compiled_precondition(
+            &explorer,
+            &func,
+            Some(&artifact),
+            state,
+            0x2000,
+            false,
+        ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
                 compiled_precondition,
+                ..
             } => {
                 assert!(compiled_precondition.is_none());
                 assert_eq!(initial_state.num_constraints(), original_constraints);
@@ -1703,11 +3258,19 @@ mod tests {
             default_diagnostics(),
         );
 
-        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+        match apply_best_compiled_precondition(
+            &explorer,
+            &func,
+            Some(&artifact),
+            state,
+            0x2000,
+            false,
+        ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
                 compiled_precondition,
+                ..
             } => {
                 assert!(compiled_precondition.is_none());
                 assert_eq!(initial_state.num_constraints(), original_constraints);
@@ -1795,11 +3358,19 @@ mod tests {
             default_diagnostics(),
         );
 
-        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+        match apply_best_compiled_precondition(
+            &explorer,
+            &func,
+            Some(&artifact),
+            state,
+            0x2000,
+            false,
+        ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
                 compiled_precondition,
+                ..
             } => {
                 assert!(compiled_precondition.is_none());
                 assert_eq!(initial_state.num_constraints(), original_constraints);
@@ -1871,21 +3442,23 @@ mod tests {
             default_diagnostics(),
         );
 
-        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x2000) {
+        match apply_best_compiled_precondition(
+            &explorer,
+            &func,
+            Some(&artifact),
+            state,
+            0x2000,
+            false,
+        ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
-                compiled_precondition,
+                compiled_precondition: _,
+                ..
             } => {
                 assert_eq!(initial_state.num_constraints(), original_constraints);
                 let narrowed_state = narrowed_state.expect("narrowed state");
                 assert_eq!(narrowed_state.num_constraints(), original_constraints + 1);
-                assert_eq!(
-                    compiled_precondition
-                        .expect("worker island summary")
-                        .precision,
-                    BackwardConditionPrecision::OverApprox
-                );
                 let narrowed_value = narrowed_state
                     .symbolic_inputs()
                     .get("sym_mem")
@@ -1973,18 +3546,23 @@ mod tests {
             default_diagnostics(),
         );
 
-        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x1010) {
+        match apply_best_compiled_precondition(
+            &explorer,
+            &func,
+            Some(&artifact),
+            state,
+            0x1010,
+            false,
+        ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
                 compiled_precondition,
+                ..
             } => {
                 assert!(initial_state.num_constraints() >= original_constraints);
                 assert!(narrowed_state.is_none());
-                assert!(
-                    compiled_precondition.is_none(),
-                    "exact artifact-guided branch narrowing should not surface fallback compiled metadata"
-                );
+                assert!(compiled_precondition.is_some());
             }
             PreconditionApplication::ExactUnsat { .. } => {
                 panic!("necessary worker islands should use the real compiled precondition path")
@@ -2035,7 +3613,8 @@ mod tests {
             default_diagnostics(),
         );
 
-        let actionable = target_condition_source(&artifact, 0x1010, false)
+        let actionable = artifact
+            .target_condition_source(0x1010, false)
             .expect("actionable target condition source");
         assert!(
             matches!(
@@ -2046,9 +3625,9 @@ mod tests {
             ),
             "multi-exit regions must not be treated as necessary-for-target"
         );
-        assert_eq!(actionable.region.anchor, 0x1000);
+        assert_eq!(actionable.block_addr, 0x1000);
         assert!(
-            target_condition_source(&artifact, 0x1010, true).is_none(),
+            artifact.target_condition_source(0x1010, true).is_none(),
             "hard-proof target narrowing must reject non-necessary regions"
         );
     }
@@ -2145,10 +3724,12 @@ mod tests {
             route.target_plan,
             TargetQueryPlan::Residual { .. }
         ));
-        assert!(!route.allow_memory_term_narrowing);
-        assert!(!route.allow_dynamic_target_compile);
+        assert!(matches!(
+            route.execution,
+            TargetQueryExecutionRoute::ResidualOnly { .. }
+        ));
         assert!(
-            target_condition_source(&artifact, 0x1010, false).is_none(),
+            artifact.target_condition_source(0x1010, false).is_none(),
             "materially conflicting target sources must not collapse into one authoritative source"
         );
         let memory_terms = artifact.actionable_memory_terms_for_target(0x1010);
@@ -2238,11 +3819,19 @@ mod tests {
             default_diagnostics(),
         );
 
-        match apply_best_compiled_precondition(&explorer, &func, Some(&artifact), state, 0x1010) {
+        match apply_best_compiled_precondition(
+            &explorer,
+            &func,
+            Some(&artifact),
+            state,
+            0x1010,
+            false,
+        ) {
             PreconditionApplication::Continue {
                 initial_state,
                 narrowed_state,
                 compiled_precondition,
+                ..
             } => {
                 assert!(compiled_precondition.is_none());
                 assert!(

@@ -46,6 +46,149 @@ pub struct ReplayMemoryOverlay {
     pub name: String,
 }
 
+const REPLAY_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const REPLAY_FINGERPRINT_PRIME: u64 = 0x100000001b3;
+
+fn replay_fingerprint_update(state: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *state ^= u64::from(*byte);
+        *state = state.wrapping_mul(REPLAY_FINGERPRINT_PRIME);
+    }
+}
+
+fn replay_fingerprint_tag(state: &mut u64, tag: u8) {
+    replay_fingerprint_update(state, &[tag]);
+}
+
+fn replay_fingerprint_u64(state: &mut u64, tag: u8, value: u64) {
+    replay_fingerprint_tag(state, tag);
+    replay_fingerprint_update(state, &value.to_le_bytes());
+}
+
+fn replay_fingerprint_bool(state: &mut u64, tag: u8, value: bool) {
+    replay_fingerprint_tag(state, tag);
+    replay_fingerprint_update(state, &[u8::from(value)]);
+}
+
+fn replay_fingerprint_str(state: &mut u64, tag: u8, value: &str) {
+    replay_fingerprint_tag(state, tag);
+    replay_fingerprint_update(state, &(value.len() as u64).to_le_bytes());
+    replay_fingerprint_update(state, value.as_bytes());
+}
+
+fn replay_fingerprint_bytes(state: &mut u64, tag: u8, value: &[u8]) {
+    replay_fingerprint_tag(state, tag);
+    replay_fingerprint_update(state, &(value.len() as u64).to_le_bytes());
+    replay_fingerprint_update(state, value);
+}
+
+fn canonical_replay_register_name(name: &str) -> String {
+    name.trim().to_ascii_uppercase()
+}
+
+fn canonical_replay_label(label: &Option<String>) -> Option<&str> {
+    label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+}
+
+pub fn stable_replay_seed_fingerprint(seed: &ReplaySeed) -> u64 {
+    let mut state = REPLAY_FINGERPRINT_OFFSET_BASIS;
+    replay_fingerprint_tag(&mut state, 0x01);
+    match seed.checkpoint_id {
+        Some(value) => replay_fingerprint_u64(&mut state, 0x02, value),
+        None => replay_fingerprint_tag(&mut state, 0x03),
+    }
+    match seed.entry_pc {
+        Some(value) => replay_fingerprint_u64(&mut state, 0x04, value),
+        None => replay_fingerprint_tag(&mut state, 0x05),
+    }
+
+    let mut registers: Vec<_> = seed
+        .registers
+        .iter()
+        .map(|register| {
+            (
+                canonical_replay_register_name(&register.name),
+                register.value,
+            )
+        })
+        .collect();
+    registers.sort_unstable();
+    replay_fingerprint_u64(&mut state, 0x06, registers.len() as u64);
+    for (name, value) in registers {
+        replay_fingerprint_str(&mut state, 0x07, &name);
+        replay_fingerprint_u64(&mut state, 0x08, value);
+    }
+
+    let mut memory: Vec<_> = seed
+        .memory
+        .iter()
+        .map(|window| {
+            (
+                window.addr,
+                canonical_replay_label(&window.label).map(str::to_string),
+                window.bytes.clone(),
+            )
+        })
+        .collect();
+    memory.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+    replay_fingerprint_u64(&mut state, 0x09, memory.len() as u64);
+    for (addr, label, bytes) in memory {
+        replay_fingerprint_u64(&mut state, 0x0a, addr);
+        match label {
+            Some(label) => replay_fingerprint_str(&mut state, 0x0b, &label),
+            None => replay_fingerprint_tag(&mut state, 0x0c),
+        }
+        replay_fingerprint_bytes(&mut state, 0x0d, &bytes);
+    }
+
+    let mut register_overlays: Vec<_> = seed
+        .register_overlays
+        .iter()
+        .map(|overlay| {
+            (
+                canonical_replay_register_name(&overlay.name),
+                overlay.symbol.trim().to_string(),
+            )
+        })
+        .collect();
+    register_overlays.sort_unstable();
+    replay_fingerprint_u64(&mut state, 0x0e, register_overlays.len() as u64);
+    for (name, symbol) in register_overlays {
+        replay_fingerprint_str(&mut state, 0x0f, &name);
+        replay_fingerprint_str(&mut state, 0x10, &symbol);
+    }
+
+    let mut memory_overlays: Vec<_> = seed
+        .memory_overlays
+        .iter()
+        .map(|overlay| (overlay.addr, overlay.size, overlay.name.trim().to_string()))
+        .collect();
+    memory_overlays.sort_unstable();
+    replay_fingerprint_u64(&mut state, 0x11, memory_overlays.len() as u64);
+    for (addr, size, name) in memory_overlays {
+        replay_fingerprint_u64(&mut state, 0x12, addr);
+        replay_fingerprint_u64(&mut state, 0x13, u64::from(size));
+        replay_fingerprint_str(&mut state, 0x14, &name);
+    }
+
+    let mut tty_fds = seed.tty_fds.clone();
+    tty_fds.sort_unstable();
+    replay_fingerprint_u64(&mut state, 0x15, tty_fds.len() as u64);
+    for fd in tty_fds {
+        replay_fingerprint_u64(&mut state, 0x16, fd as u64);
+    }
+    replay_fingerprint_bool(&mut state, 0x17, seed.skip_sleep_calls);
+    state
+}
+
 pub fn seed_replay_state_for_arch<'ctx>(
     state: &mut SymState<'ctx>,
     prepared: Option<&SsaArtifact>,
@@ -499,5 +642,109 @@ mod tests {
         assert!(symbolic.is_symbolic());
         assert!(state.is_tty_fd(0));
         assert!(state.skip_sleep_calls());
+    }
+
+    #[test]
+    fn stable_replay_seed_fingerprint_is_order_and_case_stable() {
+        let seed_a = ReplaySeed {
+            checkpoint_id: Some(7),
+            entry_pc: Some(0x4141),
+            registers: vec![
+                ReplayRegisterValue {
+                    name: "rax".to_string(),
+                    value: 0x1122,
+                },
+                ReplayRegisterValue {
+                    name: "rdi".to_string(),
+                    value: 0x3344,
+                },
+            ],
+            memory: vec![
+                ReplayMemoryWindow {
+                    addr: 0x5000,
+                    bytes: vec![0x41, 0x42],
+                    label: Some("input".to_string()),
+                },
+                ReplayMemoryWindow {
+                    addr: 0x6000,
+                    bytes: vec![0x51, 0x52],
+                    label: None,
+                },
+            ],
+            register_overlays: vec![ReplayRegisterOverlay {
+                name: "rbx".to_string(),
+                symbol: "replay_rbx".to_string(),
+            }],
+            memory_overlays: vec![ReplayMemoryOverlay {
+                addr: 0x5001,
+                size: 2,
+                name: "user_buf".to_string(),
+            }],
+            tty_fds: vec![1, 0],
+            skip_sleep_calls: true,
+        };
+        let seed_b = ReplaySeed {
+            checkpoint_id: Some(7),
+            entry_pc: Some(0x4141),
+            registers: vec![
+                ReplayRegisterValue {
+                    name: "RDI".to_string(),
+                    value: 0x3344,
+                },
+                ReplayRegisterValue {
+                    name: "RAX".to_string(),
+                    value: 0x1122,
+                },
+            ],
+            memory: vec![
+                ReplayMemoryWindow {
+                    addr: 0x6000,
+                    bytes: vec![0x51, 0x52],
+                    label: Some(String::new()),
+                },
+                ReplayMemoryWindow {
+                    addr: 0x5000,
+                    bytes: vec![0x41, 0x42],
+                    label: Some(" input ".to_string()),
+                },
+            ],
+            register_overlays: vec![ReplayRegisterOverlay {
+                name: "RBX".to_string(),
+                symbol: "replay_rbx".to_string(),
+            }],
+            memory_overlays: vec![ReplayMemoryOverlay {
+                addr: 0x5001,
+                size: 2,
+                name: "user_buf".to_string(),
+            }],
+            tty_fds: vec![0, 1],
+            skip_sleep_calls: true,
+        };
+
+        assert_eq!(
+            stable_replay_seed_fingerprint(&seed_a),
+            stable_replay_seed_fingerprint(&seed_b)
+        );
+    }
+
+    #[test]
+    fn stable_replay_seed_fingerprint_changes_with_seed_content() {
+        let base = ReplaySeed {
+            entry_pc: Some(0x4141),
+            registers: vec![ReplayRegisterValue {
+                name: "rax".to_string(),
+                value: 0x1122,
+            }],
+            ..ReplaySeed::default()
+        };
+        let different = ReplaySeed {
+            entry_pc: Some(0x4142),
+            ..base.clone()
+        };
+
+        assert_ne!(
+            stable_replay_seed_fingerprint(&base),
+            stable_replay_seed_fingerprint(&different)
+        );
     }
 }

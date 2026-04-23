@@ -1046,6 +1046,15 @@ impl<'a> FoldingContext<'a> {
         self.prepared_compare_provenance_expr(compare)
     }
 
+    #[cfg(test)]
+    pub(super) fn prepared_predicate_candidate_for_branch_block_for_test(
+        &self,
+        block_addr: u64,
+        var: &SSAVar,
+    ) -> Option<CExpr> {
+        self.prepared_predicate_candidate_for_branch_block(block_addr, var)
+    }
+
     fn prepared_compare_provenance_expr(&self, prov: &CompareProvenance) -> Option<CExpr> {
         let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
         let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;

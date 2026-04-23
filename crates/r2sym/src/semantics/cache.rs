@@ -15,7 +15,7 @@ pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SemanticSeedMode {
+pub enum SemanticSeedMode {
     Static,
     Replay,
 }
@@ -34,13 +34,16 @@ pub(crate) struct SemanticCacheKey {
     pub arch_hash: u64,
     pub summary_profile: SummaryProfile,
     pub seed_mode: SemanticSeedMode,
+    pub replay_seed_fingerprint: u64,
     pub scope_kind: SemanticCacheScopeKind,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SemanticCompilationResult {
+pub struct SemanticCompilationResult {
     pub artifact: Arc<SemanticArtifact>,
     pub cache_hit: bool,
+    pub seed_mode: SemanticSeedMode,
+    pub replay_seed_fingerprint: u64,
 }
 
 fn hash_debug_value<T: std::fmt::Debug>(value: &T) -> u64 {
@@ -143,6 +146,7 @@ pub(crate) fn semantic_cache_key(
     arch: Option<&ArchSpec>,
     summary_profile: SummaryProfile,
     seed_mode: SemanticSeedMode,
+    replay_seed_fingerprint: u64,
 ) -> SemanticCacheKey {
     SemanticCacheKey {
         schema_version: SEMANTIC_ARTIFACT_SCHEMA_VERSION,
@@ -155,23 +159,27 @@ pub(crate) fn semantic_cache_key(
         arch_hash: arch_hash(arch),
         summary_profile,
         seed_mode,
+        replay_seed_fingerprint,
         scope_kind: SemanticCacheScopeKind::Exact,
     }
 }
 
 pub(crate) fn coarse_large_slice_cache_key(
     root_addr: u64,
+    scope: &PreparedFunctionScope,
     arch: Option<&ArchSpec>,
     summary_profile: SummaryProfile,
     seed_mode: SemanticSeedMode,
+    replay_seed_fingerprint: u64,
 ) -> SemanticCacheKey {
     SemanticCacheKey {
         schema_version: SEMANTIC_ARTIFACT_SCHEMA_VERSION,
         root_addr,
-        scope_hash: 0,
+        scope_hash: stable_scope_hash(Some(scope)),
         arch_hash: arch_hash(arch),
         summary_profile,
         seed_mode,
+        replay_seed_fingerprint,
         scope_kind: SemanticCacheScopeKind::CoarseLargeSlice,
     }
 }
@@ -255,15 +263,27 @@ mod display_name_tests {
             Some(&test_arch()),
             crate::sim::SummaryProfile::Default,
             SemanticSeedMode::Static,
+            0,
         );
         let coarse_key = coarse_large_slice_cache_key(
             func.entry,
+            &PreparedFunctionScope::new(
+                0x401000,
+                vec![ScopedPreparedFunction {
+                    id: InterprocFunctionId(0x401000),
+                    name: Some("sym.main".to_string()),
+                    prepared: func.clone(),
+                }],
+            )
+            .expect("scope"),
             Some(&test_arch()),
             crate::sim::SummaryProfile::Default,
             SemanticSeedMode::Static,
+            0,
         );
         assert_eq!(exact_key.schema_version, SEMANTIC_ARTIFACT_SCHEMA_VERSION);
         assert_eq!(coarse_key.schema_version, SEMANTIC_ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(exact_key.replay_seed_fingerprint, 0);
         assert!(matches!(
             exact_key.scope_kind,
             SemanticCacheScopeKind::Exact
@@ -272,6 +292,51 @@ mod display_name_tests {
             coarse_key.scope_kind,
             SemanticCacheScopeKind::CoarseLargeSlice
         ));
+    }
+
+    #[test]
+    fn semantic_cache_keys_partition_replay_seed_identity() {
+        let func = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x401000,
+                size: 1,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            Some(&test_arch()),
+        )
+        .expect("ssa");
+        let static_key = semantic_cache_key(
+            &func,
+            None,
+            Some(&test_arch()),
+            crate::sim::SummaryProfile::Default,
+            SemanticSeedMode::Static,
+            0,
+        );
+        let replay_key_a = semantic_cache_key(
+            &func,
+            None,
+            Some(&test_arch()),
+            crate::sim::SummaryProfile::Default,
+            SemanticSeedMode::Replay,
+            0x11,
+        );
+        let replay_key_b = semantic_cache_key(
+            &func,
+            None,
+            Some(&test_arch()),
+            crate::sim::SummaryProfile::Default,
+            SemanticSeedMode::Replay,
+            0x22,
+        );
+
+        assert_eq!(static_key.seed_mode, SemanticSeedMode::Static);
+        assert_eq!(static_key.replay_seed_fingerprint, 0);
+        assert_ne!(replay_key_a, replay_key_b);
     }
 
     fn simple_function(entry: u64) -> SsaArtifact {

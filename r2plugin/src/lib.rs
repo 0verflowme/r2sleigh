@@ -26,6 +26,8 @@ use r2sleigh_export::{
 };
 use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec, userop_map_for_arch};
 use std::ffi::{CStr, CString};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::raw::c_char;
 use std::path::Path;
 use std::ptr;
@@ -3349,6 +3351,11 @@ struct InferredTypeWritebackJson {
     struct_decls: Vec<StructDeclCandidateJson>,
     global_type_links: Vec<GlobalTypeLinkCandidateJson>,
     interproc: InterprocSummaryJson,
+    plans: r2types::AnalysisPlans,
+    #[serde(skip_serializing_if = "r2ssa::AssumptionSet::is_empty")]
+    assumptions: r2ssa::AssumptionSet,
+    #[serde(skip_serializing_if = "r2types::AssumptionUsageReport::is_empty")]
+    assumption_usage: r2types::AssumptionUsageReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantics: Option<r2sym::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3381,8 +3388,15 @@ struct FunctionFactsReportJson {
     cfg_risk: CfgRiskSummaryJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
+    plans: r2types::AnalysisPlans,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_route: Option<SemanticRoutePlanJson>,
+    #[serde(skip_serializing_if = "r2ssa::AssumptionSet::is_empty")]
+    assumptions: r2ssa::AssumptionSet,
+    #[serde(skip_serializing_if = "r2types::AssumptionUsageReport::is_empty")]
+    assumption_usage: r2types::AssumptionUsageReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_diagnostics: Option<r2ssa::InterprocSummaryDiagnostics>,
     type_writeback: InferredTypeWritebackJson,
 }
 
@@ -3395,8 +3409,15 @@ struct FunctionPlanReportJson {
     semantic: Option<analysis::sym::CompiledSemanticInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
+    plans: r2types::AnalysisPlans,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_route: Option<SemanticRoutePlanJson>,
+    #[serde(skip_serializing_if = "r2ssa::AssumptionSet::is_empty")]
+    assumptions: r2ssa::AssumptionSet,
+    #[serde(skip_serializing_if = "r2types::AssumptionUsageReport::is_empty")]
+    assumption_usage: r2types::AssumptionUsageReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_diagnostics: Option<r2ssa::InterprocSummaryDiagnostics>,
     prefer_bounded_type_plan: bool,
 }
 
@@ -3462,6 +3483,7 @@ fn struct_fields_json(fields: &[r2types::StructFieldCandidate]) -> Vec<StructFie
 fn writeback_plan_json(
     plan: r2types::TypeWritebackPlan,
     interproc: InterprocSummaryJson,
+    function_facts: &r2types::FunctionFacts,
     semantics: Option<r2sym::SemanticArtifact>,
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
 ) -> InferredTypeWritebackJson {
@@ -3531,6 +3553,9 @@ fn writeback_plan_json(
             })
             .collect(),
         interproc,
+        plans: function_facts.plans.clone(),
+        assumptions: function_facts.assumptions.clone(),
+        assumption_usage: function_facts.assumption_usage.clone(),
         semantics,
         compiled_semantics,
         diagnostics: TypeWritebackDiagnosticsJson {
@@ -3541,21 +3566,104 @@ fn writeback_plan_json(
     }
 }
 
+fn parse_nonempty_scope_json(payload: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .filter(|value| {
+            !value.is_null()
+                && value
+                    .as_object()
+                    .map(|object| !object.is_empty())
+                    .unwrap_or(true)
+        })
+}
+
+fn symbolic_scope_view_json(
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<serde_json::Value> {
+    let scope = symbolic_scope?;
+    let payloads = scope
+        .helper_functions()
+        .filter_map(|function| {
+            function.name.as_ref().map(|name| {
+                serde_json::json!({
+                    "function_addr": function.id.0,
+                    "function_name": name,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let seeds = scope
+        .helper_functions()
+        .filter_map(|function| {
+            function.name.as_ref().map(|name| {
+                serde_json::json!({
+                    "id": function.id.0,
+                    "name": name,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if seeds.is_empty() && payloads.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "phase": "symbolic_scope",
+        "payloads": payloads,
+        "seeds": seeds,
+    }))
+}
+
+fn merged_interproc_scope_json(
+    scope_json: &str,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+) -> Option<serde_json::Value> {
+    let Some(symbolic_scope_json) = symbolic_scope_view_json(symbolic_scope) else {
+        return parse_nonempty_scope_json(scope_json);
+    };
+    let Some(mut merged) = parse_nonempty_scope_json(scope_json) else {
+        return Some(symbolic_scope_json);
+    };
+    let (Some(merged_obj), Some(symbolic_obj)) =
+        (merged.as_object_mut(), symbolic_scope_json.as_object())
+    else {
+        return Some(merged);
+    };
+
+    if !merged_obj.contains_key("phase")
+        && let Some(phase) = symbolic_obj.get("phase")
+    {
+        merged_obj.insert("phase".to_string(), phase.clone());
+    }
+    for key in ["payloads", "seeds"] {
+        let Some(serde_json::Value::Array(symbolic_items)) = symbolic_obj.get(key) else {
+            continue;
+        };
+        let entry = merged_obj
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let serde_json::Value::Array(items) = entry {
+            items.extend(symbolic_items.iter().cloned());
+        }
+    }
+
+    Some(merged)
+}
+
 fn type_writeback_payload_from_artifact(
     artifact: types::FunctionAnalysisArtifact,
     interproc: InterprocInferenceInput<'_>,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> InferredTypeWritebackJson {
     let semantics = artifact.function_facts.semantics.clone();
     let compiled_semantics = semantics
         .as_ref()
         .map(analysis::sym::compiled_semantic_info);
     let ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
-    let scope = serde_json::from_str::<serde_json::Value>(interproc.scope_json)
-        .ok()
-        .filter(|v| !v.is_null() && v.as_object().map(|obj| !obj.is_empty()).unwrap_or(true));
+    let scope = merged_interproc_scope_json(interproc.scope_json, symbolic_scope);
     let current_summary = artifact
-        .interproc_summary_set
-        .as_ref()
+        .function_facts
+        .interproc_summary_set()
         .and_then(|summary_set| {
             summary_set
                 .root
@@ -3576,6 +3684,7 @@ fn type_writeback_payload_from_artifact(
             summary_json: current_summary_json,
             scope,
         },
+        &artifact.function_facts,
         semantics,
         compiled_semantics,
     )
@@ -3587,6 +3696,8 @@ fn semantic_type_fallback_payload(
     ptr_bits: u32,
     interproc: InterprocInferenceInput<'_>,
     compiled: &r2sym::SemanticArtifact,
+    function_facts: &r2types::FunctionFacts,
+    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> InferredTypeWritebackJson {
     let compiled_info = analysis::sym::compiled_semantic_info(compiled);
     let plan =
@@ -3639,12 +3750,11 @@ fn semantic_type_fallback_payload(
             converged: interproc.converged,
             summary: None,
             summary_json: None,
-            scope: serde_json::from_str::<serde_json::Value>(interproc.scope_json)
-                .ok()
-                .filter(|v| {
-                    !v.is_null() && v.as_object().map(|obj| !obj.is_empty()).unwrap_or(true)
-                }),
+            scope: merged_interproc_scope_json(interproc.scope_json, symbolic_scope),
         },
+        plans: function_facts.plans.clone(),
+        assumptions: function_facts.assumptions.clone(),
+        assumption_usage: function_facts.assumption_usage.clone(),
         semantics: Some(compiled.clone()),
         compiled_semantics: Some(compiled_info),
         diagnostics: TypeWritebackDiagnosticsJson {
@@ -3652,6 +3762,17 @@ fn semantic_type_fallback_payload(
             ..TypeWritebackDiagnosticsJson::default()
         },
     }
+}
+
+fn semantic_fallback_function_facts(
+    compiled: &r2sym::SemanticArtifact,
+    assumptions: &r2ssa::AssumptionSet,
+) -> r2types::FunctionFacts {
+    r2types::FunctionFacts::new(
+        r2types::FunctionTypeFacts::default(),
+        Some(compiled.clone()),
+    )
+    .with_assumptions(assumptions.clone())
 }
 
 #[cfg(test)]
@@ -5484,6 +5605,144 @@ fn direct_call_targets_from_analysis(analysis: &types::FunctionAnalysis) -> Vec<
     targets.into_iter().collect()
 }
 
+fn runtime_registration_targets_from_analysis(
+    analysis: &types::FunctionAnalysis,
+    arch: Option<&ArchSpec>,
+    registration_call_targets: &[u64],
+) -> Vec<u64> {
+    fn debug_runtime_targets_enabled() -> bool {
+        std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_TARGETS").is_some()
+    }
+
+    fn debug_runtime_targets_log(message: &str) {
+        if !debug_runtime_targets_enabled() {
+            return;
+        }
+        let path = std::env::var("R2SLEIGH_DEBUG_RUNTIME_TARGETS_LOG")
+            .unwrap_or_else(|_| "/tmp/r2sleigh_runtime_targets.log".to_string());
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+
+    let lower_arch = arch.map(|arch| arch.name.to_ascii_lowercase());
+    let supports_windows_x64 = arch.is_some_and(|arch| {
+        lower_arch.as_deref().is_some_and(|name| {
+            (name.contains("x86") || matches!(name, "x64" | "amd64"))
+                && (arch.addr_size == 8 || name.contains("64"))
+        })
+    });
+    if !supports_windows_x64 || registration_call_targets.is_empty() {
+        debug_runtime_targets_log(&format!(
+            "skip supports_windows_x64={} arch={:?} registrations={}",
+            supports_windows_x64,
+            lower_arch.as_deref(),
+            registration_call_targets.len()
+        ));
+        return Vec::new();
+    }
+
+    let registrations = registration_call_targets
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let observations =
+        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
+    let mut targets = std::collections::BTreeSet::new();
+    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
+        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
+            debug_runtime_targets_log(&format!("call_id={call_id:?} unresolved_target"));
+            continue;
+        };
+        if !registrations.contains(&target) {
+            debug_runtime_targets_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} not_registration"
+            ));
+            continue;
+        }
+        let Some(args) = observations.get(call_id) else {
+            debug_runtime_targets_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} missing_args"
+            ));
+            continue;
+        };
+        let Some(r2ssa::CallArgObservation::Const(handler)) = args.get(1) else {
+            debug_runtime_targets_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} handler_arg={:?}",
+                args.get(1)
+            ));
+            continue;
+        };
+        if *handler >= 0x1000 {
+            debug_runtime_targets_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} handler=0x{handler:x}"
+            ));
+            targets.insert(*handler);
+        }
+    }
+    targets.into_iter().collect()
+}
+
+#[derive(Serialize)]
+struct RuntimeMaterializedSourceJson {
+    addr: u64,
+    size: u64,
+}
+
+fn runtime_materialized_sources_from_analysis(
+    analysis: &types::FunctionAnalysis,
+    arch: Option<&ArchSpec>,
+    copy_call_targets: &[u64],
+) -> Vec<RuntimeMaterializedSourceJson> {
+    let lower_arch = arch.map(|arch| arch.name.to_ascii_lowercase());
+    let supports_windows_x64 = arch.is_some_and(|arch| {
+        lower_arch.as_deref().is_some_and(|name| {
+            (name.contains("x86") || matches!(name, "x64" | "amd64"))
+                && (arch.addr_size == 8 || name.contains("64"))
+        })
+    });
+    if !supports_windows_x64 || copy_call_targets.is_empty() {
+        return Vec::new();
+    }
+
+    let copy_targets = copy_call_targets
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let observations =
+        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
+    let mut sources = std::collections::BTreeMap::<u64, u64>::new();
+    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
+        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
+            continue;
+        };
+        if !copy_targets.contains(&target) {
+            continue;
+        }
+        let Some(args) = observations.get(call_id) else {
+            continue;
+        };
+        let (
+            Some(r2ssa::CallArgObservation::Const(source)),
+            Some(r2ssa::CallArgObservation::Const(size)),
+        ) = (args.get(1), args.get(2))
+        else {
+            continue;
+        };
+        if *source >= 0x1000 && *size > 0 {
+            sources
+                .entry(*source)
+                .and_modify(|existing| *existing = (*existing).max(*size))
+                .or_insert(*size);
+        }
+    }
+
+    sources
+        .into_iter()
+        .map(|(addr, size)| RuntimeMaterializedSourceJson { addr, size })
+        .collect()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_get_direct_call_targets_json(
     ctx: *const R2ILContext,
@@ -5500,6 +5759,65 @@ pub extern "C" fn r2sleigh_get_direct_call_targets_json(
         return ptr::null_mut();
     };
     let payload = direct_call_targets_from_analysis(&analysis);
+    match serde_json::to_string(&payload) {
+        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_get_symbolic_scope_targets_json(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    registration_call_targets_json: *const c_char,
+) -> *mut c_char {
+    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(analysis) = types::build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
+    let registration_call_targets: Vec<u64> = serde_json::from_str(&helpers::cstr_or_default(
+        registration_call_targets_json,
+        "[]",
+    ))
+    .unwrap_or_default();
+    let payload = runtime_registration_targets_from_analysis(
+        &analysis,
+        input.ctx.arch,
+        &registration_call_targets,
+    );
+    match serde_json::to_string(&payload) {
+        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_get_runtime_materialized_sources_json(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    copy_call_targets_json: *const c_char,
+) -> *mut c_char {
+    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(analysis) = types::build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
+    let copy_call_targets: Vec<u64> =
+        serde_json::from_str(&helpers::cstr_or_default(copy_call_targets_json, "[]"))
+            .unwrap_or_default();
+    let payload =
+        runtime_materialized_sources_from_analysis(&analysis, input.ctx.arch, &copy_call_targets);
     match serde_json::to_string(&payload) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
@@ -5544,18 +5862,22 @@ struct SemanticWorkerLinearizationInput {
     scope_num_functions: usize,
 }
 
-fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
-    let Some(function_input) = types::build_function_input(
-        input.ctx,
-        input.blocks,
-        input.num_blocks,
-        input.fcn_addr,
-        input.fcn_name,
-    ) else {
-        return ptr::null_mut();
-    };
-    let external_context = cstr_or_default(input.external_context_json, "{}");
-    let symbolic_scope = if input.scope_functions.is_null() || input.scope_num_functions == 0 {
+struct FunctionAnalysisSharedBundle {
+    function_name: String,
+    function_addr: u64,
+    cfg_risk: CfgRiskSummaryJson,
+    semantic_artifact: Option<r2sym::SemanticArtifact>,
+    function_facts: r2types::FunctionFacts,
+    semantic_route: Option<SemanticRoutePlanJson>,
+    type_writeback: InferredTypeWritebackJson,
+    prefer_bounded_type_plan: bool,
+}
+
+fn build_inference_symbolic_scope(
+    input: &TypeWritebackInferenceInput<'_>,
+    function_input: &types::FunctionInput<'_>,
+) -> Option<r2sym::PreparedFunctionScope> {
+    if input.scope_functions.is_null() || input.scope_num_functions == 0 {
         None
     } else {
         unsafe {
@@ -5566,185 +5888,181 @@ fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mu
                 function_input.function_addr,
             )
         }
-    };
+    }
+}
+
+fn build_function_analysis_shared_bundle(
+    input: TypeWritebackInferenceInput<'_>,
+) -> Option<FunctionAnalysisSharedBundle> {
+    let function_input = types::build_function_input(
+        input.ctx,
+        input.blocks,
+        input.num_blocks,
+        input.fcn_addr,
+        input.fcn_name,
+    )?;
+    let external_context = cstr_or_default(input.external_context_json, "{}");
+    let symbolic_scope = build_inference_symbolic_scope(&input, &function_input);
     let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
-    let payload = if let Some(cached_artifact) =
-        types::get_cached_function_analysis_artifact_with_scope(
-            &function_input,
-            &external_context,
-            symbolic_scope.as_ref(),
-        ) {
-        if let Some(compiled) = cached_artifact.function_facts.semantics.as_ref()
-            && r2types::semantic_artifact_prefers_bounded_type_plan(compiled)
-        {
-            semantic_type_fallback_payload(
-                &function_input.function_name,
-                &arch_name,
-                ptr_bits,
-                input.interproc,
-                compiled,
-            )
-        } else {
-            type_writeback_payload_from_artifact(cached_artifact, input.interproc)
-        }
-    } else {
-        let Some(analysis) = types::build_function_analysis(&function_input) else {
-            return ptr::null_mut();
-        };
-        let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
-            &z3::Context::thread_local(),
-            &analysis.ssa_func,
-            symbolic_scope.as_ref(),
-            function_input.ctx.arch,
-        );
-        if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
-            semantic_type_fallback_payload(
-                &function_input.function_name,
-                &arch_name,
-                ptr_bits,
-                input.interproc,
-                &semantic_artifact,
-            )
-        } else {
-            let interproc_summary_set = types::build_interproc_summary_set(
+    let parsed_context = r2types::parse_external_context_json(&external_context, ptr_bits);
+    let (cfg_risk, semantic_artifact, function_facts, type_writeback, prefer_bounded_type_plan) =
+        if let Some(cached_artifact) =
+            types::get_cached_function_analysis_artifact_with_scope_and_interproc(
                 &function_input,
-                &analysis,
+                &external_context,
                 input.interproc.scope_json,
                 input.interproc.max_iters,
-            );
-            let Some(artifact) =
-                types::build_function_analysis_artifact_from_analysis_with_semantic_artifact(
-                    &function_input,
-                    analysis,
-                    &external_context,
-                    Some(interproc_summary_set),
-                    semantic_artifact,
+                symbolic_scope.as_ref(),
+            )
+        {
+            let cfg_risk =
+                cfg_risk_summary_json(cached_artifact.ssa_func.function().cfg_risk_summary());
+            let function_facts = cached_artifact.function_facts.clone();
+            let semantic_artifact = function_facts.semantics.clone();
+            let prefer_bounded_type_plan = semantic_artifact
+                .as_ref()
+                .is_some_and(r2types::semantic_artifact_prefers_bounded_type_plan);
+            if prefer_bounded_type_plan {
+                let compiled = semantic_artifact
+                    .as_ref()
+                    .expect("bounded semantic type fallback requires semantic artifact");
+                (
+                    cfg_risk,
+                    semantic_artifact.clone(),
+                    function_facts.clone(),
+                    semantic_type_fallback_payload(
+                        &function_input.function_name,
+                        &arch_name,
+                        ptr_bits,
+                        input.interproc,
+                        compiled,
+                        &function_facts,
+                        symbolic_scope.as_ref(),
+                    ),
+                    true,
                 )
-            else {
-                return ptr::null_mut();
-            };
-            type_writeback_payload_from_artifact(artifact, input.interproc)
-        }
+            } else {
+                (
+                    cfg_risk,
+                    semantic_artifact,
+                    function_facts,
+                    type_writeback_payload_from_artifact(
+                        cached_artifact,
+                        input.interproc,
+                        symbolic_scope.as_ref(),
+                    ),
+                    false,
+                )
+            }
+        } else {
+            let analysis = types::build_function_analysis(&function_input)?;
+            let cfg_risk = cfg_risk_summary_json(analysis.ssa_func.function().cfg_risk_summary());
+            let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+                &z3::Context::thread_local(),
+                &analysis.ssa_func,
+                symbolic_scope.as_ref(),
+                function_input.ctx.arch,
+            );
+            if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
+                let function_facts = semantic_fallback_function_facts(
+                    &semantic_artifact,
+                    &parsed_context.assumptions,
+                );
+                (
+                    cfg_risk,
+                    Some(semantic_artifact.clone()),
+                    function_facts.clone(),
+                    semantic_type_fallback_payload(
+                        &function_input.function_name,
+                        &arch_name,
+                        ptr_bits,
+                        input.interproc,
+                        &semantic_artifact,
+                        &function_facts,
+                        symbolic_scope.as_ref(),
+                    ),
+                    true,
+                )
+            } else {
+                let interproc_summary_set = types::build_interproc_summary_set_with_scope(
+                    &function_input,
+                    &analysis,
+                    input.interproc.scope_json,
+                    input.interproc.max_iters,
+                    symbolic_scope.as_ref(),
+                );
+                let artifact =
+                    types::build_function_analysis_artifact_from_analysis_with_semantic_artifact(
+                        &function_input,
+                        analysis,
+                        &external_context,
+                        Some(interproc_summary_set),
+                        semantic_artifact,
+                    )?;
+                let function_facts = artifact.function_facts.clone();
+                let semantic_artifact = function_facts.semantics.clone();
+                (
+                    cfg_risk,
+                    semantic_artifact,
+                    function_facts,
+                    type_writeback_payload_from_artifact(
+                        artifact,
+                        input.interproc,
+                        symbolic_scope.as_ref(),
+                    ),
+                    false,
+                )
+            }
+        };
+    let semantic_route = r2dec::detached_semantic_route_plan(
+        &function_input.function_name,
+        function_input.blocks.as_slice(),
+        &function_facts,
+    )
+    .map(semantic_route_plan_json);
+
+    Some(FunctionAnalysisSharedBundle {
+        function_name: function_input.function_name.clone(),
+        function_addr: function_input.function_addr,
+        cfg_risk,
+        semantic_artifact,
+        function_facts,
+        semantic_route,
+        type_writeback,
+        prefer_bounded_type_plan,
+    })
+}
+
+fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
+    let Some(bundle) = build_function_analysis_shared_bundle(input) else {
+        return ptr::null_mut();
     };
 
-    match serde_json::to_string(&payload) {
+    match serde_json::to_string(&bundle.type_writeback) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
     }
 }
 
 fn function_facts_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
-    let Some(function_input) = types::build_function_input(
-        input.ctx,
-        input.blocks,
-        input.num_blocks,
-        input.fcn_addr,
-        input.fcn_name,
-    ) else {
+    let Some(bundle) = build_function_analysis_shared_bundle(input) else {
         return ptr::null_mut();
     };
-    let external_context = cstr_or_default(input.external_context_json, "{}");
-    let symbolic_scope = if input.scope_functions.is_null() || input.scope_num_functions == 0 {
-        None
-    } else {
-        unsafe {
-            analysis::sym::build_symbolic_scope_from_ffi(
-                input.scope_functions,
-                input.scope_num_functions,
-                function_input.ctx.arch,
-                function_input.function_addr,
-            )
-        }
-    };
-    let Some(function_analysis) = types::build_function_analysis(&function_input) else {
-        return ptr::null_mut();
-    };
-    let cfg_risk = cfg_risk_summary_json(function_analysis.ssa_func.function().cfg_risk_summary());
-    let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
-    let cached_artifact = types::get_cached_function_analysis_artifact_with_scope(
-        &function_input,
-        &external_context,
-        symbolic_scope.as_ref(),
-    );
-
-    let (type_writeback, semantic_artifact) = if let Some(cached_artifact) = cached_artifact {
-        let semantics = cached_artifact.function_facts.semantics.clone();
-        let payload = if let Some(compiled) = semantics.as_ref()
-            && r2types::semantic_artifact_prefers_bounded_type_plan(compiled)
-        {
-            semantic_type_fallback_payload(
-                &function_input.function_name,
-                &arch_name,
-                ptr_bits,
-                input.interproc,
-                compiled,
-            )
-        } else {
-            type_writeback_payload_from_artifact(cached_artifact.clone(), input.interproc)
-        };
-        (payload, semantics)
-    } else {
-        let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
-            &z3::Context::thread_local(),
-            &function_analysis.ssa_func,
-            symbolic_scope.as_ref(),
-            function_input.ctx.arch,
-        );
-        if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
-            let payload = semantic_type_fallback_payload(
-                &function_input.function_name,
-                &arch_name,
-                ptr_bits,
-                input.interproc,
-                &semantic_artifact,
-            );
-            (payload, Some(semantic_artifact))
-        } else {
-            let interproc_summary_set = types::build_interproc_summary_set(
-                &function_input,
-                &function_analysis,
-                input.interproc.scope_json,
-                input.interproc.max_iters,
-            );
-            let Some(artifact) =
-                types::build_function_analysis_artifact_from_analysis_with_semantic_artifact(
-                    &function_input,
-                    function_analysis,
-                    &external_context,
-                    Some(interproc_summary_set),
-                    semantic_artifact,
-                )
-            else {
-                return ptr::null_mut();
-            };
-            let semantics = artifact.function_facts.semantics.clone();
-            (
-                type_writeback_payload_from_artifact(artifact, input.interproc),
-                semantics,
-            )
-        }
-    };
-
-    let semantic_route = semantic_artifact
-        .as_ref()
-        .and_then(|artifact| {
-            r2dec::detached_semantic_route_plan(
-                &function_input.function_name,
-                function_input.blocks.as_slice(),
-                Some(artifact),
-            )
-        })
-        .map(semantic_route_plan_json);
 
     let payload = FunctionFactsReportJson {
-        function_name: function_input.function_name.clone(),
-        function_addr: function_input.function_addr,
-        cfg_risk,
-        semantic_build_plan: semantic_artifact
+        function_name: bundle.function_name.clone(),
+        function_addr: bundle.function_addr,
+        cfg_risk: bundle.cfg_risk,
+        semantic_build_plan: bundle
+            .semantic_artifact
             .as_ref()
             .map(r2sym::SemanticArtifact::build_plan),
-        semantic_route,
-        type_writeback,
+        plans: bundle.function_facts.plans.clone(),
+        semantic_route: bundle.semantic_route,
+        assumptions: bundle.function_facts.assumptions.clone(),
+        assumption_usage: bundle.function_facts.assumption_usage.clone(),
+        summary_diagnostics: bundle.function_facts.summary_view.diagnostics().cloned(),
+        type_writeback: bundle.type_writeback,
     };
 
     match serde_json::to_string(&payload) {
@@ -5754,73 +6072,28 @@ fn function_facts_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_ch
 }
 
 fn function_plan_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
-    let Some(function_input) = types::build_function_input(
-        input.ctx,
-        input.blocks,
-        input.num_blocks,
-        input.fcn_addr,
-        input.fcn_name,
-    ) else {
+    let Some(bundle) = build_function_analysis_shared_bundle(input) else {
         return ptr::null_mut();
     };
-    let external_context = cstr_or_default(input.external_context_json, "{}");
-    let symbolic_scope = if input.scope_functions.is_null() || input.scope_num_functions == 0 {
-        None
-    } else {
-        unsafe {
-            analysis::sym::build_symbolic_scope_from_ffi(
-                input.scope_functions,
-                input.scope_num_functions,
-                function_input.ctx.arch,
-                function_input.function_addr,
-            )
-        }
-    };
-    let Some(function_analysis) = types::build_function_analysis(&function_input) else {
-        return ptr::null_mut();
-    };
-    let cfg_risk = cfg_risk_summary_json(function_analysis.ssa_func.function().cfg_risk_summary());
-    let semantic_artifact = types::get_cached_function_analysis_artifact_with_scope(
-        &function_input,
-        &external_context,
-        symbolic_scope.as_ref(),
-    )
-    .and_then(|artifact| artifact.function_facts.semantics)
-    .or_else(|| {
-        Some(r2sym::compile_semantic_artifact_default_with_scope(
-            &z3::Context::thread_local(),
-            &function_analysis.ssa_func,
-            symbolic_scope.as_ref(),
-            function_input.ctx.arch,
-        ))
-    });
-
-    let semantic_route = semantic_artifact
-        .as_ref()
-        .and_then(|artifact| {
-            r2dec::detached_semantic_route_plan(
-                &function_input.function_name,
-                function_input.blocks.as_slice(),
-                Some(artifact),
-            )
-        })
-        .map(semantic_route_plan_json);
-    let prefer_bounded_type_plan = semantic_artifact
-        .as_ref()
-        .is_some_and(r2types::semantic_artifact_prefers_bounded_type_plan);
 
     let payload = FunctionPlanReportJson {
-        function_name: function_input.function_name.clone(),
-        function_addr: function_input.function_addr,
-        cfg_risk,
-        semantic: semantic_artifact
+        function_name: bundle.function_name,
+        function_addr: bundle.function_addr,
+        cfg_risk: bundle.cfg_risk,
+        semantic: bundle
+            .semantic_artifact
             .as_ref()
             .map(analysis::sym::compiled_semantic_info),
-        semantic_build_plan: semantic_artifact
+        semantic_build_plan: bundle
+            .semantic_artifact
             .as_ref()
             .map(r2sym::SemanticArtifact::build_plan),
-        semantic_route,
-        prefer_bounded_type_plan,
+        plans: bundle.function_facts.plans.clone(),
+        semantic_route: bundle.semantic_route,
+        assumptions: bundle.function_facts.assumptions.clone(),
+        assumption_usage: bundle.function_facts.assumption_usage.clone(),
+        summary_diagnostics: bundle.function_facts.summary_view.diagnostics().cloned(),
+        prefer_bounded_type_plan: bundle.prefer_bounded_type_plan,
     };
 
     match serde_json::to_string(&payload) {
@@ -5883,10 +6156,14 @@ fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -
     let Some(semantic_artifact) = semantic_artifact else {
         return ptr::null_mut();
     };
+    let function_facts = r2types::FunctionFacts::new(
+        r2types::FunctionTypeFacts::default(),
+        Some(semantic_artifact.clone()),
+    );
     let Some(route) = r2dec::detached_semantic_route_plan(
         &function_input.function_name,
         function_input.blocks.as_slice(),
-        Some(&semantic_artifact),
+        &function_facts,
     ) else {
         return ptr::null_mut();
     };
@@ -6067,6 +6344,64 @@ pub extern "C" fn r2sleigh_function_plan_json_scope_ex(
             scope_json: &scope,
         },
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_function_analysis_artifact_cache_key(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    external_context_json: *const c_char,
+    interproc_max_iters: usize,
+    interproc_scope_json: *const c_char,
+) -> u64 {
+    let Some(function_input) =
+        types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return 0;
+    };
+    let external_context = cstr_or_default(external_context_json, "{}");
+    let interproc_scope = cstr_or_default(interproc_scope_json, "{}");
+    types::function_analysis_artifact_cache_identity_hash(
+        &function_input,
+        &external_context,
+        &interproc_scope,
+        interproc_max_iters.max(1),
+        None,
+    )
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_function_interproc_summary_json_ex(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    external_context_json: *const c_char,
+    interproc_max_iters: usize,
+    interproc_scope_json: *const c_char,
+) -> *mut c_char {
+    let Some(function_input) =
+        types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return ptr::null_mut();
+    };
+    let external_context = cstr_or_default(external_context_json, "{}");
+    let interproc_scope = cstr_or_default(interproc_scope_json, "{}");
+    let Some(summary_json) = types::function_root_interproc_summary_json_with_scope(
+        &function_input,
+        &external_context,
+        &interproc_scope,
+        interproc_max_iters.max(1),
+        None,
+    ) else {
+        return ptr::null_mut();
+    };
+    CString::new(summary_json).map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
 #[unsafe(no_mangle)]
@@ -7776,6 +8111,54 @@ mod tests {
     }
 
     #[test]
+    fn semantic_type_fallback_payload_preserves_assumptions() {
+        let compiled = test_large_cfg_semantic_artifact();
+        assert!(
+            r2types::semantic_artifact_prefers_bounded_type_plan(&compiled),
+            "expected large-CFG worker artifact to use bounded semantic type fallback"
+        );
+
+        let assumptions = r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+            id: Some("seed-rdi".to_string()),
+            scope: r2ssa::AssumptionScope::Function,
+            provenance: r2ssa::AssumptionProvenance::User,
+            subject: r2ssa::AssumptionSubject::Register {
+                name: "rdi".to_string(),
+            },
+            value: r2ssa::AssumptionValue::Constant { value: 0xdead },
+        }]);
+        let function_facts = semantic_fallback_function_facts(&compiled, &assumptions);
+        let payload = semantic_type_fallback_payload(
+            "fcn.401000",
+            "x86-64",
+            64,
+            InterprocInferenceInput {
+                iter: 0,
+                max_iters: 0,
+                converged: true,
+                scope_json: "{}",
+            },
+            &compiled,
+            &function_facts,
+            None,
+        );
+        let value = serde_json::to_value(payload).expect("payload should serialize");
+        let Some(items) = value["assumptions"]["items"].as_array() else {
+            panic!("expected serialized assumptions, got {value:?}");
+        };
+        assert_eq!(
+            items.len(),
+            1,
+            "expected one serialized assumption: {value:?}"
+        );
+        assert_eq!(
+            items[0]["subject"]["register"]["name"].as_str(),
+            Some("rdi"),
+            "expected register assumption to survive fallback payload: {value:?}"
+        );
+    }
+
+    #[test]
     fn decompile_ready_large_cfg_worker_keeps_real_decompile_path() {
         let compiled = test_large_cfg_semantic_artifact();
         assert!(
@@ -8446,6 +8829,217 @@ mod integration_tests {
             matches!(payload["ret_type"].as_str(), Some("void *" | "void*")),
             "payload={output}"
         );
+    }
+
+    #[test]
+    fn function_interproc_summary_json_ex_returns_typed_root_summary() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+
+        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
+        let external_context = CString::new("{}").expect("valid context");
+        let scope_json = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
+            .expect("valid scope json");
+
+        let out = r2sleigh_function_interproc_summary_json_ex(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+            external_context.as_ptr(),
+            4,
+            scope_json.as_ptr(),
+        );
+        assert!(!out.is_null(), "summary json should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+        let payload: serde_json::Value =
+            serde_json::from_str(&output).expect("summary should parse");
+
+        r2il_string_free(out);
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_eq!(payload["return_relation"].as_str(), Some("HeapAlloc"));
+    }
+
+    #[test]
+    fn function_analysis_artifact_cache_key_changes_with_interproc_scope() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+
+        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
+        let external_context = CString::new("{}").expect("valid context");
+        let empty_scope = CString::new("{}").expect("valid scope");
+        let seeded_scope = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
+            .expect("valid seeded scope");
+
+        let root_key = r2sleigh_function_analysis_artifact_cache_key(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+            external_context.as_ptr(),
+            1,
+            empty_scope.as_ptr(),
+        );
+        let seeded_key = r2sleigh_function_analysis_artifact_cache_key(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+            external_context.as_ptr(),
+            1,
+            seeded_scope.as_ptr(),
+        );
+
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_ne!(root_key, 0);
+        assert_ne!(seeded_key, 0);
+        assert_ne!(root_key, seeded_key);
+    }
+
+    #[test]
+    fn function_analysis_artifact_cache_key_changes_with_interproc_budget() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+
+        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
+        let external_context = CString::new("{}").expect("valid context");
+        let scope = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
+            .expect("valid scope");
+
+        let low_budget_key = r2sleigh_function_analysis_artifact_cache_key(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+            external_context.as_ptr(),
+            1,
+            scope.as_ptr(),
+        );
+        let high_budget_key = r2sleigh_function_analysis_artifact_cache_key(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+            external_context.as_ptr(),
+            4,
+            scope.as_ptr(),
+        );
+
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_ne!(low_budget_key, 0);
+        assert_ne!(high_budget_key, 0);
+        assert_ne!(low_budget_key, high_budget_key);
+    }
+
+    #[test]
+    fn function_analysis_artifact_cache_key_changes_with_function_name() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+
+        let first_name = CString::new("sym.first").expect("valid function name");
+        let second_name = CString::new("sym.second").expect("valid function name");
+        let external_context = CString::new("{}").expect("valid context");
+        let scope = CString::new("{}").expect("valid scope");
+
+        let first_key = r2sleigh_function_analysis_artifact_cache_key(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            first_name.as_ptr(),
+            external_context.as_ptr(),
+            1,
+            scope.as_ptr(),
+        );
+        let second_key = r2sleigh_function_analysis_artifact_cache_key(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            second_name.as_ptr(),
+            external_context.as_ptr(),
+            1,
+            scope.as_ptr(),
+        );
+
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_ne!(first_key, 0);
+        assert_ne!(second_key, 0);
+        assert_ne!(first_key, second_key);
     }
 
     #[test]
@@ -10026,7 +10620,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
@@ -10079,7 +10673,7 @@ mod integration_tests {
             .ops = pattern_ssa_blocks[0].ops.clone();
         manual_func = manual_func.with_name("dbg.test_struct_array_index");
         let mut manual_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        manual_decompiler.set_type_facts(artifact.function_facts.types.clone());
+        manual_decompiler.set_function_facts(artifact.function_facts.clone());
         let manual_output = manual_decompiler.decompile(&manual_func);
 
         assert!(
@@ -10236,7 +10830,7 @@ mod integration_tests {
         );
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
@@ -10355,7 +10949,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([
             (0x401110, "sym.imp.printf".to_string()),
             (0x401140, "sym.imp.memcpy".to_string()),
@@ -10493,7 +11087,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([(0x401130, "sym.imp.strcmp".to_string())]));
         decompiler.set_strings(HashMap::from([(0x403014, "secret123".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
@@ -10631,7 +11225,7 @@ mod integration_tests {
             .collect();
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         let output = decompiler.decompile(&artifact.ssa_func);
         let output_without_types =
             r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64()).decompile(&artifact.ssa_func);
@@ -10726,7 +11320,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         let output = decompiler.decompile(&artifact.ssa_func);
         let visible_bindings = artifact.function_facts.types.visible_bindings.clone();
 
@@ -10806,7 +11400,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]));
         decompiler.set_strings(HashMap::from([(0x403040, "C".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
@@ -11313,7 +11907,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -11439,7 +12033,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),
@@ -11560,7 +12154,7 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_type_facts(artifact.function_facts.types.clone());
+        decompiler.set_function_facts(artifact.function_facts.clone());
         decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.strlen".to_string(),

@@ -61,6 +61,7 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
         function_return_type: None,
         prepared_ssa: None,
         interproc_summary_set: None,
+        summary_view: None,
         prepared_semantic_view: None,
         prepared_objects: None,
         prepared_memory: None,

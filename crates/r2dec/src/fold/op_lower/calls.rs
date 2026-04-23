@@ -158,7 +158,7 @@ impl<'a> FoldingContext<'a> {
             .lookup_known_signature(name)
             .and_then(|sig| (!sig.variadic).then_some(sig.params.len()));
         let summary_arity = self
-            .interproc_summary_for_name(name)
+            .summary_helper_view_for_name(name)
             .and_then(|summary| summary.arg_count_hint);
 
         let normalized = normalize_callee_name(name);
@@ -202,7 +202,7 @@ impl<'a> FoldingContext<'a> {
         };
         let normalized = normalize_callee_name(name);
 
-        if self.interproc_summary_for_name(name).is_some() {
+        if self.summary_helper_view_for_name(name).is_some() {
             return true;
         }
 

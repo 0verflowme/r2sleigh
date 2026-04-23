@@ -1271,7 +1271,11 @@ impl<'ctx> SymSolver<'ctx> {
         let result =
             self.compute_state_sat_result(state, SolverMode::ExploreFast, DeepQueryKind::Predicate);
         self.remember_state_sat_result(cache_key, result);
-        result == SatResult::Sat
+        // Exploration pruning must be conservative. `Unknown` usually means the
+        // fast partitioned solver hit a complex bit-vector predicate; treating
+        // that as UNSAT drops real paths before the deeper query/model phase can
+        // classify them honestly.
+        result != SatResult::Unsat
     }
 
     /// Check whether a state's constraints remain satisfiable with one extra constraint.

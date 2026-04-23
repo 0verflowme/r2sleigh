@@ -35,7 +35,10 @@ pub use facts::{
     FunctionTypeFactsBuilder, InterprocFactDiagnostics, LocalFieldAccessFact, ResolvedFieldLayout,
     VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
-pub use function_facts::FunctionFacts;
+pub use function_facts::{
+    AnalysisPlans, DecompileCapabilityView, FunctionFacts, InterprocSummaryView,
+    SummaryEffectRollup, SummaryHelperView,
+};
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
 pub use oracle::{LayoutOracle, TypeOracle};
@@ -45,6 +48,7 @@ pub use prepare::{
     merge_type_hint, recover_vars_arch_profile, recover_vars_from_ssa, scalar_register_family_key,
     size_to_type, ssa_var_block_key, ssa_var_key,
 };
+pub use r2ssa::AssumptionUsageReport;
 pub use signature::{ResolvedSignature, SignatureRegistry};
 pub use signature_infer::{
     RecoveredSignatureParam, SignatureParamCandidate, SignatureTypeEvidence,

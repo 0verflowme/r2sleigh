@@ -125,20 +125,20 @@ typedef struct {
 	size_t num_tty_fds;
 	int skip_sleep_calls;
 } R2SymReplaySeed;
-extern char *r2sym_function_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr);
-extern char *r2sym_paths_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr);
+extern char *r2sym_function_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr, const char *external_context_json);
+extern char *r2sym_paths_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions, unsigned long long entry_addr, const char *external_context_json);
 extern char *r2sym_explore_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr);
+	unsigned long long entry_addr, unsigned long long target_addr, const char *external_context_json);
 extern char *r2sym_solve_to_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr);
+	unsigned long long entry_addr, unsigned long long target_addr, const char *external_context_json);
 extern char *r2sym_explore_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed);
+	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed, const char *external_context_json);
 extern char *r2sym_solve_to_replay_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed);
+	unsigned long long entry_addr, unsigned long long target_addr, const R2SymReplaySeed *replay_seed, const char *external_context_json);
 extern char *r2sym_compile_semantics_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr);
+	unsigned long long entry_addr, const char *external_context_json);
 extern char *r2sym_run_spec_json_scope(const R2ILContext *ctx, const R2ILFunctionBlocks *functions, size_t num_functions,
-	unsigned long long entry_addr, const char *spec_json);
+	unsigned long long entry_addr, const char *spec_json, const char *external_context_json);
 extern int r2sym_set_symbol_map_json(const char *json);
 extern int r2sym_merge_is_enabled(void);
 extern void r2sym_merge_set_enabled(int enabled);
@@ -176,6 +176,12 @@ extern char *r2sleigh_infer_type_writeback_json(const R2ILContext *ctx, const R2
 extern char *r2sleigh_infer_type_writeback_json_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
 	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json);
+extern unsigned long long r2sleigh_function_analysis_artifact_cache_key(const R2ILContext *ctx,
+	const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr, const char *fcn_name,
+	const char *external_context_json, size_t interproc_max_iters, const char *interproc_scope_json);
+extern char *r2sleigh_function_interproc_summary_json_ex(const R2ILContext *ctx,
+	const R2ILBlock **blocks, size_t num_blocks, unsigned long long fcn_addr, const char *fcn_name,
+	const char *external_context_json, size_t interproc_max_iters, const char *interproc_scope_json);
 extern char *r2sleigh_infer_type_writeback_json_scope_ex(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name, const char *external_context_json,
 	size_t interproc_iter, size_t interproc_max_iters, int interproc_converged, const char *interproc_scope_json,
@@ -190,6 +196,10 @@ extern char *r2sleigh_function_plan_json_scope_ex(const R2ILContext *ctx, const 
 	const R2ILFunctionBlocks *functions, size_t num_functions);
 extern char *r2sleigh_get_direct_call_targets_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *fcn_name);
+extern char *r2sleigh_get_symbolic_scope_targets_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *fcn_name, const char *registration_call_targets_json);
+extern char *r2sleigh_get_runtime_materialized_sources_json(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
+	unsigned long long fcn_addr, const char *fcn_name, const char *copy_call_targets_json);
 extern int r2sleigh_alias_function_analysis_artifact_cache(const R2ILContext *ctx, const R2ILBlock **blocks,
 	size_t num_blocks, unsigned long long fcn_addr, const char *fcn_name,
 	const char *source_external_context_json, const char *target_external_context_json);
@@ -261,6 +271,7 @@ typedef struct {
 	ut64 dep_hash;
 	ut64 applied_hash;
 	char *payload_json;
+	char *interproc_scope_json;
 } TypeWritebackCacheEntry;
 
 typedef struct {
@@ -319,9 +330,16 @@ typedef struct {
 	size_t capacity;
 } BlockArray;
 
-#define SLEIGH_SYM_HELPER_MAX_FUNCTIONS 16
+#define SLEIGH_SYM_HELPER_MAX_FUNCTIONS 32
 #define SLEIGH_SCOPE_HELPER_MAX_BLOCKS 64
 #define SLEIGH_SCOPE_HELPER_MAX_COST 256
+#define SLEIGH_RUNTIME_MATERIALIZED_MAX_BYTES 0x4000
+#define SLEIGH_RUNTIME_MATERIALIZED_SLOT_BYTES 16
+#define SLEIGH_AUTO_CALLBACK_MAX_BLOCKS 96
+#define SLEIGH_AUTO_CALLBACK_MAX_COST 512
+#define SLEIGH_AUTO_CALLBACK_MAX_LINEAR_SIZE (256ULL * 1024ULL)
+#define SLEIGH_POST_ANALYSIS_FAST_BUDGET_USEC (2ULL * 1000000ULL)
+#define SLEIGH_POST_ANALYSIS_BALANCED_BUDGET_USEC (10ULL * 1000000ULL)
 
 typedef struct {
 	R2ILFunctionBlocks *functions;
@@ -331,12 +349,18 @@ typedef struct {
 	size_t capacity;
 } SymFunctionScope;
 
+typedef struct {
+	ut64 addr;
+	ut64 size;
+} RuntimeMaterializedSource;
+
 static char *build_type_interproc_scope_json(
 	RCore *core,
 	RAnal *anal,
 	R2ILContext *ctx,
 	RAnalFunction *fcn,
-	const BlockArray *blocks
+	const BlockArray *blocks,
+	int max_iters
 );
 
 static bool warm_type_payload_cache_for_function(
@@ -358,6 +382,24 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	const char *fcn_name,
 	size_t *out_count
 );
+static ut64 *collect_runtime_scope_targets_from_blocks(
+	R2ILContext *ctx,
+	const BlockArray *blocks,
+	ut64 fcn_addr,
+	const char *fcn_name,
+	const ut64 *registration_targets,
+	size_t registration_target_count,
+	size_t *out_count
+);
+static RuntimeMaterializedSource *collect_runtime_materialized_sources_from_blocks(
+	R2ILContext *ctx,
+	const BlockArray *blocks,
+	ut64 fcn_addr,
+	const char *fcn_name,
+	const ut64 *copy_targets,
+	size_t copy_target_count,
+	size_t *out_count
+);
 static void sym_function_scope_init(SymFunctionScope *scope);
 static void sym_function_scope_free(SymFunctionScope *scope);
 static bool sym_function_scope_ensure_capacity(SymFunctionScope *scope, size_t needed);
@@ -365,13 +407,36 @@ static bool sym_function_scope_append(
 	SymFunctionScope *scope,
 	RAnal *anal,
 	RAnalFunction *fcn,
-	R2ILContext *ctx
+	R2ILContext *ctx,
+	bool include_linear_gap_blocks
+);
+static bool sym_function_scope_append_runtime_source(
+	SymFunctionScope *scope,
+	RAnal *anal,
+	R2ILContext *ctx,
+	ut64 addr,
+	ut64 size
 );
 static bool build_symbolic_function_scope(
 	RAnal *anal,
 	RAnalFunction *root_fcn,
 	R2ILContext *ctx,
 	SymFunctionScope *scope
+);
+static bool build_symbolic_function_scope_with_target(
+	RAnal *anal,
+	RAnalFunction *root_fcn,
+	R2ILContext *ctx,
+	SymFunctionScope *scope,
+	ut64 target_hint
+);
+static char *resolve_interproc_seed_name(RCore *core, RAnal *anal, ut64 addr);
+static ut64 *collect_type_interproc_direct_targets_from_blocks(
+	R2ILContext *ctx,
+	const BlockArray *blocks,
+	ut64 fcn_addr,
+	const char *fcn_name,
+	size_t *out_count
 );
 
 static void block_array_init(BlockArray *arr) {
@@ -380,12 +445,94 @@ static void block_array_init(BlockArray *arr) {
 	arr->capacity = 0;
 }
 
+static bool sleigh_debug_scope_enabled(void) {
+	return r_sys_getenv_asbool ("R2SLEIGH_DEBUG_SCOPE");
+}
+
+static void sleigh_debug_scope_log(const char *fmt, ...) {
+	char *path = NULL;
+	FILE *fd = NULL;
+	va_list ap;
+
+	if (!sleigh_debug_scope_enabled ()) {
+		return;
+	}
+	path = r_sys_getenv ("R2SLEIGH_DEBUG_SCOPE_LOG");
+	if (!path || !*path) {
+		free (path);
+		path = strdup ("/tmp/r2sleigh_scope.log");
+	}
+	if (!path) {
+		return;
+	}
+	fd = fopen (path, "a");
+	free (path);
+	if (!fd) {
+		return;
+	}
+	va_start (ap, fmt);
+	vfprintf (fd, fmt, ap);
+	va_end (ap);
+	fputc ('\n', fd);
+	fclose (fd);
+}
+
 static void block_array_push(BlockArray *arr, R2ILBlock *block) {
 	if (arr->count >= arr->capacity) {
 		arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
 		arr->blocks = realloc (arr->blocks, arr->capacity * sizeof (R2ILBlock *));
 	}
 	arr->blocks[arr->count++] = block;
+}
+
+static int block_array_compare_addr(const void *a, const void *b) {
+	const R2ILBlock *const *block_a = (const R2ILBlock *const *)a;
+	const R2ILBlock *const *block_b = (const R2ILBlock *const *)b;
+	const ut64 addr_a = (block_a && *block_a)? r2il_block_addr (*block_a): 0;
+	const ut64 addr_b = (block_b && *block_b)? r2il_block_addr (*block_b): 0;
+	if (addr_a < addr_b) {
+		return -1;
+	}
+	if (addr_a > addr_b) {
+		return 1;
+	}
+	return 0;
+}
+
+static void block_array_sort(BlockArray *arr) {
+	if (!arr || arr->count < 2 || !arr->blocks) {
+		return;
+	}
+	qsort (arr->blocks, arr->count, sizeof (R2ILBlock *), block_array_compare_addr);
+}
+
+static bool block_array_addr_covered(const BlockArray *arr, ut64 addr, ut64 *covered_end) {
+	size_t i;
+	if (!arr) {
+		return false;
+	}
+	for (i = 0; i < arr->count; i++) {
+		const R2ILBlock *block = arr->blocks[i];
+		ut64 block_addr;
+		ut64 block_size;
+		ut64 end;
+		if (!block) {
+			continue;
+		}
+		block_addr = r2il_block_addr (block);
+		block_size = r2il_block_size (block);
+		if (!block_size) {
+			continue;
+		}
+		end = block_addr + block_size;
+		if (addr >= block_addr && addr < end) {
+			if (covered_end) {
+				*covered_end = end;
+			}
+			return true;
+		}
+	}
+	return false;
 }
 
 static void block_array_free(BlockArray *arr) {
@@ -554,6 +701,8 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	}
 	RAnalFcnContext *ctx = sleigh_function_context_api.collect (anal, fcn);
 	RList *base_types = r_anal_types_baselist (anal);
+	char *assumptions_json = NULL;
+	RJson *assumptions = NULL;
 
 	PJ *pj = pj_new ();
 	if (!pj) {
@@ -653,6 +802,17 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	}
 	pj_end (pj);
 
+	if (ctx && ctx->assumptions_json) {
+		assumptions_json = strdup (ctx->assumptions_json);
+		if (assumptions_json) {
+			assumptions = r_json_parse (assumptions_json);
+			if (assumptions && assumptions->type == R_JSON_ARRAY) {
+				pj_k (pj, "assumptions");
+				pj_raw (pj, ctx->assumptions_json);
+			}
+		}
+	}
+
 	pj_k (pj, "base_types");
 	pj_a (pj);
 	RAnalBaseType *type;
@@ -665,9 +825,82 @@ static char *sleigh_collect_external_context_json(RAnal *anal, RAnalFunction *fc
 	pj_end (pj);
 
 	char *json = pj_drain (pj);
+	r_json_free (assumptions);
+	free (assumptions_json);
 	r_list_free (base_types);
 	sleigh_function_context_api.free (ctx);
 	return json? json: strdup ("{}");
+}
+
+static char *sleigh_collect_sym_external_context_json(RAnal *anal, RAnalFunction *fcn) {
+	char *parse_json = NULL;
+	if (!anal || !fcn) {
+		return strdup ("{}");
+	}
+	char *assumptions_json = r_anal_function_get_assumptions_json (anal, fcn);
+	if (R_STR_ISEMPTY (assumptions_json)) {
+		free (assumptions_json);
+		return strdup ("{}");
+	}
+
+	parse_json = strdup (assumptions_json);
+	if (!parse_json) {
+		free (assumptions_json);
+		return strdup ("{}");
+	}
+	RJson *assumptions = r_json_parse (parse_json);
+	if (!assumptions || assumptions->type != R_JSON_ARRAY) {
+		r_json_free (assumptions);
+		free (parse_json);
+		free (assumptions_json);
+		return strdup ("{}");
+	}
+	r_json_free (assumptions);
+	free (parse_json);
+
+	PJ *pj = pj_new ();
+	if (!pj) {
+		free (assumptions_json);
+		return strdup ("{}");
+	}
+	pj_o (pj);
+	pj_k (pj, "assumptions");
+	pj_raw (pj, assumptions_json);
+	pj_end (pj);
+	free (assumptions_json);
+	char *json = pj_drain (pj);
+	return json? json: strdup ("{}");
+}
+
+static char *sleigh_collect_function_assumptions_json(RAnal *anal, RAnalFunction *fcn) {
+	char *assumptions_json;
+	char *parse_json = NULL;
+	RJson *assumptions = NULL;
+
+	if (!anal || !fcn) {
+		return strdup ("[]");
+	}
+	assumptions_json = r_anal_function_get_assumptions_json (anal, fcn);
+	if (R_STR_ISEMPTY (assumptions_json)) {
+		free (assumptions_json);
+		return strdup ("[]");
+	}
+
+	parse_json = strdup (assumptions_json);
+	if (!parse_json) {
+		free (assumptions_json);
+		return strdup ("[]");
+	}
+	assumptions = r_json_parse (parse_json);
+	if (!assumptions || assumptions->type != R_JSON_ARRAY) {
+		r_json_free (assumptions);
+		free (parse_json);
+		free (assumptions_json);
+		return strdup ("[]");
+	}
+	r_json_free (assumptions);
+	free (parse_json);
+	return assumptions_json;
 }
 
 static bool sleigh_resolve_function_context_api(void) {
@@ -709,6 +942,7 @@ static void type_writeback_cache_clear(void) {
 	size_t i;
 	for (i = 0; i < type_writeback_cache_count; i++) {
 		free (type_writeback_cache[i].payload_json);
+		free (type_writeback_cache[i].interproc_scope_json);
 	}
 	free (type_writeback_cache);
 	type_writeback_cache = NULL;
@@ -868,18 +1102,22 @@ static TypeWritebackCacheEntry *type_writeback_cache_get(ut64 addr) {
 
 static bool is_caller_propagation_ref_type(RAnalRefType type);
 
-static bool type_writeback_cache_put(ut64 addr, ut64 key, ut64 dep_hash, ut64 payload_hash, ut64 applied_hash, const char *payload_json) {
+static bool type_writeback_cache_put(ut64 addr, ut64 key, ut64 dep_hash, ut64 payload_hash, ut64 applied_hash,
+	const char *payload_json, const char *interproc_scope_json) {
 	TypeWritebackCacheEntry *entry = type_writeback_cache_get (addr);
 	TypeWritebackCacheEntry *next;
 	char *payload_dup = payload_json? strdup (payload_json): NULL;
+	char *scope_dup = interproc_scope_json? strdup (interproc_scope_json): NULL;
 
 	if (entry) {
 		free (entry->payload_json);
+		free (entry->interproc_scope_json);
 		entry->key = key;
 		entry->payload_hash = payload_hash;
 		entry->dep_hash = dep_hash;
 		entry->applied_hash = applied_hash;
 		entry->payload_json = payload_dup;
+		entry->interproc_scope_json = scope_dup;
 		return true;
 	}
 
@@ -888,6 +1126,7 @@ static bool type_writeback_cache_put(ut64 addr, ut64 key, ut64 dep_hash, ut64 pa
 		next = realloc (type_writeback_cache, new_capacity * sizeof (TypeWritebackCacheEntry));
 		if (!next) {
 			free (payload_dup);
+			free (scope_dup);
 			return false;
 		}
 		type_writeback_cache = next;
@@ -900,6 +1139,7 @@ static bool type_writeback_cache_put(ut64 addr, ut64 key, ut64 dep_hash, ut64 pa
 	type_writeback_cache[type_writeback_cache_count].dep_hash = dep_hash;
 	type_writeback_cache[type_writeback_cache_count].applied_hash = applied_hash;
 	type_writeback_cache[type_writeback_cache_count].payload_json = payload_dup;
+	type_writeback_cache[type_writeback_cache_count].interproc_scope_json = scope_dup;
 	if (!type_writeback_cache_index) {
 		type_writeback_cache_index = ht_up_new0 ();
 	}
@@ -1084,6 +1324,46 @@ static bool parse_replay_target_and_json(RCore *core, const char *arg, ut64 *tar
 		return false;
 	}
 	json = strdup (json_start);
+	free (owned);
+	if (!json) {
+		return false;
+	}
+	r_str_unescape (json);
+	*out_json = json;
+	return true;
+}
+
+static bool parse_target_and_optional_json(RCore *core, const char *arg, ut64 *target, char **out_json) {
+	char *owned = NULL;
+	char *json = NULL;
+	char *sep;
+	const char *json_start = NULL;
+
+	if (!core || !arg || !*arg || !target || !out_json) {
+		return false;
+	}
+	*out_json = NULL;
+	owned = strdup (arg);
+	if (!owned) {
+		return false;
+	}
+	sep = owned;
+	while (*sep && !isspace ((unsigned char)*sep)) {
+		sep++;
+	}
+	if (*sep) {
+		*sep++ = '\0';
+		json_start = skip_cmd_spaces (sep);
+	}
+	if (!parse_sym_target_expr (core, owned, target)) {
+		free (owned);
+		return false;
+	}
+	if (json_start && *json_start) {
+		json = strdup (json_start);
+	} else {
+		json = strdup ("{}");
+	}
 	free (owned);
 	if (!json) {
 		return false;
@@ -1866,7 +2146,7 @@ static bool replay_sym_seed_add_tty_fd(ReplaySymSeedSpec *spec, int fd) {
 	return true;
 }
 
-static bool replay_sym_seed_spec_parse(RCore *core, const char *json, ReplaySymSeedSpec *spec) {
+static bool replay_sym_seed_spec_parse(RCore *core, const char *json, ReplaySymSeedSpec *spec, bool require_checkpoint) {
 	char *json_copy;
 	char *owned_json = NULL;
 	RJson *root;
@@ -1900,7 +2180,12 @@ static bool replay_sym_seed_spec_parse(RCore *core, const char *json, ReplaySymS
 	if (!value) {
 		value = r_json_get (root, "seed_checkpoint");
 	}
-	if (!replay_parse_addr_expr (core, value, &spec->checkpoint_id) || !spec->checkpoint_id) {
+	if (value) {
+		if (!replay_parse_addr_expr (core, value, &spec->checkpoint_id) || !spec->checkpoint_id) {
+			R_LOG_ERROR ("r2sleigh replay sym seed: invalid checkpoint");
+			goto fail;
+		}
+	} else if (require_checkpoint) {
 		R_LOG_ERROR ("r2sleigh replay sym seed: missing/invalid checkpoint");
 		goto fail;
 	}
@@ -2061,7 +2346,12 @@ fail:
 static RDebugStateSnapshot *replay_sym_collect_seed_snapshot(RCore *core, const ReplaySymSeedSpec *spec) {
 	RDebugStateSnapshot *snapshot;
 	ut64 previous_checkpoint;
-	R_RETURN_VAL_IF_FAIL (core && core->dbg && core->dbg->session && spec && spec->snapshot_request, NULL);
+
+	R_RETURN_VAL_IF_FAIL (core && core->dbg && spec && spec->snapshot_request, NULL);
+	if (!spec->checkpoint_id) {
+		return r_debug_state_snapshot_collect (core->dbg, spec->snapshot_request);
+	}
+	R_RETURN_VAL_IF_FAIL (core->dbg->session, NULL);
 	previous_checkpoint = core->dbg->session->current_checkpoint_id;
 	if (!r_debug_session_restore_checkpoint (core->dbg, spec->checkpoint_id)) {
 		return NULL;
@@ -2074,7 +2364,8 @@ static RDebugStateSnapshot *replay_sym_collect_seed_snapshot(RCore *core, const 
 }
 
 static char *replay_sym_query_run(RCore *core, const R2ILContext *ctx, const SymFunctionScope *scope,
-	ut64 entry_addr, ut64 target_addr, const ReplaySymSeedSpec *spec, bool is_explore) {
+	ut64 entry_addr, ut64 target_addr, const ReplaySymSeedSpec *spec, bool is_explore,
+	const char *external_context_json) {
 	RDebugStateSnapshot *snapshot = NULL;
 	R2SymReplayRegister *registers = NULL;
 	R2SymReplayMemoryWindow *memory = NULL;
@@ -2160,8 +2451,8 @@ static char *replay_sym_query_run(RCore *core, const R2ILContext *ctx, const Sym
 	seed.skip_sleep_calls = spec->skip_sleep_calls? 1: 0;
 
 	result = is_explore
-		? r2sym_explore_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed)
-		: r2sym_solve_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed);
+		? r2sym_explore_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed, external_context_json)
+		: r2sym_solve_to_replay_scope (ctx, scope->functions, scope->count, entry_addr, target_addr, &seed, external_context_json);
 
 cleanup:
 	free (registers);
@@ -3010,6 +3301,25 @@ static bool function_exceeds_helper_scope_budget(const RAnalFunction *fcn) {
 	return cost > SLEIGH_SCOPE_HELPER_MAX_COST;
 }
 
+static bool function_exceeds_auto_callback_budget(const RAnalFunction *fcn) {
+	ut32 cost;
+	int bb_count;
+	int linear_size;
+	if (!fcn) {
+		return true;
+	}
+	bb_count = function_bb_count (fcn);
+	if (bb_count > SLEIGH_AUTO_CALLBACK_MAX_BLOCKS) {
+		return true;
+	}
+	linear_size = r_anal_function_linear_size ((RAnalFunction *)fcn);
+	if (linear_size > 0 && (ut64)linear_size > SLEIGH_AUTO_CALLBACK_MAX_LINEAR_SIZE) {
+		return true;
+	}
+	cost = r_anal_function_cost ((RAnalFunction *)fcn);
+	return cost > SLEIGH_AUTO_CALLBACK_MAX_COST;
+}
+
 static bool is_autogenerated_function_name(const char *name) {
 	if (!name || !*name) {
 		return true;
@@ -3209,6 +3519,65 @@ static RAnalFunction *materialize_function_at(RAnal *anal, ut64 addr) {
 	return r_anal_get_fcn_in (anal, addr, R_ANAL_FCN_TYPE_ANY);
 }
 
+static ut64 resolve_local_direct_jump_thunk_target(RAnal *anal, ut64 addr) {
+	ut64 cur = addr;
+	size_t depth = 0;
+
+	while (anal && cur != UT64_MAX && cur && depth++ < 4) {
+		ut8 buf[16] = {0};
+		RAnalOp op = {0};
+		int size;
+
+		if (!anal->iob.read_at || anal->iob.read_at (anal->iob.io, cur, buf, sizeof (buf)) <= 0) {
+			break;
+		}
+		size = r_anal_op (anal, &op, cur, buf, sizeof (buf), R_ARCH_OP_MASK_BASIC);
+		if (size <= 0) {
+			r_anal_op_fini (&op);
+			break;
+		}
+		if ((op.type != R_ANAL_OP_TYPE_JMP && op.type != R_ANAL_OP_TYPE_UJMP)
+			|| op.jump == UT64_MAX || !op.jump || op.jump == cur || op.size > 8) {
+			r_anal_op_fini (&op);
+			break;
+		}
+		cur = op.jump;
+		r_anal_op_fini (&op);
+	}
+
+	return cur;
+}
+
+static const char *detect_local_summary_alias(RAnal *anal, ut64 addr) {
+	ut64 resolved;
+	ut8 buf[16] = {0};
+
+	if (!anal || addr == UT64_MAX || !addr || !anal->iob.read_at) {
+		return NULL;
+	}
+
+	resolved = resolve_local_direct_jump_thunk_target (anal, addr);
+	if (resolved == UT64_MAX || !resolved) {
+		return NULL;
+	}
+	if (!anal->iob.read_at (anal->iob.io, resolved, buf, sizeof (buf))) {
+		return NULL;
+	}
+
+	/* MSVC-style x64 small memcpy/memmove dispatcher:
+	 *   mov rax, rcx
+	 *   lea r10, [rip + table]
+	 *   cmp r8, imm8
+	 */
+	if (buf[0] == 0x48 && buf[1] == 0x8b && buf[2] == 0xc1
+		&& buf[3] == 0x4c && buf[4] == 0x8d && buf[5] == 0x15
+		&& buf[10] == 0x49 && buf[11] == 0x83 && buf[12] == 0xf8) {
+		return "memcpy";
+	}
+
+	return NULL;
+}
+
 static RAnalFunction *resolve_or_materialize_function_target(RCore *core, RAnal *anal, const char *target_arg) {
 	ut64 target_addr = 0;
 	RAnalFunction *fcn;
@@ -3235,8 +3604,8 @@ static RAnalFunction *resolve_or_materialize_current_function(RCore *core, RAnal
 	return materialize_function_at (anal, core->addr);
 }
 
-static char *build_sym_symbol_map_json(RCore *core) {
-	if (!core) {
+static char *build_sym_symbol_map_json(RCore *core, RAnal *anal, R2ILContext *ctx, const SymFunctionScope *scope) {
+	if (!core || !anal || !ctx || !scope || !scope->functions || !scope->count) {
 		return strdup ("{}");
 	}
 
@@ -3246,51 +3615,39 @@ static char *build_sym_symbol_map_json(RCore *core) {
 	}
 	pj_o (pj);
 
-	/* aflj: [{addr:0x...,name:"..."}] */
-	char *aflj = r_core_cmd_str (core, "aflj");
-	if (aflj && aflj[0] == '[') {
-		RJson *root = r_json_parse (aflj);
-		if (root && root->type == R_JSON_ARRAY) {
-			RJson *elem;
-			for (elem = root->children.first; elem; elem = elem->next) {
-				if (elem->type != R_JSON_OBJECT) {
-					continue;
-				}
-				const RJson *addr = r_json_get (elem, "addr");
-				const RJson *name = r_json_get (elem, "name");
-				if (addr && name && addr->type == R_JSON_INTEGER && name->type == R_JSON_STRING && name->str_value) {
-					char key[32];
-					snprintf (key, sizeof (key), "0x%llx", (unsigned long long)addr->num.u_value);
-					pj_ks (pj, key, name->str_value);
-				}
-			}
-			r_json_free (root);
+	for (size_t i = 0; i < scope->count; i++) {
+		const R2ILFunctionBlocks *function = &scope->functions[i];
+		const BlockArray *blocks = &scope->owned_blocks[i];
+		size_t direct_target_count = 0;
+		ut64 *direct_targets = NULL;
+		if (function->name && *function->name) {
+			char key[32];
+			snprintf (key, sizeof (key), "0x%llx", (unsigned long long)function->entry_addr);
+			pj_ks (pj, key, function->name);
 		}
-	}
-	free (aflj);
-
-	/* fs *;fj: include import/plt flags such as sym.imp.memcpy */
-	char *fj = r_core_cmd_str (core, "fs *;fj");
-	if (fj && fj[0] == '[') {
-		RJson *root = r_json_parse (fj);
-		if (root && root->type == R_JSON_ARRAY) {
-			RJson *elem;
-			for (elem = root->children.first; elem; elem = elem->next) {
-				if (elem->type != R_JSON_OBJECT) {
-					continue;
-				}
-				const RJson *addr = r_json_get (elem, "addr");
-				const RJson *name = r_json_get (elem, "name");
-				if (addr && name && addr->type == R_JSON_INTEGER && name->type == R_JSON_STRING && name->str_value) {
-					char key[32];
-					snprintf (key, sizeof (key), "0x%llx", (unsigned long long)addr->num.u_value);
-					pj_ks (pj, key, name->str_value);
-				}
+		direct_targets = collect_type_interproc_direct_targets_from_blocks (
+			ctx,
+			blocks,
+			function->entry_addr,
+			function->name,
+			&direct_target_count
+		);
+		for (size_t j = 0; j < direct_target_count; j++) {
+			char *target_name = resolve_interproc_seed_name (core, anal, direct_targets[j]);
+			const char *summary_alias = NULL;
+			if (target_name && *target_name) {
+				char key[32];
+				snprintf (key, sizeof (key), "0x%llx", (unsigned long long)direct_targets[j]);
+				pj_ks (pj, key, target_name);
+			} else if ((summary_alias = detect_local_summary_alias (anal, direct_targets[j]))) {
+				char key[32];
+				snprintf (key, sizeof (key), "0x%llx", (unsigned long long)direct_targets[j]);
+				pj_ks (pj, key, summary_alias);
 			}
-			r_json_free (root);
+			free (target_name);
 		}
+		free (direct_targets);
 	}
-	free (fj);
 
 	pj_end (pj);
 	return pj_drain (pj);
@@ -5734,8 +6091,62 @@ static R2ILBlock *lift_function_block_healed(
 	return NULL;
 }
 
+static void lift_function_linear_gap_blocks(RAnal *anal, RAnalFunction *fcn, R2ILContext *ctx, BlockArray *out) {
+	ut64 min_addr;
+	ut64 max_addr;
+	ut64 addr;
+
+	R_RETURN_IF_FAIL (anal && fcn && ctx && out);
+
+	min_addr = r_anal_function_min_addr (fcn);
+	max_addr = r_anal_function_max_addr (fcn);
+	if (min_addr == UT64_MAX || max_addr == UT64_MAX || max_addr <= min_addr) {
+		return;
+	}
+
+	for (addr = min_addr; addr < max_addr;) {
+		ut64 covered_end = UT64_MAX;
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
+		RAnalOp op = {0};
+		int len;
+		R2ILBlock *block;
+
+		if (block_array_addr_covered (out, addr, &covered_end)) {
+			addr = covered_end > addr? covered_end: addr + 1;
+			continue;
+		}
+		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
+			addr++;
+			continue;
+		}
+
+		len = r_anal_op (anal, &op, addr, buf, sizeof (buf), R_ARCH_OP_MASK_BASIC);
+		r_anal_op_fini (&op);
+		if (len < 1) {
+			len = 1;
+		}
+
+		block = r2il_lift (ctx, buf, sizeof (buf), addr);
+		if (block) {
+			if (r2il_block_validate (ctx, block)) {
+				block_array_push (out, block);
+			} else {
+				r2il_block_free (block);
+			}
+		}
+
+		addr += (ut64)len;
+	}
+}
+
 /* Lift all basic blocks of a function */
-static bool lift_function_blocks(RAnal *anal, RAnalFunction *fcn, R2ILContext *ctx, BlockArray *out) {
+static bool lift_function_blocks(
+	RAnal *anal,
+	RAnalFunction *fcn,
+	R2ILContext *ctx,
+	BlockArray *out,
+	bool include_linear_gap_blocks
+) {
 	R_RETURN_VAL_IF_FAIL (anal && fcn && ctx && out, false);
 
 	RListIter *iter;
@@ -5837,6 +6248,11 @@ static bool lift_function_blocks(RAnal *anal, RAnalFunction *fcn, R2ILContext *c
 		free (buf);
 		}
 
+	if (include_linear_gap_blocks) {
+		lift_function_linear_gap_blocks (anal, fcn, ctx, out);
+		block_array_sort (out);
+	}
+
 	return out->count > 0;
 }
 
@@ -5874,6 +6290,10 @@ static SleighMode cfg_get_mode_default_balanced(RAnal *anal) {
 
 static bool sleigh_mode_is_fast(RAnal *anal) {
 	return cfg_get_mode_default_balanced (anal) == SLEIGH_MODE_FAST;
+}
+
+static bool sleigh_mode_allows_deep_auto_callbacks(RAnal *anal) {
+	return cfg_get_mode_default_balanced (anal) == SLEIGH_MODE_FULL;
 }
 
 static SleighMode sleigh_mode_effective_for_post_analysis(RAnal *anal) {
@@ -6343,6 +6763,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				r_cons_println (cons, "| a:sla.slice <var> - Backward slice from variable (e.g. rax_3)");
 				r_cons_println (cons, "| a:sla.sym [name|addr] - Symbolic execution summary (current by default)");
 				r_cons_println (cons, "| a:sla.sym.paths [name|addr] - Explore paths in function (current by default)");
+				r_cons_println (cons, "| a:sla.assumptions [name|addr] - Show persisted function assumptions (current by default)");
+				r_cons_println (cons, "| a:sla.assumptions- [name|addr] - Clear persisted function assumptions");
+				r_cons_println (cons, "| a:sla.assumej <json-array> - Replace current function assumptions");
 			r_cons_println (cons, "| a:sla.sym.merge [on|off] - Toggle symbolic state merging");
 			r_cons_println (cons, "| a:sla.taint  - Taint analysis for current function");
 			r_cons_println (cons, "| a:sla.dec [name|addr] - Decompile function (current by default)");
@@ -6352,6 +6775,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sym.solve <target> - Solve concrete input for target reachability");
 			r_cons_println (cons, "| a:sym.explore.replayj <target> <json-spec> - Explore from a replay checkpoint frontier");
 			r_cons_println (cons, "| a:sym.solve.replayj <target> <json-spec> - Solve from a replay checkpoint frontier");
+			r_cons_println (cons, "| a:sym.explore.state <target> [json-spec] - Explore from current debugger state");
+			r_cons_println (cons, "| a:sym.solve.state <target> [json-spec] - Solve from current debugger state");
 			r_cons_println (cons, "| a:sym.runj <json-spec> - Run typed symbolic exploration spec");
 			r_cons_println (cons, "| a:sym.replayj <json-spec> - Search checkpointed replay branches");
 			r_cons_println (cons, "| a:sym.state  - Show last symbolic explore/solve cached result");
@@ -6374,6 +6799,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		RAnalFunction *fcn;
 		SymFunctionScope scope;
 		char *spec_json = NULL;
+		char *external_context_json = NULL;
 		char *result = NULL;
 		bool rust_owned = true;
 
@@ -6398,20 +6824,23 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core);
+		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
 		if (sym_map_json) {
 			r2sym_set_symbol_map_json (sym_map_json);
 			free (sym_map_json);
 		}
+		external_context_json = sleigh_collect_sym_external_context_json (anal, fcn);
 
 		spec_json = strdup (arg);
 		if (!spec_json) {
+			free (external_context_json);
 			sym_function_scope_free (&scope);
 			return strdup("");
 		}
 		r_str_unescape (spec_json);
-		result = r2sym_run_spec_json_scope (ctx, scope.functions, scope.count, fcn->addr, spec_json);
+		result = r2sym_run_spec_json_scope (ctx, scope.functions, scope.count, fcn->addr, spec_json, external_context_json);
 		free (spec_json);
+		free (external_context_json);
 		if (!result) {
 			rust_owned = false;
 			result = strdup ("{\"error\":\"symbolic execution failed\"}");
@@ -6477,6 +6906,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		RAnalFunction *fcn;
 		SymFunctionScope scope;
 		char *spec_json = NULL;
+		char *external_context_json = NULL;
 		char *result = NULL;
 		bool rust_owned = true;
 
@@ -6501,7 +6931,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			return strdup ("");
 		}
-		if (!replay_sym_seed_spec_parse (core, spec_json, &spec)) {
+		if (!replay_sym_seed_spec_parse (core, spec_json, &spec, true)) {
 			R_LOG_ERROR ("r2sleigh: invalid replay symbolic seed spec");
 			free (spec_json);
 			return strdup ("");
@@ -6520,18 +6950,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			replay_sym_seed_spec_fini (&spec);
 			return strdup ("");
 		}
-		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+		if (!build_symbolic_function_scope_with_target (anal, fcn, ctx, &scope, target)) {
 			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			replay_sym_seed_spec_fini (&spec);
 			return strdup ("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core);
+		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
 		if (sym_map_json) {
 			r2sym_set_symbol_map_json (sym_map_json);
 			free (sym_map_json);
 		}
+		external_context_json = sleigh_collect_sym_external_context_json (anal, fcn);
 
-		result = replay_sym_query_run (core, ctx, &scope, fcn->addr, target, &spec, is_explore);
+		result = replay_sym_query_run (core, ctx, &scope, fcn->addr, target, &spec, is_explore, external_context_json);
+		free (external_context_json);
 		if (!result) {
 			rust_owned = false;
 			result = strdup ("{\"error\":\"replay symbolic execution failed\"}");
@@ -6554,6 +6986,96 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		return strdup ("");
 	}
 
+	if (is_sym_ns && (!strncmp (cmd, "sym.explore.state", 17) || !strncmp (cmd, "sym.solve.state", 15))) {
+		bool is_explore = r_str_startswith (cmd, "sym.explore.state");
+		size_t prefix_len = is_explore ? 17 : 15;
+		const char *arg = skip_cmd_spaces (cmd + prefix_len);
+		ReplaySymSeedSpec spec;
+		ut64 target = 0;
+		R2ILContext *ctx;
+		RAnalFunction *fcn;
+		SymFunctionScope scope;
+		char *spec_json = NULL;
+		char *external_context_json = NULL;
+		char *result = NULL;
+		bool rust_owned = true;
+
+		if (!arg || !*arg) {
+			if (cons) {
+				r_cons_println (cons, is_explore
+					? "Usage: a:sym.explore.state <target_addr_expr> [json-spec]"
+					: "Usage: a:sym.solve.state <target_addr_expr> [json-spec]");
+			}
+			return strdup ("");
+		}
+		if (!core->dbg) {
+			R_LOG_ERROR ("r2sleigh: active debugger state is required");
+			return strdup ("");
+		}
+		if (!parse_target_and_optional_json (core, arg, &target, &spec_json)) {
+			R_LOG_ERROR ("r2sleigh: invalid state symbolic target/spec");
+			if (cons) {
+				r_cons_println (cons, is_explore
+					? "Usage: a:sym.explore.state <target_addr_expr> [json-spec]"
+					: "Usage: a:sym.solve.state <target_addr_expr> [json-spec]");
+			}
+			return strdup ("");
+		}
+		if (!replay_sym_seed_spec_parse (core, spec_json, &spec, false)) {
+			R_LOG_ERROR ("r2sleigh: invalid state symbolic seed spec");
+			free (spec_json);
+			return strdup ("");
+		}
+		free (spec_json);
+
+		ctx = get_context (anal);
+		if (!ctx) {
+			R_LOG_ERROR ("r2sleigh: no context");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		fcn = resolve_or_materialize_current_function (core, anal);
+		if (!fcn) {
+			R_LOG_ERROR ("r2sleigh: no function at current address");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		if (!build_symbolic_function_scope_with_target (anal, fcn, ctx, &scope, target)) {
+			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
+			replay_sym_seed_spec_fini (&spec);
+			return strdup ("");
+		}
+		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
+		if (sym_map_json) {
+			r2sym_set_symbol_map_json (sym_map_json);
+			free (sym_map_json);
+		}
+		external_context_json = sleigh_collect_sym_external_context_json (anal, fcn);
+
+		result = replay_sym_query_run (core, ctx, &scope, fcn->addr, target, &spec, is_explore, external_context_json);
+		free (external_context_json);
+		if (!result) {
+			rust_owned = false;
+			result = strdup ("{\"error\":\"state symbolic execution failed\"}");
+		}
+
+		if (cons && result) {
+			r_cons_printf (cons, "%s\n", result);
+		}
+		if (result && !sym_result_has_error (result)) {
+			sym_state_cache_update (is_explore ? "explore.state" : "solve.state",
+				fcn->addr, spec.entry_addr? spec.entry_addr: core->addr, target, result);
+		}
+		if (rust_owned) {
+			r2il_string_free (result);
+		} else {
+			free (result);
+		}
+		sym_function_scope_free (&scope);
+		replay_sym_seed_spec_fini (&spec);
+		return strdup ("");
+	}
+
 	if (is_sym_ns && (!strncmp (cmd, "sym.explore", 11) || !strncmp (cmd, "sym.solve", 9))) {
 		bool is_explore = r_str_startswith (cmd, "sym.explore");
 		size_t prefix_len = is_explore ? 11 : 9;
@@ -6563,6 +7085,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		RAnalFunction *fcn;
 		SymFunctionScope scope;
 		char *result = NULL;
+		char *external_context_json = NULL;
 		bool rust_owned = true;
 
 		if (!arg || !*arg) {
@@ -6593,21 +7116,30 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: no function at current address");
 			return strdup("");
 		}
-		if (!build_symbolic_function_scope (anal, fcn, ctx, &scope)) {
+		if (!build_symbolic_function_scope_with_target (anal, fcn, ctx, &scope, target)) {
 			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core);
+		sleigh_debug_scope_log ("sym_query_stage scope_ready count=%zu", scope.count);
+		sleigh_debug_scope_log ("sym_query_stage sym_map_begin");
+		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
 		if (sym_map_json) {
 			r2sym_set_symbol_map_json (sym_map_json);
 			free (sym_map_json);
 		}
+		sleigh_debug_scope_log ("sym_query_stage sym_map_done");
+		sleigh_debug_scope_log ("sym_query_stage assumptions_begin");
+		external_context_json = sleigh_collect_sym_external_context_json (anal, fcn);
+		sleigh_debug_scope_log ("sym_query_stage assumptions_done");
 
+		sleigh_debug_scope_log ("sym_query_stage rust_call_begin target=0x%"PFMT64x, target);
 		if (is_explore) {
-			result = r2sym_explore_to_scope (ctx, scope.functions, scope.count, fcn->addr, target);
+			result = r2sym_explore_to_scope (ctx, scope.functions, scope.count, fcn->addr, target, external_context_json);
 		} else {
-			result = r2sym_solve_to_scope (ctx, scope.functions, scope.count, fcn->addr, target);
+			result = r2sym_solve_to_scope (ctx, scope.functions, scope.count, fcn->addr, target, external_context_json);
 		}
+		sleigh_debug_scope_log ("sym_query_stage rust_call_done");
+		free (external_context_json);
 		if (!result) {
 			rust_owned = false;
 			result = strdup ("{\"error\":\"symbolic execution failed\"}");
@@ -6627,6 +7159,86 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 		sym_function_scope_free (&scope);
 		return strdup("");
+	}
+
+	if (!strcmp (cmd, "sla.assumptions-") || (!strncmp (cmd, "sla.assumptions-", 16) && isspace ((unsigned char)cmd[16]))) {
+		const char *target_arg = skip_cmd_spaces (cmd + 16);
+		RAnalFunction *fcn = (target_arg && *target_arg)
+			? resolve_or_materialize_function_target (core, anal, target_arg)
+			: resolve_or_materialize_current_function (core, anal);
+		if (!fcn) {
+			if (target_arg && *target_arg) {
+				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
+			} else {
+				R_LOG_ERROR ("r2sleigh: no function at current address");
+			}
+			return strdup ("");
+		}
+		if (!r_anal_function_set_assumptions_json (anal, fcn, "")) {
+			R_LOG_ERROR ("r2sleigh: failed to clear assumptions for 0x%"PFMT64x, fcn->addr);
+			return strdup ("");
+		}
+		if (cons) {
+			r_cons_println (cons, "[]");
+		}
+		return strdup ("");
+	}
+
+	if (!strncmp (cmd, "sla.assumptions", 15) && (!cmd[15] || isspace ((unsigned char)cmd[15]))) {
+		const char *target_arg = skip_cmd_spaces (cmd + 15);
+		RAnalFunction *fcn = (target_arg && *target_arg)
+			? resolve_or_materialize_function_target (core, anal, target_arg)
+			: resolve_or_materialize_current_function (core, anal);
+		char *assumptions_json;
+		if (!fcn) {
+			if (target_arg && *target_arg) {
+				R_LOG_ERROR ("r2sleigh: function target not found: %s", target_arg);
+			} else {
+				R_LOG_ERROR ("r2sleigh: no function at current address");
+			}
+			return strdup ("");
+		}
+		assumptions_json = sleigh_collect_function_assumptions_json (anal, fcn);
+		if (cons) {
+			r_cons_printf (cons, "%s\n", assumptions_json? assumptions_json: "[]");
+		}
+		free (assumptions_json);
+		return strdup ("");
+	}
+
+	if (!strncmp (cmd, "sla.assumej", 11) && (!cmd[11] || isspace ((unsigned char)cmd[11]))) {
+		const char *arg = skip_cmd_spaces (cmd + 11);
+		RAnalFunction *fcn;
+		char *assumptions_json;
+
+		if (!arg || !*arg) {
+			if (cons) {
+				r_cons_println (cons, "Usage: a:sla.assumej <json-array>");
+			}
+			return strdup ("");
+		}
+		fcn = resolve_or_materialize_current_function (core, anal);
+		if (!fcn) {
+			R_LOG_ERROR ("r2sleigh: no function at current address");
+			return strdup ("");
+		}
+		assumptions_json = strdup (arg);
+		if (!assumptions_json) {
+			return strdup ("");
+		}
+		r_str_unescape (assumptions_json);
+		if (!r_anal_function_set_assumptions_json (anal, fcn, assumptions_json)) {
+			R_LOG_ERROR ("r2sleigh: invalid assumptions json array");
+			free (assumptions_json);
+			return strdup ("");
+		}
+		free (assumptions_json);
+		assumptions_json = sleigh_collect_function_assumptions_json (anal, fcn);
+		if (cons) {
+			r_cons_printf (cons, "%s\n", assumptions_json? assumptions_json: "[]");
+		}
+		free (assumptions_json);
+		return strdup ("");
 	}
 
 	if (!strncmp (cmd, "sla.arch", 8)) {
@@ -6967,7 +7579,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			return strdup ("");
 		}
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup ("");
 		}
@@ -6978,11 +7590,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			free (external_context_json);
 			external_context_json = strdup ("{}");
 		}
-
 		if (!prefer_bounded_semantic_type_plan) {
 			warm_type_payload_cache_for_function (core, anal, ctx, fcn, interproc_max_iters,
 				&seen_addrs, &seen_count, &seen_cap);
-			interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
+			interproc_scope_json = build_type_interproc_scope_json (
+				core, anal, ctx, fcn, &blocks, interproc_max_iters);
 		}
 		SymFunctionScope sym_scope;
 		if (build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
@@ -7070,7 +7682,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			return strdup ("");
 		}
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup ("");
 		}
@@ -7081,11 +7693,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			free (external_context_json);
 			external_context_json = strdup ("{}");
 		}
-
 		if (!prefer_bounded_semantic_type_plan) {
 			warm_type_payload_cache_for_function (core, anal, ctx, fcn, interproc_max_iters,
 				&seen_addrs, &seen_count, &seen_cap);
-			interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
+			interproc_scope_json = build_type_interproc_scope_json (
+				core, anal, ctx, fcn, &blocks, interproc_max_iters);
 		}
 		SymFunctionScope sym_scope;
 		if (build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
@@ -7161,7 +7773,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 		/* Lift all blocks */
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7192,7 +7804,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7224,7 +7836,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Lift all blocks */
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7257,7 +7869,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Lift all blocks */
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7307,7 +7919,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Lift all blocks */
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7385,7 +7997,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			R_LOG_ERROR ("r2sleigh: failed to build symbolic function scope");
 			return strdup("");
 		}
-		char *sym_map_json = build_sym_symbol_map_json (core);
+		char *sym_map_json = build_sym_symbol_map_json (core, anal, ctx, &scope);
 		if (sym_map_json) {
 			r2sym_set_symbol_map_json (sym_map_json);
 			free (sym_map_json);
@@ -7393,11 +8005,13 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Call symbolic execution */
 		char *result;
+		char *external_context_json = sleigh_collect_sym_external_context_json (anal, fcn);
 		if (is_paths_cmd) {
-			result = r2sym_paths_scope (ctx, scope.functions, scope.count, fcn->addr);
+			result = r2sym_paths_scope (ctx, scope.functions, scope.count, fcn->addr, external_context_json);
 		} else {
-			result = r2sym_function_scope (ctx, scope.functions, scope.count, fcn->addr);
+			result = r2sym_function_scope (ctx, scope.functions, scope.count, fcn->addr, external_context_json);
 		}
+		free (external_context_json);
 
 		if (cons && result) {
 			r_cons_printf (cons, "%s\n", result);
@@ -7424,7 +8038,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Lift all blocks */
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7497,7 +8111,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 		/* Lift all blocks */
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7692,7 +8306,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Lift all blocks */
 		BlockArray blocks;
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
@@ -7729,18 +8343,23 @@ static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
 		return false;
 	}
 
+	if (!sleigh_mode_allows_deep_auto_callbacks (anal)) {
+		return true;
+	}
+	if (function_exceeds_auto_callback_budget (fcn)) {
+		R_LOG_DEBUG ("r2sleigh: auto analyze_fcn skipped by budget fcn=0x%"PFMT64x" blocks=%d",
+			fcn->addr, function_bb_count (fcn));
+		return true;
+	}
+
 	R2ILContext *ctx = get_context (anal);
 	if (!ctx) {
 		return false;
 	}
 
-	if (sleigh_mode_is_fast (anal)) {
-		return true;
-	}
-
 	BlockArray blocks;
 	ut64 cache_key;
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 		return false;
 	}
 
@@ -7780,7 +8399,12 @@ static RList *sleigh_recover_vars(RAnal *anal, RAnalFunction *fcn) {
 	if (!fcn || !anal) {
 		return NULL;
 	}
-	if (sleigh_mode_is_fast (anal)) {
+	if (!sleigh_mode_allows_deep_auto_callbacks (anal)) {
+		return NULL;
+	}
+	if (function_exceeds_auto_callback_budget (fcn)) {
+		R_LOG_DEBUG ("r2sleigh: auto recover_vars skipped by budget fcn=0x%"PFMT64x" blocks=%d",
+			fcn->addr, function_bb_count (fcn));
 		return NULL;
 	}
 
@@ -7790,7 +8414,7 @@ static RList *sleigh_recover_vars(RAnal *anal, RAnalFunction *fcn) {
 	}
 
 	BlockArray blocks;
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 		return NULL;
 	}
 
@@ -8036,7 +8660,12 @@ static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn) {
 	if (!fcn || !anal) {
 		return NULL;
 	}
-	if (sleigh_mode_is_fast (anal)) {
+	if (!sleigh_mode_allows_deep_auto_callbacks (anal)) {
+		return NULL;
+	}
+	if (function_exceeds_auto_callback_budget (fcn)) {
+		R_LOG_DEBUG ("r2sleigh: auto get_data_refs skipped by budget fcn=0x%"PFMT64x" blocks=%d",
+			fcn->addr, function_bb_count (fcn));
 		return NULL;
 	}
 
@@ -8047,7 +8676,7 @@ static RVecAnalRef *sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn) {
 
 	BlockArray blocks;
 	ut64 cache_key;
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 		return NULL;
 	}
 	cache_key = compute_xref_cache_key (fcn, &blocks, sleigh_mode_effective_for_post_analysis (anal));
@@ -8394,6 +9023,8 @@ static bool verify_practical_signature_consistency (
 	ConsistencyReasonCounters *reason_counters
 );
 
+static bool reconcile_signature_register_arg_vars(RAnal *anal, RAnalFunction *fcn, const RJson *sig_root);
+
 static bool apply_inferred_signature_typed(
 	RAnal *anal,
 	RAnalFunction *fcn,
@@ -8468,6 +9099,9 @@ static bool apply_inferred_signature_typed(
 	input.params = param_list;
 	input.noreturn = fcn->is_noreturn;
 	ok = r_anal_function_set_signature (anal, fcn, &input);
+	if (ok) {
+		reconcile_signature_register_arg_vars (anal, fcn, sig_root);
+	}
 	r_list_free (param_list);
 	if (!ok) {
 		write_reason_msg (reason, reason_sz, "typed signature apply failed");
@@ -8489,6 +9123,7 @@ static WritebackApplyResult apply_inferred_signature(
 		return res;
 	}
 	if (verify_signature_type_db_ex (anal, fcn, sig_root, res.detail, sizeof (res.detail))) {
+		reconcile_signature_register_arg_vars (anal, fcn, sig_root);
 		res.already_applied = true;
 		if (!res.detail[0]) {
 			write_reason_msg (res.detail, sizeof (res.detail), "signature already matches");
@@ -8496,6 +9131,7 @@ static WritebackApplyResult apply_inferred_signature(
 		return res;
 	}
 	if (verify_practical_signature_consistency (anal, fcn, sig_root, true, false, NULL, NULL)) {
+		reconcile_signature_register_arg_vars (anal, fcn, sig_root);
 		res.already_applied = true;
 		write_reason_msg (res.detail, sizeof (res.detail), "practical signature already matches");
 		return res;
@@ -8706,9 +9342,9 @@ static int resolve_reg_index(RAnal *anal, const char *reg_name) {
 			*p = toupper ((unsigned char)*p);
 		}
 	}
-	ri = upper_reg? r_reg_get (anal->reg, upper_reg, R_REG_TYPE_GPR): NULL;
+	ri = r_reg_get (anal->reg, reg_name, R_REG_TYPE_GPR);
 	if (!ri) {
-		ri = r_reg_get (anal->reg, reg_name, R_REG_TYPE_GPR);
+		ri = upper_reg? r_reg_get (anal->reg, upper_reg, R_REG_TYPE_GPR): NULL;
 	}
 	if (ri) {
 		index = ri->index;
@@ -8741,6 +9377,106 @@ static RAnalVar *lookup_var_for_candidate(RAnal *anal, RAnalFunction *fcn, const
 		return r_anal_function_get_var (fcn, kind, resolved_delta);
 	}
 	return NULL;
+}
+
+static int score_signature_register_arg_var(RAnalVar *var, const char *expected_name) {
+	if (!var) {
+		return -1;
+	}
+	if (expected_name && *expected_name && var->name && strings_match_normalized (var->name, expected_name)) {
+		return 100;
+	}
+	if (var->name && !is_generated_var_name (var->name)) {
+		return 50;
+	}
+	return 10;
+}
+
+static bool is_stack_arg_name_conflict(RAnalVar *var, RAnalVar *best, const char *expected_name) {
+	if (!var || var == best || !expected_name || !*expected_name || !var->name) {
+		return false;
+	}
+	if (!var->isarg || (var->kind != R_ANAL_VAR_KIND_BPV && var->kind != R_ANAL_VAR_KIND_SPV)) {
+		return false;
+	}
+	return strings_match_normalized (var->name, expected_name);
+}
+
+static bool reconcile_signature_register_arg_vars(RAnal *anal, RAnalFunction *fcn, const RJson *sig_root) {
+	const RJson *j_params;
+	const RJson *j_param;
+	bool changed = false;
+	int idx = 0;
+
+	if (!anal || !fcn || !sig_root || sig_root->type != R_JSON_OBJECT) {
+		return false;
+	}
+	j_params = r_json_get (sig_root, "params");
+	if (!j_params || j_params->type != R_JSON_ARRAY) {
+		return false;
+	}
+
+	for (j_param = json_next_object (j_params->children.first); j_param; j_param = json_next_object (j_param->next), idx++) {
+		const RJson *j_name = r_json_get (j_param, "name");
+		const RJson *j_type = r_json_get (j_param, "type");
+		const char *expected_name = json_is_string_with_value (j_name)? j_name->str_value: NULL;
+		const char *expected_type = json_is_string_with_value (j_type)? j_type->str_value: NULL;
+		RAnalVar *best = NULL;
+		int best_score = -1;
+		RListIter *iter;
+		RAnalVar *var;
+		RList *vars = r_anal_var_all_list (anal, fcn);
+
+		if (!vars) {
+			continue;
+		}
+		r_list_foreach (vars, iter, var) {
+			int score;
+			if (!var || !var->isarg || var->kind != R_ANAL_VAR_KIND_REG) {
+				continue;
+			}
+			if (r_anal_var_get_argnum (var) != idx) {
+				continue;
+			}
+			score = score_signature_register_arg_var (var, expected_name);
+			if (score > best_score) {
+				best = var;
+				best_score = score;
+			}
+		}
+		r_list_free (vars);
+		vars = NULL;
+		if (best) {
+			if (expected_type && *expected_type && (!best->type || !strings_match_normalized (best->type, expected_type))) {
+				r_anal_var_set_type (anal, best, expected_type);
+				changed = true;
+			}
+			if (expected_name && *expected_name && (!best->name || !strings_match_normalized (best->name, expected_name))) {
+				RAnalVar *conflict = r_anal_function_get_var_byname (fcn, expected_name);
+				if (is_stack_arg_name_conflict (conflict, best, expected_name)) {
+					r_anal_var_delete (anal, conflict);
+					changed = true;
+				}
+				r_anal_var_rename (anal, best, expected_name);
+				changed = true;
+			}
+			vars = r_anal_var_all_list (anal, fcn);
+			if (!vars) {
+				continue;
+			}
+			r_list_foreach (vars, iter, var) {
+				if (!var || var == best || !var->isarg || var->kind != R_ANAL_VAR_KIND_REG) {
+					continue;
+				}
+				if (r_anal_var_get_argnum (var) == idx) {
+					r_anal_var_delete (anal, var);
+					changed = true;
+				}
+			}
+			r_list_free (vars);
+		}
+	}
+	return changed;
 }
 
 static bool verify_var_type_applied(RAnalVar *var, const char *expected_type) {
@@ -9023,6 +9759,10 @@ static bool apply_var_rename_candidate(
 	if (!is_generated_var_name (var->name)) {
 		return false;
 	}
+	RAnalVar *conflict = r_anal_function_get_var_byname (fcn, new_name);
+	if (is_stack_arg_name_conflict (conflict, var, new_name)) {
+		r_anal_var_delete (anal, conflict);
+	}
 	if (r_anal_var_rename (anal, var, new_name) && verify_var_rename_applied (var, new_name)) {
 		return true;
 	}
@@ -9079,8 +9819,7 @@ static bool apply_global_type_link_candidate(RAnal *anal, RCore *core, ut64 addr
 }
 
 static ut64 compute_type_cache_key(
-	RAnalFunction *fcn,
-	const char *external_context_json,
+	ut64 artifact_key,
 	ut64 dep_hash,
 	SleighTypeWritebackMode mode,
 	int min_conf,
@@ -9088,19 +9827,13 @@ static ut64 compute_type_cache_key(
 	int struct_min_conf,
 	int max_iters
 ) {
-	ut64 key = 0;
-	int bb_count = (fcn && fcn->bbs)? r_list_length (fcn->bbs): 0;
-	int linear_size = fcn? r_anal_function_linear_size (fcn): 0;
-	key ^= fcn? fcn->addr: 0;
-	key ^= ((ut64)bb_count << 32);
-	key ^= (ut64)linear_size;
+	ut64 key = artifact_key;
 	key ^= ((ut64)mode << 56);
 	key ^= ((ut64)(min_conf & 0xff) << 8);
 	key ^= ((ut64)(rename_min_conf & 0xff) << 16);
 	key ^= ((ut64)(struct_min_conf & 0xff) << 24);
 	key ^= ((ut64)(max_iters & 0xffff) << 40);
 	key ^= dep_hash;
-	key ^= r_str_hash64 (external_context_json? external_context_json: "");
 	return key;
 }
 
@@ -9243,6 +9976,254 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	return targets;
 }
 
+static char *build_ut64_json_array(const ut64 *values, size_t count) {
+	PJ *pj;
+	size_t i;
+	char *out;
+
+	if (!values || count == 0) {
+		return strdup ("[]");
+	}
+	pj = pj_new ();
+	if (!pj) {
+		return strdup ("[]");
+	}
+	pj_a (pj);
+	for (i = 0; i < count; i++) {
+		pj_n (pj, values[i]);
+	}
+	pj_end (pj);
+	out = strdup (pj_string (pj));
+	pj_free (pj);
+	return out? out: strdup ("[]");
+}
+
+static const char *strip_runtime_scope_name_prefixes(const char *name) {
+	const char *normalized = name;
+	if (!normalized) {
+		return NULL;
+	}
+	for (;;) {
+		if (!strncasecmp (normalized, "sym.imp.", 8)) {
+			normalized += 8;
+			continue;
+		}
+		if (!strncasecmp (normalized, "sym.", 4)) {
+			normalized += 4;
+			continue;
+		}
+		if (!strncasecmp (normalized, "imp.", 4)) {
+			normalized += 4;
+			continue;
+		}
+		if (!strncasecmp (normalized, "reloc.", 6)) {
+			normalized += 6;
+			continue;
+		}
+		if (!strncasecmp (normalized, "dbg.", 4)) {
+			normalized += 4;
+			continue;
+		}
+		if (!strncasecmp (normalized, "fcn.", 4)) {
+			normalized += 4;
+			continue;
+		}
+		break;
+	}
+	return normalized;
+}
+
+static bool function_name_is_windows_runtime_registration(const char *name) {
+	const char *normalized = strip_runtime_scope_name_prefixes (name);
+	if (!normalized || !*normalized) {
+		return false;
+	}
+	size_t len = strlen (normalized);
+	size_t suffix_len = strlen ("AddVectoredExceptionHandler");
+	if (len < suffix_len) {
+		return false;
+	}
+	return !strcasecmp (normalized + (len - suffix_len), "AddVectoredExceptionHandler");
+}
+
+static bool function_name_is_import_like(const char *name) {
+	if (!name || !*name) {
+		return false;
+	}
+	return !strncasecmp (name, "sym.imp.", 8)
+		|| !strncasecmp (name, "imp.", 4)
+		|| !strncasecmp (name, "reloc.", 6);
+}
+
+static bool function_name_is_runtime_copy(const char *name) {
+	const char *normalized = strip_runtime_scope_name_prefixes (name);
+	if (!normalized || !*normalized) {
+		return false;
+	}
+	return !strcasecmp (normalized, "memcpy")
+		|| !strcasecmp (normalized, "__memcpy_chk")
+		|| !strncasecmp (normalized, "memcpy", 6);
+}
+
+static ut64 *collect_runtime_scope_targets_from_blocks(
+	R2ILContext *ctx,
+	const BlockArray *blocks,
+	ut64 fcn_addr,
+	const char *fcn_name,
+	const ut64 *registration_targets,
+	size_t registration_target_count,
+	size_t *out_count
+) {
+	char *request_json = NULL;
+	char *targets_json = NULL;
+	RJson *root = NULL;
+	RJson *item;
+	ut64 *targets = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+
+	if (out_count) {
+		*out_count = 0;
+	}
+	if (!ctx || !blocks || !blocks->blocks || blocks->count == 0 || !registration_target_count) {
+		return NULL;
+	}
+	request_json = build_ut64_json_array (registration_targets, registration_target_count);
+	if (!request_json || !*request_json) {
+		free (request_json);
+		return NULL;
+	}
+	targets_json = r2sleigh_get_symbolic_scope_targets_json (ctx,
+		(const R2ILBlock **)blocks->blocks, blocks->count, fcn_addr, fcn_name, request_json);
+	free (request_json);
+	if (!targets_json || !*targets_json) {
+		r2il_string_free (targets_json);
+		return NULL;
+	}
+	root = r_json_parse (targets_json);
+	if (!root || root->type != R_JSON_ARRAY) {
+		r_json_free (root);
+		r2il_string_free (targets_json);
+		return NULL;
+	}
+	for (item = root->children.first; item; item = item->next) {
+		if (!item || item->type != R_JSON_INTEGER) {
+			continue;
+		}
+		append_unique_ut64 (&targets, &count, &cap, item->num.u_value);
+	}
+	r_json_free (root);
+	r2il_string_free (targets_json);
+	if (out_count) {
+		*out_count = count;
+	}
+	return targets;
+}
+
+static bool append_runtime_materialized_source(
+	RuntimeMaterializedSource **sources,
+	size_t *count,
+	size_t *cap,
+	ut64 addr,
+	ut64 size
+) {
+	RuntimeMaterializedSource *next;
+	size_t i;
+	if (!sources || !count || !cap || !addr || !size) {
+		return false;
+	}
+	for (i = 0; i < *count; i++) {
+		if ((*sources)[i].addr == addr) {
+			if ((*sources)[i].size < size) {
+				(*sources)[i].size = size;
+			}
+			return true;
+		}
+	}
+	if (*count >= *cap) {
+		size_t new_cap = *cap? *cap * 2: 4;
+		next = realloc (*sources, new_cap * sizeof (**sources));
+		if (!next) {
+			return false;
+		}
+		*sources = next;
+		*cap = new_cap;
+	}
+	(*sources)[*count].addr = addr;
+	(*sources)[*count].size = size;
+	(*count)++;
+	return true;
+}
+
+static RuntimeMaterializedSource *collect_runtime_materialized_sources_from_blocks(
+	R2ILContext *ctx,
+	const BlockArray *blocks,
+	ut64 fcn_addr,
+	const char *fcn_name,
+	const ut64 *copy_targets,
+	size_t copy_target_count,
+	size_t *out_count
+) {
+	char *request_json = NULL;
+	char *sources_json = NULL;
+	RJson *root = NULL;
+	RJson *item;
+	RuntimeMaterializedSource *sources = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+
+	if (out_count) {
+		*out_count = 0;
+	}
+	if (!ctx || !blocks || !blocks->blocks || blocks->count == 0 || !copy_target_count) {
+		return NULL;
+	}
+	request_json = build_ut64_json_array (copy_targets, copy_target_count);
+	if (!request_json || !*request_json) {
+		free (request_json);
+		return NULL;
+	}
+	sources_json = r2sleigh_get_runtime_materialized_sources_json (ctx,
+		(const R2ILBlock **)blocks->blocks, blocks->count, fcn_addr, fcn_name, request_json);
+	free (request_json);
+	if (!sources_json || !*sources_json) {
+		r2il_string_free (sources_json);
+		return NULL;
+	}
+	root = r_json_parse (sources_json);
+	if (!root || root->type != R_JSON_ARRAY) {
+		r_json_free (root);
+		r2il_string_free (sources_json);
+		return NULL;
+	}
+	for (item = root->children.first; item; item = item->next) {
+		const RJson *addr_json;
+		const RJson *size_json;
+		ut64 addr;
+		ut64 size;
+		if (!item || item->type != R_JSON_OBJECT) {
+			continue;
+		}
+		addr_json = r_json_get (item, "addr");
+		size_json = r_json_get (item, "size");
+		if (!addr_json || addr_json->type != R_JSON_INTEGER
+			|| !size_json || size_json->type != R_JSON_INTEGER) {
+			continue;
+		}
+		addr = addr_json->num.u_value;
+		size = size_json->num.u_value;
+		if (addr && size) {
+			(void)append_runtime_materialized_source (&sources, &count, &cap, addr, size);
+		}
+	}
+	r_json_free (root);
+	r2il_string_free (sources_json);
+	if (out_count) {
+		*out_count = count;
+	}
+	return sources;
+}
+
 static void sym_function_scope_init(SymFunctionScope *scope) {
 	if (!scope) {
 		return;
@@ -9300,7 +10281,8 @@ static bool sym_function_scope_append(
 	SymFunctionScope *scope,
 	RAnal *anal,
 	RAnalFunction *fcn,
-	R2ILContext *ctx
+	R2ILContext *ctx,
+	bool include_linear_gap_blocks
 ) {
 	BlockArray blocks;
 	if (!scope || !anal || !fcn || !ctx) {
@@ -9309,7 +10291,14 @@ static bool sym_function_scope_append(
 	if (!sym_function_scope_ensure_capacity (scope, scope->count + 1)) {
 		return false;
 	}
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+	sleigh_debug_scope_log (
+		"scope_append addr=0x%"PFMT64x" name=%s include_gaps=%d",
+		fcn->addr,
+		fcn->name? fcn->name: "(null)",
+		include_linear_gap_blocks? 1: 0
+	);
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks, include_linear_gap_blocks)) {
+		sleigh_debug_scope_log ("scope_append_failed addr=0x%"PFMT64x, fcn->addr);
 		return false;
 	}
 	scope->owned_blocks[scope->count] = blocks;
@@ -9319,14 +10308,96 @@ static bool sym_function_scope_append(
 	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
 	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
 	scope->count++;
+	sleigh_debug_scope_log (
+		"scope_appended addr=0x%"PFMT64x" blocks=%zu",
+		fcn->addr,
+		blocks.count
+	);
 	return true;
 }
 
-static bool build_symbolic_function_scope(
+static bool lift_runtime_materialized_source_blocks(
+	RAnal *anal,
+	R2ILContext *ctx,
+	ut64 addr,
+	ut64 size,
+	BlockArray *out
+) {
+	ut64 limit;
+	ut64 offset = 0;
+
+	if (!anal || !ctx || !out || !addr || !size || !anal->iob.read_at) {
+		return false;
+	}
+	limit = R_MIN (size, (ut64)SLEIGH_RUNTIME_MATERIALIZED_MAX_BYTES);
+	block_array_init (out);
+	while (offset < limit) {
+		ut64 cur = addr + offset;
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
+		ut64 remaining = limit - offset;
+		ut64 logical_size = R_MIN (remaining, (ut64)SLEIGH_RUNTIME_MATERIALIZED_SLOT_BYTES);
+		R2ILBlock *block;
+
+		if (!anal->iob.read_at (anal->iob.io, cur, buf, sizeof (buf))) {
+			break;
+		}
+		block = r2il_lift_block (ctx, buf, sizeof (buf), cur, (unsigned int)logical_size);
+		if (block) {
+			if (r2il_block_validate (ctx, block)) {
+				block_array_push (out, block);
+			} else {
+				r2il_block_free (block);
+			}
+		}
+		offset += logical_size;
+	}
+	block_array_sort (out);
+	return out->count > 0;
+}
+
+static bool sym_function_scope_append_runtime_source(
+	SymFunctionScope *scope,
+	RAnal *anal,
+	R2ILContext *ctx,
+	ut64 addr,
+	ut64 size
+) {
+	BlockArray blocks;
+	char name[64];
+
+	if (!scope || !anal || !ctx || !addr || !size) {
+		return false;
+	}
+	if (!lift_runtime_materialized_source_blocks (anal, ctx, addr, size, &blocks)) {
+		return false;
+	}
+	if (!sym_function_scope_ensure_capacity (scope, scope->count + 1)) {
+		block_array_free (&blocks);
+		return false;
+	}
+	snprintf (name, sizeof (name), "runtime.materialized.%"PFMT64x, addr);
+	scope->owned_blocks[scope->count] = blocks;
+	scope->owned_names[scope->count] = strdup (name);
+	scope->functions[scope->count].entry_addr = addr;
+	scope->functions[scope->count].name = scope->owned_names[scope->count];
+	scope->functions[scope->count].blocks = (const R2ILBlock **)scope->owned_blocks[scope->count].blocks;
+	scope->functions[scope->count].num_blocks = scope->owned_blocks[scope->count].count;
+	scope->count++;
+	sleigh_debug_scope_log (
+		"scope_runtime_source addr=0x%"PFMT64x" size=%"PFMT64u" blocks=%zu",
+		addr,
+		size,
+		blocks.count
+	);
+	return true;
+}
+
+static bool build_symbolic_function_scope_with_target(
 	RAnal *anal,
 	RAnalFunction *root_fcn,
 	R2ILContext *ctx,
-	SymFunctionScope *scope
+	SymFunctionScope *scope,
+	ut64 target_hint
 ) {
 	size_t queue_count = 0;
 	size_t queue_cap = 0;
@@ -9335,6 +10406,7 @@ static bool build_symbolic_function_scope(
 	ut64 *seen = NULL;
 	size_t seen_count = 0;
 	size_t seen_cap = 0;
+	ut64 target_entry = UT64_MAX;
 
 	if (!anal || !root_fcn || !ctx || !scope) {
 		return false;
@@ -9344,12 +10416,47 @@ static bool build_symbolic_function_scope(
 		free (queue);
 		return false;
 	}
+	if (target_hint != UT64_MAX && target_hint && target_hint != root_fcn->addr) {
+		RAnalFunction *target_fcn = materialize_function_at (anal, target_hint);
+		if (target_fcn) {
+			target_entry = target_fcn->addr;
+			append_unique_ut64 (&queue, &queue_count, &queue_cap, target_fcn->addr);
+			sleigh_debug_scope_log (
+				"scope_target_hint target=0x%"PFMT64x" entry=0x%"PFMT64x" name=%s",
+				target_hint,
+				target_fcn->addr,
+				target_fcn->name? target_fcn->name: "(null)"
+			);
+		} else {
+			sleigh_debug_scope_log (
+				"scope_target_hint_unmaterialized target=0x%"PFMT64x,
+				target_hint
+			);
+		}
+	}
+	sleigh_debug_scope_log (
+		"scope_build_start root=0x%"PFMT64x" name=%s",
+		root_fcn->addr,
+		root_fcn->name? root_fcn->name: "(null)"
+	);
 
 	while (queue_index < queue_count && scope->count < SLEIGH_SYM_HELPER_MAX_FUNCTIONS) {
 		RAnalFunction *fcn;
 		ut64 addr = queue[queue_index++];
-		ut64 *targets = NULL;
+		ut64 *direct_targets = NULL;
+		ut64 *queued_direct_targets = NULL;
+		ut64 *runtime_copy_targets = NULL;
+		ut64 *runtime_targets = NULL;
+		RuntimeMaterializedSource *runtime_sources = NULL;
 		size_t target_count = 0;
+		size_t queued_direct_target_count = 0;
+		size_t queued_direct_target_cap = 0;
+		size_t runtime_copy_target_count = 0;
+		size_t runtime_copy_target_cap = 0;
+		size_t runtime_target_count = 0;
+		size_t runtime_source_count = 0;
+		ut64 registration_targets[8] = {0};
+		size_t registration_target_count = 0;
 		size_t i;
 		const BlockArray *blocks;
 
@@ -9357,31 +10464,210 @@ static bool build_symbolic_function_scope(
 		if (!fcn || !append_unique_ut64 (&seen, &seen_count, &seen_cap, fcn->addr)) {
 			continue;
 		}
-		if (!sym_function_scope_append (scope, anal, fcn, ctx)) {
+		bool target_hint_function = target_entry != UT64_MAX && fcn->addr == target_entry;
+		if (fcn->addr != root_fcn->addr
+			&& !target_hint_function
+			&& function_exceeds_helper_scope_budget (fcn)) {
+			sleigh_debug_scope_log (
+				"scope_skip_budget addr=0x%"PFMT64x" name=%s",
+				fcn->addr,
+				fcn->name? fcn->name: "(null)"
+			);
+			continue;
+		}
+		if (!sym_function_scope_append (
+			scope,
+			anal,
+			fcn,
+			ctx,
+			scope->count == 0 || fcn->addr == root_fcn->addr
+		)) {
+			continue;
+		}
+		if (fcn->addr != root_fcn->addr) {
+			sleigh_debug_scope_log (
+				"scope_expand_helper addr=0x%"PFMT64x" name=%s",
+				fcn->addr,
+				fcn->name? fcn->name: "(null)"
+			);
+		}
+		if (target_hint_function && fcn->addr != root_fcn->addr) {
+			sleigh_debug_scope_log (
+				"scope_target_terminal addr=0x%"PFMT64x" target=0x%"PFMT64x,
+				fcn->addr,
+				target_hint
+			);
 			continue;
 		}
 		blocks = &scope->owned_blocks[scope->count - 1];
-		targets = collect_type_interproc_direct_targets_from_blocks (
+		direct_targets = collect_type_interproc_direct_targets_from_blocks (
 			ctx, blocks, fcn->addr, fcn->name, &target_count);
+		sleigh_debug_scope_log (
+			"scope_targets addr=0x%"PFMT64x" direct=%zu",
+			fcn->addr,
+			target_count
+		);
 		for (i = 0; i < target_count; i++) {
-			RAnalFunction *callee = materialize_function_at (anal, targets[i]);
-			if (callee && !function_exceeds_helper_scope_budget (callee)) {
-				append_unique_ut64 (&queue, &queue_count, &queue_cap, callee->addr);
+			char *target_name = resolve_interproc_seed_name (anal->coreb.core, anal, direct_targets[i]);
+			bool queue_direct_target = true;
+			RAnalFunction *target_fcn = NULL;
+			ut64 scope_target = direct_targets[i];
+			const char *summary_alias = NULL;
+			if (target_name && registration_target_count < R_ARRAY_SIZE (registration_targets)
+				&& function_name_is_windows_runtime_registration (target_name)) {
+				registration_targets[registration_target_count++] = direct_targets[i];
+			}
+			if (target_name && function_name_is_runtime_copy (target_name)) {
+				append_unique_ut64 (
+					&runtime_copy_targets,
+					&runtime_copy_target_count,
+					&runtime_copy_target_cap,
+					direct_targets[i]
+				);
+			}
+			if (target_name && function_name_is_import_like (target_name)) {
+				queue_direct_target = false;
+				sleigh_debug_scope_log (
+					"scope_skip_import_target addr=0x%"PFMT64x" name=%s",
+					direct_targets[i],
+					target_name
+				);
+			}
+			if (queue_direct_target) {
+				summary_alias = detect_local_summary_alias (anal, direct_targets[i]);
+				if (summary_alias) {
+					queue_direct_target = false;
+					if (function_name_is_runtime_copy (summary_alias)) {
+						append_unique_ut64 (
+							&runtime_copy_targets,
+							&runtime_copy_target_count,
+							&runtime_copy_target_cap,
+							direct_targets[i]
+						);
+					}
+					sleigh_debug_scope_log (
+						"scope_skip_summary_target addr=0x%"PFMT64x" summary=%s",
+						direct_targets[i],
+						summary_alias
+					);
+				}
+			}
+			if (queue_direct_target) {
+				scope_target = resolve_local_direct_jump_thunk_target (anal, direct_targets[i]);
+				if (scope_target != direct_targets[i]) {
+					sleigh_debug_scope_log (
+						"scope_resolved_thunk_target from=0x%"PFMT64x" to=0x%"PFMT64x" name=%s",
+						direct_targets[i],
+						scope_target,
+						target_name? target_name: "(null)"
+					);
+				}
+				target_fcn = materialize_function_at (anal, scope_target);
+				if (!target_fcn) {
+					queue_direct_target = false;
+					sleigh_debug_scope_log (
+						"scope_skip_unmaterialized_target addr=0x%"PFMT64x" resolved=0x%"PFMT64x" name=%s",
+						direct_targets[i],
+						scope_target,
+						target_name? target_name: "(null)"
+					);
+				} else if (function_exceeds_helper_scope_budget (target_fcn)) {
+					queue_direct_target = false;
+					sleigh_debug_scope_log (
+						"scope_skip_budget_target addr=0x%"PFMT64x" resolved=0x%"PFMT64x" name=%s",
+						direct_targets[i],
+						scope_target,
+						target_name? target_name: "(null)"
+					);
+				}
+			}
+			free (target_name);
+			if (queue_direct_target) {
+				if (scope_target != direct_targets[i]) {
+					append_unique_ut64 (
+						&queued_direct_targets,
+						&queued_direct_target_count,
+						&queued_direct_target_cap,
+						direct_targets[i]
+					);
+				}
+				append_unique_ut64 (
+					&queued_direct_targets,
+					&queued_direct_target_count,
+					&queued_direct_target_cap,
+					scope_target
+				);
 			}
 		}
-		free (targets);
+		runtime_targets = collect_runtime_scope_targets_from_blocks (
+			ctx,
+			blocks,
+			fcn->addr,
+			fcn->name,
+			registration_targets,
+			registration_target_count,
+			&runtime_target_count);
+		runtime_sources = collect_runtime_materialized_sources_from_blocks (
+			ctx,
+			blocks,
+			fcn->addr,
+			fcn->name,
+			runtime_copy_targets,
+			runtime_copy_target_count,
+			&runtime_source_count);
+		sleigh_debug_scope_log (
+			"scope_runtime_targets addr=0x%"PFMT64x" registrations=%zu runtime=%zu materialized=%zu",
+			fcn->addr,
+			registration_target_count,
+			runtime_target_count,
+			runtime_source_count
+		);
+		for (i = 0; i < runtime_target_count; i++) {
+			append_unique_ut64 (&queue, &queue_count, &queue_cap, runtime_targets[i]);
+		}
+		for (i = 0; i < runtime_source_count && scope->count < SLEIGH_SYM_HELPER_MAX_FUNCTIONS; i++) {
+			if (append_unique_ut64 (&seen, &seen_count, &seen_cap, runtime_sources[i].addr)) {
+				(void)sym_function_scope_append_runtime_source (
+					scope,
+					anal,
+					ctx,
+					runtime_sources[i].addr,
+					runtime_sources[i].size
+				);
+			}
+		}
+		for (i = 0; i < queued_direct_target_count; i++) {
+			append_unique_ut64 (&queue, &queue_count, &queue_cap, queued_direct_targets[i]);
+		}
+		free (queued_direct_targets);
+		free (runtime_copy_targets);
+		free (runtime_targets);
+		free (runtime_sources);
+		free (direct_targets);
 	}
 
 	free (queue);
 	free (seen);
+	sleigh_debug_scope_log ("scope_build_done count=%zu", scope->count);
 	return scope->count > 0;
+}
+
+static bool build_symbolic_function_scope(
+	RAnal *anal,
+	RAnalFunction *root_fcn,
+	R2ILContext *ctx,
+	SymFunctionScope *scope
+) {
+	return build_symbolic_function_scope_with_target (anal, root_fcn, ctx, scope, UT64_MAX);
 }
 
 static char *build_type_interproc_scope_json_from_targets(
 	RCore *core,
 	RAnal *anal,
+	R2ILContext *ctx,
 	const ut64 *targets,
-	size_t target_count
+	size_t target_count,
+	int max_iters
 ) {
 	PJ *pj;
 	ut64 *seen_addrs = NULL;
@@ -9390,7 +10676,7 @@ static char *build_type_interproc_scope_json_from_targets(
 	size_t i;
 	char *out;
 
-	if (!anal || !targets || target_count == 0) {
+	if (!anal || !ctx || !targets || target_count == 0) {
 		return strdup ("{}");
 	}
 	pj = pj_new ();
@@ -9400,6 +10686,58 @@ static char *build_type_interproc_scope_json_from_targets(
 
 	pj_o (pj);
 	pj_ks (pj, "phase", "fixpoint");
+	pj_k (pj, "summaries");
+	pj_a (pj);
+	for (i = 0; i < target_count; i++) {
+		RAnalFunction *callee_fcn;
+		TypeWritebackCacheEntry *entry;
+		BlockArray callee_blocks;
+		char *external_context_json = NULL;
+		char *summary_json = NULL;
+		ut64 target = targets[i];
+		if (!target) {
+			continue;
+		}
+		callee_fcn = materialize_function_at (anal, target);
+		if (!callee_fcn || function_exceeds_helper_scope_budget (callee_fcn)
+			|| !append_unique_ut64 (&seen_addrs, &seen_count, &seen_cap, callee_fcn->addr)) {
+			continue;
+		}
+		entry = type_writeback_cache_get (callee_fcn->addr);
+		if (!entry || !entry->interproc_scope_json || !*entry->interproc_scope_json) {
+			continue;
+		}
+		if (!lift_function_blocks (anal, callee_fcn, ctx, &callee_blocks, true)) {
+			continue;
+		}
+		external_context_json = sleigh_collect_external_context_json (anal, callee_fcn);
+		if (!external_context_json || (external_context_json[0] != '{' && external_context_json[0] != '[')) {
+			free (external_context_json);
+			external_context_json = strdup ("{}");
+		}
+		summary_json = r2sleigh_function_interproc_summary_json_ex (
+			ctx,
+			(const R2ILBlock **)callee_blocks.blocks,
+			callee_blocks.count,
+			callee_fcn->addr,
+			callee_fcn->name,
+			external_context_json? external_context_json: "{}",
+			max_iters,
+			entry->interproc_scope_json);
+		if (summary_json && *summary_json) {
+			pj_j (pj, summary_json);
+		}
+		r2il_string_free (summary_json);
+		free (external_context_json);
+		block_array_free (&callee_blocks);
+	}
+	pj_end (pj);
+
+	free (seen_addrs);
+	seen_addrs = NULL;
+	seen_count = 0;
+	seen_cap = 0;
+
 	pj_k (pj, "payloads");
 	pj_a (pj);
 	for (i = 0; i < target_count; i++) {
@@ -9477,9 +10815,9 @@ static bool warm_type_payload_cache_for_function(
 	char *external_context_json = NULL;
 	char *interproc_scope_json = NULL;
 	char *payload_json = NULL;
+	ut64 artifact_key = 0;
 	ut64 payload_hash = 0;
 	bool ok = false;
-	TypeWritebackCacheEntry *entry;
 
 	if (!core || !anal || !ctx || !fcn) {
 		return false;
@@ -9487,11 +10825,7 @@ static bool warm_type_payload_cache_for_function(
 	if (!append_unique_ut64 (seen_addrs, seen_count, seen_cap, fcn->addr)) {
 		return true;
 	}
-	entry = type_writeback_cache_get (fcn->addr);
-	if (entry && entry->payload_json && *entry->payload_json) {
-		return true;
-	}
-	if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+	if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 		return false;
 	}
 
@@ -9512,14 +10846,30 @@ static bool warm_type_payload_cache_for_function(
 		external_context_json = strdup ("{}");
 	}
 	interproc_scope_json = build_type_interproc_scope_json_from_targets (
-		core, anal, direct_targets, direct_target_count);
+		core, anal, ctx, direct_targets, direct_target_count, max_iters);
+	artifact_key = r2sleigh_function_analysis_artifact_cache_key (
+		ctx,
+		(const R2ILBlock **)blocks.blocks,
+		blocks.count,
+		fcn->addr,
+		fcn->name,
+		external_context_json? external_context_json: "{}",
+		max_iters,
+		interproc_scope_json? interproc_scope_json: "{}");
 	payload_json = r2sleigh_infer_type_writeback_json_ex (ctx,
 		(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
 		external_context_json? external_context_json: "{}",
 		1, max_iters, 1, interproc_scope_json? interproc_scope_json: "{}");
 	if (payload_json && *payload_json) {
 		payload_hash = r_str_hash64 (payload_json);
-		ok = type_writeback_cache_put (fcn->addr, 0, 0, payload_hash, 0, payload_json);
+		ok = type_writeback_cache_put (
+			fcn->addr,
+			artifact_key,
+			0,
+			payload_hash,
+			0,
+			payload_json,
+			interproc_scope_json? interproc_scope_json: "{}");
 	}
 
 	r2il_string_free (payload_json);
@@ -9535,10 +10885,15 @@ static char *build_type_interproc_scope_json(
 	RAnal *anal,
 	R2ILContext *ctx,
 	RAnalFunction *fcn,
-	const BlockArray *blocks
+	const BlockArray *blocks,
+	int max_iters
 ) {
 	ut64 *direct_targets = NULL;
 	size_t direct_target_count = 0;
+	ut64 *seen_addrs = NULL;
+	size_t seen_count = 0;
+	size_t seen_cap = 0;
+	size_t i;
 	char *scope_json;
 
 	if (!anal || !ctx || !fcn || !blocks) {
@@ -9546,9 +10901,19 @@ static char *build_type_interproc_scope_json(
 	}
 	direct_targets = collect_type_interproc_direct_targets_from_blocks (
 		ctx, blocks, fcn->addr, fcn->name, &direct_target_count);
+	for (i = 0; i < direct_target_count; i++) {
+		RAnalFunction *callee_fcn = materialize_function_at (anal, direct_targets[i]);
+		if (!callee_fcn || callee_fcn->addr == fcn->addr
+			|| function_exceeds_helper_scope_budget (callee_fcn)) {
+			continue;
+		}
+		warm_type_payload_cache_for_function (
+			core, anal, ctx, callee_fcn, max_iters, &seen_addrs, &seen_count, &seen_cap);
+	}
 	scope_json = build_type_interproc_scope_json_from_targets (
-		core, anal, direct_targets, direct_target_count);
+		core, anal, ctx, direct_targets, direct_target_count, max_iters);
 	free (direct_targets);
+	free (seen_addrs);
 	return scope_json;
 }
 
@@ -10332,6 +11697,11 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	bool sigwrite_enabled = post_mode != SLEIGH_MODE_FAST;
 	bool type_writeback_enabled = sigwrite_enabled && type_wb_mode != SLEIGH_TYPE_WRITEBACK_OFF;
 	bool sigverify_enabled = false;
+	ut64 post_start_us = r_time_now_mono ();
+	ut64 post_budget_us = post_mode == SLEIGH_MODE_FAST
+		? SLEIGH_POST_ANALYSIS_FAST_BUDGET_USEC
+		: SLEIGH_POST_ANALYSIS_BALANCED_BUDGET_USEC;
+	bool post_budget_exhausted = false;
 	ut64 *type_eligible_addrs = NULL;
 	size_t type_eligible_count = 0;
 	size_t type_eligible_cap = 0;
@@ -10371,6 +11741,12 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	RListIter *iter;
 	RAnalFunction *fcn;
 	r_list_foreach (anal->fcns, iter, fcn) {
+		if (post_budget_us && r_time_now_mono () - post_start_us > post_budget_us) {
+			post_budget_exhausted = true;
+			R_LOG_WARN ("r2sleigh: post-analysis budget exhausted after %llu usec; refusing remaining automatic enrichment",
+				(unsigned long long)(r_time_now_mono () - post_start_us));
+			break;
+		}
 		int bb_count = (fcn && fcn->bbs) ? r_list_length (fcn->bbs) : 0;
 		bool sig_scope_eligible = !sigwrite_focus_only || (focus_callee_addr && fcn && fcn->addr == focus_callee_addr);
 		bool type_scope_eligible = !type_writeback_focus_only || (focus_callee_addr && fcn && fcn->addr == focus_callee_addr);
@@ -10405,7 +11781,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		if (!fcn || !need_blocks) {
 			continue;
 		}
-		if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			continue;
 		}
 
@@ -10737,6 +12113,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			bool signature_arch_eligible = sig_arch_supported;
 			bool callconv_arch_eligible = cc_arch_supported;
 			bool sig_metrics_eligible = signature_arch_eligible && signature_part_eligible;
+			ut64 artifact_key = 0;
 			ut64 cache_key = 0;
 			ut64 payload_hash = 0;
 			ut64 dep_hash = 0;
@@ -10756,16 +12133,28 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				free (external_context_json);
 				external_context_json = strdup ("{}");
 			}
+			interproc_scope_json = build_type_interproc_scope_json (
+				core, anal, ctx, fcn, &blocks, type_max_iters);
+			artifact_key = r2sleigh_function_analysis_artifact_cache_key (
+				ctx,
+				(const R2ILBlock **)blocks.blocks,
+				blocks.count,
+				fcn->addr,
+				fcn->name,
+				external_context_json? external_context_json: "{}",
+				type_max_iters,
+				interproc_scope_json? interproc_scope_json: "{}");
 
 			if (type_cache_enabled && type_writeback_enabled) {
 				TypeWritebackCacheEntry *cache_entry;
 				dep_hash = compute_callee_dependency_hash (core, anal, fcn);
-				cache_key = compute_type_cache_key (fcn, external_context_json,
+				cache_key = compute_type_cache_key (artifact_key,
 					dep_hash, type_wb_mode, type_min_conf,
 					type_rename_min_conf, type_struct_min_conf, type_max_iters);
 				cache_entry = type_writeback_cache_get (fcn->addr);
 				if (cache_entry && cache_entry->key == cache_key) {
 					type_wb.cache_hits++;
+					free (interproc_scope_json);
 					free (external_context_json);
 					block_array_free (&blocks);
 					continue;
@@ -10778,13 +12167,10 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				}
 			}
 
-			interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
 			payload_json = r2sleigh_infer_type_writeback_json_ex (ctx,
 				(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
 				external_context_json? external_context_json: "{}",
 				1, type_max_iters, 1, interproc_scope_json? interproc_scope_json: "{}");
-			free (interproc_scope_json);
-			interproc_scope_json = NULL;
 			if (!payload_json || !*payload_json) {
 				if (sig_metrics_eligible) {
 					sig_parse_failures++;
@@ -10928,7 +12314,14 @@ static bool sleigh_post_analysis(RAnal *anal) {
 
 					if (type_cache_enabled && type_writeback_enabled) {
 						ut64 applied_hash = type_payload_changed? payload_hash: 0;
-						if (type_writeback_cache_put (fcn->addr, cache_key, dep_hash, payload_hash, applied_hash, payload_json)) {
+						if (type_writeback_cache_put (
+								fcn->addr,
+								cache_key,
+								dep_hash,
+								payload_hash,
+								applied_hash,
+								payload_json,
+								interproc_scope_json? interproc_scope_json: "{}")) {
 							type_wb.cache_updates++;
 						}
 					}
@@ -10959,7 +12352,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		block_array_free (&blocks);
 	}
 
-	if (xref_enabled) {
+	if (xref_enabled && !post_budget_exhausted) {
 		ut64 *xref_queue = NULL;
 		size_t xref_queue_count = 0;
 		size_t xref_queue_cap = 0;
@@ -10978,6 +12371,12 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		}
 
 		while (xref_queue_count > 0) {
+			if (post_budget_us && r_time_now_mono () - post_start_us > post_budget_us) {
+				post_budget_exhausted = true;
+				R_LOG_WARN ("r2sleigh: post-analysis xref budget exhausted after %llu usec; refusing remaining automatic xrefs",
+					(unsigned long long)(r_time_now_mono () - post_start_us));
+				break;
+			}
 			ut64 faddr = xref_queue[--xref_queue_count];
 			RAnalFunction *xref_fcn_cur = r_anal_get_fcn_in (anal, faddr, 0);
 			BlockArray xref_blocks;
@@ -10988,7 +12387,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			if (!xref_fcn_cur) {
 				continue;
 			}
-			if (!lift_function_blocks (anal, xref_fcn_cur, ctx, &xref_blocks)) {
+			if (!lift_function_blocks (anal, xref_fcn_cur, ctx, &xref_blocks, true)) {
 				continue;
 			}
 			cache_key = compute_xref_cache_key (xref_fcn_cur, &xref_blocks, post_mode);
@@ -11014,7 +12413,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		qsort (type_eligible_addrs, type_eligible_count, sizeof (ut64), ut64_cmp_asc);
 	}
 
-	if (type_writeback_enabled) {
+	if (type_writeback_enabled && !post_budget_exhausted) {
 		ut64 *queue = NULL;
 		size_t queue_count = 0;
 		size_t queue_cap = 0;
@@ -11033,6 +12432,12 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			}
 		}
 		while (queue_count > 0 && iter_idx < type_max_iters) {
+			if (post_budget_us && r_time_now_mono () - post_start_us > post_budget_us) {
+				post_budget_exhausted = true;
+				R_LOG_WARN ("r2sleigh: post-analysis type fixpoint budget exhausted after %llu usec; refusing remaining type propagation",
+					(unsigned long long)(r_time_now_mono () - post_start_us));
+				break;
+			}
 			ut64 *current = queue;
 			size_t current_count = queue_count;
 			iter_idx++;
@@ -11054,6 +12459,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				bool type_changed = false;
 				bool sig_or_cc_changed = false;
 				bool summary_changed = false;
+				ut64 artifact_key = 0;
 				ut64 payload_hash = 0;
 				ut64 dep_hash = 0;
 				ut64 cache_key = 0;
@@ -11068,7 +12474,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					type_wb.type_fcns_skipped_size++;
 					continue;
 				}
-				if (!lift_function_blocks (anal, fcn, ctx, &blocks)) {
+				if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 					continue;
 				}
 
@@ -11077,16 +12483,28 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					free (external_context_json);
 					external_context_json = strdup ("{}");
 				}
+				interproc_scope_json = build_type_interproc_scope_json (
+					core, anal, ctx, fcn, &blocks, type_max_iters);
+				artifact_key = r2sleigh_function_analysis_artifact_cache_key (
+					ctx,
+					(const R2ILBlock **)blocks.blocks,
+					blocks.count,
+					fcn->addr,
+					fcn->name,
+					external_context_json? external_context_json: "{}",
+					type_max_iters,
+					interproc_scope_json? interproc_scope_json: "{}");
 
 				if (type_cache_enabled) {
 					TypeWritebackCacheEntry *cache_entry;
 					dep_hash = compute_callee_dependency_hash (core, anal, fcn);
-					cache_key = compute_type_cache_key (fcn, external_context_json,
+					cache_key = compute_type_cache_key (artifact_key,
 						dep_hash, type_wb_mode, type_min_conf,
 						type_rename_min_conf, type_struct_min_conf, type_max_iters);
 					cache_entry = type_writeback_cache_get (fcn->addr);
 					if (cache_entry && cache_entry->key == cache_key) {
 						type_wb.cache_hits++;
+						free (interproc_scope_json);
 						free (external_context_json);
 						block_array_free (&blocks);
 						continue;
@@ -11099,14 +12517,11 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					}
 				}
 
-				interproc_scope_json = build_type_interproc_scope_json (core, anal, ctx, fcn, &blocks);
 				payload_json = r2sleigh_infer_type_writeback_json_ex (ctx,
 					(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
 					external_context_json? external_context_json: "{}",
 					(size_t)iter_idx, (size_t)type_max_iters, 0,
 					interproc_scope_json? interproc_scope_json: "{}");
-				free (interproc_scope_json);
-				interproc_scope_json = NULL;
 				if (!payload_json || !*payload_json) {
 					type_wb.payload_missing++;
 					r2il_string_free (payload_json);
@@ -11173,7 +12588,14 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				}
 				if (type_cache_enabled) {
 					ut64 applied_hash = (type_changed || sig_or_cc_changed)? payload_hash: 0;
-					if (type_writeback_cache_put (fcn->addr, cache_key, dep_hash, payload_hash, applied_hash, payload_json)) {
+					if (type_writeback_cache_put (
+							fcn->addr,
+							cache_key,
+							dep_hash,
+							payload_hash,
+							applied_hash,
+							payload_json,
+							interproc_scope_json? interproc_scope_json: "{}")) {
 						type_wb.cache_updates++;
 					}
 				}
@@ -11224,8 +12646,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		snprintf (type_wb.fixpoint_stop_reason, sizeof (type_wb.fixpoint_stop_reason),
 			type_writeback_enabled? "queue_empty": "off");
 	}
-	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d xref_cache_hits=%d xref_recomputes=%d xref_dirty_queued=%d type_queue_pops=%d type_fixpoint_converged=%d",
-		num_fcns, xref_cache_hits, xref_recomputes, xref_dirty_queued,
+	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d xref_cache_hits=%d xref_recomputes=%d xref_dirty_queued=%d type_queue_pops=%d type_fixpoint_converged=%d",
+		num_fcns, post_budget_exhausted? 1: 0, xref_cache_hits, xref_recomputes, xref_dirty_queued,
 		type_wb.fixpoint_queue_pops, type_wb.fixpoint_converged);
 	R_LOG_INFO ("r2sleigh: type write-back enabled=%d mode=%d vars_considered=%d vars_applied=%d vars_hint_only=%d vars_low_conf=%d vars_conflict=%d vars_api_verify_fail=%d vars_cmd_fallback_attempted=%d vars_cmd_apply_fail=%d renames_considered=%d renames_applied=%d renames_low_conf=%d renames_conflict=%d rename_generated_guard_skips=%d structs_considered=%d structs_imported=%d structs_low_conf=%d structs_import_fail=%d global_links_considered=%d global_links_applied=%d global_links_low_conf=%d global_links_conflict_skip=%d global_links_existing_preserved=%d global_links_fail=%d payload_missing=%d payload_parse_failures=%d cache_hits=%d cache_misses=%d cache_invalidates=%d cache_updates=%d type_skipped_arch=%d type_skipped_size=%d fixpoint_iters=%d fixpoint_converged=%d fixpoint_queue_pushes=%d fixpoint_queue_pops=%d fixpoint_requeues=%d fixpoint_stop=%s",
 		type_writeback_enabled? 1: 0, (int)type_wb_mode,
