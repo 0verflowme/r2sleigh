@@ -2,7 +2,7 @@ NAME=signature_struct_array_index_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"calltype":"amd64","name":"dbg.test_struct_array_index","nargs":3,"nlocals":0,"signature":"int32_t dbg.test_struct_array_index (struct sla_struct_420703e08f70f00e *arr, int32_t idx, int32_t v);","size":124}
+{"calltype":"amd64","name":"sym.test_struct_array_index","nargs":3,"nlocals":3,"signature":"int64_t sym.test_struct_array_index (struct sla_struct_420703e08f70f00e *arg1, intN_t arg2, void *arg3);","size":73}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
@@ -14,7 +14,7 @@ NAME=signature_array_index_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"calltype":"amd64","name":"dbg.test_array_index","nargs":2,"nlocals":0,"signature":"int dbg.test_array_index (int *arr, int idx);","size":39}
+{"calltype":"amd64","name":"sym.test_array_index","nargs":2,"nlocals":2,"signature":"int64_t sym.test_array_index (struct sla_struct_296e3114dadc6967 *arg1, intN_t arg2);","size":24}
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa

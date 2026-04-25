@@ -8,16 +8,21 @@ R2R_TMPDIR ?= /tmp/r2sleigh-r2r-tmp
 R2R_PLUGIN_DIR ?= $(R2R_TMPDIR)/plugins
 R2R_RUST_FEATURES ?= all-archs
 R2R_PLUGIN_RUNTIME_SUBDIR ?= r2sleigh
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+SHARED_EXT := dylib
+else
+SHARED_EXT := so
+endif
 LOCAL_PLUGIN_DIR := $(abspath ../../r2plugin)
-LOCAL_PLUGIN_RUST_LIB := $(abspath ../../target/release/libr2sleigh_plugin.so)
-LOCAL_PLUGIN_ANAL_SO := $(LOCAL_PLUGIN_DIR)/anal_sleigh.so
-LOCAL_PLUGIN_ARCH_SO := $(LOCAL_PLUGIN_DIR)/arch_sleigh.so
+LOCAL_PLUGIN_RUST_LIB := $(abspath ../../target/release/libr2sleigh_plugin.$(SHARED_EXT))
+LOCAL_PLUGIN_ANAL_SO := $(LOCAL_PLUGIN_DIR)/anal_sleigh.$(SHARED_EXT)
+LOCAL_PLUGIN_ARCH_SO := $(LOCAL_PLUGIN_DIR)/arch_sleigh.$(SHARED_EXT)
 LOCAL_R2_DIR ?= ../../../radare2
 LOCAL_R2_ABS := $(abspath $(LOCAL_R2_DIR))
 LOCAL_R2_BIN := $(LOCAL_R2_ABS)/binr/radare2/radare2
-LOCAL_R2_ANAL_SO := $(LOCAL_R2_ABS)/libr/anal/libr_anal.so
+LOCAL_R2_ANAL_SO := $(LOCAL_R2_ABS)/libr/anal/libr_anal.$(SHARED_EXT)
 LOCAL_R2_LD_LIBRARY_PATH := $(shell find "$(LOCAL_R2_ABS)/libr" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | paste -sd: -)
-UNAME_S := $(shell uname -s)
 
 ifeq ($(wildcard $(LOCAL_R2_BIN)),$(LOCAL_R2_BIN))
 ifeq ($(wildcard $(LOCAL_R2_ANAL_SO)),$(LOCAL_R2_ANAL_SO))

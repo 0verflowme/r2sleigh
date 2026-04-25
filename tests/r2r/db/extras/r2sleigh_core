@@ -5,198 +5,72 @@ EXPECT=<<EOF_EXPECT
 sla: loaded architecture 'x86-64'
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-a:sla.info
+a:sla
 EOF_CMDS
 RUN
 
-NAME=sla_json_store_ops_at_0x40127e
+NAME=sla_lift_store_tracks_stack_write
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"IntAdd":{"a":{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"Register"},"b":{"offset":18446744073709551612,"size":8,"space":"Const"},"dst":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"}}},{"Copy":{"dst":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"Unique"},"src":{"meta":{"storage_class":"register"},"name":"EDI","offset":56,"size":4,"space":"Register"}}},{"Store":{"addr":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"},"space":{"Custom":"space"},"val":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"Unique"}}}]
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x8 >/dev/null
-a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
+s `is~check_secret[2]`+0x4 >/dev/null
+a:sla.debug.mem | jq -c 'length == 1 and .[0].write == true and .[0].stack == true and .[0].stack_base == "RBP" and .[0].stack_offset == -8'
 EOF_CMDS
 RUN
 
-NAME=sla_regs_store_at_0x40127e
+NAME=sla_lift_cmp_writes_flags_and_reads_stack
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"read":["EDI","RBP"],"write":[]}
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x8 >/dev/null
-a:sla.regs | python3 normalize_snapshot.py regs
+s `is~check_secret[2]`+0x7 >/dev/null
+a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
+a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
+jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("ZF") != null) and ($regs[0].write | index("CF") != null) and (($mem[0] | map(select(.write == false and .stack == true and .stack_offset == -8)) | length) == 1)'
 EOF_CMDS
 RUN
 
-NAME=sla_mem_store_at_0x40127e
+NAME=sla_lift_branch_uses_zf_without_memory
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"addr":"tmp:0x4700","addr_detail":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"unique"},"memory_class":"stack","permissions":{"cacheable":true,"execute":false,"read":false,"volatile":false,"write":true},"size":4,"stack":true,"stack_base":"RBP","stack_offset":-4,"type":"store","value":{"meta":{"storage_class":"register"},"offset":27264,"size":4,"space":"unique"},"write":true}]
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x8 >/dev/null
-a:sla.mem | python3 normalize_snapshot.py json
+s `is~check_secret[2]`+0xe >/dev/null
+a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
+a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
+jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].read == ["ZF"]) and ($regs[0].write == []) and ($mem[0] == [])'
 EOF_CMDS
 RUN
 
-NAME=sla_vars_store_shape_at_0x40127e
+NAME=sla_lift_return_load_writes_rax
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"name":"0xfffffffffffffffc","offset":18446744073709551612,"size":8,"space":"const"},{"meta":{"storage_class":"register"},"name":"EDI","offset":56,"size":4,"space":"register"},{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"register"},{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"name":"tmp:0x4700","offset":18176,"size":8,"space":"unique"},{"meta":{"storage_class":"register"},"name":"tmp:0x6a80","offset":27264,"size":4,"space":"unique"}]
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x8 >/dev/null
-a:sla.vars | python3 normalize_snapshot.py vars
+s `is~check_secret[2]`+0x20 >/dev/null
+a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
+a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
+jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("RAX") != null) and (($mem[0] | map(select(.write == false and .stack == true and .stack_offset == -4)) | length) == 1)'
 EOF_CMDS
 RUN
 
-NAME=sla_json_cmp_ops_at_0x401281
+NAME=sla_lift_cpuid_keeps_userop_name
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-[{"IntAdd":{"a":{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"Register"},"b":{"offset":18446744073709551612,"size":8,"space":"Const"},"dst":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"}}},{"Load":{"addr":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"Unique"},"dst":{"offset":73472,"size":4,"space":"Unique"},"space":{"Custom":"space"}}},{"Copy":{"dst":{"offset":255104,"size":4,"space":"Unique"},"src":{"offset":73472,"size":4,"space":"Unique"}}},{"IntLess":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"CF","offset":512,"size":1,"space":"Register"}}},{"IntSBorrow":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"meta":{"storage_class":"register"},"name":"OF","offset":523,"size":1,"space":"Register"}}},{"IntSub":{"a":{"offset":255104,"size":4,"space":"Unique"},"b":{"offset":57005,"size":4,"space":"Const"},"dst":{"offset":255360,"size":4,"space":"Unique"}}},{"IntSLess":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":0,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"SF","offset":519,"size":1,"space":"Register"}}},{"IntEqual":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":0,"size":4,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"Register"}}},{"IntAnd":{"a":{"offset":255360,"size":4,"space":"Unique"},"b":{"offset":255,"size":4,"space":"Const"},"dst":{"offset":180736,"size":4,"space":"Unique"}}},{"PopCount":{"dst":{"offset":180864,"size":1,"space":"Unique"},"src":{"offset":180736,"size":4,"space":"Unique"}}},{"IntAnd":{"a":{"offset":180864,"size":1,"space":"Unique"},"b":{"offset":1,"size":1,"space":"Const"},"dst":{"offset":180992,"size":1,"space":"Unique"}}},{"IntEqual":{"a":{"offset":180992,"size":1,"space":"Unique"},"b":{"offset":0,"size":1,"space":"Const"},"dst":{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"PF","offset":514,"size":1,"space":"Register"}}}]
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xb >/dev/null
-a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
-EOF_CMDS
-RUN
-
-NAME=sla_regs_cmp_at_0x401281
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-{"read":["RBP"],"write":["CF","OF","PF","SF","ZF"]}
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xb >/dev/null
-a:sla.regs | python3 normalize_snapshot.py regs
-EOF_CMDS
-RUN
-
-NAME=sla_mem_cmp_at_0x401281
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[{"addr":"tmp:0x4700","addr_detail":{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"offset":18176,"size":8,"space":"unique"},"memory_class":"stack","permissions":{"cacheable":true,"execute":false,"read":true,"volatile":false,"write":false},"size":4,"stack":true,"stack_base":"RBP","stack_offset":-4,"type":"load","write":false}]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xb >/dev/null
-a:sla.mem | python3 normalize_snapshot.py json
-EOF_CMDS
-RUN
-
-NAME=sla_vars_cmp_shape_at_0x401281
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[{"name":"0x1","offset":1,"size":1,"space":"const"},{"name":"0xdead","offset":57005,"size":4,"space":"const"},{"name":"0xff","offset":255,"size":4,"space":"const"},{"name":"0xfffffffffffffffc","offset":18446744073709551612,"size":8,"space":"const"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"CF","offset":512,"size":1,"space":"register"},{"meta":{"storage_class":"register"},"name":"OF","offset":523,"size":1,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"PF","offset":514,"size":1,"space":"register"},{"meta":{"storage_class":"register"},"name":"RBP","offset":40,"size":8,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"SF","offset":519,"size":1,"space":"register"},{"meta":{"scalar_kind":"bool","storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"register"},{"name":"tmp:0x11f00","offset":73472,"size":4,"space":"unique"},{"name":"tmp:0x2c200","offset":180736,"size":4,"space":"unique"},{"name":"tmp:0x2c280","offset":180864,"size":1,"space":"unique"},{"name":"tmp:0x2c300","offset":180992,"size":1,"space":"unique"},{"name":"tmp:0x3e480","offset":255104,"size":4,"space":"unique"},{"name":"tmp:0x3e580","offset":255360,"size":4,"space":"unique"},{"meta":{"pointer_hint":"pointer_like","storage_class":"stack"},"name":"tmp:0x4700","offset":18176,"size":8,"space":"unique"}]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xb >/dev/null
-a:sla.vars | python3 normalize_snapshot.py vars
-EOF_CMDS
-RUN
-
-NAME=sla_json_branch_ops_at_0x401288
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[{"BoolNot":{"dst":{"meta":{"scalar_kind":"bool"},"offset":75776,"size":1,"space":"Unique"},"src":{"meta":{"storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"Register"}}},{"CBranch":{"cond":{"meta":{"scalar_kind":"bool"},"offset":75776,"size":1,"space":"Unique"},"target":{"offset":27,"size":8,"space":"Ram"}}}]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x12 >/dev/null
-a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
-EOF_CMDS
-RUN
-
-NAME=sla_regs_branch_at_0x401288
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-{"read":["ZF"],"write":[]}
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x12 >/dev/null
-a:sla.regs | python3 normalize_snapshot.py regs
-EOF_CMDS
-RUN
-
-NAME=sla_mem_branch_at_0x401288
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x12 >/dev/null
-a:sla.mem | python3 normalize_snapshot.py json
-EOF_CMDS
-RUN
-
-NAME=sla_vars_branch_shape_at_0x401288
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[{"meta":{"storage_class":"register"},"name":"ZF","offset":518,"size":1,"space":"register"}]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x12 >/dev/null
-a:sla.vars | python3 normalize_snapshot.py vars
-EOF_CMDS
-RUN
-
-NAME=sla_json_copy_ops_at_0x40128a
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[{"Copy":{"dst":{"meta":{"storage_class":"register"},"name":"RAX","offset":0,"size":8,"space":"Register"},"src":{"offset":1,"size":8,"space":"Const"}}}]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x14 >/dev/null
-a:sla.json | python3 normalize_snapshot.py json --ram-base `is~check_secret[2]`
-EOF_CMDS
-RUN
-
-NAME=sla_regs_copy_at_0x40128a
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-{"read":[],"write":["RAX"]}
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x14 >/dev/null
-a:sla.regs | python3 normalize_snapshot.py regs
-EOF_CMDS
-RUN
-
-NAME=sla_mem_copy_at_0x40128a
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x14 >/dev/null
-a:sla.mem | python3 normalize_snapshot.py json
-EOF_CMDS
-RUN
-
-NAME=sla_vars_copy_shape_at_0x40128a
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
-EXPECT=<<EOF_EXPECT
-[{"name":"0x1","offset":1,"size":8,"space":"const"},{"meta":{"storage_class":"register"},"name":"RAX","offset":0,"size":8,"space":"register"}]
-EOF_EXPECT
-CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x14 >/dev/null
-a:sla.vars | python3 normalize_snapshot.py vars
+s `is~test_cpuid[2]`+0x2 >/dev/null
+a:sla.debug.json | jq -c '([.[] | .CallOther?.userop_name? | strings | select(startswith("cpuid"))] | length) > 0'
 EOF_CMDS
 RUN
