@@ -10534,15 +10534,23 @@ static bool sym_function_scope_ensure_capacity(SymFunctionScope *scope, size_t n
 	while (new_cap < needed) {
 		new_cap *= 2;
 	}
-	functions_next = realloc (scope->functions, new_cap * sizeof (*scope->functions));
-	blocks_next = realloc (scope->owned_blocks, new_cap * sizeof (*scope->owned_blocks));
-	names_next = realloc (scope->owned_names, new_cap * sizeof (*scope->owned_names));
+	functions_next = calloc (new_cap, sizeof (*scope->functions));
+	blocks_next = calloc (new_cap, sizeof (*scope->owned_blocks));
+	names_next = calloc (new_cap, sizeof (*scope->owned_names));
 	if (!functions_next || !blocks_next || !names_next) {
 		free (functions_next);
 		free (blocks_next);
 		free (names_next);
 		return false;
 	}
+	if (scope->count) {
+		memcpy (functions_next, scope->functions, scope->count * sizeof (*scope->functions));
+		memcpy (blocks_next, scope->owned_blocks, scope->count * sizeof (*scope->owned_blocks));
+		memcpy (names_next, scope->owned_names, scope->count * sizeof (*scope->owned_names));
+	}
+	free (scope->functions);
+	free (scope->owned_blocks);
+	free (scope->owned_names);
 	scope->functions = functions_next;
 	scope->owned_blocks = blocks_next;
 	scope->owned_names = names_next;
