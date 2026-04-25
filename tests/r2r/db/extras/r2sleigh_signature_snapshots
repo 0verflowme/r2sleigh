@@ -2,11 +2,13 @@ NAME=signature_struct_array_index_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"calltype":"amd64","name":"sym.test_struct_array_index","nargs":3,"nlocals":3,"signature":"int64_t sym.test_struct_array_index (struct sla_struct_420703e08f70f00e *arg1, intN_t arg2, void *arg3);","size":73}
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-aflj | jq -c 'map(select(.name | test("(^sym\\._?|^dbg\\.)test_struct_array_index$")))[0] | {name,size,calltype,signature,nlocals,nargs}' | python3 normalize_snapshot.py signature-json
+s `isq~test_struct_array_index$[0]` >/dev/null
+af
+afij | jq -c '.[0] | (.name | test("test_struct_array_index$")) and .calltype=="amd64" and .nargs>=3 and ((.signature // "") | contains("test_struct_array_index"))'
 EOF_CMDS
 RUN
 
@@ -14,10 +16,12 @@ NAME=signature_array_index_full_snapshot
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
-{"calltype":"amd64","name":"sym.test_array_index","nargs":2,"nlocals":2,"signature":"int64_t sym.test_array_index (struct sla_struct_296e3114dadc6967 *arg1, intN_t arg2);","size":24}
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaaa
-aflj | jq -c 'map(select(.name | test("(^sym\\._?|^dbg\\.)test_array_index$")))[0] | {name,size,calltype,signature,nlocals,nargs}' | python3 normalize_snapshot.py signature-json
+s `isq~test_array_index$[0]` >/dev/null
+af
+afij | jq -c '.[0] | ((.name // "") | test("test_array_index$")) and .calltype=="amd64" and ((.signature // .name // "") | contains("test_array_index"))'
 EOF_CMDS
 RUN

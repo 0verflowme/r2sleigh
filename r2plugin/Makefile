@@ -71,7 +71,7 @@ LDFLAGS = $(R2_LDFLAGS) -L$(RUST_BUILD_DIR) -lr2sleigh_plugin $(LDFLAGS_OS) -lst
 ANAL_PLUGIN_SO = $(ANAL_PLUGIN_NAME).$(PLUGIN_EXT)
 ARCH_PLUGIN_SO = $(ARCH_PLUGIN_NAME).$(PLUGIN_EXT)
 
-.PHONY: all clean install uninstall rust rust-debug rust-release help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs
+.PHONY: all clean install uninstall rust rust-debug rust-release help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs FORCE
 
 RUST_MANIFESTS := $(shell find .. -maxdepth 2 \( -name Cargo.toml -o -path '../.cargo/config.toml' \) -type f)
 RUST_SOURCES := $(shell find ../r2plugin/src ../crates -type f -name '*.rs')
@@ -115,12 +115,12 @@ endif
 ifeq ($(RUST_TARGET),release)
 rust: rust-release
 rust-release: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): $(RUST_BUILD_PREREQS)
+$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): FORCE $(RUST_BUILD_PREREQS)
 	cd .. && cargo build --release --features $(RUST_FEATURES) -p r2sleigh-plugin
 else
 rust: rust-debug
 rust-debug: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): $(RUST_BUILD_PREREQS)
+$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): FORCE $(RUST_BUILD_PREREQS)
 	cd .. && cargo build --features $(RUST_FEATURES) -p r2sleigh-plugin
 endif
 ifeq ($(UNAME),Darwin)
@@ -128,7 +128,7 @@ ifeq ($(UNAME),Darwin)
 	@codesign --force --sign - $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
 endif
 
-$(RUST_LIB_LOCAL): $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+$(RUST_LIB_LOCAL): FORCE $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	mkdir -p $(RUST_RUNTIME_SUBDIR)
 	rm -f $@
 	cp $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) $@

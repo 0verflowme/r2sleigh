@@ -981,11 +981,15 @@ fn recognize_affine_pointer<'ctx>(addr: &SymValue<'ctx>) -> Option<AffinePointer
 }
 
 fn recognize_affine_bv(ast: &BV) -> Option<(BV, i64)> {
+    recognize_affine_bv_by_kind(ast).or_else(|| recognize_affine_bv_by_substitution(ast))
+}
+
+fn recognize_affine_bv_by_kind(ast: &BV) -> Option<(BV, i64)> {
     if ast.as_u64().is_some() {
         return None;
     }
 
-    if ast.is_const() && ast.decl().kind() == DeclKind::Uninterpreted {
+    if is_symbolic_bv_leaf(ast) {
         return Some((ast.clone(), 0));
     }
 
@@ -1031,6 +1035,48 @@ fn recognize_affine_bv(ast: &BV) -> Option<(BV, i64)> {
         }
         _ => None,
     }
+}
+
+fn recognize_affine_bv_by_substitution(ast: &BV) -> Option<(BV, i64)> {
+    let mut leaves = BTreeMap::new();
+    collect_uninterpreted_bv_leaves(ast, &mut leaves);
+    if leaves.len() != 1 {
+        return None;
+    }
+    let base = leaves.into_values().next()?;
+    let zero = BV::from_u64(0, base.get_size());
+    let residual = ast.substitute(&[(&base, &zero)]).simplify();
+    let delta = affine_constant(&residual)?;
+    let widened_base = widen_affine_base(&base, ast.get_size());
+    let expected = if delta == 0 {
+        widened_base.clone()
+    } else if delta > 0 {
+        widened_base.bvadd(BV::from_i64(delta, ast.get_size()))
+    } else {
+        widened_base.bvsub(BV::from_i64(delta.saturating_abs(), ast.get_size()))
+    };
+    let solver = Solver::new();
+    solver.assert(expected.eq(ast).not());
+    (solver.check() == SatResult::Unsat).then_some((widened_base, delta))
+}
+
+fn collect_uninterpreted_bv_leaves(ast: &BV, leaves: &mut BTreeMap<String, BV>) {
+    if ast.as_u64().is_some() {
+        return;
+    }
+    if is_symbolic_bv_leaf(ast) {
+        leaves.entry(ast.to_string()).or_insert_with(|| ast.clone());
+        return;
+    }
+    for child in ast.children() {
+        if let Some(child_bv) = child.as_bv() {
+            collect_uninterpreted_bv_leaves(&child_bv, leaves);
+        }
+    }
+}
+
+fn is_symbolic_bv_leaf(ast: &BV) -> bool {
+    ast.as_u64().is_none() && ast.children().is_empty()
 }
 
 fn widen_affine_base(base: &BV, target_bits: u32) -> BV {

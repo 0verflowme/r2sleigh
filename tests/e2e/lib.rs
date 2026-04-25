@@ -295,9 +295,12 @@ fn configure_plugin_env(command: &mut Command) {
             }
         }
         let plugin_src = plugin_src?;
-        let home_dir = std::env::temp_dir().join("r2sleigh-e2e-home");
+        let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".to_string());
+        let home_dir = std::env::temp_dir()
+            .join(format!("r2sleigh-e2e-home-{}-{run_id}", std::process::id()));
         let plugin_dst = home_dir.join(".local/share/radare2/plugins");
         let runtime_dst = plugin_dst.join(RUST_PLUGIN_SUBDIR);
+        let _ = fs::remove_dir_all(&home_dir);
         fs::create_dir_all(&plugin_dst).ok()?;
         fs::create_dir_all(&runtime_dst).ok()?;
         fs::copy(
@@ -353,13 +356,15 @@ fn configure_plugin_env(command: &mut Command) {
     if let Some(home_dir) = home_override {
         let plugins = home_dir.join(".local/share/radare2/plugins");
         command.env("HOME", home_dir);
-        command.env("R2_USER_PLUGINS", plugins);
+        command.env("R2_USER_PLUGINS", &plugins);
+        command.env("R2_LIBR_PLUGINS", plugins);
         return;
     }
 
     if let Ok(home) = std::env::var("HOME") {
         let plugin_dir = format!("{}/.local/share/radare2/plugins", home);
-        command.env("R2_USER_PLUGINS", plugin_dir);
+        command.env("R2_USER_PLUGINS", &plugin_dir);
+        command.env("R2_LIBR_PLUGINS", plugin_dir);
     }
 }
 

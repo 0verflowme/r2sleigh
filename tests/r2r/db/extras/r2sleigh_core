@@ -1,6 +1,6 @@
 NAME=sla_info_arch_loaded
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
 EXPECT=<<EOF_EXPECT
 sla: loaded architecture 'x86-64'
 EOF_EXPECT
@@ -10,25 +10,27 @@ EOF_CMDS
 RUN
 
 NAME=sla_lift_store_tracks_stack_write
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x4 >/dev/null
+wx 488945f8000000000000000000000000
+s 0 >/dev/null
 a:sla.debug.mem | jq -c 'length == 1 and .[0].write == true and .[0].stack == true and .[0].stack_base == "RBP" and .[0].stack_offset == -8'
 EOF_CMDS
 RUN
 
 NAME=sla_lift_cmp_writes_flags_and_reads_stack
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x7 >/dev/null
+wx 48837df8000000000000000000000000
+s 0 >/dev/null
 a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
 a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
 jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("ZF") != null) and ($regs[0].write | index("CF") != null) and (($mem[0] | map(select(.write == false and .stack == true and .stack_offset == -8)) | length) == 1)'
@@ -36,13 +38,14 @@ EOF_CMDS
 RUN
 
 NAME=sla_lift_branch_uses_zf_without_memory
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0xe >/dev/null
+wx 74050000000000000000000000000000
+s 0 >/dev/null
 a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
 a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
 jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].read == ["ZF"]) and ($regs[0].write == []) and ($mem[0] == [])'
@@ -50,13 +53,14 @@ EOF_CMDS
 RUN
 
 NAME=sla_lift_return_load_writes_rax
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~check_secret[2]`+0x20 >/dev/null
+wx 488b45fc000000000000000000000000
+s 0 >/dev/null
 a:sla.debug.regs > /tmp/r2sleigh_core_regs.json
 a:sla.debug.mem > /tmp/r2sleigh_core_mem.json
 jq -n -c --slurpfile regs /tmp/r2sleigh_core_regs.json --slurpfile mem /tmp/r2sleigh_core_mem.json '($regs[0].write | index("RAX") != null) and (($mem[0] | map(select(.write == false and .stack == true and .stack_offset == -4)) | length) == 1)'
@@ -64,13 +68,14 @@ EOF_CMDS
 RUN
 
 NAME=sla_lift_cpuid_keeps_userop_name
-FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e bin.relocs.apply=true
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-s `is~test_cpuid[2]`+0x2 >/dev/null
+wx 0fa20000000000000000000000000000
+s 0 >/dev/null
 a:sla.debug.json | jq -c '([.[] | .CallOther?.userop_name? | strings | select(startswith("cpuid"))] | length) > 0'
 EOF_CMDS
 RUN

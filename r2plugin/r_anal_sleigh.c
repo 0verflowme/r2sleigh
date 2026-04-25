@@ -1351,28 +1351,33 @@ static bool data_ref_cache_put(ut64 addr, ut64 key, ut64 payload_hash, int ref_c
 }
 
 static bool type_writeback_cache_get(ut64 addr, TypeWritebackCacheEntry *entry) {
-	ut64 key = 0;
-	ut64 dep_hash = 0;
-	ut64 payload_hash = 0;
-	ut64 applied_hash = 0;
+	unsigned long long key = 0;
+	unsigned long long dep_hash = 0;
+	unsigned long long payload_hash = 0;
+	unsigned long long applied_hash = 0;
 	if (!entry) {
 		return false;
 	}
-	if (!r2sleigh_type_writeback_cache_get (addr, &key, &dep_hash, &payload_hash, &applied_hash)) {
+	if (!r2sleigh_type_writeback_cache_get ((unsigned long long)addr, &key, &dep_hash, &payload_hash, &applied_hash)) {
 		return false;
 	}
 	entry->addr = addr;
-	entry->key = key;
-	entry->dep_hash = dep_hash;
-	entry->payload_hash = payload_hash;
-	entry->applied_hash = applied_hash;
+	entry->key = (ut64)key;
+	entry->dep_hash = (ut64)dep_hash;
+	entry->payload_hash = (ut64)payload_hash;
+	entry->applied_hash = (ut64)applied_hash;
 	return true;
 }
 
 static bool is_caller_propagation_ref_type(RAnalRefType type);
 
 static bool type_writeback_cache_put(ut64 addr, ut64 key, ut64 dep_hash, ut64 payload_hash, ut64 applied_hash) {
-	return r2sleigh_type_writeback_cache_put (addr, key, dep_hash, payload_hash, applied_hash) != 0;
+	return r2sleigh_type_writeback_cache_put (
+		(unsigned long long)addr,
+		(unsigned long long)key,
+		(unsigned long long)dep_hash,
+		(unsigned long long)payload_hash,
+		(unsigned long long)applied_hash) != 0;
 }
 
 static void sym_state_cache_update(const char *mode, ut64 function_addr, ut64 entry_addr, ut64 target_addr, const char *result_json) {
@@ -4474,7 +4479,14 @@ static const char *taint_risk_level_flag_name(TaintRiskLevel level) {
 }
 
 static const char *dangerous_sinks[] = {
+	"__memcpy_chk",
+	"__memmove_chk",
+	"__snprintf_chk",
+	"__sprintf_chk",
+	"__strcat_chk",
+	"__strcpy_chk",
 	"memcpy",
+	"memmove",
 	"strcpy",
 	"strcat",
 	"gets",
@@ -6634,7 +6646,7 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 	}
 
 	/* Ensure we have enough bytes for libsla */
-	ut8 buf[SLEIGH_MIN_BYTES];
+	ut8 buf[SLEIGH_MIN_BYTES] = {0};
 	int use_len = len;
 	const ut8 *use_data = data;
 
@@ -7565,7 +7577,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		/* Get current seek */
 		ut64 addr = core->addr;
 
-		ut8 buf[SLEIGH_MIN_BYTES];
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
 			R_LOG_ERROR ("r2sleigh: failed to read bytes at 0x%"PFMT64x, addr);
 			return strdup("");
@@ -7611,7 +7623,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		ut64 addr = core->addr;
-		ut8 buf[SLEIGH_MIN_BYTES];
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
 			R_LOG_ERROR ("r2sleigh: failed to read bytes at 0x%"PFMT64x, addr);
 			return strdup("");
@@ -7646,7 +7658,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		ut64 addr = core->addr;
-		ut8 buf[SLEIGH_MIN_BYTES];
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
 			R_LOG_ERROR ("r2sleigh: failed to read bytes at 0x%"PFMT64x, addr);
 			return strdup("");
@@ -7696,7 +7708,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		ut64 addr = core->addr;
-		ut8 buf[SLEIGH_MIN_BYTES];
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
 			R_LOG_ERROR ("r2sleigh: failed to read bytes at 0x%"PFMT64x, addr);
 			return strdup("");
@@ -7726,7 +7738,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		ut64 addr = core->addr;
-		ut8 buf[SLEIGH_MIN_BYTES];
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
 			R_LOG_ERROR ("r2sleigh: failed to read bytes at 0x%"PFMT64x, addr);
 			return strdup("");
@@ -7756,7 +7768,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		ut64 addr = core->addr;
-		ut8 buf[SLEIGH_MIN_BYTES];
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
 			R_LOG_ERROR ("r2sleigh: failed to read bytes at 0x%"PFMT64x, addr);
 			return strdup("");
@@ -7786,7 +7798,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		ut64 addr = core->addr;
-		ut8 buf[SLEIGH_MIN_BYTES];
+		ut8 buf[SLEIGH_MIN_BYTES] = {0};
 		if (!anal->iob.read_at (anal->iob.io, addr, buf, sizeof (buf))) {
 			R_LOG_ERROR ("r2sleigh: failed to read bytes at 0x%"PFMT64x, addr);
 			return strdup("");

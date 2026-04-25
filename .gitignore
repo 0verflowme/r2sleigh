@@ -23,6 +23,7 @@ com.apple.kernel
 # Plugin build artifacts
 r2plugin/*.so
 r2plugin/*.dylib
+r2plugin/r2sleigh/*.so
 r2plugin/r2sleigh/*.dylib
 
 # Debug
