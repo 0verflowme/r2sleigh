@@ -177,7 +177,7 @@ fn run_r2_with_env(
 ) -> R2Result {
     let retries = parse_retry_count(std::env::var("R2SLEIGH_E2E_RETRIES").ok());
     for attempt in 0..=retries {
-        let mut command = Command::new("r2");
+        let mut command = Command::new(radare2_binary());
         command.args(["-q", "-e", "bin.relocs.apply=true", "-c", cmd, binary]);
         configure_plugin_env(&mut command);
 
@@ -199,6 +199,26 @@ fn run_r2_with_env(
     }
 
     unreachable!("retry loop must return in all paths");
+}
+
+fn radare2_binary() -> PathBuf {
+    if let Ok(path) = std::env::var("R2SLEIGH_E2E_RADARE2")
+        .or_else(|_| std::env::var("R2R_RADARE2"))
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    for candidate in [
+        "../radare2/binr/radare2/radare2",
+        "../../radare2/binr/radare2/radare2",
+        "/Users/priyanshu/code/radare2/binr/radare2/radare2",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+    PathBuf::from("r2")
 }
 
 fn should_retry_transient_crash(result: &R2Result, attempt: u32, retries: u32) -> bool {
