@@ -34,22 +34,43 @@ mod cli_run {
         }
     }
 
+    fn configure_nested_cargo_env(command: &mut Command) {
+        if std::env::var_os("Z3_SYS_Z3_HEADER").is_none() {
+            for candidate in ["/opt/homebrew/include/z3.h", "/usr/local/include/z3.h"] {
+                if Path::new(candidate).exists() {
+                    command.env("Z3_SYS_Z3_HEADER", candidate);
+                    break;
+                }
+            }
+        }
+        if std::env::var_os("Z3_LIBRARY_PATH_OVERRIDE").is_none() {
+            for candidate in ["/opt/homebrew/lib", "/usr/local/lib"] {
+                if Path::new(candidate).join("libz3.dylib").exists()
+                    || Path::new(candidate).join("libz3.so").exists()
+                {
+                    command.env("Z3_LIBRARY_PATH_OVERRIDE", candidate);
+                    break;
+                }
+            }
+        }
+    }
+
     fn run_cli(args: &[&str]) -> (String, String, bool) {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "--manifest-path",
-                workspace_manifest_path(),
-                "-p",
-                "r2sleigh-cli",
-                "--features",
-                "x86",
-                "--",
-            ])
-            .args(args)
-            .output()
-            .expect("execute r2sleigh cli");
+        let mut command = Command::new("cargo");
+        command.args([
+            "run",
+            "-q",
+            "--manifest-path",
+            workspace_manifest_path(),
+            "-p",
+            "r2sleigh-cli",
+            "--features",
+            "x86",
+            "--",
+        ]);
+        command.args(args);
+        configure_nested_cargo_env(&mut command);
+        let output = command.output().expect("execute r2sleigh cli");
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -257,7 +278,10 @@ mod ffi {
         > = unsafe { lib.get(b"r2sleigh_session_analyze").unwrap() };
         let session_type_writeback: libloading::Symbol<
             unsafe extern "C" fn(*const c_void) -> *const c_char,
-        > = unsafe { lib.get(b"r2sleigh_session_result_type_writeback_json").unwrap() };
+        > = unsafe {
+            lib.get(b"r2sleigh_session_result_type_writeback_json")
+                .unwrap()
+        };
         let session_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
             unsafe { lib.get(b"r2sleigh_session_result_free").unwrap() };
         let input = R2SleighSessionInput {
@@ -272,8 +296,10 @@ mod ffi {
                 context_hash: 0,
                 external_context_json: external_context.as_ptr(),
                 signature_name: function_name.as_ptr(),
-                signature_ret_type: signature_ret_type.map_or(std::ptr::null(), |value| value.as_ptr()),
-                signature_callconv: signature_callconv.map_or(std::ptr::null(), |value| value.as_ptr()),
+                signature_ret_type: signature_ret_type
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                signature_callconv: signature_callconv
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
                 signature_noreturn: 0,
                 params: params.as_ptr().cast(),
                 num_params: params.len(),
@@ -305,10 +331,7 @@ mod ffi {
         let session = unsafe { session_analyze(&input) };
         assert!(!session.is_null(), "Expected non-null session result");
         let json_ptr = unsafe { session_type_writeback(session) };
-        assert!(
-            !json_ptr.is_null(),
-            "Expected session type writeback JSON"
-        );
+        assert!(!json_ptr.is_null(), "Expected session type writeback JSON");
         let json = unsafe { CStr::from_ptr(json_ptr) }
             .to_string_lossy()
             .to_string();
@@ -1887,7 +1910,10 @@ mod ffi {
                 .and_then(|obj| obj.get("type"))
                 .and_then(Value::as_str);
             assert!(
-                matches!(param_ty, Some("char *") | Some("int8_t*") | Some("int8_t *")),
+                matches!(
+                    param_ty,
+                    Some("char *") | Some("int8_t*") | Some("int8_t *")
+                ),
                 "explicit param type should survive via canonicalization, got {:?} in {}",
                 param_ty,
                 json_str
@@ -1976,10 +2002,7 @@ mod ffi {
             let json_str = CStr::from_ptr(json_ptr).to_string_lossy().to_string();
             r2il_string_free(json_ptr);
             let parsed: Value = serde_json::from_str(&json_str).expect("valid signature json");
-            assert_eq!(
-                parsed.get("arch").and_then(Value::as_str),
-                Some("aarch64")
-            );
+            assert_eq!(parsed.get("arch").and_then(Value::as_str), Some("aarch64"));
             assert_eq!(
                 parsed.get("callconv").and_then(Value::as_str),
                 Some(""),
@@ -2083,10 +2106,7 @@ mod ffi {
                 &typed_params,
             );
             let parsed: Value = serde_json::from_str(&json_str).expect("valid type writeback json");
-            assert_eq!(
-                parsed.get("arch").and_then(Value::as_str),
-                Some("aarch64")
-            );
+            assert_eq!(parsed.get("arch").and_then(Value::as_str), Some("aarch64"));
             assert_eq!(
                 parsed.get("callconv").and_then(Value::as_str),
                 Some(""),
@@ -2110,10 +2130,7 @@ mod ffi {
                 json_str
             );
             assert!(
-                parsed
-                    .get("params")
-                    .and_then(Value::as_array)
-                    .is_some(),
+                parsed.get("params").and_then(Value::as_array).is_some(),
                 "non-x86 type writeback payload should still serialize params: {}",
                 json_str
             );
@@ -2220,7 +2237,10 @@ mod host_matrix {
             assert_check_secret_semantic_invariants(&result.stdout);
             checked += 1;
         }
-        assert!(checked > 0, "host-matrix must validate at least one fresh target");
+        assert!(
+            checked > 0,
+            "host-matrix must validate at least one fresh target"
+        );
     }
 }
 
