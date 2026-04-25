@@ -32,6 +32,9 @@ pub type ExternalStackVarSpec = ExternalStackSlotSpec;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedExternalContext {
+    pub context_schema_version: Option<u64>,
+    pub context_dirty_epoch: Option<u64>,
+    pub context_hash: Option<u64>,
     pub current_signature: Option<FunctionSignatureSpec>,
     pub merged_signature: Option<FunctionSignatureSpec>,
     pub known_function_signatures: HashMap<String, FunctionType>,
@@ -123,6 +126,16 @@ pub struct ExternalSignatureJson {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalContextMetadataJson {
+    #[serde(default)]
+    pub schema_version: Option<u64>,
+    #[serde(default)]
+    pub dirty_epoch: Option<u64>,
+    #[serde(default)]
+    pub context_hash: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalVarJson {
     pub kind: ExternalVarKind,
     pub name: String,
@@ -200,6 +213,8 @@ pub struct KnownSignatureJson {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalContextJson {
+    #[serde(default)]
+    pub context: Option<ExternalContextMetadataJson>,
     #[serde(default)]
     pub signature: Option<ExternalSignatureJson>,
     #[serde(default)]
@@ -319,13 +334,25 @@ pub fn parse_external_context_json(json_str: &str, ptr_bits: u32) -> ParsedExter
         return ParsedExternalContext::default();
     }
 
-    let mut parsed = ParsedExternalContext::default();
     let Ok(raw) = serde_json::from_str::<ExternalContextJson>(trimmed) else {
+        let mut parsed = ParsedExternalContext::default();
         parsed
             .diagnostics
             .push("failed to parse external context json".to_string());
         return parsed;
     };
+
+    parse_external_context(raw, ptr_bits)
+}
+
+pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> ParsedExternalContext {
+    let mut parsed = ParsedExternalContext::default();
+
+    if let Some(context) = raw.context.as_ref() {
+        parsed.context_schema_version = context.schema_version;
+        parsed.context_dirty_epoch = context.dirty_epoch;
+        parsed.context_hash = context.context_hash;
+    }
 
     if let Some(signature) = raw.signature.as_ref() {
         parsed.current_signature = parse_signature_json(signature, ptr_bits);

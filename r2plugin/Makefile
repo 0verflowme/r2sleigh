@@ -38,6 +38,10 @@ LOCAL_R2_LIB_FLAGS = \
 	-L$(LOCAL_R2_ABS)/libr/core \
 	-L$(LOCAL_R2_ABS)/libr/anal \
 	-L$(LOCAL_R2_ABS)/libr/arch \
+	-L$(LOCAL_R2_ABS)/libr/bin \
+	-L$(LOCAL_R2_ABS)/libr/bp \
+	-L$(LOCAL_R2_ABS)/libr/config \
+	-L$(LOCAL_R2_ABS)/libr/debug \
 	-L$(LOCAL_R2_ABS)/libr/util \
 	-L$(LOCAL_R2_ABS)/libr/io \
 	-L$(LOCAL_R2_ABS)/libr/reg \
@@ -47,7 +51,7 @@ LOCAL_R2_LIB_FLAGS = \
 	-L$(LOCAL_R2_ABS)/libr/search \
 	-L$(LOCAL_R2_ABS)/libr/syscall \
 	-L$(LOCAL_R2_ABS)/libr/muta \
-	-lr_core -lr_anal -lr_arch -lr_util -lr_io -lr_reg -lr_esil -lr_cons -lr_flag -lr_search -lr_syscall -lr_muta
+	-lr_core -lr_anal -lr_arch -lr_bin -lr_bp -lr_config -lr_debug -lr_util -lr_io -lr_reg -lr_esil -lr_cons -lr_flag -lr_search -lr_syscall -lr_muta
 ifeq ($(wildcard $(LOCAL_R2_INCLUDE)/r_anal.h)$(wildcard $(LOCAL_R2_ANAL_LIB)),)
 R2_CFLAGS := $(shell pkg-config --cflags r_anal r_arch r_core 2>/dev/null || echo "-I/usr/include/libr")
 R2_LDFLAGS := $(shell pkg-config --libs r_anal r_arch r_core 2>/dev/null || echo "-lr_core -lr_anal -lr_arch -lr_util -lr_io")

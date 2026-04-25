@@ -1869,6 +1869,12 @@ fn parse_scope_assumptions(
     let text = unsafe { CStr::from_ptr(external_context_json) }
         .to_str()
         .map_err(|_| "external context is not valid utf-8")?;
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') {
+        let assumptions = serde_json::from_str::<Vec<r2ssa::AnalysisAssumption>>(trimmed)
+            .map_err(|_| "assumptions json is invalid")?;
+        return Ok(r2ssa::AssumptionSet::new(assumptions));
+    }
     let ptr_bits = arch.map(effective_ptr_bits).unwrap_or(64);
     Ok(r2types::parse_external_context_json(text, ptr_bits).assumptions)
 }
@@ -3465,6 +3471,16 @@ mod tests {
     fn parse_scope_assumptions_reads_external_context_payload() {
         let json = CString::new(
             r#"{"assumptions":[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]}"#,
+        )
+        .expect("json");
+        let assumptions = parse_scope_assumptions(json.as_ptr(), None).expect("assumptions");
+        assert_eq!(assumptions.items.len(), 1);
+    }
+
+    #[test]
+    fn parse_scope_assumptions_reads_direct_assumption_array() {
+        let json = CString::new(
+            r#"[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]"#,
         )
         .expect("json");
         let assumptions = parse_scope_assumptions(json.as_ptr(), None).expect("assumptions");

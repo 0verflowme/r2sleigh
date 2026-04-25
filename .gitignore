@@ -14,13 +14,16 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+com.apple.kernel
 
 # Generated files
 *.r2il
+*.dSYM/
 
 # Plugin build artifacts
 r2plugin/*.so
 r2plugin/*.dylib
+r2plugin/r2sleigh/*.dylib
 
 # Debug
 *.log
@@ -28,6 +31,7 @@ r2plugin/*.dylib
 # Test binaries (compiled from .c files)
 tests/e2e/test_func
 tests/e2e/sym_test
+tests/e2e/*_x86
 tests/e2e/target/
 r2plugin/arch_sleigh.o
 r2plugin/r_anal_sleigh_arch.o

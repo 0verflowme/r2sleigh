@@ -1,3 +1,3 @@
 [alias]
 install-plugin = "run -p r2sleigh-plugin --bin r2sleigh-plugin-install"
-e2e-test = "test --manifest-path tests/e2e/Cargo.toml -- --test-threads=1 --test integration"
+e2e-test = "test --manifest-path tests/e2e/Cargo.toml -- --test-threads=1"

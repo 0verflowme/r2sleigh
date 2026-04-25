@@ -964,6 +964,51 @@ pub extern "C" fn r2il_string_free(s: *mut c_char) {
 // ========== Typed Analysis FFI ==========
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{LazyLock, RwLock};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2ILBlockMemAccess {
+    is_write: i32,
+    size: u32,
+    addr_reg: *const c_char,
+    base: u64,
+    has_base: i32,
+    delta: i64,
+    is_stack: i32,
+    stack_base: *const c_char,
+    stack_offset: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2ILBlockImmediateValue {
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2ILBlockRegValue {
+    name: *const c_char,
+}
+
+pub struct R2ILBlockAnalValues {
+    memory: Vec<R2ILBlockMemAccess>,
+    immediates: Vec<R2ILBlockImmediateValue>,
+    reg_reads: Vec<R2ILBlockRegValue>,
+    reg_writes: Vec<R2ILBlockRegValue>,
+    _strings: Vec<CString>,
+}
+
+fn ffi_values_push_string(strings: &mut Vec<CString>, value: impl AsRef<str>) -> *const c_char {
+    match CString::new(value.as_ref()) {
+        Ok(s) => {
+            strings.push(s);
+            strings.last().map_or(ptr::null(), |s| s.as_ptr())
+        }
+        Err(_) => ptr::null(),
+    }
+}
 
 /// Helper: extract all register varnodes that are read by an operation.
 fn op_regs_read(op: &R2ILOp) -> Vec<&Varnode> {
@@ -1747,6 +1792,225 @@ pub extern "C" fn r2il_block_varnodes(
 
     let json = serde_json::to_string(&varnodes).unwrap_or_default();
     CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
+fn block_values_for_ffi(
+    ctx_ref: &R2ILContext,
+    blk: &R2ILBlock,
+    disasm: &Disassembler,
+) -> R2ILBlockAnalValues {
+    let defs = build_stack_defs(&blk.ops);
+    let mut strings = Vec::new();
+    let mut memory = Vec::new();
+    let mut immediates = Vec::new();
+    let mut seen_immediates: HashSet<(u64, u32)> = HashSet::new();
+    let mut reg_reads = BTreeSet::new();
+    let mut reg_writes = BTreeSet::new();
+
+    for op in &blk.ops {
+        for reg in op_regs_read(op) {
+            if let Some(name) = disasm.register_name(reg) {
+                reg_reads.insert(name);
+            }
+        }
+        for reg in op_regs_write(op) {
+            if let Some(name) = disasm.register_name(reg) {
+                reg_writes.insert(name);
+            }
+        }
+        for vn in op_all_varnodes(op) {
+            if vn.space.is_const() && seen_immediates.insert((vn.offset, vn.size)) {
+                immediates.push(R2ILBlockImmediateValue { value: vn.offset });
+            }
+        }
+    }
+
+    let mut push_mem = |addr: &Varnode, size: u32, is_write: bool| {
+        let stack = resolve_stack_addr(addr, disasm, &defs, &blk.ops);
+        let addr_reg = if addr.is_register() {
+            disasm
+                .register_name(addr)
+                .map(|name| ffi_values_push_string(&mut strings, name))
+                .unwrap_or(ptr::null())
+        } else {
+            ptr::null()
+        };
+        let (stack_base, stack_offset, is_stack) = match stack {
+            Some((base, offset)) => (ffi_values_push_string(&mut strings, base), offset, 1),
+            None => (ptr::null(), 0, 0),
+        };
+        memory.push(R2ILBlockMemAccess {
+            is_write: i32::from(is_write),
+            size,
+            addr_reg,
+            base: if addr.is_register() { 0 } else { addr.offset },
+            has_base: i32::from(!addr.is_register()),
+            delta: if addr.is_register() {
+                addr.offset as i64
+            } else {
+                0
+            },
+            is_stack,
+            stack_base,
+            stack_offset,
+        });
+    };
+
+    for op in &blk.ops {
+        match op {
+            R2ILOp::Load { dst, addr, .. }
+            | R2ILOp::LoadLinked { dst, addr, .. }
+            | R2ILOp::LoadGuarded { dst, addr, .. } => {
+                push_mem(addr, dst.size, false);
+            }
+            R2ILOp::Store { addr, val, .. }
+            | R2ILOp::StoreConditional { addr, val, .. }
+            | R2ILOp::StoreGuarded { addr, val, .. } => {
+                push_mem(addr, val.size, true);
+            }
+            R2ILOp::AtomicCAS { dst, addr, .. } => {
+                push_mem(addr, dst.size, true);
+            }
+            _ => {}
+        }
+    }
+
+    let reg_reads = reg_reads
+        .into_iter()
+        .filter_map(|name| {
+            let ptr = ffi_values_push_string(&mut strings, name);
+            (!ptr.is_null()).then_some(R2ILBlockRegValue { name: ptr })
+        })
+        .collect();
+    let reg_writes = reg_writes
+        .into_iter()
+        .filter_map(|name| {
+            let ptr = ffi_values_push_string(&mut strings, name);
+            (!ptr.is_null()).then_some(R2ILBlockRegValue { name: ptr })
+        })
+        .collect();
+
+    let _ = ctx_ref;
+    R2ILBlockAnalValues {
+        memory,
+        immediates,
+        reg_reads,
+        reg_writes,
+        _strings: strings,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_values_typed(
+    ctx: *const R2ILContext,
+    block: *const R2ILBlock,
+) -> *mut R2ILBlockAnalValues {
+    if ctx.is_null() || block.is_null() {
+        return ptr::null_mut();
+    }
+    let ctx_ref = unsafe { &*ctx };
+    let Some(disasm) = ctx_ref.disasm.as_ref() else {
+        return ptr::null_mut();
+    };
+    let blk = unsafe { &*block };
+    Box::into_raw(Box::new(block_values_for_ffi(ctx_ref, blk, disasm)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_values_memory(
+    values: *const R2ILBlockAnalValues,
+    count: *mut usize,
+) -> *const R2ILBlockMemAccess {
+    if values.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let values = unsafe { &*values };
+    if !count.is_null() {
+        unsafe {
+            *count = values.memory.len();
+        }
+    }
+    values.memory.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_values_immediates(
+    values: *const R2ILBlockAnalValues,
+    count: *mut usize,
+) -> *const R2ILBlockImmediateValue {
+    if values.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let values = unsafe { &*values };
+    if !count.is_null() {
+        unsafe {
+            *count = values.immediates.len();
+        }
+    }
+    values.immediates.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_values_reg_reads(
+    values: *const R2ILBlockAnalValues,
+    count: *mut usize,
+) -> *const R2ILBlockRegValue {
+    if values.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let values = unsafe { &*values };
+    if !count.is_null() {
+        unsafe {
+            *count = values.reg_reads.len();
+        }
+    }
+    values.reg_reads.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_values_reg_writes(
+    values: *const R2ILBlockAnalValues,
+    count: *mut usize,
+) -> *const R2ILBlockRegValue {
+    if values.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let values = unsafe { &*values };
+    if !count.is_null() {
+        unsafe {
+            *count = values.reg_writes.len();
+        }
+    }
+    values.reg_writes.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2il_block_values_free(values: *mut R2ILBlockAnalValues) {
+    if !values.is_null() {
+        unsafe {
+            drop(Box::from_raw(values));
+        }
+    }
 }
 
 fn space_label(space: r2il::SpaceId) -> String {
@@ -3156,6 +3420,108 @@ pub extern "C" fn r2dec_function_with_context_scope(
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn r2dec_function_with_session_context(
+    input: *const R2SleighSessionInput,
+    func_names_json: *const c_char,
+    strings_json: *const c_char,
+    symbols_json: *const c_char,
+) -> *mut c_char {
+    if input.is_null() {
+        return ptr::null_mut();
+    }
+    let input = unsafe { &*input };
+    let Some(ctx_view) = context::require_ctx_view(input.ctx) else {
+        return ptr::null_mut();
+    };
+    let Some(block_slice) =
+        (unsafe { blocks::BlockSlice::from_ffi(input.blocks, input.num_blocks) })
+    else {
+        return ptr::null_mut();
+    };
+
+    let func_name_str = helpers::resolve_function_name(input.function_addr, input.function_name);
+    let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
+    let max_blocks = decompiler_max_blocks();
+    if block_slice.len() > max_blocks {
+        let output =
+            r2dec::block_guard_fallback_comment(&func_name_str, block_slice.len(), max_blocks);
+        return CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw());
+    }
+
+    let func_names_str = helpers::cstr_or_default(func_names_json, "{}");
+    let strings_str = helpers::cstr_or_default(strings_json, "{}");
+    let symbols_str = helpers::cstr_or_default(symbols_json, "{}");
+    let external_context = cstr_or_default(input.function_context.external_context_json, "{}");
+    let scope_facts = unsafe { typed_interproc_scope_facts(&input.interproc_scope) };
+    let interproc_iter = input.budget.interproc_iter.max(1);
+    let interproc_max_iters = input.budget.interproc_max_iters.max(interproc_iter);
+    let Some(function_input) = types::build_function_input(
+        input.ctx,
+        input.blocks,
+        input.num_blocks,
+        input.function_addr,
+        input.function_name,
+    ) else {
+        return ptr::null_mut();
+    };
+    let inference_input = TypeWritebackInferenceInput {
+        ctx: input.ctx,
+        blocks: input.blocks,
+        num_blocks: input.num_blocks,
+        fcn_addr: input.function_addr,
+        fcn_name: input.function_name,
+        external_context_json: input.function_context.external_context_json,
+        function_context: Some(&input.function_context),
+        scope_functions: input.interproc_scope.functions,
+        scope_num_functions: input.interproc_scope.num_functions,
+        interproc: InterprocInferenceInput {
+            iter: interproc_iter,
+            max_iters: interproc_max_iters,
+            converged: input.budget.interproc_converged != 0,
+            scope_facts: &scope_facts,
+            scope_report: None,
+        },
+    };
+    let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
+    let parsed_context = unsafe {
+        typed_function_context_to_parsed(&input.function_context, &external_context, ptr_bits)
+    };
+    let cached_artifact =
+        types::build_function_analysis_artifact_with_scope_context_and_scope_facts(
+            &function_input,
+            &parsed_context,
+            types::hash_string_payload(&external_context),
+            &scope_facts,
+            interproc_max_iters,
+            symbolic_scope.as_ref(),
+        );
+    let semantic_metadata_enabled = ctx_view.semantic_metadata_enabled;
+    let reg_type_hints = if semantic_metadata_enabled {
+        types::collect_register_type_hints(block_slice.as_slice(), ctx_view.disasm)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let arch_clone = ctx_view.arch.cloned();
+    let output = decompiler::run_full_decompile_on_large_stack(
+        block_slice.into_inner(),
+        input.function_addr,
+        func_name_str,
+        arch_clone,
+        ptr_bits,
+        semantic_metadata_enabled,
+        reg_type_hints,
+        func_names_str,
+        strings_str,
+        symbols_str,
+        "{}".to_string(),
+        cached_artifact,
+        symbolic_scope,
+    );
+
+    CString::new(output).map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
 /// Decompile a single basic block to C code.
 /// Returns C code as a string. Caller must free with r2il_string_free().
 #[unsafe(no_mangle)]
@@ -3360,7 +3726,615 @@ struct InferredTypeWritebackJson {
     semantics: Option<r2sym::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
+    mutation_plan: SessionMutationPlanJson,
     diagnostics: TypeWritebackDiagnosticsJson,
+}
+
+#[derive(Debug, serde::Serialize, Default)]
+struct SessionMutationPlanJson {
+    mutations: Vec<SessionMutationJson>,
+    diagnostics: Vec<String>,
+}
+
+const R2SLEIGH_MUTATION_SIGNATURE: u32 = 0;
+const R2SLEIGH_MUTATION_CALLCONV: u32 = 1;
+const R2SLEIGH_MUTATION_VAR: u32 = 2;
+const R2SLEIGH_MUTATION_VAR_RENAME: u32 = 3;
+const R2SLEIGH_MUTATION_VAR_TYPE: u32 = 4;
+const R2SLEIGH_MUTATION_XREF: u32 = 5;
+const R2SLEIGH_MUTATION_COMMENT: u32 = 6;
+const R2SLEIGH_MUTATION_FLAG: u32 = 7;
+const R2SLEIGH_MUTATION_TYPE_DECL: u32 = 8;
+const R2SLEIGH_MUTATION_TYPE_LINK: u32 = 9;
+
+const R2SLEIGH_CONTEXT_VAR_REGISTER: u32 = 0;
+const R2SLEIGH_CONTEXT_VAR_STACK: u32 = 1;
+const R2SLEIGH_CONTEXT_STACK_LOCAL: u32 = 0;
+const R2SLEIGH_CONTEXT_STACK_ARG: u32 = 1;
+const R2SLEIGH_CONTEXT_STACK_HOME: u32 = 2;
+const R2SLEIGH_CONTEXT_STACK_SAVED_REG: u32 = 3;
+const R2SLEIGH_CONTEXT_STACK_SAVED_FP: u32 = 4;
+const R2SLEIGH_CONTEXT_STACK_UNKNOWN: u32 = 5;
+const R2SLEIGH_CONTEXT_BASE_STRUCT: u32 = 0;
+const R2SLEIGH_CONTEXT_BASE_UNION: u32 = 1;
+const R2SLEIGH_CONTEXT_BASE_ENUM: u32 = 2;
+const R2SLEIGH_CONTEXT_BASE_TYPEDEF: u32 = 3;
+const R2SLEIGH_CONTEXT_BASE_ATOMIC: u32 = 4;
+
+#[repr(C)]
+pub struct R2SleighContextParam {
+    name: *const c_char,
+    type_name: *const c_char,
+    cc_reg: *const c_char,
+}
+
+#[repr(C)]
+pub struct R2SleighContextVar {
+    kind: u32,
+    name: *const c_char,
+    type_name: *const c_char,
+    reg: *const c_char,
+    base: *const c_char,
+    offset: i64,
+    has_offset: i32,
+    role: u32,
+    param_index: i64,
+    param_name: *const c_char,
+    source_reg: *const c_char,
+    is_arg: i32,
+}
+
+#[repr(C)]
+pub struct R2SleighContextBaseMember {
+    name: *const c_char,
+    type_name: *const c_char,
+    offset: u64,
+    size_bits: u64,
+    has_size_bits: i32,
+}
+
+#[repr(C)]
+pub struct R2SleighContextEnumVariant {
+    name: *const c_char,
+    value: i64,
+}
+
+#[repr(C)]
+pub struct R2SleighContextBaseType {
+    kind: u32,
+    name: *const c_char,
+    type_name: *const c_char,
+    size_bits: u64,
+    has_size_bits: i32,
+    members: *const R2SleighContextBaseMember,
+    num_members: usize,
+    variants: *const R2SleighContextEnumVariant,
+    num_variants: usize,
+}
+
+#[repr(C)]
+pub struct R2SleighFunctionContext {
+    schema_version: u32,
+    dirty_epoch: u64,
+    context_hash: u64,
+    external_context_json: *const c_char,
+    signature_name: *const c_char,
+    signature_ret_type: *const c_char,
+    signature_callconv: *const c_char,
+    signature_noreturn: i32,
+    params: *const R2SleighContextParam,
+    num_params: usize,
+    vars: *const R2SleighContextVar,
+    num_vars: usize,
+    base_types: *const R2SleighContextBaseType,
+    num_base_types: usize,
+    assumptions_json: *const c_char,
+}
+
+#[repr(C)]
+pub struct R2SleighInterprocSeed {
+    id: u64,
+    name: *const c_char,
+    arg_count_hint: usize,
+    has_arg_count_hint: i32,
+}
+
+#[repr(C)]
+pub struct R2SleighInterprocScope {
+    schema_version: u32,
+    functions: *const analysis::sym::R2ILFunctionBlocks,
+    num_functions: usize,
+    seeds: *const R2SleighInterprocSeed,
+    num_seeds: usize,
+}
+
+#[repr(C)]
+pub struct R2SleighDebugSeed {
+    schema_version: u32,
+    seed_hash: u64,
+}
+
+#[repr(C)]
+pub struct R2SleighBudgetConfig {
+    schema_version: u32,
+    interproc_iter: usize,
+    interproc_max_iters: usize,
+    interproc_converged: i32,
+    global_max_links: usize,
+}
+
+#[repr(C)]
+pub struct R2SleighSessionInput {
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    function_addr: u64,
+    function_name: *const c_char,
+    function_context: R2SleighFunctionContext,
+    interproc_scope: R2SleighInterprocScope,
+    debug_seed: R2SleighDebugSeed,
+    budget: R2SleighBudgetConfig,
+}
+
+fn optional_cstr(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn typed_stack_role(role: u32) -> r2types::ExternalStackSlotRole {
+    match role {
+        R2SLEIGH_CONTEXT_STACK_LOCAL => r2types::ExternalStackSlotRole::Local,
+        R2SLEIGH_CONTEXT_STACK_ARG => r2types::ExternalStackSlotRole::StackArg,
+        R2SLEIGH_CONTEXT_STACK_HOME => r2types::ExternalStackSlotRole::ParamHome,
+        R2SLEIGH_CONTEXT_STACK_SAVED_REG => r2types::ExternalStackSlotRole::SavedReg,
+        R2SLEIGH_CONTEXT_STACK_SAVED_FP => r2types::ExternalStackSlotRole::SavedFp,
+        R2SLEIGH_CONTEXT_STACK_UNKNOWN => r2types::ExternalStackSlotRole::Unknown,
+        _ => r2types::ExternalStackSlotRole::Unknown,
+    }
+}
+
+fn typed_base_type_kind(kind: u32) -> r2types::ExternalBaseTypeKind {
+    match kind {
+        R2SLEIGH_CONTEXT_BASE_STRUCT => r2types::ExternalBaseTypeKind::Struct,
+        R2SLEIGH_CONTEXT_BASE_UNION => r2types::ExternalBaseTypeKind::Union,
+        R2SLEIGH_CONTEXT_BASE_ENUM => r2types::ExternalBaseTypeKind::Enum,
+        R2SLEIGH_CONTEXT_BASE_TYPEDEF => r2types::ExternalBaseTypeKind::Typedef,
+        R2SLEIGH_CONTEXT_BASE_ATOMIC => r2types::ExternalBaseTypeKind::Atomic,
+        _ => r2types::ExternalBaseTypeKind::Atomic,
+    }
+}
+
+unsafe fn typed_function_context_to_parsed(
+    context: &R2SleighFunctionContext,
+    fallback_json: &str,
+    ptr_bits: u32,
+) -> r2types::ParsedExternalContext {
+    let fallback = serde_json::from_str::<r2types::ExternalContextJson>(fallback_json).ok();
+    let mut raw = r2types::ExternalContextJson {
+        context: Some(r2types::ExternalContextMetadataJson {
+            schema_version: (context.schema_version != 0).then_some(context.schema_version as u64),
+            dirty_epoch: Some(context.dirty_epoch),
+            context_hash: Some(context.context_hash),
+        }),
+        signature: None,
+        vars: Vec::new(),
+        base_types: Vec::new(),
+        known_signatures: fallback
+            .as_ref()
+            .map(|ctx| ctx.known_signatures.clone())
+            .unwrap_or_default(),
+        assumptions: Vec::new(),
+    };
+
+    let params = if context.params.is_null() || context.num_params == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(context.params, context.num_params) }
+    };
+    let signature_params = params
+        .iter()
+        .map(|param| r2types::ExternalSignatureParamJson {
+            name: optional_cstr(param.name),
+            ty: optional_cstr(param.type_name),
+            cc_reg: optional_cstr(param.cc_reg),
+        })
+        .collect::<Vec<_>>();
+    let has_signature = optional_cstr(context.signature_name).is_some()
+        || optional_cstr(context.signature_ret_type).is_some()
+        || optional_cstr(context.signature_callconv).is_some()
+        || context.signature_noreturn != 0
+        || !signature_params.is_empty();
+    if has_signature {
+        raw.signature = Some(r2types::ExternalSignatureJson {
+            name: optional_cstr(context.signature_name),
+            ret_type: optional_cstr(context.signature_ret_type),
+            callconv: optional_cstr(context.signature_callconv),
+            noreturn: context.signature_noreturn != 0,
+            params: signature_params,
+        });
+    }
+
+    let vars = if context.vars.is_null() || context.num_vars == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(context.vars, context.num_vars) }
+    };
+    raw.vars = vars
+        .iter()
+        .enumerate()
+        .map(|(idx, var)| {
+            let (kind, is_register) = match var.kind {
+                R2SLEIGH_CONTEXT_VAR_REGISTER => (r2types::ExternalVarKind::Register, true),
+                R2SLEIGH_CONTEXT_VAR_STACK => (r2types::ExternalVarKind::Stack, false),
+                _ => (r2types::ExternalVarKind::Stack, false),
+            };
+            let fallback_name = if is_register {
+                format!("arg{}", idx + 1)
+            } else {
+                format!("stack_{:x}", var.offset)
+            };
+            r2types::ExternalVarJson {
+                kind,
+                name: optional_cstr(var.name).unwrap_or(fallback_name),
+                ty: optional_cstr(var.type_name),
+                is_arg: var.is_arg != 0,
+                reg: optional_cstr(var.reg),
+                base: optional_cstr(var.base),
+                offset: (var.has_offset != 0).then_some(var.offset),
+                role: Some(typed_stack_role(var.role)),
+                param_index: (var.param_index >= 0).then_some(var.param_index as usize),
+                param_name: optional_cstr(var.param_name),
+                source_reg: optional_cstr(var.source_reg),
+            }
+        })
+        .collect();
+
+    let base_types = if context.base_types.is_null() || context.num_base_types == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(context.base_types, context.num_base_types) }
+    };
+    raw.base_types = if base_types.is_empty() {
+        fallback
+            .as_ref()
+            .map(|ctx| ctx.base_types.clone())
+            .unwrap_or_default()
+    } else {
+        base_types
+            .iter()
+            .map(|base_type| {
+                let members = if base_type.members.is_null() || base_type.num_members == 0 {
+                    &[][..]
+                } else {
+                    unsafe { slice::from_raw_parts(base_type.members, base_type.num_members) }
+                };
+                let variants = if base_type.variants.is_null() || base_type.num_variants == 0 {
+                    &[][..]
+                } else {
+                    unsafe { slice::from_raw_parts(base_type.variants, base_type.num_variants) }
+                };
+                r2types::ExternalBaseTypeJson {
+                    kind: typed_base_type_kind(base_type.kind),
+                    name: optional_cstr(base_type.name).unwrap_or_default(),
+                    members: members
+                        .iter()
+                        .map(|member| r2types::ExternalBaseTypeMemberJson {
+                            name: optional_cstr(member.name).unwrap_or_default(),
+                            ty: optional_cstr(member.type_name)
+                                .unwrap_or_else(|| "void *".to_string()),
+                            offset: member.offset,
+                            size_bits: (member.has_size_bits != 0).then_some(member.size_bits),
+                        })
+                        .collect(),
+                    variants: variants
+                        .iter()
+                        .map(|variant| r2types::ExternalEnumVariantJson {
+                            name: optional_cstr(variant.name).unwrap_or_default(),
+                            value: variant.value,
+                        })
+                        .collect(),
+                    ty: optional_cstr(base_type.type_name),
+                    size_bits: (base_type.has_size_bits != 0).then_some(base_type.size_bits),
+                }
+            })
+            .collect()
+    };
+
+    if let Some(assumptions) = optional_cstr(context.assumptions_json)
+        && let Ok(parsed) = serde_json::from_str::<Vec<r2ssa::AnalysisAssumption>>(&assumptions)
+    {
+        raw.assumptions = parsed;
+    } else if let Some(fallback) = fallback.as_ref() {
+        raw.assumptions = fallback.assumptions.clone();
+    }
+
+    r2types::parse_external_context(raw, ptr_bits)
+}
+
+unsafe fn typed_interproc_scope_facts(
+    scope: &R2SleighInterprocScope,
+) -> types::InterprocScopeFacts {
+    if scope.seeds.is_null() || scope.num_seeds == 0 {
+        return types::empty_interproc_scope_facts();
+    }
+    let seeds = unsafe { slice::from_raw_parts(scope.seeds, scope.num_seeds) };
+    types::interproc_scope_facts_from_seed_entries(seeds.iter().map(|seed| {
+        (
+            seed.id,
+            optional_cstr(seed.name),
+            (seed.has_arg_count_hint != 0).then_some(seed.arg_count_hint),
+        )
+    }))
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighMutation {
+    kind: u32,
+    signature: *const c_char,
+    callconv: *const c_char,
+    old_name: *const c_char,
+    name: *const c_char,
+    reg: *const c_char,
+    type_name: *const c_char,
+    text: *const c_char,
+    addr: u64,
+    size: u64,
+    delta: i64,
+    var_kind: c_char,
+    is_arg: i32,
+    confidence: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighSignatureParam {
+    name: *const c_char,
+    type_name: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighSignatureFact {
+    signature: *const c_char,
+    ret_type: *const c_char,
+    callconv: *const c_char,
+    arch: *const c_char,
+    params: *const R2SleighSignatureParam,
+    num_params: usize,
+    confidence: u8,
+    callconv_confidence: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighAnnotation {
+    addr: u64,
+    comment: *const c_char,
+}
+
+pub struct R2SleighAnnotations {
+    items: Vec<R2SleighAnnotation>,
+    _strings: Vec<CString>,
+}
+
+pub struct R2SleighU64Array {
+    values: Vec<u64>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighRuntimeSource {
+    addr: u64,
+    size: u64,
+}
+
+pub struct R2SleighRuntimeSources {
+    items: Vec<R2SleighRuntimeSource>,
+}
+
+pub struct R2SleighSessionResult {
+    report_json: CString,
+    type_writeback_json: CString,
+    type_writeback_hash: u64,
+    mutations: Vec<R2SleighMutation>,
+    signature_fact: R2SleighSignatureFact,
+    _signature_params: Vec<R2SleighSignatureParam>,
+    _strings: Vec<CString>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TypeWritebackCacheEntry {
+    key: u64,
+    dep_hash: u64,
+    payload_hash: u64,
+    applied_hash: u64,
+}
+
+const TYPE_WRITEBACK_CACHE_LIMIT: usize = 4096;
+
+static TYPE_WRITEBACK_CACHE: LazyLock<RwLock<HashMap<u64, TypeWritebackCacheEntry>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_type_writeback_cache_clear() {
+    TYPE_WRITEBACK_CACHE
+        .write()
+        .expect("type writeback cache lock poisoned")
+        .clear();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_type_writeback_cache_len() -> usize {
+    TYPE_WRITEBACK_CACHE
+        .read()
+        .expect("type writeback cache lock poisoned")
+        .len()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_type_writeback_cache_get(
+    addr: u64,
+    key: *mut u64,
+    dep_hash: *mut u64,
+    payload_hash: *mut u64,
+    applied_hash: *mut u64,
+) -> i32 {
+    let Some(entry) = TYPE_WRITEBACK_CACHE
+        .read()
+        .expect("type writeback cache lock poisoned")
+        .get(&addr)
+        .copied()
+    else {
+        return 0;
+    };
+    unsafe {
+        if !key.is_null() {
+            *key = entry.key;
+        }
+        if !dep_hash.is_null() {
+            *dep_hash = entry.dep_hash;
+        }
+        if !payload_hash.is_null() {
+            *payload_hash = entry.payload_hash;
+        }
+        if !applied_hash.is_null() {
+            *applied_hash = entry.applied_hash;
+        }
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_type_writeback_cache_put(
+    addr: u64,
+    key: u64,
+    dep_hash: u64,
+    payload_hash: u64,
+    applied_hash: u64,
+) -> i32 {
+    let mut cache = TYPE_WRITEBACK_CACHE
+        .write()
+        .expect("type writeback cache lock poisoned");
+    if cache.len() >= TYPE_WRITEBACK_CACHE_LIMIT && !cache.contains_key(&addr) {
+        cache.clear();
+    }
+    cache.insert(
+        addr,
+        TypeWritebackCacheEntry {
+            key,
+            dep_hash,
+            payload_hash,
+            applied_hash,
+        },
+    );
+    1
+}
+
+#[cfg(test)]
+mod type_writeback_cache_tests {
+    use super::*;
+
+    #[test]
+    fn type_writeback_cache_is_rust_owned_and_address_keyed() {
+        r2sleigh_type_writeback_cache_clear();
+        assert_eq!(r2sleigh_type_writeback_cache_len(), 0);
+
+        assert_eq!(r2sleigh_type_writeback_cache_put(0x401000, 1, 2, 3, 4), 1);
+        assert_eq!(r2sleigh_type_writeback_cache_len(), 1);
+
+        let mut key = 0;
+        let mut dep_hash = 0;
+        let mut payload_hash = 0;
+        let mut applied_hash = 0;
+        assert_eq!(
+            r2sleigh_type_writeback_cache_get(
+                0x401000,
+                &mut key,
+                &mut dep_hash,
+                &mut payload_hash,
+                &mut applied_hash,
+            ),
+            1
+        );
+        assert_eq!((key, dep_hash, payload_hash, applied_hash), (1, 2, 3, 4));
+
+        assert_eq!(
+            r2sleigh_type_writeback_cache_put(0x401000, 10, 20, 30, 40),
+            1
+        );
+        assert_eq!(r2sleigh_type_writeback_cache_len(), 1);
+        assert_eq!(
+            r2sleigh_type_writeback_cache_get(
+                0x401000,
+                &mut key,
+                &mut dep_hash,
+                &mut payload_hash,
+                &mut applied_hash,
+            ),
+            1
+        );
+        assert_eq!(
+            (key, dep_hash, payload_hash, applied_hash),
+            (10, 20, 30, 40)
+        );
+
+        r2sleigh_type_writeback_cache_clear();
+    }
+}
+
+struct FunctionAnalysisSessionReport {
+    report_json: String,
+    type_writeback_json: String,
+    type_writeback_hash: u64,
+    mutations: Vec<R2SleighMutation>,
+    signature_fact: R2SleighSignatureFact,
+    signature_params: Vec<R2SleighSignatureParam>,
+    strings: Vec<CString>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SessionMutationJson {
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ret_type: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    params: Vec<InferredParamJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callconv: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addr: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    var_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_arg: Option<bool>,
+    confidence: u8,
+    source: String,
+    evidence: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3382,42 +4356,24 @@ struct SemanticRoutePlanJson {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct FunctionFactsReportJson {
+struct FunctionAnalysisSessionReportJson {
     function_name: String,
     function_addr: u64,
     cfg_risk: CfgRiskSummaryJson,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
     plans: r2types::AnalysisPlans,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    semantic_route: Option<SemanticRoutePlanJson>,
     #[serde(skip_serializing_if = "r2ssa::AssumptionSet::is_empty")]
     assumptions: r2ssa::AssumptionSet,
     #[serde(skip_serializing_if = "r2types::AssumptionUsageReport::is_empty")]
     assumption_usage: r2types::AssumptionUsageReport,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary_diagnostics: Option<r2ssa::InterprocSummaryDiagnostics>,
-    type_writeback: InferredTypeWritebackJson,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct FunctionPlanReportJson {
-    function_name: String,
-    function_addr: u64,
-    cfg_risk: CfgRiskSummaryJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic: Option<analysis::sym::CompiledSemanticInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
-    plans: r2types::AnalysisPlans,
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_route: Option<SemanticRoutePlanJson>,
-    #[serde(skip_serializing_if = "r2ssa::AssumptionSet::is_empty")]
-    assumptions: r2ssa::AssumptionSet,
-    #[serde(skip_serializing_if = "r2types::AssumptionUsageReport::is_empty")]
-    assumption_usage: r2types::AssumptionUsageReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary_diagnostics: Option<r2ssa::InterprocSummaryDiagnostics>,
+    type_writeback: InferredTypeWritebackJson,
     prefer_bounded_type_plan: bool,
 }
 
@@ -3480,6 +4436,282 @@ fn struct_fields_json(fields: &[r2types::StructFieldCandidate]) -> Vec<StructFie
         .collect()
 }
 
+fn mutation_plan_from_writeback(
+    plan: &r2types::TypeWritebackPlan,
+    global_max_links: usize,
+) -> SessionMutationPlanJson {
+    let mut mutations = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    mutations.push(SessionMutationJson {
+        kind: "signature".to_string(),
+        signature: Some(plan.signature.signature.clone()),
+        ret_type: Some(plan.signature.ret_type.clone()),
+        params: plan
+            .signature
+            .params
+            .iter()
+            .map(|param| InferredParamJson {
+                name: param.name.clone(),
+                param_type: param.param_type.clone(),
+            })
+            .collect(),
+        callconv: Some(plan.signature.callconv.clone()),
+        old_name: None,
+        name: Some(plan.signature.function_name.clone()),
+        reg: None,
+        type_name: None,
+        text: None,
+        addr: None,
+        size: None,
+        delta: None,
+        var_kind: None,
+        is_arg: None,
+        confidence: plan.signature.confidence,
+        source: "function_facts".to_string(),
+        evidence: vec!["merged-signature".to_string()],
+    });
+
+    mutations.push(SessionMutationJson {
+        kind: "callconv".to_string(),
+        signature: None,
+        ret_type: None,
+        params: Vec::new(),
+        callconv: Some(plan.signature.callconv.clone()),
+        old_name: None,
+        name: Some(plan.signature.function_name.clone()),
+        reg: None,
+        type_name: None,
+        text: None,
+        addr: None,
+        size: None,
+        delta: None,
+        var_kind: None,
+        is_arg: None,
+        confidence: plan.signature.callconv_confidence,
+        source: "function_facts".to_string(),
+        evidence: vec!["calling-convention".to_string()],
+    });
+
+    for decl in &plan.struct_decls {
+        mutations.push(SessionMutationJson {
+            kind: "type_decl".to_string(),
+            signature: None,
+            ret_type: None,
+            params: Vec::new(),
+            callconv: None,
+            old_name: None,
+            name: Some(decl.name.clone()),
+            reg: None,
+            type_name: None,
+            text: Some(decl.decl.clone()),
+            addr: None,
+            size: None,
+            delta: None,
+            var_kind: None,
+            is_arg: None,
+            confidence: decl.confidence,
+            source: decl.source.as_str().to_string(),
+            evidence: vec!["struct-declaration".to_string()],
+        });
+    }
+
+    for candidate in &plan.var_type_candidates {
+        if candidate.confidence >= 95 {
+            mutations.push(SessionMutationJson {
+                kind: "var".to_string(),
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: None,
+                name: Some(candidate.name.clone()),
+                reg: candidate.reg.clone(),
+                type_name: Some(candidate.var_type.clone()),
+                text: None,
+                addr: None,
+                size: Some(candidate.size as u64),
+                delta: Some(candidate.delta),
+                var_kind: Some(candidate.kind.clone()),
+                is_arg: Some(candidate.isarg),
+                confidence: candidate.confidence,
+                source: candidate.source.as_str().to_string(),
+                evidence: evidence_json(&candidate.evidence),
+            });
+        }
+        mutations.push(SessionMutationJson {
+            kind: "var_type".to_string(),
+            signature: None,
+            ret_type: None,
+            params: Vec::new(),
+            callconv: None,
+            old_name: Some(candidate.name.clone()),
+            name: Some(candidate.name.clone()),
+            reg: candidate.reg.clone(),
+            type_name: Some(candidate.var_type.clone()),
+            text: None,
+            addr: None,
+            size: Some(candidate.size as u64),
+            delta: Some(candidate.delta),
+            var_kind: Some(candidate.kind.clone()),
+            is_arg: Some(candidate.isarg),
+            confidence: candidate.confidence,
+            source: candidate.source.as_str().to_string(),
+            evidence: evidence_json(&candidate.evidence),
+        });
+    }
+
+    for candidate in &plan.var_rename_candidates {
+        mutations.push(SessionMutationJson {
+            kind: "var_rename".to_string(),
+            signature: None,
+            ret_type: None,
+            params: Vec::new(),
+            callconv: None,
+            old_name: Some(candidate.name.clone()),
+            name: Some(candidate.target_name.clone()),
+            reg: None,
+            type_name: None,
+            text: None,
+            addr: None,
+            size: None,
+            delta: None,
+            var_kind: None,
+            is_arg: None,
+            confidence: candidate.confidence,
+            source: candidate.source.as_str().to_string(),
+            evidence: evidence_json(&candidate.evidence),
+        });
+    }
+
+    for candidate in plan.global_type_links.iter().take(global_max_links) {
+        mutations.push(SessionMutationJson {
+            kind: "type_link".to_string(),
+            signature: None,
+            ret_type: None,
+            params: Vec::new(),
+            callconv: None,
+            old_name: None,
+            name: None,
+            reg: None,
+            type_name: Some(candidate.target_type.clone()),
+            text: None,
+            addr: Some(candidate.addr),
+            size: None,
+            delta: None,
+            var_kind: None,
+            is_arg: None,
+            confidence: candidate.confidence,
+            source: candidate.source.as_str().to_string(),
+            evidence: vec!["global-type-link".to_string()],
+        });
+    }
+    if plan.global_type_links.len() > global_max_links {
+        diagnostics.push(format!(
+            "global type-link mutation plan truncated from {} to {} item(s)",
+            plan.global_type_links.len(),
+            global_max_links
+        ));
+    }
+
+    SessionMutationPlanJson {
+        mutations,
+        diagnostics,
+    }
+}
+
+fn session_mutation_kind_id(kind: &str) -> Option<u32> {
+    match kind {
+        "signature" => Some(R2SLEIGH_MUTATION_SIGNATURE),
+        "callconv" => Some(R2SLEIGH_MUTATION_CALLCONV),
+        "var" => Some(R2SLEIGH_MUTATION_VAR),
+        "var_rename" => Some(R2SLEIGH_MUTATION_VAR_RENAME),
+        "var_type" => Some(R2SLEIGH_MUTATION_VAR_TYPE),
+        "xref" => Some(R2SLEIGH_MUTATION_XREF),
+        "comment" => Some(R2SLEIGH_MUTATION_COMMENT),
+        "flag" => Some(R2SLEIGH_MUTATION_FLAG),
+        "type_decl" => Some(R2SLEIGH_MUTATION_TYPE_DECL),
+        "type_link" => Some(R2SLEIGH_MUTATION_TYPE_LINK),
+        _ => None,
+    }
+}
+
+fn push_session_cstring(strings: &mut Vec<CString>, value: Option<&str>) -> *const c_char {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return ptr::null();
+    };
+    let Ok(cstr) = CString::new(value) else {
+        return ptr::null();
+    };
+    let ptr = cstr.as_ptr();
+    strings.push(cstr);
+    ptr
+}
+
+fn ffi_mutations_from_session_plan(
+    plan: &SessionMutationPlanJson,
+) -> (Vec<R2SleighMutation>, Vec<CString>) {
+    let mut strings = Vec::new();
+    let mut mutations = Vec::new();
+
+    for mutation in &plan.mutations {
+        let Some(kind) = session_mutation_kind_id(&mutation.kind) else {
+            continue;
+        };
+        let var_kind = mutation
+            .var_kind
+            .as_deref()
+            .and_then(|kind| kind.as_bytes().first().copied())
+            .unwrap_or_default() as c_char;
+        mutations.push(R2SleighMutation {
+            kind,
+            signature: push_session_cstring(&mut strings, mutation.signature.as_deref()),
+            callconv: push_session_cstring(&mut strings, mutation.callconv.as_deref()),
+            old_name: push_session_cstring(&mut strings, mutation.old_name.as_deref()),
+            name: push_session_cstring(&mut strings, mutation.name.as_deref()),
+            reg: push_session_cstring(&mut strings, mutation.reg.as_deref()),
+            type_name: push_session_cstring(&mut strings, mutation.type_name.as_deref()),
+            text: push_session_cstring(&mut strings, mutation.text.as_deref()),
+            addr: mutation.addr.unwrap_or_default(),
+            size: mutation.size.unwrap_or_default(),
+            delta: mutation.delta.unwrap_or_default(),
+            var_kind,
+            is_arg: i32::from(mutation.is_arg.unwrap_or(false)),
+            confidence: mutation.confidence,
+        });
+    }
+
+    (mutations, strings)
+}
+
+fn ffi_signature_fact_from_type_writeback(
+    type_writeback: &InferredTypeWritebackJson,
+    strings: &mut Vec<CString>,
+) -> (R2SleighSignatureFact, Vec<R2SleighSignatureParam>) {
+    let mut params = Vec::with_capacity(type_writeback.params.len());
+    for param in &type_writeback.params {
+        params.push(R2SleighSignatureParam {
+            name: push_session_cstring(strings, Some(param.name.as_str())),
+            type_name: push_session_cstring(strings, Some(param.param_type.as_str())),
+        });
+    }
+    let fact = R2SleighSignatureFact {
+        signature: push_session_cstring(strings, Some(type_writeback.signature.as_str())),
+        ret_type: push_session_cstring(strings, Some(type_writeback.ret_type.as_str())),
+        callconv: push_session_cstring(strings, Some(type_writeback.callconv.as_str())),
+        arch: push_session_cstring(strings, Some(type_writeback.arch.as_str())),
+        params: if params.is_empty() {
+            ptr::null()
+        } else {
+            params.as_ptr()
+        },
+        num_params: params.len(),
+        confidence: type_writeback.confidence,
+        callconv_confidence: type_writeback.callconv_confidence,
+    };
+    (fact, params)
+}
+
 fn writeback_plan_json(
     plan: r2types::TypeWritebackPlan,
     interproc: InterprocSummaryJson,
@@ -3487,6 +4719,7 @@ fn writeback_plan_json(
     semantics: Option<r2sym::SemanticArtifact>,
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
 ) -> InferredTypeWritebackJson {
+    let mutation_plan = mutation_plan_from_writeback(&plan, usize::MAX);
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
         signature: plan.signature.signature,
@@ -3558,24 +4791,13 @@ fn writeback_plan_json(
         assumption_usage: function_facts.assumption_usage.clone(),
         semantics,
         compiled_semantics,
+        mutation_plan,
         diagnostics: TypeWritebackDiagnosticsJson {
             conflicts: plan.diagnostics.conflicts,
             warnings: plan.diagnostics.warnings,
             solver_warnings: plan.diagnostics.solver_warnings,
         },
     }
-}
-
-fn parse_nonempty_scope_json(payload: &str) -> Option<serde_json::Value> {
-    serde_json::from_str::<serde_json::Value>(payload)
-        .ok()
-        .filter(|value| {
-            !value.is_null()
-                && value
-                    .as_object()
-                    .map(|object| !object.is_empty())
-                    .unwrap_or(true)
-        })
 }
 
 fn symbolic_scope_view_json(
@@ -3614,14 +4836,14 @@ fn symbolic_scope_view_json(
     }))
 }
 
-fn merged_interproc_scope_json(
-    scope_json: &str,
+fn merged_interproc_scope_report(
+    scope_report: Option<&serde_json::Value>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<serde_json::Value> {
     let Some(symbolic_scope_json) = symbolic_scope_view_json(symbolic_scope) else {
-        return parse_nonempty_scope_json(scope_json);
+        return scope_report.cloned();
     };
-    let Some(mut merged) = parse_nonempty_scope_json(scope_json) else {
+    let Some(mut merged) = scope_report.cloned() else {
         return Some(symbolic_scope_json);
     };
     let (Some(merged_obj), Some(symbolic_obj)) =
@@ -3660,7 +4882,7 @@ fn type_writeback_payload_from_artifact(
         .as_ref()
         .map(analysis::sym::compiled_semantic_info);
     let ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
-    let scope = merged_interproc_scope_json(interproc.scope_json, symbolic_scope);
+    let scope = merged_interproc_scope_report(interproc.scope_report, symbolic_scope);
     let current_summary = artifact
         .function_facts
         .interproc_summary_set()
@@ -3702,6 +4924,7 @@ fn semantic_type_fallback_payload(
     let compiled_info = analysis::sym::compiled_semantic_info(compiled);
     let plan =
         r2types::build_semantic_type_fallback_plan(function_name, arch_name, ptr_bits, compiled);
+    let mutation_plan = mutation_plan_from_writeback(&plan, usize::MAX);
 
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
@@ -3750,13 +4973,14 @@ fn semantic_type_fallback_payload(
             converged: interproc.converged,
             summary: None,
             summary_json: None,
-            scope: merged_interproc_scope_json(interproc.scope_json, symbolic_scope),
+            scope: merged_interproc_scope_report(interproc.scope_report, symbolic_scope),
         },
         plans: function_facts.plans.clone(),
         assumptions: function_facts.assumptions.clone(),
         assumption_usage: function_facts.assumption_usage.clone(),
         semantics: Some(compiled.clone()),
         compiled_semantics: Some(compiled_info),
+        mutation_plan,
         diagnostics: TypeWritebackDiagnosticsJson {
             warnings: plan.diagnostics.warnings,
             ..TypeWritebackDiagnosticsJson::default()
@@ -5766,6 +6990,26 @@ pub extern "C" fn r2sleigh_get_direct_call_targets_json(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_get_direct_call_targets_typed(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+) -> *mut R2SleighU64Array {
+    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(analysis) = types::build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(R2SleighU64Array {
+        values: direct_call_targets_from_analysis(&analysis),
+    }))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_get_symbolic_scope_targets_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
@@ -5798,6 +7042,39 @@ pub extern "C" fn r2sleigh_get_symbolic_scope_targets_json(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_get_symbolic_scope_targets_typed(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    registration_call_targets: *const u64,
+    num_registration_call_targets: usize,
+) -> *mut R2SleighU64Array {
+    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(analysis) = types::build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
+    let registration_call_targets = if registration_call_targets.is_null() {
+        &[]
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(registration_call_targets, num_registration_call_targets)
+        }
+    };
+    Box::into_raw(Box::new(R2SleighU64Array {
+        values: runtime_registration_targets_from_analysis(
+            &analysis,
+            input.ctx.arch,
+            registration_call_targets,
+        ),
+    }))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_get_runtime_materialized_sources_json(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
@@ -5824,6 +7101,101 @@ pub extern "C" fn r2sleigh_get_runtime_materialized_sources_json(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_get_runtime_materialized_sources_typed(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+    copy_call_targets: *const u64,
+    num_copy_call_targets: usize,
+) -> *mut R2SleighRuntimeSources {
+    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(analysis) = types::build_function_analysis(&input) else {
+        return ptr::null_mut();
+    };
+    let copy_call_targets = if copy_call_targets.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(copy_call_targets, num_copy_call_targets) }
+    };
+    let items =
+        runtime_materialized_sources_from_analysis(&analysis, input.ctx.arch, copy_call_targets)
+            .into_iter()
+            .map(|source| R2SleighRuntimeSource {
+                addr: source.addr,
+                size: source.size,
+            })
+            .collect();
+    Box::into_raw(Box::new(R2SleighRuntimeSources { items }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_u64_array_items(
+    array: *const R2SleighU64Array,
+    count: *mut usize,
+) -> *const u64 {
+    if array.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let array = unsafe { &*array };
+    if !count.is_null() {
+        unsafe {
+            *count = array.values.len();
+        }
+    }
+    array.values.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_u64_array_free(array: *mut R2SleighU64Array) {
+    if !array.is_null() {
+        unsafe {
+            drop(Box::from_raw(array));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_runtime_sources_items(
+    sources: *const R2SleighRuntimeSources,
+    count: *mut usize,
+) -> *const R2SleighRuntimeSource {
+    if sources.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let sources = unsafe { &*sources };
+    if !count.is_null() {
+        unsafe {
+            *count = sources.items.len();
+        }
+    }
+    sources.items.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_runtime_sources_free(sources: *mut R2SleighRuntimeSources) {
+    if !sources.is_null() {
+        unsafe {
+            drop(Box::from_raw(sources));
+        }
+    }
+}
+
 /// Infer full type write-back payload (signature + per-variable + structs + globals).
 ///
 /// Returns JSON suitable for plugin-side confidence/conflict policy.
@@ -5833,7 +7205,8 @@ struct InterprocInferenceInput<'a> {
     iter: usize,
     max_iters: usize,
     converged: bool,
-    scope_json: &'a str,
+    scope_facts: &'a types::InterprocScopeFacts,
+    scope_report: Option<&'a serde_json::Value>,
 }
 
 struct TypeWritebackInferenceInput<'a> {
@@ -5843,6 +7216,7 @@ struct TypeWritebackInferenceInput<'a> {
     fcn_addr: u64,
     fcn_name: *const c_char,
     external_context_json: *const c_char,
+    function_context: Option<&'a R2SleighFunctionContext>,
     scope_functions: *const analysis::sym::R2ILFunctionBlocks,
     scope_num_functions: usize,
     interproc: InterprocInferenceInput<'a>,
@@ -5904,13 +7278,19 @@ fn build_function_analysis_shared_bundle(
     let external_context = cstr_or_default(input.external_context_json, "{}");
     let symbolic_scope = build_inference_symbolic_scope(&input, &function_input);
     let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
-    let parsed_context = r2types::parse_external_context_json(&external_context, ptr_bits);
+    let parsed_context = if let Some(function_context) = input.function_context {
+        unsafe { typed_function_context_to_parsed(function_context, &external_context, ptr_bits) }
+    } else {
+        r2types::parse_external_context_json(&external_context, ptr_bits)
+    };
+    let external_context_fallback_hash = types::hash_string_payload(&external_context);
     let (cfg_risk, semantic_artifact, function_facts, type_writeback, prefer_bounded_type_plan) =
         if let Some(cached_artifact) =
-            types::get_cached_function_analysis_artifact_with_scope_and_interproc(
+            types::get_cached_function_analysis_artifact_with_parsed_context_and_scope_facts(
                 &function_input,
-                &external_context,
-                input.interproc.scope_json,
+                &parsed_context,
+                external_context_fallback_hash,
+                input.interproc.scope_facts,
                 input.interproc.max_iters,
                 symbolic_scope.as_ref(),
             )
@@ -5984,18 +7364,18 @@ fn build_function_analysis_shared_bundle(
                     true,
                 )
             } else {
-                let interproc_summary_set = types::build_interproc_summary_set_with_scope(
+                let interproc_summary_set = types::build_interproc_summary_set_with_scope_facts(
                     &function_input,
                     &analysis,
-                    input.interproc.scope_json,
+                    input.interproc.scope_facts,
                     input.interproc.max_iters,
                     symbolic_scope.as_ref(),
                 );
                 let artifact =
-                    types::build_function_analysis_artifact_from_analysis_with_semantic_artifact(
+                    types::build_function_analysis_artifact_from_analysis_with_semantic_artifact_context(
                         &function_input,
                         analysis,
-                        &external_context,
+                        &parsed_context,
                         Some(interproc_summary_set),
                         semantic_artifact,
                     )?;
@@ -6033,72 +7413,201 @@ fn build_function_analysis_shared_bundle(
     })
 }
 
-fn infer_type_writeback_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
-    let Some(bundle) = build_function_analysis_shared_bundle(input) else {
-        return ptr::null_mut();
-    };
-
-    match serde_json::to_string(&bundle.type_writeback) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-fn function_facts_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
-    let Some(bundle) = build_function_analysis_shared_bundle(input) else {
-        return ptr::null_mut();
-    };
-
-    let payload = FunctionFactsReportJson {
-        function_name: bundle.function_name.clone(),
-        function_addr: bundle.function_addr,
-        cfg_risk: bundle.cfg_risk,
-        semantic_build_plan: bundle
-            .semantic_artifact
-            .as_ref()
-            .map(r2sym::SemanticArtifact::build_plan),
-        plans: bundle.function_facts.plans.clone(),
-        semantic_route: bundle.semantic_route,
-        assumptions: bundle.function_facts.assumptions.clone(),
-        assumption_usage: bundle.function_facts.assumption_usage.clone(),
-        summary_diagnostics: bundle.function_facts.summary_view.diagnostics().cloned(),
-        type_writeback: bundle.type_writeback,
-    };
-
-    match serde_json::to_string(&payload) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-fn function_plan_json_impl(input: TypeWritebackInferenceInput<'_>) -> *mut c_char {
-    let Some(bundle) = build_function_analysis_shared_bundle(input) else {
-        return ptr::null_mut();
-    };
-
-    let payload = FunctionPlanReportJson {
+fn function_analysis_session_report_json(
+    bundle: FunctionAnalysisSharedBundle,
+) -> Option<FunctionAnalysisSessionReport> {
+    let type_writeback_json = serde_json::to_string(&bundle.type_writeback).ok()?;
+    let type_writeback_hash = types::hash_string_payload(&type_writeback_json);
+    let (mutations, strings) =
+        ffi_mutations_from_session_plan(&bundle.type_writeback.mutation_plan);
+    let mut strings = strings;
+    let (signature_fact, signature_params) =
+        ffi_signature_fact_from_type_writeback(&bundle.type_writeback, &mut strings);
+    let semantic = bundle
+        .semantic_artifact
+        .as_ref()
+        .map(analysis::sym::compiled_semantic_info);
+    let semantic_build_plan = bundle
+        .semantic_artifact
+        .as_ref()
+        .map(r2sym::SemanticArtifact::build_plan);
+    let summary_diagnostics = bundle.function_facts.summary_view.diagnostics().cloned();
+    let plans = bundle.function_facts.plans.clone();
+    let assumptions = bundle.function_facts.assumptions.clone();
+    let assumption_usage = bundle.function_facts.assumption_usage.clone();
+    let payload = FunctionAnalysisSessionReportJson {
         function_name: bundle.function_name,
         function_addr: bundle.function_addr,
         cfg_risk: bundle.cfg_risk,
-        semantic: bundle
-            .semantic_artifact
-            .as_ref()
-            .map(analysis::sym::compiled_semantic_info),
-        semantic_build_plan: bundle
-            .semantic_artifact
-            .as_ref()
-            .map(r2sym::SemanticArtifact::build_plan),
-        plans: bundle.function_facts.plans.clone(),
+        plans,
+        assumptions,
+        assumption_usage,
+        semantic,
+        semantic_build_plan,
         semantic_route: bundle.semantic_route,
-        assumptions: bundle.function_facts.assumptions.clone(),
-        assumption_usage: bundle.function_facts.assumption_usage.clone(),
-        summary_diagnostics: bundle.function_facts.summary_view.diagnostics().cloned(),
+        summary_diagnostics,
+        type_writeback: bundle.type_writeback,
         prefer_bounded_type_plan: bundle.prefer_bounded_type_plan,
     };
+    let report_json = serde_json::to_string(&payload).ok()?;
+    Some(FunctionAnalysisSessionReport {
+        report_json,
+        type_writeback_json,
+        type_writeback_hash,
+        mutations,
+        signature_fact,
+        signature_params,
+        strings,
+    })
+}
 
-    match serde_json::to_string(&payload) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => ptr::null_mut(),
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_analyze(
+    input: *const R2SleighSessionInput,
+) -> *mut R2SleighSessionResult {
+    if input.is_null() {
+        return ptr::null_mut();
+    }
+    let input = unsafe { &*input };
+    let scope_facts = unsafe { typed_interproc_scope_facts(&input.interproc_scope) };
+    let interproc_iter = input.budget.interproc_iter.max(1);
+    let interproc_max_iters = input.budget.interproc_max_iters.max(interproc_iter);
+    let inference_input = TypeWritebackInferenceInput {
+        ctx: input.ctx,
+        blocks: input.blocks,
+        num_blocks: input.num_blocks,
+        fcn_addr: input.function_addr,
+        fcn_name: input.function_name,
+        external_context_json: input.function_context.external_context_json,
+        function_context: Some(&input.function_context),
+        scope_functions: input.interproc_scope.functions,
+        scope_num_functions: input.interproc_scope.num_functions,
+        interproc: InterprocInferenceInput {
+            iter: interproc_iter,
+            max_iters: interproc_max_iters,
+            converged: input.budget.interproc_converged != 0,
+            scope_facts: &scope_facts,
+            scope_report: None,
+        },
+    };
+    let Some(bundle) = build_function_analysis_shared_bundle(inference_input) else {
+        return ptr::null_mut();
+    };
+    let Some(FunctionAnalysisSessionReport {
+        report_json,
+        type_writeback_json,
+        type_writeback_hash,
+        mutations,
+        mut signature_fact,
+        signature_params,
+        strings,
+    }) = function_analysis_session_report_json(bundle)
+    else {
+        return ptr::null_mut();
+    };
+    let Ok(report_json) = CString::new(report_json) else {
+        return ptr::null_mut();
+    };
+    let Ok(type_writeback_json) = CString::new(type_writeback_json) else {
+        return ptr::null_mut();
+    };
+    if !signature_params.is_empty() {
+        signature_fact.params = signature_params.as_ptr();
+    }
+    Box::into_raw(Box::new(R2SleighSessionResult {
+        report_json,
+        type_writeback_json,
+        type_writeback_hash,
+        mutations,
+        signature_fact,
+        _signature_params: signature_params,
+        _strings: strings,
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_result_report_json(
+    result: *const R2SleighSessionResult,
+) -> *const c_char {
+    if result.is_null() {
+        return ptr::null();
+    }
+    unsafe { (*result).report_json.as_ptr() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_result_type_writeback_json(
+    result: *const R2SleighSessionResult,
+) -> *const c_char {
+    if result.is_null() {
+        return ptr::null();
+    }
+    unsafe { (*result).type_writeback_json.as_ptr() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_result_type_writeback_json_dup(
+    result: *const R2SleighSessionResult,
+) -> *mut c_char {
+    if result.is_null() {
+        return ptr::null_mut();
+    }
+    let bytes = unsafe { (*result).type_writeback_json.as_bytes() };
+    CString::new(bytes.to_vec()).map_or(ptr::null_mut(), |cstr| cstr.into_raw())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_result_type_writeback_hash(
+    result: *const R2SleighSessionResult,
+) -> u64 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { (*result).type_writeback_hash }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_result_mutations(
+    result: *const R2SleighSessionResult,
+    count: *mut usize,
+) -> *const R2SleighMutation {
+    if result.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let result = unsafe { &*result };
+    if !count.is_null() {
+        unsafe {
+            *count = result.mutations.len();
+        }
+    }
+    result.mutations.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_result_signature_fact(
+    result: *const R2SleighSessionResult,
+) -> *const R2SleighSignatureFact {
+    if result.is_null() {
+        return ptr::null();
+    }
+    let result = unsafe { &*result };
+    if result.signature_fact.signature.is_null() {
+        return ptr::null();
+    }
+    &result.signature_fact
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_session_result_free(result: *mut R2SleighSessionResult) {
+    if !result.is_null() {
+        unsafe {
+            drop(Box::from_raw(result));
+        }
     }
 }
 
@@ -6186,222 +7695,126 @@ fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_infer_type_writeback_json(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-    external_context_json: *const c_char,
-) -> *mut c_char {
-    infer_type_writeback_json_impl(TypeWritebackInferenceInput {
-        ctx,
-        blocks,
-        num_blocks,
-        fcn_addr,
-        fcn_name,
-        external_context_json,
-        scope_functions: ptr::null(),
-        scope_num_functions: 0,
-        interproc: InterprocInferenceInput {
-            iter: 1,
-            max_iters: 1,
-            converged: true,
-            scope_json: "{}",
-        },
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_infer_type_writeback_json_ex(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-    external_context_json: *const c_char,
-    interproc_iter: usize,
-    interproc_max_iters: usize,
-    interproc_converged: i32,
-    interproc_scope_json: *const c_char,
-) -> *mut c_char {
-    let scope = cstr_or_default(interproc_scope_json, "{}");
-    infer_type_writeback_json_impl(TypeWritebackInferenceInput {
-        ctx,
-        blocks,
-        num_blocks,
-        fcn_addr,
-        fcn_name,
-        external_context_json,
-        scope_functions: ptr::null(),
-        scope_num_functions: 0,
-        interproc: InterprocInferenceInput {
-            iter: interproc_iter.max(1),
-            max_iters: interproc_max_iters.max(1),
-            converged: interproc_converged != 0,
-            scope_json: &scope,
-        },
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_infer_type_writeback_json_scope_ex(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-    external_context_json: *const c_char,
-    interproc_iter: usize,
-    interproc_max_iters: usize,
-    interproc_converged: i32,
-    interproc_scope_json: *const c_char,
-    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
-    scope_num_functions: usize,
-) -> *mut c_char {
-    let scope = cstr_or_default(interproc_scope_json, "{}");
-    infer_type_writeback_json_impl(TypeWritebackInferenceInput {
-        ctx,
-        blocks,
-        num_blocks,
-        fcn_addr,
-        fcn_name,
-        external_context_json,
-        scope_functions,
-        scope_num_functions,
-        interproc: InterprocInferenceInput {
-            iter: interproc_iter.max(1),
-            max_iters: interproc_max_iters.max(1),
-            converged: interproc_converged != 0,
-            scope_json: &scope,
-        },
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_function_facts_json_scope_ex(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-    external_context_json: *const c_char,
-    interproc_iter: usize,
-    interproc_max_iters: usize,
-    interproc_converged: i32,
-    interproc_scope_json: *const c_char,
-    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
-    scope_num_functions: usize,
-) -> *mut c_char {
-    let scope = cstr_or_default(interproc_scope_json, "{}");
-    function_facts_json_impl(TypeWritebackInferenceInput {
-        ctx,
-        blocks,
-        num_blocks,
-        fcn_addr,
-        fcn_name,
-        external_context_json,
-        scope_functions,
-        scope_num_functions,
-        interproc: InterprocInferenceInput {
-            iter: interproc_iter.max(1),
-            max_iters: interproc_max_iters.max(1),
-            converged: interproc_converged != 0,
-            scope_json: &scope,
-        },
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_function_plan_json_scope_ex(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-    external_context_json: *const c_char,
-    interproc_iter: usize,
-    interproc_max_iters: usize,
-    interproc_converged: i32,
-    interproc_scope_json: *const c_char,
-    scope_functions: *const analysis::sym::R2ILFunctionBlocks,
-    scope_num_functions: usize,
-) -> *mut c_char {
-    let scope = cstr_or_default(interproc_scope_json, "{}");
-    function_plan_json_impl(TypeWritebackInferenceInput {
-        ctx,
-        blocks,
-        num_blocks,
-        fcn_addr,
-        fcn_name,
-        external_context_json,
-        scope_functions,
-        scope_num_functions,
-        interproc: InterprocInferenceInput {
-            iter: interproc_iter.max(1),
-            max_iters: interproc_max_iters.max(1),
-            converged: interproc_converged != 0,
-            scope_json: &scope,
-        },
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_function_analysis_artifact_cache_key(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-    external_context_json: *const c_char,
-    interproc_max_iters: usize,
-    interproc_scope_json: *const c_char,
-) -> u64 {
-    let Some(function_input) =
-        types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
-    else {
+pub extern "C" fn r2sleigh_session_artifact_cache_key(input: *const R2SleighSessionInput) -> u64 {
+    if input.is_null() {
+        return 0;
+    }
+    let input = unsafe { &*input };
+    let Some(function_input) = types::build_function_input(
+        input.ctx,
+        input.blocks,
+        input.num_blocks,
+        input.function_addr,
+        input.function_name,
+    ) else {
         return 0;
     };
-    let external_context = cstr_or_default(external_context_json, "{}");
-    let interproc_scope = cstr_or_default(interproc_scope_json, "{}");
-    types::function_analysis_artifact_cache_identity_hash(
+    let external_context = cstr_or_default(input.function_context.external_context_json, "{}");
+    let scope_facts = unsafe { typed_interproc_scope_facts(&input.interproc_scope) };
+    let interproc_iter = input.budget.interproc_iter.max(1);
+    let interproc_max_iters = input.budget.interproc_max_iters.max(interproc_iter);
+    let inference_input = TypeWritebackInferenceInput {
+        ctx: input.ctx,
+        blocks: input.blocks,
+        num_blocks: input.num_blocks,
+        fcn_addr: input.function_addr,
+        fcn_name: input.function_name,
+        external_context_json: input.function_context.external_context_json,
+        function_context: Some(&input.function_context),
+        scope_functions: input.interproc_scope.functions,
+        scope_num_functions: input.interproc_scope.num_functions,
+        interproc: InterprocInferenceInput {
+            iter: interproc_iter,
+            max_iters: interproc_max_iters,
+            converged: input.budget.interproc_converged != 0,
+            scope_facts: &scope_facts,
+            scope_report: None,
+        },
+    };
+    let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
+    let ptr_bits = function_input
+        .ctx
+        .arch
+        .as_ref()
+        .map(|arch| helpers::effective_ptr_bits(arch))
+        .unwrap_or(64);
+    let parsed_context = unsafe {
+        typed_function_context_to_parsed(&input.function_context, &external_context, ptr_bits)
+    };
+    types::function_analysis_artifact_cache_identity_hash_with_parsed_context_and_scope_facts(
         &function_input,
-        &external_context,
-        &interproc_scope,
-        interproc_max_iters.max(1),
-        None,
+        &parsed_context,
+        types::hash_string_payload(&external_context),
+        &scope_facts,
+        interproc_max_iters,
+        symbolic_scope.as_ref(),
     )
     .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_function_interproc_summary_json_ex(
-    ctx: *const R2ILContext,
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-    external_context_json: *const c_char,
-    interproc_max_iters: usize,
-    interproc_scope_json: *const c_char,
+pub extern "C" fn r2sleigh_session_interproc_summary_json(
+    input: *const R2SleighSessionInput,
 ) -> *mut c_char {
-    let Some(function_input) =
-        types::build_function_input(ctx, blocks, num_blocks, fcn_addr, fcn_name)
-    else {
+    if input.is_null() {
         return ptr::null_mut();
-    };
-    let external_context = cstr_or_default(external_context_json, "{}");
-    let interproc_scope = cstr_or_default(interproc_scope_json, "{}");
-    let Some(summary_json) = types::function_root_interproc_summary_json_with_scope(
-        &function_input,
-        &external_context,
-        &interproc_scope,
-        interproc_max_iters.max(1),
-        None,
+    }
+    let input = unsafe { &*input };
+    let Some(function_input) = types::build_function_input(
+        input.ctx,
+        input.blocks,
+        input.num_blocks,
+        input.function_addr,
+        input.function_name,
     ) else {
         return ptr::null_mut();
     };
-    CString::new(summary_json).map_or(ptr::null_mut(), |c| c.into_raw())
+    let external_context = cstr_or_default(input.function_context.external_context_json, "{}");
+    let scope_facts = unsafe { typed_interproc_scope_facts(&input.interproc_scope) };
+    let interproc_iter = input.budget.interproc_iter.max(1);
+    let interproc_max_iters = input.budget.interproc_max_iters.max(interproc_iter);
+    let inference_input = TypeWritebackInferenceInput {
+        ctx: input.ctx,
+        blocks: input.blocks,
+        num_blocks: input.num_blocks,
+        fcn_addr: input.function_addr,
+        fcn_name: input.function_name,
+        external_context_json: input.function_context.external_context_json,
+        function_context: Some(&input.function_context),
+        scope_functions: input.interproc_scope.functions,
+        scope_num_functions: input.interproc_scope.num_functions,
+        interproc: InterprocInferenceInput {
+            iter: interproc_iter,
+            max_iters: interproc_max_iters,
+            converged: input.budget.interproc_converged != 0,
+            scope_facts: &scope_facts,
+            scope_report: None,
+        },
+    };
+    let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
+    let ptr_bits = function_input
+        .ctx
+        .arch
+        .as_ref()
+        .map(|arch| helpers::effective_ptr_bits(arch))
+        .unwrap_or(64);
+    let parsed_context = unsafe {
+        typed_function_context_to_parsed(&input.function_context, &external_context, ptr_bits)
+    };
+    let Some(summary) = types::function_root_interproc_summary_with_parsed_context_and_scope_facts(
+        &function_input,
+        &parsed_context,
+        types::hash_string_payload(&external_context),
+        &scope_facts,
+        interproc_max_iters,
+        symbolic_scope.as_ref(),
+    ) else {
+        return ptr::null_mut();
+    };
+    serde_json::to_string(&summary)
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+        .map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
 #[unsafe(no_mangle)]
@@ -6581,20 +7994,12 @@ struct FcnAnnotation {
     comment: String,
 }
 
-/// Analyze a function and return per-block annotations as JSON.
-/// Returns a JSON array of {addr, comment} pairs summarizing SSA def-use info.
-/// Uses function-level SSA with phi nodes for meaningful annotations.
-/// Caller must free with r2il_string_free().
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_analyze_fcn_annotations(
+fn function_annotations_for_ffi(
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
     num_blocks: usize,
-    _fcn_addr: u64,
-) -> *mut c_char {
-    let Some(input) = types::build_function_input(ctx, blocks, num_blocks, 0, ptr::null()) else {
-        return ptr::null_mut();
-    };
+) -> Option<Vec<FcnAnnotation>> {
+    let input = types::build_function_input(ctx, blocks, num_blocks, 0, ptr::null())?;
 
     let semantic_by_addr: std::collections::HashMap<u64, String> = input
         .blocks
@@ -6603,19 +8008,15 @@ pub extern "C" fn r2sleigh_analyze_fcn_annotations(
         .filter_map(|block| summarize_block_semantics(block).map(|summary| (block.addr, summary)))
         .collect();
 
-    // Build function-level SSA with phi nodes
+    // Build function-level SSA with phi nodes.
     let ssa_func =
-        match r2ssa::SSAFunction::from_blocks_with_arch(input.blocks.as_slice(), input.ctx.arch) {
-            Some(f) => f,
-            None => return ptr::null_mut(),
-        };
+        r2ssa::SSAFunction::from_blocks_with_arch(input.blocks.as_slice(), input.ctx.arch)?;
 
     let mut annotations = Vec::new();
 
     for block in ssa_func.blocks() {
         let mut parts = Vec::new();
 
-        // Phi nodes show where values merge from different paths
         if !block.phis.is_empty() {
             let phi_vars: Vec<&str> = block
                 .phis
@@ -6635,7 +8036,6 @@ pub extern "C" fn r2sleigh_analyze_fcn_annotations(
             }
         }
 
-        // Collect register reads (version 0 = function input)
         let mut func_inputs = Vec::new();
         for op in &block.ops {
             for src in op.sources() {
@@ -6654,7 +8054,6 @@ pub extern "C" fn r2sleigh_analyze_fcn_annotations(
             parts.push(format!("uses {}", func_inputs.join(",")));
         }
 
-        // Collect register definitions
         let mut defs = Vec::new();
         for op in &block.ops {
             if let Some(dst) = op.dst()
@@ -6691,12 +8090,100 @@ pub extern "C" fn r2sleigh_analyze_fcn_annotations(
     }
 
     if annotations.is_empty() {
-        return ptr::null_mut();
+        return None;
     }
+
+    Some(annotations)
+}
+
+fn ffi_annotations_from_annotations(annotations: Vec<FcnAnnotation>) -> R2SleighAnnotations {
+    let mut strings = Vec::with_capacity(annotations.len());
+    let mut items = Vec::with_capacity(annotations.len());
+
+    for annotation in annotations {
+        let comment_ptr = match CString::new(annotation.comment) {
+            Ok(comment) => {
+                strings.push(comment);
+                strings.last().map_or(ptr::null(), |s| s.as_ptr())
+            }
+            Err(_) => ptr::null(),
+        };
+        if !comment_ptr.is_null() {
+            items.push(R2SleighAnnotation {
+                addr: annotation.addr,
+                comment: comment_ptr,
+            });
+        }
+    }
+
+    R2SleighAnnotations {
+        items,
+        _strings: strings,
+    }
+}
+
+/// Analyze a function and return per-block annotations as JSON.
+/// Returns a JSON array of {addr, comment} pairs summarizing SSA def-use info.
+/// Uses function-level SSA with phi nodes for meaningful annotations.
+/// Caller must free with r2il_string_free().
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_analyze_fcn_annotations(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    _fcn_addr: u64,
+) -> *mut c_char {
+    let Some(annotations) = function_annotations_for_ffi(ctx, blocks, num_blocks) else {
+        return ptr::null_mut();
+    };
 
     match serde_json::to_string(&annotations) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_analyze_fcn_annotations_typed(
+    ctx: *const R2ILContext,
+    blocks: *const *const R2ILBlock,
+    num_blocks: usize,
+    _fcn_addr: u64,
+) -> *mut R2SleighAnnotations {
+    let Some(annotations) = function_annotations_for_ffi(ctx, blocks, num_blocks) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(ffi_annotations_from_annotations(annotations)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_annotations_items(
+    annotations: *const R2SleighAnnotations,
+    count: *mut usize,
+) -> *const R2SleighAnnotation {
+    if annotations.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let annotations = unsafe { &*annotations };
+    if !count.is_null() {
+        unsafe {
+            *count = annotations.items.len();
+        }
+    }
+    annotations.items.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_annotations_free(annotations: *mut R2SleighAnnotations) {
+    if !annotations.is_null() {
+        unsafe {
+            drop(Box::from_raw(annotations));
+        }
     }
 }
 
@@ -8128,6 +9615,7 @@ mod tests {
             value: r2ssa::AssumptionValue::Constant { value: 0xdead },
         }]);
         let function_facts = semantic_fallback_function_facts(&compiled, &assumptions);
+        let scope_facts = types::empty_interproc_scope_facts();
         let payload = semantic_type_fallback_payload(
             "fcn.401000",
             "x86-64",
@@ -8136,7 +9624,8 @@ mod tests {
                 iter: 0,
                 max_iters: 0,
                 converged: true,
-                scope_json: "{}",
+                scope_facts: &scope_facts,
+                scope_report: None,
             },
             &compiled,
             &function_facts,
@@ -8155,6 +9644,111 @@ mod tests {
             items[0]["subject"]["register"]["name"].as_str(),
             Some("rdi"),
             "expected register assumption to survive fallback payload: {value:?}"
+        );
+    }
+
+    #[test]
+    fn mutation_plan_materializes_session_writeback_kinds() {
+        let plan = r2types::TypeWritebackPlan {
+            signature: r2types::InferredSignature {
+                function_name: "dbg.sum".to_string(),
+                signature: "int32_t dbg.sum(int32_t a);".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![r2types::InferredSignatureParam {
+                    name: "a".to_string(),
+                    param_type: "int32_t".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 90,
+            },
+            var_type_candidates: vec![r2types::VarTypeCandidate {
+                name: "var_8h".to_string(),
+                kind: "b".to_string(),
+                delta: -8,
+                var_type: "int32_t".to_string(),
+                isarg: false,
+                reg: None,
+                size: 4,
+                confidence: 95,
+                source: r2types::WritebackSource::ExternalTypeDb,
+                evidence: vec![r2types::WritebackEvidence::ExternalStackAnnotation],
+            }],
+            var_rename_candidates: vec![r2types::VarRenameCandidate {
+                name: "arg1".to_string(),
+                target_name: "a".to_string(),
+                confidence: 96,
+                source: r2types::WritebackSource::ExistingState,
+                evidence: vec![r2types::WritebackEvidence::ExternalParamName],
+            }],
+            struct_decls: Vec::new(),
+            global_type_links: Vec::new(),
+            diagnostics: r2types::TypeWritebackDiagnostics::default(),
+        };
+
+        let mutation_plan = mutation_plan_from_writeback(&plan, usize::MAX);
+        let kinds = mutation_plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.kind.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec!["signature", "callconv", "var", "var_type", "var_rename"]
+        );
+        assert_eq!(
+            mutation_plan.mutations[0].signature.as_deref(),
+            Some("int32_t dbg.sum(int32_t a);")
+        );
+        assert_eq!(
+            mutation_plan.mutations[3].type_name.as_deref(),
+            Some("int32_t")
+        );
+        assert_eq!(mutation_plan.mutations[4].old_name.as_deref(), Some("arg1"));
+        let (ffi_mutations, strings) = ffi_mutations_from_session_plan(&mutation_plan);
+        assert_eq!(ffi_mutations.len(), 5);
+        assert_eq!(strings.len(), 12);
+        assert_eq!(ffi_mutations[0].kind, R2SLEIGH_MUTATION_SIGNATURE);
+        assert_eq!(ffi_mutations[1].kind, R2SLEIGH_MUTATION_CALLCONV);
+        assert_eq!(ffi_mutations[2].kind, R2SLEIGH_MUTATION_VAR);
+        assert_eq!(ffi_mutations[3].kind, R2SLEIGH_MUTATION_VAR_TYPE);
+        assert_eq!(ffi_mutations[4].kind, R2SLEIGH_MUTATION_VAR_RENAME);
+        assert_eq!(ffi_mutations[2].delta, -8);
+        assert_eq!(ffi_mutations[2].var_kind, b'b' as c_char);
+        assert_eq!(ffi_mutations[2].confidence, 95);
+
+        let function_facts = r2types::FunctionFacts::default();
+        let payload = writeback_plan_json(
+            plan,
+            InterprocSummaryJson {
+                callsite_count: 0,
+                iterations: 1,
+                max_iterations: 1,
+                converged: true,
+                summary: None,
+                summary_json: None,
+                scope: None,
+            },
+            &function_facts,
+            None,
+            None,
+        );
+        let mut fact_strings = Vec::new();
+        let (signature_fact, signature_params) =
+            ffi_signature_fact_from_type_writeback(&payload, &mut fact_strings);
+        assert_eq!(signature_fact.confidence, 96);
+        assert_eq!(signature_fact.callconv_confidence, 90);
+        assert_eq!(signature_fact.num_params, 1);
+        assert_eq!(signature_fact.params, signature_params.as_ptr());
+        assert_eq!(
+            unsafe { CStr::from_ptr(signature_fact.signature) }.to_str(),
+            Ok("int32_t dbg.sum(int32_t a);")
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(signature_params[0].type_name) }.to_str(),
+            Ok("int32_t")
         );
     }
 
@@ -8315,6 +9909,63 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    fn test_function_context(external_context: &CString) -> R2SleighFunctionContext {
+        R2SleighFunctionContext {
+            schema_version: 1,
+            dirty_epoch: 0,
+            context_hash: 0,
+            external_context_json: external_context.as_ptr(),
+            signature_name: ptr::null(),
+            signature_ret_type: ptr::null(),
+            signature_callconv: ptr::null(),
+            signature_noreturn: 0,
+            params: ptr::null(),
+            num_params: 0,
+            vars: ptr::null(),
+            num_vars: 0,
+            base_types: ptr::null(),
+            num_base_types: 0,
+            assumptions_json: ptr::null(),
+        }
+    }
+
+    fn test_session_input(
+        ctx: *const R2ILContext,
+        blocks: &[*const R2ILBlock],
+        function_addr: u64,
+        function_name: &CString,
+        external_context: &CString,
+        seeds: &[R2SleighInterprocSeed],
+        interproc_max_iters: usize,
+    ) -> R2SleighSessionInput {
+        R2SleighSessionInput {
+            ctx,
+            blocks: blocks.as_ptr(),
+            num_blocks: blocks.len(),
+            function_addr,
+            function_name: function_name.as_ptr(),
+            function_context: test_function_context(external_context),
+            interproc_scope: R2SleighInterprocScope {
+                schema_version: 1,
+                functions: ptr::null(),
+                num_functions: 0,
+                seeds: seeds.as_ptr(),
+                num_seeds: seeds.len(),
+            },
+            debug_seed: R2SleighDebugSeed {
+                schema_version: 1,
+                seed_hash: 0,
+            },
+            budget: R2SleighBudgetConfig {
+                schema_version: 1,
+                interproc_iter: 1,
+                interproc_max_iters,
+                interproc_converged: 1,
+                global_max_links: 64,
+            },
+        }
+    }
 
     #[test]
     fn test_init_x86_64() {
@@ -8774,7 +10425,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn infer_type_writeback_json_ex_uses_interproc_seed_summaries_for_wrapper_return_type() {
+    fn session_analyze_uses_typed_interproc_seed_for_wrapper_return_type() {
         let arch = CString::new("x86-64").expect("valid arch");
         let ctx = r2il_arch_init(arch.as_ptr());
         assert!(!ctx.is_null(), "context should initialize");
@@ -8796,27 +10447,36 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let scope_json = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
-            .expect("valid scope json");
-
-        let out = r2sleigh_infer_type_writeback_json_ex(
+        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seeds = [R2SleighInterprocSeed {
+            id: 8192,
+            name: seed_name.as_ptr(),
+            arg_count_hint: 0,
+            has_arg_count_hint: 0,
+        }];
+        let input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            func_name.as_ptr(),
-            external_context.as_ptr(),
-            1,
+            &func_name,
+            &external_context,
+            &seeds,
             4,
-            1,
-            scope_json.as_ptr(),
         );
-        assert!(!out.is_null(), "writeback payload should not be null");
-        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+        let session = r2sleigh_session_analyze(&input);
+        assert!(!session.is_null(), "session should not be null");
+        let payload_ptr = r2sleigh_session_result_type_writeback_json(session);
+        assert!(
+            !payload_ptr.is_null(),
+            "writeback payload should not be null"
+        );
+        let output = unsafe { CStr::from_ptr(payload_ptr) }
+            .to_string_lossy()
+            .to_string();
         let payload: serde_json::Value =
             serde_json::from_str(&output).expect("payload should parse");
 
-        r2il_string_free(out);
+        r2sleigh_session_result_free(session);
         r2il_block_free(raw_block);
         r2il_free(ctx);
 
@@ -8832,7 +10492,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn function_interproc_summary_json_ex_returns_typed_root_summary() {
+    fn session_interproc_summary_returns_typed_root_summary() {
         let arch = CString::new("x86-64").expect("valid arch");
         let ctx = r2il_arch_init(arch.as_ptr());
         assert!(!ctx.is_null(), "context should initialize");
@@ -8854,19 +10514,23 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let scope_json = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
-            .expect("valid scope json");
-
-        let out = r2sleigh_function_interproc_summary_json_ex(
+        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seeds = [R2SleighInterprocSeed {
+            id: 8192,
+            name: seed_name.as_ptr(),
+            arg_count_hint: 0,
+            has_arg_count_hint: 0,
+        }];
+        let input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            func_name.as_ptr(),
-            external_context.as_ptr(),
+            &func_name,
+            &external_context,
+            &seeds,
             4,
-            scope_json.as_ptr(),
         );
+        let out = r2sleigh_session_interproc_summary_json(&input);
         assert!(!out.is_null(), "summary json should not be null");
         let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
         let payload: serde_json::Value =
@@ -8902,30 +10566,33 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let empty_scope = CString::new("{}").expect("valid scope");
-        let seeded_scope = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
-            .expect("valid seeded scope");
-
-        let root_key = r2sleigh_function_analysis_artifact_cache_key(
+        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seeds = [R2SleighInterprocSeed {
+            id: 8192,
+            name: seed_name.as_ptr(),
+            arg_count_hint: 0,
+            has_arg_count_hint: 0,
+        }];
+        let empty_input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            func_name.as_ptr(),
-            external_context.as_ptr(),
+            &func_name,
+            &external_context,
+            &[],
             1,
-            empty_scope.as_ptr(),
         );
-        let seeded_key = r2sleigh_function_analysis_artifact_cache_key(
+        let seeded_input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            func_name.as_ptr(),
-            external_context.as_ptr(),
+            &func_name,
+            &external_context,
+            &seeds,
             1,
-            seeded_scope.as_ptr(),
         );
+        let root_key = r2sleigh_session_artifact_cache_key(&empty_input);
+        let seeded_key = r2sleigh_session_artifact_cache_key(&seeded_input);
 
         r2il_block_free(raw_block);
         r2il_free(ctx);
@@ -8958,29 +10625,33 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let scope = CString::new(r#"{"seeds":[{"id":8192,"name":"sym.imp.malloc"}]}"#)
-            .expect("valid scope");
-
-        let low_budget_key = r2sleigh_function_analysis_artifact_cache_key(
+        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seeds = [R2SleighInterprocSeed {
+            id: 8192,
+            name: seed_name.as_ptr(),
+            arg_count_hint: 0,
+            has_arg_count_hint: 0,
+        }];
+        let low_budget_input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            func_name.as_ptr(),
-            external_context.as_ptr(),
+            &func_name,
+            &external_context,
+            &seeds,
             1,
-            scope.as_ptr(),
         );
-        let high_budget_key = r2sleigh_function_analysis_artifact_cache_key(
+        let high_budget_input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            func_name.as_ptr(),
-            external_context.as_ptr(),
+            &func_name,
+            &external_context,
+            &seeds,
             4,
-            scope.as_ptr(),
         );
+        let low_budget_key = r2sleigh_session_artifact_cache_key(&low_budget_input);
+        let high_budget_key = r2sleigh_session_artifact_cache_key(&high_budget_input);
 
         r2il_block_free(raw_block);
         r2il_free(ctx);
@@ -9011,28 +10682,26 @@ mod integration_tests {
         let first_name = CString::new("sym.first").expect("valid function name");
         let second_name = CString::new("sym.second").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let scope = CString::new("{}").expect("valid scope");
-
-        let first_key = r2sleigh_function_analysis_artifact_cache_key(
+        let first_input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            first_name.as_ptr(),
-            external_context.as_ptr(),
+            &first_name,
+            &external_context,
+            &[],
             1,
-            scope.as_ptr(),
         );
-        let second_key = r2sleigh_function_analysis_artifact_cache_key(
+        let second_input = test_session_input(
             ctx,
-            blocks.as_ptr(),
-            blocks.len(),
+            &blocks,
             0x401000,
-            second_name.as_ptr(),
-            external_context.as_ptr(),
+            &second_name,
+            &external_context,
+            &[],
             1,
-            scope.as_ptr(),
         );
+        let first_key = r2sleigh_session_artifact_cache_key(&first_input);
+        let second_key = r2sleigh_session_artifact_cache_key(&second_input);
 
         r2il_block_free(raw_block);
         r2il_free(ctx);
@@ -12622,16 +14291,58 @@ mod integration_tests {
         )
         .expect("valid process_string external context");
 
-        let out = r2sleigh_infer_type_writeback_json(
+        let session_input = R2SleighSessionInput {
             ctx,
-            owned_blocks.as_ptr().cast(),
-            owned_blocks.len(),
-            0,
-            func_name.as_ptr(),
-            external_context.as_ptr(),
+            blocks: owned_blocks.as_ptr().cast(),
+            num_blocks: owned_blocks.len(),
+            function_addr: 0,
+            function_name: func_name.as_ptr(),
+            function_context: R2SleighFunctionContext {
+                schema_version: 1,
+                dirty_epoch: 0,
+                context_hash: 0,
+                external_context_json: external_context.as_ptr(),
+                signature_name: ptr::null(),
+                signature_ret_type: ptr::null(),
+                signature_callconv: ptr::null(),
+                signature_noreturn: 0,
+                params: ptr::null(),
+                num_params: 0,
+                vars: ptr::null(),
+                num_vars: 0,
+                base_types: ptr::null(),
+                num_base_types: 0,
+                assumptions_json: ptr::null(),
+            },
+            interproc_scope: R2SleighInterprocScope {
+                schema_version: 1,
+                functions: ptr::null(),
+                num_functions: 0,
+                seeds: ptr::null(),
+                num_seeds: 0,
+            },
+            debug_seed: R2SleighDebugSeed {
+                schema_version: 1,
+                seed_hash: 0,
+            },
+            budget: R2SleighBudgetConfig {
+                schema_version: 1,
+                interproc_iter: 1,
+                interproc_max_iters: 1,
+                interproc_converged: 1,
+                global_max_links: 64,
+            },
+        };
+        let session = r2sleigh_session_analyze(&session_input);
+        assert!(!session.is_null(), "session should not be null");
+        let payload_ptr = r2sleigh_session_result_type_writeback_json(session);
+        assert!(
+            !payload_ptr.is_null(),
+            "type writeback output should not be null"
         );
-        assert!(!out.is_null(), "type writeback output should not be null");
-        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+        let output = unsafe { CStr::from_ptr(payload_ptr) }
+            .to_string_lossy()
+            .to_string();
         let payload: serde_json::Value =
             serde_json::from_str(&output).expect("type writeback payload should parse");
         let parsed_context = r2types::parse_external_context_json(
@@ -12653,7 +14364,7 @@ mod integration_tests {
             .to_string_lossy()
             .to_string();
 
-        r2il_string_free(out);
+        r2sleigh_session_result_free(session);
         r2il_string_free(recovered_out);
         for block in owned_blocks {
             r2il_block_free(block);
