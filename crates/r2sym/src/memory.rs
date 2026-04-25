@@ -985,12 +985,12 @@ fn recognize_affine_bv(ast: &BV) -> Option<(BV, i64)> {
         return None;
     }
 
-    if ast.is_const() && ast.decl().kind() == DeclKind::UNINTERPRETED {
+    if ast.is_const() && ast.decl().kind() == DeclKind::Uninterpreted {
         return Some((ast.clone(), 0));
     }
 
     match ast.decl().kind() {
-        DeclKind::BADD => {
+        DeclKind::Badd => {
             let children = ast.children();
             if children.len() != 2 {
                 return None;
@@ -1011,7 +1011,7 @@ fn recognize_affine_bv(ast: &BV) -> Option<(BV, i64)> {
             }
             None
         }
-        DeclKind::BSUB => {
+        DeclKind::Bsub => {
             let children = ast.children();
             if children.len() != 2 {
                 return None;
@@ -1024,7 +1024,7 @@ fn recognize_affine_bv(ast: &BV) -> Option<(BV, i64)> {
                 .checked_sub(delta)
                 .map(|combined| (widen_affine_base(&base, ast.get_size()), combined))
         }
-        DeclKind::ZERO_EXT | DeclKind::SIGN_EXT => {
+        DeclKind::ZeroExt | DeclKind::SignExt => {
             let child = ast.nth_child(0)?.as_bv()?;
             let (base, delta) = recognize_affine_bv(&child)?;
             Some((widen_affine_base(&base, ast.get_size()), delta))

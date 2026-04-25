@@ -365,7 +365,7 @@ impl<'ctx> SymValue<'ctx> {
                     let dyn_ast = Dynamic::from_ast(ast);
                     if matches!(
                         dyn_ast.safe_decl().map(|decl| decl.kind()),
-                        Ok(DeclKind::ZERO_EXT)
+                        Ok(DeclKind::ZeroExt)
                     ) {
                         if let Some(child) =
                             dyn_ast.children().first().and_then(|child| child.as_bv())
@@ -429,7 +429,7 @@ impl<'ctx> SymValue<'ctx> {
                     let dyn_ast = Dynamic::from_ast(ast);
                     if matches!(
                         dyn_ast.safe_decl().map(|decl| decl.kind()),
-                        Ok(DeclKind::SIGN_EXT)
+                        Ok(DeclKind::SignExt)
                     ) {
                         if let Some(child) =
                             dyn_ast.children().first().and_then(|child| child.as_bv())
@@ -494,7 +494,7 @@ impl<'ctx> SymValue<'ctx> {
                     let dyn_ast = Dynamic::from_ast(ast);
                     if matches!(
                         dyn_ast.safe_decl().map(|decl| decl.kind()),
-                        Ok(DeclKind::ZERO_EXT | DeclKind::SIGN_EXT)
+                        Ok(DeclKind::ZeroExt | DeclKind::SignExt)
                     ) {
                         let children = dyn_ast.children();
                         if let Some(child) = children.first().and_then(|child| child.as_bv())

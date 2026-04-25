@@ -504,7 +504,7 @@ impl<'ctx> SymSolver<'ctx> {
         let is_uninterpreted_leaf = expr.is_const()
             && matches!(
                 expr.safe_decl().map(|decl| decl.kind()),
-                Ok(DeclKind::UNINTERPRETED)
+                Ok(DeclKind::Uninterpreted)
             );
         if is_uninterpreted_leaf {
             return Some(DependencyAtom(expr.clone()));
@@ -558,7 +558,7 @@ impl<'ctx> SymSolver<'ctx> {
         let children = expr.children();
 
         match (decl.kind(), positive) {
-            (DeclKind::AND, true) => {
+            (DeclKind::And, true) => {
                 for child in &children {
                     Self::apply_abstract_constraint(facts, child, true);
                     if facts.unsat {
@@ -566,26 +566,26 @@ impl<'ctx> SymSolver<'ctx> {
                     }
                 }
             }
-            (DeclKind::NOT, _) => {
+            (DeclKind::Not, _) => {
                 if let Some(child) = children.first() {
                     Self::apply_abstract_constraint(facts, child, !positive);
                 }
             }
-            (DeclKind::EQ, true) if children.len() == 2 => {
+            (DeclKind::Eq, true) if children.len() == 2 => {
                 if let Some((atom, value)) =
                     Self::extract_leaf_const_pair(&children[0], &children[1])
                 {
                     facts.record_eq(atom, value);
                 }
             }
-            (DeclKind::EQ, false) if children.len() == 2 => {
+            (DeclKind::Eq, false) if children.len() == 2 => {
                 if let Some((atom, value)) =
                     Self::extract_leaf_const_pair(&children[0], &children[1])
                 {
                     facts.record_ne(atom, value);
                 }
             }
-            (DeclKind::ULEQ, true) if children.len() == 2 => {
+            (DeclKind::Uleq, true) if children.len() == 2 => {
                 if let Some((atom, value)) =
                     Self::extract_leaf_const_pair(&children[0], &children[1])
                 {
@@ -596,7 +596,7 @@ impl<'ctx> SymSolver<'ctx> {
                     }
                 }
             }
-            (DeclKind::UGEQ, true) if children.len() == 2 => {
+            (DeclKind::Ugeq, true) if children.len() == 2 => {
                 if let Some((atom, value)) =
                     Self::extract_leaf_const_pair(&children[0], &children[1])
                 {
@@ -607,7 +607,7 @@ impl<'ctx> SymSolver<'ctx> {
                     }
                 }
             }
-            (DeclKind::ULT, true) if children.len() == 2 => {
+            (DeclKind::Ult, true) if children.len() == 2 => {
                 if let Some((atom, value)) =
                     Self::extract_leaf_const_pair(&children[0], &children[1])
                 {
@@ -622,7 +622,7 @@ impl<'ctx> SymSolver<'ctx> {
                     }
                 }
             }
-            (DeclKind::UGT, true) if children.len() == 2 => {
+            (DeclKind::Ugt, true) if children.len() == 2 => {
                 if let Some((atom, value)) =
                     Self::extract_leaf_const_pair(&children[0], &children[1])
                 {
