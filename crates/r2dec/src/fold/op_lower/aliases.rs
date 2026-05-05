@@ -396,6 +396,17 @@ impl<'a> FoldingContext<'a> {
         pure
     }
 
+    fn call_expr_returns_void(&self, expr: &CExpr) -> bool {
+        let CExpr::Call { func, .. } = expr else {
+            return false;
+        };
+        let Some(name) = Self::extract_callee_name(func) else {
+            return false;
+        };
+        self.lookup_known_signature(name)
+            .is_some_and(|sig| matches!(sig.return_type, r2types::CTypeLike::Void))
+    }
+
     pub(super) fn collect_expr_reads(&self, expr: &CExpr, out: &mut HashSet<String>) {
         expr.visit(&mut |node| {
             if let CExpr::Var(name) = node {
@@ -503,17 +514,107 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn prune_dead_temp_assignments(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
+        self.prune_dead_temp_assignments_with_options(stmts, true)
+    }
+
+    pub(super) fn prune_dead_temp_assignments_before_structuring(
+        &self,
+        stmts: Vec<CStmt>,
+    ) -> Vec<CStmt> {
+        self.prune_dead_temp_assignments_with_options(stmts, false)
+    }
+
+    fn prune_dead_temp_assignments_with_options(
+        &self,
+        stmts: Vec<CStmt>,
+        demote_dead_return_register_calls: bool,
+    ) -> Vec<CStmt> {
         let mut live = HashSet::new();
+        let mut live_call_sources = BTreeSet::new();
+        let mut live_call_assignment_sources = BTreeSet::new();
         let mut kept_rev = Vec::with_capacity(stmts.len());
 
         for stmt in stmts.into_iter().rev() {
-            let (reads, def) = self.stmt_reads_and_def(&stmt);
+            let mut stmt = stmt;
+            let (mut reads, mut def) = self.stmt_reads_and_def(&stmt);
 
             let drop_stmt = if let Some((target, rhs)) = Self::assignment_target_and_rhs(&stmt) {
                 let target_lower = target.to_ascii_lowercase();
+                let dead_sleigh_memory_artifact = self.is_sleigh_memory_temp_name(target)
+                    && !live.contains(target)
+                    && self.expr_contains_unresolved_memory(rhs);
+                let source_call_for_target = self
+                    .call_result_source_for_ssa_name(target)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(target))
+                    .or_else(|| self.source_call_for_visible_owner_name(target));
+                let observable_call_result_owner =
+                    source_call_for_target.is_some_and(|source_call| {
+                        let candidate_names = self.call_result_candidate_names(source_call, target);
+                        self.call_result_candidate_names_have_observable_use(&candidate_names)
+                    });
+                let replayed_call_result_has_live_owner =
+                    source_call_for_target.is_some_and(|source_call| {
+                        self.call_result_candidate_names(source_call, target)
+                            .into_iter()
+                            .any(|candidate| {
+                                !candidate.eq_ignore_ascii_case(target) && live.contains(&candidate)
+                            })
+                    });
+                let rhs_call_source = match rhs {
+                    CExpr::Call { .. } => self
+                        .source_call_for_call_expr(rhs)
+                        .or_else(|| self.source_call_for_loose_internal_call_expr(rhs)),
+                    _ => None,
+                };
+                let replayed_call_result_has_live_expr =
+                    rhs_call_source.is_some_and(|source| live_call_sources.contains(&source));
+                let replayed_call_result_has_later_same_assignment =
+                    rhs_call_source.is_some_and(|source| {
+                        live_call_assignment_sources
+                            .contains(&(source, target.to_ascii_lowercase()))
+                    });
+                let replayed_call_result_reuses_target_as_input =
+                    self.call_expr_args_contain_var_name(rhs, target);
+                let target_is_named_stack_owner =
+                    self.stack_slot_provenance_for_name(target).is_some()
+                        || self.stack_offset_for_visible_storage_name(target).is_some();
+                let target_is_materialized_call_owner = rhs_call_source.is_some_and(|source| {
+                    self.stable_owned_call_result_name_for_source(source)
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(target))
+                });
+                let protected_named_call_result_owner =
+                    target_is_named_stack_owner && target_is_materialized_call_owner;
+                let target_base = target
+                    .split('_')
+                    .next()
+                    .unwrap_or(target)
+                    .to_ascii_lowercase();
+                let dead_return_register_owner = demote_dead_return_register_calls
+                    && self.inputs.arch.is_return_register_name(&target_base);
+                let dead_replayed_call_result = (((!live.contains(target)
+                    || replayed_call_result_reuses_target_as_input)
+                    && replayed_call_result_has_live_expr)
+                    || replayed_call_result_has_later_same_assignment)
+                    && matches!(rhs, CExpr::Call { .. })
+                    && (replayed_call_result_has_later_same_assignment
+                        || replayed_call_result_reuses_target_as_input
+                        || self.is_low_signal_visible_name(target)
+                        || self.is_transient_visible_name(target)
+                        || self.is_prunable_dead_binding_target(target));
+                let dead_transient_call_result = !live.contains(target)
+                    && (dead_return_register_owner
+                        || !observable_call_result_owner
+                        || self.call_expr_returns_void(rhs))
+                    && matches!(rhs, CExpr::Call { .. })
+                    && !protected_named_call_result_owner
+                    && (self.is_low_signal_visible_name(target)
+                        || self.is_transient_visible_name(target)
+                        || self.is_prunable_dead_binding_target(target));
+                let dead_replayed_call_result = dead_replayed_call_result
+                    || (dead_transient_call_result && replayed_call_result_has_live_owner);
                 let dead_ephemeral = self.is_prunable_dead_binding_target(target)
                     && !live.contains(target)
-                    && self.expr_is_pure(rhs);
+                    && (self.expr_is_pure(rhs) || dead_sleigh_memory_artifact);
                 let dead_flag_artifact =
                     is_cpu_flag(&target_lower) && !live.contains(target) && self.expr_is_pure(rhs);
 
@@ -533,7 +634,15 @@ impl<'a> FoldingContext<'a> {
                     false
                 };
 
-                dead_ephemeral || dead_flag_artifact || dead_phi_copy
+                if dead_replayed_call_result {
+                    true
+                } else if dead_transient_call_result {
+                    stmt = CStmt::Expr(rhs.clone());
+                    (reads, def) = self.stmt_reads_and_def(&stmt);
+                    false
+                } else {
+                    dead_ephemeral || dead_flag_artifact || dead_phi_copy
+                }
             } else {
                 false
             };
@@ -546,11 +655,17 @@ impl<'a> FoldingContext<'a> {
                 live.remove(&def_name);
             }
             live.extend(reads);
+            self.collect_call_sources_in_stmt(&stmt, &mut live_call_sources);
+            self.collect_call_assignment_sources_in_stmt(&stmt, &mut live_call_assignment_sources);
             kept_rev.push(stmt);
         }
 
         kept_rev.reverse();
-        kept_rev
+        if demote_dead_return_register_calls {
+            self.dedup_replayed_call_exprs(kept_rev)
+        } else {
+            kept_rev
+        }
     }
 
     pub(crate) fn prune_dead_temp_assignments_in_stmt(&self, stmt: CStmt) -> CStmt {
@@ -610,5 +725,230 @@ impl<'a> FoldingContext<'a> {
             .map(|stmt| self.prune_dead_temp_assignments_in_stmt(stmt))
             .collect();
         self.prune_dead_temp_assignments(rewritten)
+    }
+
+    fn call_source_for_statement(&self, stmt: &CStmt) -> Option<(u64, usize)> {
+        match stmt {
+            CStmt::Expr(expr @ CExpr::Call { .. }) => self
+                .source_call_for_call_expr(expr)
+                .or_else(|| self.source_call_for_loose_internal_call_expr(expr)),
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                right,
+                ..
+            }) if matches!(right.as_ref(), CExpr::Call { .. }) => self
+                .source_call_for_call_expr(right)
+                .or_else(|| self.source_call_for_loose_internal_call_expr(right)),
+            _ => None,
+        }
+    }
+
+    fn collect_call_sources_in_stmt(&self, stmt: &CStmt, out: &mut BTreeSet<(u64, usize)>) {
+        match stmt {
+            CStmt::Expr(expr)
+            | CStmt::Return(Some(expr))
+            | CStmt::While { cond: expr, .. }
+            | CStmt::DoWhile { cond: expr, .. } => self.collect_call_sources_in_expr(expr, out),
+            CStmt::Decl {
+                init: Some(expr), ..
+            } => self.collect_call_sources_in_expr(expr, out),
+            CStmt::If { cond, .. } => self.collect_call_sources_in_expr(cond, out),
+            CStmt::For {
+                cond: Some(expr),
+                update: Some(update),
+                ..
+            } => {
+                self.collect_call_sources_in_expr(expr, out);
+                self.collect_call_sources_in_expr(update, out);
+            }
+            CStmt::For {
+                cond: Some(expr),
+                update: None,
+                ..
+            }
+            | CStmt::For {
+                cond: None,
+                update: Some(expr),
+                ..
+            } => self.collect_call_sources_in_expr(expr, out),
+            CStmt::Switch { expr, .. } => self.collect_call_sources_in_expr(expr, out),
+            CStmt::Return(None)
+            | CStmt::Decl { init: None, .. }
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label { .. }
+            | CStmt::Comment(_)
+            | CStmt::Empty
+            | CStmt::Block(_)
+            | CStmt::For {
+                cond: None,
+                update: None,
+                ..
+            } => {}
+        }
+    }
+
+    fn collect_call_sources_in_expr(&self, expr: &CExpr, out: &mut BTreeSet<(u64, usize)>) {
+        expr.visit(&mut |node| {
+            if let CExpr::Call { .. } = node
+                && let Some(source) = self
+                    .source_call_for_call_expr(node)
+                    .or_else(|| self.source_call_for_loose_internal_call_expr(node))
+            {
+                out.insert(source);
+            }
+        });
+    }
+
+    fn collect_call_assignment_sources_in_stmt(
+        &self,
+        stmt: &CStmt,
+        out: &mut BTreeSet<((u64, usize), String)>,
+    ) {
+        let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = stmt
+        else {
+            return;
+        };
+        let CExpr::Var(target) = left.as_ref() else {
+            return;
+        };
+        if !matches!(right.as_ref(), CExpr::Call { .. }) {
+            return;
+        }
+        if let Some(source) = self
+            .source_call_for_call_expr(right)
+            .or_else(|| self.source_call_for_loose_internal_call_expr(right))
+        {
+            out.insert((source, target.to_ascii_lowercase()));
+        }
+    }
+
+    fn call_expr_args_contain_var_name(&self, expr: &CExpr, name: &str) -> bool {
+        let CExpr::Call { args, .. } = expr else {
+            return false;
+        };
+        args.iter().any(|arg| {
+            let mut found = false;
+            arg.visit(&mut |node| {
+                if let CExpr::Var(candidate) = node
+                    && candidate.eq_ignore_ascii_case(name)
+                {
+                    found = true;
+                }
+            });
+            found
+        })
+    }
+
+    fn dedup_replayed_call_exprs(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
+        let mut seen = BTreeSet::new();
+        self.dedup_replayed_call_exprs_in_block(stmts, &mut seen)
+    }
+
+    fn dedup_replayed_call_exprs_in_block(
+        &self,
+        stmts: Vec<CStmt>,
+        seen: &mut BTreeSet<(u64, usize)>,
+    ) -> Vec<CStmt> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            if let Some(source) = self.call_source_for_statement(&stmt) {
+                let is_bare_call = matches!(stmt, CStmt::Expr(CExpr::Call { .. }));
+                if is_bare_call && seen.contains(&source) {
+                    continue;
+                }
+                seen.insert(source);
+            }
+            out.push(self.dedup_replayed_call_exprs_in_stmt(stmt, seen));
+        }
+        out
+    }
+
+    fn dedup_replayed_call_exprs_in_stmt(
+        &self,
+        stmt: CStmt,
+        seen: &mut BTreeSet<(u64, usize)>,
+    ) -> CStmt {
+        match stmt {
+            CStmt::Block(stmts) => {
+                CStmt::Block(self.dedup_replayed_call_exprs_in_block(stmts, seen))
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let mut then_seen = seen.clone();
+                let then_body =
+                    Box::new(self.dedup_replayed_call_exprs_in_stmt(*then_body, &mut then_seen));
+                let else_body = else_body.map(|stmt| {
+                    let mut else_seen = seen.clone();
+                    Box::new(self.dedup_replayed_call_exprs_in_stmt(*stmt, &mut else_seen))
+                });
+                CStmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                }
+            }
+            CStmt::While { cond, body } => {
+                let mut body_seen = seen.clone();
+                CStmt::While {
+                    cond,
+                    body: Box::new(self.dedup_replayed_call_exprs_in_stmt(*body, &mut body_seen)),
+                }
+            }
+            CStmt::DoWhile { body, cond } => {
+                let mut body_seen = seen.clone();
+                CStmt::DoWhile {
+                    body: Box::new(self.dedup_replayed_call_exprs_in_stmt(*body, &mut body_seen)),
+                    cond,
+                }
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                let mut body_seen = seen.clone();
+                CStmt::For {
+                    init,
+                    cond,
+                    update,
+                    body: Box::new(self.dedup_replayed_call_exprs_in_stmt(*body, &mut body_seen)),
+                }
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                let cases = cases
+                    .into_iter()
+                    .map(|mut case| {
+                        let mut case_seen = seen.clone();
+                        case.body =
+                            self.dedup_replayed_call_exprs_in_block(case.body, &mut case_seen);
+                        case
+                    })
+                    .collect();
+                let default = default.map(|stmts| {
+                    let mut default_seen = seen.clone();
+                    self.dedup_replayed_call_exprs_in_block(stmts, &mut default_seen)
+                });
+                CStmt::Switch {
+                    expr,
+                    cases,
+                    default,
+                }
+            }
+            other => other,
+        }
     }
 }

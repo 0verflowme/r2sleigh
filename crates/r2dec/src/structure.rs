@@ -470,6 +470,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         reachable_target: u64,
     ) -> CExpr {
         let cond = self.get_branch_condition(region.anchor);
+        if region.branch_truth_for_target(reachable_target) == Some(false) {
+            return Self::negate_condition(cond);
+        }
         if Self::region_supporting_compiled_condition(region).is_some() {
             return cond;
         }
@@ -477,9 +480,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .resolve_conditional_targets(region.anchor)
             .is_some_and(|(_, false_target)| false_target == reachable_target)
         {
-            return Self::negate_condition(cond);
-        }
-        if region.branch_truth_for_target(reachable_target) == Some(false) {
             return Self::negate_condition(cond);
         }
         cond

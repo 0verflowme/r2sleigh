@@ -9,13 +9,16 @@ use crate::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, Write};
+use std::fmt::{self, Write as _};
+use std::hash::{Hash, Hasher};
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 const ANALYSIS_CACHE_LIMIT: usize = 256;
+static DECOMPILE_RENDER_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static DECOMPILE_RENDER_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 fn should_reuse_decompile_ssa_for_pattern_analysis(prepared: &r2ssa::SsaArtifact) -> bool {
     let summary = prepared.function().cfg_risk_summary();
@@ -64,39 +67,150 @@ struct FunctionArtifactCacheKey {
     symbolic_scope_hash: u64,
 }
 
-struct HasherWriter<'a, H: Hasher>(&'a mut H);
+struct BoundedArcCache<K, V> {
+    limit: usize,
+    entries: HashMap<K, (Arc<V>, u64)>,
+    order: BTreeMap<u64, K>,
+    next_ticket: u64,
+}
 
-impl<H: Hasher> Write for HasherWriter<'_, H> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf);
-        Ok(buf.len())
+impl<K, V> BoundedArcCache<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            next_ticket: 1,
+        }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn allocate_ticket(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+        ticket
+    }
+
+    fn get(&mut self, key: &K) -> Option<Arc<V>> {
+        let new_ticket = self.allocate_ticket();
+        let (value, old_ticket) = self.entries.get_mut(key)?;
+        let value = value.clone();
+        let previous_ticket = *old_ticket;
+        *old_ticket = new_ticket;
+        self.order.remove(&previous_ticket);
+        self.order.insert(new_ticket, key.clone());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: Arc<V>) {
+        if self.limit == 0 {
+            return;
+        }
+        let ticket = self.allocate_ticket();
+        if let Some((_, old_ticket)) = self.entries.insert(key.clone(), (value, ticket)) {
+            self.order.remove(&old_ticket);
+        }
+        self.order.insert(ticket, key);
+        while self.entries.len() > self.limit {
+            let Some((_, evicted_key)) = self.order.pop_first() else {
+                break;
+            };
+            self.entries.remove(&evicted_key);
+        }
+    }
+
+    fn retain<F>(&mut self, mut keep: F) -> bool
+    where
+        F: FnMut(&K, &Arc<V>) -> bool,
+    {
+        let before = self.entries.len();
+        self.entries.retain(|key, (value, _)| keep(key, value));
+        self.order.clear();
+        for (key, (_, ticket)) in &self.entries {
+            self.order.insert(*ticket, key.clone());
+        }
+        self.entries.len() != before
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Clone)]
+struct Fnv64Hasher(u64);
+
+impl Default for Fnv64Hasher {
+    fn default() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for Fnv64Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+struct FnvFmtWriter<'a>(&'a mut Fnv64Hasher);
+
+impl fmt::Write for FnvFmtWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.write(s.as_bytes());
         Ok(())
     }
 }
 
-fn hash_json_value<T: serde::Serialize>(value: &T) -> Option<u64> {
-    let mut hasher = DefaultHasher::new();
-    let mut writer = HasherWriter(&mut hasher);
-    serde_json::to_writer(&mut writer, value).ok()?;
-    Some(hasher.finish())
+fn hash_debug_payload<T: std::fmt::Debug>(value: &T) -> u64 {
+    let mut hasher = Fnv64Hasher::default();
+    let _ = write!(&mut FnvFmtWriter(&mut hasher), "{value:?}");
+    hasher.finish()
 }
 
 fn hash_optional_arch(arch: Option<&ArchSpec>) -> u64 {
-    arch.and_then(hash_json_value).unwrap_or(0)
+    arch.map(hash_debug_payload).unwrap_or(0)
 }
 
 pub(crate) fn hash_string_payload(payload: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fnv64Hasher::default();
     payload.hash(&mut hasher);
     hasher.finish()
 }
 
 fn hash_value<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fnv64Hasher::default();
     value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_blocks(blocks: &[R2ILBlock]) -> u64 {
+    let mut hasher = Fnv64Hasher::default();
+    "r2il-blocks-v1".hash(&mut hasher);
+    blocks.len().hash(&mut hasher);
+    for block in blocks {
+        block.addr.hash(&mut hasher);
+        block.size.hash(&mut hasher);
+        block.ops.len().hash(&mut hasher);
+        for op in &block.ops {
+            let _ = write!(&mut FnvFmtWriter(&mut hasher), "{op:?}");
+        }
+        let _ = write!(
+            &mut FnvFmtWriter(&mut hasher),
+            "{:?}{:?}",
+            block.switch_info,
+            block.op_metadata
+        );
+    }
     hasher.finish()
 }
 
@@ -107,7 +221,7 @@ fn function_analysis_cache_key_parts(
 ) -> Option<FunctionAnalysisCacheKey> {
     Some(FunctionAnalysisCacheKey {
         arch_hash: hash_optional_arch(arch),
-        blocks_hash: hash_json_value(&blocks)?,
+        blocks_hash: hash_blocks(blocks),
     })
 }
 
@@ -172,7 +286,7 @@ fn session_context_identity_hash_from_parsed(
     match (parsed.context_hash, parsed.context_dirty_epoch) {
         (None, None) => fallback_hash,
         (context_hash, dirty_epoch) => {
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = Fnv64Hasher::default();
             "radare2-typed-context".hash(&mut hasher);
             parsed.context_schema_version.hash(&mut hasher);
             context_hash.unwrap_or(fallback_hash).hash(&mut hasher);
@@ -185,35 +299,26 @@ fn session_context_identity_hash_from_parsed(
 fn interproc_scope_identity_hash(
     summaries: &BTreeMap<r2ssa::InterprocFunctionId, r2ssa::FunctionSemanticSummary>,
 ) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fnv64Hasher::default();
     "typed-interproc-scope".hash(&mut hasher);
-    hash_json_value(summaries).unwrap_or(0).hash(&mut hasher);
+    hash_debug_payload(summaries).hash(&mut hasher);
     hasher.finish()
 }
 
 pub(crate) struct FunctionFactsStore {
-    analysis_cache: RwLock<HashMap<FunctionAnalysisCacheKey, Arc<FunctionAnalysis>>>,
-    artifact_cache: RwLock<HashMap<FunctionArtifactCacheKey, Arc<FunctionAnalysisArtifact>>>,
+    analysis_cache: RwLock<BoundedArcCache<FunctionAnalysisCacheKey, FunctionAnalysis>>,
+    artifact_cache: RwLock<BoundedArcCache<FunctionArtifactCacheKey, FunctionAnalysisArtifact>>,
+    decompile_cache: RwLock<BoundedArcCache<u64, String>>,
 }
 
 impl FunctionFactsStore {
     fn new() -> Self {
         Self {
-            analysis_cache: RwLock::new(HashMap::new()),
-            artifact_cache: RwLock::new(HashMap::new()),
+            analysis_cache: RwLock::new(BoundedArcCache::new(ANALYSIS_CACHE_LIMIT)),
+            artifact_cache: RwLock::new(BoundedArcCache::new(ANALYSIS_CACHE_LIMIT)),
+            decompile_cache: RwLock::new(BoundedArcCache::new(ANALYSIS_CACHE_LIMIT)),
         }
     }
-}
-
-fn cache_insert_bounded<K, V>(cache: &RwLock<HashMap<K, Arc<V>>>, key: K, value: Arc<V>)
-where
-    K: Eq + Hash,
-{
-    let mut guard = cache.write().expect("plugin cache write lock poisoned");
-    if guard.len() >= ANALYSIS_CACHE_LIMIT {
-        guard.clear();
-    }
-    guard.insert(key, value);
 }
 
 pub(crate) fn function_facts_store() -> &'static FunctionFactsStore {
@@ -258,15 +363,17 @@ impl FunctionFactsStore {
         function_name: &str,
     ) -> Option<FunctionAnalysis> {
         self.analysis_cache
-            .read()
-            .expect("plugin cache read lock poisoned")
+            .write()
+            .expect("plugin cache write lock poisoned")
             .get(key)
-            .cloned()
             .map(|analysis| rename_function_analysis((*analysis).clone(), function_name))
     }
 
     fn insert_analysis(&self, key: FunctionAnalysisCacheKey, analysis: FunctionAnalysis) {
-        cache_insert_bounded(&self.analysis_cache, key, Arc::new(analysis));
+        self.analysis_cache
+            .write()
+            .expect("plugin cache write lock poisoned")
+            .insert(key, Arc::new(analysis));
     }
 
     fn cached_artifact(
@@ -275,15 +382,17 @@ impl FunctionFactsStore {
         function_name: &str,
     ) -> Option<FunctionAnalysisArtifact> {
         self.artifact_cache
-            .read()
-            .expect("plugin cache read lock poisoned")
+            .write()
+            .expect("plugin cache write lock poisoned")
             .get(key)
-            .cloned()
             .map(|artifact| rename_function_analysis_artifact((*artifact).clone(), function_name))
     }
 
     fn insert_artifact(&self, key: FunctionArtifactCacheKey, artifact: FunctionAnalysisArtifact) {
-        cache_insert_bounded(&self.artifact_cache, key, Arc::new(artifact));
+        self.artifact_cache
+            .write()
+            .expect("plugin cache write lock poisoned")
+            .insert(key, Arc::new(artifact));
     }
 
     fn clear_artifacts_for_function(
@@ -295,12 +404,72 @@ impl FunctionFactsStore {
             .artifact_cache
             .write()
             .expect("plugin cache write lock poisoned");
-        let before = cache.len();
         cache.retain(|key, _| {
             key.analysis != *analysis_key || key.function_name_hash != function_name_hash
-        });
-        cache.len() != before
+        })
     }
+}
+
+pub(crate) struct DecompileRenderCacheKeyInput<'a> {
+    pub(crate) blocks: &'a [R2ILBlock],
+    pub(crate) function_name: &'a str,
+    pub(crate) arch: Option<&'a ArchSpec>,
+    pub(crate) ptr_bits: u32,
+    pub(crate) function_facts: &'a r2types::FunctionFacts,
+    pub(crate) func_names_payload: &'a str,
+    pub(crate) strings_payload: &'a str,
+    pub(crate) symbols_payload: &'a str,
+}
+
+pub(crate) fn decompile_render_cache_key(input: DecompileRenderCacheKeyInput<'_>) -> u64 {
+    let mut hasher = Fnv64Hasher::default();
+    "decompile-render-v1".hash(&mut hasher);
+    hash_blocks(input.blocks).hash(&mut hasher);
+    input.function_name.hash(&mut hasher);
+    hash_optional_arch(input.arch).hash(&mut hasher);
+    input.ptr_bits.hash(&mut hasher);
+    hash_debug_payload(input.function_facts).hash(&mut hasher);
+    hash_string_payload(input.func_names_payload).hash(&mut hasher);
+    hash_string_payload(input.strings_payload).hash(&mut hasher);
+    hash_string_payload(input.symbols_payload).hash(&mut hasher);
+    hasher.finish()
+}
+
+pub(crate) fn cached_decompile_render(key: u64) -> Option<String> {
+    let cached = function_facts_store()
+        .decompile_cache
+        .write()
+        .expect("plugin decompile cache write lock poisoned")
+        .get(&key)
+        .map(|output| (*output).clone());
+    if cached.is_some() {
+        DECOMPILE_RENDER_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DECOMPILE_RENDER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    cached
+}
+
+pub(crate) fn insert_decompile_render(key: u64, output: String) {
+    function_facts_store()
+        .decompile_cache
+        .write()
+        .expect("plugin decompile cache write lock poisoned")
+        .insert(key, Arc::new(output));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_decompile_render_cache_stats_json() -> *mut c_char {
+    let hits = DECOMPILE_RENDER_CACHE_HITS.load(Ordering::Relaxed);
+    let misses = DECOMPILE_RENDER_CACHE_MISSES.load(Ordering::Relaxed);
+    let json = format!("{{\"hits\":{hits},\"misses\":{misses}}}");
+    CString::new(json).map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_decompile_render_cache_stats_reset() {
+    DECOMPILE_RENDER_CACHE_HITS.store(0, Ordering::Relaxed);
+    DECOMPILE_RENDER_CACHE_MISSES.store(0, Ordering::Relaxed);
 }
 
 fn merged_assumption_usage(
@@ -910,12 +1079,23 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_context(
                 .with_assumptions(&parsed_context.assumptions),
         }
     };
-    let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+    let mut semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
         &z3::Context::thread_local(),
         &semantic_analysis.ssa_func,
         symbolic_scope,
         input.ctx.arch,
     );
+    if let Some(root_summary) = interproc_summary_set.as_ref().and_then(|summary_set| {
+        summary_set
+            .root
+            .and_then(|root| summary_set.summaries.get(&root))
+    }) {
+        r2sym::augment_semantic_artifact_with_interproc_summary(
+            &mut semantic_artifact,
+            semantic_analysis.ssa_func.entry,
+            root_summary,
+        );
+    }
     build_function_analysis_artifact_from_analysis_with_semantic_artifact_context(
         input,
         analysis,
@@ -3401,6 +3581,21 @@ mod tests {
             key_a, key_b,
             "different helper closures must not alias the same artifact cache entry"
         );
+    }
+
+    #[test]
+    fn bounded_arc_cache_evicts_only_oldest_and_refreshes_recency() {
+        let mut cache = BoundedArcCache::new(2);
+        cache.insert(1_u64, std::sync::Arc::new("one".to_string()));
+        cache.insert(2_u64, std::sync::Arc::new("two".to_string()));
+        assert_eq!(cache.get(&1).as_deref().map(String::as_str), Some("one"));
+
+        cache.insert(3_u64, std::sync::Arc::new("three".to_string()));
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&1).as_deref().map(String::as_str), Some("one"));
+        assert!(cache.get(&2).is_none());
+        assert_eq!(cache.get(&3).as_deref().map(String::as_str), Some("three"));
     }
 
     #[test]

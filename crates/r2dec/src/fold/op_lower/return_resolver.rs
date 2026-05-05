@@ -328,6 +328,12 @@ impl<'a> FoldingContext<'a> {
         }
         let mut has_semantic_root = false;
         if let CExpr::Var(name) = expr {
+            if self
+                .materialized_call_result_source_for_visible_name(name)
+                .is_some()
+            {
+                return expr.clone();
+            }
             if let Some(candidate) = self.semantic_deref_candidate_for_name(name) {
                 let should_promote = if matches!(context, VisibleExprContext::Generic) {
                     Self::expr_is_structured_memory_candidate(&candidate)

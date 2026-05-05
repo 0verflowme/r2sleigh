@@ -732,7 +732,7 @@ mod ffi {
     }
 
     #[test]
-    fn block_validate_rejects_invalid_switch_metadata() {
+    fn block_set_switch_info_canonicalizes_duplicate_case_values() {
         if !require_plugin() {
             eprintln!("Skipping: plugin not built");
             return;
@@ -767,9 +767,6 @@ mod ffi {
             let r2il_block_validate: libloading::Symbol<
                 unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
             > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_error: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_void) -> *const c_char,
-            > = lib.get(b"r2il_error").unwrap();
             let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
                 lib.get(b"r2il_free").unwrap();
             let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
@@ -790,7 +787,9 @@ mod ffi {
                 "Freshly lifted block should validate"
             );
 
-            // Inject invalid switch metadata: duplicate case values.
+            // radare2 can report duplicate switch case values for one decoded
+            // switch table. The FFI boundary canonicalizes that metadata before
+            // R2IL validation so one case value has one deterministic target.
             let case_values = [0u64, 0u64];
             let case_targets = [0x2000u64, 0x3000u64];
             r2il_block_set_switch_info(
@@ -806,20 +805,8 @@ mod ffi {
 
             assert_eq!(
                 r2il_block_validate(ctx, block),
-                0,
-                "Validation should fail for duplicate switch case values"
-            );
-
-            let err_ptr = r2il_error(ctx);
-            assert!(
-                !err_ptr.is_null(),
-                "Validation failure should populate context error"
-            );
-            let err = CStr::from_ptr(err_ptr).to_string_lossy();
-            assert!(
-                err.contains("switch") && err.contains("duplicate"),
-                "Validation error should mention duplicate switch case issue: {}",
-                err
+                1,
+                "Duplicate switch case values should be canonicalized at the FFI boundary"
             );
 
             r2il_block_free(block);

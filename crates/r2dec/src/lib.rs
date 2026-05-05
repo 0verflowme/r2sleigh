@@ -1744,6 +1744,7 @@ impl Decompiler {
             fold_ctx.inputs.visible_bindings,
             fold_ctx.inputs.stack_slots,
         );
+        prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         prune_unused_pure_locals(&mut c_function);
 
         c_function
@@ -2254,6 +2255,18 @@ fn reserved_param_stack_home_target_name(
         }
         _ => None,
     }
+}
+
+fn prune_dead_temp_assignments_in_function_body(
+    func: &mut CFunction,
+    fold_ctx: &FoldingContext<'_>,
+) {
+    let body = CStmt::Block(std::mem::take(&mut func.body));
+    func.body = match fold_ctx.prune_dead_temp_assignments_in_stmt(body) {
+        CStmt::Block(stmts) => stmts,
+        CStmt::Empty => Vec::new(),
+        stmt => vec![stmt],
+    };
 }
 
 fn prune_unused_pure_locals(func: &mut CFunction) {
@@ -2967,6 +2980,76 @@ mod tests {
         assert_eq!(
             **else_body.as_ref().expect("else branch"),
             CStmt::Return(Some(CExpr::Var("y".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
+        let mut func = CFunction {
+            name: "late_prune".to_string(),
+            ret_type: CType::i64(),
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: vec![
+                CStmt::Expr(CExpr::assign(
+                    CExpr::Var("tmp_ldwn_1".to_string()),
+                    CExpr::deref(CExpr::binary(
+                        BinaryOp::Add,
+                        CExpr::Var("base".to_string()),
+                        CExpr::IntLit(50),
+                    )),
+                )),
+                CStmt::Expr(CExpr::assign(
+                    CExpr::Var("tmp_stwn_1".to_string()),
+                    CExpr::binary(
+                        BinaryOp::Add,
+                        CExpr::deref(CExpr::binary(
+                            BinaryOp::Add,
+                            CExpr::Var("base".to_string()),
+                            CExpr::IntLit(50),
+                        )),
+                        CExpr::Var("arg1".to_string()),
+                    ),
+                )),
+                CStmt::Expr(CExpr::assign(
+                    CExpr::deref(CExpr::binary(
+                        BinaryOp::Add,
+                        CExpr::Var("x0_5".to_string()),
+                        CExpr::IntLit(50),
+                    )),
+                    CExpr::binary(
+                        BinaryOp::Add,
+                        CExpr::Var("arg1".to_string()),
+                        CExpr::deref(CExpr::binary(
+                            BinaryOp::Add,
+                            CExpr::Var("base".to_string()),
+                            CExpr::IntLit(50),
+                        )),
+                    ),
+                )),
+                CStmt::Return(Some(CExpr::Var("x0_5".to_string()))),
+            ],
+        };
+        let ctx = FoldingContext::new(64);
+
+        prune_dead_temp_assignments_in_function_body(&mut func, &ctx);
+
+        assert_eq!(func.body.len(), 2, "{func:?}");
+        assert!(
+            !format!("{:?}", func.body).contains("tmp_"),
+            "Sleigh load/store temps should be gone from final function body: {:?}",
+            func.body
+        );
+        assert!(matches!(
+            func.body[0],
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                ..
+            })
+        ));
+        assert_eq!(
+            func.body[1],
+            CStmt::Return(Some(CExpr::Var("x0_5".to_string())))
         );
     }
 

@@ -63,6 +63,18 @@ mod tests {
         arch
     }
 
+    fn make_test_arch_aarch64_kernel_regs() -> ArchSpec {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.add_register(RegisterDef::new("x0", 0x4000, 8));
+        arch.add_register(RegisterDef::sub("w0", 0x4000, 4, "x0"));
+        arch.add_register(RegisterDef::new("x8", 0x4040, 8));
+        arch.add_register(RegisterDef::sub("w8", 0x4040, 4, "x8"));
+        arch.add_register(RegisterDef::new("x20", 0x40a0, 8));
+        arch.add_register(RegisterDef::sub("w20", 0x40a0, 4, "x20"));
+        arch.add_register(RegisterDef::new("x30", 0x40f0, 8));
+        arch
+    }
+
     fn prepared_from_r2il_blocks(
         blocks: &[R2ILBlock],
         arch: &ArchSpec,
@@ -297,6 +309,14 @@ mod tests {
         prepared_ssa: &'a r2ssa::SsaArtifact,
     ) -> FoldingContext<'a> {
         let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(prepared_ssa);
+        ctx
+    }
+
+    fn make_aarch64_ctx_with_prepared<'a>(
+        prepared_ssa: &'a r2ssa::SsaArtifact,
+    ) -> FoldingContext<'a> {
+        let mut ctx = make_aarch64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
         ctx
     }
@@ -6320,6 +6340,214 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_dead_temp_assignments_removes_sleigh_load_store_temps() {
+        let ctx = FoldingContext::new(64);
+        let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("tmp_ldxn_1".to_string()),
+                CExpr::Var("sym._debug_iomalloc_size".to_string()),
+            )),
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("tmp_stxn_1".to_string()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Var("sym._debug_iomalloc_size".to_string()),
+                    CExpr::Var("arg1".to_string()),
+                ),
+            )),
+            CStmt::Return(Some(CExpr::Var("arg1".to_string()))),
+        ];
+
+        let pruned = ctx.prune_dead_temp_assignments(stmts);
+
+        assert_eq!(
+            pruned,
+            vec![CStmt::Return(Some(CExpr::Var("arg1".to_string())))]
+        );
+    }
+
+    #[test]
+    fn test_prune_dead_temp_assignments_removes_sleigh_memory_temps_with_call_address_artifacts() {
+        let ctx = FoldingContext::new(64);
+        let call_based_addr = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::Var("ctx".to_string())]),
+            CExpr::IntLit(50),
+        );
+        let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("tmp_ldwn_1".to_string()),
+                CExpr::deref(call_based_addr.clone()),
+            )),
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("tmp_stwn_1".to_string()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::deref(call_based_addr),
+                    CExpr::Var("arg1".to_string()),
+                ),
+            )),
+            CStmt::Expr(CExpr::assign(
+                CExpr::deref(CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Var("x0_5".to_string()),
+                    CExpr::IntLit(50),
+                )),
+                CExpr::Var("arg1".to_string()),
+            )),
+            CStmt::Return(Some(CExpr::Var("x0_5".to_string()))),
+        ];
+
+        let pruned = ctx.prune_dead_temp_assignments(stmts);
+
+        assert_eq!(pruned.len(), 2, "{pruned:?}");
+        assert!(
+            !format!("{:?}", pruned).contains("tmp_"),
+            "dead Sleigh memory temps should not survive final output: {pruned:?}"
+        );
+    }
+
+    #[test]
+    fn test_prune_dead_temp_assignments_keeps_dead_transient_call_as_side_effect() {
+        let mut ctx = make_aarch64_ctx();
+        ctx.set_known_function_signatures(HashMap::from([(
+            "sym._IORWLockUnlock".to_string(),
+            FunctionType {
+                return_type: CType::Void,
+                params: vec![CType::ptr(CType::Void)],
+                variadic: false,
+            },
+        )]));
+        let call = CExpr::call(
+            CExpr::Var("sym._IORWLockUnlock".to_string()),
+            vec![CExpr::Subscript {
+                base: Box::new(CExpr::UIntLit(0xfffffe0007d21000)),
+                index: Box::new(CExpr::IntLit(367)),
+            }],
+        );
+        let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("x0_8".to_string()),
+                call.clone(),
+            )),
+            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+        ];
+
+        let pruned = ctx.prune_dead_temp_assignments(stmts);
+
+        assert_eq!(
+            pruned,
+            vec![
+                CStmt::Expr(call),
+                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_prune_dead_temp_assignments_drops_dead_replayed_call_result() {
+        let mut ctx = make_aarch64_ctx();
+        let source_call = (0x1000, 0);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(source_call, BTreeSet::from(["x0_3".to_string(), "x0_4".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .insert("x0_3".to_string(), source_call);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .insert("x0_4".to_string(), source_call);
+        let call = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(source_call, call.clone());
+        let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("x0_3".to_string()),
+                call.clone(),
+            )),
+            CStmt::Expr(CExpr::assign(CExpr::Var("x0_4".to_string()), call)),
+            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+        ];
+
+        let pruned = ctx.prune_dead_temp_assignments(stmts);
+
+        assert_eq!(
+            pruned,
+            vec![
+                CStmt::Expr(CExpr::assign(
+                    CExpr::Var("x0_3".to_string()),
+                    CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]),
+                )),
+                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_prune_dead_temp_assignments_drops_duplicate_bare_replayed_call() {
+        let mut ctx = make_aarch64_ctx();
+        let source_call = (0x1000, 0);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(source_call, BTreeSet::from(["x0_3".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .insert("x0_3".to_string(), source_call);
+        let call = CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(source_call, call.clone());
+        let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("x0_3".to_string()),
+                call.clone(),
+            )),
+            CStmt::Expr(call.clone()),
+            CStmt::Expr(call),
+            CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+        ];
+
+        let pruned = ctx.prune_dead_temp_assignments(stmts);
+
+        assert_eq!(
+            pruned,
+            vec![
+                CStmt::Expr(CExpr::assign(
+                    CExpr::Var("x0_3".to_string()),
+                    CExpr::call(CExpr::Var("fcn.1000".to_string()), vec![CExpr::IntLit(16)]),
+                )),
+                CStmt::Return(Some(CExpr::Var("x0_3".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_normalize_call_arg_hides_raw_opaque_tmp_names() {
+        let ctx = make_aarch64_ctx();
+        let callee = CExpr::Var("fcn.1000".to_string());
+
+        let normalized =
+            ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("tmp:2a000".to_string()));
+
+        assert_eq!(normalized, CExpr::Var("unk_2a000".to_string()));
+    }
+
+    #[test]
     fn test_propagate_ephemeral_copies_inlines_autogenerated_stack_home_param_copy() {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
@@ -7411,6 +7639,511 @@ mod tests {
                     && matches!(right.as_ref(), CExpr::IntLit(0))
             ),
             "expected local branch condition to stay a direct null-check without tmp scaffolding, got {cond:?}"
+        );
+    }
+
+    #[test]
+    fn aarch64_direct_call_result_materializes_callee_saved_owner_once() {
+        let x0_ret = make_var("X0", 1, 8);
+        let x20_owner = make_var("X20", 1, 8);
+        let cond = make_var("tmp:pred", 1, 1);
+        let block = make_block(vec![
+            SSAOp::Call {
+                target: make_var("const:401000", 0, 8),
+            },
+            SSAOp::CallDefine {
+                dst: x0_ret.clone(),
+            },
+            SSAOp::Copy {
+                dst: x20_owner.clone(),
+                src: x0_ret,
+            },
+            SSAOp::IntEqual {
+                dst: cond.clone(),
+                a: x20_owner,
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::CBranch {
+                cond: cond.clone(),
+                target: make_var("const:2000", 0, 8),
+            },
+        ]);
+
+        let mut ctx = make_aarch64_ctx();
+        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
+            0x401000,
+            "sym._kernel_helper".to_string(),
+        )])));
+        ctx.analyze_blocks(std::slice::from_ref(&block));
+        let source_call = (block.addr, 0);
+        assert!(
+            ctx.should_materialize_call_result_at_source(source_call)
+                .is_some(),
+            "expected callee-saved call-result owner for source {:?}; aliases={:?}",
+            source_call,
+            ctx.call_result_aliases_map().get(&source_call)
+        );
+        let source_expr = ctx
+            .call_result_exprs_map()
+            .get(&source_call)
+            .expect("source call expression")
+            .clone();
+        assert_eq!(ctx.source_call_for_call_expr(&source_expr), Some(source_call));
+        assert_eq!(
+            ctx.normalize_assignment_predicate_rhs(CExpr::binary(
+                BinaryOp::Eq,
+                source_expr,
+                CExpr::IntLit(0),
+            )),
+            CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::Var("x20_1".to_string()),
+                CExpr::IntLit(0),
+            )
+        );
+        let pre_fold_branch_cond = ctx
+            .extract_condition_from_block(&block)
+            .expect("pre-fold local branch condition");
+        assert_eq!(
+            pre_fold_branch_cond,
+            CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::Var("x20_1".to_string()),
+                CExpr::IntLit(0),
+            ),
+            "expected pre-fold branch condition to reuse owned call result, got {pre_fold_branch_cond:?}"
+        );
+
+        let stmts = ctx.fold_block(&block, block.addr);
+        let Some(CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        })) = stmts.first()
+        else {
+            panic!("expected call result owner assignment, got {stmts:?}");
+        };
+        assert_eq!(left.as_ref(), &CExpr::Var("x20_1".to_string()));
+        assert!(
+            matches!(right.as_ref(), CExpr::Call { .. }),
+            "expected owner to materialize the call once, got {right:?}"
+        );
+        assert!(
+            stmts.iter().skip(1).all(|stmt| {
+                !matches!(
+                    stmt,
+                    CStmt::Expr(CExpr::Binary {
+                        right,
+                        ..
+                    }) if matches!(right.as_ref(), CExpr::Call { .. })
+                )
+            }),
+            "shadow call-result copies should be suppressed after call-site owner materialization: {stmts:?}"
+        );
+
+        let branch_cond = ctx
+            .extract_condition_from_block(&block)
+            .expect("local branch condition");
+        assert_eq!(
+            branch_cond,
+            CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::Var("x20_1".to_string()),
+                CExpr::IntLit(0),
+            ),
+            "expected branch condition to reuse owned call result, got {branch_cond:?}"
+        );
+    }
+
+    #[test]
+    fn aarch64_second_call_result_condition_does_not_reuse_prior_owner() {
+        let first_ret = make_var("X0", 1, 8);
+        let first_owner = make_var("X20", 1, 8);
+        let second_ret = make_var("X0", 2, 8);
+        let second_owner = make_var("X8", 1, 8);
+        let restored_ret = make_var("X0", 3, 8);
+        let cond = make_var("tmp:pred", 1, 1);
+        let block = make_block(vec![
+            SSAOp::Call {
+                target: make_var("const:401000", 0, 8),
+            },
+            SSAOp::CallDefine {
+                dst: first_ret.clone(),
+            },
+            SSAOp::Copy {
+                dst: first_owner.clone(),
+                src: first_ret,
+            },
+            SSAOp::Call {
+                target: make_var("const:402000", 0, 8),
+            },
+            SSAOp::CallDefine {
+                dst: second_ret.clone(),
+            },
+            SSAOp::Copy {
+                dst: second_owner.clone(),
+                src: second_ret,
+            },
+            SSAOp::Copy {
+                dst: restored_ret,
+                src: first_owner.clone(),
+            },
+            SSAOp::IntEqual {
+                dst: cond.clone(),
+                a: second_owner.clone(),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::CBranch {
+                cond: cond.clone(),
+                target: make_var("const:2000", 0, 8),
+            },
+        ]);
+
+        let mut ctx = make_aarch64_ctx();
+        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
+            (0x401000, "sym._first_helper".to_string()),
+            (0x402000, "sym._second_helper".to_string()),
+        ])));
+        ctx.analyze_blocks(std::slice::from_ref(&block));
+
+        assert_eq!(
+            ctx.state
+                .analysis_ctx
+                .use_info
+                .call_result_source_by_alias
+                .get(&second_owner.display_name())
+                .copied(),
+            Some((block.addr, 3)),
+            "x8 copy should remain owned by the second call; aliases={:?}",
+            ctx.state.analysis_ctx.use_info.call_result_source_by_alias
+        );
+
+        let branch_cond = ctx
+            .extract_condition_from_block(&block)
+            .expect("local branch condition");
+        assert_ne!(
+            branch_cond,
+            CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::Var(first_owner.display_name().to_ascii_lowercase()),
+                CExpr::IntLit(0),
+            ),
+            "second-call null check must not collapse to the first call owner"
+        );
+        assert!(
+            branch_cond == CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::Var(second_owner.display_name().to_ascii_lowercase()),
+                CExpr::IntLit(0),
+            ) || matches!(
+                branch_cond,
+                CExpr::Binary {
+                    op: BinaryOp::Eq,
+                    ref left,
+                    ref right,
+                } if matches!(left.as_ref(), CExpr::Call { .. })
+                    && right.as_ref() == &CExpr::IntLit(0)
+            ),
+            "expected branch condition to use the second call result, got {branch_cond:?}; second_expr={:?}; cond_expr={:?}; aliases={:?}; defs={:?}; formatted={:?}; semantic={:?}; var_aliases={:?}; copy_sources={:?}",
+            ctx.get_expr(&second_owner),
+            ctx.get_expr(&cond),
+            ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
+            ctx.state.analysis_ctx.use_info.definitions,
+            ctx.state.analysis_ctx.use_info.formatted_defs,
+            ctx.state.analysis_ctx.use_info.semantic_values,
+            ctx.state.analysis_ctx.use_info.var_aliases,
+            ctx.state.analysis_ctx.use_info.copy_sources
+        );
+        assert_ne!(
+            ctx.get_expr(&second_owner),
+            CExpr::Var("arg1".to_string()),
+            "second call owner expression must not resolve to entry arg; expr={:?}; cond_expr={:?}; defs={:?}; formatted={:?}; semantic={:?}; aliases={:?}; copy_sources={:?}",
+            ctx.get_expr(&second_owner),
+            ctx.get_expr(&cond),
+            ctx.state.analysis_ctx.use_info.definitions,
+            ctx.state.analysis_ctx.use_info.formatted_defs,
+            ctx.state.analysis_ctx.use_info.semantic_values,
+            ctx.state.analysis_ctx.use_info.var_aliases,
+            ctx.state.analysis_ctx.use_info.copy_sources
+        );
+    }
+
+    #[test]
+    fn prepared_aarch64_second_call_result_condition_uses_post_call_copy() {
+        let arch = make_test_arch_aarch64_kernel_regs();
+        let mut entry = R2ILBlock::new(0x1000, 0x18);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x4000, 8),
+            src: Varnode::constant(0x111, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0x40f0, 8),
+            a: Varnode::constant(0x1004, 8),
+            b: Varnode::constant(4, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::ram(0x401000, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x40a0, 8),
+            src: Varnode::register(0x4000, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x4000, 8),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0x40f0, 8),
+            a: Varnode::constant(0x1008, 8),
+            b: Varnode::constant(4, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::ram(0x402000, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x4040, 8),
+            src: Varnode::register(0x4000, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x4000, 8),
+            src: Varnode::register(0x40a0, 8),
+        });
+        entry.push(R2ILOp::IntEqual {
+            dst: Varnode::unique(0x18f80, 1),
+            a: Varnode::register(0x4040, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1020, 8),
+            cond: Varnode::unique(0x18f80, 1),
+        });
+        let mut fallthrough = R2ILBlock::new(0x1018, 4);
+        fallthrough.push(R2ILOp::Return {
+            target: Varnode::register(0x4000, 8),
+        });
+        let mut taken = R2ILBlock::new(0x1020, 4);
+        taken.push(R2ILOp::Return {
+            target: Varnode::register(0x4000, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("kernel_copy");
+        let mut ctx = make_aarch64_ctx_with_prepared(&prepared);
+        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
+            (0x401000, "sym._first_helper".to_string()),
+            (0x402000, "sym._second_helper".to_string()),
+        ])));
+        let entry = prepared.function().get_block(0x1000).expect("entry");
+        ctx.analyze_blocks(std::slice::from_ref(entry));
+        let SSAOp::CBranch { cond, .. } = entry.ops.last().expect("last op") else {
+            panic!("expected branch");
+        };
+        let prepared_candidate =
+            ctx.prepared_predicate_candidate_for_branch_block_for_test(entry.addr, cond);
+        let second_source = ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .get("X8_3")
+            .copied();
+        let second_owner = second_source
+            .and_then(|source| ctx.stable_owned_call_result_name_for_source(source));
+
+        let condition = ctx
+            .extract_condition_from_block(entry)
+            .expect("prepared branch condition");
+        let rendered = format!("{condition:?}");
+        assert_eq!(
+            second_owner.as_deref(),
+            Some("w10_2"),
+            "expected x8 post-call copy to resolve to the second call owner"
+        );
+        assert!(
+            !rendered.contains("x20")
+                && !rendered.contains("X20")
+                && !rendered.contains("w10_1")
+                && !rendered.contains("sym._first_helper")
+                && !matches!(
+                    &condition,
+                    CExpr::Binary { left, .. }
+                        if matches!(
+                            left.as_ref(),
+                            CExpr::Var(name)
+                                if name == "arg1" || name.eq_ignore_ascii_case("x0")
+                        )
+                ),
+            "prepared predicate should use the second call result, not the restored first-call owner: {condition:?}; prepared_candidate={prepared_candidate:?}; second_source={second_source:?}; second_owner={second_owner:?}",
+        );
+    }
+
+    #[test]
+    fn prepared_aarch64_tbz_loaded_w8_does_not_reuse_prior_call_owner() {
+        let arch = make_test_arch_aarch64_kernel_regs();
+        let mut entry = R2ILBlock::new(0x2000, 0x20);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x4000, 8),
+            src: Varnode::constant(0x111, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::ram(0x401000, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x25500, 1),
+            space: SpaceId::Ram,
+            addr: Varnode::ram(0x5000, 8),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x4040, 8),
+            src: Varnode::unique(0x25500, 1),
+        });
+        entry.push(R2ILOp::IntRight {
+            dst: Varnode::unique(0x18900, 4),
+            a: Varnode::register(0x4040, 4),
+            b: Varnode::constant(0, 4),
+        });
+        entry.push(R2ILOp::IntAnd {
+            dst: Varnode::unique(0x18980, 4),
+            a: Varnode::unique(0x18900, 4),
+            b: Varnode::constant(1, 4),
+        });
+        entry.push(R2ILOp::IntEqual {
+            dst: Varnode::unique(0x18a80, 1),
+            a: Varnode::unique(0x18980, 4),
+            b: Varnode::constant(0, 4),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x2020, 8),
+            cond: Varnode::unique(0x18a80, 1),
+        });
+        let mut fallthrough = R2ILBlock::new(0x2018, 4);
+        fallthrough.push(R2ILOp::Return {
+            target: Varnode::register(0x4000, 8),
+        });
+        let mut taken = R2ILBlock::new(0x2020, 4);
+        taken.push(R2ILOp::Return {
+            target: Varnode::register(0x4000, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("kernel_tbz");
+        let mut ctx = make_aarch64_ctx_with_prepared(&prepared);
+        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
+            0x401000,
+            "sym._first_helper".to_string(),
+        )])));
+        let entry = prepared.function().get_block(0x2000).expect("entry");
+        ctx.analyze_blocks(std::slice::from_ref(entry));
+
+        let condition = ctx
+            .extract_condition_from_block(entry)
+            .expect("tbz branch condition");
+        let rendered = format!("{condition:?}");
+        assert!(
+            !rendered.contains("w10_1") && !rendered.contains("sym._first_helper"),
+            "tbz on loaded w8 must not reuse the prior call owner: {condition:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_internal_call_owner_tolerates_low_quality_kernel_arg_mismatch() {
+        let mut ctx = make_aarch64_ctx();
+        let source_call = (0x1000, 0);
+        let source_expr = CExpr::call(
+            CExpr::Var("fcn.1000".to_string()),
+            vec![
+                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg2".to_string()),
+                CExpr::Var("unk_2a000".to_string()),
+                CExpr::Member {
+                    base: Box::new(CExpr::Var("class".to_string())),
+                    member: "std".to_string(),
+                },
+            ],
+        );
+        let replay_expr = CExpr::call(
+            CExpr::Var("fcn.1000".to_string()),
+            vec![
+                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg2".to_string()),
+                CExpr::Var("tmp:2a000".to_string()),
+                CExpr::IntLit(0),
+            ],
+        );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(source_call, source_expr);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .entry(source_call)
+            .or_default()
+            .insert("X0_3".to_string());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert("X0_3".to_string());
+
+        assert_eq!(
+            ctx.stable_owned_call_result_expr_for_call_expr(&replay_expr),
+            Some(CExpr::Var("x0_3".to_string()))
+        );
+        assert_eq!(
+            ctx.normalize_final_return_expr_candidate(replay_expr),
+            CExpr::Var("x0_3".to_string())
+        );
+    }
+
+    #[test]
+    fn imported_call_owner_stays_strict_for_low_quality_arg_mismatch() {
+        let mut ctx = make_aarch64_ctx();
+        let source_call = (0x1000, 0);
+        let source_expr = CExpr::call(
+            CExpr::Var("sym.imp.helper".to_string()),
+            vec![
+                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg2".to_string()),
+                CExpr::Var("unk_2a000".to_string()),
+                CExpr::Member {
+                    base: Box::new(CExpr::Var("class".to_string())),
+                    member: "std".to_string(),
+                },
+            ],
+        );
+        let replay_expr = CExpr::call(
+            CExpr::Var("sym.imp.helper".to_string()),
+            vec![
+                CExpr::Var("arg1".to_string()),
+                CExpr::Var("arg2".to_string()),
+                CExpr::Var("tmp:2a000".to_string()),
+                CExpr::IntLit(0),
+            ],
+        );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(source_call, source_expr);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .entry(source_call)
+            .or_default()
+            .insert("X0_3".to_string());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert("X0_3".to_string());
+
+        assert_eq!(
+            ctx.stable_owned_call_result_expr_for_call_expr(&replay_expr),
+            None
         );
     }
 
@@ -13068,6 +13801,67 @@ mod tests {
                 .skip(1)
                 .all(|arg| !expr_contains_transient_call_artifact(arg)),
             "post-call helper recovery must keep preserved inputs clean, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn aarch64_unused_helper_call_result_renders_as_side_effect_call() {
+        let mut ctx = make_aarch64_ctx();
+        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
+            0x1000005d4,
+            "sym._unlock".to_string(),
+        )])));
+        ctx.set_known_function_signatures(HashMap::from([(
+            "sym._unlock".to_string(),
+            FunctionType {
+                return_type: CType::Int(32),
+                params: vec![CType::ptr(CType::Void)],
+                variadic: false,
+            },
+        )]));
+
+        let block = SSABlock {
+            addr: 0x100001000,
+            size: 4,
+            phis: Vec::new(),
+            ops: vec![
+                SSAOp::Copy {
+                    dst: make_var("X0", 1, 8),
+                    src: make_var("const:1234", 0, 8),
+                },
+                SSAOp::Call {
+                    target: make_var("const:1000005d4", 0, 8),
+                },
+                SSAOp::CallDefine {
+                    dst: make_var("X0", 2, 8),
+                },
+                SSAOp::Return {
+                    target: make_var("const:0", 0, 8),
+                },
+            ],
+        };
+
+        ctx.analyze_blocks(std::slice::from_ref(&block));
+        let stmts = ctx.fold_block(&block, block.addr);
+        assert!(
+            matches!(
+                stmts.first(),
+                Some(CStmt::Expr(CExpr::Call { func, .. }))
+                    if **func == CExpr::Var("sym._unlock".to_string())
+            ),
+            "unused helper result should render as a side-effect call, got {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| matches!(
+                stmt,
+                CStmt::Expr(CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    left,
+                    right,
+                }) if matches!(left.as_ref(), CExpr::Var(name) if name.eq_ignore_ascii_case("x0_2"))
+                    && matches!(right.as_ref(), CExpr::Call { .. })
+            )),
+            "unused helper result must not materialize a transient assignment, got {stmts:?}"
         );
     }
 

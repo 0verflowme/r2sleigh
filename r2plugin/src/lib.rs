@@ -599,9 +599,10 @@ pub extern "C" fn r2il_block_set_switch_info(
         cases.push(r2il::SwitchCase { value, target });
     }
 
-    // Deduplicate cases (same target may appear multiple times)
+    // Canonicalize radare2 switch metadata into the stricter R2IL invariant:
+    // one case value has one deterministic target.
     cases.sort_by_key(|c| (c.value, c.target));
-    cases.dedup();
+    cases.dedup_by_key(|c| c.value);
 
     let switch_info = r2il::SwitchInfo {
         switch_addr,
@@ -3482,6 +3483,9 @@ pub extern "C" fn r2dec_function_with_session_context(
             scope_facts: &scope_facts,
             scope_report: None,
         },
+        global_max_links: input.budget.global_max_links.max(1),
+        max_type_decls: input.budget.max_type_decls.max(1),
+        max_mutations: input.budget.max_mutations.max(1),
     };
     let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
     let parsed_context = unsafe {
@@ -3861,6 +3865,8 @@ pub struct R2SleighBudgetConfig {
     interproc_max_iters: usize,
     interproc_converged: i32,
     global_max_links: usize,
+    max_type_decls: usize,
+    max_mutations: usize,
 }
 
 #[repr(C)]
@@ -4436,12 +4442,53 @@ fn struct_fields_json(fields: &[r2types::StructFieldCandidate]) -> Vec<StructFie
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct TypeOutputBudget {
+    global_max_links: usize,
+    max_type_decls: usize,
+    max_mutations: usize,
+}
+
+impl TypeOutputBudget {
+    fn new(global_max_links: usize, max_type_decls: usize, max_mutations: usize) -> Self {
+        Self {
+            global_max_links: global_max_links.max(1),
+            max_type_decls: max_type_decls.max(1),
+            max_mutations: max_mutations.max(1),
+        }
+    }
+}
+
+fn push_budgeted_mutation(
+    mutations: &mut Vec<SessionMutationJson>,
+    diagnostics: &mut Vec<String>,
+    emitted: &mut usize,
+    skipped: &mut usize,
+    budget: TypeOutputBudget,
+    mutation: SessionMutationJson,
+) {
+    if *emitted < budget.max_mutations {
+        mutations.push(mutation);
+        *emitted += 1;
+    } else {
+        *skipped += 1;
+        if *skipped == 1 {
+            diagnostics.push(format!(
+                "non-signature mutation plan truncated to {} item(s)",
+                budget.max_mutations
+            ));
+        }
+    }
+}
+
 fn mutation_plan_from_writeback(
     plan: &r2types::TypeWritebackPlan,
-    global_max_links: usize,
+    budget: TypeOutputBudget,
 ) -> SessionMutationPlanJson {
     let mut mutations = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut emitted_budgeted = 0usize;
+    let mut skipped_budgeted = 0usize;
 
     mutations.push(SessionMutationJson {
         kind: "signature".to_string(),
@@ -4493,38 +4540,86 @@ fn mutation_plan_from_writeback(
         evidence: vec!["calling-convention".to_string()],
     });
 
-    for decl in &plan.struct_decls {
-        mutations.push(SessionMutationJson {
-            kind: "type_decl".to_string(),
-            signature: None,
-            ret_type: None,
-            params: Vec::new(),
-            callconv: None,
-            old_name: None,
-            name: Some(decl.name.clone()),
-            reg: None,
-            type_name: None,
-            text: Some(decl.decl.clone()),
-            addr: None,
-            size: None,
-            delta: None,
-            var_kind: None,
-            is_arg: None,
-            confidence: decl.confidence,
-            source: decl.source.as_str().to_string(),
-            evidence: vec!["struct-declaration".to_string()],
-        });
-    }
-
-    for candidate in &plan.var_type_candidates {
-        if candidate.confidence >= 95 {
-            mutations.push(SessionMutationJson {
-                kind: "var".to_string(),
+    for decl in plan.struct_decls.iter().take(budget.max_type_decls) {
+        push_budgeted_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            SessionMutationJson {
+                kind: "type_decl".to_string(),
                 signature: None,
                 ret_type: None,
                 params: Vec::new(),
                 callconv: None,
                 old_name: None,
+                name: Some(decl.name.clone()),
+                reg: None,
+                type_name: None,
+                text: Some(decl.decl.clone()),
+                addr: None,
+                size: None,
+                delta: None,
+                var_kind: None,
+                is_arg: None,
+                confidence: decl.confidence,
+                source: decl.source.as_str().to_string(),
+                evidence: vec!["struct-declaration".to_string()],
+            },
+        );
+    }
+    if plan.struct_decls.len() > budget.max_type_decls {
+        diagnostics.push(format!(
+            "type declaration mutation plan truncated from {} to {} item(s)",
+            plan.struct_decls.len(),
+            budget.max_type_decls
+        ));
+    }
+
+    for candidate in &plan.var_type_candidates {
+        if candidate.confidence >= 95 {
+            push_budgeted_mutation(
+                &mut mutations,
+                &mut diagnostics,
+                &mut emitted_budgeted,
+                &mut skipped_budgeted,
+                budget,
+                SessionMutationJson {
+                    kind: "var".to_string(),
+                    signature: None,
+                    ret_type: None,
+                    params: Vec::new(),
+                    callconv: None,
+                    old_name: None,
+                    name: Some(candidate.name.clone()),
+                    reg: candidate.reg.clone(),
+                    type_name: Some(candidate.var_type.clone()),
+                    text: None,
+                    addr: None,
+                    size: Some(candidate.size as u64),
+                    delta: Some(candidate.delta),
+                    var_kind: Some(candidate.kind.clone()),
+                    is_arg: Some(candidate.isarg),
+                    confidence: candidate.confidence,
+                    source: candidate.source.as_str().to_string(),
+                    evidence: evidence_json(&candidate.evidence),
+                },
+            );
+        }
+        push_budgeted_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            SessionMutationJson {
+                kind: "var_type".to_string(),
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: Some(candidate.name.clone()),
                 name: Some(candidate.name.clone()),
                 reg: candidate.reg.clone(),
                 type_name: Some(candidate.var_type.clone()),
@@ -4537,80 +4632,74 @@ fn mutation_plan_from_writeback(
                 confidence: candidate.confidence,
                 source: candidate.source.as_str().to_string(),
                 evidence: evidence_json(&candidate.evidence),
-            });
-        }
-        mutations.push(SessionMutationJson {
-            kind: "var_type".to_string(),
-            signature: None,
-            ret_type: None,
-            params: Vec::new(),
-            callconv: None,
-            old_name: Some(candidate.name.clone()),
-            name: Some(candidate.name.clone()),
-            reg: candidate.reg.clone(),
-            type_name: Some(candidate.var_type.clone()),
-            text: None,
-            addr: None,
-            size: Some(candidate.size as u64),
-            delta: Some(candidate.delta),
-            var_kind: Some(candidate.kind.clone()),
-            is_arg: Some(candidate.isarg),
-            confidence: candidate.confidence,
-            source: candidate.source.as_str().to_string(),
-            evidence: evidence_json(&candidate.evidence),
-        });
+            },
+        );
     }
 
     for candidate in &plan.var_rename_candidates {
-        mutations.push(SessionMutationJson {
-            kind: "var_rename".to_string(),
-            signature: None,
-            ret_type: None,
-            params: Vec::new(),
-            callconv: None,
-            old_name: Some(candidate.name.clone()),
-            name: Some(candidate.target_name.clone()),
-            reg: None,
-            type_name: None,
-            text: None,
-            addr: None,
-            size: None,
-            delta: None,
-            var_kind: None,
-            is_arg: None,
-            confidence: candidate.confidence,
-            source: candidate.source.as_str().to_string(),
-            evidence: evidence_json(&candidate.evidence),
-        });
+        push_budgeted_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            SessionMutationJson {
+                kind: "var_rename".to_string(),
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: Some(candidate.name.clone()),
+                name: Some(candidate.target_name.clone()),
+                reg: None,
+                type_name: None,
+                text: None,
+                addr: None,
+                size: None,
+                delta: None,
+                var_kind: None,
+                is_arg: None,
+                confidence: candidate.confidence,
+                source: candidate.source.as_str().to_string(),
+                evidence: evidence_json(&candidate.evidence),
+            },
+        );
     }
 
-    for candidate in plan.global_type_links.iter().take(global_max_links) {
-        mutations.push(SessionMutationJson {
-            kind: "type_link".to_string(),
-            signature: None,
-            ret_type: None,
-            params: Vec::new(),
-            callconv: None,
-            old_name: None,
-            name: None,
-            reg: None,
-            type_name: Some(candidate.target_type.clone()),
-            text: None,
-            addr: Some(candidate.addr),
-            size: None,
-            delta: None,
-            var_kind: None,
-            is_arg: None,
-            confidence: candidate.confidence,
-            source: candidate.source.as_str().to_string(),
-            evidence: vec!["global-type-link".to_string()],
-        });
+    for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
+        push_budgeted_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            SessionMutationJson {
+                kind: "type_link".to_string(),
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: None,
+                name: None,
+                reg: None,
+                type_name: Some(candidate.target_type.clone()),
+                text: None,
+                addr: Some(candidate.addr),
+                size: None,
+                delta: None,
+                var_kind: None,
+                is_arg: None,
+                confidence: candidate.confidence,
+                source: candidate.source.as_str().to_string(),
+                evidence: vec!["global-type-link".to_string()],
+            },
+        );
     }
-    if plan.global_type_links.len() > global_max_links {
+    if plan.global_type_links.len() > budget.global_max_links {
         diagnostics.push(format!(
             "global type-link mutation plan truncated from {} to {} item(s)",
             plan.global_type_links.len(),
-            global_max_links
+            budget.global_max_links
         ));
     }
 
@@ -4718,8 +4807,24 @@ fn writeback_plan_json(
     function_facts: &r2types::FunctionFacts,
     semantics: Option<r2sym::SemanticArtifact>,
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
+    budget: TypeOutputBudget,
 ) -> InferredTypeWritebackJson {
-    let mutation_plan = mutation_plan_from_writeback(&plan, usize::MAX);
+    let mutation_plan = mutation_plan_from_writeback(&plan, budget);
+    let mut warnings = plan.diagnostics.warnings;
+    if plan.struct_decls.len() > budget.max_type_decls {
+        warnings.push(format!(
+            "type declaration report truncated from {} to {} item(s)",
+            plan.struct_decls.len(),
+            budget.max_type_decls
+        ));
+    }
+    if plan.global_type_links.len() > budget.global_max_links {
+        warnings.push(format!(
+            "global type-link report truncated from {} to {} item(s)",
+            plan.global_type_links.len(),
+            budget.global_max_links
+        ));
+    }
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
         signature: plan.signature.signature,
@@ -4767,6 +4872,7 @@ fn writeback_plan_json(
         struct_decls: plan
             .struct_decls
             .into_iter()
+            .take(budget.max_type_decls)
             .map(|decl| StructDeclCandidateJson {
                 name: decl.name,
                 decl: decl.decl,
@@ -4778,6 +4884,7 @@ fn writeback_plan_json(
         global_type_links: plan
             .global_type_links
             .into_iter()
+            .take(budget.global_max_links)
             .map(|candidate| GlobalTypeLinkCandidateJson {
                 addr: candidate.addr,
                 target_type: candidate.target_type,
@@ -4794,7 +4901,7 @@ fn writeback_plan_json(
         mutation_plan,
         diagnostics: TypeWritebackDiagnosticsJson {
             conflicts: plan.diagnostics.conflicts,
-            warnings: plan.diagnostics.warnings,
+            warnings,
             solver_warnings: plan.diagnostics.solver_warnings,
         },
     }
@@ -4876,6 +4983,7 @@ fn type_writeback_payload_from_artifact(
     artifact: types::FunctionAnalysisArtifact,
     interproc: InterprocInferenceInput<'_>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+    budget: TypeOutputBudget,
 ) -> InferredTypeWritebackJson {
     let semantics = artifact.function_facts.semantics.clone();
     let compiled_semantics = semantics
@@ -4909,22 +5017,47 @@ fn type_writeback_payload_from_artifact(
         &artifact.function_facts,
         semantics,
         compiled_semantics,
+        budget,
     )
 }
 
-fn semantic_type_fallback_payload(
-    function_name: &str,
-    arch_name: &str,
+struct SemanticTypeFallbackPayloadInput<'a> {
+    function_name: &'a str,
+    arch_name: &'a str,
     ptr_bits: u32,
-    interproc: InterprocInferenceInput<'_>,
-    compiled: &r2sym::SemanticArtifact,
-    function_facts: &r2types::FunctionFacts,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
+    interproc: InterprocInferenceInput<'a>,
+    compiled: &'a r2sym::SemanticArtifact,
+    function_facts: &'a r2types::FunctionFacts,
+    symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    budget: TypeOutputBudget,
+}
+
+fn semantic_type_fallback_payload(
+    input: SemanticTypeFallbackPayloadInput<'_>,
 ) -> InferredTypeWritebackJson {
-    let compiled_info = analysis::sym::compiled_semantic_info(compiled);
-    let plan =
-        r2types::build_semantic_type_fallback_plan(function_name, arch_name, ptr_bits, compiled);
-    let mutation_plan = mutation_plan_from_writeback(&plan, usize::MAX);
+    let compiled_info = analysis::sym::compiled_semantic_info(input.compiled);
+    let plan = r2types::build_semantic_type_fallback_plan(
+        input.function_name,
+        input.arch_name,
+        input.ptr_bits,
+        input.compiled,
+    );
+    let mutation_plan = mutation_plan_from_writeback(&plan, input.budget);
+    let mut warnings = plan.diagnostics.warnings;
+    if plan.struct_decls.len() > input.budget.max_type_decls {
+        warnings.push(format!(
+            "type declaration report truncated from {} to {} item(s)",
+            plan.struct_decls.len(),
+            input.budget.max_type_decls
+        ));
+    }
+    if plan.global_type_links.len() > input.budget.global_max_links {
+        warnings.push(format!(
+            "global type-link report truncated from {} to {} item(s)",
+            plan.global_type_links.len(),
+            input.budget.global_max_links
+        ));
+    }
 
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
@@ -4948,6 +5081,7 @@ fn semantic_type_fallback_payload(
         struct_decls: plan
             .struct_decls
             .into_iter()
+            .take(input.budget.max_type_decls)
             .map(|decl| StructDeclCandidateJson {
                 name: decl.name,
                 decl: decl.decl,
@@ -4959,6 +5093,7 @@ fn semantic_type_fallback_payload(
         global_type_links: plan
             .global_type_links
             .into_iter()
+            .take(input.budget.global_max_links)
             .map(|candidate| GlobalTypeLinkCandidateJson {
                 addr: candidate.addr,
                 target_type: candidate.target_type,
@@ -4968,21 +5103,24 @@ fn semantic_type_fallback_payload(
             .collect(),
         interproc: InterprocSummaryJson {
             callsite_count: 0,
-            iterations: interproc.iter.max(1),
-            max_iterations: interproc.max_iters.max(interproc.iter.max(1)),
-            converged: interproc.converged,
+            iterations: input.interproc.iter.max(1),
+            max_iterations: input.interproc.max_iters.max(input.interproc.iter.max(1)),
+            converged: input.interproc.converged,
             summary: None,
             summary_json: None,
-            scope: merged_interproc_scope_report(interproc.scope_report, symbolic_scope),
+            scope: merged_interproc_scope_report(
+                input.interproc.scope_report,
+                input.symbolic_scope,
+            ),
         },
-        plans: function_facts.plans.clone(),
-        assumptions: function_facts.assumptions.clone(),
-        assumption_usage: function_facts.assumption_usage.clone(),
-        semantics: Some(compiled.clone()),
+        plans: input.function_facts.plans.clone(),
+        assumptions: input.function_facts.assumptions.clone(),
+        assumption_usage: input.function_facts.assumption_usage.clone(),
+        semantics: Some(input.compiled.clone()),
         compiled_semantics: Some(compiled_info),
         mutation_plan,
         diagnostics: TypeWritebackDiagnosticsJson {
-            warnings: plan.diagnostics.warnings,
+            warnings,
             ..TypeWritebackDiagnosticsJson::default()
         },
     }
@@ -4991,12 +5129,14 @@ fn semantic_type_fallback_payload(
 fn semantic_fallback_function_facts(
     compiled: &r2sym::SemanticArtifact,
     assumptions: &r2ssa::AssumptionSet,
+    interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
 ) -> r2types::FunctionFacts {
     r2types::FunctionFacts::new(
         r2types::FunctionTypeFacts::default(),
         Some(compiled.clone()),
     )
     .with_assumptions(assumptions.clone())
+    .with_summary_set(interproc_summary_set)
 }
 
 #[cfg(test)]
@@ -7220,6 +7360,9 @@ struct TypeWritebackInferenceInput<'a> {
     scope_functions: *const analysis::sym::R2ILFunctionBlocks,
     scope_num_functions: usize,
     interproc: InterprocInferenceInput<'a>,
+    global_max_links: usize,
+    max_type_decls: usize,
+    max_mutations: usize,
 }
 
 struct SemanticWorkerLinearizationInput {
@@ -7284,6 +7427,11 @@ fn build_function_analysis_shared_bundle(
         r2types::parse_external_context_json(&external_context, ptr_bits)
     };
     let external_context_fallback_hash = types::hash_string_payload(&external_context);
+    let output_budget = TypeOutputBudget::new(
+        input.global_max_links,
+        input.max_type_decls,
+        input.max_mutations,
+    );
     let (cfg_risk, semantic_artifact, function_facts, type_writeback, prefer_bounded_type_plan) =
         if let Some(cached_artifact) =
             types::get_cached_function_analysis_artifact_with_parsed_context_and_scope_facts(
@@ -7310,15 +7458,16 @@ fn build_function_analysis_shared_bundle(
                     cfg_risk,
                     semantic_artifact.clone(),
                     function_facts.clone(),
-                    semantic_type_fallback_payload(
-                        &function_input.function_name,
-                        &arch_name,
+                    semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
+                        function_name: &function_input.function_name,
+                        arch_name: &arch_name,
                         ptr_bits,
-                        input.interproc,
+                        interproc: input.interproc,
                         compiled,
-                        &function_facts,
-                        symbolic_scope.as_ref(),
-                    ),
+                        function_facts: &function_facts,
+                        symbolic_scope: symbolic_scope.as_ref(),
+                        budget: output_budget,
+                    }),
                     true,
                 )
             } else {
@@ -7330,6 +7479,7 @@ fn build_function_analysis_shared_bundle(
                         cached_artifact,
                         input.interproc,
                         symbolic_scope.as_ref(),
+                        output_budget,
                     ),
                     false,
                 )
@@ -7337,40 +7487,52 @@ fn build_function_analysis_shared_bundle(
         } else {
             let analysis = types::build_function_analysis(&function_input)?;
             let cfg_risk = cfg_risk_summary_json(analysis.ssa_func.function().cfg_risk_summary());
-            let semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+            let interproc_summary_set = types::build_interproc_summary_set_with_scope_facts(
+                &function_input,
+                &analysis,
+                input.interproc.scope_facts,
+                input.interproc.max_iters,
+                symbolic_scope.as_ref(),
+            );
+            let mut semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
                 &z3::Context::thread_local(),
                 &analysis.ssa_func,
                 symbolic_scope.as_ref(),
                 function_input.ctx.arch,
             );
+            if let Some(root_summary) = interproc_summary_set
+                .root
+                .and_then(|root| interproc_summary_set.summaries.get(&root))
+            {
+                r2sym::augment_semantic_artifact_with_interproc_summary(
+                    &mut semantic_artifact,
+                    analysis.ssa_func.entry,
+                    root_summary,
+                );
+            }
             if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
                 let function_facts = semantic_fallback_function_facts(
                     &semantic_artifact,
                     &parsed_context.assumptions,
+                    Some(interproc_summary_set),
                 );
                 (
                     cfg_risk,
                     Some(semantic_artifact.clone()),
                     function_facts.clone(),
-                    semantic_type_fallback_payload(
-                        &function_input.function_name,
-                        &arch_name,
+                    semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
+                        function_name: &function_input.function_name,
+                        arch_name: &arch_name,
                         ptr_bits,
-                        input.interproc,
-                        &semantic_artifact,
-                        &function_facts,
-                        symbolic_scope.as_ref(),
-                    ),
+                        interproc: input.interproc,
+                        compiled: &semantic_artifact,
+                        function_facts: &function_facts,
+                        symbolic_scope: symbolic_scope.as_ref(),
+                        budget: output_budget,
+                    }),
                     true,
                 )
             } else {
-                let interproc_summary_set = types::build_interproc_summary_set_with_scope_facts(
-                    &function_input,
-                    &analysis,
-                    input.interproc.scope_facts,
-                    input.interproc.max_iters,
-                    symbolic_scope.as_ref(),
-                );
                 let artifact =
                     types::build_function_analysis_artifact_from_analysis_with_semantic_artifact_context(
                         &function_input,
@@ -7389,6 +7551,7 @@ fn build_function_analysis_shared_bundle(
                         artifact,
                         input.interproc,
                         symbolic_scope.as_ref(),
+                        output_budget,
                     ),
                     false,
                 )
@@ -7489,6 +7652,9 @@ pub extern "C" fn r2sleigh_session_analyze(
             scope_facts: &scope_facts,
             scope_report: None,
         },
+        global_max_links: input.budget.global_max_links.max(1),
+        max_type_decls: input.budget.max_type_decls.max(1),
+        max_mutations: input.budget.max_mutations.max(1),
     };
     let Some(bundle) = build_function_analysis_shared_bundle(inference_input) else {
         return ptr::null_mut();
@@ -7730,6 +7896,9 @@ pub extern "C" fn r2sleigh_session_artifact_cache_key(input: *const R2SleighSess
             scope_facts: &scope_facts,
             scope_report: None,
         },
+        global_max_links: input.budget.global_max_links.max(1),
+        max_type_decls: input.budget.max_type_decls.max(1),
+        max_mutations: input.budget.max_mutations.max(1),
     };
     let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
     let ptr_bits = function_input
@@ -7790,6 +7959,9 @@ pub extern "C" fn r2sleigh_session_interproc_summary_json(
             scope_facts: &scope_facts,
             scope_report: None,
         },
+        global_max_links: input.budget.global_max_links.max(1),
+        max_type_decls: input.budget.max_type_decls.max(1),
+        max_mutations: input.budget.max_mutations.max(1),
     };
     let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
     let ptr_bits = function_input
@@ -8258,6 +8430,32 @@ mod tests {
                 "{synthetic} should be excluded as non-register data"
             );
         }
+    }
+
+    #[test]
+    fn switch_info_ffi_canonicalizes_duplicate_case_values() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        let values = [0, 0, 4, 4, 8, 8];
+        let targets = [0x3000, 0x2000, 0x4004, 0x4000, 0x5000, 0x5000];
+
+        r2il_block_set_switch_info(
+            &mut block,
+            0x1000,
+            0,
+            8,
+            0,
+            values.as_ptr(),
+            targets.as_ptr(),
+            values.len(),
+        );
+
+        let switch_info = block.switch_info.expect("switch info");
+        let cases: Vec<(u64, u64)> = switch_info
+            .cases
+            .iter()
+            .map(|case| (case.value, case.target))
+            .collect();
+        assert_eq!(cases, vec![(0, 0x2000), (4, 0x4000), (8, 0x5000)]);
     }
 
     #[cfg(feature = "x86")]
@@ -9614,23 +9812,24 @@ mod tests {
             },
             value: r2ssa::AssumptionValue::Constant { value: 0xdead },
         }]);
-        let function_facts = semantic_fallback_function_facts(&compiled, &assumptions);
+        let function_facts = semantic_fallback_function_facts(&compiled, &assumptions, None);
         let scope_facts = types::empty_interproc_scope_facts();
-        let payload = semantic_type_fallback_payload(
-            "fcn.401000",
-            "x86-64",
-            64,
-            InterprocInferenceInput {
+        let payload = semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
+            function_name: "fcn.401000",
+            arch_name: "x86-64",
+            ptr_bits: 64,
+            interproc: InterprocInferenceInput {
                 iter: 0,
                 max_iters: 0,
                 converged: true,
                 scope_facts: &scope_facts,
                 scope_report: None,
             },
-            &compiled,
-            &function_facts,
-            None,
-        );
+            compiled: &compiled,
+            function_facts: &function_facts,
+            symbolic_scope: None,
+            budget: TypeOutputBudget::new(64, usize::MAX, usize::MAX),
+        });
         let value = serde_json::to_value(payload).expect("payload should serialize");
         let Some(items) = value["assumptions"]["items"].as_array() else {
             panic!("expected serialized assumptions, got {value:?}");
@@ -9687,7 +9886,10 @@ mod tests {
             diagnostics: r2types::TypeWritebackDiagnostics::default(),
         };
 
-        let mutation_plan = mutation_plan_from_writeback(&plan, usize::MAX);
+        let mutation_plan = mutation_plan_from_writeback(
+            &plan,
+            TypeOutputBudget::new(usize::MAX, usize::MAX, usize::MAX),
+        );
         let kinds = mutation_plan
             .mutations
             .iter()
@@ -9734,6 +9936,7 @@ mod tests {
             &function_facts,
             None,
             None,
+            TypeOutputBudget::new(64, usize::MAX, usize::MAX),
         );
         let mut fact_strings = Vec::new();
         let (signature_fact, signature_params) =
@@ -9749,6 +9952,137 @@ mod tests {
         assert_eq!(
             unsafe { CStr::from_ptr(signature_params[0].type_name) }.to_str(),
             Ok("int32_t")
+        );
+    }
+
+    #[test]
+    fn mutation_plan_respects_global_type_link_budget() {
+        let plan = r2types::TypeWritebackPlan {
+            signature: r2types::InferredSignature {
+                function_name: "dbg.links".to_string(),
+                signature: "void dbg.links(void);".to_string(),
+                ret_type: "void".to_string(),
+                params: Vec::new(),
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 90,
+            },
+            var_type_candidates: Vec::new(),
+            var_rename_candidates: Vec::new(),
+            struct_decls: Vec::new(),
+            global_type_links: vec![
+                r2types::GlobalTypeLinkCandidate {
+                    addr: 0x404000,
+                    target_type: "struct a *".to_string(),
+                    confidence: 90,
+                    source: r2types::WritebackSource::ExternalTypeDb,
+                },
+                r2types::GlobalTypeLinkCandidate {
+                    addr: 0x404008,
+                    target_type: "struct b *".to_string(),
+                    confidence: 90,
+                    source: r2types::WritebackSource::ExternalTypeDb,
+                },
+            ],
+            diagnostics: r2types::TypeWritebackDiagnostics::default(),
+        };
+
+        let limited =
+            mutation_plan_from_writeback(&plan, TypeOutputBudget::new(1, usize::MAX, usize::MAX));
+        let all =
+            mutation_plan_from_writeback(&plan, TypeOutputBudget::new(2, usize::MAX, usize::MAX));
+
+        assert_eq!(
+            limited
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.kind == "type_link")
+                .count(),
+            1
+        );
+        assert_eq!(
+            all.mutations
+                .iter()
+                .filter(|mutation| mutation.kind == "type_link")
+                .count(),
+            2
+        );
+        assert_eq!(
+            limited.diagnostics,
+            vec!["global type-link mutation plan truncated from 2 to 1 item(s)"]
+        );
+    }
+
+    #[test]
+    fn type_output_budget_truncates_declarations_and_budgeted_mutations() {
+        let plan = r2types::TypeWritebackPlan {
+            signature: r2types::InferredSignature {
+                function_name: "dbg.types".to_string(),
+                signature: "void dbg.types(void);".to_string(),
+                ret_type: "void".to_string(),
+                params: Vec::new(),
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 90,
+            },
+            var_type_candidates: Vec::new(),
+            var_rename_candidates: Vec::new(),
+            struct_decls: vec![
+                r2types::StructDeclCandidate {
+                    name: "struct a".to_string(),
+                    decl: "typedef struct a { int x; } a;".to_string(),
+                    confidence: 90,
+                    source: r2types::StructDeclSource::ExternalTypeDb,
+                    fields: Vec::new(),
+                },
+                r2types::StructDeclCandidate {
+                    name: "struct b".to_string(),
+                    decl: "typedef struct b { int y; } b;".to_string(),
+                    confidence: 90,
+                    source: r2types::StructDeclSource::ExternalTypeDb,
+                    fields: Vec::new(),
+                },
+            ],
+            global_type_links: Vec::new(),
+            diagnostics: r2types::TypeWritebackDiagnostics::default(),
+        };
+
+        let budget = TypeOutputBudget::new(64, 1, 1);
+        let mutation_plan = mutation_plan_from_writeback(&plan, budget);
+        assert_eq!(
+            mutation_plan
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.kind == "type_decl")
+                .count(),
+            1
+        );
+        assert!(mutation_plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "type declaration mutation plan truncated from 2 to 1 item(s)"
+        }));
+        let payload = writeback_plan_json(
+            plan,
+            InterprocSummaryJson {
+                callsite_count: 0,
+                iterations: 1,
+                max_iterations: 1,
+                converged: true,
+                summary: None,
+                summary_json: None,
+                scope: None,
+            },
+            &r2types::FunctionFacts::default(),
+            None,
+            None,
+            budget,
+        );
+        assert_eq!(payload.struct_decls.len(), 1);
+        assert!(
+            payload.diagnostics.warnings.iter().any(|warning| {
+                warning == "type declaration report truncated from 2 to 1 item(s)"
+            })
         );
     }
 
@@ -9963,6 +10297,8 @@ mod integration_tests {
                 interproc_max_iters,
                 interproc_converged: 1,
                 global_max_links: 64,
+                max_type_decls: 64,
+                max_mutations: 256,
             },
         }
     }
@@ -14331,6 +14667,8 @@ mod integration_tests {
                 interproc_max_iters: 1,
                 interproc_converged: 1,
                 global_max_links: 64,
+                max_type_decls: 64,
+                max_mutations: 256,
             },
         };
         let session = r2sleigh_session_analyze(&session_input);

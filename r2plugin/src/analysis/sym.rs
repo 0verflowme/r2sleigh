@@ -364,6 +364,9 @@ pub(crate) struct CompiledSemanticInfo {
     pub(crate) region_count: usize,
     pub(crate) control_region_count: usize,
     pub(crate) memory_region_count: usize,
+    pub(crate) memory_fact_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) memory_summaries: Vec<MemorySummaryInfo>,
     pub(crate) compiled_condition_count: usize,
     pub(crate) exact_compiled_condition_count: usize,
     pub(crate) actionable_compiled_condition_count: usize,
@@ -377,6 +380,21 @@ pub(crate) struct CompiledSemanticInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) vm_transfer: Option<VmStepSummaryInfo>,
     pub(crate) cache_hit: bool,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MemorySummaryInfo {
+    pub(crate) anchor: String,
+    pub(crate) region: String,
+    pub(crate) offset_lo: i64,
+    pub(crate) offset_hi: i64,
+    pub(crate) size: u32,
+    pub(crate) exact_offset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binding: Option<String>,
+    pub(crate) expr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) value_expr: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1468,6 +1486,39 @@ pub(crate) fn compiled_semantic_info(compiled: &r2sym::SemanticArtifact) -> Comp
     compiled_semantic_info_with_seed(compiled, None)
 }
 
+fn memory_summary_region_label(region: &r2sym::BackwardMemoryRegion) -> String {
+    match region {
+        r2sym::BackwardMemoryRegion::Argument { index } => format!("arg{index}"),
+        r2sym::BackwardMemoryRegion::Region(region) => format!("{:?}:{}", region.kind, region.name),
+    }
+}
+
+fn semantic_memory_summaries(native: Option<&r2sym::NativeArtifactBody>) -> Vec<MemorySummaryInfo> {
+    let mut summaries = native
+        .into_iter()
+        .flat_map(|body| body.regions.values())
+        .flat_map(|region| {
+            region.memory.iter().map(|fact| {
+                let term = &fact.value.term;
+                MemorySummaryInfo {
+                    anchor: format!("0x{:x}", region.anchor),
+                    region: memory_summary_region_label(&term.region),
+                    offset_lo: term.offset_lo,
+                    offset_hi: term.offset_hi,
+                    size: term.size,
+                    exact_offset: term.exact_offset,
+                    binding: term.binding.clone(),
+                    expr: term.expr.clone(),
+                    value_expr: term.value_expr.clone(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    summaries.sort();
+    summaries.dedup();
+    summaries
+}
+
 fn compiled_semantic_info_with_replay_seed(
     compiled: &r2sym::SemanticArtifact,
     replay_seed: &r2sym::ReplaySeed,
@@ -1483,6 +1534,8 @@ fn compiled_semantic_info_with_seed(
     replay_seed_fingerprint: Option<u64>,
 ) -> CompiledSemanticInfo {
     let native = compiled.native_body();
+    let memory_summaries = semantic_memory_summaries(native);
+    let memory_fact_count = memory_summaries.len();
     CompiledSemanticInfo {
         schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
         stage: match compiled.stage {
@@ -1587,6 +1640,8 @@ fn compiled_semantic_info_with_seed(
                     .count()
             })
             .unwrap_or(0),
+        memory_fact_count,
+        memory_summaries,
         compiled_condition_count: compiled.actionable_control_count(),
         exact_compiled_condition_count: compiled.exact_control_count(),
         actionable_compiled_condition_count: compiled.actionable_control_count(),
@@ -1631,15 +1686,65 @@ fn path_solution_from_result<'ctx>(
         inputs: solved
             .inputs
             .into_iter()
+            .filter(|(name, _)| is_public_solution_symbol(name))
             .map(|(k, v)| (k, format!("0x{:x}", v)))
             .collect(),
         registers: solved
             .registers
             .into_iter()
-            .filter(|(name, _)| !name.starts_with("tmp:") && !name.contains("_0"))
+            .filter(|(name, _)| is_public_solution_register(name))
             .map(|(k, v)| (k, format!("0x{:x}", v)))
             .collect(),
     })
+}
+
+fn is_flag_like_symbol(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cy" | "cf"
+            | "ng"
+            | "nf"
+            | "ov"
+            | "of"
+            | "zr"
+            | "zf"
+            | "sf"
+            | "pf"
+            | "af"
+            | "df"
+            | "tmpcy"
+            | "tmpng"
+            | "tmpov"
+            | "tmpzr"
+    )
+}
+
+fn is_public_solution_symbol(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("tmp:")
+        || lower.starts_with("tmp")
+        || lower.starts_with("const:")
+        || lower.starts_with("ram:")
+        || lower.starts_with("unique:")
+    {
+        return false;
+    }
+    let base = lower.split('_').next().unwrap_or(lower.as_str());
+    !is_flag_like_symbol(base) && !is_frame_scaffold_symbol(base)
+}
+
+fn is_public_solution_register(name: &str) -> bool {
+    if name.contains("_0") {
+        return false;
+    }
+    is_public_solution_symbol(name)
+}
+
+fn is_frame_scaffold_symbol(base: &str) -> bool {
+    matches!(
+        base,
+        "sp" | "fp" | "x29" | "w29" | "x30" | "w30" | "lr" | "pc"
+    )
 }
 
 fn buffer_solution(bytes: Vec<u8>) -> BufferSolution {
@@ -1671,6 +1776,7 @@ fn run_path_solution_from_result<'ctx>(
         inputs: solved
             .inputs
             .into_iter()
+            .filter(|(name, _)| is_public_solution_symbol(name))
             .map(|(k, v)| (k, format!("0x{:x}", v)))
             .collect(),
         input_buffers: solved
@@ -1681,7 +1787,7 @@ fn run_path_solution_from_result<'ctx>(
         registers: solved
             .registers
             .into_iter()
-            .filter(|(name, _)| !name.starts_with("tmp:") && !name.contains("_0"))
+            .filter(|(name, _)| is_public_solution_register(name))
             .map(|(k, v)| (k, format!("0x{:x}", v)))
             .collect(),
     })
@@ -3464,7 +3570,10 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_sym_exec_summary, parse_scope_assumptions};
+    use super::{
+        build_sym_exec_summary, is_public_solution_register, is_public_solution_symbol,
+        parse_scope_assumptions,
+    };
     use std::ffi::CString;
 
     #[test]
@@ -3485,6 +3594,33 @@ mod tests {
         .expect("json");
         let assumptions = parse_scope_assumptions(json.as_ptr(), None).expect("assumptions");
         assert_eq!(assumptions.items.len(), 1);
+    }
+
+    #[test]
+    fn public_solution_filter_hides_temps_and_flags_but_keeps_abi_inputs() {
+        for hidden in [
+            "tmp:1234", "TMPZR", "TMPNG", "CY", "OV", "const:4", "ram:1000",
+        ] {
+            assert!(
+                !is_public_solution_symbol(hidden),
+                "{hidden} should not be public solution input"
+            );
+        }
+        for visible in ["sym_input", "RDI_0", "x0_0", "arg1"] {
+            assert!(
+                is_public_solution_symbol(visible),
+                "{visible} should stay visible as a public solution input"
+            );
+        }
+        assert!(!is_public_solution_register("RDI_0"));
+        assert!(is_public_solution_register("RDI_1"));
+        for hidden in ["SP_1", "FP_1", "X29_1", "X30_1", "LR_1", "PC_1"] {
+            assert!(
+                !is_public_solution_register(hidden),
+                "{hidden} should not be a public ARM64 solution register"
+            );
+        }
+        assert!(is_public_solution_register("X0_1"));
     }
 
     #[test]

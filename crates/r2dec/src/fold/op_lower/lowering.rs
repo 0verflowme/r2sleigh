@@ -58,7 +58,17 @@ impl<'a> FoldingContext<'a> {
                             if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
                                 args.truncate(max_arity);
                             }
-                            return LoweredOp::Expr(CExpr::call(func_expr, args));
+                            let call = CExpr::call(func_expr, args);
+                            if let Some(owner) = self.materializable_call_result_expr_for_call_expr(
+                                (frame.block_addr, frame.op_idx),
+                                &call,
+                            ) {
+                                return LoweredOp::Assign {
+                                    lhs: owner,
+                                    rhs: call,
+                                };
+                            }
+                            return LoweredOp::Expr(call);
                         }
                         SSAOp::CallInd { target } => {
                             let resolved_target = self.resolve_call_target_for_site(
@@ -87,7 +97,17 @@ impl<'a> FoldingContext<'a> {
                             if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
                                 args.truncate(max_arity);
                             }
-                            return LoweredOp::Expr(CExpr::call(func_expr, args));
+                            let call = CExpr::call(func_expr, args);
+                            if let Some(owner) = self.materializable_call_result_expr_for_call_expr(
+                                (frame.block_addr, frame.op_idx),
+                                &call,
+                            ) {
+                                return LoweredOp::Assign {
+                                    lhs: owner,
+                                    rhs: call,
+                                };
+                            }
+                            return LoweredOp::Expr(call);
                         }
                         _ => {}
                     }

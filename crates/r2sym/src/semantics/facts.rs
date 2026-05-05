@@ -1,19 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use r2il::ArchSpec;
-use r2ssa::{InterprocFunctionId, SsaArtifact};
+use r2ssa::{
+    FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput, InterprocSolveConfig,
+    SSAOp, SSAVar, SsaArtifact, SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryRegion,
+    solve_interproc_summary_set,
+};
 use serde::{Deserialize, Serialize};
 use z3::Context;
 
 use crate::SymState;
 use crate::backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
-    compile_branch_precondition_with_summaries,
+    BackwardMemoryRegion, compile_branch_precondition_with_summaries,
 };
 use crate::path::{ExploreConfig, PathExplorer};
 use crate::runtime::seed_default_state_for_arch;
 use crate::semantics::{
-    SemanticEvidence, SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+    SemanticArtifact, SemanticArtifactBody, SemanticEvidence, SemanticEvidenceCoverage,
+    SemanticEvidenceProvenance, SemanticEvidenceReason,
 };
 use crate::sim::{
     DerivedSummaryCompletion, DerivedSummarySet, PreparedFunctionScope, SummaryProfile,
@@ -22,6 +27,8 @@ use crate::sim::{
 use crate::solver::SatResult;
 
 use super::region::{ControlFact, Judged, MemoryFact, RegionKey, SemanticRegion, TargetFact};
+
+const LARGE_CFG_SUMMARY_MEMORY_TERM_MAX: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolicReachabilityStatus {
@@ -211,6 +218,413 @@ fn build_canonical_regions(
         .into_values()
         .map(|region| (region.key(), region))
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LargeCfgMemoryTransfer {
+    block_addr: u64,
+    dst_arg: usize,
+    src_arg: usize,
+    size: u32,
+}
+
+fn abi_pointer_arg_index(var: &SSAVar) -> Option<usize> {
+    let name = var
+        .name
+        .strip_prefix("reg:")
+        .unwrap_or(var.name.as_str())
+        .trim_start_matches('_')
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "x0" | "w0" | "rdi" | "edi" | "di" | "a0" => Some(0),
+        "x1" | "w1" | "rsi" | "esi" | "si" | "a1" => Some(1),
+        "x2" | "w2" | "rdx" | "edx" | "dx" | "a2" => Some(2),
+        "x3" | "w3" | "rcx" | "ecx" | "cx" | "a3" => Some(3),
+        "x4" | "w4" | "r8" | "r8d" | "a4" => Some(4),
+        "x5" | "w5" | "r9" | "r9d" | "a5" => Some(5),
+        "x6" | "w6" | "a6" => Some(6),
+        "x7" | "w7" | "a7" => Some(7),
+        _ => None,
+    }
+}
+
+fn rooted_arg_var(var: &SSAVar, roots: &BTreeMap<SSAVar, usize>) -> Option<usize> {
+    abi_pointer_arg_index(var).or_else(|| roots.get(var).copied())
+}
+
+fn copy_root_if_known(dst: &SSAVar, src: &SSAVar, roots: &mut BTreeMap<SSAVar, usize>) {
+    if let Some(root) = rooted_arg_var(src, roots) {
+        roots.insert(dst.clone(), root);
+    }
+}
+
+fn copy_binary_root_if_unambiguous(
+    dst: &SSAVar,
+    a: &SSAVar,
+    b: &SSAVar,
+    roots: &mut BTreeMap<SSAVar, usize>,
+) {
+    let a_root = rooted_arg_var(a, roots);
+    let b_root = rooted_arg_var(b, roots);
+    match (a_root, b_root) {
+        (Some(root), None) | (None, Some(root)) => {
+            roots.insert(dst.clone(), root);
+        }
+        (Some(a_root), Some(b_root)) if a_root == b_root => {
+            roots.insert(dst.clone(), a_root);
+        }
+        _ => {}
+    }
+}
+
+fn copy_phi_root_if_unambiguous<'a>(
+    dst: &SSAVar,
+    sources: impl IntoIterator<Item = &'a SSAVar>,
+    roots: &mut BTreeMap<SSAVar, usize>,
+) {
+    let mut source_roots = sources
+        .into_iter()
+        .filter_map(|src| rooted_arg_var(src, roots));
+    if let Some(first) = source_roots.next()
+        && source_roots.all(|root| root == first)
+    {
+        roots.insert(dst.clone(), first);
+    }
+}
+
+fn loaded_arg_var(var: &SSAVar, load_sources: &BTreeMap<SSAVar, usize>) -> Option<usize> {
+    load_sources.get(var).copied()
+}
+
+fn copy_load_source_if_known(
+    dst: &SSAVar,
+    src: &SSAVar,
+    load_sources: &mut BTreeMap<SSAVar, usize>,
+) {
+    if let Some(source) = loaded_arg_var(src, load_sources) {
+        load_sources.insert(dst.clone(), source);
+    }
+}
+
+fn copy_phi_load_source_if_unambiguous<'a>(
+    dst: &SSAVar,
+    sources: impl IntoIterator<Item = &'a SSAVar>,
+    load_sources: &mut BTreeMap<SSAVar, usize>,
+) {
+    let mut source_roots = sources
+        .into_iter()
+        .filter_map(|src| loaded_arg_var(src, load_sources));
+    if let Some(first) = source_roots.next()
+        && source_roots.all(|root| root == first)
+    {
+        load_sources.insert(dst.clone(), first);
+    }
+}
+
+fn large_cfg_memory_transfers(func: &SsaArtifact) -> BTreeSet<LargeCfgMemoryTransfer> {
+    let mut roots = BTreeMap::<SSAVar, usize>::new();
+    let mut load_sources = BTreeMap::<SSAVar, usize>::new();
+    let mut transfers = BTreeSet::<LargeCfgMemoryTransfer>::new();
+
+    for block in func.function().blocks() {
+        for phi in &block.phis {
+            copy_phi_root_if_unambiguous(
+                &phi.dst,
+                phi.sources.iter().map(|(_, src)| src),
+                &mut roots,
+            );
+            copy_phi_load_source_if_unambiguous(
+                &phi.dst,
+                phi.sources.iter().map(|(_, src)| src),
+                &mut load_sources,
+            );
+        }
+        for op in &block.ops {
+            match op {
+                SSAOp::Phi { dst, sources } => {
+                    copy_phi_root_if_unambiguous(dst, sources, &mut roots);
+                    copy_phi_load_source_if_unambiguous(dst, sources, &mut load_sources);
+                }
+                SSAOp::Copy { dst, src }
+                | SSAOp::IntZExt { dst, src }
+                | SSAOp::IntSExt { dst, src }
+                | SSAOp::Subpiece { dst, src, .. }
+                | SSAOp::Cast { dst, src }
+                | SSAOp::Trunc { dst, src } => {
+                    copy_root_if_known(dst, src, &mut roots);
+                    copy_load_source_if_known(dst, src, &mut load_sources);
+                }
+                SSAOp::IntAdd { dst, a, b }
+                | SSAOp::IntSub { dst, a, b }
+                | SSAOp::IntAnd { dst, a, b }
+                | SSAOp::IntOr { dst, a, b }
+                | SSAOp::PtrAdd {
+                    dst,
+                    base: a,
+                    index: b,
+                    ..
+                }
+                | SSAOp::PtrSub {
+                    dst,
+                    base: a,
+                    index: b,
+                    ..
+                } => {
+                    copy_binary_root_if_unambiguous(dst, a, b, &mut roots);
+                }
+                SSAOp::Load { dst, addr, .. }
+                | SSAOp::LoadLinked { dst, addr, .. }
+                | SSAOp::LoadGuarded { dst, addr, .. } => {
+                    if let Some(src_arg) = rooted_arg_var(addr, &roots) {
+                        load_sources.insert(dst.clone(), src_arg);
+                    }
+                }
+                SSAOp::Store { addr, val, .. }
+                | SSAOp::StoreGuarded { addr, val, .. }
+                | SSAOp::StoreConditional { addr, val, .. } => {
+                    if let (Some(dst_arg), Some(src_arg)) =
+                        (rooted_arg_var(addr, &roots), load_sources.get(val).copied())
+                        && dst_arg != src_arg
+                    {
+                        transfers.insert(LargeCfgMemoryTransfer {
+                            block_addr: block.addr,
+                            dst_arg,
+                            src_arg,
+                            size: val.size,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    transfers
+}
+
+fn append_large_cfg_memory_transfer_terms(
+    func: &SsaArtifact,
+    regions: &mut BTreeMap<RegionKey, SemanticRegion>,
+) {
+    let transfers = large_cfg_memory_transfers(func);
+    if transfers.is_empty() {
+        return;
+    }
+    let mut by_anchor = BTreeMap::<u64, SemanticRegion>::new();
+    for region in std::mem::take(regions).into_values() {
+        by_anchor.insert(region.anchor, region);
+    }
+    for transfer in transfers {
+        let region = ensure_semantic_region(&mut by_anchor, transfer.block_addr);
+        let term = BackwardMemoryCondition {
+            region: BackwardMemoryRegion::Argument {
+                index: transfer.dst_arg,
+            },
+            offset_lo: 0,
+            offset_hi: 0,
+            size: transfer.size,
+            exact_offset: false,
+            evidence: SemanticEvidence::likely(SemanticEvidenceReason::SummaryBudget)
+                .with_coverage(SemanticEvidenceCoverage::Bounded)
+                .with_provenance(SemanticEvidenceProvenance::Stable)
+                .with_budget_limited(true),
+            binding: Some(format!(
+                "copy_arg{}_to_arg{}",
+                transfer.src_arg, transfer.dst_arg
+            )),
+            expr: format!("copy arg{} -> arg{}", transfer.src_arg, transfer.dst_arg),
+            value_expr: Some(format!("*arg{}", transfer.src_arg)),
+            exact_value: false,
+        };
+        push_region_memory_terms(region, [term]);
+    }
+    *regions = by_anchor
+        .into_values()
+        .map(|region| (region.key(), region))
+        .collect();
+}
+
+fn summary_effect_expr(kind: SummaryMemoryEffectKind, arg_index: usize, offset: i64) -> String {
+    let action = match kind {
+        SummaryMemoryEffectKind::Read => "read",
+        SummaryMemoryEffectKind::Write => "write",
+        SummaryMemoryEffectKind::Escape => "escape",
+        SummaryMemoryEffectKind::Free => "free",
+    };
+    format!(
+        "{action} {}",
+        summary_memory_location_expr(arg_index, offset)
+    )
+}
+
+fn large_cfg_summary_memory_term(effect: &SummaryMemoryEffect) -> Option<BackwardMemoryCondition> {
+    let SummaryMemoryRegion::Arg { index } = effect.location.region else {
+        return None;
+    };
+    let (offset_lo, offset_hi, size, exact_offset) = effect
+        .location
+        .range
+        .map(|range| {
+            (
+                range.offset_lo,
+                range.offset_hi,
+                range.width.unwrap_or(0),
+                true,
+            )
+        })
+        .unwrap_or((0, 0, 0, false));
+    Some(BackwardMemoryCondition {
+        region: BackwardMemoryRegion::Argument { index },
+        offset_lo,
+        offset_hi,
+        size,
+        exact_offset,
+        evidence: SemanticEvidence::likely(SemanticEvidenceReason::SummaryBudget)
+            .with_coverage(SemanticEvidenceCoverage::Bounded)
+            .with_provenance(SemanticEvidenceProvenance::Stable)
+            .with_budget_limited(true),
+        binding: Some(format!("{:?}_arg{}", effect.kind, index).to_ascii_lowercase()),
+        expr: summary_effect_expr(effect.kind, index, offset_lo),
+        value_expr: None,
+        exact_value: false,
+    })
+}
+
+fn bounded_large_cfg_summary_memory_terms(
+    effects: &[SummaryMemoryEffect],
+) -> Vec<BackwardMemoryCondition> {
+    let mut terms = effects
+        .iter()
+        .filter_map(large_cfg_summary_memory_term)
+        .collect::<Vec<_>>();
+    terms.sort_by_key(|term| {
+        (
+            term.binding.clone(),
+            term.region.clone(),
+            term.offset_lo,
+            term.offset_hi,
+            term.size,
+            term.expr.clone(),
+            term.value_expr.clone(),
+        )
+    });
+    terms.dedup();
+    if terms.len() <= LARGE_CFG_SUMMARY_MEMORY_TERM_MAX {
+        return terms;
+    }
+
+    let mut by_binding = BTreeMap::<(Option<String>, BackwardMemoryRegion), VecDeque<_>>::new();
+    for term in terms {
+        by_binding
+            .entry((term.binding.clone(), term.region.clone()))
+            .or_default()
+            .push_back(term);
+    }
+
+    let mut selected = Vec::with_capacity(LARGE_CFG_SUMMARY_MEMORY_TERM_MAX);
+    while selected.len() < LARGE_CFG_SUMMARY_MEMORY_TERM_MAX
+        && by_binding.values().any(|terms| !terms.is_empty())
+    {
+        for terms in by_binding.values_mut() {
+            if selected.len() >= LARGE_CFG_SUMMARY_MEMORY_TERM_MAX {
+                break;
+            }
+            if let Some(term) = terms.pop_front() {
+                selected.push(term);
+            }
+        }
+    }
+    selected.sort_by_key(|term| {
+        (
+            term.binding.clone(),
+            term.region.clone(),
+            term.offset_lo,
+            term.offset_hi,
+            term.size,
+            term.expr.clone(),
+            term.value_expr.clone(),
+        )
+    });
+    selected
+}
+
+fn large_cfg_root_summary(func: &SsaArtifact, arch: &ArchSpec) -> Option<FunctionSemanticSummary> {
+    let id = InterprocFunctionId(func.entry);
+    let input = InterprocFunctionInput {
+        id,
+        name: func.function().name.clone(),
+        prepared: func,
+    };
+    solve_interproc_summary_set(
+        &[input],
+        Some(arch),
+        Some(id),
+        &BTreeMap::new(),
+        InterprocSolveConfig::default(),
+    )
+    .summaries
+    .remove(&id)
+}
+
+fn append_large_cfg_summary_memory_terms(
+    func: &SsaArtifact,
+    arch: &ArchSpec,
+    regions: &mut BTreeMap<RegionKey, SemanticRegion>,
+) {
+    let Some(summary) = large_cfg_root_summary(func, arch) else {
+        return;
+    };
+    let terms = bounded_large_cfg_summary_memory_terms(&summary.memory_effects);
+    if terms.is_empty() {
+        return;
+    }
+    let mut by_anchor = BTreeMap::<u64, SemanticRegion>::new();
+    for region in std::mem::take(regions).into_values() {
+        by_anchor.insert(region.anchor, region);
+    }
+    let region = ensure_semantic_region(&mut by_anchor, func.entry);
+    push_region_memory_terms(region, terms);
+    *regions = by_anchor
+        .into_values()
+        .map(|region| (region.key(), region))
+        .collect();
+}
+
+pub fn augment_semantic_artifact_with_interproc_summary(
+    artifact: &mut SemanticArtifact,
+    anchor: u64,
+    summary: &FunctionSemanticSummary,
+) -> usize {
+    let terms = bounded_large_cfg_summary_memory_terms(&summary.memory_effects);
+    if terms.is_empty() {
+        return 0;
+    }
+
+    let SemanticArtifactBody::Native(native) = &mut artifact.body else {
+        return 0;
+    };
+
+    let before = native
+        .regions
+        .values()
+        .map(|region| region.memory.len())
+        .sum::<usize>();
+    let mut by_anchor = BTreeMap::<u64, SemanticRegion>::new();
+    for region in std::mem::take(&mut native.regions).into_values() {
+        by_anchor.insert(region.anchor, region);
+    }
+    let region = ensure_semantic_region(&mut by_anchor, anchor);
+    push_region_memory_terms(region, terms);
+    native.regions = by_anchor
+        .into_values()
+        .map(|region| (region.key(), region))
+        .collect();
+    let after = native
+        .regions
+        .values()
+        .map(|region| region.memory.len())
+        .sum::<usize>();
+    after.saturating_sub(before)
 }
 
 fn control_fact_evidence(
@@ -875,6 +1289,8 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
             diagnostics,
         }
     };
+    append_large_cfg_summary_memory_terms(func, arch, &mut collected.regions);
+    append_large_cfg_memory_transfer_terms(func, &mut collected.regions);
     collected.diagnostics.skipped_large_cfg = true;
     collected
 }
@@ -950,5 +1366,251 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
     CollectedNativeSemanticRegions {
         regions: build_canonical_regions(&branch_facts, &BTreeMap::new(), &diagnostics),
         diagnostics,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
+        RefinementStage, SemanticArtifactDiagnostics,
+    };
+    use r2il::{RegisterDef, SpaceId, Varnode};
+
+    #[test]
+    fn large_cfg_memory_transfer_pass_detects_copy_shaped_store() {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("x1", 0x08, 8));
+
+        let mut block = r2il::R2ILBlock::new(0x1000, 4);
+        block.push(r2il::R2ILOp::Load {
+            dst: Varnode::unique(0, 1),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x08, 8),
+        });
+        block.push(r2il::R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+            val: Varnode::unique(0, 1),
+        });
+
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
+            .expect("copy-shaped fixture should build SSA");
+        let transfers = large_cfg_memory_transfers(&artifact);
+
+        assert!(transfers.contains(&LargeCfgMemoryTransfer {
+            block_addr: 0x1000,
+            dst_arg: 0,
+            src_arg: 1,
+            size: 1,
+        }));
+    }
+
+    #[test]
+    fn large_cfg_memory_transfer_pass_tracks_pointer_and_value_plumbing() {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("x1", 0x08, 8));
+
+        let src_addr = Varnode::unique(0x10, 8);
+        let dst_addr = Varnode::unique(0x11, 8);
+        let loaded = Varnode::unique(0x12, 1);
+        let widened = Varnode::unique(0x13, 8);
+        let casted = Varnode::unique(0x14, 8);
+
+        let mut block = r2il::R2ILBlock::new(0x1010, 4);
+        block.push(r2il::R2ILOp::PtrAdd {
+            dst: src_addr.clone(),
+            base: Varnode::register(0x08, 8),
+            index: Varnode::constant(4, 8),
+            element_size: 1,
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: src_addr,
+        });
+        block.push(r2il::R2ILOp::IntZExt {
+            dst: widened.clone(),
+            src: loaded,
+        });
+        block.push(r2il::R2ILOp::Cast {
+            dst: casted.clone(),
+            src: widened,
+        });
+        block.push(r2il::R2ILOp::PtrAdd {
+            dst: dst_addr.clone(),
+            base: Varnode::register(0x00, 8),
+            index: Varnode::constant(8, 8),
+            element_size: 1,
+        });
+        block.push(r2il::R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: dst_addr,
+            val: casted,
+        });
+
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
+            .expect("plumbed copy-shaped fixture should build SSA");
+        let transfers = large_cfg_memory_transfers(&artifact);
+
+        assert!(transfers.contains(&LargeCfgMemoryTransfer {
+            block_addr: 0x1010,
+            dst_arg: 0,
+            src_arg: 1,
+            size: 8,
+        }));
+    }
+
+    #[test]
+    fn large_cfg_summary_pass_surfaces_bounded_arg_memory_effects() {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("x1", 0x08, 8));
+
+        let mut block = r2il::R2ILBlock::new(0x2000, 4);
+        block.push(r2il::R2ILOp::Load {
+            dst: Varnode::unique(0, 1),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x08, 8),
+        });
+        block.push(r2il::R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+            val: Varnode::unique(0, 1),
+        });
+
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
+            .expect("copy-shaped fixture should build SSA");
+        let mut regions = BTreeMap::new();
+        append_large_cfg_summary_memory_terms(&artifact, &arch, &mut regions);
+        let terms = regions
+            .values()
+            .flat_map(|region| region.memory.iter())
+            .collect::<Vec<_>>();
+
+        assert!(terms.iter().any(|term| {
+            term.value.term.binding.as_deref() == Some("read_arg1")
+                && matches!(
+                    term.value.term.region,
+                    BackwardMemoryRegion::Argument { index: 1 }
+                )
+        }));
+        assert!(terms.iter().any(|term| {
+            term.value.term.binding.as_deref() == Some("write_arg0")
+                && matches!(
+                    term.value.term.region,
+                    BackwardMemoryRegion::Argument { index: 0 }
+                )
+        }));
+    }
+
+    #[test]
+    fn large_cfg_summary_budget_preserves_distinct_memory_effect_classes() {
+        let mut effects = (0..48)
+            .map(|index| SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: r2ssa::SummaryMemoryLocation {
+                    region: SummaryMemoryRegion::Arg { index: 0 },
+                    range: Some(r2ssa::SummaryMemoryRange {
+                        offset_lo: index * 8,
+                        offset_hi: index * 8 + 7,
+                        width: Some(8),
+                    }),
+                },
+            })
+            .collect::<Vec<_>>();
+        effects.push(SummaryMemoryEffect {
+            kind: SummaryMemoryEffectKind::Write,
+            location: r2ssa::SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index: 1 },
+                range: Some(r2ssa::SummaryMemoryRange {
+                    offset_lo: 0,
+                    offset_hi: 7,
+                    width: Some(8),
+                }),
+            },
+        });
+
+        let terms = bounded_large_cfg_summary_memory_terms(&effects);
+
+        assert_eq!(terms.len(), LARGE_CFG_SUMMARY_MEMORY_TERM_MAX);
+        assert!(terms.iter().any(|term| {
+            term.binding.as_deref() == Some("write_arg1")
+                && matches!(term.region, BackwardMemoryRegion::Argument { index: 1 })
+        }));
+    }
+
+    #[test]
+    fn interproc_summary_augmentation_adds_native_memory_terms() {
+        let root = InterprocFunctionId(0x3000);
+        let summary = FunctionSemanticSummary {
+            id: root,
+            name: Some("sym.copy_worker".to_string()),
+            arg_count_hint: Some(1),
+            direct_callees: BTreeSet::new(),
+            callsite_count: 0,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: vec![SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Write,
+                location: r2ssa::SummaryMemoryLocation {
+                    region: SummaryMemoryRegion::Arg { index: 0 },
+                    range: Some(r2ssa::SummaryMemoryRange {
+                        offset_lo: 0,
+                        offset_hi: 7,
+                        width: Some(8),
+                    }),
+                },
+            }],
+            return_relation: r2ssa::SummaryReturnRelation::Unknown,
+            reads_global_memory: false,
+            writes_global_memory: false,
+            touches_unknown_memory: false,
+        };
+        let mut artifact = SemanticArtifact {
+            stage: RefinementStage::Residual,
+            granularity: ArtifactGranularity::SummaryOnly,
+            execution: ExecutionModel::Native,
+            body: SemanticArtifactBody::Native(NativeArtifactBody {
+                summary: NativeFunctionSummary {
+                    slice_class: crate::SliceClass::Worker,
+                    closure_functions: 1,
+                    helper_functions: 0,
+                    derived_summaries: 0,
+                    derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+                },
+                regions: BTreeMap::new(),
+            }),
+            diagnostics: SemanticArtifactDiagnostics {
+                branches_evaluated: 0,
+                branches_pruned: 0,
+                branches_unknown: 0,
+                skipped_missing_arch: false,
+                skipped_large_cfg: true,
+                residual_reasons: vec![crate::ResidualReason::LargeCfg],
+                ambiguous_targets: Vec::new(),
+                cache_hit: false,
+            },
+        };
+
+        let added =
+            augment_semantic_artifact_with_interproc_summary(&mut artifact, 0x3000, &summary);
+
+        assert_eq!(added, 1);
+        let native = artifact.native_body().expect("native semantic body");
+        let region = native.regions.values().next().expect("summary region");
+        assert!(region.memory.iter().any(|term| {
+            term.value.term.binding.as_deref() == Some("write_arg0")
+                && matches!(
+                    term.value.term.region,
+                    BackwardMemoryRegion::Argument { index: 0 }
+                )
+        }));
     }
 }

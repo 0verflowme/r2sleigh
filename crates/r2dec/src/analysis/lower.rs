@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{SSAOp, SSAVar};
 use r2types::TypeOracle;
 
@@ -430,6 +431,11 @@ impl<'a> LowerCtx<'a> {
                 userop,
                 inputs,
             } => {
+                if is_arm64_pauth_userop(*userop)
+                    && let Some(input) = inputs.first()
+                {
+                    return self.get_expr(input);
+                }
                 let mut args = Vec::with_capacity(inputs.len() + 1);
                 args.push(CExpr::StringLit(format!("userop_{}", userop)));
                 for input in inputs {
@@ -1527,6 +1533,42 @@ mod tests {
 
         assert_eq!(ctx.resolve_addr_literal(0xff), None);
         assert_eq!(ctx.resolve_addr_literal(0x5000), None);
+    }
+
+    #[test]
+    fn op_to_expr_treats_arm64_pauth_as_value_preserving() {
+        let fn_map = HashMap::new();
+        let str_map = HashMap::new();
+        let sym_map = HashMap::new();
+        let definitions = HashMap::new();
+        let use_counts = HashMap::new();
+        let condition_vars = HashSet::new();
+        let pinned = HashSet::new();
+        let var_aliases = HashMap::new();
+        let ptr_arith = HashMap::new();
+        let stack_slots = HashMap::new();
+        let forwarded_values = HashMap::new();
+        let ctx = make_ctx(
+            &definitions,
+            &use_counts,
+            &condition_vars,
+            &pinned,
+            &var_aliases,
+            &ptr_arith,
+            &stack_slots,
+            &forwarded_values,
+            &fn_map,
+            &str_map,
+            &sym_map,
+        );
+
+        let expr = ctx.op_to_expr(&SSAOp::CallOther {
+            output: Some(SSAVar::new("X30", 1, 8)),
+            userop: r2il::userops::ARM64_PAUTH_AUTH_USEROP,
+            inputs: vec![SSAVar::new("X30", 0, 8), SSAVar::new("SP", 0, 8)],
+        });
+
+        assert_eq!(expr, CExpr::Var("x30".to_string()));
     }
 
     #[test]

@@ -188,6 +188,21 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 }
             }
 
+            let render_cache_key =
+                crate::types::decompile_render_cache_key(crate::types::DecompileRenderCacheKeyInput {
+                    blocks: &r2il_blocks,
+                    function_name: &display_func_name,
+                    arch: arch.as_ref(),
+                    ptr_bits,
+                    function_facts: &artifact.function_facts,
+                    func_names_payload: &func_names_str,
+                    strings_payload: &strings_str,
+                    symbols_payload: &symbols_str,
+                });
+            if let Some(output) = crate::types::cached_decompile_render(render_cache_key) {
+                return output;
+            }
+
             let decompiler = r2dec::Decompiler::new(config);
             let semantic_fallback_output = r2dec::semantic_fallback_comment(
                 &display_func_name,
@@ -202,8 +217,8 @@ pub(crate) fn run_full_decompile_on_large_stack(
             );
 
             let output = decompiler.decompile_input(&input);
-            if output.trim().is_empty() {
-                return semantic_fallback_output.unwrap_or_else(|| {
+            let output = if output.trim().is_empty() {
+                semantic_fallback_output.unwrap_or_else(|| {
                     cfg_guard_reason
                         .as_ref()
                         .map(|reason| r2dec::artifact_guard_fallback_comment(&func_name_str, reason))
@@ -213,8 +228,11 @@ pub(crate) fn run_full_decompile_on_large_stack(
                                 display_func_name
                             )
                         })
-                });
-            }
+                })
+            } else {
+                output
+            };
+            crate::types::insert_decompile_render(render_cache_key, output.clone());
             output
         });
 

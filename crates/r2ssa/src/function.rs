@@ -2031,13 +2031,15 @@ fn apply_op_family_effect(
         SSAOp::Copy { src, .. } | SSAOp::Cast { src, .. } | SSAOp::New { src, .. } => {
             if let Some(root) = adapt_family_root(src, member.width) {
                 state.insert(exact_slot, root.clone());
-                seed_narrow_const_roots(state, family_info, member.family_id, member.width, &root);
+                seed_narrow_family_roots(state, family_info, member.family_id, member.width, &root);
             } else {
                 state.insert(exact_slot, dst.clone());
+                seed_narrow_family_roots(state, family_info, member.family_id, member.width, dst);
             }
         }
         SSAOp::IntZExt { src, .. } | SSAOp::IntSExt { src, .. } => {
             state.insert(exact_slot, dst.clone());
+            seed_narrow_family_roots(state, family_info, member.family_id, member.width, dst);
             if let Some(root) = adapt_family_root(src, src.size) {
                 state.insert(
                     RegisterFamilySlot {
@@ -2066,12 +2068,18 @@ fn rewrite_decompile_family_source(
     state: &FamilyRootState,
     family_info: &RegisterFamilyInfo,
 ) -> SSAVar {
-    if src.version != 0 {
-        return src.clone();
-    }
     let Some(member) = family_info.member_for(src) else {
         return src.clone();
     };
+    if src.version != 0
+        && family_info
+            .family_widths
+            .get(&member.family_id)
+            .and_then(|widths| widths.iter().copied().max())
+            .is_none_or(|max_width| member.width >= max_width)
+    {
+        return src.clone();
+    }
     let slot = RegisterFamilySlot {
         family_id: member.family_id,
         width: src.size,
@@ -2093,22 +2101,22 @@ fn adapt_family_root(root: &SSAVar, width: u32) -> Option<SSAVar> {
     if root.size == width {
         return Some(root.clone());
     }
+    if root.size > width && !root.is_const() {
+        return Some(SSAVar::new(root.name.clone(), root.version, width));
+    }
     if !root.is_const() {
         return None;
     }
     const_value(root).map(|value| SSAVar::constant(mask_const_to_width(value, width), width))
 }
 
-fn seed_narrow_const_roots(
+fn seed_narrow_family_roots(
     state: &mut FamilyRootState,
     family_info: &RegisterFamilyInfo,
     family_id: usize,
     written_width: u32,
     root: &SSAVar,
 ) {
-    let Some(const_value) = const_value(root) else {
-        return;
-    };
     let Some(widths) = family_info.family_widths.get(&family_id) else {
         return;
     };
@@ -2117,10 +2125,10 @@ fn seed_narrow_const_roots(
         if width > written_width {
             continue;
         }
-        state.insert(
-            RegisterFamilySlot { family_id, width },
-            SSAVar::constant(mask_const_to_width(const_value, width), width),
-        );
+        let Some(adapted) = adapt_family_root(root, width) else {
+            continue;
+        };
+        state.insert(RegisterFamilySlot { family_id, width }, adapted);
     }
 }
 
@@ -2509,6 +2517,8 @@ mod tests {
 
     fn make_arm64_alias_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("aarch64");
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        arch.add_register(RegisterDef::new("w0", 0x00, 4));
         arch.add_register(RegisterDef::new("x8", 0x80, 8));
         arch.add_register(RegisterDef::new("w8", 0x80, 4));
         arch.add_register(RegisterDef::new("x9", 0x88, 8));
@@ -2896,6 +2906,78 @@ mod tests {
                 .object(uses[0].location.object)
                 .map(|fact| &fact.kind),
             Some(&crate::semantic::ObjectKind::EscapedUnknown)
+        );
+    }
+
+    #[test]
+    fn decompile_ssa_models_post_call_arm64_return_register_clobber() {
+        let arch = make_arm64_alias_arch();
+        let blocks = vec![R2ILBlock {
+            addr: 0x1400,
+            size: 16,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0x00, 8),
+                    src: make_const(0, 8),
+                },
+                R2ILOp::Call {
+                    target: make_ram(0x401000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(0x80, 8),
+                    src: make_reg(0x00, 8),
+                },
+                R2ILOp::IntEqual {
+                    dst: Varnode {
+                        space: SpaceId::Unique,
+                        offset: 0x20,
+                        size: 1,
+                        meta: None,
+                    },
+                    a: make_reg(0x80, 8),
+                    b: make_const(0, 8),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1410, 8),
+                    cond: Varnode {
+                        space: SpaceId::Unique,
+                        offset: 0x20,
+                        size: 1,
+                        meta: None,
+                    },
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let ops = &prepared.get_block(0x1400).expect("entry block").ops;
+        let post_call_x0 = ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::CallDefine { dst } if dst.name == "x0" => Some(dst.clone()),
+                _ => None,
+            })
+            .expect("decompile SSA should define a fresh x0 after calls");
+
+        let copied_x8_source = ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Copy { dst, src } if dst.name == "x8" => Some(src.clone()),
+                _ => None,
+            })
+            .expect("expected x8 copy from call return register");
+
+        assert_eq!(
+            copied_x8_source, post_call_x0,
+            "post-call x8 copy must use the fresh call result owner, not the pre-call x0"
+        );
+        assert_ne!(
+            copied_x8_source,
+            SSAVar::constant(0, 8),
+            "call result must not fold back to the pre-call literal"
         );
     }
 
@@ -3626,6 +3708,42 @@ mod tests {
                 assert_eq!(src, &SSAVar::new("tmp:24c00", 3, 4));
             }
             other => panic!("expected IntSExt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decompile_normalization_rewrites_narrow_alias_after_wide_zext_write() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let block = func.get_block_mut(0x1000).expect("entry block");
+        block.ops = vec![
+            SSAOp::IntZExt {
+                dst: SSAVar::new("x8", 1, 8),
+                src: SSAVar::new("tmp:25500", 1, 1),
+            },
+            SSAOp::IntRight {
+                dst: SSAVar::new("tmp:18900", 1, 4),
+                a: SSAVar::new("w8", 0, 4),
+                b: SSAVar::constant(0, 4),
+            },
+        ];
+
+        func.normalize_subregister_sources_for_decompile(&make_arm64_alias_arch());
+
+        match &func.get_block(0x1000).expect("entry block").ops[1] {
+            SSAOp::IntRight { a, .. } => {
+                assert_eq!(a, &SSAVar::new("x8", 1, 4));
+            }
+            other => panic!("expected IntRight, got {other:?}"),
         }
     }
 

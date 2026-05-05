@@ -14,6 +14,7 @@ use r2il::{
 use std::collections::HashMap;
 
 use crate::translate::{self, PcodeSource};
+use crate::userops::{ARM64_PAUTH_AUTH_USEROP, ARM64_PAUTH_SIGN_USEROP, ARM64_PAUTH_STRIP_USEROP};
 use crate::{LiftError, Result};
 
 /// A disassembler that uses libsla to lift instructions to r2il.
@@ -1431,6 +1432,19 @@ fn normalize_memory_semantics_with_hints<F, G>(
         );
     }
 
+    if block.ops.is_empty()
+        && is_arm64_arch_name(&arch)
+        && let Some(op) = pointer_auth_userop_from_mnemonic(&token, mnemonic, &resolve_register)
+    {
+        block.push_with_metadata(
+            op,
+            Some(OpMetadata {
+                instruction_addr: Some(block.addr),
+                ..Default::default()
+            }),
+        );
+    }
+
     let op_ordering = ordering_from_mnemonic_token(&token);
     let lr_like = (arch.contains("riscv") && token.starts_with("lr."))
         || (arch.contains("arm") && token.starts_with("ldrex"));
@@ -1522,6 +1536,68 @@ fn normalize_memory_semantics_with_hints<F, G>(
             }
         }
     }
+}
+
+fn is_arm64_arch_name(arch: &str) -> bool {
+    arch.contains("aarch64") || arch.contains("arm64")
+}
+
+fn pointer_auth_userop_for_token(token: &str) -> Option<u32> {
+    if token.starts_with("aut") {
+        Some(ARM64_PAUTH_AUTH_USEROP)
+    } else if token.starts_with("xpac") {
+        Some(ARM64_PAUTH_STRIP_USEROP)
+    } else if token.starts_with("pac") {
+        Some(ARM64_PAUTH_SIGN_USEROP)
+    } else {
+        None
+    }
+}
+
+fn pointer_auth_operands(mnemonic: &str) -> Vec<&str> {
+    mnemonic
+        .split_once(char::is_whitespace)
+        .map(|(_, operands)| operands)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|operand| !operand.is_empty())
+        .collect()
+}
+
+fn pointer_auth_userop_from_mnemonic<G>(
+    token: &str,
+    mnemonic: &str,
+    resolve_register: &G,
+) -> Option<R2ILOp>
+where
+    G: Fn(&str) -> Option<Varnode>,
+{
+    let userop = pointer_auth_userop_for_token(token)?;
+    let operands = pointer_auth_operands(mnemonic);
+    let dst_name = operands.first().copied().or(match token {
+        "pacibsp" | "paciasp" | "autibsp" | "autiasp" | "xpaclri" => Some("x30"),
+        _ => None,
+    })?;
+    let dst = resolve_register(dst_name)?;
+    let mut inputs = Vec::new();
+    inputs.push(dst.clone());
+    for operand in operands.iter().skip(1).copied() {
+        if let Some(input) = resolve_register(operand) {
+            inputs.push(input);
+        }
+    }
+    if operands.len() <= 1
+        && matches!(token, "pacibsp" | "paciasp" | "autibsp" | "autiasp")
+        && let Some(sp) = resolve_register("sp")
+    {
+        inputs.push(sp);
+    }
+    Some(R2ILOp::CallOther {
+        output: Some(dst),
+        userop,
+        inputs,
+    })
 }
 
 fn set_memory_hints(
@@ -1630,6 +1706,16 @@ mod tests {
         Varnode::new(SpaceId::Ram, offset, size)
     }
 
+    fn arm64_reg(name: &str) -> Option<Varnode> {
+        match name {
+            "x16" => Some(reg(16 * 8, 8)),
+            "x17" => Some(reg(17 * 8, 8)),
+            "x30" | "lr" => Some(reg(30 * 8, 8)),
+            "sp" => Some(reg(31 * 8, 8)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn normalization_fence_userop_rewrites_to_fence() {
         let mut block = R2ILBlock::new(0x1000, 4);
@@ -1657,6 +1743,56 @@ mod tests {
         let meta = block.op_metadata.get(&0).expect("metadata for op 0");
         assert_eq!(meta.atomic_kind, Some(AtomicKind::Fence));
         assert_eq!(meta.memory_ordering, Some(MemoryOrdering::SeqCst));
+    }
+
+    #[test]
+    fn normalization_arm64_pointer_auth_register_form_becomes_named_userop() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+
+        normalize_memory_semantics_with_hints(
+            &mut block,
+            "aarch64",
+            "autda x16, x17",
+            |_| None,
+            arm64_reg,
+        );
+
+        match &block.ops[0] {
+            R2ILOp::CallOther {
+                output: Some(output),
+                userop,
+                inputs,
+            } => {
+                assert_eq!(*userop, ARM64_PAUTH_AUTH_USEROP);
+                assert_eq!(*output, reg(16 * 8, 8));
+                assert_eq!(inputs, &vec![reg(16 * 8, 8), reg(17 * 8, 8)]);
+            }
+            other => panic!("expected pointer-auth CallOther, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalization_arm64_pointer_auth_stack_form_preserves_lr_and_sp_evidence() {
+        let mut block = R2ILBlock::new(0x2000, 4);
+
+        normalize_memory_semantics_with_hints(&mut block, "arm64", "pacibsp", |_| None, arm64_reg);
+
+        match &block.ops[0] {
+            R2ILOp::CallOther {
+                output: Some(output),
+                userop,
+                inputs,
+            } => {
+                assert_eq!(*userop, ARM64_PAUTH_SIGN_USEROP);
+                assert_eq!(*output, reg(30 * 8, 8));
+                assert_eq!(inputs, &vec![reg(30 * 8, 8), reg(31 * 8, 8)]);
+            }
+            other => panic!("expected stack pointer-auth CallOther, got {other:?}"),
+        }
+        assert_eq!(
+            block.op_metadata(0).and_then(|meta| meta.instruction_addr),
+            Some(0x2000)
+        );
     }
 
     #[test]

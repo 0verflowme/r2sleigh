@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{FunctionSSABlock, SSAOp, SSAVar};
 use z3::Context;
 use z3::ast::BV;
@@ -874,7 +875,7 @@ impl<'ctx> SymExecutor<'ctx> {
             CallOther {
                 output,
                 userop,
-                inputs: _,
+                inputs,
             } => {
                 // x86 RDTSC is a timing source, not program data. Model it as a
                 // stable low-delta value so timing anti-debug checks do not dominate
@@ -883,6 +884,15 @@ impl<'ctx> SymExecutor<'ctx> {
                     && let Some(dst) = output
                 {
                     self.write_var(state, dst, SymValue::concrete(0, dst.size * 8));
+                    return Ok(vec![]);
+                }
+                if is_arm64_pauth_userop(*userop)
+                    && let (Some(dst), Some(src)) = (output, inputs.first())
+                {
+                    let value = self.read_var(state, src);
+                    let provenance = self.read_var_provenance(state, src);
+                    self.write_var(state, dst, value);
+                    self.propagate_var_provenance(state, dst, provenance);
                     return Ok(vec![]);
                 }
                 // User-defined operation - return symbolic result
@@ -1892,6 +1902,31 @@ mod tests {
                 .mem_read(&SymValue::concrete(0x2000, 64), 8)
                 .as_concrete(),
             Some(0xaabb_ccdd_eeff_0011)
+        );
+    }
+
+    #[test]
+    fn arm64_pauth_userops_preserve_pointer_value() {
+        let ctx = Context::thread_local();
+        let executor = SymExecutor::new(&ctx);
+        let mut state = SymState::new(&ctx, 0x1000);
+        state.set_register("X30_0", SymValue::concrete(0xffff_fe00_1234_5678, 64));
+        state.set_register("SP_0", SymValue::concrete(0xffff_fe00_0000_0000, 64));
+
+        executor
+            .step(
+                &mut state,
+                &SSAOp::CallOther {
+                    output: Some(SSAVar::new("X30", 1, 8)),
+                    userop: r2il::userops::ARM64_PAUTH_SIGN_USEROP,
+                    inputs: vec![SSAVar::new("X30", 0, 8), SSAVar::new("SP", 0, 8)],
+                },
+            )
+            .expect("pauth userop should execute");
+
+        assert_eq!(
+            state.get_register("X30_1").as_concrete(),
+            Some(0xffff_fe00_1234_5678)
         );
     }
 

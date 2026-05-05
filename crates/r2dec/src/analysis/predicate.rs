@@ -181,4 +181,42 @@ mod tests {
             CExpr::binary(BinaryOp::Eq, CExpr::Var("t1".to_string()), CExpr::IntLit(0))
         );
     }
+
+    #[test]
+    fn simplify_condition_expr_collapses_boolean_one_comparison_and_shift_zero() {
+        let ctx = FoldingContext::new(64);
+        let simplifier = PredicateSimplifier::new(&ctx);
+
+        let expr = CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::binary(
+                    BinaryOp::BitAnd,
+                    CExpr::binary(
+                        BinaryOp::Shr,
+                        CExpr::Var("x0_3".to_string()),
+                        CExpr::IntLit(0),
+                    ),
+                    CExpr::IntLit(1),
+                ),
+                CExpr::IntLit(0),
+            ),
+            CExpr::IntLit(1),
+        );
+
+        let simplified = simplifier.simplify_condition_expr(expr);
+        assert_eq!(
+            simplified,
+            CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::binary(
+                    BinaryOp::BitAnd,
+                    CExpr::Var("x0_3".to_string()),
+                    CExpr::IntLit(1),
+                ),
+                CExpr::IntLit(0),
+            )
+        );
+    }
 }

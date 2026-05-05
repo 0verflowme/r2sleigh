@@ -6344,6 +6344,9 @@ fn call_result_expr_for_post_call_source(
                 if register_family_name(&dst.name).as_deref() == Some(ret_family.as_str())
         )
     });
+    if producer_is_call_define && !producer_idx.is_some_and(|idx| call_idx < idx && idx < use_idx) {
+        return None;
+    }
     if producer_idx.is_some_and(|idx| call_idx <= idx) && !producer_is_call_define {
         return None;
     }
@@ -6400,6 +6403,13 @@ fn is_post_call_result_alias_for_call(
         Some(SSAOp::CallDefine { dst })
             if register_family_name(&dst.name).as_deref() == Some(ret_family)
     );
+    if source_is_call_define
+        && !source_entry
+            .as_ref()
+            .is_some_and(|(_, source_idx)| call_idx < *source_idx && *source_idx < use_idx)
+    {
+        return false;
+    }
     if source_entry
         .as_ref()
         .is_some_and(|(_, source_idx)| *source_idx >= call_idx)

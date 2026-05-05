@@ -33,6 +33,59 @@ const EXACT_RUNTIME_LOOP_MAX_ITERS: u64 = 4096;
 const EXACT_RUNTIME_LOOP_MAX_BLOCK_STEPS: u64 = 200_000;
 const SYMBOLIC_CONTINUATION_MAX_TARGETS: usize = 512;
 
+#[derive(Debug, Default)]
+struct TargetDistanceCache {
+    entries: HashMap<(u64, u64), (HashMap<u64, usize>, u64)>,
+    order: BTreeMap<u64, (u64, u64)>,
+    next_ticket: u64,
+}
+
+impl TargetDistanceCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            next_ticket: 1,
+        }
+    }
+
+    fn allocate_ticket(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+        ticket
+    }
+
+    fn get(&mut self, key: &(u64, u64)) -> Option<HashMap<u64, usize>> {
+        let new_ticket = self.allocate_ticket();
+        let (distances, old_ticket) = self.entries.get_mut(key)?;
+        let distances = distances.clone();
+        let previous_ticket = *old_ticket;
+        *old_ticket = new_ticket;
+        self.order.remove(&previous_ticket);
+        self.order.insert(new_ticket, *key);
+        Some(distances)
+    }
+
+    fn insert(&mut self, key: (u64, u64), distances: HashMap<u64, usize>) {
+        let ticket = self.allocate_ticket();
+        if let Some((_, old_ticket)) = self.entries.insert(key, (distances, ticket)) {
+            self.order.remove(&old_ticket);
+        }
+        self.order.insert(ticket, key);
+        while self.entries.len() > TARGET_DISTANCE_CACHE_LIMIT {
+            let Some((_, evicted_key)) = self.order.pop_first() else {
+                break;
+            };
+            self.entries.remove(&evicted_key);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 fn debug_target_guidance_enabled() -> bool {
     std::env::var_os("R2SLEIGH_DEBUG_TARGET_GUIDANCE").is_some()
 }
@@ -270,7 +323,7 @@ pub struct PathExplorer<'ctx> {
     /// Derived helper summaries registered for direct-call targets.
     derived_call_summaries: HashMap<u64, RegisteredDerivedCallSummary<'ctx>>,
     /// Cached reverse-distance maps keyed by (function entry, target address).
-    target_distance_cache: HashMap<(u64, u64), HashMap<u64, usize>>,
+    target_distance_cache: TargetDistanceCache,
     /// Candidate-generation tactics used during model extraction.
     solve_tactic_config: SolveTacticConfig,
 }
@@ -1557,7 +1610,7 @@ impl<'ctx> PathExplorer<'ctx> {
             exception_bridge_guidance_enabled: true,
             residual_runtime_loop_summaries_enabled: true,
             derived_call_summaries: HashMap::new(),
-            target_distance_cache: HashMap::new(),
+            target_distance_cache: TargetDistanceCache::new(),
             solve_tactic_config: SolveTacticConfig::default(),
         }
     }
@@ -1580,7 +1633,7 @@ impl<'ctx> PathExplorer<'ctx> {
             exception_bridge_guidance_enabled: true,
             residual_runtime_loop_summaries_enabled: true,
             derived_call_summaries: HashMap::new(),
-            target_distance_cache: HashMap::new(),
+            target_distance_cache: TargetDistanceCache::new(),
             solve_tactic_config: SolveTacticConfig::default(),
         }
     }
@@ -2556,12 +2609,9 @@ impl<'ctx> PathExplorer<'ctx> {
     fn target_distance_map(&mut self, func: &SsaArtifact, target_addr: u64) -> HashMap<u64, usize> {
         let key = (func.entry, target_addr);
         if let Some(cached) = self.target_distance_cache.get(&key) {
-            return cached.clone();
+            return cached;
         }
         let distances = self.compute_target_distance_map(func, target_addr);
-        if self.target_distance_cache.len() >= TARGET_DISTANCE_CACHE_LIMIT {
-            self.target_distance_cache.clear();
-        }
         self.target_distance_cache.insert(key, distances.clone());
         distances
     }

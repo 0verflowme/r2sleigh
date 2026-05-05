@@ -256,17 +256,37 @@ impl AbiProfile {
         };
         let lower = arch.name.to_ascii_lowercase();
         match lower.as_str() {
-            "x86-64" | "x86_64" | "x64" | "amd64" => Self::new(
-                vec![
-                    ("rdi", 8, &["edi", "di", "dil"][..]),
-                    ("rsi", 8, &["esi", "si", "sil"][..]),
-                    ("rdx", 8, &["edx", "dx", "dl"][..]),
-                    ("rcx", 8, &["ecx", "cx", "cl"][..]),
-                    ("r8", 8, &["r8d", "r8w", "r8b"][..]),
-                    ("r9", 8, &["r9d", "r9w", "r9b"][..]),
-                ],
-                &[("rax", &["eax", "ax", "al"][..])],
-            ),
+            "x86-64" | "x86_64" | "x64" | "amd64" if arch.addr_size == 8 || lower != "x86-64" => {
+                Self::new(
+                    vec![
+                        ("rdi", 8, &["edi", "di", "dil"][..]),
+                        ("rsi", 8, &["esi", "si", "sil"][..]),
+                        ("rdx", 8, &["edx", "dx", "dl"][..]),
+                        ("rcx", 8, &["ecx", "cx", "cl"][..]),
+                        ("r8", 8, &["r8d", "r8w", "r8b"][..]),
+                        ("r9", 8, &["r9d", "r9w", "r9b"][..]),
+                    ],
+                    &[("rax", &["eax", "ax", "al"][..])],
+                )
+            }
+            name if name.starts_with("x86:")
+                && (arch.addr_size == 8 || name.split(':').any(|part| part == "64")) =>
+            {
+                Self::new(
+                    vec![
+                        ("rdi", 8, &["edi", "di", "dil"][..]),
+                        ("rsi", 8, &["esi", "si", "sil"][..]),
+                        ("rdx", 8, &["edx", "dx", "dl"][..]),
+                        ("rcx", 8, &["ecx", "cx", "cl"][..]),
+                        ("r8", 8, &["r8d", "r8w", "r8b"][..]),
+                        ("r9", 8, &["r9d", "r9w", "r9b"][..]),
+                    ],
+                    &[("rax", &["eax", "ax", "al"][..])],
+                )
+            }
+            name if name.starts_with("x86:") => {
+                Self::new(Vec::new(), &[("eax", &["ax", "al"][..])])
+            }
             "x86" | "x86-32" | "i386" | "i686" => {
                 Self::new(Vec::new(), &[("eax", &["ax", "al"][..])])
             }
@@ -280,6 +300,19 @@ impl AbiProfile {
                 &[("r0", &[])],
             ),
             "aarch64" | "arm64" => Self::new(
+                vec![
+                    ("x0", 8, &["w0"][..]),
+                    ("x1", 8, &["w1"][..]),
+                    ("x2", 8, &["w2"][..]),
+                    ("x3", 8, &["w3"][..]),
+                    ("x4", 8, &["w4"][..]),
+                    ("x5", 8, &["w5"][..]),
+                    ("x6", 8, &["w6"][..]),
+                    ("x7", 8, &["w7"][..]),
+                ],
+                &[("x0", &["w0"][..])],
+            ),
+            name if name.starts_with("aarch64:") || name.starts_with("arm64:") => Self::new(
                 vec![
                     ("x0", 8, &["w0"][..]),
                     ("x1", 8, &["w1"][..]),
@@ -683,7 +716,7 @@ fn resolve_summary(
         has_unknown_calls: local.has_unknown_calls,
         arg_effects,
         memory_effects: memory_effects.iter().copied().collect(),
-        return_relation: resolve_return_relation(&local.return_observations, current),
+        return_relation: resolve_return_relation_with_wrapper_fallback(local, current),
         reads_global_memory,
         writes_global_memory,
         touches_unknown_memory,
@@ -789,6 +822,49 @@ fn resolve_return_relation(
     }
 
     relation.unwrap_or(SummaryReturnRelation::Unknown)
+}
+
+fn resolve_single_call_wrapper_return_relation(
+    local: &LocalSummaryFacts,
+    current: &BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
+) -> Option<SummaryReturnRelation> {
+    if local.has_unknown_calls || local.call_observations.len() != 1 {
+        return None;
+    }
+    if !local
+        .return_observations
+        .iter()
+        .all(|observation| matches!(observation, SummaryValueObservation::Unknown))
+    {
+        return None;
+    }
+
+    let call = local.call_observations.values().next()?;
+    let callee = current.get(&InterprocFunctionId(call.target))?;
+    match &callee.return_relation {
+        SummaryReturnRelation::Arg(idx) => match call.args.get(*idx) {
+            Some(SummaryOperand::Arg(arg_idx)) => Some(SummaryReturnRelation::Arg(*arg_idx)),
+            Some(SummaryOperand::Const(value)) => Some(SummaryReturnRelation::Const(*value)),
+            _ => None,
+        },
+        SummaryReturnRelation::Const(value) => Some(SummaryReturnRelation::Const(*value)),
+        SummaryReturnRelation::HeapAlloc => Some(SummaryReturnRelation::HeapAlloc),
+        SummaryReturnRelation::Global(address) => Some(SummaryReturnRelation::Global(*address)),
+        SummaryReturnRelation::Void | SummaryReturnRelation::Unknown => None,
+    }
+}
+
+fn resolve_return_relation_with_wrapper_fallback(
+    local: &LocalSummaryFacts,
+    current: &BTreeMap<InterprocFunctionId, FunctionSemanticSummary>,
+) -> SummaryReturnRelation {
+    match resolve_return_relation(&local.return_observations, current) {
+        SummaryReturnRelation::Unknown => {
+            resolve_single_call_wrapper_return_relation(local, current)
+                .unwrap_or(SummaryReturnRelation::Unknown)
+        }
+        relation => relation,
+    }
 }
 
 fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> LocalSummaryFacts {
@@ -1710,6 +1786,25 @@ mod tests {
         arch
     }
 
+    #[test]
+    fn sleigh_aarch64_arch_name_uses_arm64_abi_profile() {
+        let mut arch = ArchSpec::new("AARCH64:LE:64:v8A");
+        arch.addr_size = 8;
+        let profile = AbiProfile::from_arch(Some(&arch));
+
+        assert_eq!(profile.alias_to_arg.get("x0"), Some(&0));
+        assert_eq!(profile.alias_to_arg.get("w1"), Some(&1));
+    }
+
+    #[test]
+    fn sleigh_x86_64_arch_name_uses_amd64_abi_profile_without_addr_size() {
+        let arch = ArchSpec::new("x86:LE:64:default");
+        let profile = AbiProfile::from_arch(Some(&arch));
+
+        assert_eq!(profile.alias_to_arg.get("rdi"), Some(&0));
+        assert!(profile.alias_is_ret.contains("rax"));
+    }
+
     fn reg(offset: u64, size: u32) -> Varnode {
         Varnode {
             space: SpaceId::Register,
@@ -1870,6 +1965,49 @@ mod tests {
             set.summaries
                 .get(&InterprocFunctionId(0x1000))
                 .expect("alloc summary")
+                .return_relation,
+            SummaryReturnRelation::HeapAlloc
+        );
+    }
+
+    #[test]
+    fn solve_summary_set_uses_single_call_wrapper_fallback_for_opaque_return_register() {
+        let mut arch = ArchSpec::new("x86:LE:64:default");
+        arch.addr_size = 8;
+        let wrapper_block = block(
+            0x401000,
+            vec![
+                R2ILOp::Call {
+                    target: c(0x2000, 8),
+                },
+                R2ILOp::Return { target: reg(0, 8) },
+            ],
+        );
+        let wrapper =
+            SsaArtifact::for_symbolic(&[wrapper_block], Some(&arch)).expect("wrapper ssa");
+        let mut seeds = BTreeMap::new();
+        seeds.insert(
+            InterprocFunctionId(0x2000),
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(0x2000), "sym.imp.malloc")
+                .expect("malloc"),
+        );
+
+        let set = solve_interproc_summary_set(
+            &[InterprocFunctionInput {
+                id: InterprocFunctionId(0x401000),
+                name: Some("sym.alloc_wrapper".to_string()),
+                prepared: &wrapper,
+            }],
+            Some(&arch),
+            Some(InterprocFunctionId(0x401000)),
+            &seeds,
+            InterprocSolveConfig::default(),
+        );
+
+        assert_eq!(
+            set.summaries
+                .get(&InterprocFunctionId(0x401000))
+                .expect("wrapper summary")
                 .return_relation,
             SummaryReturnRelation::HeapAlloc
         );

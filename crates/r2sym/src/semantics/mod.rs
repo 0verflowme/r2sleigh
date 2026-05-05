@@ -24,7 +24,7 @@ pub use compiler::{
     compile_query_semantic_artifact_with_scope_and_replay_seed,
     compile_semantic_artifact_with_scope, compile_semantic_artifact_with_scope_and_replay_seed,
 };
-pub use facts::SymbolicReachabilityStatus;
+pub use facts::{SymbolicReachabilityStatus, augment_semantic_artifact_with_interproc_summary};
 pub use plan::{
     ArtifactBuildPlan, DecompilePlan, QueryGuidanceMode, QueryPlan, TargetQueryExecutionRoute,
     TargetQueryPlan, TargetQueryRoutePlan, TypePlan,

@@ -629,10 +629,43 @@ fn type_hint_conflicts(existing: &CTypeLike, hint: &CTypeLike, ptr_bits: u32) ->
     render_signature_type(existing, ptr_bits) != render_signature_type(hint, ptr_bits)
 }
 
+fn type_hint_requires_semantic_corroboration(assumption: &r2ssa::AnalysisAssumption) -> bool {
+    matches!(assumption.provenance, r2ssa::AssumptionProvenance::Derived)
+}
+
+fn type_hint_can_replace_weak_existing(
+    assumption: &r2ssa::AnalysisAssumption,
+    existing: &CTypeLike,
+    binding_name: Option<&str>,
+    ptr_bits: u32,
+) -> bool {
+    if is_generic_signature_type(Some(existing)) {
+        return true;
+    }
+
+    match assumption.provenance {
+        r2ssa::AssumptionProvenance::User | r2ssa::AssumptionProvenance::ImportedContext => {
+            let generic_binding = binding_name.is_none_or(is_generic_arg_name);
+            generic_binding
+                && matches!(
+                    existing,
+                    CTypeLike::Int {
+                        bits,
+                        signedness: Signedness::Signed
+                            | Signedness::Unsigned
+                            | Signedness::Unknown,
+                    } if *bits == ptr_bits
+                )
+        }
+        r2ssa::AssumptionProvenance::Replay | r2ssa::AssumptionProvenance::Derived => false,
+    }
+}
+
 fn apply_type_hint_to_signature_param(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
     index: usize,
+    assumption: &r2ssa::AnalysisAssumption,
     hint: &CTypeLike,
     ptr_bits: u32,
 ) -> Result<bool, String> {
@@ -650,7 +683,14 @@ fn apply_type_hint_to_signature_param(
                 param.ty = Some(hint.clone());
                 applied = true;
             }
-            Some(existing) if is_generic_signature_type(Some(existing)) => {
+            Some(existing)
+                if type_hint_can_replace_weak_existing(
+                    assumption,
+                    existing,
+                    Some(&param.name),
+                    ptr_bits,
+                ) =>
+            {
                 param.ty = Some(hint.clone());
                 applied = true;
             }
@@ -667,11 +707,21 @@ fn apply_type_hint_to_signature_param(
         }
     }
 
-    if let Some(param) = inferred_signature.params.get_mut(index)
-        && is_generic_type_string(&param.param_type)
-    {
-        param.param_type = render_signature_type(hint, ptr_bits);
-        applied = true;
+    if let Some(param) = inferred_signature.params.get_mut(index) {
+        let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
+        let can_replace = is_generic_type_string(&param.param_type)
+            || existing_ty.as_ref().is_some_and(|existing| {
+                type_hint_can_replace_weak_existing(
+                    assumption,
+                    existing,
+                    Some(&param.name),
+                    ptr_bits,
+                )
+            });
+        if can_replace {
+            param.param_type = render_signature_type(hint, ptr_bits);
+            applied = true;
+        }
     }
 
     Ok(applied)
@@ -703,7 +753,7 @@ fn apply_type_hint_assumptions_to_context(
                 let corroborated = semantic_projection.is_some_and(|projection| {
                     projection.corroborates_param_type_hint(*index, &hint)
                 });
-                if !corroborated {
+                if type_hint_requires_semantic_corroboration(assumption) && !corroborated {
                     usage.mark_ignored(assumption);
                     continue;
                 }
@@ -711,6 +761,7 @@ fn apply_type_hint_assumptions_to_context(
                     &mut parsed_context.merged_signature,
                     inferred_signature,
                     *index,
+                    assumption,
                     &hint,
                     ptr_bits,
                 ) {
@@ -734,7 +785,7 @@ fn apply_type_hint_assumptions_to_context(
                 };
                 let corroborated = semantic_projection
                     .is_some_and(|projection| projection.corroborates_param_type_hint(idx, &hint));
-                if !corroborated {
+                if type_hint_requires_semantic_corroboration(assumption) && !corroborated {
                     usage.mark_ignored(assumption);
                     continue;
                 }
@@ -744,7 +795,14 @@ fn apply_type_hint_assumptions_to_context(
                         reg_param.ty = Some(hint.clone());
                         true
                     }
-                    Some(existing) if is_generic_signature_type(Some(existing)) => {
+                    Some(existing)
+                        if type_hint_can_replace_weak_existing(
+                            assumption,
+                            existing,
+                            Some(&reg_param.name),
+                            ptr_bits,
+                        ) =>
+                    {
                         reg_param.ty = Some(hint.clone());
                         true
                     }
@@ -765,6 +823,7 @@ fn apply_type_hint_assumptions_to_context(
                     &mut parsed_context.merged_signature,
                     inferred_signature,
                     idx,
+                    assumption,
                     &hint,
                     ptr_bits,
                 ) {
@@ -792,7 +851,7 @@ fn apply_type_hint_assumptions_to_context(
                             projection.corroborates_stack_slot_type_hint(slot, &hint)
                         })
                 });
-                if !corroborated {
+                if type_hint_requires_semantic_corroboration(assumption) && !corroborated {
                     usage.mark_ignored(assumption);
                     continue;
                 }
@@ -805,7 +864,14 @@ fn apply_type_hint_assumptions_to_context(
                         slot.ty = Some(hint.clone());
                         true
                     }
-                    Some(existing) if is_generic_signature_type(Some(existing)) => {
+                    Some(existing)
+                        if type_hint_can_replace_weak_existing(
+                            assumption,
+                            existing,
+                            Some(&slot.name),
+                            ptr_bits,
+                        ) =>
+                    {
                         slot.ty = Some(hint.clone());
                         true
                     }
@@ -833,6 +899,7 @@ fn apply_type_hint_assumptions_to_context(
                         &mut parsed_context.merged_signature,
                         inferred_signature,
                         index,
+                        assumption,
                         &hint,
                         ptr_bits,
                     ) {
@@ -4115,7 +4182,7 @@ mod tests {
     }
 
     #[test]
-    fn uncorroborated_type_hint_assumptions_are_ignored() {
+    fn user_type_hint_assumptions_apply_without_semantic_corroboration() {
         let mut parsed_context = ParsedExternalContext {
             assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
                 id: Some("param0-char-ptr".to_string()),
@@ -4149,11 +4216,127 @@ mod tests {
             Some(&SemanticTypeProjection::default()),
         );
 
+        assert_eq!(usage.applied.len(), 1);
+        assert!(usage.ignored.is_empty());
+        assert!(usage.conflicts.is_empty());
+        assert_eq!(inferred_signature.params[0].param_type, "int8_t*");
+        assert_eq!(
+            render_signature_type(
+                parsed_context
+                    .merged_signature
+                    .as_ref()
+                    .expect("merged signature")
+                    .params[0]
+                    .ty
+                    .as_ref()
+                    .expect("hinted param type"),
+                64
+            ),
+            "int8_t*"
+        );
+    }
+
+    #[test]
+    fn derived_type_hint_assumptions_still_require_corroboration() {
+        let mut parsed_context = ParsedExternalContext {
+            assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+                id: Some("param0-char-ptr".to_string()),
+                subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "char *".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::Derived,
+            }]),
+            ..ParsedExternalContext::default()
+        };
+        let mut inferred_signature = InferredSignature {
+            function_name: "sym.demo".to_string(),
+            signature: "void sym.demo(void *)".to_string(),
+            ret_type: "void".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "arg1".to_string(),
+                param_type: "void *".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 80,
+            callconv_confidence: 80,
+        };
+
+        let usage = apply_type_hint_assumptions_to_context(
+            &mut parsed_context,
+            &mut inferred_signature,
+            64,
+            Some(&SemanticTypeProjection::default()),
+        );
+
         assert!(usage.applied.is_empty());
         assert_eq!(usage.ignored.len(), 1);
         assert!(usage.conflicts.is_empty());
         assert_eq!(inferred_signature.params[0].param_type, "void *");
         assert!(parsed_context.merged_signature.is_none());
+    }
+
+    #[test]
+    fn user_type_hint_replaces_weak_pointer_sized_generic_arg() {
+        let mut parsed_context = ParsedExternalContext {
+            assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+                id: Some("rdi-int32".to_string()),
+                subject: r2ssa::AssumptionSubject::Register {
+                    name: "rdi".to_string(),
+                },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "int32_t".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::User,
+            }]),
+            register_params: vec![crate::context::ExternalRegisterParamSpec {
+                name: "arg1".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                }),
+                reg: "RDI".to_string(),
+            }],
+            ..ParsedExternalContext::default()
+        };
+        let mut inferred_signature = InferredSignature {
+            function_name: "sym.demo".to_string(),
+            signature: "int64_t sym.demo(int64_t)".to_string(),
+            ret_type: "int64_t".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "arg1".to_string(),
+                param_type: "int64_t".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 80,
+            callconv_confidence: 80,
+        };
+
+        let usage = apply_type_hint_assumptions_to_context(
+            &mut parsed_context,
+            &mut inferred_signature,
+            64,
+            Some(&SemanticTypeProjection::default()),
+        );
+
+        assert_eq!(usage.applied.len(), 1);
+        assert!(usage.ignored.is_empty());
+        assert!(usage.conflicts.is_empty());
+        assert_eq!(inferred_signature.params[0].param_type, "int32_t");
+        assert_eq!(
+            render_signature_type(
+                parsed_context.register_params[0]
+                    .ty
+                    .as_ref()
+                    .expect("register type"),
+                64
+            ),
+            "int32_t"
+        );
     }
 
     #[test]

@@ -39,6 +39,64 @@ a:sla.dec | jq -Rs 'contains("check_secret") and contains("0xdead") and contains
 EOF_CMDS
 RUN
 
+NAME=pdd_routes_to_sleigh_decompiler_when_plugin_loaded
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~check_secret[0]` >/dev/null
+af
+pdd | jq -Rs 'contains("check_secret") and contains("return") and (contains("r2pm -ci r2dec")|not)'
+EOF_CMDS
+RUN
+
+NAME=profilej_reports_deterministic_stage_timings_when_enabled
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla >/dev/null
+e anal.sla.profile=true
+e anal.sla.profile.max=5
+aaaa
+a:sla.debug.profilej | jq -c '.enabled==true and .max==5 and .count>0 and (.decompile_cache|has("hits") and has("misses")) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
+EOF_CMDS
+RUN
+
+NAME=profile_config_is_available_at_startup
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true -e anal.sla.profile=true -e anal.sla.profile.max=3
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla >/dev/null
+aaa
+a:sla.debug.profilej | jq -c '.enabled==true and .max==3 and .count>0'
+EOF_CMDS
+RUN
+
+NAME=repeated_dec_reports_shared_render_cache_hit
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~check_secret[0]` >/dev/null
+af
+a:sla.dec >/dev/null
+a:sla.dec >/dev/null
+a:sla.debug.profilej | jq -c '.decompile_cache.hits >= 1 and .decompile_cache.misses >= 1'
+EOF_CMDS
+RUN
+
 NAME=dec_check_secret_explicit_address_public_surface
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -135,6 +193,20 @@ a:sym.solve 0xc | jq -c '.found==true and (.selected_path.solution.inputs|length
 EOF_CMDS
 RUN
 
+NAME=sym_solve_public_solution_filters_temp_and_flag_noise
+FILE=malloc://64
+ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 4883ff007406b800000000c3b801000000c300000000000000
+s 0 >/dev/null
+af
+a:sym.solve 0xc | jq -c '.found==true and (.selected_path.solution.inputs|keys|all((startswith("tmp:") or startswith("TMP") or .=="CY" or .=="NG" or .=="OV" or .=="ZR")|not))'
+EOF_CMDS
+RUN
+
 NAME=sym_explore_check_secret_public_target
 FILE=malloc://64
 ARGS=-a x86 -b 64 -e scr.color=false -e log.level=0
@@ -208,6 +280,19 @@ a:sla.dec | jq -Rs 'contains("test_symbolic_xor_guard") and contains("return")'
 EOF_CMDS
 RUN
 
+NAME=arm64_pointer_auth_lift_emits_semantic_userop
+FILE=malloc://16
+ARGS=-a arm -b 64 -e scr.color=false -e log.level=0
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+wx 7f2303d5000000000000000000000000
+s 0 >/dev/null
+a:sla.debug.json | jq -c '.[0].CallOther.userop == 4294901762'
+EOF_CMDS
+RUN
+
 NAME=types_symbolic_helper_scope_exposes_interproc_payload
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -227,6 +312,7 @@ FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 aaa
@@ -234,6 +320,7 @@ s `afl~test_symbolic_helper_pure_guard[0]` >/dev/null
 af
 a:sla.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}}] >/dev/null
 a:sla.debug.types | jq -c '(.assumptions.items // [] | any((.subject.register.name? // "" | ascii_downcase) == "rdi" and .value.type_hint.ty == "int32_t"))'
+a:sla.debug.types | jq -c '(.params[0].type // "") == "int32_t"'
 EOF_CMDS
 RUN
 

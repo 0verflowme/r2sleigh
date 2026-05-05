@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -36,6 +36,67 @@ pub(crate) struct SemanticCacheKey {
     pub seed_mode: SemanticSeedMode,
     pub replay_seed_fingerprint: u64,
     pub scope_kind: SemanticCacheScopeKind,
+}
+
+struct BoundedArcCache<K, V> {
+    limit: usize,
+    entries: HashMap<K, (Arc<V>, u64)>,
+    order: BTreeMap<u64, K>,
+    next_ticket: u64,
+}
+
+impl<K, V> BoundedArcCache<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            next_ticket: 1,
+        }
+    }
+
+    fn allocate_ticket(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+        ticket
+    }
+
+    fn get(&mut self, key: &K) -> Option<Arc<V>> {
+        let new_ticket = self.allocate_ticket();
+        let (value, old_ticket) = self.entries.get_mut(key)?;
+        let value = value.clone();
+        let previous_ticket = *old_ticket;
+        *old_ticket = new_ticket;
+        self.order.remove(&previous_ticket);
+        self.order.insert(new_ticket, key.clone());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: Arc<V>) -> Arc<V> {
+        if self.limit == 0 {
+            return value;
+        }
+        let ticket = self.allocate_ticket();
+        if let Some((_, old_ticket)) = self.entries.insert(key.clone(), (value.clone(), ticket)) {
+            self.order.remove(&old_ticket);
+        }
+        self.order.insert(ticket, key);
+        while self.entries.len() > self.limit {
+            let Some((_, evicted_key)) = self.order.pop_first() else {
+                break;
+            };
+            self.entries.remove(&evicted_key);
+        }
+        value
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -184,18 +245,17 @@ pub(crate) fn coarse_large_slice_cache_key(
     }
 }
 
-fn semantic_cache() -> &'static RwLock<HashMap<SemanticCacheKey, Arc<SemanticArtifact>>> {
-    static CACHE: OnceLock<RwLock<HashMap<SemanticCacheKey, Arc<SemanticArtifact>>>> =
+fn semantic_cache() -> &'static RwLock<BoundedArcCache<SemanticCacheKey, SemanticArtifact>> {
+    static CACHE: OnceLock<RwLock<BoundedArcCache<SemanticCacheKey, SemanticArtifact>>> =
         OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+    CACHE.get_or_init(|| RwLock::new(BoundedArcCache::new(SEMANTIC_CACHE_LIMIT)))
 }
 
 pub(crate) fn lookup_semantic_cache(key: &SemanticCacheKey) -> Option<Arc<SemanticArtifact>> {
     semantic_cache()
-        .read()
-        .expect("semantic cache read lock poisoned")
+        .write()
+        .expect("semantic cache write lock poisoned")
         .get(key)
-        .cloned()
 }
 
 pub(crate) fn cache_insert_bounded(
@@ -205,11 +265,7 @@ pub(crate) fn cache_insert_bounded(
     let mut guard = semantic_cache()
         .write()
         .expect("semantic cache write lock poisoned");
-    if guard.len() >= SEMANTIC_CACHE_LIMIT {
-        guard.clear();
-    }
-    guard.insert(key, value.clone());
-    value
+    guard.insert(key, value)
 }
 
 #[cfg(test)]
@@ -220,8 +276,8 @@ mod display_name_tests {
     use crate::sim::{PreparedFunctionScope, ScopedPreparedFunction};
 
     use super::{
-        SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCacheScopeKind, SemanticSeedMode,
-        coarse_large_slice_cache_key, semantic_cache_key, stable_scope_hash,
+        BoundedArcCache, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCacheScopeKind,
+        SemanticSeedMode, coarse_large_slice_cache_key, semantic_cache_key, stable_scope_hash,
     };
 
     const RAX: u64 = 0;
@@ -240,6 +296,21 @@ mod display_name_tests {
             size,
             meta: None,
         }
+    }
+
+    #[test]
+    fn bounded_cache_evicts_one_oldest_entry_and_refreshes_recency() {
+        let mut cache = BoundedArcCache::new(2);
+        cache.insert(1_u64, std::sync::Arc::new("one".to_string()));
+        cache.insert(2_u64, std::sync::Arc::new("two".to_string()));
+        assert_eq!(cache.get(&1).as_deref().map(String::as_str), Some("one"));
+
+        cache.insert(3_u64, std::sync::Arc::new("three".to_string()));
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&1).as_deref().map(String::as_str), Some("one"));
+        assert!(cache.get(&2).is_none());
+        assert_eq!(cache.get(&3).as_deref().map(String::as_str), Some("three"));
     }
 
     #[test]

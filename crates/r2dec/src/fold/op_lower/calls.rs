@@ -992,13 +992,15 @@ impl<'a> FoldingContext<'a> {
             return rewritten;
         }
         let rewritten_best = self.rewrite_stack_expr(best.clone());
-        self.choose_preferred_imported_call_arg_expr(
-            Some(best.clone()),
-            Some(rewritten_best),
-            preserve_stable_input_slot,
-            preserve_explicit_call_expr,
-        )
-        .unwrap_or(best)
+        let normalized = self
+            .choose_preferred_imported_call_arg_expr(
+                Some(best.clone()),
+                Some(rewritten_best),
+                preserve_stable_input_slot,
+                preserve_explicit_call_expr,
+            )
+            .unwrap_or(best);
+        self.sanitize_public_call_arg_expr(normalized)
     }
 
     fn finalize_authoritative_imported_call_arg_expr(

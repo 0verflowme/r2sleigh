@@ -696,6 +696,29 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
             disasm.set_userop_map(userop_map_for_arch("arm"));
             Ok((disasm, spec))
         }
+        #[cfg(feature = "arm")]
+        "arm64" | "arm64e" | "aarch64" => {
+            let mut spec = build_arch_spec(
+                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+                sleigh_config::processor_aarch64::PSPEC_AARCH64,
+                "aarch64",
+            )
+            .map_err(|e| e.to_string())?;
+            let mut disasm = Disassembler::from_sla(
+                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
+                sleigh_config::processor_aarch64::PSPEC_AARCH64,
+                "aarch64",
+            )
+            .map_err(|e| e.to_string())?;
+            let userops = userop_map_for_arch("arm64");
+            disasm.set_userop_map(userops.clone());
+            spec.userops = userops
+                .into_iter()
+                .map(|(index, name)| r2il::serialize::UserOpDef { index, name })
+                .collect();
+            spec.userops.sort_by_key(|def| def.index);
+            Ok((disasm, spec))
+        }
         #[cfg(feature = "mips")]
         "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
             let spec = build_arch_spec(
@@ -803,7 +826,7 @@ fn get_disassembler_with_spec(arch: &str) -> Result<(Disassembler, r2il::ArchSpe
             #[cfg(feature = "x86")]
             supported.extend(["x86-64", "x86"]);
             #[cfg(feature = "arm")]
-            supported.push("arm");
+            supported.extend(["arm", "arm64", "aarch64"]);
             #[cfg(feature = "mips")]
             supported.extend(["mips32be", "mips32le", "mips64be", "mips64le"]);
             #[cfg(feature = "riscv")]
@@ -834,6 +857,8 @@ mod tests {
     const X86_BYTES_DEC: &str = "48ffc000000000000000000000000000";
     #[cfg(feature = "arm")]
     const ARM_BYTES: &str = "0100a0e3000000000000000000000000";
+    #[cfg(feature = "arm")]
+    const ARM64_PACIBSP_BYTES: &str = "7f2303d5000000000000000000000000";
     #[cfg(feature = "riscv")]
     const RISCV_BYTES: &str = "13051500000000000000000000000000";
 
@@ -1218,6 +1243,24 @@ mod tests {
     #[cfg(feature = "arm")]
     fn conformance_matrix_arm_deterministic() {
         run_matrix_for_arch("arm", ARM_BYTES, ARM_BYTES);
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm64_alias_lifts_pointer_auth_userop() {
+        let out = run_action_output(
+            "arm64",
+            ARM64_PACIBSP_BYTES,
+            "0x1000",
+            InstructionAction::Lift,
+            ExportFormat::Json,
+        )
+        .expect("run output");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            parsed["ops"][0]["CallOther"]["userop"].as_u64(),
+            Some(0xffff_0002)
+        );
     }
 
     #[test]

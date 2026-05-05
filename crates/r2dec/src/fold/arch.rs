@@ -43,6 +43,16 @@ fn canonical_x86_arg_reg(base: &str) -> &str {
         "w5" => "x5",
         "w6" => "x6",
         "w7" => "x7",
+        "w8" => "x8",
+        "w9" => "x9",
+        "w10" => "x10",
+        "w11" => "x11",
+        "w12" => "x12",
+        "w13" => "x13",
+        "w14" => "x14",
+        "w15" => "x15",
+        "w16" => "x16",
+        "w17" => "x17",
         other => other,
     }
 }
@@ -71,7 +81,34 @@ impl FoldArchConfig {
 
     pub(crate) fn is_callee_saved_name(&self, name: &str) -> bool {
         let base = normalized_base_name(name);
-        matches!(base.as_str(), "rbx" | "r12" | "r13" | "r14" | "r15")
+        matches!(
+            base.as_str(),
+            "rbx"
+                | "r12"
+                | "r13"
+                | "r14"
+                | "r15"
+                | "x19"
+                | "x20"
+                | "x21"
+                | "x22"
+                | "x23"
+                | "x24"
+                | "x25"
+                | "x26"
+                | "x27"
+                | "x28"
+                | "w19"
+                | "w20"
+                | "w21"
+                | "w22"
+                | "w23"
+                | "w24"
+                | "w25"
+                | "w26"
+                | "w27"
+                | "w28"
+        )
     }
 
     pub(crate) fn is_register_like_base_name(&self, name: &str) -> bool {

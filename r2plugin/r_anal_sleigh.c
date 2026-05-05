@@ -79,6 +79,8 @@ extern char *r2il_block_to_esil(const R2ILContext *ctx, const R2ILBlock *block);
 extern char *r2il_block_mnemonic(const R2ILContext *ctx, const unsigned char *bytes, size_t len, unsigned long long addr);
 extern char *r2il_block_op_json_named(const R2ILContext *ctx, const R2ILBlock *block, size_t index);
 extern void r2il_string_free(char *s);
+extern char *r2sleigh_decompile_render_cache_stats_json(void);
+extern void r2sleigh_decompile_render_cache_stats_reset(void);
 
 /* Typed analysis */
 extern char *r2il_block_regs_read(const R2ILContext *ctx, const R2ILBlock *block);
@@ -278,6 +280,8 @@ typedef struct {
 	size_t interproc_max_iters;
 	int interproc_converged;
 	size_t global_max_links;
+	size_t max_type_decls;
+	size_t max_mutations;
 } R2SleighBudgetConfig;
 typedef struct {
 	const R2ILContext *ctx;
@@ -531,6 +535,33 @@ static StructDeclMemoEntry *struct_decl_memo = NULL;
 static size_t struct_decl_memo_count = 0;
 static size_t struct_decl_memo_capacity = 0;
 
+typedef enum {
+	SLEIGH_PROFILE_STAGE_LIFT,
+	SLEIGH_PROFILE_STAGE_TYPED_CONTEXT,
+	SLEIGH_PROFILE_STAGE_SESSION,
+	SLEIGH_PROFILE_STAGE_MUTATION,
+	SLEIGH_PROFILE_STAGE_XREF,
+	SLEIGH_PROFILE_STAGE_TAINT,
+	SLEIGH_PROFILE_STAGE_DECOMPILE,
+} SleighProfileStage;
+
+typedef struct {
+	ut64 addr;
+	char *name;
+	ut64 lift_us;
+	ut64 typed_context_us;
+	ut64 session_us;
+	ut64 mutation_us;
+	ut64 xref_us;
+	ut64 taint_us;
+	ut64 decompile_us;
+	ut64 total_us;
+} SleighProfileEntry;
+
+static SleighProfileEntry *sleigh_profile_entries = NULL;
+static size_t sleigh_profile_count = 0;
+static size_t sleigh_profile_cap = 0;
+
 /* Minimum bytes to pass to libsla (it reads ahead for variable-length instructions) */
 #define SLEIGH_MIN_BYTES 16
 #define SLEIGH_LIFT_BLOCK_MAX_ALLOC (1024 * 1024)
@@ -547,6 +578,9 @@ static size_t struct_decl_memo_capacity = 0;
 #define SLEIGH_TYPE_MAX_BLOCKS_DEFAULT 500
 #define SLEIGH_TYPE_WRITEBACK_GLOBAL_MAX_FCNS 128
 #define SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT 128
+#define SLEIGH_TYPE_MAX_DECLS_DEFAULT 64
+#define SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT 512
+#define SLEIGH_PROFILE_MAX_DEFAULT 20
 #define SLEIGH_CALLER_PROP_MAX_PER_CALLEE 256
 #define SLEIGH_CALLER_PROP_MAX_TOTAL 2048
 #define SLEIGH_CALLER_PROP_SAMPLE_MAX 5
@@ -596,6 +630,7 @@ typedef struct {
 	R2SleighFunctionContext context;
 	RAnalFcnContext *typed_ctx;
 	RList *typed_base_types;
+	bool owns_typed_base_types;
 	R2SleighContextParam *typed_params;
 	R2SleighContextVar *typed_vars;
 	R2SleighContextBaseType *typed_base_type_entries;
@@ -612,7 +647,9 @@ static void sleigh_typed_function_context_clear(SleighTypedFunctionContext *type
 		}
 	}
 	free (typed->typed_base_type_entries);
-	r_list_free (typed->typed_base_types);
+	if (typed->owns_typed_base_types) {
+		r_anal_types_snapshot_free (typed->typed_base_types);
+	}
 	free (typed->typed_vars);
 	free (typed->typed_params);
 	if (typed->typed_ctx && sleigh_function_context_api.free) {
@@ -625,7 +662,8 @@ static bool sleigh_typed_function_context_build(
 	RAnal *anal,
 	RAnalFunction *fcn,
 	SleighTypedFunctionContext *typed,
-	const char *fallback_external_context_json
+	const char *fallback_external_context_json,
+	RList *base_type_snapshot
 ) {
 	RListIter *iter;
 	size_t typed_param_count = 0;
@@ -643,7 +681,13 @@ static bool sleigh_typed_function_context_build(
 	if (sleigh_function_context_api.available && sleigh_function_context_api.collect && sleigh_function_context_api.free) {
 		typed->typed_ctx = sleigh_function_context_api.collect (anal, fcn);
 	}
-	typed->typed_base_types = r_anal_types_baselist (anal);
+	if (base_type_snapshot) {
+		typed->typed_base_types = base_type_snapshot;
+		typed->owns_typed_base_types = false;
+	} else {
+		typed->typed_base_types = r_anal_types_snapshot (anal);
+		typed->owns_typed_base_types = true;
+	}
 	if (typed->typed_ctx) {
 		typed->context.signature_name = fcn->name;
 		if (typed->typed_ctx->signature) {
@@ -838,7 +882,9 @@ static bool sleigh_session_input_init(
 	size_t scope_num_functions,
 	const R2SleighInterprocSeed *scope_seeds,
 	size_t scope_num_seeds,
-	size_t global_max_links
+	size_t global_max_links,
+	size_t max_type_decls,
+	size_t max_mutations
 ) {
 	if (!input || !anal || !ctx || !fcn || !blocks || !blocks->blocks || !blocks->count || !typed_context) {
 		return false;
@@ -862,6 +908,8 @@ static bool sleigh_session_input_init(
 	input->budget.interproc_max_iters = interproc_max_iters? interproc_max_iters: 1;
 	input->budget.interproc_converged = interproc_converged? 1: 0;
 	input->budget.global_max_links = global_max_links;
+	input->budget.max_type_decls = max_type_decls;
+	input->budget.max_mutations = max_mutations;
 	return true;
 }
 
@@ -878,7 +926,9 @@ static R2SleighSessionResult *sleigh_analyze_type_session(
 	size_t scope_num_functions,
 	const R2SleighInterprocSeed *scope_seeds,
 	size_t scope_num_seeds,
-	size_t global_max_links
+	size_t global_max_links,
+	size_t max_type_decls,
+	size_t max_mutations
 ) {
 	R2SleighSessionInput input = {0};
 	R2SleighSessionResult *result = NULL;
@@ -888,7 +938,8 @@ static R2SleighSessionResult *sleigh_analyze_type_session(
 	}
 	if (sleigh_session_input_init (&input, anal, ctx, fcn, blocks, typed_context,
 			interproc_iter, interproc_max_iters, interproc_converged,
-			scope_functions, scope_num_functions, scope_seeds, scope_num_seeds, global_max_links)) {
+			scope_functions, scope_num_functions, scope_seeds, scope_num_seeds,
+			global_max_links, max_type_decls, max_mutations)) {
 		result = r2sleigh_session_analyze (&input);
 	}
 	return result;
@@ -6503,8 +6554,27 @@ static int cfg_get_type_global_max_links(RAnal *anal) {
 		SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT, 1, 4096);
 }
 
+static int cfg_get_type_max_decls(RAnal *anal) {
+	return cfg_get_int_clamped (anal, "anal.sla.type.max_decls",
+		SLEIGH_TYPE_MAX_DECLS_DEFAULT, 1, 4096);
+}
+
+static int cfg_get_type_max_mutations(RAnal *anal) {
+	return cfg_get_int_clamped (anal, "anal.sla.type.max_mutations",
+		SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT, 1, 16384);
+}
+
 static bool cfg_get_type_cache_enabled(RAnal *anal) {
 	return cfg_get_int_clamped (anal, "anal.sla.type.cache", 0, 0, 1) != 0;
+}
+
+static bool cfg_get_profile_enabled(RAnal *anal) {
+	return cfg_get_int_clamped (anal, "anal.sla.profile", 0, 0, 1) != 0;
+}
+
+static int cfg_get_profile_max(RAnal *anal) {
+	return cfg_get_int_clamped (anal, "anal.sla.profile.max",
+		SLEIGH_PROFILE_MAX_DEFAULT, 1, 4096);
 }
 
 static void ensure_sleigh_default_configs(RAnal *anal) {
@@ -6524,8 +6594,153 @@ static void ensure_sleigh_default_configs(RAnal *anal) {
 		"maximum basic blocks for type write-back inference", SLEIGH_TYPE_MAX_BLOCKS_DEFAULT);
 	ensure_default_int_config (anal, "anal.sla.type.global.max_links",
 		"maximum global type links applied per function payload", SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT);
+	ensure_default_int_config (anal, "anal.sla.type.max_decls",
+		"maximum struct/type declarations emitted per function payload", SLEIGH_TYPE_MAX_DECLS_DEFAULT);
+	ensure_default_int_config (anal, "anal.sla.type.max_mutations",
+		"maximum non-signature type mutations emitted per function payload", SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT);
 	ensure_default_int_config (anal, "anal.sla.type.cache",
 		"legacy C-side type payload cache for debugging; Rust FunctionFactsStore owns normal cache reuse", 0);
+	ensure_default_int_config (anal, "anal.sla.profile",
+		"record opt-in r2sleigh per-function stage timings", 0);
+	ensure_default_int_config (anal, "anal.sla.profile.max",
+		"maximum profile entries shown by a:sla.debug.profilej", SLEIGH_PROFILE_MAX_DEFAULT);
+}
+
+static void sleigh_profile_clear(void) {
+	for (size_t i = 0; i < sleigh_profile_count; i++) {
+		free (sleigh_profile_entries[i].name);
+	}
+	free (sleigh_profile_entries);
+	sleigh_profile_entries = NULL;
+	sleigh_profile_count = 0;
+	sleigh_profile_cap = 0;
+	r2sleigh_decompile_render_cache_stats_reset ();
+}
+
+static SleighProfileEntry *sleigh_profile_entry_get(ut64 addr, const char *name) {
+	for (size_t i = 0; i < sleigh_profile_count; i++) {
+		if (sleigh_profile_entries[i].addr == addr) {
+			if (!sleigh_profile_entries[i].name && name && *name) {
+				sleigh_profile_entries[i].name = strdup (name);
+			}
+			return &sleigh_profile_entries[i];
+		}
+	}
+	if (sleigh_profile_count >= sleigh_profile_cap) {
+		size_t next_cap = sleigh_profile_cap? sleigh_profile_cap * 2: 64;
+		SleighProfileEntry *next = realloc (sleigh_profile_entries, next_cap * sizeof (*next));
+		if (!next) {
+			return NULL;
+		}
+		sleigh_profile_entries = next;
+		sleigh_profile_cap = next_cap;
+	}
+	SleighProfileEntry *entry = &sleigh_profile_entries[sleigh_profile_count++];
+	memset (entry, 0, sizeof (*entry));
+	entry->addr = addr;
+	entry->name = (name && *name)? strdup (name): NULL;
+	return entry;
+}
+
+static void sleigh_profile_add(RAnal *anal, const RAnalFunction *fcn, SleighProfileStage stage, ut64 elapsed_us) {
+	if (!elapsed_us || !cfg_get_profile_enabled (anal)) {
+		return;
+	}
+	const char *name = (fcn && fcn->name)? fcn->name: NULL;
+	ut64 addr = fcn? fcn->addr: UT64_MAX;
+	SleighProfileEntry *entry = sleigh_profile_entry_get (addr, name);
+	if (!entry) {
+		return;
+	}
+	entry->total_us += elapsed_us;
+	switch (stage) {
+	case SLEIGH_PROFILE_STAGE_LIFT:
+		entry->lift_us += elapsed_us;
+		break;
+	case SLEIGH_PROFILE_STAGE_TYPED_CONTEXT:
+		entry->typed_context_us += elapsed_us;
+		break;
+	case SLEIGH_PROFILE_STAGE_SESSION:
+		entry->session_us += elapsed_us;
+		break;
+	case SLEIGH_PROFILE_STAGE_MUTATION:
+		entry->mutation_us += elapsed_us;
+		break;
+	case SLEIGH_PROFILE_STAGE_XREF:
+		entry->xref_us += elapsed_us;
+		break;
+	case SLEIGH_PROFILE_STAGE_TAINT:
+		entry->taint_us += elapsed_us;
+		break;
+	case SLEIGH_PROFILE_STAGE_DECOMPILE:
+		entry->decompile_us += elapsed_us;
+		break;
+	}
+}
+
+static int sleigh_profile_entry_cmp(const void *a, const void *b) {
+	const SleighProfileEntry *left = *(const SleighProfileEntry * const *)a;
+	const SleighProfileEntry *right = *(const SleighProfileEntry * const *)b;
+	if (left->total_us != right->total_us) {
+		return left->total_us < right->total_us ? 1 : -1;
+	}
+	if (left->addr != right->addr) {
+		return left->addr < right->addr ? -1 : 1;
+	}
+	return strcmp (left->name? left->name: "", right->name? right->name: "");
+}
+
+static char *sleigh_profile_json(RAnal *anal) {
+	PJ *pj = pj_new ();
+	if (!pj) {
+		return NULL;
+	}
+	size_t max_items = (size_t)cfg_get_profile_max (anal);
+	SleighProfileEntry **items = NULL;
+	char *decompile_cache = r2sleigh_decompile_render_cache_stats_json ();
+	if (sleigh_profile_count > 0) {
+		items = calloc (sleigh_profile_count, sizeof (*items));
+		if (items) {
+			for (size_t i = 0; i < sleigh_profile_count; i++) {
+				items[i] = &sleigh_profile_entries[i];
+			}
+			qsort (items, sleigh_profile_count, sizeof (*items), sleigh_profile_entry_cmp);
+		}
+	}
+	pj_o (pj);
+	pj_kb (pj, "enabled", cfg_get_profile_enabled (anal));
+	pj_kn (pj, "count", sleigh_profile_count);
+	pj_kn (pj, "max", max_items);
+	if (decompile_cache && *decompile_cache) {
+		pj_k (pj, "decompile_cache");
+		pj_raw (pj, decompile_cache);
+	}
+	pj_ka (pj, "functions");
+	size_t shown = 0;
+	if (items) {
+		for (size_t i = 0; i < sleigh_profile_count && shown < max_items; i++, shown++) {
+			const SleighProfileEntry *entry = items[i];
+			pj_o (pj);
+			pj_kn (pj, "addr", entry->addr);
+			pj_ks (pj, "name", entry->name? entry->name: "");
+			pj_kn (pj, "total_us", entry->total_us);
+			pj_kn (pj, "lift_us", entry->lift_us);
+			pj_kn (pj, "typed_context_us", entry->typed_context_us);
+			pj_kn (pj, "session_us", entry->session_us);
+			pj_kn (pj, "mutation_us", entry->mutation_us);
+			pj_kn (pj, "xref_us", entry->xref_us);
+			pj_kn (pj, "taint_us", entry->taint_us);
+			pj_kn (pj, "decompile_us", entry->decompile_us);
+			pj_end (pj);
+		}
+	}
+	pj_end (pj);
+	pj_end (pj);
+	free (items);
+	if (decompile_cache) {
+		r2il_string_free (decompile_cache);
+	}
+	return pj_drain (pj);
 }
 
 static void configure_context_runtime_options(RAnal *anal, R2ILContext *ctx) {
@@ -7066,6 +7281,15 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_printf (cons, "%s\n", state_json);
 		}
 		free (state_json);
+		return strdup("");
+	}
+
+	if (is_sla_ns && !strcmp (cmd, "sla.profilej")) {
+		char *profile_json = sleigh_profile_json (anal);
+		if (cons && profile_json) {
+			r_cons_printf (cons, "%s\n", profile_json);
+		}
+		free (profile_json);
 		return strdup("");
 	}
 
@@ -7837,6 +8061,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				(r_str_startswith (cmd, "sla.plan")? 8: 9);
 			const char *target_arg = skip_cmd_spaces (cmd + prefix_len);
 			int interproc_max_iters = cfg_get_type_interproc_max_iters (anal);
+			int type_global_max_links = cfg_get_type_global_max_links (anal);
+			int type_max_decls = cfg_get_type_max_decls (anal);
+			int type_max_mutations = cfg_get_type_max_mutations (anal);
 			bool prefer_bounded_semantic_type_plan = false;
 
 		if (!ctx) {
@@ -7865,7 +8092,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
 					&sym_scope, &interproc_seeds);
 			}
-			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}")) {
+			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", NULL)) {
 				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
 				if (have_sym_scope) {
 					sym_function_scope_free (&sym_scope);
@@ -7887,7 +8114,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 					have_sym_scope? sym_scope.count: 0,
 					have_sym_scope? interproc_seeds.items: NULL,
 					have_sym_scope? interproc_seeds.count: 0,
-					0)) {
+					(size_t)type_global_max_links,
+					(size_t)type_max_decls,
+					(size_t)type_max_mutations)) {
 				session = r2sleigh_session_analyze (&session_input);
 				result = r2sleigh_session_result_report_json (session);
 			}
@@ -7921,6 +8150,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			bool have_sym_scope = false;
 			const char *target_arg = skip_cmd_spaces (cmd + 9);
 			int interproc_max_iters = cfg_get_type_interproc_max_iters (anal);
+			int type_global_max_links = cfg_get_type_global_max_links (anal);
+			int type_max_decls = cfg_get_type_max_decls (anal);
+			int type_max_mutations = cfg_get_type_max_mutations (anal);
 			bool prefer_bounded_semantic_type_plan = false;
 
 		if (!ctx) {
@@ -7949,7 +8181,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
 					&sym_scope, &interproc_seeds);
 			}
-			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}")) {
+			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", NULL)) {
 				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
 				if (have_sym_scope) {
 					sym_function_scope_free (&sym_scope);
@@ -7970,7 +8202,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 					have_sym_scope? sym_scope.count: 0,
 					have_sym_scope? interproc_seeds.items: NULL,
 					have_sym_scope? interproc_seeds.count: 0,
-					0)) {
+					(size_t)type_global_max_links,
+					(size_t)type_max_decls,
+					(size_t)type_max_mutations)) {
 				session = r2sleigh_session_analyze (&session_input);
 				result = r2sleigh_session_result_type_writeback_json (session);
 			}
@@ -8028,10 +8262,12 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 		/* Lift all blocks */
 		BlockArray blocks;
+		ut64 profile_start_us = r_time_now_mono ();
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
+		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
 		/* Get function SSA */
 		char *result = r2ssa_function_json (ctx, (const R2ILBlock **)blocks.blocks, blocks.count);
@@ -8366,10 +8602,12 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 		/* Lift all blocks */
 		BlockArray blocks;
+		ut64 profile_start_us = r_time_now_mono ();
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 			return strdup("");
 		}
+		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
 		char *result = NULL;
 		SymFunctionScope sym_scope;
@@ -8410,12 +8648,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		char *symbols_json = NULL;
 		SleighTypedFunctionContext typed_context = {0};
 		R2SleighSessionInput session_input = {0};
+		int type_global_max_links = cfg_get_type_global_max_links (anal);
+		int type_max_decls = cfg_get_type_max_decls (anal);
+		int type_max_mutations = cfg_get_type_max_mutations (anal);
 
 		func_names_json = build_decompiler_function_names_json (anal);
 		strings_json = build_decompiler_strings_json (anal, core, fcn);
 		symbols_json = build_decompiler_symbols_json (core);
 
-			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}")) {
+			profile_start_us = r_time_now_mono ();
+			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", NULL)) {
 				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
 				if (have_sym_scope) {
 					sym_function_scope_free (&sym_scope);
@@ -8426,20 +8668,31 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				block_array_free (&blocks);
 				return strdup("");
 			}
+			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
 
 			/* Decompile with context */
 				if (have_sym_scope) {
 					if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-							1, 1, true, sym_scope.functions, sym_scope.count, NULL, 0, 0)) {
+							1, 1, true, sym_scope.functions, sym_scope.count, NULL, 0,
+							(size_t)type_global_max_links,
+							(size_t)type_max_decls,
+							(size_t)type_max_mutations)) {
+						profile_start_us = r_time_now_mono ();
 						result = r2dec_function_with_session_context (&session_input,
 							func_names_json, strings_json, symbols_json);
+						sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
 					}
 					sym_function_scope_free (&sym_scope);
 				} else {
 					if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-							1, 1, true, NULL, 0, NULL, 0, 0)) {
+							1, 1, true, NULL, 0, NULL, 0,
+							(size_t)type_global_max_links,
+							(size_t)type_max_decls,
+							(size_t)type_max_mutations)) {
+						profile_start_us = r_time_now_mono ();
 						result = r2dec_function_with_session_context (&session_input,
 							func_names_json, strings_json, symbols_json);
+						sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
 					}
 			}
 
@@ -10102,7 +10355,10 @@ static ut64 compute_type_cache_key(
 	int min_conf,
 	int rename_min_conf,
 	int struct_min_conf,
-	int max_iters
+	int max_iters,
+	int global_max_links,
+	int max_type_decls,
+	int max_mutations
 ) {
 	ut64 key = artifact_key;
 	key ^= ((ut64)mode << 56);
@@ -10110,6 +10366,9 @@ static ut64 compute_type_cache_key(
 	key ^= ((ut64)(rename_min_conf & 0xff) << 16);
 	key ^= ((ut64)(struct_min_conf & 0xff) << 24);
 	key ^= ((ut64)(max_iters & 0xffff) << 40);
+	key = sleigh_hash_mix (key, (ut64)(global_max_links & 0xffff));
+	key = sleigh_hash_mix (key, (ut64)(max_type_decls & 0xffff));
+	key = sleigh_hash_mix (key, (ut64)(max_mutations & 0xffff));
 	key ^= dep_hash;
 	return key;
 }
@@ -11513,6 +11772,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	int type_max_iters = cfg_get_type_interproc_max_iters (anal);
 	int type_max_blocks = cfg_get_type_max_blocks (anal);
 	int type_global_max_links = cfg_get_type_global_max_links (anal);
+	int type_max_decls = cfg_get_type_max_decls (anal);
+	int type_max_mutations = cfg_get_type_max_mutations (anal);
 	bool type_cache_enabled = cfg_get_type_cache_enabled (anal);
 	bool semantic_comments_enabled = false;
 	bool taint_enabled = post_mode != SLEIGH_MODE_FAST;
@@ -11530,6 +11791,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	ut64 *changed_type_fcns = NULL;
 	size_t changed_type_count = 0;
 	size_t changed_type_cap = 0;
+	RList *post_base_type_snapshot = NULL;
 
 	struct_decl_memo_clear ();
 	if (!ctx) {
@@ -11555,6 +11817,10 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		struct_decl_memo_clear ();
 		return true;
 	}
+	if (cfg_get_profile_enabled (anal)) {
+		sleigh_profile_clear ();
+	}
+	post_base_type_snapshot = r_anal_types_snapshot (anal);
 	caller_propagation_state_init (&prop_state);
 	if (!xref_enabled) {
 		R_LOG_INFO ("r2sleigh: post-analysis running in fast mode");
@@ -11581,6 +11847,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		bool need_blocks = taint_eligible || sig_eligible || type_eligible;
 		const char *fcn_name = (fcn && fcn->name) ? fcn->name : "unknown";
 		BlockArray blocks;
+		ut64 profile_start_us;
 
 		if (taint_enabled) {
 			if (taint_eligible) {
@@ -11603,9 +11870,11 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		if (!fcn || !need_blocks) {
 			continue;
 		}
+		profile_start_us = r_time_now_mono ();
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			continue;
 		}
+		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
 		if (semantic_for_fcn) {
 			semantic_comments_total += write_semantic_comments_for_function (
@@ -11614,6 +11883,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 
 		/* Remove previous auto-generated taint artifacts only when taint sweep is active. */
 		if (taint_enabled) {
+			profile_start_us = r_time_now_mono ();
 			clear_taint_function_artifacts (anal, core, fcn, &blocks);
 			}
 
@@ -11861,6 +12131,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					r2taint_function_summary_free (taint_summary);
 				}
 			}
+			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TAINT, r_time_now_mono () - profile_start_us);
 
 		if (!sigwrite_enabled && !type_writeback_enabled) {
 			/* Signature writeback explicitly disabled for this run. */
@@ -11907,7 +12178,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				/* Automatic post-analysis must stay bounded across all functions.
 				 * Focused reports/decompile still build typed helper scopes. */
 				have_type_scope = false;
-				if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}")) {
+				profile_start_us = r_time_now_mono ();
+				if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", post_base_type_snapshot)) {
 					if (have_type_scope) {
 						sym_function_scope_free (&type_scope);
 						sleigh_interproc_seeds_free (&interproc_seeds);
@@ -11915,6 +12187,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					block_array_free (&blocks);
 					continue;
 				}
+				sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
 				R2SleighSessionInput cache_input = {0};
 				if (sleigh_session_input_init (&cache_input, anal, ctx, fcn, &blocks, &typed_context,
 						1, type_max_iters, true,
@@ -11922,7 +12195,9 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						have_type_scope? type_scope.count: 0,
 						have_type_scope? interproc_seeds.items: NULL,
 						have_type_scope? interproc_seeds.count: 0,
-						(size_t)type_global_max_links)) {
+						(size_t)type_global_max_links,
+						(size_t)type_max_decls,
+						(size_t)type_max_mutations)) {
 					artifact_key = r2sleigh_session_artifact_cache_key (&cache_input);
 				}
 
@@ -11932,7 +12207,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					dep_hash = compute_callee_dependency_hash (core, anal, fcn);
 					cache_key = compute_type_cache_key (artifact_key,
 						dep_hash, type_wb_mode, type_min_conf,
-						type_rename_min_conf, type_struct_min_conf, type_max_iters);
+						type_rename_min_conf, type_struct_min_conf, type_max_iters,
+						type_global_max_links, type_max_decls, type_max_mutations);
 					has_cache_entry = type_writeback_cache_get (fcn->addr, &cache_entry);
 						if (has_cache_entry && cache_entry.key == cache_key) {
 							type_wb.cache_hits++;
@@ -11952,13 +12228,17 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					}
 				}
 
+				profile_start_us = r_time_now_mono ();
 				session = sleigh_analyze_type_session (anal, ctx, fcn, &blocks, &typed_context,
 					1, type_max_iters, true,
 					have_type_scope? type_scope.functions: NULL,
 					have_type_scope? type_scope.count: 0,
 					have_type_scope? interproc_seeds.items: NULL,
 					have_type_scope? interproc_seeds.count: 0,
-					(size_t)type_global_max_links);
+					(size_t)type_global_max_links,
+					(size_t)type_max_decls,
+					(size_t)type_max_mutations);
+				sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_SESSION, r_time_now_mono () - profile_start_us);
 			payload_hash = r2sleigh_session_result_type_writeback_hash (session);
 			if (!session || !payload_hash) {
 				if (sig_metrics_eligible) {
@@ -11976,6 +12256,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				} else {
 					confidence = (int)signature_fact->confidence;
 					cc_confidence = (int)signature_fact->callconv_confidence;
+					profile_start_us = r_time_now_mono ();
 
 					if (signature_arch_eligible && signature_part_eligible
 							&& signature_fact->signature && *signature_fact->signature) {
@@ -12084,6 +12365,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 							(const R2ILBlock **)blocks.blocks, blocks.count, fcn->addr, fcn->name,
 							"{}", "{}");
 					}
+					sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_MUTATION, r_time_now_mono () - profile_start_us);
 				}
 			}
 				r2sleigh_session_result_free (session);
@@ -12129,15 +12411,19 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			const R2SleighDataRef *typed_items;
 			size_t typed_count = 0;
 			ut64 cache_key;
+			ut64 profile_start_us;
 			int ref_count;
 
 			if (!xref_fcn_cur) {
 				continue;
 			}
+			profile_start_us = r_time_now_mono ();
 			if (!lift_function_blocks (anal, xref_fcn_cur, ctx, &xref_blocks, true)) {
 				continue;
 			}
+			sleigh_profile_add (anal, xref_fcn_cur, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 			cache_key = compute_xref_cache_key (xref_fcn_cur, &xref_blocks, post_mode);
+			profile_start_us = r_time_now_mono ();
 			typed_refs = r2sleigh_data_refs_typed (ctx,
 				(const R2ILBlock **)xref_blocks.blocks, xref_blocks.count, xref_fcn_cur->addr);
 			typed_items = r2sleigh_data_refs_items (typed_refs, &typed_count);
@@ -12151,6 +12437,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			xrefs_added += ref_count;
 			xref_recomputes++;
 			data_ref_cache_put (xref_fcn_cur->addr, cache_key, typed_data_refs_hash (typed_items, typed_count), ref_count);
+			sleigh_profile_add (anal, xref_fcn_cur, SLEIGH_PROFILE_STAGE_XREF, r_time_now_mono () - profile_start_us);
 			r2sleigh_data_refs_free (typed_refs);
 			block_array_free (&xref_blocks);
 		}
@@ -12224,14 +12511,17 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					type_wb.type_fcns_skipped_size++;
 					continue;
 				}
+				ut64 profile_start_us = r_time_now_mono ();
 				if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 					continue;
 				}
+				sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
 
 					/* Automatic fixpoint iterations reuse the root-only session path;
 					 * helper scopes are reserved for focused commands. */
 					have_type_scope = false;
-					if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}")) {
+					profile_start_us = r_time_now_mono ();
+					if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", post_base_type_snapshot)) {
 						if (have_type_scope) {
 							sym_function_scope_free (&type_scope);
 							sleigh_interproc_seeds_free (&interproc_seeds);
@@ -12239,6 +12529,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						block_array_free (&blocks);
 						continue;
 					}
+					sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
 					R2SleighSessionInput cache_input = {0};
 					if (sleigh_session_input_init (&cache_input, anal, ctx, fcn, &blocks, &typed_context,
 							(size_t)iter_idx, (size_t)type_max_iters, false,
@@ -12246,7 +12537,9 @@ static bool sleigh_post_analysis(RAnal *anal) {
 							have_type_scope? type_scope.count: 0,
 							have_type_scope? interproc_seeds.items: NULL,
 							have_type_scope? interproc_seeds.count: 0,
-							(size_t)type_global_max_links)) {
+							(size_t)type_global_max_links,
+							(size_t)type_max_decls,
+							(size_t)type_max_mutations)) {
 						artifact_key = r2sleigh_session_artifact_cache_key (&cache_input);
 					}
 
@@ -12256,7 +12549,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						dep_hash = compute_callee_dependency_hash (core, anal, fcn);
 						cache_key = compute_type_cache_key (artifact_key,
 							dep_hash, type_wb_mode, type_min_conf,
-							type_rename_min_conf, type_struct_min_conf, type_max_iters);
+							type_rename_min_conf, type_struct_min_conf, type_max_iters,
+							type_global_max_links, type_max_decls, type_max_mutations);
 						has_cache_entry = type_writeback_cache_get (fcn->addr, &cache_entry);
 						if (has_cache_entry && cache_entry.key == cache_key) {
 							type_wb.cache_hits++;
@@ -12276,13 +12570,17 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						}
 					}
 
+					profile_start_us = r_time_now_mono ();
 					session = sleigh_analyze_type_session (anal, ctx, fcn, &blocks, &typed_context,
 						(size_t)iter_idx, (size_t)type_max_iters, false,
 						have_type_scope? type_scope.functions: NULL,
 						have_type_scope? type_scope.count: 0,
 						have_type_scope? interproc_seeds.items: NULL,
 						have_type_scope? interproc_seeds.count: 0,
-						(size_t)type_global_max_links);
+						(size_t)type_global_max_links,
+						(size_t)type_max_decls,
+						(size_t)type_max_mutations);
+					sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_SESSION, r_time_now_mono () - profile_start_us);
 				payload_hash = r2sleigh_session_result_type_writeback_hash (session);
 				if (!session || !payload_hash) {
 					type_wb.payload_missing++;
@@ -12309,6 +12607,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						continue;
 					}
 
+				profile_start_us = r_time_now_mono ();
 				if (sig_arch_supported && bb_count <= SLEIGH_SIG_WRITEBACK_MAX_BLOCKS) {
 					int conf = (int)signature_fact->confidence;
 					int cc_conf = (int)signature_fact->callconv_confidence;
@@ -12359,6 +12658,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 								type_wb.cache_updates++;
 						}
 					}
+					sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_MUTATION, r_time_now_mono () - profile_start_us);
 					r2sleigh_session_result_free (session);
 					sleigh_typed_function_context_clear (&typed_context);
 					if (have_type_scope) {
@@ -12441,7 +12741,12 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		prop_state.prop_type_match_failures, prop_state.prop_afva_failures,
 		sample_callees ? sample_callees : "-");
 	free (sample_callees);
+	if (cfg_get_profile_enabled (anal)) {
+		R_LOG_INFO ("r2sleigh: profile collected functions=%zu max=%d; inspect a:sla.debug.profilej for deterministic stage timings",
+			sleigh_profile_count, cfg_get_profile_max (anal));
+	}
 	caller_propagation_state_fini (&prop_state);
+	r_anal_types_snapshot_free (post_base_type_snapshot);
 	free (type_eligible_addrs);
 	free (changed_type_fcns);
 	struct_decl_memo_clear ();
