@@ -124,7 +124,6 @@ CMDS=<<EOF_CMDS
 aaa
 s dbg.check_secret
 a:sla >/dev/null
-e anal.sla.mode=full
 afs void dbg.check_secret(void)
 afc ms
 aaaa

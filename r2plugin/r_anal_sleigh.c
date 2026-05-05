@@ -482,9 +482,9 @@ typedef struct {
 static SleighFunctionContextApi sleigh_function_context_api = {0};
 
 typedef enum {
-	SLEIGH_MODE_FULL = 0,
+	SLEIGH_MODE_FAST = 0,
 	SLEIGH_MODE_BALANCED = 1,
-	SLEIGH_MODE_FAST = 2,
+	SLEIGH_MODE_FULL = 2,
 } SleighMode;
 
 typedef struct {
@@ -606,6 +606,7 @@ typedef struct {
 #define SLEIGH_AUTO_CALLBACK_MAX_LINEAR_SIZE (256ULL * 1024ULL)
 #define SLEIGH_POST_ANALYSIS_FAST_BUDGET_USEC (2ULL * 1000000ULL)
 #define SLEIGH_POST_ANALYSIS_BALANCED_BUDGET_USEC (10ULL * 1000000ULL)
+#define SLEIGH_POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC (30ULL * 1000000ULL)
 
 typedef struct {
 	R2ILFunctionBlocks *functions;
@@ -6373,109 +6374,38 @@ static bool lift_function_blocks(
 	return out->count > 0;
 }
 
-static SleighMode cfg_get_mode_default_full(RAnal *anal) {
-	RCore *core;
-	RConfigNode *node;
-	const char *mode;
-
-	if (!anal || !anal->config) {
-		return SLEIGH_MODE_FULL;
-	}
-	core = anal->coreb.core;
-	if (!core || !core->config) {
-		return SLEIGH_MODE_FULL;
-	}
-	node = r_config_node_get (core->config, "anal.sla.mode");
-	if (!node) {
-		return SLEIGH_MODE_FULL;
-	}
-	mode = r_config_get (core->config, "anal.sla.mode");
-	if (!mode || !*mode) {
-		return SLEIGH_MODE_FULL;
-	}
-	if (!strcasecmp (mode, "full")) {
-		return SLEIGH_MODE_FULL;
-	}
-	if (!strcasecmp (mode, "fast")) {
-		return SLEIGH_MODE_FAST;
-	}
-	if (!strcasecmp (mode, "balanced")) {
+static SleighMode sleigh_mode_from_analysis_depth(RAnal *anal) {
+	if (!anal) {
 		return SLEIGH_MODE_BALANCED;
 	}
-	return SLEIGH_MODE_FULL;
+	switch (anal->plugin_analysis_depth) {
+	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC:
+		return SLEIGH_MODE_FAST;
+	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE:
+		return SLEIGH_MODE_FULL;
+	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_BALANCED:
+	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_UNSPECIFIED:
+	default:
+		return SLEIGH_MODE_BALANCED;
+	}
 }
 
 static bool sleigh_mode_is_fast(RAnal *anal) {
-	return cfg_get_mode_default_full (anal) == SLEIGH_MODE_FAST;
+	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
+	return mode == SLEIGH_MODE_FAST;
 }
 
 static bool sleigh_mode_allows_deep_auto_callbacks(RAnal *anal) {
-	return cfg_get_mode_default_full (anal) == SLEIGH_MODE_FULL;
+	return sleigh_mode_from_analysis_depth (anal) == SLEIGH_MODE_FULL;
 }
 
 static SleighMode sleigh_mode_effective_for_post_analysis(RAnal *anal) {
-	SleighMode mode = cfg_get_mode_default_full (anal);
-	return mode == SLEIGH_MODE_FAST ? SLEIGH_MODE_FAST : SLEIGH_MODE_FULL;
-}
-
-static void ensure_default_string_config(RAnal *anal, const char *key, const char *desc, const char *value) {
-	RCore *core;
-	RConfigNode *node;
-
-	if (!anal || !key || !*key || !value) {
-		return;
-	}
-	core = anal->coreb.core;
-	if (!core || !core->config) {
-		return;
-	}
-
-	node = r_config_node_get (core->config, key);
-	if (!node) {
-		bool was_locked = core->config->lock;
-		if (was_locked) {
-			core->config->lock = false;
-		}
-		node = r_config_set (core->config, key, value);
-		if (was_locked) {
-			core->config->lock = true;
-		}
-	}
-	if (node && desc && *desc) {
-		r_config_node_desc (node, desc);
-	}
-}
-
-static void ensure_default_int_config(RAnal *anal, const char *key, const char *desc, ut64 value) {
-	RCore *core;
-	RConfigNode *node;
-
-	if (!anal || !key || !*key) {
-		return;
-	}
-	core = anal->coreb.core;
-	if (!core || !core->config) {
-		return;
-	}
-
-	node = r_config_node_get (core->config, key);
-	if (!node) {
-		bool was_locked = core->config->lock;
-		if (was_locked) {
-			core->config->lock = false;
-		}
-		node = r_config_set_i (core->config, key, value);
-		if (was_locked) {
-			core->config->lock = true;
-		}
-	}
-	if (node && desc && *desc) {
-		r_config_node_desc (node, desc);
-	}
+	return sleigh_mode_from_analysis_depth (anal);
 }
 
 static SleighTypeWritebackMode cfg_get_type_writeback_mode_default_balanced(RAnal *anal) {
 	RCore *core;
+	RConfigNode *node;
 	const char *mode;
 
 	if (!anal) {
@@ -6483,6 +6413,17 @@ static SleighTypeWritebackMode cfg_get_type_writeback_mode_default_balanced(RAna
 	}
 	core = anal->coreb.core;
 	if (!core || !core->config) {
+		return SLEIGH_TYPE_WRITEBACK_BALANCED;
+	}
+	node = r_config_node_get (core->config, "anal.sla.type.writeback");
+	if (!node) {
+		SleighMode analysis_mode = sleigh_mode_from_analysis_depth (anal);
+		if (analysis_mode == SLEIGH_MODE_FAST) {
+			return SLEIGH_TYPE_WRITEBACK_OFF;
+		}
+		if (analysis_mode == SLEIGH_MODE_FULL) {
+			return SLEIGH_TYPE_WRITEBACK_AGGRESSIVE;
+		}
 		return SLEIGH_TYPE_WRITEBACK_BALANCED;
 	}
 	mode = r_config_get (core->config, "anal.sla.type.writeback");
@@ -6540,70 +6481,56 @@ static int cfg_get_type_struct_min_conf(RAnal *anal) {
 }
 
 static int cfg_get_type_interproc_max_iters(RAnal *anal) {
+	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
+	int default_value = mode == SLEIGH_MODE_FULL
+		? SLEIGH_TYPE_INTERPROC_MAX_ITERS_DEFAULT
+		: (mode == SLEIGH_MODE_BALANCED ? 4 : 1);
 	return cfg_get_int_clamped (anal, "anal.sla.type.interproc.max_iters",
-		SLEIGH_TYPE_INTERPROC_MAX_ITERS_DEFAULT, 1, 256);
+		default_value, 1, 256);
 }
 
 static int cfg_get_type_max_blocks(RAnal *anal) {
+	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
+	int default_value = mode == SLEIGH_MODE_FULL
+		? SLEIGH_TYPE_MAX_BLOCKS_DEFAULT
+		: (mode == SLEIGH_MODE_BALANCED ? 200 : 96);
 	return cfg_get_int_clamped (anal, "anal.sla.type.max_blocks",
-		SLEIGH_TYPE_MAX_BLOCKS_DEFAULT, 1, 4096);
+		default_value, 1, 4096);
 }
 
 static int cfg_get_type_global_max_links(RAnal *anal) {
+	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
+	int default_value = mode == SLEIGH_MODE_FULL
+		? SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT
+		: (mode == SLEIGH_MODE_BALANCED ? 32 : 8);
 	return cfg_get_int_clamped (anal, "anal.sla.type.global.max_links",
-		SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT, 1, 4096);
+		default_value, 1, 4096);
 }
 
 static int cfg_get_type_max_decls(RAnal *anal) {
+	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
+	int default_value = mode == SLEIGH_MODE_FULL
+		? SLEIGH_TYPE_MAX_DECLS_DEFAULT
+		: (mode == SLEIGH_MODE_BALANCED ? 32 : 8);
 	return cfg_get_int_clamped (anal, "anal.sla.type.max_decls",
-		SLEIGH_TYPE_MAX_DECLS_DEFAULT, 1, 4096);
+		default_value, 1, 4096);
 }
 
 static int cfg_get_type_max_mutations(RAnal *anal) {
+	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
+	int default_value = mode == SLEIGH_MODE_FULL
+		? SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT
+		: (mode == SLEIGH_MODE_BALANCED ? 128 : 32);
 	return cfg_get_int_clamped (anal, "anal.sla.type.max_mutations",
-		SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT, 1, 16384);
+		default_value, 1, 16384);
 }
 
 static bool cfg_get_type_cache_enabled(RAnal *anal) {
 	return cfg_get_int_clamped (anal, "anal.sla.type.cache", 0, 0, 1) != 0;
 }
 
-static bool cfg_get_profile_enabled(RAnal *anal) {
-	return cfg_get_int_clamped (anal, "anal.sla.profile", 0, 0, 1) != 0;
-}
-
-static int cfg_get_profile_max(RAnal *anal) {
-	return cfg_get_int_clamped (anal, "anal.sla.profile.max",
-		SLEIGH_PROFILE_MAX_DEFAULT, 1, 4096);
-}
-
 static void ensure_sleigh_default_configs(RAnal *anal) {
-	ensure_default_string_config (anal, "anal.sla.mode",
-		"analysis profile for r2sleigh: full|balanced|fast", "full");
-	ensure_default_string_config (anal, "anal.sla.type.writeback",
-		"type write-back policy: off|balanced|aggressive", "balanced");
-	ensure_default_int_config (anal, "anal.sla.type.min_conf",
-		"minimum confidence for type apply", SLEIGH_TYPE_MIN_CONF_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.rename_min_conf",
-		"minimum confidence for variable rename apply", SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.struct_min_conf",
-		"minimum confidence for struct declaration import", SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.interproc.max_iters",
-		"maximum interprocedural propagation iterations", SLEIGH_TYPE_INTERPROC_MAX_ITERS_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.max_blocks",
-		"maximum basic blocks for type write-back inference", SLEIGH_TYPE_MAX_BLOCKS_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.global.max_links",
-		"maximum global type links applied per function payload", SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.max_decls",
-		"maximum struct/type declarations emitted per function payload", SLEIGH_TYPE_MAX_DECLS_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.max_mutations",
-		"maximum non-signature type mutations emitted per function payload", SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT);
-	ensure_default_int_config (anal, "anal.sla.type.cache",
-		"legacy C-side type payload cache for debugging; Rust FunctionFactsStore owns normal cache reuse", 0);
-	ensure_default_int_config (anal, "anal.sla.profile",
-		"record opt-in r2sleigh per-function stage timings", 0);
-	ensure_default_int_config (anal, "anal.sla.profile.max",
-		"maximum profile entries shown by a:sla.debug.profilej", SLEIGH_PROFILE_MAX_DEFAULT);
+	(void)anal;
 }
 
 static void sleigh_profile_clear(void) {
@@ -6643,7 +6570,8 @@ static SleighProfileEntry *sleigh_profile_entry_get(ut64 addr, const char *name)
 }
 
 static void sleigh_profile_add(RAnal *anal, const RAnalFunction *fcn, SleighProfileStage stage, ut64 elapsed_us) {
-	if (!elapsed_us || !cfg_get_profile_enabled (anal)) {
+	(void)anal;
+	if (!elapsed_us) {
 		return;
 	}
 	const char *name = (fcn && fcn->name)? fcn->name: NULL;
@@ -6691,11 +6619,12 @@ static int sleigh_profile_entry_cmp(const void *a, const void *b) {
 }
 
 static char *sleigh_profile_json(RAnal *anal) {
+	(void)anal;
 	PJ *pj = pj_new ();
 	if (!pj) {
 		return NULL;
 	}
-	size_t max_items = (size_t)cfg_get_profile_max (anal);
+	size_t max_items = SLEIGH_PROFILE_MAX_DEFAULT;
 	SleighProfileEntry **items = NULL;
 	char *decompile_cache = r2sleigh_decompile_render_cache_stats_json ();
 	if (sleigh_profile_count > 0) {
@@ -6708,7 +6637,7 @@ static char *sleigh_profile_json(RAnal *anal) {
 		}
 	}
 	pj_o (pj);
-	pj_kb (pj, "enabled", cfg_get_profile_enabled (anal));
+	pj_kb (pj, "enabled", true);
 	pj_kn (pj, "count", sleigh_profile_count);
 	pj_kn (pj, "max", max_items);
 	if (decompile_cache && *decompile_cache) {
@@ -7193,6 +7122,18 @@ static const char *sleigh_legacy_debug_replacement(const char *cmd) {
 	if (cmd_matches_exact_or_arg (cmd, "sla.types")) {
 		return "a:sla.debug.types";
 	}
+	if (cmd_matches_exact_or_arg (cmd, "sla.profilej")) {
+		return "a:sla.debug.profilej";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sla.assumptions-")) {
+		return "a:sla.debug.assumptions-";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sla.assumptions")) {
+		return "a:sla.debug.assumptions";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sla.assumej")) {
+		return "a:sla.debug.assumej";
+	}
 	if (!strcmp (cmd, "sla.ssa.func")) {
 		return "a:sla.debug.ssa.func";
 	}
@@ -7229,10 +7170,36 @@ static const char *sleigh_legacy_debug_replacement(const char *cmd) {
 	return NULL;
 }
 
+static const char *sleigh_legacy_sym_debug_replacement(const char *cmd) {
+	if (!cmd) {
+		return NULL;
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sym.runj")) {
+		return "a:sym.debug.runj";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sym.replayj")) {
+		return "a:sym.debug.replayj";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sym.explore.replayj")) {
+		return "a:sym.debug.explore.replayj";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sym.solve.replayj")) {
+		return "a:sym.debug.solve.replayj";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sym.explore.state")) {
+		return "a:sym.debug.explore.state";
+	}
+	if (cmd_matches_exact_or_arg (cmd, "sym.solve.state")) {
+		return "a:sym.debug.solve.state";
+	}
+	return NULL;
+}
+
 static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	bool is_sla_ns = r_str_startswith (cmd, "sla");
 	bool is_sym_ns = r_str_startswith (cmd, "sym");
 	bool is_sla_debug_ns = false;
+	bool is_sym_debug_ns = false;
 	char debug_cmd[4096];
 	if (!is_sla_ns && !is_sym_ns) {
 		return NULL;
@@ -7252,9 +7219,29 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		cmd = debug_cmd;
 		is_sla_debug_ns = true;
 	}
+	if (r_str_startswith (cmd, "sym.debug.")) {
+		int n = snprintf (debug_cmd, sizeof (debug_cmd), "sym.%s", cmd + strlen ("sym.debug."));
+		if (n < 0 || (size_t)n >= sizeof (debug_cmd)) {
+			if (cons) {
+				r_cons_println (cons, "r2sleigh: debug command too long");
+			}
+			return strdup ("");
+		}
+		cmd = debug_cmd;
+		is_sym_debug_ns = true;
+	}
 
 	if (!is_sla_debug_ns) {
 		const char *replacement = sleigh_legacy_debug_replacement (cmd);
+		if (replacement) {
+			if (cons) {
+				r_cons_printf (cons, "r2sleigh: command moved to %s\n", replacement);
+			}
+			return strdup ("");
+		}
+	}
+	if (!is_sym_debug_ns) {
+		const char *replacement = sleigh_legacy_sym_debug_replacement (cmd);
 		if (replacement) {
 			if (cons) {
 				r_cons_printf (cons, "r2sleigh: command moved to %s\n", replacement);
@@ -7270,7 +7257,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			r_cons_println (cons, "| a:sym.explore <target> - Explore symbolic paths reaching target");
 			r_cons_println (cons, "| a:sym.solve <target> - Solve concrete input for target reachability");
 			r_cons_println (cons, "| a:sym.state  - Show last symbolic explore/solve cached result");
-			r_cons_println (cons, "| e anal.sla.* - Configure budgets, write-back, replay, and debug output");
 		}
 		return strdup("");
 	}
@@ -11776,14 +11762,16 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	int type_max_mutations = cfg_get_type_max_mutations (anal);
 	bool type_cache_enabled = cfg_get_type_cache_enabled (anal);
 	bool semantic_comments_enabled = false;
-	bool taint_enabled = post_mode != SLEIGH_MODE_FAST;
-	bool sigwrite_enabled = post_mode != SLEIGH_MODE_FAST;
+	bool taint_enabled = post_mode == SLEIGH_MODE_FULL;
+	bool sigwrite_enabled = post_mode == SLEIGH_MODE_BALANCED || post_mode == SLEIGH_MODE_FULL;
 	bool type_writeback_enabled = sigwrite_enabled && type_wb_mode != SLEIGH_TYPE_WRITEBACK_OFF;
 	bool sigverify_enabled = false;
 	ut64 post_start_us = r_time_now_mono ();
-	ut64 post_budget_us = post_mode == SLEIGH_MODE_FAST
-		? SLEIGH_POST_ANALYSIS_FAST_BUDGET_USEC
-		: SLEIGH_POST_ANALYSIS_BALANCED_BUDGET_USEC;
+	ut64 post_budget_us = post_mode == SLEIGH_MODE_FULL
+		? SLEIGH_POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC
+		: (post_mode == SLEIGH_MODE_BALANCED
+			? SLEIGH_POST_ANALYSIS_BALANCED_BUDGET_USEC
+			: SLEIGH_POST_ANALYSIS_FAST_BUDGET_USEC);
 	bool post_budget_exhausted = false;
 	ut64 *type_eligible_addrs = NULL;
 	size_t type_eligible_count = 0;
@@ -11810,20 +11798,22 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	}
 
 	int num_fcns = r_list_length (anal->fcns);
-	bool xref_enabled = post_mode != SLEIGH_MODE_FAST;
+	bool xref_enabled = post_mode == SLEIGH_MODE_BALANCED || post_mode == SLEIGH_MODE_FULL;
 	bool sigwrite_focus_only = sigwrite_enabled && num_fcns > SLEIGH_SIG_WRITEBACK_GLOBAL_MAX_FCNS;
 	bool type_writeback_focus_only = type_writeback_enabled && num_fcns > SLEIGH_TYPE_WRITEBACK_GLOBAL_MAX_FCNS;
 	if (num_fcns == 0) {
 		struct_decl_memo_clear ();
 		return true;
 	}
-	if (cfg_get_profile_enabled (anal)) {
-		sleigh_profile_clear ();
-	}
+	sleigh_profile_clear ();
 	post_base_type_snapshot = r_anal_types_snapshot (anal);
 	caller_propagation_state_init (&prop_state);
-	if (!xref_enabled) {
-		R_LOG_INFO ("r2sleigh: post-analysis running in fast mode");
+	if (post_mode == SLEIGH_MODE_FAST) {
+		R_LOG_INFO ("r2sleigh: post-analysis running in basic mode");
+	} else if (post_mode == SLEIGH_MODE_BALANCED) {
+		R_LOG_INFO ("r2sleigh: post-analysis running in balanced mode");
+	} else {
+		R_LOG_INFO ("r2sleigh: post-analysis running in aggressive mode");
 	}
 
 	RListIter *iter;
@@ -12741,10 +12731,6 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		prop_state.prop_type_match_failures, prop_state.prop_afva_failures,
 		sample_callees ? sample_callees : "-");
 	free (sample_callees);
-	if (cfg_get_profile_enabled (anal)) {
-		R_LOG_INFO ("r2sleigh: profile collected functions=%zu max=%d; inspect a:sla.debug.profilej for deterministic stage timings",
-			sleigh_profile_count, cfg_get_profile_max (anal));
-	}
 	caller_propagation_state_fini (&prop_state);
 	r_anal_types_snapshot_free (post_base_type_snapshot);
 	free (type_eligible_addrs);

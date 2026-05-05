@@ -4,10 +4,12 @@ ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 true
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
-a:sla? | jq -Rs 'contains("a:sla.dec") and (contains("a:sla.debug.sym")|not)'
+a:sla? | jq -Rs 'contains("a:sla.dec") and (contains("anal.sla")|not) and (contains("a:sla.debug.sym")|not)'
 a:sym? | jq -Rs 'contains("a:sym.solve") and contains("a:sym.state") and (contains("a:sym.runj")|not)'
+e??anal.sla | jq -Rs 'length==0'
 EOF_CMDS
 RUN
 
@@ -17,11 +19,17 @@ ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 true
+true
+true
+true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla.debug.mem >/dev/null
 a:sla.mem | jq -Rs 'contains("moved to a:sla.debug.mem")'
 a:sla.types | jq -Rs 'contains("moved to a:sla.debug.types")'
+a:sla.profilej | jq -Rs 'contains("moved to a:sla.debug.profilej")'
+a:sla.assumej [] | jq -Rs 'contains("moved to a:sla.debug.assumej")'
+a:sym.runj {} | jq -Rs 'contains("moved to a:sym.debug.runj")'
 EOF_CMDS
 RUN
 
@@ -53,7 +61,7 @@ pdd | jq -Rs 'contains("check_secret") and contains("return") and (contains("r2p
 EOF_CMDS
 RUN
 
-NAME=profilej_reports_deterministic_stage_timings_when_enabled
+NAME=profilej_reports_deterministic_stage_timings
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -61,23 +69,21 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla >/dev/null
-e anal.sla.profile=true
-e anal.sla.profile.max=5
 aaaa
-a:sla.debug.profilej | jq -c '.enabled==true and .max==5 and .count>0 and (.decompile_cache|has("hits") and has("misses")) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
+a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0 and (.decompile_cache|has("hits") and has("misses")) and (.functions|type=="array") and (.functions|length>0) and (.functions[0]|has("addr") and has("total_us") and has("lift_us") and has("typed_context_us") and has("session_us") and has("mutation_us") and has("xref_us") and has("taint_us") and has("decompile_us"))'
 EOF_CMDS
 RUN
 
-NAME=profile_config_is_available_at_startup
+NAME=profilej_available_without_config
 FILE=bins/vuln_test_x86
-ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true -e anal.sla.profile=true -e anal.sla.profile.max=3
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
 true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla >/dev/null
 aaa
-a:sla.debug.profilej | jq -c '.enabled==true and .max==3 and .count>0'
+a:sla.debug.profilej | jq -c '.enabled==true and .max==20 and .count>0'
 EOF_CMDS
 RUN
 
@@ -318,7 +324,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~test_symbolic_helper_pure_guard[0]` >/dev/null
 af
-a:sla.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}}] >/dev/null
+a:sla.debug.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}}] >/dev/null
 a:sla.debug.types | jq -c '(.assumptions.items // [] | any((.subject.register.name? // "" | ascii_downcase) == "rdi" and .value.type_hint.ty == "int32_t"))'
 a:sla.debug.types | jq -c '(.params[0].type // "") == "int32_t"'
 EOF_CMDS
