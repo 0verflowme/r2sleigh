@@ -507,6 +507,19 @@ typedef enum {
 } SleighTypeWritebackMode;
 
 typedef struct {
+	SleighMode mode;
+	SleighTypeWritebackMode type_writeback_mode;
+	int type_min_conf;
+	int type_rename_min_conf;
+	int type_struct_min_conf;
+	int type_interproc_max_iters;
+	int type_max_blocks;
+	int type_global_max_links;
+	int type_max_decls;
+	int type_max_mutations;
+} SleighAnalysisPolicy;
+
+typedef struct {
 	ut64 addr;
 	ut64 key;
 	ut64 payload_hash;
@@ -6403,134 +6416,40 @@ static SleighMode sleigh_mode_effective_for_post_analysis(RAnal *anal) {
 	return sleigh_mode_from_analysis_depth (anal);
 }
 
-static SleighTypeWritebackMode cfg_get_type_writeback_mode_default_balanced(RAnal *anal) {
-	RCore *core;
-	RConfigNode *node;
-	const char *mode;
+static SleighAnalysisPolicy sleigh_analysis_policy_from_mode(SleighMode mode) {
+	SleighAnalysisPolicy policy = {
+		.mode = mode,
+		.type_writeback_mode = SLEIGH_TYPE_WRITEBACK_BALANCED,
+		.type_min_conf = SLEIGH_TYPE_MIN_CONF_DEFAULT,
+		.type_rename_min_conf = SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT,
+		.type_struct_min_conf = SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT,
+		.type_interproc_max_iters = 4,
+		.type_max_blocks = 200,
+		.type_global_max_links = 32,
+		.type_max_decls = 32,
+		.type_max_mutations = 128,
+	};
 
-	if (!anal) {
-		return SLEIGH_TYPE_WRITEBACK_BALANCED;
+	if (mode == SLEIGH_MODE_FAST) {
+		policy.type_writeback_mode = SLEIGH_TYPE_WRITEBACK_OFF;
+		policy.type_interproc_max_iters = 1;
+		policy.type_max_blocks = 96;
+		policy.type_global_max_links = 8;
+		policy.type_max_decls = 8;
+		policy.type_max_mutations = 32;
+	} else if (mode == SLEIGH_MODE_FULL) {
+		policy.type_writeback_mode = SLEIGH_TYPE_WRITEBACK_AGGRESSIVE;
+		policy.type_interproc_max_iters = SLEIGH_TYPE_INTERPROC_MAX_ITERS_DEFAULT;
+		policy.type_max_blocks = SLEIGH_TYPE_MAX_BLOCKS_DEFAULT;
+		policy.type_global_max_links = SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT;
+		policy.type_max_decls = SLEIGH_TYPE_MAX_DECLS_DEFAULT;
+		policy.type_max_mutations = SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT;
 	}
-	core = anal->coreb.core;
-	if (!core || !core->config) {
-		return SLEIGH_TYPE_WRITEBACK_BALANCED;
-	}
-	node = r_config_node_get (core->config, "anal.sla.type.writeback");
-	if (!node) {
-		SleighMode analysis_mode = sleigh_mode_from_analysis_depth (anal);
-		if (analysis_mode == SLEIGH_MODE_FAST) {
-			return SLEIGH_TYPE_WRITEBACK_OFF;
-		}
-		if (analysis_mode == SLEIGH_MODE_FULL) {
-			return SLEIGH_TYPE_WRITEBACK_AGGRESSIVE;
-		}
-		return SLEIGH_TYPE_WRITEBACK_BALANCED;
-	}
-	mode = r_config_get (core->config, "anal.sla.type.writeback");
-	if (!mode || !*mode) {
-		return SLEIGH_TYPE_WRITEBACK_BALANCED;
-	}
-	if (!strcasecmp (mode, "off")) {
-		return SLEIGH_TYPE_WRITEBACK_OFF;
-	}
-	if (!strcasecmp (mode, "aggressive")) {
-		return SLEIGH_TYPE_WRITEBACK_AGGRESSIVE;
-	}
-	return SLEIGH_TYPE_WRITEBACK_BALANCED;
+	return policy;
 }
 
-static int cfg_get_int_clamped(RAnal *anal, const char *key, int default_value, int min_value, int max_value) {
-	RCore *core;
-	RConfigNode *node;
-	ut64 raw;
-
-	if (!anal) {
-		return default_value;
-	}
-	core = anal->coreb.core;
-	if (!core || !core->config) {
-		return default_value;
-	}
-	node = r_config_node_get (core->config, key);
-	if (!node) {
-		return default_value;
-	}
-	raw = r_config_get_i (core->config, key);
-	if ((int)raw < min_value) {
-		return min_value;
-	}
-	if ((int)raw > max_value) {
-		return max_value;
-	}
-	return (int)raw;
-}
-
-static int cfg_get_type_min_conf(RAnal *anal) {
-	return cfg_get_int_clamped (anal, "anal.sla.type.min_conf",
-		SLEIGH_TYPE_MIN_CONF_DEFAULT, 1, 100);
-}
-
-static int cfg_get_type_rename_min_conf(RAnal *anal) {
-	return cfg_get_int_clamped (anal, "anal.sla.type.rename_min_conf",
-		SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT, 1, 100);
-}
-
-static int cfg_get_type_struct_min_conf(RAnal *anal) {
-	return cfg_get_int_clamped (anal, "anal.sla.type.struct_min_conf",
-		SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT, 1, 100);
-}
-
-static int cfg_get_type_interproc_max_iters(RAnal *anal) {
-	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
-	int default_value = mode == SLEIGH_MODE_FULL
-		? SLEIGH_TYPE_INTERPROC_MAX_ITERS_DEFAULT
-		: (mode == SLEIGH_MODE_BALANCED ? 4 : 1);
-	return cfg_get_int_clamped (anal, "anal.sla.type.interproc.max_iters",
-		default_value, 1, 256);
-}
-
-static int cfg_get_type_max_blocks(RAnal *anal) {
-	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
-	int default_value = mode == SLEIGH_MODE_FULL
-		? SLEIGH_TYPE_MAX_BLOCKS_DEFAULT
-		: (mode == SLEIGH_MODE_BALANCED ? 200 : 96);
-	return cfg_get_int_clamped (anal, "anal.sla.type.max_blocks",
-		default_value, 1, 4096);
-}
-
-static int cfg_get_type_global_max_links(RAnal *anal) {
-	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
-	int default_value = mode == SLEIGH_MODE_FULL
-		? SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT
-		: (mode == SLEIGH_MODE_BALANCED ? 32 : 8);
-	return cfg_get_int_clamped (anal, "anal.sla.type.global.max_links",
-		default_value, 1, 4096);
-}
-
-static int cfg_get_type_max_decls(RAnal *anal) {
-	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
-	int default_value = mode == SLEIGH_MODE_FULL
-		? SLEIGH_TYPE_MAX_DECLS_DEFAULT
-		: (mode == SLEIGH_MODE_BALANCED ? 32 : 8);
-	return cfg_get_int_clamped (anal, "anal.sla.type.max_decls",
-		default_value, 1, 4096);
-}
-
-static int cfg_get_type_max_mutations(RAnal *anal) {
-	SleighMode mode = sleigh_mode_from_analysis_depth (anal);
-	int default_value = mode == SLEIGH_MODE_FULL
-		? SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT
-		: (mode == SLEIGH_MODE_BALANCED ? 128 : 32);
-	return cfg_get_int_clamped (anal, "anal.sla.type.max_mutations",
-		default_value, 1, 16384);
-}
-
-static bool cfg_get_type_cache_enabled(RAnal *anal) {
-	return cfg_get_int_clamped (anal, "anal.sla.type.cache", 0, 0, 1) != 0;
-}
-
-static void ensure_sleigh_default_configs(RAnal *anal) {
-	(void)anal;
+static SleighAnalysisPolicy sleigh_analysis_policy_for_anal(RAnal *anal) {
+	return sleigh_analysis_policy_from_mode (sleigh_mode_from_analysis_depth (anal));
 }
 
 static void sleigh_profile_clear(void) {
@@ -6683,7 +6602,6 @@ R2ILContext *get_context(RAnal *anal) {
 	if (!anal || !anal->config || !anal->config->arch[0]) {
 		return NULL;
 	}
-	ensure_sleigh_default_configs (anal);
 	const char *arch = anal->config->arch;
 	int bits = anal->config->bits;
 
@@ -6849,8 +6767,6 @@ static bool sleigh_init(RAnal *anal) {
 		sleigh_report_missing_function_context_api ();
 		return false;
 	}
-	/* Lazy init - context created on first use. */
-	ensure_sleigh_default_configs (anal);
 	/* Prime context early so register aliases are available before aa/aaa passes. */
 	(void)get_context (anal);
 	return true;
@@ -8041,16 +7957,13 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			SleighTypedFunctionContext typed_context = {0};
 			R2SleighSessionInput session_input = {0};
 			SymFunctionScope sym_scope;
-			SleighInterprocSeeds interproc_seeds;
-			bool have_sym_scope = false;
-			size_t prefix_len = r_str_startswith (cmd, "sla.session")? 11:
-				(r_str_startswith (cmd, "sla.plan")? 8: 9);
-			const char *target_arg = skip_cmd_spaces (cmd + prefix_len);
-			int interproc_max_iters = cfg_get_type_interproc_max_iters (anal);
-			int type_global_max_links = cfg_get_type_global_max_links (anal);
-			int type_max_decls = cfg_get_type_max_decls (anal);
-			int type_max_mutations = cfg_get_type_max_mutations (anal);
-			bool prefer_bounded_semantic_type_plan = false;
+				SleighInterprocSeeds interproc_seeds;
+				bool have_sym_scope = false;
+				size_t prefix_len = r_str_startswith (cmd, "sla.session")? 11:
+					(r_str_startswith (cmd, "sla.plan")? 8: 9);
+				const char *target_arg = skip_cmd_spaces (cmd + prefix_len);
+				SleighAnalysisPolicy policy = sleigh_analysis_policy_for_anal (anal);
+				bool prefer_bounded_semantic_type_plan = false;
 
 		if (!ctx) {
 			R_LOG_ERROR ("r2sleigh: no context");
@@ -8093,16 +8006,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				sleigh_interproc_seeds_init (&interproc_seeds);
 			}
 			if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-					1,
-					prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
-					prefer_bounded_semantic_type_plan? false: true,
-					have_sym_scope? sym_scope.functions: NULL,
-					have_sym_scope? sym_scope.count: 0,
-					have_sym_scope? interproc_seeds.items: NULL,
-					have_sym_scope? interproc_seeds.count: 0,
-					(size_t)type_global_max_links,
-					(size_t)type_max_decls,
-					(size_t)type_max_mutations)) {
+						1,
+						prefer_bounded_semantic_type_plan? 1: policy.type_interproc_max_iters,
+						prefer_bounded_semantic_type_plan? false: true,
+						have_sym_scope? sym_scope.functions: NULL,
+						have_sym_scope? sym_scope.count: 0,
+						have_sym_scope? interproc_seeds.items: NULL,
+						have_sym_scope? interproc_seeds.count: 0,
+						(size_t)policy.type_global_max_links,
+						(size_t)policy.type_max_decls,
+						(size_t)policy.type_max_mutations)) {
 				session = r2sleigh_session_analyze (&session_input);
 				result = r2sleigh_session_result_report_json (session);
 			}
@@ -8132,14 +8045,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			SleighTypedFunctionContext typed_context = {0};
 			R2SleighSessionInput session_input = {0};
 			SymFunctionScope sym_scope;
-			SleighInterprocSeeds interproc_seeds;
-			bool have_sym_scope = false;
-			const char *target_arg = skip_cmd_spaces (cmd + 9);
-			int interproc_max_iters = cfg_get_type_interproc_max_iters (anal);
-			int type_global_max_links = cfg_get_type_global_max_links (anal);
-			int type_max_decls = cfg_get_type_max_decls (anal);
-			int type_max_mutations = cfg_get_type_max_mutations (anal);
-			bool prefer_bounded_semantic_type_plan = false;
+				SleighInterprocSeeds interproc_seeds;
+				bool have_sym_scope = false;
+				const char *target_arg = skip_cmd_spaces (cmd + 9);
+				SleighAnalysisPolicy policy = sleigh_analysis_policy_for_anal (anal);
+				bool prefer_bounded_semantic_type_plan = false;
 
 		if (!ctx) {
 			R_LOG_ERROR ("r2sleigh: no context");
@@ -8181,16 +8091,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				sleigh_interproc_seeds_init (&interproc_seeds);
 			}
 			if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-					1,
-					prefer_bounded_semantic_type_plan? 1: interproc_max_iters,
-					prefer_bounded_semantic_type_plan? false: true,
-					have_sym_scope? sym_scope.functions: NULL,
-					have_sym_scope? sym_scope.count: 0,
-					have_sym_scope? interproc_seeds.items: NULL,
-					have_sym_scope? interproc_seeds.count: 0,
-					(size_t)type_global_max_links,
-					(size_t)type_max_decls,
-					(size_t)type_max_mutations)) {
+						1,
+						prefer_bounded_semantic_type_plan? 1: policy.type_interproc_max_iters,
+						prefer_bounded_semantic_type_plan? false: true,
+						have_sym_scope? sym_scope.functions: NULL,
+						have_sym_scope? sym_scope.count: 0,
+						have_sym_scope? interproc_seeds.items: NULL,
+						have_sym_scope? interproc_seeds.count: 0,
+						(size_t)policy.type_global_max_links,
+						(size_t)policy.type_max_decls,
+						(size_t)policy.type_max_mutations)) {
 				session = r2sleigh_session_analyze (&session_input);
 				result = r2sleigh_session_result_type_writeback_json (session);
 			}
@@ -8630,13 +8540,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		/* Gather function names from r2 */
 		char *func_names_json = NULL;
-		char *strings_json = NULL;
-		char *symbols_json = NULL;
-		SleighTypedFunctionContext typed_context = {0};
-		R2SleighSessionInput session_input = {0};
-		int type_global_max_links = cfg_get_type_global_max_links (anal);
-		int type_max_decls = cfg_get_type_max_decls (anal);
-		int type_max_mutations = cfg_get_type_max_mutations (anal);
+			char *strings_json = NULL;
+			char *symbols_json = NULL;
+			SleighTypedFunctionContext typed_context = {0};
+			R2SleighSessionInput session_input = {0};
+			SleighAnalysisPolicy policy = sleigh_analysis_policy_for_anal (anal);
 
 		func_names_json = build_decompiler_function_names_json (anal);
 		strings_json = build_decompiler_strings_json (anal, core, fcn);
@@ -8658,23 +8566,23 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 			/* Decompile with context */
 				if (have_sym_scope) {
-					if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-							1, 1, true, sym_scope.functions, sym_scope.count, NULL, 0,
-							(size_t)type_global_max_links,
-							(size_t)type_max_decls,
-							(size_t)type_max_mutations)) {
+						if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
+								1, 1, true, sym_scope.functions, sym_scope.count, NULL, 0,
+								(size_t)policy.type_global_max_links,
+								(size_t)policy.type_max_decls,
+								(size_t)policy.type_max_mutations)) {
 						profile_start_us = r_time_now_mono ();
 						result = r2dec_function_with_session_context (&session_input,
 							func_names_json, strings_json, symbols_json);
 						sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
 					}
 					sym_function_scope_free (&sym_scope);
-				} else {
-					if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-							1, 1, true, NULL, 0, NULL, 0,
-							(size_t)type_global_max_links,
-							(size_t)type_max_decls,
-							(size_t)type_max_mutations)) {
+					} else {
+						if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
+								1, 1, true, NULL, 0, NULL, 0,
+								(size_t)policy.type_global_max_links,
+								(size_t)policy.type_max_decls,
+								(size_t)policy.type_max_mutations)) {
 						profile_start_us = r_time_now_mono ();
 						result = r2dec_function_with_session_context (&session_input,
 							func_names_json, strings_json, symbols_json);
@@ -11750,17 +11658,17 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	bool sig_arch_supported = false;
 	bool cc_arch_supported = false;
 	bool type_arch_supported = false;
-	SleighMode post_mode = sleigh_mode_effective_for_post_analysis (anal);
-	SleighTypeWritebackMode type_wb_mode = cfg_get_type_writeback_mode_default_balanced (anal);
-	int type_min_conf = cfg_get_type_min_conf (anal);
-	int type_rename_min_conf = cfg_get_type_rename_min_conf (anal);
-	int type_struct_min_conf = cfg_get_type_struct_min_conf (anal);
-	int type_max_iters = cfg_get_type_interproc_max_iters (anal);
-	int type_max_blocks = cfg_get_type_max_blocks (anal);
-	int type_global_max_links = cfg_get_type_global_max_links (anal);
-	int type_max_decls = cfg_get_type_max_decls (anal);
-	int type_max_mutations = cfg_get_type_max_mutations (anal);
-	bool type_cache_enabled = cfg_get_type_cache_enabled (anal);
+	SleighAnalysisPolicy policy = sleigh_analysis_policy_for_anal (anal);
+	SleighMode post_mode = policy.mode;
+	SleighTypeWritebackMode type_wb_mode = policy.type_writeback_mode;
+	int type_min_conf = policy.type_min_conf;
+	int type_rename_min_conf = policy.type_rename_min_conf;
+	int type_struct_min_conf = policy.type_struct_min_conf;
+	int type_max_iters = policy.type_interproc_max_iters;
+	int type_max_blocks = policy.type_max_blocks;
+	int type_global_max_links = policy.type_global_max_links;
+	int type_max_decls = policy.type_max_decls;
+	int type_max_mutations = policy.type_max_mutations;
 	bool semantic_comments_enabled = false;
 	bool taint_enabled = post_mode == SLEIGH_MODE_FULL;
 	bool sigwrite_enabled = post_mode == SLEIGH_MODE_BALANCED || post_mode == SLEIGH_MODE_FULL;
@@ -12191,7 +12099,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					artifact_key = r2sleigh_session_artifact_cache_key (&cache_input);
 				}
 
-				if (type_cache_enabled && type_writeback_enabled) {
+				if (type_writeback_enabled) {
 					TypeWritebackCacheEntry cache_entry = {0};
 					bool has_cache_entry = false;
 					dep_hash = compute_callee_dependency_hash (core, anal, fcn);
@@ -12336,7 +12244,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						}
 					}
 
-					if (type_cache_enabled && type_writeback_enabled) {
+					if (type_writeback_enabled) {
 						ut64 applied_hash = type_payload_changed? payload_hash: 0;
 							if (type_writeback_cache_put (
 									fcn->addr,
@@ -12533,7 +12441,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						artifact_key = r2sleigh_session_artifact_cache_key (&cache_input);
 					}
 
-					if (type_cache_enabled) {
+					if (type_writeback_enabled) {
 						TypeWritebackCacheEntry cache_entry = {0};
 						bool has_cache_entry = false;
 						dep_hash = compute_callee_dependency_hash (core, anal, fcn);
@@ -12637,7 +12545,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						type_eligible_addrs, type_eligible_count,
 						&queue, &queue_count, &queue_cap, &type_wb, true);
 				}
-				if (type_cache_enabled) {
+				if (type_writeback_enabled) {
 					ut64 applied_hash = (type_changed || sig_or_cc_changed)? payload_hash: 0;
 						if (type_writeback_cache_put (
 								fcn->addr,

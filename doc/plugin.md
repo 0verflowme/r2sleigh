@@ -29,7 +29,7 @@ sleigh_op: Lifts instructions during aaa. Generates ESIL.
 sleigh_recover_vars: Provides SSA-derived variables for afva.
 sleigh_analyze_fcn: Per-function SSA analysis after af (also auto-applies DATA xrefs).
 sleigh_get_data_refs: Def-use xrefs callback used by radare2 during aar when supported.
-sleigh_post_analysis: Auto-taint + signature/CC write-back during aaaa.
+sleigh_post_analysis: Native post-analysis enrichment during aa/aaa/aaaa.
 
 Command Reference
 -----------------
@@ -117,27 +117,17 @@ SLEIGH_SIG_WRITEBACK_MAX_BLOCKS: Max blocks for automatic signature/CC write-bac
 SLEIGH_SIG_MIN_CONFIDENCE: Minimum confidence for signature overwrite. Default 70.
 SLEIGH_CC_MIN_CONFIDENCE: Minimum confidence for calling convention overwrite. Default 80.
 
-Runtime analysis profile:
+Native analysis depth:
 
-- `anal.sla.mode` (default `balanced`)
-- Accepted values: `full`, `balanced`, `fast`
+| Command | r2sleigh behavior |
+|---|---|
+| `aa` | basic bounded post-analysis |
+| `aaa` | balanced signatures, xrefs, and type facts |
+| `aaaa` | aggressive taint, interproc, and type write-back |
 
-Mode semantics:
-
-| Context | `full` | `balanced` | `fast` |
-|---|---|---|---|
-| `aa` / `aaa` callbacks | full behavior | balanced behavior | reduced behavior |
-| `aaaa` post-analysis | full behavior | full behavior (forced) | reduced behavior |
-
-Behavior by mode:
-
-| Pass | `full` | `balanced` | `fast` |
-|---|---|---|---|
-| semantic comments | on | on | off |
-| recover vars | on | on | off |
-| computed data xrefs | on | on | off |
-| post taint | on | on | off |
-| post signature/callconv write-back | on | on | off |
+r2sleigh does not expose public `anal.*` tuning keys. Detailed engine inspection
+lives under debug commands such as `a:sla.debug.profilej` and
+`a:sla.debug.types`.
 
 Automatic Signature Write-Back (aaaa)
 -------------------------------------

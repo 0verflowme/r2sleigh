@@ -134,14 +134,14 @@ def count_semantic_lines(comments_payload: Any) -> dict[str, int]:
 def collect_comment_metrics(
     r2: str, binary: str, metadata_enabled: bool, force_x86: bool
 ) -> dict[str, Any]:
-    mode = "full" if metadata_enabled else "fast"
+    analysis_cmd = "aaaa" if metadata_enabled else "aa"
     cmd_parts = []
     if force_x86:
         cmd_parts.extend(["e anal.arch=x86", "e arch.bits=64"])
     cmd_parts.extend(
         [
-            f"a:sla.info >/dev/null; e anal.sla.mode={mode}",
-            "aaaa",
+            "a:sla.info >/dev/null",
+            analysis_cmd,
             "CCj",
         ]
     )
@@ -166,11 +166,11 @@ def collect_comment_metrics(
 def collect_afvj_pointer_count(
     r2: str, binary: str, func_name: str, metadata_enabled: bool
 ) -> dict[str, Any]:
-    mode = "full" if metadata_enabled else "fast"
+    analysis_cmd = "aaa" if metadata_enabled else "aa"
     cmd = "; ".join(
         [
-            f"a:sla.info >/dev/null; e anal.sla.mode={mode}",
-            "aaa",
+            "a:sla.info >/dev/null",
+            analysis_cmd,
             f"s {func_name}",
             "afva",
             "afvj",
@@ -199,7 +199,7 @@ def collect_afvj_pointer_count(
 
 
 def median_timing(r2: str, metadata_enabled: bool, runs: int) -> dict[str, Any]:
-    mode = "full" if metadata_enabled else "fast"
+    analysis_cmd = "aaaa" if metadata_enabled else "aa"
     timings = []
     errors = []
     for _ in range(runs):
@@ -207,8 +207,8 @@ def median_timing(r2: str, metadata_enabled: bool, runs: int) -> dict[str, Any]:
             [
                 "e anal.arch=x86",
                 "e arch.bits=64",
-                f"a:sla.info >/dev/null; e anal.sla.mode={mode}",
-                "aaaa",
+                "a:sla.info >/dev/null",
+                analysis_cmd,
             ]
         )
         result = run_r2(r2, "/bin/ls", cmd)
@@ -307,7 +307,7 @@ def main() -> int:
         f"off={comment_counts['bin_ls_forced_x86']['meta_off']['meta_lines']}"
     )
     print(
-        "  /bin/ls aaaa median: "
+		"  /bin/ls native-depth median: "
         f"off={off_median:.6f}s on={on_median:.6f}s overhead={overhead_pct:.2f}%"
     )
     for func in AFVJ_POINTER_FUNCS:
