@@ -499,6 +499,14 @@ impl<'ctx> SummaryRegistry<'ctx> {
             budgets.max_memcpy,
             budgets.byte_policy,
         ));
+        registry.register_summary(KernelCopySummary::copyin(
+            budgets.max_memcpy,
+            budgets.byte_policy,
+        ));
+        registry.register_summary(KernelCopySummary::copyout(
+            budgets.max_memcpy,
+            budgets.byte_policy,
+        ));
         registry.register_summary(MemsetSummary::with_policy(
             budgets.max_memset,
             budgets.byte_policy,
@@ -508,6 +516,10 @@ impl<'ctx> SummaryRegistry<'ctx> {
         registry.register_summary(MemcmpSummary::new(budgets.max_memcmp));
         registry.register_summary(MallocSummary::new());
         registry.register_summary(FreeSummary::new());
+        registry.register_summary(ArgReturnSummary::retain());
+        registry.register_summary(NoopSummary::release());
+        registry.register_summary(NoopSummary::lock());
+        registry.register_summary(NoopSummary::unlock());
         registry.register_summary(PutsSummary::new(budgets.max_printf_scan));
         registry.register_summary(PrintfSummaryBasic::new(budgets.max_printf_scan));
         registry.register_summary(ReadSummary::new());
@@ -1771,15 +1783,24 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
     if let Some(rest) = normalized.strip_prefix("__gi_") {
         normalized = rest;
     }
+    while let Some(rest) = normalized.strip_prefix('_') {
+        normalized = rest;
+    }
 
     match normalized {
         "strlen" | "__strlen_chk" => Some("strlen"),
         "strcmp" => Some("strcmp"),
         "memcmp" => Some("memcmp"),
         "memcpy" | "__memcpy_chk" => Some("memcpy"),
+        "copyin" => Some("copyin"),
+        "copyout" => Some("copyout"),
         "memset" => Some("memset"),
         "malloc" | "__libc_malloc" | "__gi___libc_malloc" => Some("malloc"),
         "free" => Some("free"),
+        "os_ref_retain" | "osobject_retain" => Some("retain"),
+        "os_ref_release" | "osobject_release" => Some("release"),
+        "lck_mtx_lock" | "lck_rw_lock_shared" | "lck_rw_lock_exclusive" => Some("lock"),
+        "lck_mtx_unlock" | "lck_rw_unlock_shared" | "lck_rw_unlock_exclusive" => Some("unlock"),
         "puts" => Some("puts"),
         "printf" | "__printf_chk" => Some("printf"),
         "read" | "__read_chk" => Some("read"),
@@ -1797,6 +1818,10 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
                 Some("memcmp")
             } else if normalized.starts_with("memcpy") {
                 Some("memcpy")
+            } else if normalized.starts_with("copyin") {
+                Some("copyin")
+            } else if normalized.starts_with("copyout") {
+                Some("copyout")
             } else if normalized.starts_with("memset") {
                 Some("memset")
             } else if normalized.starts_with("printf") || normalized == "__printf_chk" {
@@ -1813,10 +1838,32 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
                 Some("nanosleep")
             } else if normalized.starts_with("puts") {
                 Some("puts")
-            } else if normalized == "malloc" || normalized.ends_with("malloc") {
+            } else if normalized == "malloc"
+                || normalized.ends_with("malloc")
+                || normalized.starts_with("kalloc")
+                || normalized.starts_with("zalloc")
+            {
                 Some("malloc")
-            } else if normalized == "free" || normalized.ends_with("free") {
+            } else if normalized == "free"
+                || normalized.ends_with("free")
+                || normalized.starts_with("kfree")
+            {
                 Some("free")
+            } else if normalized.contains("retain") {
+                Some("retain")
+            } else if normalized.contains("release") {
+                Some("release")
+            } else if (normalized.starts_with("lck_") && normalized.contains("unlock"))
+                || normalized.starts_with("os_unfair_lock_unlock")
+                || normalized.ends_with("_unlock")
+            {
+                Some("unlock")
+            } else if normalized.starts_with("lck_")
+                || normalized.starts_with("os_unfair_lock_lock")
+                || normalized.ends_with("_lock")
+                || normalized.contains("_lock_")
+            {
+                Some("lock")
             } else if normalized.starts_with("exit") {
                 Some("exit")
             } else {
@@ -1923,6 +1970,76 @@ impl<'ctx> FunctionSummary<'ctx> for MemcpySummary {
             state.note_runtime_store_copy(dst_addr, n as u32, Some(&provenance));
         }
         SummaryEffect::Return(Some(dst))
+    }
+}
+
+/// copyin/copyout-style kernel summary.
+///
+/// The memory transfer is summarized on the success path, but the return value
+/// remains symbolic and range-bounded so callers can still explore fault paths.
+struct KernelCopySummary {
+    name: &'static str,
+    dst_arg: usize,
+    src_arg: usize,
+    len_arg: usize,
+    max_copy: u64,
+    byte_policy: ByteSummaryPolicy,
+}
+
+impl KernelCopySummary {
+    fn copyin(max_copy: u64, byte_policy: ByteSummaryPolicy) -> Self {
+        Self {
+            name: "copyin",
+            dst_arg: 1,
+            src_arg: 0,
+            len_arg: 2,
+            max_copy,
+            byte_policy,
+        }
+    }
+
+    fn copyout(max_copy: u64, byte_policy: ByteSummaryPolicy) -> Self {
+        Self {
+            name: "copyout",
+            dst_arg: 1,
+            src_arg: 0,
+            len_arg: 2,
+            max_copy,
+            byte_policy,
+        }
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for KernelCopySummary {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        3
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let dst = call
+            .args
+            .get(self.dst_arg)
+            .cloned()
+            .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
+        let src = call
+            .args
+            .get(self.src_arg)
+            .cloned()
+            .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
+        let n = call
+            .args
+            .get(self.len_arg)
+            .cloned()
+            .unwrap_or_else(|| SymValue::unknown(call.arg_bits));
+
+        copy_bytes(state, &dst, &src, &n, self.max_copy, self.byte_policy);
+        let ret = SymValue::symbolic(BV::fresh_const(self.name, call.ret_bits), call.ret_bits);
+        state.constrain_range(&ret, 0, 0x1000);
+        SummaryEffect::Return(Some(ret))
     }
 }
 
@@ -2411,6 +2528,74 @@ impl<'ctx> FunctionSummary<'ctx> for FreeSummary {
     }
 }
 
+/// Return one argument unchanged, useful for retain-style helpers.
+struct ArgReturnSummary {
+    name: &'static str,
+    arg_index: usize,
+}
+
+impl ArgReturnSummary {
+    fn retain() -> Self {
+        Self {
+            name: "retain",
+            arg_index: 0,
+        }
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for ArgReturnSummary {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        self.arg_index + 1
+    }
+
+    fn execute(&self, state: &mut SymState<'ctx>, call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        let ret = call
+            .args
+            .get(self.arg_index)
+            .cloned()
+            .unwrap_or_else(|| SymValue::unknown(call.ret_bits));
+        SummaryEffect::Return(Some(adjust_bits(state.context(), ret, call.ret_bits)))
+    }
+}
+
+/// No-op helper summary for side-effect-only helpers whose exact state change
+/// is intentionally not owned by the symbolic executor.
+struct NoopSummary {
+    name: &'static str,
+}
+
+impl NoopSummary {
+    fn release() -> Self {
+        Self { name: "release" }
+    }
+
+    fn lock() -> Self {
+        Self { name: "lock" }
+    }
+
+    fn unlock() -> Self {
+        Self { name: "unlock" }
+    }
+}
+
+impl<'ctx> FunctionSummary<'ctx> for NoopSummary {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn arity(&self) -> usize {
+        1
+    }
+
+    fn execute(&self, _state: &mut SymState<'ctx>, _call: &CallInfo<'ctx>) -> SummaryEffect<'ctx> {
+        SummaryEffect::Return(None)
+    }
+}
+
 /// exit(code) summary.
 #[derive(Default)]
 pub struct ExitSummary;
@@ -2588,6 +2773,55 @@ mod tests {
         assert!(
             SummaryRegistry::with_profile_for_arch(&arch, SummaryProfile::PathListing).is_some()
         );
+    }
+
+    #[test]
+    fn kernel_helper_names_normalize_to_semantic_summaries() {
+        let cases = [
+            ("sym._copyin", Some("copyin")),
+            ("sym._copyout", Some("copyout")),
+            ("sym._IOMalloc", Some("malloc")),
+            ("sym._kalloc_type_impl", Some("malloc")),
+            ("sym._IOFree", Some("free")),
+            ("sym._os_ref_retain", Some("retain")),
+            ("sym._os_ref_release", Some("release")),
+            ("sym._lck_mtx_lock", Some("lock")),
+            ("sym._lck_mtx_unlock", Some("unlock")),
+            ("sym._clock_gettime", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(normalize_core_summary_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn kernel_copyin_summary_copies_success_path_and_keeps_symbolic_status() {
+        let ctx = z3::Context::thread_local();
+        let mut state = SymState::new(&ctx, 0);
+        let src = SymValue::concrete(0x1000, 64);
+        let dst = SymValue::concrete(0x2000, 64);
+        state.mem_write(
+            &src,
+            &SymValue::symbolic_tainted(BV::fresh_const("copyin_src", 8), 8, 0x80),
+            1,
+        );
+
+        let summary = KernelCopySummary::copyin(0x40, ByteSummaryPolicy::precise(0x40));
+        let ret = summary.execute(
+            &mut state,
+            &CallInfo {
+                args: vec![src, dst.clone(), SymValue::concrete(1, 64)],
+                arg_bits: 64,
+                ret_bits: 32,
+            },
+        );
+
+        let copied = state.mem_read(&dst, 1);
+        assert_eq!(copied.get_taint(), 0x80);
+        match ret {
+            SummaryEffect::Return(Some(value)) => assert!(value.as_concrete().is_none()),
+            _ => panic!("expected symbolic copyin status"),
+        }
     }
 
     #[test]
