@@ -1399,7 +1399,11 @@ impl<'a> FoldingContext<'a> {
                 });
 
             for key in &call_expr_keys {
-                facts.call_expr_sources.insert(key.clone(), source_id);
+                facts
+                    .call_expr_sources
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(source_id);
             }
 
             facts.call_ownership.insert(
@@ -5262,48 +5266,27 @@ impl<'a> FoldingContext<'a> {
         {
             return cached;
         }
+        self.call_result_owner_expr_cache
+            .borrow_mut()
+            .insert(cache_key.clone(), None);
 
         let result = self
             .source_call_for_call_expr(expr)
             .or_else(|| self.source_call_for_loose_internal_call_expr(expr))
             .and_then(|source_call| self.stable_owned_call_result_expr_for_source(source_call))
             .or_else(|| {
-                self.fallback_owned_call_result_register_name_from_matching_call_expr(expr)
-                    .map(CExpr::Var)
+                (self.call_expr_source_candidates(expr).len() <= 1)
+                    .then(|| {
+                        self.fallback_owned_call_result_register_name_from_matching_call_expr(expr)
+                            .map(CExpr::Var)
+                    })
+                    .flatten()
             });
 
         self.call_result_owner_expr_cache
             .borrow_mut()
             .insert(cache_key, result.clone());
         result
-    }
-
-    fn call_exprs_match_for_owner(&self, candidate: &CExpr, expr: &CExpr) -> bool {
-        let candidate = self
-            .normalize_call_expr_for_owner_match(candidate)
-            .unwrap_or_else(|| candidate.clone());
-        let expr = self
-            .normalize_call_expr_for_owner_match(expr)
-            .unwrap_or_else(|| expr.clone());
-
-        match (&candidate, &expr) {
-            (
-                CExpr::Call {
-                    func: candidate_func,
-                    args: candidate_args,
-                },
-                CExpr::Call { func, args },
-            ) => {
-                self.call_target_identity(candidate_func.as_ref())
-                    == self.call_target_identity(func.as_ref())
-                    && candidate_args.len() == args.len()
-                    && candidate_args
-                        .iter()
-                        .zip(args.iter())
-                        .all(|(left, right)| left == right)
-            }
-            _ => candidate == expr,
-        }
     }
 
     fn raw_call_exprs_match_for_owner_definition(&self, candidate: &CExpr, expr: &CExpr) -> bool {
@@ -5333,6 +5316,9 @@ impl<'a> FoldingContext<'a> {
         }
         match (left, right) {
             (CExpr::Var(left), CExpr::Var(right)) => {
+                if self.visible_names_share_stack_slot(left, right) {
+                    return true;
+                }
                 self.normalized_call_owner_definition_var_arg(left)
                     == self.normalized_call_owner_definition_var_arg(right)
             }
@@ -5393,45 +5379,64 @@ impl<'a> FoldingContext<'a> {
             return None;
         };
 
+        self.unique_call_expr_source(expr)
+    }
+
+    fn unique_call_expr_source(&self, expr: &CExpr) -> Option<(u64, usize)> {
+        let sources = self.call_expr_source_candidates(expr);
+        let mut iter = sources.into_iter();
+        let source = iter.next()?;
+        iter.next().is_none().then_some(source)
+    }
+
+    fn call_expr_source_candidates(&self, expr: &CExpr) -> BTreeSet<(u64, usize)> {
+        let mut sources = BTreeSet::new();
         let cache_key = call_expr_cache_key(expr);
-        self.ownership()
-            .source_for_call_expr_key(&cache_key)
-            .map(Into::into)
-            .or_else(|| {
-                self.call_result_exprs_map()
+        if let Some(key_sources) = self.ownership().sources_for_call_expr_key(&cache_key) {
+            sources.extend(
+                key_sources
                     .iter()
-                    .find_map(|(source_call, candidate)| {
-                        self.call_exprs_match_for_owner(candidate, expr)
-                            .then_some(*source_call)
-                    })
-            })
-            .or_else(|| {
-                self.call_result_aliases_map()
+                    .map(|source| (source.block_addr, source.op_idx)),
+            );
+        }
+
+        sources.extend(self.call_result_exprs_map().iter().filter_map(
+            |(source_call, candidate)| {
+                self.raw_call_exprs_match_for_owner_definition(candidate, expr)
+                    .then_some(*source_call)
+            },
+        ));
+
+        sources.extend(self.call_result_aliases_map().iter().filter_map(
+            |(source_call, aliases)| {
+                aliases
                     .iter()
-                    .find_map(|(source_call, aliases)| {
-                        aliases
-                            .iter()
-                            .any(|alias| {
-                                self.direct_definition_expr(alias)
-                                    .or_else(|| self.lookup_definition_raw(alias))
-                                    .or_else(|| self.lookup_definition(alias))
-                                    .as_ref()
-                                    .is_some_and(|candidate| {
-                                        self.call_exprs_match_for_owner(candidate, expr)
-                                    })
+                    .any(|alias| {
+                        self.direct_definition_expr(alias)
+                            .or_else(|| self.lookup_definition_raw(alias))
+                            .or_else(|| self.lookup_definition(alias))
+                            .as_ref()
+                            .is_some_and(|candidate| {
+                                self.raw_call_exprs_match_for_owner_definition(candidate, expr)
                             })
-                            .then_some(*source_call)
                     })
-            })
-            .or_else(|| {
-                self.call_result_aliases_map()
-                    .keys()
-                    .find_map(|source_call| {
-                        self.synthesized_call_expr_for_source_call(*source_call)
-                            .filter(|candidate| self.call_exprs_match_for_owner(candidate, expr))
-                            .map(|_| *source_call)
-                    })
-            })
+                    .then_some(*source_call)
+            },
+        ));
+
+        sources.extend(
+            self.call_result_aliases_map()
+                .keys()
+                .filter_map(|source_call| {
+                    self.synthesized_call_expr_for_source_call(*source_call)
+                        .filter(|candidate| {
+                            self.raw_call_exprs_match_for_owner_definition(candidate, expr)
+                        })
+                        .map(|_| *source_call)
+                }),
+        );
+
+        sources
     }
 
     fn source_call_for_loose_internal_call_expr(&self, expr: &CExpr) -> Option<(u64, usize)> {
@@ -5582,13 +5587,22 @@ impl<'a> FoldingContext<'a> {
 
     fn call_target_identity(&self, expr: &CExpr) -> Option<String> {
         match expr {
-            CExpr::Var(name) => Some(normalize_callee_name(name)),
+            CExpr::Var(name) => Some(self.call_target_identity_for_name(name)),
             CExpr::Paren(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
                 self.call_target_identity(inner)
             }
             CExpr::Cast { expr: inner, .. } => self.call_target_identity(inner),
             _ => None,
         }
+    }
+
+    fn call_target_identity_for_name(&self, name: &str) -> String {
+        if let Some(addr) = parse_address_from_var_name(name)
+            && let Some(symbol) = self.inputs.function_names.get(&addr)
+        {
+            return normalize_callee_name(symbol);
+        }
+        normalize_callee_name(name)
     }
 
     fn recovered_owned_call_result_definition_rhs(
@@ -5714,20 +5728,23 @@ impl<'a> FoldingContext<'a> {
             .or_else(|| self.lookup_definition_raw(name))
             .and_then(|definition| {
                 let cache_key = call_expr_cache_key(&definition);
-                self.ownership()
-                    .source_for_call_expr_key(&cache_key)
-                    .map(Into::into)
-                    .or_else(|| {
-                        self.call_result_exprs_map()
+                let mut sources = BTreeSet::new();
+                if let Some(key_sources) = self.ownership().sources_for_call_expr_key(&cache_key) {
+                    sources.extend(
+                        key_sources
                             .iter()
-                            .find_map(|(source_call, candidate)| {
-                                self.raw_call_exprs_match_for_owner_definition(
-                                    candidate,
-                                    &definition,
-                                )
-                                .then_some(*source_call)
-                            })
-                    })
+                            .map(|source| (source.block_addr, source.op_idx)),
+                    );
+                }
+                sources.extend(self.call_result_exprs_map().iter().filter_map(
+                    |(source_call, candidate)| {
+                        self.raw_call_exprs_match_for_owner_definition(candidate, &definition)
+                            .then_some(*source_call)
+                    },
+                ));
+                let mut iter = sources.into_iter();
+                let source = iter.next()?;
+                iter.next().is_none().then_some(source)
             })
     }
 

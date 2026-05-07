@@ -48,6 +48,16 @@ pub struct SummaryEffectRollup {
     pub out_param_indices: Vec<usize>,
     #[serde(default)]
     pub pointer_param_indices: Vec<usize>,
+    #[serde(default)]
+    pub transfer_count: usize,
+    #[serde(default)]
+    pub allocation_count: usize,
+    #[serde(default)]
+    pub lifetime_count: usize,
+    #[serde(default)]
+    pub sync_count: usize,
+    #[serde(default)]
+    pub atomic_count: usize,
     pub helper_summary_count: usize,
     pub has_unknown_calls: bool,
     pub touches_unknown_memory: bool,
@@ -65,6 +75,16 @@ pub struct SummaryHelperView {
     pub out_param_indices: Vec<usize>,
     #[serde(default)]
     pub pointer_param_indices: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfer_effects: Vec<r2ssa::SummaryTransferEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allocation_effects: Vec<r2ssa::SummaryAllocationEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifetime_effects: Vec<r2ssa::SummaryLifetimeEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_effects: Vec<r2ssa::SummarySyncEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub atomic_effects: Vec<r2ssa::SummaryAtomicEffect>,
     pub has_unknown_calls: bool,
     pub touches_unknown_memory: bool,
 }
@@ -301,6 +321,7 @@ fn summary_rollup(set: Option<&r2ssa::InterprocSummarySet>) -> Option<SummaryEff
                     indices.push(index);
                 }
             }
+            push_structured_summary_pointer_indices(summary, &mut indices);
             indices
         })
         .unwrap_or_default();
@@ -312,6 +333,11 @@ fn summary_rollup(set: Option<&r2ssa::InterprocSummarySet>) -> Option<SummaryEff
         root_return_relation: root_summary.map(|summary| summary.return_relation.clone()),
         out_param_indices,
         pointer_param_indices,
+        transfer_count: root_summary.map_or(0, |summary| summary.transfer_effects.len()),
+        allocation_count: root_summary.map_or(0, |summary| summary.allocation_effects.len()),
+        lifetime_count: root_summary.map_or(0, |summary| summary.lifetime_effects.len()),
+        sync_count: root_summary.map_or(0, |summary| summary.sync_effects.len()),
+        atomic_count: root_summary.map_or(0, |summary| summary.atomic_effects.len()),
         helper_summary_count: set
             .summaries
             .len()
@@ -350,6 +376,7 @@ fn helper_views(set: Option<&r2ssa::InterprocSummarySet>) -> Vec<SummaryHelperVi
                     pointer_param_indices.push(index);
                 }
             }
+            push_structured_summary_pointer_indices(summary, &mut pointer_param_indices);
             pointer_param_indices.sort_unstable();
             pointer_param_indices.dedup();
 
@@ -360,6 +387,11 @@ fn helper_views(set: Option<&r2ssa::InterprocSummarySet>) -> Vec<SummaryHelperVi
                 return_relation: summary.return_relation.clone(),
                 out_param_indices,
                 pointer_param_indices,
+                transfer_effects: summary.transfer_effects.clone(),
+                allocation_effects: summary.allocation_effects.clone(),
+                lifetime_effects: summary.lifetime_effects.clone(),
+                sync_effects: summary.sync_effects.clone(),
+                atomic_effects: summary.atomic_effects.clone(),
                 has_unknown_calls: summary.has_unknown_calls,
                 touches_unknown_memory: summary.touches_unknown_memory,
             }
@@ -371,4 +403,24 @@ fn helper_views(set: Option<&r2ssa::InterprocSummarySet>) -> Vec<SummaryHelperVi
             .then(left.function_id.cmp(&right.function_id))
     });
     helpers
+}
+
+fn push_structured_summary_pointer_indices(
+    summary: &r2ssa::FunctionSemanticSummary,
+    indices: &mut Vec<usize>,
+) {
+    for effect in &summary.transfer_effects {
+        if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.dst.region {
+            indices.push(index);
+        }
+        if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.src.region {
+            indices.push(index);
+        }
+    }
+    for effect in &summary.lifetime_effects {
+        indices.push(effect.arg);
+    }
+    for effect in &summary.sync_effects {
+        indices.push(effect.arg);
+    }
 }

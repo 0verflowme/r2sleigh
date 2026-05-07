@@ -53,9 +53,11 @@ pub use graph::{
 pub use interproc::{
     AbiProfile, CallArgObservation, FunctionSemanticSummary, InterprocFunctionId,
     InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet,
-    SummaryArgEffect, SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation,
-    SummaryMemoryRange, SummaryMemoryRegion, SummaryReturnRelation, observe_call_arguments,
-    solve_interproc_summary_set,
+    SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryAtomicOp,
+    SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect,
+    SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion,
+    SummaryReturnRelation, SummarySyncEffect, SummarySyncOp, SummaryTransferEffect,
+    SummaryTransferLength, observe_call_arguments, solve_interproc_summary_set,
 };
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};

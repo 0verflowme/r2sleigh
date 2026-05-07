@@ -16,10 +16,13 @@ use crate::external::{
     ExternalField, ExternalStruct, ExternalTypeDb, normalize_external_type_name,
 };
 use crate::facts::{
-    CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
-    CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
-    FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics,
-    LocalFieldAccessFact, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    CalleeAllocationEffect, CalleeArgEffect, CalleeAtomicEffect, CalleeAtomicOp,
+    CalleeAtomicOrdering, CalleeFact, CalleeLifetimeEffect, CalleeLifetimeOp, CalleeMemoryEffect,
+    CalleeMemoryEffectKind, CalleeMemoryLocation, CalleeMemoryRange, CalleeMemoryRegion,
+    CalleeReturnRelation, CalleeSyncEffect, CalleeSyncOp, CalleeTransferEffect,
+    CalleeTransferLength, FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFactInputs,
+    FunctionTypeFacts, InterprocFactDiagnostics, LocalFieldAccessFact, VisibleBinding,
+    VisibleBindingKind, parse_type_like_spec,
 };
 use crate::function_facts::{FunctionFacts, InterprocSummaryView};
 use crate::model::Signedness;
@@ -246,6 +249,21 @@ impl SemanticTypeProjection {
                     projection.out_param_indices.insert(*idx);
                 }
             }
+            for effect in &summary.transfer_effects {
+                if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.dst.region {
+                    projection.pointer_param_indices.insert(index);
+                    projection.out_param_indices.insert(index);
+                }
+                if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.src.region {
+                    projection.pointer_param_indices.insert(index);
+                }
+            }
+            for effect in &summary.lifetime_effects {
+                projection.pointer_param_indices.insert(effect.arg);
+            }
+            for effect in &summary.sync_effects {
+                projection.pointer_param_indices.insert(effect.arg);
+            }
         }
         projection.slot_field_profiles =
             collect_semantic_slot_profiles(semantic_artifact, ptr_bits);
@@ -332,6 +350,90 @@ fn summary_memory_effect_to_callee(effect: &SummaryMemoryEffect) -> CalleeMemory
     CalleeMemoryEffect { kind, location }
 }
 
+fn summary_location_to_callee(location: r2ssa::SummaryMemoryLocation) -> CalleeMemoryLocation {
+    CalleeMemoryLocation {
+        region: match location.region {
+            r2ssa::SummaryMemoryRegion::Arg { index } => CalleeMemoryRegion::Arg { index },
+            r2ssa::SummaryMemoryRegion::Global { address } => {
+                CalleeMemoryRegion::Global { address }
+            }
+            r2ssa::SummaryMemoryRegion::HeapReturn => CalleeMemoryRegion::HeapReturn,
+            r2ssa::SummaryMemoryRegion::Unknown => CalleeMemoryRegion::Unknown,
+        },
+        range: location.range.map(|range| CalleeMemoryRange {
+            offset_lo: range.offset_lo,
+            offset_hi: range.offset_hi,
+            width: range.width,
+        }),
+    }
+}
+
+fn summary_transfer_effect_to_callee(
+    effect: &r2ssa::SummaryTransferEffect,
+) -> CalleeTransferEffect {
+    CalleeTransferEffect {
+        dst: summary_location_to_callee(effect.dst),
+        src: summary_location_to_callee(effect.src),
+        len: match effect.len {
+            r2ssa::SummaryTransferLength::Arg(index) => CalleeTransferLength::Arg(index),
+            r2ssa::SummaryTransferLength::Const(value) => CalleeTransferLength::Const(value),
+            r2ssa::SummaryTransferLength::Unknown => CalleeTransferLength::Unknown,
+        },
+    }
+}
+
+fn summary_allocation_effect_to_callee(
+    effect: &r2ssa::SummaryAllocationEffect,
+) -> CalleeAllocationEffect {
+    CalleeAllocationEffect {
+        size_arg: effect.size_arg,
+        zeroed: effect.zeroed,
+    }
+}
+
+fn summary_lifetime_effect_to_callee(
+    effect: &r2ssa::SummaryLifetimeEffect,
+) -> CalleeLifetimeEffect {
+    CalleeLifetimeEffect {
+        arg: effect.arg,
+        op: match effect.op {
+            r2ssa::SummaryLifetimeOp::Free => CalleeLifetimeOp::Free,
+            r2ssa::SummaryLifetimeOp::Retain => CalleeLifetimeOp::Retain,
+            r2ssa::SummaryLifetimeOp::Release => CalleeLifetimeOp::Release,
+        },
+    }
+}
+
+fn summary_sync_effect_to_callee(effect: &r2ssa::SummarySyncEffect) -> CalleeSyncEffect {
+    CalleeSyncEffect {
+        arg: effect.arg,
+        op: match effect.op {
+            r2ssa::SummarySyncOp::Lock => CalleeSyncOp::Lock,
+            r2ssa::SummarySyncOp::Unlock => CalleeSyncOp::Unlock,
+        },
+    }
+}
+
+fn summary_atomic_effect_to_callee(effect: &r2ssa::SummaryAtomicEffect) -> CalleeAtomicEffect {
+    CalleeAtomicEffect {
+        op: match effect.op {
+            r2ssa::SummaryAtomicOp::LoadLinked => CalleeAtomicOp::LoadLinked,
+            r2ssa::SummaryAtomicOp::StoreConditional => CalleeAtomicOp::StoreConditional,
+            r2ssa::SummaryAtomicOp::CompareExchange => CalleeAtomicOp::CompareExchange,
+            r2ssa::SummaryAtomicOp::Fence => CalleeAtomicOp::Fence,
+        },
+        location: summary_location_to_callee(effect.location),
+        ordering: match effect.ordering {
+            r2ssa::SummaryAtomicOrdering::Relaxed => CalleeAtomicOrdering::Relaxed,
+            r2ssa::SummaryAtomicOrdering::Acquire => CalleeAtomicOrdering::Acquire,
+            r2ssa::SummaryAtomicOrdering::Release => CalleeAtomicOrdering::Release,
+            r2ssa::SummaryAtomicOrdering::AcqRel => CalleeAtomicOrdering::AcqRel,
+            r2ssa::SummaryAtomicOrdering::SeqCst => CalleeAtomicOrdering::SeqCst,
+            r2ssa::SummaryAtomicOrdering::Unknown => CalleeAtomicOrdering::Unknown,
+        },
+    }
+}
+
 fn summary_param_type_hints(summary: &FunctionSemanticSummary) -> BTreeMap<usize, CTypeLike> {
     let pointer_ty = CTypeLike::Pointer(Box::new(CTypeLike::Void));
     let mut hints = BTreeMap::new();
@@ -340,6 +442,23 @@ fn summary_param_type_hints(summary: &FunctionSemanticSummary) -> BTreeMap<usize
         if let SummaryMemoryRegion::Arg { index } = effect.location.region {
             max_idx = max_idx.max(index);
         }
+    }
+    for effect in &summary.transfer_effects {
+        if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.dst.region {
+            max_idx = max_idx.max(index);
+        }
+        if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.src.region {
+            max_idx = max_idx.max(index);
+        }
+        if let r2ssa::SummaryTransferLength::Arg(index) = effect.len {
+            max_idx = max_idx.max(index);
+        }
+    }
+    for effect in &summary.lifetime_effects {
+        max_idx = max_idx.max(effect.arg);
+    }
+    for effect in &summary.sync_effects {
+        max_idx = max_idx.max(effect.arg);
     }
     for idx in 0..=max_idx {
         if summary_suggests_pointer_param(summary, idx) {
@@ -378,6 +497,31 @@ fn summary_to_callee_fact(summary: &FunctionSemanticSummary) -> CalleeFact {
             .memory_effects
             .iter()
             .map(summary_memory_effect_to_callee)
+            .collect(),
+        transfer_effects: summary
+            .transfer_effects
+            .iter()
+            .map(summary_transfer_effect_to_callee)
+            .collect(),
+        allocation_effects: summary
+            .allocation_effects
+            .iter()
+            .map(summary_allocation_effect_to_callee)
+            .collect(),
+        lifetime_effects: summary
+            .lifetime_effects
+            .iter()
+            .map(summary_lifetime_effect_to_callee)
+            .collect(),
+        sync_effects: summary
+            .sync_effects
+            .iter()
+            .map(summary_sync_effect_to_callee)
+            .collect(),
+        atomic_effects: summary
+            .atomic_effects
+            .iter()
+            .map(summary_atomic_effect_to_callee)
             .collect(),
         param_type_hints,
         return_type_hint,
@@ -419,6 +563,15 @@ fn summary_suggests_pointer_param(summary: &FunctionSemanticSummary, idx: usize)
         || summary.memory_effects.iter().any(|effect| {
             matches!(effect.location.region, SummaryMemoryRegion::Arg { index } if index == idx)
         })
+        || summary.transfer_effects.iter().any(|effect| {
+            matches!(effect.dst.region, r2ssa::SummaryMemoryRegion::Arg { index } if index == idx)
+                || matches!(effect.src.region, r2ssa::SummaryMemoryRegion::Arg { index } if index == idx)
+        })
+        || summary
+            .lifetime_effects
+            .iter()
+            .any(|effect| effect.arg == idx)
+        || summary.sync_effects.iter().any(|effect| effect.arg == idx)
 }
 
 fn maybe_upgrade_param_to_pointer(
@@ -4388,6 +4541,11 @@ mod tests {
                         },
                     )]),
                     memory_effects: Vec::new(),
+                    transfer_effects: Vec::new(),
+                    allocation_effects: Vec::new(),
+                    lifetime_effects: Vec::new(),
+                    sync_effects: Vec::new(),
+                    atomic_effects: Vec::new(),
                     return_relation: SummaryReturnRelation::Void,
                     reads_global_memory: false,
                     writes_global_memory: false,
@@ -4445,6 +4603,11 @@ mod tests {
                     has_unknown_calls: false,
                     arg_effects: BTreeMap::new(),
                     memory_effects: Vec::new(),
+                    transfer_effects: Vec::new(),
+                    allocation_effects: Vec::new(),
+                    lifetime_effects: Vec::new(),
+                    sync_effects: Vec::new(),
+                    atomic_effects: Vec::new(),
                     return_relation: SummaryReturnRelation::HeapAlloc,
                     reads_global_memory: false,
                     writes_global_memory: false,
@@ -4503,6 +4666,11 @@ mod tests {
                         has_unknown_calls: false,
                         arg_effects: BTreeMap::new(),
                         memory_effects: Vec::new(),
+                        transfer_effects: Vec::new(),
+                        allocation_effects: Vec::new(),
+                        lifetime_effects: Vec::new(),
+                        sync_effects: Vec::new(),
+                        atomic_effects: Vec::new(),
                         return_relation: SummaryReturnRelation::Arg(0),
                         reads_global_memory: false,
                         writes_global_memory: false,
@@ -4528,6 +4696,11 @@ mod tests {
                             },
                         )]),
                         memory_effects: Vec::new(),
+                        transfer_effects: Vec::new(),
+                        allocation_effects: Vec::new(),
+                        lifetime_effects: Vec::new(),
+                        sync_effects: Vec::new(),
+                        atomic_effects: Vec::new(),
                         return_relation: SummaryReturnRelation::Arg(0),
                         reads_global_memory: false,
                         writes_global_memory: false,
@@ -5831,6 +6004,11 @@ mod tests {
                 has_unknown_calls: false,
                 arg_effects: BTreeMap::new(),
                 memory_effects: Vec::new(),
+                transfer_effects: Vec::new(),
+                allocation_effects: Vec::new(),
+                lifetime_effects: Vec::new(),
+                sync_effects: Vec::new(),
+                atomic_effects: Vec::new(),
                 return_relation: r2ssa::SummaryReturnRelation::HeapAlloc,
                 reads_global_memory: false,
                 writes_global_memory: false,
@@ -5898,6 +6076,11 @@ mod tests {
                 has_unknown_calls: false,
                 arg_effects: BTreeMap::new(),
                 memory_effects: Vec::new(),
+                transfer_effects: Vec::new(),
+                allocation_effects: Vec::new(),
+                lifetime_effects: Vec::new(),
+                sync_effects: Vec::new(),
+                atomic_effects: Vec::new(),
                 return_relation: r2ssa::SummaryReturnRelation::Unknown,
                 reads_global_memory: false,
                 writes_global_memory: false,
@@ -5949,6 +6132,21 @@ mod tests {
                         },
                     },
                 ],
+                transfer_effects: vec![r2ssa::SummaryTransferEffect {
+                    dst: r2ssa::SummaryMemoryLocation {
+                        region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                        range: None,
+                    },
+                    src: r2ssa::SummaryMemoryLocation {
+                        region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                        range: None,
+                    },
+                    len: r2ssa::SummaryTransferLength::Arg(2),
+                }],
+                allocation_effects: Vec::new(),
+                lifetime_effects: Vec::new(),
+                sync_effects: Vec::new(),
+                atomic_effects: Vec::new(),
                 return_relation: r2ssa::SummaryReturnRelation::Arg(0),
                 reads_global_memory: false,
                 writes_global_memory: false,
@@ -6028,6 +6226,20 @@ mod tests {
                 }
             )
         }));
+        assert_eq!(
+            helper_fact.transfer_effects,
+            vec![crate::facts::CalleeTransferEffect {
+                dst: crate::facts::CalleeMemoryLocation {
+                    region: crate::facts::CalleeMemoryRegion::Arg { index: 0 },
+                    range: None,
+                },
+                src: crate::facts::CalleeMemoryLocation {
+                    region: crate::facts::CalleeMemoryRegion::Arg { index: 1 },
+                    range: None,
+                },
+                len: crate::facts::CalleeTransferLength::Arg(2),
+            }]
+        );
     }
 
     #[test]
@@ -6064,6 +6276,11 @@ mod tests {
                             }),
                         },
                     }],
+                    transfer_effects: Vec::new(),
+                    allocation_effects: Vec::new(),
+                    lifetime_effects: Vec::new(),
+                    sync_effects: Vec::new(),
+                    atomic_effects: Vec::new(),
                     return_relation: SummaryReturnRelation::Void,
                     reads_global_memory: false,
                     writes_global_memory: false,

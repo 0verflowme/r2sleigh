@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use r2il::ArchSpec;
+use r2il::{ArchSpec, MemoryOrdering};
 use serde::{Deserialize, Serialize};
 
 use crate::function::{SSAFunction, SsaArtifact};
@@ -52,6 +52,76 @@ pub struct SummaryMemoryLocation {
 pub struct SummaryMemoryEffect {
     pub kind: SummaryMemoryEffectKind,
     pub location: SummaryMemoryLocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SummaryTransferLength {
+    Arg(usize),
+    Const(u64),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SummaryTransferEffect {
+    pub dst: SummaryMemoryLocation,
+    pub src: SummaryMemoryLocation,
+    pub len: SummaryTransferLength,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SummaryAllocationEffect {
+    pub size_arg: Option<usize>,
+    pub zeroed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SummaryLifetimeOp {
+    Free,
+    Retain,
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SummaryLifetimeEffect {
+    pub arg: usize,
+    pub op: SummaryLifetimeOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SummarySyncOp {
+    Lock,
+    Unlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SummarySyncEffect {
+    pub arg: usize,
+    pub op: SummarySyncOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SummaryAtomicOp {
+    LoadLinked,
+    StoreConditional,
+    CompareExchange,
+    Fence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SummaryAtomicOrdering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SummaryAtomicEffect {
+    pub op: SummaryAtomicOp,
+    pub location: SummaryMemoryLocation,
+    pub ordering: SummaryAtomicOrdering,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +173,16 @@ pub struct FunctionSemanticSummary {
     pub arg_effects: BTreeMap<usize, SummaryArgEffect>,
     #[serde(default)]
     pub memory_effects: Vec<SummaryMemoryEffect>,
+    #[serde(default)]
+    pub transfer_effects: Vec<SummaryTransferEffect>,
+    #[serde(default)]
+    pub allocation_effects: Vec<SummaryAllocationEffect>,
+    #[serde(default)]
+    pub lifetime_effects: Vec<SummaryLifetimeEffect>,
+    #[serde(default)]
+    pub sync_effects: Vec<SummarySyncEffect>,
+    #[serde(default)]
+    pub atomic_effects: Vec<SummaryAtomicEffect>,
     pub return_relation: SummaryReturnRelation,
     pub reads_global_memory: bool,
     pub writes_global_memory: bool,
@@ -120,6 +200,11 @@ impl FunctionSemanticSummary {
             has_unknown_calls: false,
             arg_effects: BTreeMap::new(),
             memory_effects: Vec::new(),
+            transfer_effects: Vec::new(),
+            allocation_effects: Vec::new(),
+            lifetime_effects: Vec::new(),
+            sync_effects: Vec::new(),
+            atomic_effects: Vec::new(),
             return_relation: SummaryReturnRelation::Unknown,
             reads_global_memory: false,
             writes_global_memory: false,
@@ -141,34 +226,148 @@ impl FunctionSemanticSummary {
                 },
             );
         };
+        let mut memory_effects = Vec::new();
+        let mut transfer_effects = Vec::new();
+        let mut allocation_effects = Vec::new();
+        let mut lifetime_effects = Vec::new();
+        let mut sync_effects = Vec::new();
+        let atomic_effects = Vec::new();
 
         let return_relation = match normalized {
-            "malloc" => SummaryReturnRelation::HeapAlloc,
+            "malloc" => {
+                effect(0, true, false, false, false);
+                allocation_effects.push(SummaryAllocationEffect {
+                    size_arg: Some(0),
+                    zeroed: false,
+                });
+                SummaryReturnRelation::HeapAlloc
+            }
+            "calloc" => {
+                effect(0, true, false, false, false);
+                effect(1, true, false, false, false);
+                allocation_effects.push(SummaryAllocationEffect {
+                    size_arg: Some(1),
+                    zeroed: true,
+                });
+                SummaryReturnRelation::HeapAlloc
+            }
             "free" => {
                 effect(0, false, false, true, true);
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Free,
+                    location: arg_location(0, None, None),
+                });
+                lifetime_effects.push(SummaryLifetimeEffect {
+                    arg: 0,
+                    op: SummaryLifetimeOp::Free,
+                });
                 SummaryReturnRelation::Void
             }
-            "memcpy" => {
+            "memcpy" | "memmove" => {
                 effect(0, false, true, true, false);
                 effect(1, true, false, false, false);
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Write,
+                    location: arg_location(0, None, None),
+                });
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: arg_location(1, None, None),
+                });
+                transfer_effects.push(SummaryTransferEffect {
+                    dst: arg_location(0, None, None),
+                    src: arg_location(1, None, None),
+                    len: SummaryTransferLength::Arg(2),
+                });
                 SummaryReturnRelation::Arg(0)
+            }
+            "copyin" | "copyout" => {
+                effect(0, true, false, false, false);
+                effect(1, false, true, true, false);
+                effect(2, true, false, false, false);
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: arg_location(0, None, None),
+                });
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Write,
+                    location: arg_location(1, None, None),
+                });
+                transfer_effects.push(SummaryTransferEffect {
+                    dst: arg_location(1, None, None),
+                    src: arg_location(0, None, None),
+                    len: SummaryTransferLength::Arg(2),
+                });
+                SummaryReturnRelation::Unknown
             }
             "memset" => {
                 effect(0, false, true, true, false);
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Write,
+                    location: arg_location(0, None, None),
+                });
                 SummaryReturnRelation::Arg(0)
             }
             "strlen" => {
                 effect(0, true, false, false, false);
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: arg_location(0, None, None),
+                });
                 SummaryReturnRelation::Unknown
             }
             "strcmp" | "memcmp" => {
                 effect(0, true, false, false, false);
                 effect(1, true, false, false, false);
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: arg_location(0, None, None),
+                });
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: arg_location(1, None, None),
+                });
                 SummaryReturnRelation::Unknown
             }
             "puts" | "printf" => {
                 effect(0, true, false, false, false);
+                memory_effects.push(SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: arg_location(0, None, None),
+                });
                 SummaryReturnRelation::Unknown
+            }
+            "retain" => {
+                effect(0, true, false, true, false);
+                lifetime_effects.push(SummaryLifetimeEffect {
+                    arg: 0,
+                    op: SummaryLifetimeOp::Retain,
+                });
+                SummaryReturnRelation::Arg(0)
+            }
+            "release" => {
+                effect(0, false, false, true, false);
+                lifetime_effects.push(SummaryLifetimeEffect {
+                    arg: 0,
+                    op: SummaryLifetimeOp::Release,
+                });
+                SummaryReturnRelation::Void
+            }
+            "lock" => {
+                effect(0, false, false, true, false);
+                sync_effects.push(SummarySyncEffect {
+                    arg: 0,
+                    op: SummarySyncOp::Lock,
+                });
+                SummaryReturnRelation::Void
+            }
+            "unlock" => {
+                effect(0, false, false, true, false);
+                sync_effects.push(SummarySyncEffect {
+                    arg: 0,
+                    op: SummarySyncOp::Unlock,
+                });
+                SummaryReturnRelation::Void
             }
             "exit" => SummaryReturnRelation::Void,
             _ => return None,
@@ -178,16 +377,23 @@ impl FunctionSemanticSummary {
             id,
             name: Some(normalized.to_string()),
             arg_count_hint: Some(match normalized {
-                "malloc" | "free" | "strlen" | "puts" | "printf" | "exit" => 1,
+                "malloc" | "free" | "strlen" | "puts" | "printf" | "exit" | "retain"
+                | "release" | "lock" | "unlock" => 1,
+                "calloc" => 2,
                 "strcmp" | "memcmp" => 2,
-                "memcpy" | "memset" => 3,
+                "memcpy" | "memmove" | "copyin" | "copyout" | "memset" => 3,
                 _ => 0,
             }),
             direct_callees: BTreeSet::new(),
             callsite_count: 0,
             has_unknown_calls: false,
             arg_effects,
-            memory_effects: Vec::new(),
+            memory_effects,
+            transfer_effects,
+            allocation_effects,
+            lifetime_effects,
+            sync_effects,
+            atomic_effects,
             return_relation,
             reads_global_memory: false,
             writes_global_memory: false,
@@ -443,6 +649,11 @@ struct LocalSummaryFacts {
     has_unknown_calls: bool,
     arg_effects: BTreeMap<usize, SummaryArgEffect>,
     memory_effects: BTreeSet<SummaryMemoryEffect>,
+    transfer_effects: BTreeSet<SummaryTransferEffect>,
+    allocation_effects: BTreeSet<SummaryAllocationEffect>,
+    lifetime_effects: BTreeSet<SummaryLifetimeEffect>,
+    sync_effects: BTreeSet<SummarySyncEffect>,
+    atomic_effects: BTreeSet<SummaryAtomicEffect>,
     return_observations: Vec<SummaryValueObservation>,
     call_observations: BTreeMap<CallSiteId, CallObservation>,
 }
@@ -482,6 +693,17 @@ fn unknown_location() -> SummaryMemoryLocation {
     SummaryMemoryLocation {
         region: SummaryMemoryRegion::Unknown,
         range: None,
+    }
+}
+
+fn summary_atomic_ordering(ordering: MemoryOrdering) -> SummaryAtomicOrdering {
+    match ordering {
+        MemoryOrdering::Relaxed => SummaryAtomicOrdering::Relaxed,
+        MemoryOrdering::Acquire => SummaryAtomicOrdering::Acquire,
+        MemoryOrdering::Release => SummaryAtomicOrdering::Release,
+        MemoryOrdering::AcqRel => SummaryAtomicOrdering::AcqRel,
+        MemoryOrdering::SeqCst => SummaryAtomicOrdering::SeqCst,
+        MemoryOrdering::Unknown => SummaryAtomicOrdering::Unknown,
     }
 }
 
@@ -669,6 +891,11 @@ fn initial_summary(
         has_unknown_calls: local.has_unknown_calls,
         arg_effects: local.arg_effects.clone(),
         memory_effects: local.memory_effects.iter().copied().collect(),
+        transfer_effects: local.transfer_effects.iter().copied().collect(),
+        allocation_effects: local.allocation_effects.iter().copied().collect(),
+        lifetime_effects: local.lifetime_effects.iter().copied().collect(),
+        sync_effects: local.sync_effects.iter().copied().collect(),
+        atomic_effects: local.atomic_effects.iter().copied().collect(),
         return_relation: resolve_return_relation(&local.return_observations, &BTreeMap::new()),
         reads_global_memory,
         writes_global_memory,
@@ -684,6 +911,11 @@ fn resolve_summary(
 ) -> FunctionSemanticSummary {
     let mut arg_effects = local.arg_effects.clone();
     let mut memory_effects = local.memory_effects.clone();
+    let mut transfer_effects = local.transfer_effects.clone();
+    let mut allocation_effects = local.allocation_effects.clone();
+    let mut lifetime_effects = local.lifetime_effects.clone();
+    let mut sync_effects = local.sync_effects.clone();
+    let mut atomic_effects = local.atomic_effects.clone();
     for call in local.call_observations.values() {
         let Some(callee) = current.get(&InterprocFunctionId(call.target)) else {
             continue;
@@ -703,6 +935,23 @@ fn resolve_summary(
         for effect in &callee.memory_effects {
             memory_effects.insert(remap_memory_effect(effect, &call.args));
         }
+        for effect in &callee.transfer_effects {
+            transfer_effects.insert(remap_transfer_effect(effect, &call.args));
+        }
+        allocation_effects.extend(callee.allocation_effects.iter().copied());
+        for effect in &callee.lifetime_effects {
+            if let Some(effect) = remap_lifetime_effect(effect, &call.args) {
+                lifetime_effects.insert(effect);
+            }
+        }
+        for effect in &callee.sync_effects {
+            if let Some(effect) = remap_sync_effect(effect, &call.args) {
+                sync_effects.insert(effect);
+            }
+        }
+        for effect in &callee.atomic_effects {
+            atomic_effects.insert(remap_atomic_effect(effect, &call.args));
+        }
     }
     let (reads_global_memory, writes_global_memory, touches_unknown_memory) =
         summarize_memory_effect_flags(&memory_effects);
@@ -716,6 +965,11 @@ fn resolve_summary(
         has_unknown_calls: local.has_unknown_calls,
         arg_effects,
         memory_effects: memory_effects.iter().copied().collect(),
+        transfer_effects: transfer_effects.iter().copied().collect(),
+        allocation_effects: allocation_effects.iter().copied().collect(),
+        lifetime_effects: lifetime_effects.iter().copied().collect(),
+        sync_effects: sync_effects.iter().copied().collect(),
+        atomic_effects: atomic_effects.iter().copied().collect(),
         return_relation: resolve_return_relation_with_wrapper_fallback(local, current),
         reads_global_memory,
         writes_global_memory,
@@ -753,15 +1007,25 @@ fn remap_memory_effect(
     effect: &SummaryMemoryEffect,
     args: &[SummaryOperand],
 ) -> SummaryMemoryEffect {
-    let location = match effect.location.region {
+    SummaryMemoryEffect {
+        kind: effect.kind,
+        location: remap_memory_location(effect.location, args),
+    }
+}
+
+fn remap_memory_location(
+    location: SummaryMemoryLocation,
+    args: &[SummaryOperand],
+) -> SummaryMemoryLocation {
+    match location.region {
         SummaryMemoryRegion::Arg { index } => match args.get(index) {
             Some(SummaryOperand::Arg(caller_idx)) => SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Arg { index: *caller_idx },
-                range: effect.location.range,
+                range: location.range,
             },
             Some(SummaryOperand::Const(value)) => SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Global { address: *value },
-                range: effect.location.range,
+                range: location.range,
             },
             _ => SummaryMemoryLocation {
                 region: SummaryMemoryRegion::Unknown,
@@ -770,12 +1034,70 @@ fn remap_memory_effect(
         },
         other => SummaryMemoryLocation {
             region: other,
-            range: effect.location.range,
+            range: location.range,
         },
+    }
+}
+
+fn remap_transfer_effect(
+    effect: &SummaryTransferEffect,
+    args: &[SummaryOperand],
+) -> SummaryTransferEffect {
+    SummaryTransferEffect {
+        dst: remap_memory_location(effect.dst, args),
+        src: remap_memory_location(effect.src, args),
+        len: remap_transfer_len(effect.len, args),
+    }
+}
+
+fn remap_transfer_len(
+    len: SummaryTransferLength,
+    args: &[SummaryOperand],
+) -> SummaryTransferLength {
+    match len {
+        SummaryTransferLength::Arg(index) => match args.get(index) {
+            Some(SummaryOperand::Arg(caller_idx)) => SummaryTransferLength::Arg(*caller_idx),
+            Some(SummaryOperand::Const(value)) => SummaryTransferLength::Const(*value),
+            _ => SummaryTransferLength::Unknown,
+        },
+        other => other,
+    }
+}
+
+fn remap_lifetime_effect(
+    effect: &SummaryLifetimeEffect,
+    args: &[SummaryOperand],
+) -> Option<SummaryLifetimeEffect> {
+    let Some(SummaryOperand::Arg(caller_arg)) = args.get(effect.arg) else {
+        return None;
     };
-    SummaryMemoryEffect {
-        kind: effect.kind,
-        location,
+    Some(SummaryLifetimeEffect {
+        arg: *caller_arg,
+        op: effect.op,
+    })
+}
+
+fn remap_sync_effect(
+    effect: &SummarySyncEffect,
+    args: &[SummaryOperand],
+) -> Option<SummarySyncEffect> {
+    let Some(SummaryOperand::Arg(caller_arg)) = args.get(effect.arg) else {
+        return None;
+    };
+    Some(SummarySyncEffect {
+        arg: *caller_arg,
+        op: effect.op,
+    })
+}
+
+fn remap_atomic_effect(
+    effect: &SummaryAtomicEffect,
+    args: &[SummaryOperand],
+) -> SummaryAtomicEffect {
+    SummaryAtomicEffect {
+        op: effect.op,
+        location: remap_memory_location(effect.location, args),
+        ordering: effect.ordering,
     }
 }
 
@@ -877,6 +1199,11 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
         has_unknown_calls: false,
         arg_effects: BTreeMap::new(),
         memory_effects: BTreeSet::new(),
+        transfer_effects: BTreeSet::new(),
+        allocation_effects: BTreeSet::new(),
+        lifetime_effects: BTreeSet::new(),
+        sync_effects: BTreeSet::new(),
+        atomic_effects: BTreeSet::new(),
         return_observations: Vec::new(),
         call_observations: BTreeMap::new(),
     };
@@ -958,6 +1285,15 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                         kind: SummaryMemoryEffectKind::Read,
                         location: classify_memory_access_location(prepared, abi, addr, dst.size),
                     });
+                    if let SSAOp::LoadLinked { ordering, .. } = op {
+                        out.atomic_effects.insert(SummaryAtomicEffect {
+                            op: SummaryAtomicOp::LoadLinked,
+                            location: classify_memory_access_location(
+                                prepared, abi, addr, dst.size,
+                            ),
+                            ordering: summary_atomic_ordering(*ordering),
+                        });
+                    }
                 }
                 SSAOp::AtomicCAS { addr, expected, .. } => {
                     let operand = prepared
@@ -988,6 +1324,15 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                         kind: SummaryMemoryEffectKind::Write,
                         location,
                     });
+                    out.atomic_effects.insert(SummaryAtomicEffect {
+                        op: SummaryAtomicOp::CompareExchange,
+                        location,
+                        ordering: if let SSAOp::AtomicCAS { ordering, .. } = op {
+                            summary_atomic_ordering(*ordering)
+                        } else {
+                            SummaryAtomicOrdering::Unknown
+                        },
+                    });
                 }
                 SSAOp::StoreConditional { addr, val, .. } => {
                     let operand = prepared
@@ -1016,6 +1361,22 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
                     out.memory_effects.insert(SummaryMemoryEffect {
                         kind: SummaryMemoryEffectKind::Write,
                         location,
+                    });
+                    out.atomic_effects.insert(SummaryAtomicEffect {
+                        op: SummaryAtomicOp::StoreConditional,
+                        location,
+                        ordering: if let SSAOp::StoreConditional { ordering, .. } = op {
+                            summary_atomic_ordering(*ordering)
+                        } else {
+                            SummaryAtomicOrdering::Unknown
+                        },
+                    });
+                }
+                SSAOp::Fence { ordering } => {
+                    out.atomic_effects.insert(SummaryAtomicEffect {
+                        op: SummaryAtomicOp::Fence,
+                        location: unknown_location(),
+                        ordering: summary_atomic_ordering(*ordering),
                     });
                 }
                 SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
@@ -1744,18 +2105,67 @@ fn normalize_seed_name(name: &str) -> Option<&'static str> {
     if let Some(rest) = normalized.strip_prefix("__gi_") {
         normalized = rest;
     }
+    while let Some(rest) = normalized.strip_prefix('_') {
+        normalized = rest;
+    }
     match normalized {
         "strlen" | "__strlen_chk" => Some("strlen"),
         "strcmp" => Some("strcmp"),
         "memcmp" => Some("memcmp"),
         "memcpy" | "__memcpy_chk" => Some("memcpy"),
+        "memmove" | "__memmove_chk" => Some("memmove"),
+        "copyin" => Some("copyin"),
+        "copyout" => Some("copyout"),
         "memset" => Some("memset"),
         "malloc" | "__libc_malloc" | "__gi___libc_malloc" => Some("malloc"),
+        "calloc" | "__libc_calloc" => Some("calloc"),
         "free" => Some("free"),
+        "os_ref_retain" | "osobject_retain" => Some("retain"),
+        "os_ref_release" | "osobject_release" => Some("release"),
+        "lck_mtx_lock" | "lck_rw_lock_shared" | "lck_rw_lock_exclusive" => Some("lock"),
+        "lck_mtx_unlock" | "lck_rw_unlock_shared" | "lck_rw_unlock_exclusive" => Some("unlock"),
         "puts" => Some("puts"),
         "printf" | "__printf_chk" => Some("printf"),
         "exit" | "_exit" => Some("exit"),
-        _ => None,
+        _ => {
+            if normalized.starts_with("memcpy") {
+                Some("memcpy")
+            } else if normalized.starts_with("memmove") {
+                Some("memmove")
+            } else if normalized.starts_with("copyin") {
+                Some("copyin")
+            } else if normalized.starts_with("copyout") {
+                Some("copyout")
+            } else if normalized == "malloc"
+                || normalized.ends_with("malloc")
+                || normalized.starts_with("kalloc")
+                || normalized.starts_with("zalloc")
+            {
+                Some("malloc")
+            } else if normalized == "free"
+                || normalized.ends_with("free")
+                || normalized.starts_with("kfree")
+            {
+                Some("free")
+            } else if normalized.contains("retain") {
+                Some("retain")
+            } else if normalized.contains("release") {
+                Some("release")
+            } else if (normalized.starts_with("lck_") && normalized.contains("unlock"))
+                || normalized.starts_with("os_unfair_lock_unlock")
+                || normalized.ends_with("_unlock")
+            {
+                Some("unlock")
+            } else if normalized.starts_with("lck_")
+                || normalized.starts_with("os_unfair_lock_lock")
+                || normalized.ends_with("_lock")
+                || normalized.contains("_lock_")
+            {
+                Some("lock")
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -1847,11 +2257,65 @@ mod tests {
             FunctionSemanticSummary::seed_for_name(InterprocFunctionId(1), "sym.imp.malloc")
                 .expect("malloc seed");
         assert_eq!(malloc.return_relation, SummaryReturnRelation::HeapAlloc);
+        assert_eq!(
+            malloc.allocation_effects,
+            vec![SummaryAllocationEffect {
+                size_arg: Some(0),
+                zeroed: false,
+            }]
+        );
         let memcpy = FunctionSemanticSummary::seed_for_name(InterprocFunctionId(2), "memcpy")
             .expect("memcpy seed");
         assert_eq!(memcpy.return_relation, SummaryReturnRelation::Arg(0));
         assert!(memcpy.arg_effects.get(&0).expect("dst").write);
         assert!(memcpy.arg_effects.get(&1).expect("src").read);
+        assert_eq!(
+            memcpy.transfer_effects,
+            vec![SummaryTransferEffect {
+                dst: arg_location(0, None, None),
+                src: arg_location(1, None, None),
+                len: SummaryTransferLength::Arg(2),
+            }]
+        );
+    }
+
+    #[test]
+    fn seed_summary_models_kernel_helpers_as_canonical_effects() {
+        let copyin = FunctionSemanticSummary::seed_for_name(InterprocFunctionId(3), "sym._copyin")
+            .expect("copyin seed");
+        assert_eq!(
+            copyin.transfer_effects,
+            vec![SummaryTransferEffect {
+                dst: arg_location(1, None, None),
+                src: arg_location(0, None, None),
+                len: SummaryTransferLength::Arg(2),
+            }]
+        );
+        assert!(copyin.arg_effects.get(&0).expect("src").read);
+        assert!(copyin.arg_effects.get(&1).expect("dst").write);
+
+        let retain =
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(4), "sym._os_ref_retain")
+                .expect("retain seed");
+        assert_eq!(retain.return_relation, SummaryReturnRelation::Arg(0));
+        assert_eq!(
+            retain.lifetime_effects,
+            vec![SummaryLifetimeEffect {
+                arg: 0,
+                op: SummaryLifetimeOp::Retain,
+            }]
+        );
+
+        let lock =
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(5), "sym._lck_mtx_lock")
+                .expect("lock seed");
+        assert_eq!(
+            lock.sync_effects,
+            vec![SummarySyncEffect {
+                arg: 0,
+                op: SummarySyncOp::Lock,
+            }]
+        );
     }
 
     #[test]
@@ -2118,6 +2582,14 @@ mod tests {
         let arg0 = summary.arg_effects.get(&0).expect("arg effect");
         assert!(arg0.read);
         assert!(arg0.write);
+        assert_eq!(
+            summary.atomic_effects,
+            vec![SummaryAtomicEffect {
+                op: SummaryAtomicOp::StoreConditional,
+                location: arg_location(0, Some(0), Some(1)),
+                ordering: SummaryAtomicOrdering::SeqCst,
+            }]
+        );
         assert!(summary.memory_effects.iter().any(|effect| {
             matches!(
                 effect,
@@ -2180,6 +2652,14 @@ mod tests {
         let arg0 = summary.arg_effects.get(&0).expect("arg effect");
         assert!(arg0.read);
         assert!(arg0.write);
+        assert_eq!(
+            summary.atomic_effects,
+            vec![SummaryAtomicEffect {
+                op: SummaryAtomicOp::CompareExchange,
+                location: arg_location(0, Some(0), Some(8)),
+                ordering: SummaryAtomicOrdering::SeqCst,
+            }]
+        );
         assert!(summary.memory_effects.iter().any(|effect| {
             matches!(
                 effect,

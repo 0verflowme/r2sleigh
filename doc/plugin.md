@@ -136,12 +136,23 @@ R2SLEIGH_KERNELCACHE=/path/to/kernelcache \
   scripts/kernel_smoke.py \
   --r2 /Users/priyanshu/code/radare2/binr/radare2/radare2 \
   --analysis aaaa \
+  --strict \
   --out /tmp/r2sleigh-kernel-smoke.json
 ```
 
 The harness is advisory and local-only: no kernel binaries or generated smoke
 reports are committed. It probes representative kernel helpers and records
 normalized decompile, type, profile, and symex output for regression triage.
+By default the report keeps hashes, sizes, and line counts while redacting the
+local kernel path and stdout/stderr previews. Use `--include-sensitive` only for
+local triage when full paths and text previews are needed.
+
+Strict mode returns non-zero for missing requested targets, zero discovered
+functions, malformed profile/type/symex JSON, decompiler fallback comments, and
+radare2 command return failures. The harness mirrors the r2r/e2e plugin
+isolation knobs where practical: `--plugin-dir` defaults to
+`R2SLEIGH_PLUGIN_DIR`, `R2R_PLUGIN_DIR`, or `R2_LIBR_PLUGINS`, and `--tmpdir`
+sets a temporary HOME/XDG/TMP root for radare2 subprocesses.
 
 Automatic Signature Write-Back (aaaa)
 -------------------------------------

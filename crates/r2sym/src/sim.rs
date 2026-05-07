@@ -1307,6 +1307,29 @@ fn collect_pointer_memory_windows(
         }
         inputs.insert(*index, window);
     }
+    for transfer in &summary.transfer_effects {
+        for location in [transfer.dst, transfer.src] {
+            let SummaryMemoryRegion::Arg { index } = location.region else {
+                continue;
+            };
+            let window = inputs.entry(index).or_insert(PointerInputWindow {
+                headroom: 0,
+                forward_size: DEFAULT_MAX_INTERPROC_HAVOC as u32,
+            });
+            if let Some(range) = location.range {
+                let start = range.offset_lo.min(range.offset_hi);
+                let end = range.offset_hi.max(range.offset_lo);
+                if start < 0 {
+                    window.headroom = window
+                        .headroom
+                        .max(start.checked_abs().unwrap_or(i64::MAX).min(u32::MAX as i64) as u32);
+                }
+                if end >= 0 {
+                    window.forward_size = window.forward_size.max((end as u32).saturating_add(1));
+                }
+            }
+        }
+    }
     inputs
 }
 
@@ -1341,6 +1364,26 @@ fn collect_tracked_memory_writes(summary: &FunctionSemanticSummary) -> Vec<(usiz
             offset = next;
         }
     }
+    for transfer in &summary.transfer_effects {
+        let SummaryMemoryRegion::Arg { index } = transfer.dst.region else {
+            continue;
+        };
+        let width = match transfer.len {
+            r2ssa::SummaryTransferLength::Const(value) => value
+                .clamp(1, DEFAULT_MAX_INTERPROC_HAVOC)
+                .min(u32::MAX as u64)
+                as u32,
+            _ => DEFAULT_MAX_INTERPROC_HAVOC as u32,
+        };
+        let offset = transfer
+            .dst
+            .range
+            .map(|range| range.offset_lo.min(range.offset_hi))
+            .unwrap_or(0);
+        writes.push((index, offset, width));
+    }
+    writes.sort_unstable();
+    writes.dedup();
     writes
 }
 
@@ -1626,6 +1669,9 @@ fn apply_interproc_summary<'ctx>(
     callconv: &CallConv,
 ) -> CallHookResult {
     let call = callconv.collect_call_info(state, summary_arity(summary));
+    for effect in &summary.transfer_effects {
+        apply_interproc_transfer_effect(state, &call, effect);
+    }
     for effect in &summary.memory_effects {
         apply_interproc_memory_effect(state, &call, effect);
     }
@@ -1647,6 +1693,23 @@ fn summary_arity(summary: &FunctionSemanticSummary) -> usize {
         if let SummaryMemoryRegion::Arg { index } = effect.location.region {
             arity = arity.max(index.saturating_add(1));
         }
+    }
+    for effect in &summary.transfer_effects {
+        if let SummaryMemoryRegion::Arg { index } = effect.dst.region {
+            arity = arity.max(index.saturating_add(1));
+        }
+        if let SummaryMemoryRegion::Arg { index } = effect.src.region {
+            arity = arity.max(index.saturating_add(1));
+        }
+        if let r2ssa::SummaryTransferLength::Arg(index) = effect.len {
+            arity = arity.max(index.saturating_add(1));
+        }
+    }
+    for effect in &summary.lifetime_effects {
+        arity = arity.max(effect.arg.saturating_add(1));
+    }
+    for effect in &summary.sync_effects {
+        arity = arity.max(effect.arg.saturating_add(1));
     }
     arity
 }
@@ -1692,6 +1755,57 @@ fn apply_interproc_memory_effect<'ctx>(
             apply_memory_effect_at_base(state, &base, call.arg_bits, effect);
         }
         SummaryMemoryRegion::HeapReturn | SummaryMemoryRegion::Unknown => {}
+    }
+}
+
+fn apply_interproc_transfer_effect<'ctx>(
+    state: &mut SymState<'ctx>,
+    call: &CallInfo<'ctx>,
+    effect: &r2ssa::SummaryTransferEffect,
+) {
+    let Some(dst) = summary_location_value(state, call, effect.dst) else {
+        return;
+    };
+    let Some(src) = summary_location_value(state, call, effect.src) else {
+        return;
+    };
+    let len = match effect.len {
+        r2ssa::SummaryTransferLength::Arg(index) => call
+            .args
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| SymValue::unknown(call.arg_bits)),
+        r2ssa::SummaryTransferLength::Const(value) => SymValue::concrete(value, call.arg_bits),
+        r2ssa::SummaryTransferLength::Unknown => SymValue::unknown(call.arg_bits),
+    };
+    copy_bytes(
+        state,
+        &dst,
+        &src,
+        &len,
+        DEFAULT_MAX_INTERPROC_HAVOC,
+        ByteSummaryPolicy::summarized(DEFAULT_MAX_INTERPROC_HAVOC),
+    );
+}
+
+fn summary_location_value<'ctx>(
+    state: &mut SymState<'ctx>,
+    call: &CallInfo<'ctx>,
+    location: r2ssa::SummaryMemoryLocation,
+) -> Option<SymValue<'ctx>> {
+    let base = match location.region {
+        SummaryMemoryRegion::Arg { index } => call.args.get(index).cloned()?,
+        SummaryMemoryRegion::Global { address } => SymValue::concrete(address, call.arg_bits),
+        SummaryMemoryRegion::HeapReturn | SummaryMemoryRegion::Unknown => return None,
+    };
+    let offset = location.range.map(|range| range.offset_lo).unwrap_or(0);
+    if offset == 0 {
+        Some(base)
+    } else {
+        Some(base.add(
+            state.context(),
+            &SymValue::concrete(offset as u64, call.arg_bits),
+        ))
     }
 }
 

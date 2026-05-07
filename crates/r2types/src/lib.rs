@@ -31,11 +31,14 @@ pub use external::{
     normalize_external_type_name,
 };
 pub use facts::{
-    CalleeArgEffect, CalleeFact, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
-    CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, FunctionParamSpec,
-    FunctionSignatureSpec, FunctionType, FunctionTypeFactInputs, FunctionTypeFacts,
-    FunctionTypeFactsBuilder, InterprocFactDiagnostics, LocalFieldAccessFact, ResolvedFieldLayout,
-    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    CalleeAllocationEffect, CalleeArgEffect, CalleeAtomicEffect, CalleeAtomicOp,
+    CalleeAtomicOrdering, CalleeFact, CalleeLifetimeEffect, CalleeLifetimeOp, CalleeMemoryEffect,
+    CalleeMemoryEffectKind, CalleeMemoryLocation, CalleeMemoryRange, CalleeMemoryRegion,
+    CalleeReturnRelation, CalleeSyncEffect, CalleeSyncOp, CalleeTransferEffect,
+    CalleeTransferLength, FunctionParamSpec, FunctionSignatureSpec, FunctionType,
+    FunctionTypeFactInputs, FunctionTypeFacts, FunctionTypeFactsBuilder, InterprocFactDiagnostics,
+    LocalFieldAccessFact, ResolvedFieldLayout, VisibleBinding, VisibleBindingKind,
+    parse_type_like_spec,
 };
 pub use function_facts::{
     AnalysisPlans, DecompileCapabilityView, FunctionFacts, InterprocSummaryView,

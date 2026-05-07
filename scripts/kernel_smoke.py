@@ -33,6 +33,16 @@ DEFAULT_TARGETS = (
     "_os_ref_release",
 )
 
+JSON_COMMANDS = frozenset({"profile", "types", "symex"})
+DECOMPILER_COMMANDS = frozenset({"decompile_sla", "decompile_pdd", "decompile_pdD"})
+DECOMPILER_FALLBACK_MARKERS = (
+    "r2dec fallback:",
+    "r2dec: decompilation panicked",
+    "r2dec: failed to spawn",
+    "skipped decompilation",
+    "r2pm -ci r2dec",
+)
+
 
 @dataclass
 class CmdResult:
@@ -40,6 +50,44 @@ class CmdResult:
     stdout: str
     stderr: str
     elapsed_s: float
+
+
+def default_r2_path() -> str:
+    for env_name in ("R2SLEIGH_E2E_RADARE2", "R2R_RADARE2"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+    for candidate in (
+        "../radare2/binr/radare2/radare2",
+        "../../radare2/binr/radare2/radare2",
+        "/Users/priyanshu/code/radare2/binr/radare2/radare2",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return "radare2"
+
+
+def default_plugin_dir() -> str:
+    for env_name in ("R2SLEIGH_PLUGIN_DIR", "R2R_PLUGIN_DIR", "R2_LIBR_PLUGINS"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+    if sys.platform == "darwin":
+        shared_ext = "dylib"
+        rust_plugin = f"libr2sleigh_plugin.{shared_ext}"
+    elif sys.platform == "win32":
+        shared_ext = "dll"
+        rust_plugin = "r2sleigh_plugin.dll"
+    else:
+        shared_ext = "so"
+        rust_plugin = f"libr2sleigh_plugin.{shared_ext}"
+    for candidate in (Path("r2plugin"), Path("../r2plugin"), Path("../../r2plugin")):
+        if (
+            candidate.joinpath(f"anal_sleigh.{shared_ext}").exists()
+            and candidate.joinpath("r2sleigh", rust_plugin).exists()
+        ):
+            return str(candidate)
+    return ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,10 +101,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--r2",
-        default=os.environ.get(
-            "R2R_RADARE2", "/Users/priyanshu/code/radare2/binr/radare2/radare2"
-        ),
+        default=default_r2_path(),
         help="radare2 executable path",
+    )
+    parser.add_argument(
+        "--plugin-dir",
+        default=default_plugin_dir(),
+        help="isolated radare2 plugin directory, defaults to R2SLEIGH_PLUGIN_DIR/R2R_PLUGIN_DIR",
+    )
+    parser.add_argument(
+        "--tmpdir",
+        default=os.environ.get("R2SLEIGH_KERNEL_SMOKE_TMPDIR", "/tmp/r2sleigh-kernel-smoke-tmp"),
+        help="temporary HOME/XDG/TMP root for the radare2 subprocess",
     )
     parser.add_argument(
         "--analysis",
@@ -83,12 +139,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="return non-zero when any matched target has a failing command",
+        help="return non-zero when discovery, target matching, JSON validation, or commands fail",
+    )
+    parser.add_argument(
+        "--include-sensitive",
+        action="store_true",
+        help="include local kernel paths and stdout/stderr previews in the JSON report",
     )
     return parser.parse_args()
 
 
-def run_r2(r2: str, binary: Path, cmd: str, timeout_s: int) -> CmdResult:
+def build_r2_env(plugin_dir: str, tmpdir: Path | None) -> dict[str, str]:
+    env = os.environ.copy()
+    if plugin_dir:
+        env["R2_USER_PLUGINS"] = plugin_dir
+        env["R2_LIBR_PLUGINS"] = plugin_dir
+    if tmpdir is not None:
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        xdg_data = tmpdir / "xdg-data"
+        xdg_data.mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(tmpdir)
+        env["TMP"] = str(tmpdir)
+        env["TEMP"] = str(tmpdir)
+        env["XDG_DATA_HOME"] = str(xdg_data)
+        env["HOME"] = str(tmpdir / "home")
+        Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def run_r2(
+    r2: str,
+    binary: Path,
+    cmd: str,
+    timeout_s: int,
+    env: dict[str, str] | None = None,
+) -> CmdResult:
     argv = [
         r2,
         "-q",
@@ -109,6 +194,7 @@ def run_r2(r2: str, binary: Path, cmd: str, timeout_s: int) -> CmdResult:
         text=True,
         timeout=timeout_s,
         check=False,
+        env=env,
     )
     return CmdResult(
         returncode=proc.returncode,
@@ -132,6 +218,10 @@ def parse_json_payload(text: str) -> Any:
     raise ValueError("no JSON payload found")
 
 
+def redacted_path(path: Path) -> str:
+    return f"<redacted:{path.name}>"
+
+
 def normalize_symbol(name: str) -> str:
     for prefix in ("sym.", "dbg.", "imp."):
         if name.startswith(prefix):
@@ -140,9 +230,13 @@ def normalize_symbol(name: str) -> str:
 
 
 def discover_functions(
-    r2: str, kernel: Path, analysis: str, timeout_s: int
+    r2: str,
+    kernel: Path,
+    analysis: str,
+    timeout_s: int,
+    env: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], CmdResult]:
-    result = run_r2(r2, kernel, f"a:sla >/dev/null; {analysis}; aflj", timeout_s)
+    result = run_r2(r2, kernel, f"a:sla >/dev/null; {analysis}; aflj", timeout_s, env=env)
     functions: list[dict[str, Any]] = []
     if result.returncode != 0:
         return functions, result
@@ -212,19 +306,35 @@ def choose_targets(
     return selected
 
 
-def summarize_text(text: str, max_lines: int = 80) -> dict[str, Any]:
+def summarize_text(text: str, max_lines: int = 80, include_preview: bool = False) -> dict[str, Any]:
     lines = text.splitlines()
-    return {
+    summary: dict[str, Any] = {
         "sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(),
         "bytes": len(text.encode("utf-8", "replace")),
         "lines": len(lines),
-        "preview": lines[:max_lines],
         "truncated": len(lines) > max_lines,
     }
+    if include_preview:
+        summary["preview"] = lines[:max_lines]
+    return summary
+
+
+def decompiler_fallback_marker(text: str) -> str | None:
+    lower = text.lower()
+    for marker in DECOMPILER_FALLBACK_MARKERS:
+        if marker.lower() in lower:
+            return marker
+    return None
 
 
 def collect_target(
-    r2: str, kernel: Path, analysis: str, target: dict[str, Any], timeout_s: int
+    r2: str,
+    kernel: Path,
+    analysis: str,
+    target: dict[str, Any],
+    timeout_s: int,
+    include_sensitive: bool,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if not target.get("found"):
         return target
@@ -241,21 +351,96 @@ def collect_target(
     out: dict[str, Any] = dict(target)
     out["commands"] = {}
     for name, command in commands.items():
-        result = run_r2(r2, kernel, f"{prefix}; {command}", timeout_s)
+        result = run_r2(r2, kernel, f"{prefix}; {command}", timeout_s, env=env)
         entry: dict[str, Any] = {
             "returncode": result.returncode,
             "elapsed_s": round(result.elapsed_s, 6),
-            "stdout": summarize_text(result.stdout),
+            "stdout": summarize_text(result.stdout, include_preview=include_sensitive),
         }
         if result.stderr.strip():
-            entry["stderr"] = summarize_text(result.stderr, max_lines=40)
-        if name in {"profile", "types", "symex"} and result.stdout.strip():
+            entry["stderr"] = summarize_text(
+                result.stderr, max_lines=40, include_preview=include_sensitive
+            )
+        if name in JSON_COMMANDS:
             try:
                 entry["json_kind"] = type(parse_json_payload(result.stdout)).__name__
             except ValueError as exc:
                 entry["json_error"] = str(exc)
+        if name in DECOMPILER_COMMANDS:
+            marker = decompiler_fallback_marker(result.stdout)
+            if marker is not None:
+                entry["fallback_marker"] = marker
         out["commands"][name] = entry
     return out
+
+
+def collect_failures(
+    functions: list[dict[str, Any]],
+    discovery: CmdResult,
+    collected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    if discovery.returncode != 0:
+        failures.append(
+            {
+                "kind": "command_return",
+                "target": "discovery",
+                "command": "aflj",
+                "returncode": discovery.returncode,
+            }
+        )
+    if len(functions) == 0:
+        failures.append(
+            {
+                "kind": "zero_functions",
+                "target": "discovery",
+                "command": "aflj",
+            }
+        )
+    for item in collected:
+        target_name = item.get("name") or item.get("requested")
+        if not item.get("found", True):
+            failures.append(
+                {
+                    "kind": "missing_target",
+                    "target": target_name,
+                }
+            )
+            continue
+        for command, result in item.get("commands", {}).items():
+            if result.get("returncode") != 0:
+                failures.append(
+                    {
+                        "kind": "command_return",
+                        "target": target_name,
+                        "command": command,
+                        "returncode": result.get("returncode"),
+                    }
+                )
+            if command in JSON_COMMANDS and result.get("json_error"):
+                failures.append(
+                    {
+                        "kind": "json_parse",
+                        "target": target_name,
+                        "command": command,
+                        "error": result.get("json_error"),
+                    }
+                )
+            if command in DECOMPILER_COMMANDS and result.get("fallback_marker"):
+                failures.append(
+                    {
+                        "kind": "decompiler_fallback",
+                        "target": target_name,
+                        "command": command,
+                        "marker": result.get("fallback_marker"),
+                    }
+                )
+    return failures
+
+
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
 
 def main() -> int:
@@ -269,52 +454,70 @@ def main() -> int:
             "reason": "R2SLEIGH_KERNELCACHE is not set",
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
-        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        write_report(report_path, report)
         print(f"kernel smoke skipped; wrote {report_path}")
         return 0
 
     kernel = Path(args.kernel)
     if not kernel.exists():
-        print(f"kernel smoke failed: missing kernelcache {kernel}", file=sys.stderr)
+        report = {
+            "schema": 1,
+            "status": "failed",
+            "reason": "missing kernelcache",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "kernel": str(kernel) if args.include_sensitive else redacted_path(kernel),
+        }
+        write_report(report_path, report)
+        print(
+            "kernel smoke failed: missing kernelcache "
+            f"{kernel if args.include_sensitive else redacted_path(kernel)}",
+            file=sys.stderr,
+        )
         return 2
 
     requested_targets = [target.strip() for target in args.targets.split(",") if target.strip()]
-    functions, discovery = discover_functions(args.r2, kernel, args.analysis, args.timeout)
+    env = build_r2_env(args.plugin_dir, Path(args.tmpdir) if args.tmpdir else None)
+    functions, discovery = discover_functions(
+        args.r2, kernel, args.analysis, args.timeout, env=env
+    )
     selected = choose_targets(functions, requested_targets)
     collected = [
-        collect_target(args.r2, kernel, args.analysis, target, args.timeout)
+        collect_target(
+            args.r2,
+            kernel,
+            args.analysis,
+            target,
+            args.timeout,
+            args.include_sensitive,
+            env=env,
+        )
         for target in selected
     ]
-    failures = [
-        {
-            "target": item.get("name") or item.get("requested"),
-            "command": command,
-            "returncode": result.get("returncode"),
-        }
-        for item in collected
-        for command, result in item.get("commands", {}).items()
-        if result.get("returncode") != 0
-    ]
+    failures = collect_failures(functions, discovery, collected)
     report = {
         "schema": 1,
         "status": "failed" if failures else "ok",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "r2": args.r2,
-        "kernel": str(kernel),
+        "kernel": str(kernel) if args.include_sensitive else redacted_path(kernel),
         "analysis": args.analysis,
         "discovery": {
             "returncode": discovery.returncode,
             "elapsed_s": round(discovery.elapsed_s, 6),
             "function_count": len(functions),
-            "stdout": summarize_text(discovery.stdout, max_lines=20),
+            "stdout": summarize_text(
+                discovery.stdout, max_lines=20, include_preview=args.include_sensitive
+            ),
         },
         "requested_targets": requested_targets,
         "targets": collected,
         "failures": failures,
     }
     if discovery.stderr.strip():
-        report["discovery"]["stderr"] = summarize_text(discovery.stderr, max_lines=20)
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        report["discovery"]["stderr"] = summarize_text(
+            discovery.stderr, max_lines=20, include_preview=args.include_sensitive
+        )
+    write_report(report_path, report)
     print(f"kernel smoke {report['status']}; wrote {report_path}")
     if failures and args.strict:
         return 1

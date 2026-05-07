@@ -144,7 +144,8 @@ impl<'a> FoldingContext<'a> {
                 aliases.insert(target.to_string(), rhs.clone());
             }
 
-            let clear_aliases = Self::stmt_clears_aliases(&rewritten);
+            let clear_aliases =
+                Self::stmt_clears_aliases(&rewritten) || Self::stmt_contains_call(&rewritten);
             out.push(rewritten);
             if clear_aliases {
                 aliases.clear();
@@ -353,6 +354,52 @@ impl<'a> FoldingContext<'a> {
                 | CStmt::Switch { .. }
                 | CStmt::Block(_)
         )
+    }
+
+    fn stmt_contains_call(stmt: &CStmt) -> bool {
+        let mut contains_call = false;
+        match stmt {
+            CStmt::Expr(expr)
+            | CStmt::Return(Some(expr))
+            | CStmt::While { cond: expr, .. }
+            | CStmt::DoWhile { cond: expr, .. } => {
+                expr.visit(&mut |node| {
+                    if matches!(node, CExpr::Call { .. }) {
+                        contains_call = true;
+                    }
+                });
+            }
+            CStmt::Decl {
+                init: Some(expr), ..
+            }
+            | CStmt::If { cond: expr, .. }
+            | CStmt::Switch { expr, .. } => {
+                expr.visit(&mut |node| {
+                    if matches!(node, CExpr::Call { .. }) {
+                        contains_call = true;
+                    }
+                });
+            }
+            CStmt::For { cond, update, .. } => {
+                for expr in cond.iter().chain(update.iter()) {
+                    expr.visit(&mut |node| {
+                        if matches!(node, CExpr::Call { .. }) {
+                            contains_call = true;
+                        }
+                    });
+                }
+            }
+            CStmt::Return(None)
+            | CStmt::Decl { init: None, .. }
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Comment(_)
+            | CStmt::Empty
+            | CStmt::Block(_) => {}
+        }
+        contains_call
     }
 
     fn ssa_base_name(name: &str) -> Option<&str> {
@@ -777,7 +824,7 @@ impl<'a> FoldingContext<'a> {
             | CStmt::Break
             | CStmt::Continue
             | CStmt::Goto(_)
-            | CStmt::Label { .. }
+            | CStmt::Label(_)
             | CStmt::Comment(_)
             | CStmt::Empty
             | CStmt::Block(_)

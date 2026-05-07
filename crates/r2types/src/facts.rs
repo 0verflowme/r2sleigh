@@ -135,6 +135,76 @@ pub struct CalleeMemoryEffect {
     pub location: CalleeMemoryLocation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeTransferLength {
+    Arg(usize),
+    Const(u64),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeTransferEffect {
+    pub dst: CalleeMemoryLocation,
+    pub src: CalleeMemoryLocation,
+    pub len: CalleeTransferLength,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeAllocationEffect {
+    pub size_arg: Option<usize>,
+    pub zeroed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeLifetimeOp {
+    Free,
+    Retain,
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeLifetimeEffect {
+    pub arg: usize,
+    pub op: CalleeLifetimeOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeSyncOp {
+    Lock,
+    Unlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeSyncEffect {
+    pub arg: usize,
+    pub op: CalleeSyncOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeAtomicOp {
+    LoadLinked,
+    StoreConditional,
+    CompareExchange,
+    Fence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeAtomicOrdering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeAtomicEffect {
+    pub op: CalleeAtomicOp,
+    pub location: CalleeMemoryLocation,
+    pub ordering: CalleeAtomicOrdering,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CalleeReturnRelation {
     Unknown,
@@ -154,6 +224,11 @@ pub struct CalleeFact {
     pub has_unknown_calls: bool,
     pub arg_effects: BTreeMap<usize, CalleeArgEffect>,
     pub memory_effects: Vec<CalleeMemoryEffect>,
+    pub transfer_effects: Vec<CalleeTransferEffect>,
+    pub allocation_effects: Vec<CalleeAllocationEffect>,
+    pub lifetime_effects: Vec<CalleeLifetimeEffect>,
+    pub sync_effects: Vec<CalleeSyncEffect>,
+    pub atomic_effects: Vec<CalleeAtomicEffect>,
     pub param_type_hints: BTreeMap<usize, CTypeLike>,
     pub return_type_hint: Option<CTypeLike>,
     pub return_relation: CalleeReturnRelation,

@@ -3377,7 +3377,9 @@ mod tests {
             .analysis_ctx
             .ownership
             .call_expr_sources
-            .insert(call_expr_cache_key(&call_expr), source_id);
+            .entry(call_expr_cache_key(&call_expr))
+            .or_default()
+            .insert(source_id);
         ctx.state.analysis_ctx.ownership.call_ownership.insert(
             source_id,
             CallOwnershipFact {
@@ -6591,6 +6593,34 @@ mod tests {
     }
 
     #[test]
+    fn propagate_ephemeral_copies_does_not_reuse_alias_after_call() {
+        let ctx = FoldingContext::new(64);
+        let stmts = vec![
+            CStmt::Expr(CExpr::assign(
+                CExpr::Var("tmp:1".to_string()),
+                CExpr::Var("global_value".to_string()),
+            )),
+            CStmt::Expr(CExpr::call(CExpr::Var("mutate_global".to_string()), vec![])),
+            CStmt::Return(Some(CExpr::Var("tmp:1".to_string()))),
+        ];
+
+        let propagated = ctx.propagate_ephemeral_copies(stmts);
+
+        assert_eq!(
+            propagated,
+            vec![
+                CStmt::Expr(CExpr::assign(
+                    CExpr::Var("tmp:1".to_string()),
+                    CExpr::Var("global_value".to_string()),
+                )),
+                CStmt::Expr(CExpr::call(CExpr::Var("mutate_global".to_string()), vec![])),
+                CStmt::Return(Some(CExpr::Var("tmp:1".to_string()))),
+            ],
+            "copy aliases must not be reused across side-effecting calls"
+        );
+    }
+
+    #[test]
     fn test_prune_dead_temp_assignments_keeps_side_effecting_rhs() {
         let ctx = FoldingContext::new(64);
         let stmts = vec![
@@ -8144,6 +8174,51 @@ mod tests {
         assert_eq!(
             ctx.stable_owned_call_result_expr_for_call_expr(&replay_expr),
             None
+        );
+    }
+
+    #[test]
+    fn identical_helper_replay_across_callsites_is_ambiguous() {
+        let mut ctx = make_aarch64_ctx();
+        let first_call = (0x1000, 0);
+        let second_call = (0x1008, 0);
+        let helper_call = CExpr::call(
+            CExpr::Var("sym.imp.helper".to_string()),
+            vec![CExpr::Var("arg1".to_string())],
+        );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(first_call, helper_call.clone());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(second_call, helper_call.clone());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(first_call, BTreeSet::from(["X20_1".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(second_call, BTreeSet::from(["X21_1".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .extend(["X20_1".to_string(), "X21_1".to_string()]);
+        ctx.state.analysis_ctx.ownership = ctx.build_semantic_ownership_facts();
+        ctx.clear_semantic_ownership_caches();
+
+        assert_eq!(ctx.source_call_for_call_expr(&helper_call), None);
+        assert_eq!(
+            ctx.stable_owned_call_result_expr_for_call_expr(&helper_call),
+            None,
+            "identical helper replay must not pick an arbitrary owner across callsites"
         );
     }
 
@@ -16614,6 +16689,11 @@ mod tests {
                     },
                 )]),
                 memory_effects: Vec::new(),
+                transfer_effects: Vec::new(),
+                allocation_effects: Vec::new(),
+                lifetime_effects: Vec::new(),
+                sync_effects: Vec::new(),
+                atomic_effects: Vec::new(),
                 param_type_hints: BTreeMap::new(),
                 return_type_hint: None,
                 return_relation: CalleeReturnRelation::HeapAlloc,
