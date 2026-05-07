@@ -19,6 +19,7 @@ com.apple.kernel
 # Generated files
 *.r2il
 *.dSYM/
+r2sleigh-kernel-smoke*.json
 
 # Plugin build artifacts
 r2plugin/*.so

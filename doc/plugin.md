@@ -129,6 +129,20 @@ r2sleigh does not expose public `anal.*` tuning keys. Detailed engine inspection
 lives under debug commands such as `a:sla.debug.profilej` and
 `a:sla.debug.types`.
 
+Kernel smoke harness:
+
+```bash
+R2SLEIGH_KERNELCACHE=/path/to/kernelcache \
+  scripts/kernel_smoke.py \
+  --r2 /Users/priyanshu/code/radare2/binr/radare2/radare2 \
+  --analysis aaaa \
+  --out /tmp/r2sleigh-kernel-smoke.json
+```
+
+The harness is advisory and local-only: no kernel binaries or generated smoke
+reports are committed. It probes representative kernel helpers and records
+normalized decompile, type, profile, and symex output for regression triage.
+
 Automatic Signature Write-Back (aaaa)
 -------------------------------------
 
