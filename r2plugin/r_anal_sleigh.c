@@ -520,6 +520,21 @@ typedef struct {
 } SleighAnalysisPolicy;
 
 typedef struct {
+	unsigned int mode;
+	unsigned int type_writeback_mode;
+	int type_min_conf;
+	int type_rename_min_conf;
+	int type_struct_min_conf;
+	int type_interproc_max_iters;
+	int type_max_blocks;
+	int type_global_max_links;
+	int type_max_decls;
+	int type_max_mutations;
+} R2SleighAnalysisPolicy;
+
+extern R2SleighAnalysisPolicy r2sleigh_analysis_policy_for_depth(unsigned int depth);
+
+typedef struct {
 	ut64 addr;
 	ut64 key;
 	ut64 payload_hash;
@@ -584,15 +599,7 @@ static size_t sleigh_profile_cap = 0;
 #define SLEIGH_SIG_WRITEBACK_GLOBAL_MAX_FCNS 128
 #define SLEIGH_SIG_MIN_CONFIDENCE 70
 #define SLEIGH_CC_MIN_CONFIDENCE 80
-#define SLEIGH_TYPE_MIN_CONF_DEFAULT 85
-#define SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT 93
-#define SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT 85
-#define SLEIGH_TYPE_INTERPROC_MAX_ITERS_DEFAULT 12
-#define SLEIGH_TYPE_MAX_BLOCKS_DEFAULT 500
 #define SLEIGH_TYPE_WRITEBACK_GLOBAL_MAX_FCNS 128
-#define SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT 128
-#define SLEIGH_TYPE_MAX_DECLS_DEFAULT 64
-#define SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT 512
 #define SLEIGH_PROFILE_MAX_DEFAULT 20
 #define SLEIGH_CALLER_PROP_MAX_PER_CALLEE 256
 #define SLEIGH_CALLER_PROP_MAX_TOTAL 2048
@@ -3155,7 +3162,7 @@ static bool replay_temp_bps_add(RCore *core, ReplayTempBpSet *set, ut64 addr) {
 	if (r_bp_get_in (core->dbg->bp, addr, R_BP_PROT_EXEC)) {
 		return true;
 	}
-	if (!r_bp_add_sw (core->dbg->bp, addr, core->dbg->bpsize, R_BP_PROT_EXEC)) {
+	if (!r_bp_add_sw (core->dbg->bp, addr, core->dbg->options.bpsize, R_BP_PROT_EXEC)) {
 		return false;
 	}
 	next = realloc (set->addrs, (set->count + 1) * sizeof (ut64));
@@ -6388,19 +6395,8 @@ static bool lift_function_blocks(
 }
 
 static SleighMode sleigh_mode_from_analysis_depth(RAnal *anal) {
-	if (!anal) {
-		return SLEIGH_MODE_BALANCED;
-	}
-	switch (anal->plugin_analysis_depth) {
-	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC:
-		return SLEIGH_MODE_FAST;
-	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE:
-		return SLEIGH_MODE_FULL;
-	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_BALANCED:
-	case R_ANAL_PLUGIN_ANALYSIS_DEPTH_UNSPECIFIED:
-	default:
-		return SLEIGH_MODE_BALANCED;
-	}
+	R2SleighAnalysisPolicy rust_policy = r2sleigh_analysis_policy_for_depth (anal? (unsigned int)anal->plugin_analysis_depth: 0);
+	return rust_policy.mode <= (unsigned int)SLEIGH_MODE_FULL? (SleighMode)rust_policy.mode: SLEIGH_MODE_BALANCED;
 }
 
 static bool sleigh_mode_is_fast(RAnal *anal) {
@@ -6416,40 +6412,23 @@ static SleighMode sleigh_mode_effective_for_post_analysis(RAnal *anal) {
 	return sleigh_mode_from_analysis_depth (anal);
 }
 
-static SleighAnalysisPolicy sleigh_analysis_policy_from_mode(SleighMode mode) {
-	SleighAnalysisPolicy policy = {
-		.mode = mode,
-		.type_writeback_mode = SLEIGH_TYPE_WRITEBACK_BALANCED,
-		.type_min_conf = SLEIGH_TYPE_MIN_CONF_DEFAULT,
-		.type_rename_min_conf = SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT,
-		.type_struct_min_conf = SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT,
-		.type_interproc_max_iters = 4,
-		.type_max_blocks = 200,
-		.type_global_max_links = 32,
-		.type_max_decls = 32,
-		.type_max_mutations = 128,
-	};
-
-	if (mode == SLEIGH_MODE_FAST) {
-		policy.type_writeback_mode = SLEIGH_TYPE_WRITEBACK_OFF;
-		policy.type_interproc_max_iters = 1;
-		policy.type_max_blocks = 96;
-		policy.type_global_max_links = 8;
-		policy.type_max_decls = 8;
-		policy.type_max_mutations = 32;
-	} else if (mode == SLEIGH_MODE_FULL) {
-		policy.type_writeback_mode = SLEIGH_TYPE_WRITEBACK_AGGRESSIVE;
-		policy.type_interproc_max_iters = SLEIGH_TYPE_INTERPROC_MAX_ITERS_DEFAULT;
-		policy.type_max_blocks = SLEIGH_TYPE_MAX_BLOCKS_DEFAULT;
-		policy.type_global_max_links = SLEIGH_TYPE_GLOBAL_MAX_LINKS_DEFAULT;
-		policy.type_max_decls = SLEIGH_TYPE_MAX_DECLS_DEFAULT;
-		policy.type_max_mutations = SLEIGH_TYPE_MAX_MUTATIONS_DEFAULT;
-	}
-	return policy;
-}
-
 static SleighAnalysisPolicy sleigh_analysis_policy_for_anal(RAnal *anal) {
-	return sleigh_analysis_policy_from_mode (sleigh_mode_from_analysis_depth (anal));
+	R2SleighAnalysisPolicy rust_policy = r2sleigh_analysis_policy_for_depth (anal? (unsigned int)anal->plugin_analysis_depth: 0);
+	SleighAnalysisPolicy policy = {
+		.mode = rust_policy.mode <= (unsigned int)SLEIGH_MODE_FULL? (SleighMode)rust_policy.mode: SLEIGH_MODE_BALANCED,
+		.type_writeback_mode = rust_policy.type_writeback_mode <= (unsigned int)SLEIGH_TYPE_WRITEBACK_AGGRESSIVE
+			? (SleighTypeWritebackMode)rust_policy.type_writeback_mode
+			: SLEIGH_TYPE_WRITEBACK_BALANCED,
+		.type_min_conf = rust_policy.type_min_conf,
+		.type_rename_min_conf = rust_policy.type_rename_min_conf,
+		.type_struct_min_conf = rust_policy.type_struct_min_conf,
+		.type_interproc_max_iters = rust_policy.type_interproc_max_iters,
+		.type_max_blocks = rust_policy.type_max_blocks,
+		.type_global_max_links = rust_policy.type_global_max_links,
+		.type_max_decls = rust_policy.type_max_decls,
+		.type_max_mutations = rust_policy.type_max_mutations,
+	};
+	return policy;
 }
 
 static void sleigh_profile_clear(void) {
@@ -9624,14 +9603,17 @@ static bool reconcile_signature_register_arg_vars_fact(RAnal *anal, RAnalFunctio
 		const char *expected_type = fact_param->type_name && *fact_param->type_name? fact_param->type_name: NULL;
 		RAnalVar *best = NULL;
 		int best_score = -1;
-		RListIter *iter;
-		RAnalVar *var;
-		RList *vars = r_anal_var_all_list (anal, fcn);
+		RVecAnalVarPtr *vars = r_anal_function_vars (anal, fcn);
+		size_t vars_len;
+		size_t var_idx;
 
 		if (!vars) {
 			continue;
 		}
-		r_list_foreach (vars, iter, var) {
+		vars_len = RVecAnalVarPtr_length (vars);
+		for (var_idx = 0; var_idx < vars_len; var_idx++) {
+			RAnalVar **var_ref = RVecAnalVarPtr_at (vars, var_idx);
+			RAnalVar *var = var_ref? *var_ref: NULL;
 			int score;
 			if (!var || !var->isarg || var->kind != R_ANAL_VAR_KIND_REG) {
 				continue;
@@ -9645,7 +9627,7 @@ static bool reconcile_signature_register_arg_vars_fact(RAnal *anal, RAnalFunctio
 				best_score = score;
 			}
 		}
-		r_list_free (vars);
+		RVecAnalVarPtr_free (vars);
 		vars = NULL;
 		if (best) {
 			if (expected_type && (!best->type || !strings_match_normalized (best->type, expected_type))) {
@@ -9671,11 +9653,14 @@ static bool reconcile_signature_register_arg_vars_fact(RAnal *anal, RAnalFunctio
 				};
 				changed |= apply_typed_mutation (anal, &mutation);
 			}
-			vars = r_anal_var_all_list (anal, fcn);
+			vars = r_anal_function_vars (anal, fcn);
 			if (!vars) {
 				continue;
 			}
-			r_list_foreach (vars, iter, var) {
+			vars_len = RVecAnalVarPtr_length (vars);
+			for (var_idx = 0; var_idx < vars_len; var_idx++) {
+				RAnalVar **var_ref = RVecAnalVarPtr_at (vars, var_idx);
+				RAnalVar *var = var_ref? *var_ref: NULL;
 				if (!var || var == best || !var->isarg || var->kind != R_ANAL_VAR_KIND_REG) {
 					continue;
 				}
@@ -9684,7 +9669,7 @@ static bool reconcile_signature_register_arg_vars_fact(RAnal *anal, RAnalFunctio
 					changed = true;
 				}
 			}
-			r_list_free (vars);
+			RVecAnalVarPtr_free (vars);
 		}
 	}
 	return changed;

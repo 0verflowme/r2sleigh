@@ -964,8 +964,9 @@ pub extern "C" fn r2il_string_free(s: *mut c_char) {
 
 // ========== Typed Analysis FFI ==========
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{LazyLock, RwLock};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::Hash;
+use std::sync::{Arc, LazyLock, RwLock};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3870,6 +3871,75 @@ pub struct R2SleighBudgetConfig {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct R2SleighAnalysisPolicy {
+    mode: u32,
+    type_writeback_mode: u32,
+    type_min_conf: i32,
+    type_rename_min_conf: i32,
+    type_struct_min_conf: i32,
+    type_interproc_max_iters: i32,
+    type_max_blocks: i32,
+    type_global_max_links: i32,
+    type_max_decls: i32,
+    type_max_mutations: i32,
+}
+
+const R2_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC: u32 = 1;
+const R2_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE: u32 = 3;
+const R2SLEIGH_MODE_FAST: u32 = 0;
+const R2SLEIGH_MODE_BALANCED: u32 = 1;
+const R2SLEIGH_MODE_FULL: u32 = 2;
+const R2SLEIGH_TYPE_WRITEBACK_OFF: u32 = 0;
+const R2SLEIGH_TYPE_WRITEBACK_BALANCED: u32 = 1;
+const R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE: u32 = 2;
+const R2SLEIGH_TYPE_MIN_CONF_DEFAULT: i32 = 85;
+const R2SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT: i32 = 93;
+const R2SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT: i32 = 85;
+
+fn analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
+    let mut policy = R2SleighAnalysisPolicy {
+        mode: R2SLEIGH_MODE_BALANCED,
+        type_writeback_mode: R2SLEIGH_TYPE_WRITEBACK_BALANCED,
+        type_min_conf: R2SLEIGH_TYPE_MIN_CONF_DEFAULT,
+        type_rename_min_conf: R2SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT,
+        type_struct_min_conf: R2SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT,
+        type_interproc_max_iters: 4,
+        type_max_blocks: 200,
+        type_global_max_links: 32,
+        type_max_decls: 32,
+        type_max_mutations: 128,
+    };
+    match depth {
+        R2_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC => {
+            policy.mode = R2SLEIGH_MODE_FAST;
+            policy.type_writeback_mode = R2SLEIGH_TYPE_WRITEBACK_OFF;
+            policy.type_interproc_max_iters = 1;
+            policy.type_max_blocks = 96;
+            policy.type_global_max_links = 8;
+            policy.type_max_decls = 8;
+            policy.type_max_mutations = 32;
+        }
+        R2_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE => {
+            policy.mode = R2SLEIGH_MODE_FULL;
+            policy.type_writeback_mode = R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE;
+            policy.type_interproc_max_iters = 12;
+            policy.type_max_blocks = 500;
+            policy.type_global_max_links = 128;
+            policy.type_max_decls = 64;
+            policy.type_max_mutations = 512;
+        }
+        _ => {}
+    }
+    policy
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
+    analysis_policy_for_depth(depth)
+}
+
+#[repr(C)]
 pub struct R2SleighSessionInput {
     ctx: *const R2ILContext,
     blocks: *const *const R2ILBlock,
@@ -4167,8 +4237,104 @@ struct TypeWritebackCacheEntry {
 
 const TYPE_WRITEBACK_CACHE_LIMIT: usize = 4096;
 
-static TYPE_WRITEBACK_CACHE: LazyLock<RwLock<HashMap<u64, TypeWritebackCacheEntry>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+struct BoundedArcCache<K, V>
+where
+    K: Copy + Eq + Hash + Ord,
+{
+    limit: usize,
+    next_ticket: u64,
+    items: HashMap<K, (u64, Arc<V>)>,
+    recency: BTreeMap<(u64, K), K>,
+}
+
+impl<K, V> BoundedArcCache<K, V>
+where
+    K: Copy + Eq + Hash + Ord,
+{
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            next_ticket: 1,
+            items: HashMap::new(),
+            recency: BTreeMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.next_ticket = 1;
+        self.items.clear();
+        self.recency.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn get(&mut self, key: K) -> Option<Arc<V>> {
+        let (_, value) = self.items.get(&key)?;
+        let value = Arc::clone(value);
+        self.touch_existing(key);
+        Some(value)
+    }
+
+    fn put(&mut self, key: K, value: V) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.items.contains_key(&key) {
+            self.remove_recency(key);
+        }
+        while self.items.len() >= self.limit && !self.items.contains_key(&key) {
+            self.evict_oldest();
+        }
+        let ticket = self.allocate_ticket();
+        self.items.insert(key, (ticket, Arc::new(value)));
+        self.recency.insert((ticket, key), key);
+    }
+
+    fn touch_existing(&mut self, key: K) {
+        let Some((old_ticket, value)) = self
+            .items
+            .get(&key)
+            .map(|(ticket, value)| (*ticket, Arc::clone(value)))
+        else {
+            return;
+        };
+        self.recency.remove(&(old_ticket, key));
+        let ticket = self.allocate_ticket();
+        self.items.insert(key, (ticket, value));
+        self.recency.insert((ticket, key), key);
+    }
+
+    fn remove_recency(&mut self, key: K) {
+        if let Some((ticket, _)) = self.items.get(&key) {
+            self.recency.remove(&(*ticket, key));
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        let Some((recency_key, key)) = self
+            .recency
+            .iter()
+            .next()
+            .map(|(recency_key, key)| (*recency_key, *key))
+        else {
+            self.items.clear();
+            return;
+        };
+        self.recency.remove(&recency_key);
+        self.items.remove(&key);
+    }
+
+    fn allocate_ticket(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+        ticket
+    }
+}
+
+static TYPE_WRITEBACK_CACHE: LazyLock<RwLock<BoundedArcCache<u64, TypeWritebackCacheEntry>>> =
+    LazyLock::new(|| RwLock::new(BoundedArcCache::new(TYPE_WRITEBACK_CACHE_LIMIT)));
 
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_type_writeback_cache_clear() {
@@ -4195,10 +4361,9 @@ pub extern "C" fn r2sleigh_type_writeback_cache_get(
     applied_hash: *mut u64,
 ) -> i32 {
     let Some(entry) = TYPE_WRITEBACK_CACHE
-        .read()
+        .write()
         .expect("type writeback cache lock poisoned")
-        .get(&addr)
-        .copied()
+        .get(addr)
     else {
         return 0;
     };
@@ -4230,10 +4395,7 @@ pub extern "C" fn r2sleigh_type_writeback_cache_put(
     let mut cache = TYPE_WRITEBACK_CACHE
         .write()
         .expect("type writeback cache lock poisoned");
-    if cache.len() >= TYPE_WRITEBACK_CACHE_LIMIT && !cache.contains_key(&addr) {
-        cache.clear();
-    }
-    cache.insert(
+    cache.put(
         addr,
         TypeWritebackCacheEntry {
             key,
@@ -4248,9 +4410,43 @@ pub extern "C" fn r2sleigh_type_writeback_cache_put(
 #[cfg(test)]
 mod type_writeback_cache_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static CACHE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn analysis_policy_tracks_native_radare2_depths() {
+        let basic = analysis_policy_for_depth(R2_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC);
+        assert_eq!(basic.mode, R2SLEIGH_MODE_FAST);
+        assert_eq!(basic.type_writeback_mode, R2SLEIGH_TYPE_WRITEBACK_OFF);
+        assert_eq!(basic.type_interproc_max_iters, 1);
+        assert_eq!(basic.type_max_blocks, 96);
+        assert_eq!(basic.type_global_max_links, 8);
+
+        let balanced = analysis_policy_for_depth(0);
+        assert_eq!(balanced.mode, R2SLEIGH_MODE_BALANCED);
+        assert_eq!(
+            balanced.type_writeback_mode,
+            R2SLEIGH_TYPE_WRITEBACK_BALANCED
+        );
+        assert_eq!(balanced.type_interproc_max_iters, 4);
+        assert_eq!(balanced.type_max_blocks, 200);
+        assert_eq!(balanced.type_global_max_links, 32);
+
+        let aggressive = analysis_policy_for_depth(R2_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE);
+        assert_eq!(aggressive.mode, R2SLEIGH_MODE_FULL);
+        assert_eq!(
+            aggressive.type_writeback_mode,
+            R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE
+        );
+        assert_eq!(aggressive.type_interproc_max_iters, 12);
+        assert_eq!(aggressive.type_max_blocks, 500);
+        assert_eq!(aggressive.type_global_max_links, 128);
+    }
 
     #[test]
     fn type_writeback_cache_is_rust_owned_and_address_keyed() {
+        let _guard = CACHE_TEST_LOCK.lock().expect("cache test lock poisoned");
         r2sleigh_type_writeback_cache_clear();
         assert_eq!(r2sleigh_type_writeback_cache_len(), 0);
 
@@ -4292,6 +4488,81 @@ mod type_writeback_cache_tests {
             (key, dep_hash, payload_hash, applied_hash),
             (10, 20, 30, 40)
         );
+
+        r2sleigh_type_writeback_cache_clear();
+    }
+
+    #[test]
+    fn type_writeback_cache_evicts_oldest_entry_deterministically() {
+        let _guard = CACHE_TEST_LOCK.lock().expect("cache test lock poisoned");
+        r2sleigh_type_writeback_cache_clear();
+
+        for idx in 0..TYPE_WRITEBACK_CACHE_LIMIT as u64 {
+            assert_eq!(
+                r2sleigh_type_writeback_cache_put(0x500000 + idx, idx, idx + 1, idx + 2, idx + 3),
+                1
+            );
+        }
+        assert_eq!(
+            r2sleigh_type_writeback_cache_len(),
+            TYPE_WRITEBACK_CACHE_LIMIT
+        );
+
+        let mut key = 0;
+        let mut dep_hash = 0;
+        let mut payload_hash = 0;
+        let mut applied_hash = 0;
+        assert_eq!(
+            r2sleigh_type_writeback_cache_get(
+                0x500000,
+                &mut key,
+                &mut dep_hash,
+                &mut payload_hash,
+                &mut applied_hash,
+            ),
+            1
+        );
+        assert_eq!((key, dep_hash, payload_hash, applied_hash), (0, 1, 2, 3));
+
+        assert_eq!(
+            r2sleigh_type_writeback_cache_put(0x600000, 9, 10, 11, 12),
+            1
+        );
+        assert_eq!(
+            r2sleigh_type_writeback_cache_len(),
+            TYPE_WRITEBACK_CACHE_LIMIT
+        );
+        assert_eq!(
+            r2sleigh_type_writeback_cache_get(
+                0x500000,
+                &mut key,
+                &mut dep_hash,
+                &mut payload_hash,
+                &mut applied_hash,
+            ),
+            1
+        );
+        assert_eq!(
+            r2sleigh_type_writeback_cache_get(
+                0x500001,
+                &mut key,
+                &mut dep_hash,
+                &mut payload_hash,
+                &mut applied_hash,
+            ),
+            0
+        );
+        assert_eq!(
+            r2sleigh_type_writeback_cache_get(
+                0x600000,
+                &mut key,
+                &mut dep_hash,
+                &mut payload_hash,
+                &mut applied_hash,
+            ),
+            1
+        );
+        assert_eq!((key, dep_hash, payload_hash, applied_hash), (9, 10, 11, 12));
 
         r2sleigh_type_writeback_cache_clear();
     }
