@@ -104,19 +104,13 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 &symbols,
             );
             let mut artifact = if let Some(artifact) = cached_artifact {
-                if let Some(route) = r2dec::detached_semantic_route_plan(
+                let route = r2dec::detached_semantic_route_plan(
                     &display_func_name,
                     &r2il_blocks,
                     &artifact.function_facts,
-                ) {
-                    if let r2dec::SemanticRoutePlan::FallbackComment { comment } = route {
-                        return comment;
-                    }
-                    if let Some(reason) = cfg_guard_reason.as_ref()
-                        && matches!(route, r2dec::SemanticRoutePlan::Standard)
-                    {
-                        return r2dec::artifact_guard_fallback_comment(&func_name_str, reason);
-                    }
+                );
+                if let Some(r2dec::SemanticRoutePlan::FallbackComment { comment }) = route {
+                    return comment;
                 }
                 artifact
             } else {
@@ -131,22 +125,16 @@ pub(crate) fn run_full_decompile_on_large_stack(
                         )
                     },
                 );
-                if let Some(route) = r2dec::detached_semantic_route_plan(
+                let route = r2dec::detached_semantic_route_plan(
                     &display_func_name,
                     &r2il_blocks,
                     &r2types::FunctionFacts::new(
                         r2types::FunctionTypeFacts::default(),
                         precomputed_semantic_artifact.clone(),
                     ),
-                ) {
-                    if let r2dec::SemanticRoutePlan::FallbackComment { comment } = route {
-                        return comment;
-                    }
-                    if let Some(reason) = cfg_guard_reason.as_ref()
-                        && matches!(route, r2dec::SemanticRoutePlan::Standard)
-                    {
-                        return r2dec::artifact_guard_fallback_comment(&func_name_str, reason);
-                    }
+                );
+                if let Some(r2dec::SemanticRoutePlan::FallbackComment { comment }) = route {
+                    return comment;
                 }
                 let Some(artifact) =
                     crate::types::build_detached_function_analysis_artifact_with_scope_and_semantics(

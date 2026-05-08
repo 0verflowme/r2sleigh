@@ -372,6 +372,20 @@ a:sla.debug.types | jq -c 'type=="object" and ((((.function_name // "") | contai
 EOF_CMDS
 RUN
 
+NAME=stress_parse_number_decompile_uses_bounded_cfg_residual_not_hard_fallback
+FILE=bins/stress_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `isq~parse_number$[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec residual:") and contains("loc_") and contains("goto loc_") and (contains("r2dec fallback:")|not)'
+EOF_CMDS
+RUN
+
 NAME=vm_shaped_large_cfg_records_bounded_result
 FILE=bins/stress_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true

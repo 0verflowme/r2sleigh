@@ -23,7 +23,7 @@ where
         return EmptyStructuringFallback {
             body_stmt: crate::Decompiler::prepend_comment(
                 unfolded_stmt,
-                format!("r2dec fallback: {}", folded_reason),
+                format!("r2dec residual: {}", folded_reason),
             ),
             use_conservative_locals: true,
             is_linear_fallback: false,
@@ -57,7 +57,7 @@ where
         linear_stmts.insert(
             0,
             CStmt::comment(format!(
-                "r2dec fallback: {} -> linear block emission",
+                "r2dec residual: {} -> linear cfg emission",
                 fallback_reason
             )),
         );

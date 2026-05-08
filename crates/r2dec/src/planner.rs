@@ -164,7 +164,7 @@ pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
 
 pub fn block_guard_fallback_comment(func_name: &str, blocks: usize, max_blocks: usize) -> String {
     format!(
-        "/* r2dec fallback: skipped decompilation for {} ({} blocks > limit {}). Set SLEIGH_DEC_MAX_BLOCKS to override. */",
+        "/* r2dec budget: skipped decompilation for {} ({} blocks > limit {}). */",
         func_name, blocks, max_blocks
     )
 }

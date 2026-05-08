@@ -61,7 +61,7 @@ pub(crate) fn semantic_worker_linear_body(reason: &str, mut linear_stmts: Vec<CS
     linear_stmts.insert(
         0,
         CStmt::comment(format!(
-            "r2dec fallback: semantic worker linearization for {}",
+            "r2dec residual: semantic worker linearization for {}",
             reason
         )),
     );

@@ -253,14 +253,20 @@ impl SemanticRegion {
         let has_condition = reachable_target
             .and_then(|target| self.actionable_compiled_condition_for_target(target))
             .is_some();
-        let has_memory_support = reachable_target
+        let has_memory_facts = !self.memory.is_empty()
+            || self
+                .control
+                .iter()
+                .filter_map(|fact| fact.value.compiled.as_ref())
+                .any(|compiled| !compiled.memory_terms.is_empty());
+        let has_target_memory_support = reachable_target
             .map(|target| !self.actionable_memory_terms_for_target(target).is_empty())
             .unwrap_or(false);
         self.control
             .iter()
             .any(|fact| fact.evidence.allows_guarded_structuring())
             && has_condition
-            && has_memory_support
+            && (!has_memory_facts || has_target_memory_support)
     }
 
     pub fn supports_query_guidance(&self) -> bool {
@@ -757,6 +763,24 @@ mod tests {
                 SemanticEvidence::exact(),
             )],
         }
+    }
+
+    fn control_only_region(anchor: u64, target: u64, branch_truth: bool) -> SemanticRegion {
+        let mut region = guided_region(anchor, target, branch_truth);
+        region.memory.clear();
+        for fact in &mut region.control {
+            if let Some(compiled) = fact.value.compiled.as_mut() {
+                compiled.memory_terms.clear();
+            }
+        }
+        region
+    }
+
+    #[test]
+    fn control_only_compiled_condition_supports_guarded_structuring() {
+        let region = control_only_region(0x401000, 0x401040, true);
+        assert!(region.supports_guarded_structuring());
+        assert!(worker_body([region]).supports_guarded_structuring());
     }
 
     proptest! {

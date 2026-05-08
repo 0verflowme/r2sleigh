@@ -58,6 +58,7 @@ use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2il::R2ILBlock;
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
+use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts, FunctionSignatureSpec,
     FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding,
@@ -1345,14 +1346,80 @@ impl Decompiler {
         let mut stmts = Vec::new();
 
         for block in &blocks {
+            stmts.push(CStmt::Label(Self::linear_block_label(block.addr)));
             for stmt in fold_ctx.fold_block(block, block.addr) {
                 if !matches!(stmt, CStmt::Empty) {
                     stmts.push(stmt);
                 }
             }
+            if let Some(terminator_stmt) = Self::linearized_terminator_stmt(func, fold_ctx, block) {
+                stmts.push(terminator_stmt);
+            }
         }
 
         stmts
+    }
+
+    fn linear_block_label(addr: u64) -> String {
+        format!("loc_{addr:x}")
+    }
+
+    fn linearized_terminator_stmt(
+        func: &SSAFunction,
+        fold_ctx: &FoldingContext<'_>,
+        block: &r2ssa::FunctionSSABlock,
+    ) -> Option<CStmt> {
+        let terminator = &func.cfg().get_block(block.addr)?.terminator;
+        match terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } => {
+                let cond = fold_ctx
+                    .extract_condition_from_block(block)
+                    .unwrap_or(CExpr::IntLit(1));
+                Some(CStmt::if_stmt(
+                    cond,
+                    CStmt::Goto(Self::linear_block_label(*true_target)),
+                    Some(CStmt::Goto(Self::linear_block_label(*false_target))),
+                ))
+            }
+            BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
+                Some(CStmt::Goto(Self::linear_block_label(*target)))
+            }
+            BlockTerminator::Call {
+                fallthrough: Some(target),
+                ..
+            }
+            | BlockTerminator::IndirectCall {
+                fallthrough: Some(target),
+            } => Some(CStmt::Goto(Self::linear_block_label(*target))),
+            BlockTerminator::Switch { cases, default } => {
+                let mut stmts = Vec::new();
+                for (value, target) in cases {
+                    stmts.push(CStmt::comment(format!(
+                        "case {value}: goto {};",
+                        Self::linear_block_label(*target)
+                    )));
+                }
+                if let Some(target) = default {
+                    stmts.push(CStmt::comment(format!(
+                        "default: goto {};",
+                        Self::linear_block_label(*target)
+                    )));
+                }
+                (!stmts.is_empty()).then_some(CStmt::Block(stmts))
+            }
+            BlockTerminator::IndirectBranch => Some(CStmt::comment(
+                "indirect branch target unresolved".to_string(),
+            )),
+            BlockTerminator::Call {
+                fallthrough: None, ..
+            }
+            | BlockTerminator::IndirectCall { fallthrough: None }
+            | BlockTerminator::Return
+            | BlockTerminator::None => None,
+        }
     }
 
     /// Build a C function from an SSA function.
@@ -1600,22 +1667,31 @@ impl Decompiler {
         if matches!(semantic_route, planner::SemanticRoutePlan::Standard)
             && !Self::stmt_has_content(&body_stmt)
         {
-            let folded_reason = structurer
-                .safety_reason()
-                .map(str::to_string)
-                .unwrap_or_else(|| "folded structuring produced empty output".to_string());
-            let empty_fallback = consumer_fallback::recover_empty_structuring(
-                func,
-                &fold_ctx,
-                folded_reason,
-                prefer_symbolic_large_worker_decompile(&self.context.function_facts)
-                    .then(|| preferred_semantic_worker_reason(&func.cfg_risk_summary()))
-                    .as_deref(),
-                || self.linearize_function_body(func, &fold_ctx),
-            );
-            use_conservative_locals = empty_fallback.use_conservative_locals;
-            is_linear_fallback = empty_fallback.is_linear_fallback;
-            body_stmt = empty_fallback.body_stmt;
+            if let Some(semantic_body) = structurer.structure_semantic_worker_islands(6) {
+                body_stmt = consumer_structured::semantic_worker_structured_body(
+                    "semantic control islands",
+                    semantic_body,
+                );
+                use_conservative_locals = true;
+                is_linear_fallback = false;
+            } else {
+                let folded_reason = structurer
+                    .safety_reason()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "folded structuring produced empty output".to_string());
+                let empty_fallback = consumer_fallback::recover_empty_structuring(
+                    func,
+                    &fold_ctx,
+                    folded_reason,
+                    prefer_symbolic_large_worker_decompile(&self.context.function_facts)
+                        .then(|| preferred_semantic_worker_reason(&func.cfg_risk_summary()))
+                        .as_deref(),
+                    || self.linearize_function_body(func, &fold_ctx),
+                );
+                use_conservative_locals = empty_fallback.use_conservative_locals;
+                is_linear_fallback = empty_fallback.is_linear_fallback;
+                body_stmt = empty_fallback.body_stmt;
+            }
         }
 
         body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt);
@@ -5518,7 +5594,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_semantic_linearization_reason_uses_worker_label_when_cfg_is_benign() {
+    fn preferred_semantic_structuring_reason_uses_control_only_worker_label_when_cfg_is_benign() {
         let likely =
             r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
         let region = test_semantic_region(
@@ -5550,13 +5626,22 @@ mod tests {
         let semantic_artifact =
             large_cfg_worker_artifact(r2sym::RefinementStage::Compiled, Vec::new(), vec![region]);
         assert_eq!(
-            preferred_semantic_linearization_reason(
+            preferred_semantic_structuring_reason(
                 "_140010138",
                 Some(&semantic_artifact),
                 &summary,
             )
             .as_deref(),
             Some("semantic worker islands")
+        );
+        assert!(
+            preferred_semantic_linearization_reason(
+                "_140010138",
+                Some(&semantic_artifact),
+                &summary,
+            )
+            .is_none(),
+            "control-only guarded regions should use the structured semantic path"
         );
     }
 
