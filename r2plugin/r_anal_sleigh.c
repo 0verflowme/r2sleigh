@@ -8486,7 +8486,11 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 		char *result = NULL;
 		SymFunctionScope sym_scope;
-		bool have_sym_scope = build_symbolic_function_scope (anal, fcn, ctx, &sym_scope);
+		SleighInterprocSeeds interproc_seeds;
+		bool have_sym_scope = false;
+		sleigh_interproc_seeds_init (&interproc_seeds);
+		have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
+			&sym_scope, &interproc_seeds);
 		if (have_cfg_summary) {
 			result = r2dec_semantic_worker_linearization_scope_ffi (
 				ctx,
@@ -8507,6 +8511,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				r2il_string_free (result);
 				if (have_sym_scope) {
 					sym_function_scope_free (&sym_scope);
+					sleigh_interproc_seeds_free (&interproc_seeds);
 				}
 				block_array_free (&blocks);
 				return strdup("");
@@ -8518,7 +8523,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		}
 
 		/* Gather function names from r2 */
-		char *func_names_json = NULL;
+			char *func_names_json = NULL;
 			char *strings_json = NULL;
 			char *symbols_json = NULL;
 			SleighTypedFunctionContext typed_context = {0};
@@ -8535,6 +8540,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				if (have_sym_scope) {
 					sym_function_scope_free (&sym_scope);
 				}
+				sleigh_interproc_seeds_free (&interproc_seeds);
 				free (func_names_json);
 				free (strings_json);
 				free (symbols_json);
@@ -8544,30 +8550,24 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_TYPED_CONTEXT, r_time_now_mono () - profile_start_us);
 
 			/* Decompile with context */
-				if (have_sym_scope) {
-						if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-								1, 1, true, sym_scope.functions, sym_scope.count, NULL, 0,
-								(size_t)policy.type_global_max_links,
-								(size_t)policy.type_max_decls,
-								(size_t)policy.type_max_mutations)) {
-						profile_start_us = r_time_now_mono ();
-						result = r2dec_function_with_session_context (&session_input,
-							func_names_json, strings_json, symbols_json);
-						sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
-					}
-					sym_function_scope_free (&sym_scope);
-					} else {
-						if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
-								1, 1, true, NULL, 0, NULL, 0,
-								(size_t)policy.type_global_max_links,
-								(size_t)policy.type_max_decls,
-								(size_t)policy.type_max_mutations)) {
-						profile_start_us = r_time_now_mono ();
-						result = r2dec_function_with_session_context (&session_input,
-							func_names_json, strings_json, symbols_json);
-						sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
-					}
+			if (sleigh_session_input_init (&session_input, anal, ctx, fcn, &blocks, &typed_context,
+					1, 1, true,
+					have_sym_scope? sym_scope.functions: NULL,
+					have_sym_scope? sym_scope.count: 0,
+					have_sym_scope? interproc_seeds.items: NULL,
+					have_sym_scope? interproc_seeds.count: 0,
+					(size_t)policy.type_global_max_links,
+					(size_t)policy.type_max_decls,
+					(size_t)policy.type_max_mutations)) {
+				profile_start_us = r_time_now_mono ();
+				result = r2dec_function_with_session_context (&session_input,
+					func_names_json, strings_json, symbols_json);
+				sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_DECOMPILE, r_time_now_mono () - profile_start_us);
 			}
+			if (have_sym_scope) {
+				sym_function_scope_free (&sym_scope);
+			}
+			sleigh_interproc_seeds_free (&interproc_seeds);
 
 		if (cons) {
 			if (result && result[0]) {

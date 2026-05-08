@@ -158,6 +158,20 @@ pub(crate) fn run_full_decompile_on_large_stack(
             };
             artifact = rename_function_artifact_for_display(artifact, &display_func_name);
 
+            if let Some(r2sym::DecompilePlan::NativeLinear { reason }) =
+                artifact.function_facts.decompile_plan()
+            {
+                let route = r2dec::SemanticRoutePlan::LinearWorker { reason };
+                if let Some(output) = r2dec::render_semantic_worker_summary(
+                    &display_func_name,
+                    &artifact.function_facts,
+                    &route,
+                    config.clone(),
+                ) {
+                    return output;
+                }
+            }
+
             if let Some(route) = r2dec::detached_semantic_route_plan(
                 &display_func_name,
                 &r2il_blocks,
@@ -165,9 +179,20 @@ pub(crate) fn run_full_decompile_on_large_stack(
             ) {
                 match route {
                     r2dec::SemanticRoutePlan::VmSummary { .. } => {
-                        if let Some(output) =
-                            r2dec::render_vm_semantic_summary(&display_func_name, &artifact.function_facts)
-                        {
+                        if let Some(output) = r2dec::render_vm_semantic_summary(
+                            &display_func_name,
+                            &artifact.function_facts,
+                        ) {
+                            return output;
+                        }
+                    }
+                    r2dec::SemanticRoutePlan::LinearWorker { .. } => {
+                        if let Some(output) = r2dec::render_semantic_worker_summary(
+                            &display_func_name,
+                            &artifact.function_facts,
+                            &route,
+                            config.clone(),
+                        ) {
                             return output;
                         }
                     }

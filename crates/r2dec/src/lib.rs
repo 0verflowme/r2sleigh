@@ -111,6 +111,21 @@ fn should_use_prepared_semantic_view(
     planner::should_use_prepared_semantic_view(prepared, function_facts)
 }
 
+fn should_render_bounded_semantic_worker_summary(
+    function_facts: &FunctionFacts,
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> bool {
+    if !function_facts.has_summary_conflicts() {
+        return false;
+    }
+    let Some(native) = semantic_artifact.native_body() else {
+        return false;
+    };
+    native.regions.len() >= 4
+        && native.actionable_control_count() == 0
+        && native.exact_control_count() == 0
+}
+
 fn seed_runtime_type_hints_from_facts_and_recovery(
     type_facts: &FunctionTypeFacts,
     var_recovery: &VariableRecovery,
@@ -301,6 +316,10 @@ fn format_vm_memory_conditions(conditions: &[r2sym::VmMemoryCondition]) -> Strin
     format!("[{rendered}]")
 }
 
+fn sanitize_comment_text(text: &str) -> String {
+    text.replace("*/", "* /").replace(['\r', '\n'], " ")
+}
+
 pub(crate) fn format_vm_summary_kind(kind: r2sym::InterpreterKind) -> &'static str {
     match kind {
         r2sym::InterpreterKind::SwitchDispatch => "switch_dispatch",
@@ -456,6 +475,19 @@ pub fn render_vm_semantic_summary(
         func_name,
         &function_facts.types,
         function_facts.semantics.as_ref()?,
+    )
+}
+
+pub fn render_semantic_worker_summary(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+    route: &SemanticRoutePlan,
+    config: DecompilerConfig,
+) -> Option<String> {
+    Decompiler::new(config).semantic_worker_summary_output_for_route(
+        func_name,
+        function_facts,
+        route,
     )
 }
 
@@ -1056,6 +1088,13 @@ impl Decompiler {
         if let Some(output) = self.vm_summary_output_for_route(&func_name, &semantic_route) {
             return output;
         }
+        if let Some(output) = self.semantic_worker_summary_output_for_route(
+            &func_name,
+            &self.context.function_facts,
+            &semantic_route,
+        ) {
+            return output;
+        }
         // Build the C function
         let c_func = self.build_function(func);
 
@@ -1077,6 +1116,13 @@ impl Decompiler {
             &func.cfg_risk_summary(),
         );
         if let Some(output) = self.vm_summary_output_for_route(&func_name, &semantic_route) {
+            return output;
+        }
+        if let Some(output) = self.semantic_worker_summary_output_for_route(
+            &func_name,
+            &input.context.function_facts,
+            &semantic_route,
+        ) {
             return output;
         }
         let c_func = self.build_function_from_input(input);
@@ -1335,6 +1381,161 @@ impl Decompiler {
         }
 
         Some(out.trim_end().to_string())
+    }
+
+    fn semantic_worker_summary_output_for_route(
+        &self,
+        func_name: &str,
+        function_facts: &FunctionFacts,
+        route: &planner::SemanticRoutePlan,
+    ) -> Option<String> {
+        let planner::SemanticRoutePlan::LinearWorker { reason } = route else {
+            return None;
+        };
+        let semantic_artifact = function_facts.semantic_artifact()?;
+        if !should_render_bounded_semantic_worker_summary(function_facts, semantic_artifact) {
+            return None;
+        }
+
+        let mut comments = Vec::new();
+        comments.push(format!(
+            "r2dec residual: semantic worker summary for {}",
+            sanitize_comment_text(reason)
+        ));
+        comments.push(format!(
+            "semantic mode: {}; slice={}",
+            semantic_mode_label(semantic_artifact),
+            semantic_artifact
+                .slice_class()
+                .map(semantic_slice_class_label)
+                .unwrap_or("unknown")
+        ));
+
+        if !semantic_artifact.diagnostics.residual_reasons.is_empty() {
+            let reasons = semantic_artifact
+                .diagnostics
+                .residual_reasons
+                .iter()
+                .map(|reason| semantic_residual_reason_label(*reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            comments.push(format!("residual reasons: {reasons}"));
+        }
+
+        if let Some(native) = semantic_artifact.native_body() {
+            let memory_fact_count = native
+                .regions
+                .values()
+                .map(|region| region.memory.len())
+                .sum::<usize>();
+            comments.push(format!(
+                "native regions: regions={}, actionable_conditions={}, exact_conditions={}, memory_facts={}",
+                native.regions.len(),
+                native.actionable_control_count(),
+                native.exact_control_count(),
+                memory_fact_count
+            ));
+        }
+
+        if function_facts.has_assumption_conflicts() {
+            comments.push(format!(
+                "assumption conflicts: {}",
+                function_facts.assumption_usage.conflicts.len()
+            ));
+        }
+        if function_facts.has_summary_conflicts() {
+            comments
+                .push("summary conflicts: interprocedural summaries did not converge".to_string());
+        }
+
+        if let Some(rollup) = function_facts.summary_rollup() {
+            if let Some(return_relation) = rollup.root_return_relation.as_ref() {
+                comments.push(format!("summary return: {return_relation:?}"));
+            }
+            if !rollup.out_param_indices.is_empty() {
+                comments.push(format!(
+                    "summary out params: {}",
+                    rollup
+                        .out_param_indices
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if rollup.transfer_count
+                + rollup.allocation_count
+                + rollup.lifetime_count
+                + rollup.sync_count
+                + rollup.atomic_count
+                > 0
+            {
+                comments.push(format!(
+                    "summary effects: transfers={}, allocations={}, lifetimes={}, sync={}, atomics={}",
+                    rollup.transfer_count,
+                    rollup.allocation_count,
+                    rollup.lifetime_count,
+                    rollup.sync_count,
+                    rollup.atomic_count
+                ));
+            }
+            if rollup.helper_summary_count > 0 {
+                comments.push(format!("helper summaries: {}", rollup.helper_summary_count));
+            }
+            if rollup.has_unknown_calls || rollup.touches_unknown_memory {
+                comments.push(format!(
+                    "residual effects: unknown_calls={}, unknown_memory={}",
+                    rollup.has_unknown_calls, rollup.touches_unknown_memory
+                ));
+            }
+        }
+
+        let c_func =
+            self.semantic_worker_summary_function(func_name, &function_facts.types, comments);
+        let mut codegen = CodeGenerator::new(self.config.codegen.clone());
+        Some(codegen.generate_function(&c_func))
+    }
+
+    fn semantic_worker_summary_function(
+        &self,
+        func_name: &str,
+        type_facts: &FunctionTypeFacts,
+        comments: Vec<String>,
+    ) -> CFunction {
+        let ret_type = type_facts
+            .merged_signature
+            .as_ref()
+            .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+            .unwrap_or(CType::Unknown);
+        let mut params =
+            merge_params_with_external_signature(Vec::new(), type_facts.merged_signature.as_ref());
+        if params.is_empty() {
+            params = type_facts
+                .register_params
+                .iter()
+                .enumerate()
+                .map(|(idx, param)| ast::CParam {
+                    ty: param
+                        .ty
+                        .as_ref()
+                        .map(type_like_to_ctype)
+                        .unwrap_or(CType::Unknown),
+                    name: if is_generic_arg_name(&param.name) || param.name.trim().is_empty() {
+                        format!("arg{}", idx + 1)
+                    } else {
+                        param.name.clone()
+                    },
+                })
+                .collect();
+        }
+
+        CFunction {
+            name: func_name.to_string(),
+            ret_type,
+            params,
+            locals: Vec::new(),
+            body: comments.into_iter().map(CStmt::comment).collect(),
+        }
     }
 
     fn linearize_function_body(
@@ -5272,6 +5473,116 @@ mod tests {
         )
         .expect("ready large worker should prefer linearized decompile path");
         assert!(reason.contains("complex loop graph"));
+    }
+
+    #[test]
+    fn preferred_semantic_linearization_reason_honors_named_worker_native_linear_plan() {
+        let region = test_semantic_region(
+            0x401000,
+            BTreeSet::from([0x401010, 0x401020]),
+            Vec::new(),
+            Vec::new(),
+        );
+        let summary = r2ssa::CFGRiskSummary {
+            block_count: 8,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let semantic_artifact =
+            large_cfg_worker_artifact(r2sym::RefinementStage::Residual, Vec::new(), vec![region]);
+        let reason = preferred_semantic_linearization_reason(
+            "sym._usage",
+            Some(&semantic_artifact),
+            &summary,
+        )
+        .expect("named native worker with a linear decompile plan should avoid full structuring");
+        assert_eq!(reason, "guarded structuring unavailable");
+    }
+
+    #[test]
+    fn decompile_input_uses_bounded_summary_for_native_linear_worker() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let semantic_artifact = large_cfg_worker_artifact(
+            r2sym::RefinementStage::Residual,
+            Vec::new(),
+            vec![
+                test_semantic_region(
+                    0x401000,
+                    BTreeSet::from([0x401010, 0x401020]),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                test_semantic_region(
+                    0x401100,
+                    BTreeSet::from([0x401110, 0x401120]),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                test_semantic_region(
+                    0x401200,
+                    BTreeSet::from([0x401210, 0x401220]),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                test_semantic_region(
+                    0x401300,
+                    BTreeSet::from([0x401310, 0x401320]),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ],
+        );
+        let summary_set = r2ssa::InterprocSummarySet {
+            diagnostics: r2ssa::InterprocSummaryDiagnostics {
+                iterations: 1,
+                max_iterations: 1,
+                converged: false,
+                ..r2ssa::InterprocSummaryDiagnostics::default()
+            },
+            ..r2ssa::InterprocSummarySet::default()
+        };
+        let function_facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(signature_spec(
+                    Some(CType::Void),
+                    vec![("status", Some(CType::Int(32)))],
+                )),
+                ..FunctionTypeFacts::default()
+            },
+            Some(semantic_artifact),
+        )
+        .with_summary_set(Some(summary_set));
+        assert!(function_facts.has_summary_conflicts());
+        let context = DecompilerContext::from_function_facts(
+            function_facts,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            64,
+        );
+        let input = DecompilerInput::new(prepared, context);
+        assert!(input.context.function_facts.has_summary_conflicts());
+        let output = Decompiler::new(DecompilerConfig::default()).decompile_input(&input);
+
+        assert!(
+            output.contains("void stable_demo(int32_t status)"),
+            "expected signature-preserving summary output, got:\n{output}"
+        );
+        assert!(
+            output.contains(
+                "r2dec residual: semantic worker summary for guarded structuring unavailable"
+            ) && output.contains("native regions: regions=4")
+                && !output.contains("loc_"),
+            "expected bounded semantic summary instead of linearized SSA blocks, got:\n{output}"
+        );
     }
 
     #[test]
