@@ -87,7 +87,7 @@ install-plugin:
 		cp "$(LOCAL_PLUGIN_ANAL_SO)" "$(R2R_PLUGIN_DIR)/"; \
 		cp "$(LOCAL_PLUGIN_ARCH_SO)" "$(R2R_PLUGIN_DIR)/"; \
 	else \
-		$(MAKE) -C ../../r2plugin RUST_FEATURES=$(R2R_RUST_FEATURES) R2_PLUGIN_DIR="$(abspath $(R2R_PLUGIN_DIR))" install; \
+		$(MAKE) -C ../../r2plugin RUST_FEATURES=$(R2R_RUST_FEATURES) LOCAL_R2_DIR="$(LOCAL_R2_ABS)" R2_PLUGIN_DIR="$(abspath $(R2R_PLUGIN_DIR))" install; \
 	fi
 
 run: ensure-tools link-bins
@@ -99,4 +99,5 @@ run: ensure-tools link-bins
 		XDG_DATA_HOME="$(abspath $(R2R_TMPDIR)/xdg-data)" \
 		R2_LIBR_PLUGINS="$(abspath $(R2R_PLUGIN_DIR))" \
 		LD_LIBRARY_PATH="$(R2R_LD_LIBRARY_PATH)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+		DYLD_LIBRARY_PATH="$(R2R_LD_LIBRARY_PATH)$${DYLD_LIBRARY_PATH:+:$$DYLD_LIBRARY_PATH}" \
 		r2r -t $(R2R_TIMEOUT) -j $(R2R_JOBS) -L db/extras

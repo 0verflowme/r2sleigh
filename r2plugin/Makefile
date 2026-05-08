@@ -33,6 +33,7 @@ endif
 LOCAL_R2_DIR ?= ../../radare2
 LOCAL_R2_ABS := $(abspath $(LOCAL_R2_DIR))
 LOCAL_R2_INCLUDE := $(LOCAL_R2_ABS)/libr/include
+LOCAL_R2_SDB_INCLUDE := $(LOCAL_R2_ABS)/subprojects/sdb/include
 LOCAL_R2_ANAL_LIB := $(LOCAL_R2_ABS)/libr/anal/libr_anal.so
 LOCAL_R2_LIB_FLAGS = \
 	-L$(LOCAL_R2_ABS)/libr/core \
@@ -56,7 +57,7 @@ ifeq ($(wildcard $(LOCAL_R2_INCLUDE)/r_anal.h)$(wildcard $(LOCAL_R2_ANAL_LIB)),)
 R2_CFLAGS := $(shell pkg-config --cflags r_anal r_arch r_core 2>/dev/null || echo "-I/usr/include/libr")
 R2_LDFLAGS := $(shell pkg-config --libs r_anal r_arch r_core 2>/dev/null || echo "-lr_core -lr_anal -lr_arch -lr_util -lr_io")
 else
-R2_CFLAGS := -I$(LOCAL_R2_INCLUDE)
+R2_CFLAGS := -I$(LOCAL_R2_INCLUDE) -I$(LOCAL_R2_SDB_INCLUDE)
 R2_LDFLAGS := $(LOCAL_R2_LIB_FLAGS)
 endif
 R2_PLUGIN_DIR := $(shell r2 -H R2_USER_PLUGINS 2>/dev/null || echo "$(HOME)/.local/share/radare2/plugins")
