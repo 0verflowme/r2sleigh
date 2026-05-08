@@ -36,6 +36,10 @@ VALID_JSON = "{}\n"
 
 
 class KernelSmokeTests(unittest.TestCase):
+    def test_parse_json_payload_tolerates_noisy_stdout(self):
+        output = "INFO: ignored {not json}\n{\"ok\": true}\nWARN: trailing text\n"
+        self.assertEqual(kernel_smoke.parse_json_payload(output), {"ok": True})
+
     def run_harness(
         self,
         responses: list,
@@ -139,6 +143,20 @@ class KernelSmokeTests(unittest.TestCase):
         self.assertEqual(
             report["targets"][0]["commands"]["decompile_sla"]["fallback_marker"],
             "r2dec fallback:",
+        )
+
+    def test_budget_refusal_is_not_hard_decompiler_fallback(self):
+        responses = self.valid_target_responses()
+        responses[1] = cmd_result(
+            "/* r2dec budget: skipped decompilation for main (2198 blocks > limit 200). */\n"
+        )
+        exit_code, report, _, _ = self.run_harness(responses)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["failures"], [])
+        self.assertNotIn(
+            "fallback_marker",
+            report["targets"][0]["commands"]["decompile_sla"],
         )
 
     def test_strict_fails_command_return_failure(self):

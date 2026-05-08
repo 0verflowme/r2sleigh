@@ -208,11 +208,13 @@ def parse_json_payload(text: str) -> Any:
     stripped = text.strip()
     if not stripped:
         raise ValueError("empty output")
+    decoder = json.JSONDecoder()
     for idx, ch in enumerate(stripped):
         if ch not in "[{":
             continue
         try:
-            return json.loads(stripped[idx:])
+            payload, _ = decoder.raw_decode(stripped[idx:])
+            return payload
         except json.JSONDecodeError:
             continue
     raise ValueError("no JSON payload found")
@@ -321,6 +323,8 @@ def summarize_text(text: str, max_lines: int = 80, include_preview: bool = False
 
 def decompiler_fallback_marker(text: str) -> str | None:
     lower = text.lower()
+    if "r2dec budget:" in lower or "r2dec residual:" in lower:
+        return None
     for marker in DECOMPILER_FALLBACK_MARKERS:
         if marker.lower() in lower:
             return marker

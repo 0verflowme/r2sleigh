@@ -20,6 +20,8 @@ com.apple.kernel
 *.r2il
 *.dSYM/
 r2sleigh-kernel-smoke*.json
+r2sleigh-reversing-benchmark*.json
+r2sleigh-corpora*/
 
 # Plugin build artifacts
 r2plugin/*.so
