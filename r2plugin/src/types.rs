@@ -500,6 +500,7 @@ fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
         r2types::CTypeLike::Struct(name) => r2dec::CType::Struct(name.clone()),
         r2types::CTypeLike::Union(name) => r2dec::CType::Union(name.clone()),
         r2types::CTypeLike::Enum(name) => r2dec::CType::Enum(name.clone()),
+        r2types::CTypeLike::Typedef(name) => r2dec::CType::Typedef(name.clone()),
         r2types::CTypeLike::Function | r2types::CTypeLike::Unknown => r2dec::CType::Unknown,
     }
 }

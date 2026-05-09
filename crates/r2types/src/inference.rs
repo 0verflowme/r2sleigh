@@ -1152,7 +1152,7 @@ impl TypeInference {
                 let (elem_ty, struct_name) = self.type_like_to_typeid(inner, arena);
                 (arena.array(elem_ty, *len, None), struct_name)
             }
-            CTypeLike::Struct(name) => (
+            CTypeLike::Struct(name) | CTypeLike::Typedef(name) => (
                 arena.struct_named_or_existing(name.clone()),
                 Some(name.clone()),
             ),

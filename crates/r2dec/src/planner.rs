@@ -133,13 +133,20 @@ pub(crate) fn preferred_semantic_summary_islands_reason(
     }
     match capability.plan.as_ref()? {
         r2sym::DecompilePlan::NativeStructured => {
-            let high_risk = capability.skipped_large_cfg
+            if capability.skipped_large_cfg
                 && (cfg_guard_reason_from_summary(cfg_summary).is_some()
-                    || capability.summary_island_count >= 8);
-            high_risk.then(|| preferred_semantic_worker_reason(cfg_summary))
+                    || capability.summary_island_count >= 8)
+            {
+                return Some(preferred_semantic_worker_reason(cfg_summary));
+            }
+            let summary_dense_native_worker = capability.summary_island_count >= 16
+                && (cfg_summary.loop_count > 0
+                    || cfg_summary.back_edge_count > 0
+                    || capability.actionable_region_count >= 4);
+            summary_dense_native_worker.then(|| "summary-dense semantic worker islands".to_string())
         }
         r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
-            if !capability.skipped_large_cfg {
+            if !capability.skipped_large_cfg && capability.summary_island_count < 16 {
                 return None;
             }
             if capability.summary_conflicted || capability.assumption_conflicted {
@@ -196,6 +203,13 @@ pub fn cfg_guard_reason_from_summary(summary: &CFGRiskSummary) -> Option<String>
         return Some(format!(
             "complex loop graph (loops={}, back_edges={})",
             summary.loop_count, summary.back_edge_count
+        ));
+    }
+
+    if summary.loop_count > 0 && summary.block_count >= 32 && summary.max_switch_cases >= 32 {
+        return Some(format!(
+            "dense switch in looped CFG (blocks={}, loops={}, max_switch_cases={})",
+            summary.block_count, summary.loop_count, summary.max_switch_cases
         ));
     }
 

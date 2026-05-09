@@ -197,7 +197,8 @@ fn ctype_to_type_like(ty: &CType) -> CTypeLike {
         CType::Struct(name) => CTypeLike::Struct(name.clone()),
         CType::Union(name) => CTypeLike::Union(name.clone()),
         CType::Enum(name) => CTypeLike::Enum(name.clone()),
-        CType::Function { .. } | CType::Typedef(_) | CType::Unknown => CTypeLike::Unknown,
+        CType::Typedef(name) => CTypeLike::Typedef(name.clone()),
+        CType::Function { .. } | CType::Unknown => CTypeLike::Unknown,
     }
 }
 
@@ -215,6 +216,7 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
         CTypeLike::Struct(name) => CType::Struct(name.clone()),
         CTypeLike::Union(name) => CType::Union(name.clone()),
         CTypeLike::Enum(name) => CType::Enum(name.clone()),
+        CTypeLike::Typedef(name) => CType::Typedef(name.clone()),
         CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
     }
 }
@@ -6303,6 +6305,89 @@ mod tests {
         assert!(output.contains("native summary islands: 1"));
         assert!(output.contains("summary island: scan arg0 until zero byte"));
         assert!(output.contains("island summary: string_scan"));
+    }
+
+    #[test]
+    fn summary_dense_native_structured_worker_routes_to_summary_islands() {
+        let region = test_semantic_region(
+            0x401000,
+            BTreeSet::from([0x401000, 0x401020]),
+            vec![test_control_fact(
+                0x401020,
+                r2sym::SymbolicReachabilityStatus::Reachable,
+                Some(true),
+                Some("cursor != end"),
+                Some(compiled_summary(
+                    "cursor != end",
+                    r2sym::BackwardConditionPrecision::OverApprox,
+                    1,
+                    1,
+                    Vec::new(),
+                )),
+                r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage),
+            )],
+            Vec::new(),
+        );
+        let mut semantic_artifact = test_native_semantic_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::ArtifactGranularity::Regioned,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            vec![region],
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
+            panic!("expected native artifact");
+        };
+        let summary_template = r2sym::NativeRegionSummary {
+            stable_id: 0x401010,
+            anchor: 0x401010,
+            kind: r2sym::NativeWorkerSummaryKind::MemoryRead,
+            blocks: BTreeSet::from([0x401010]),
+            entries: BTreeSet::from([0x401010]),
+            exits: BTreeSet::new(),
+            memory_accesses: vec![r2sym::NativeMemoryAccessSummary {
+                kind: r2sym::NativeMemoryAccessKind::Read,
+                location: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                dst: None,
+                src: None,
+                len: None,
+                width: Some(1),
+            }],
+            loop_summary: None,
+            reductions: Vec::new(),
+            parser: None,
+            residual_reasons: Vec::new(),
+            confidence: r2sym::SemanticConfidence::Likely,
+            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
+        };
+        for idx in 0..16 {
+            let mut summary = summary_template.clone();
+            summary.stable_id += idx;
+            summary.anchor += idx;
+            native.summary.region_summaries.push(summary);
+        }
+
+        let function_facts =
+            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
+        let cfg_summary = r2ssa::CFGRiskSummary {
+            block_count: 17,
+            loop_count: 2,
+            back_edge_count: 2,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+
+        let route = planner::semantic_route_plan("dbg.worker", &function_facts, &cfg_summary);
+        assert_eq!(
+            route,
+            planner::SemanticRoutePlan::SummaryIslands {
+                reason: "summary-dense semantic worker islands".to_string()
+            }
+        );
     }
 
     #[test]

@@ -526,6 +526,7 @@ pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
             }),
             "float" => Some(CTypeLike::Float(32)),
             "double" => Some(CTypeLike::Float(64)),
+            "unknown" | "unknown_t" | "undefined" | "undefined_t" => Some(CTypeLike::Unknown),
             _ if ty.to_ascii_lowercase().starts_with("struct ") => ty
                 .split_whitespace()
                 .nth(1)
@@ -538,6 +539,7 @@ pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
                 .split_whitespace()
                 .nth(1)
                 .map(|name| CTypeLike::Enum(name.to_string())),
+            _ if is_c_typedef_name(ty) => Some(CTypeLike::Typedef(ty.to_string())),
             _ => None,
         }
     }?;
@@ -549,6 +551,15 @@ pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
         base = CTypeLike::Pointer(Box::new(base));
     }
     Some(base)
+}
+
+fn is_c_typedef_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -748,5 +759,15 @@ mod tests {
             Some(signed_char_ptr)
         );
         assert_eq!(parse_type_like_spec("void const *", 64), Some(void_ptr));
+    }
+
+    #[test]
+    fn parse_type_like_spec_accepts_external_typedef_pointers() {
+        assert_eq!(
+            parse_type_like_spec("FILE *", 64),
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
+                "FILE".to_string()
+            ))))
+        );
     }
 }

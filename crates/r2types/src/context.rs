@@ -298,6 +298,7 @@ pub fn merge_signature_with_register_params(
         return Some(signature);
     }
 
+    let allow_param_count_extension = !signature_param_count_is_authoritative(&signature);
     for (idx, reg_param) in register_params.iter().enumerate() {
         if let Some(existing) = signature.params.get_mut(idx) {
             if is_generic_signature_type(existing.ty.as_ref())
@@ -308,7 +309,7 @@ pub fn merge_signature_with_register_params(
             if is_generic_arg_name(&existing.name) && !is_generic_arg_name(&reg_param.name) {
                 existing.name = reg_param.name.clone();
             }
-        } else {
+        } else if allow_param_count_extension {
             signature.params.push(FunctionParamSpec {
                 name: reg_param.name.clone(),
                 ty: reg_param.ty.clone(),
@@ -360,10 +361,25 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
         parsed.noreturn = signature.noreturn;
     }
 
-    let (register_params, stack_slots) = parse_external_vars(&raw.vars, ptr_bits);
+    parsed.external_type_db = external_type_db_from_base_types(&raw.base_types, ptr_bits);
+    if let Some(signature) = parsed.current_signature.as_mut() {
+        resolve_signature_aliases_from_type_db(signature, &parsed.external_type_db);
+    }
+
+    let max_register_params = parsed
+        .current_signature
+        .as_ref()
+        .filter(|signature| signature_param_count_is_authoritative(signature))
+        .map(|signature| signature.params.len());
+    let (register_params, stack_slots) =
+        parse_external_vars(&raw.vars, ptr_bits, max_register_params);
     parsed.register_params = register_params;
     parsed.stack_slots = stack_slots;
-    parsed.external_type_db = external_type_db_from_base_types(&raw.base_types, ptr_bits);
+    resolve_register_param_aliases_from_type_db(
+        &mut parsed.register_params,
+        &parsed.external_type_db,
+    );
+    resolve_stack_slot_aliases_from_type_db(&mut parsed.stack_slots, &parsed.external_type_db);
     parsed.known_function_signatures = parse_known_signatures(&raw.known_signatures, ptr_bits);
     parsed.merged_signature = merge_signature_with_register_params(
         parsed.current_signature.clone(),
@@ -378,6 +394,61 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
     );
 
     parsed
+}
+
+fn resolve_signature_aliases_from_type_db(
+    signature: &mut FunctionSignatureSpec,
+    type_db: &ExternalTypeDb,
+) {
+    if let Some(ret_ty) = signature.ret_type.as_mut() {
+        resolve_type_alias_from_type_db(ret_ty, type_db);
+    }
+    for param in &mut signature.params {
+        if let Some(ty) = param.ty.as_mut() {
+            resolve_type_alias_from_type_db(ty, type_db);
+        }
+    }
+}
+
+fn resolve_register_param_aliases_from_type_db(
+    register_params: &mut [ExternalRegisterParamSpec],
+    type_db: &ExternalTypeDb,
+) {
+    for param in register_params {
+        if let Some(ty) = param.ty.as_mut() {
+            resolve_type_alias_from_type_db(ty, type_db);
+        }
+    }
+}
+
+fn resolve_stack_slot_aliases_from_type_db(
+    stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    type_db: &ExternalTypeDb,
+) {
+    for slot in stack_slots.values_mut() {
+        if let Some(ty) = slot.ty.as_mut() {
+            resolve_type_alias_from_type_db(ty, type_db);
+        }
+    }
+}
+
+fn resolve_type_alias_from_type_db(ty: &mut CTypeLike, type_db: &ExternalTypeDb) {
+    match ty {
+        CTypeLike::Pointer(inner) | CTypeLike::Array(inner, _) => {
+            resolve_type_alias_from_type_db(inner, type_db);
+        }
+        CTypeLike::Typedef(name) => {
+            let key = name.trim().to_ascii_lowercase();
+            if let Some(st) = type_db.structs.get(&key) {
+                *ty = CTypeLike::Struct(st.name.clone());
+            } else if let Some(un) = type_db.unions.get(&key) {
+                *ty = CTypeLike::Union(un.name.clone());
+            } else if let Some(en) = type_db.enums.get(&key) {
+                *ty = CTypeLike::Enum(en.name.clone());
+            }
+        }
+        _ => {}
+    }
 }
 
 fn imported_assumptions_from_context(
@@ -491,6 +562,7 @@ fn parse_signature_json(
 fn parse_external_vars(
     vars: &[ExternalVarJson],
     ptr_bits: u32,
+    max_register_params: Option<usize>,
 ) -> (
     Vec<ExternalRegisterParamSpec>,
     BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
@@ -514,6 +586,10 @@ fn parse_external_vars(
 
         match var.kind {
             ExternalVarKind::Register => {
+                let param_index = var.param_index.unwrap_or(register_params.len());
+                if max_register_params.is_some_and(|limit| param_index >= limit) {
+                    continue;
+                }
                 register_params.push(ExternalRegisterParamSpec {
                     name,
                     ty,
@@ -752,7 +828,9 @@ fn type_like_size_bits(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
         CTypeLike::Array(inner, Some(len)) => type_like_size_bits(inner, ptr_bits)
             .and_then(|elem_bits| elem_bits.checked_mul(*len as u64)),
         CTypeLike::Array(_, None) => None,
-        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) => None,
+        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) | CTypeLike::Typedef(_) => {
+            None
+        }
     }
 }
 
@@ -889,6 +967,27 @@ fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
     }
 }
 
+fn signature_strength(signature: &FunctionSignatureSpec) -> u8 {
+    let has_type_info =
+        signature.ret_type.is_some() || signature.params.iter().any(|param| param.ty.is_some());
+    let has_named_params = signature
+        .params
+        .iter()
+        .any(|param| !is_generic_arg_name(&param.name));
+    if has_type_info || has_named_params {
+        96
+    } else {
+        80
+    }
+}
+
+fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec) -> bool {
+    if signature.params.is_empty() {
+        return false;
+    }
+    signature_strength(signature) >= 96
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,6 +1022,67 @@ mod tests {
                 })
                 .map(|var| var.name.as_str()),
             Some("local_10h")
+        );
+    }
+
+    #[test]
+    fn parse_external_context_caps_register_params_with_authoritative_signature() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature":{
+                    "ret":"FILE *",
+                    "params":[
+                        {"name":"filename","type":"char const *"},
+                        {"name":"mode","type":"char const *"}
+                    ]
+                },
+                "vars":[
+                    {"kind":"register","name":"filename","type":"char const *","reg":"rdi","param_index":0},
+                    {"kind":"register","name":"mode","type":"char const *","reg":"rsi","param_index":1},
+                    {"kind":"register","name":"arg3","type":"uint32_t","reg":"rcx","param_index":2}
+                ]
+            }"#,
+            64,
+        );
+
+        let merged = ctx.merged_signature.expect("merged signature");
+        assert_eq!(
+            merged.ret_type,
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
+                "FILE".to_string()
+            ))))
+        );
+        assert_eq!(merged.params.len(), 2);
+        assert_eq!(ctx.register_params.len(), 2);
+        assert_eq!(ctx.register_params[0].reg, "rdi");
+        assert_eq!(ctx.register_params[1].reg, "rsi");
+    }
+
+    #[test]
+    fn parse_external_context_resolves_known_aggregate_typedef_aliases() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature":{
+                    "ret":"int32_t",
+                    "params":[{"name":"obj","type":"DemoStruct *"}]
+                },
+                "base_types":[
+                    {
+                        "kind":"struct",
+                        "name":"DemoStruct",
+                        "members":[{"name":"value","type":"int32_t","offset":0}]
+                    }
+                ]
+            }"#,
+            64,
+        );
+
+        let merged = ctx.merged_signature.expect("merged signature");
+        assert_eq!(
+            merged.params.first().and_then(|param| param.ty.as_ref()),
+            Some(&CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                "DemoStruct".to_string()
+            ))))
         );
     }
 

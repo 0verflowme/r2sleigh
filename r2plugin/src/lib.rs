@@ -4696,6 +4696,10 @@ fn cfg_risk_prefers_bounded_type_plan(summary: &CfgRiskSummaryJson) -> bool {
                 || summary.max_switch_cases >= 32))
 }
 
+fn cfg_risk_forces_bounded_type_plan(summary: &CfgRiskSummaryJson) -> bool {
+    r2dec::cfg_guard_reason_from_summary(&cfg_risk_summary_from_json(summary)).is_some()
+}
+
 fn cfg_risk_bounded_type_reason(summary: &CfgRiskSummaryJson) -> String {
     r2dec::cfg_guard_reason_from_summary(&cfg_risk_summary_from_json(summary)).unwrap_or_else(|| {
         format!(
@@ -5719,6 +5723,7 @@ fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
         r2types::CTypeLike::Struct(name) => r2dec::CType::Struct(name.clone()),
         r2types::CTypeLike::Union(name) => r2dec::CType::Union(name.clone()),
         r2types::CTypeLike::Enum(name) => r2dec::CType::Enum(name.clone()),
+        r2types::CTypeLike::Typedef(name) => r2dec::CType::Typedef(name.clone()),
         r2types::CTypeLike::Function | r2types::CTypeLike::Unknown => r2dec::CType::Unknown,
     }
 }
@@ -5745,9 +5750,8 @@ fn ctype_to_type_like(ty: &r2dec::CType) -> r2types::CTypeLike {
         r2dec::CType::Struct(name) => r2types::CTypeLike::Struct(name.clone()),
         r2dec::CType::Union(name) => r2types::CTypeLike::Union(name.clone()),
         r2dec::CType::Enum(name) => r2types::CTypeLike::Enum(name.clone()),
-        r2dec::CType::Function { .. } | r2dec::CType::Typedef(_) | r2dec::CType::Unknown => {
-            r2types::CTypeLike::Unknown
-        }
+        r2dec::CType::Typedef(name) => r2types::CTypeLike::Typedef(name.clone()),
+        r2dec::CType::Function { .. } | r2dec::CType::Unknown => r2types::CTypeLike::Unknown,
     }
 }
 
@@ -7967,8 +7971,9 @@ fn build_function_analysis_shared_bundle(
                 cfg_risk_summary_json(cached_artifact.ssa_func.function().cfg_risk_summary());
             let function_facts = cached_artifact.function_facts.clone();
             let semantic_artifact = function_facts.semantics.clone();
-            let prefer_cfg_bounded =
-                caller_requested_bounded_type_plan && cfg_risk_prefers_bounded_type_plan(&cfg_risk);
+            let prefer_cfg_bounded = cfg_risk_forces_bounded_type_plan(&cfg_risk)
+                || (caller_requested_bounded_type_plan
+                    && cfg_risk_prefers_bounded_type_plan(&cfg_risk));
             let prefer_semantic_bounded = semantic_artifact.as_ref().is_some_and(|artifact| {
                 semantic_or_cfg_prefers_bounded_type_plan(artifact, &cfg_risk)
             });
@@ -8044,7 +8049,10 @@ fn build_function_analysis_shared_bundle(
             let analysis = types::build_function_analysis(&function_input)?;
             push_phase(&mut phase_timings, "ssa_build", phase_start);
             let cfg_risk = cfg_risk_summary_json(analysis.ssa_func.function().cfg_risk_summary());
-            if caller_requested_bounded_type_plan && cfg_risk_prefers_bounded_type_plan(&cfg_risk) {
+            if cfg_risk_forces_bounded_type_plan(&cfg_risk)
+                || (caller_requested_bounded_type_plan
+                    && cfg_risk_prefers_bounded_type_plan(&cfg_risk))
+            {
                 let type_facts = type_facts_from_parsed_context(&parsed_context);
                 let function_facts = r2types::FunctionFacts::new(type_facts, None)
                     .with_assumptions(parsed_context.assumptions.clone());
@@ -10298,6 +10306,23 @@ mod tests {
         let reason = r2dec::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
         assert!(
             reason.contains("dense switch") || reason.contains("max_switch_cases"),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn decompiler_cfg_guard_reason_trips_on_compact_looped_switch_summary() {
+        let summary = r2ssa::CFGRiskSummary {
+            block_count: 39,
+            loop_count: 2,
+            back_edge_count: 2,
+            switch_block_count: 1,
+            max_switch_cases: 47,
+        };
+
+        let reason = r2dec::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
+        assert!(
+            reason.contains("dense switch in looped CFG"),
             "unexpected reason: {reason}"
         );
     }

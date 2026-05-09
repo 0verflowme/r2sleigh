@@ -3629,6 +3629,13 @@ fn signature_param_allows_local_struct_override(
         return true;
     }
 
+    if matches!(
+        param.ty.as_ref(),
+        Some(CTypeLike::Pointer(inner)) if matches!(inner.as_ref(), CTypeLike::Typedef(_))
+    ) {
+        return true;
+    }
+
     is_generic_arg_name(&param.name)
         && matches!(
             param.ty.as_ref(),
@@ -3690,7 +3697,12 @@ fn signature_param_blocks_local_struct_override(
     match ty {
         CTypeLike::Pointer(inner) => !matches!(
             inner.as_ref(),
-            CTypeLike::Unknown | CTypeLike::Void | CTypeLike::Struct(_) | CTypeLike::Union(_)
+            CTypeLike::Unknown
+                | CTypeLike::Void
+                | CTypeLike::Struct(_)
+                | CTypeLike::Union(_)
+                | CTypeLike::Enum(_)
+                | CTypeLike::Typedef(_)
         ),
         _ => true,
     }
@@ -4414,7 +4426,9 @@ fn estimate_type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
         CTypeLike::Array(inner, Some(count)) => estimate_type_like_size_bytes(inner, ptr_bits)
             .map(|inner_size| inner_size.saturating_mul(*count as u64)),
         CTypeLike::Array(inner, None) => estimate_type_like_size_bytes(inner, ptr_bits),
-        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) => None,
+        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) | CTypeLike::Typedef(_) => {
+            None
+        }
     }
 }
 

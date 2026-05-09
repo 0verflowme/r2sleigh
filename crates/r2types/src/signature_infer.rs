@@ -274,6 +274,9 @@ pub fn materialize_signature_type_like(ty: CTypeLike, ptr_bits: u32) -> CTypeLik
         CTypeLike::Enum(name) if is_unmaterialized_aggregate_name(&name) => {
             fallback_scalar_type_like((ptr_bits / 8).max(1), &Default::default(), ptr_bits)
         }
+        CTypeLike::Typedef(name) if name.trim().is_empty() => {
+            fallback_scalar_type_like((ptr_bits / 8).max(1), &Default::default(), ptr_bits)
+        }
         other => other,
     }
 }
@@ -333,6 +336,7 @@ pub fn render_signature_type(ty: &CTypeLike, ptr_bits: u32) -> String {
         CTypeLike::Struct(name) => format!("struct {name}"),
         CTypeLike::Union(name) => format!("union {name}"),
         CTypeLike::Enum(name) => format!("enum {name}"),
+        CTypeLike::Typedef(name) => name,
         CTypeLike::Function => "void (*)()".to_string(),
         CTypeLike::Unknown => "int64_t".to_string(),
     }
@@ -419,7 +423,7 @@ pub fn resolve_evidence_driven_signature_type(
     }
 
     match initial_ty {
-        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) => {
+        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) | CTypeLike::Typedef(_) => {
             if pointer_score > scalar_score.saturating_add(1) {
                 return CTypeLike::Pointer(Box::new(CTypeLike::Void));
             }

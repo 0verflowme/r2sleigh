@@ -3792,6 +3792,11 @@ static bool decompile_cfg_summary_prefers_budget(const DecompileCFGRiskSummary *
 	if (summary->loop_count > 8 || summary->back_edge_count > 16) {
 		return true;
 	}
+	if (summary->loop_count > 0
+		&& summary->block_count >= 32
+		&& summary->max_switch_cases >= 32) {
+		return true;
+	}
 	return summary->loop_count > 4
 		&& summary->block_count >= 96
 		&& summary->max_switch_cases >= 32;

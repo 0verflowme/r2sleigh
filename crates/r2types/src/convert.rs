@@ -11,6 +11,7 @@ pub enum CTypeLike {
     Struct(String),
     Union(String),
     Enum(String),
+    Typedef(String),
     Function,
     Unknown,
 }
@@ -42,6 +43,6 @@ pub fn to_c_type_like(arena: &TypeArena, ty: TypeId) -> CTypeLike {
         Type::UnknownAlias(name) if name.starts_with("enum ") => {
             CTypeLike::Enum(name.trim_start_matches("enum ").to_string())
         }
-        Type::UnknownAlias(_) => CTypeLike::Unknown,
+        Type::UnknownAlias(name) => CTypeLike::Typedef(name.clone()),
     }
 }

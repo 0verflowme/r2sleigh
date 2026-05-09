@@ -28,6 +28,7 @@ pub(crate) fn type_like_to_ctype(ty: &CTypeLike) -> CType {
         CTypeLike::Struct(name) => CType::Struct(name.clone()),
         CTypeLike::Union(name) => CType::Union(name.clone()),
         CTypeLike::Enum(name) => CType::Enum(name.clone()),
+        CTypeLike::Typedef(name) => CType::Typedef(name.clone()),
         CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
     }
 }
