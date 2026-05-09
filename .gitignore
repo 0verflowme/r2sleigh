@@ -33,8 +33,11 @@ r2plugin/r2sleigh/*.dylib
 *.log
 
 # Test binaries (compiled from .c files)
+tests/e2e/stress_test
+tests/e2e/stress_test_opt
 tests/e2e/test_func
 tests/e2e/sym_test
+tests/e2e/vuln_test
 tests/e2e/*_x86
 tests/e2e/target/
 r2plugin/arch_sleigh.o
