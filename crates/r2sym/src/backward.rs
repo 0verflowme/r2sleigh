@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use r2ssa::graph::{InstPayload, ValueId};
@@ -1602,15 +1603,24 @@ fn build_summary_substitutions<'ctx>(
         let Some(actual) = call.args.get(*index) else {
             continue;
         };
-        substitutions.push((symbol.to_bv(state.context()), actual.to_bv(state.context())));
+        let adjusted = adjust_bits(state.context(), actual.clone(), symbol.bits());
+        substitutions.push((
+            symbol.to_bv(state.context()),
+            adjusted.to_bv(state.context()),
+        ));
     }
     for input in &summary.memory_inputs {
         let Some(base) = call.args.get(input.arg_index) else {
             continue;
         };
+        let actual = adjust_bits(
+            state.context(),
+            state.mem_read(base, input.size),
+            input.symbol.bits(),
+        );
         substitutions.push((
             input.symbol.to_bv(state.context()),
-            state.mem_read(base, input.size).to_bv(state.context()),
+            actual.to_bv(state.context()),
         ));
     }
     substitutions
@@ -1625,15 +1635,24 @@ fn build_call_substitutions<'ctx>(
         let Some(actual) = call_ctx.args.get(*index) else {
             continue;
         };
-        substitutions.push((symbol.to_bv(state.context()), actual.to_bv(state.context())));
+        let adjusted = adjust_bits(state.context(), actual.clone(), symbol.bits());
+        substitutions.push((
+            symbol.to_bv(state.context()),
+            adjusted.to_bv(state.context()),
+        ));
     }
     for input in &call_ctx.summary.memory_inputs {
         let Some(base) = call_ctx.args.get(input.arg_index) else {
             continue;
         };
+        let actual = adjust_bits(
+            state.context(),
+            state.mem_read(base, input.size),
+            input.symbol.bits(),
+        );
         substitutions.push((
             input.symbol.to_bv(state.context()),
-            state.mem_read(base, input.size).to_bv(state.context()),
+            actual.to_bv(state.context()),
         ));
     }
     substitutions
@@ -2076,23 +2095,28 @@ fn substitute_value<'ctx>(
     value: &SymValue<'ctx>,
     substitutions: &[(BV, BV)],
 ) -> SymValue<'ctx> {
+    if substitutions.is_empty() {
+        return value.clone();
+    }
     let pairs = substitutions
         .iter()
         .map(|(from, to)| (from, to))
         .collect::<Vec<_>>();
-    SymValue::symbolic_tainted(
-        value.to_bv(ctx).substitute(&pairs),
-        value.bits(),
-        value.get_taint(),
-    )
+    catch_unwind(AssertUnwindSafe(|| value.to_bv(ctx).substitute(&pairs)))
+        .map(|substituted| SymValue::symbolic_tainted(substituted, value.bits(), value.get_taint()))
+        .unwrap_or_else(|_| SymValue::unknown(value.bits()))
 }
 
 fn substitute_bool(ast: &Bool, substitutions: &[(BV, BV)]) -> Bool {
+    if substitutions.is_empty() {
+        return ast.clone();
+    }
     let pairs = substitutions
         .iter()
         .map(|(from, to)| (from, to))
         .collect::<Vec<_>>();
-    ast.substitute(&pairs)
+    catch_unwind(AssertUnwindSafe(|| ast.substitute(&pairs)))
+        .unwrap_or_else(|_| Bool::from_bool(true))
 }
 
 fn ite_value<'ctx>(

@@ -3,6 +3,7 @@ mod cache;
 mod classify;
 mod compiler;
 pub(crate) mod facts;
+pub(crate) mod native_worker;
 mod plan;
 mod region;
 mod vm;
@@ -31,8 +32,12 @@ pub use plan::{
 };
 pub use region::{
     ArtifactGranularity, ControlFact, ExecutionModel, Judged, MemoryFact, NativeArtifactBody,
-    NativeFunctionSummary, RefinementStage, RegionKey, SemanticArtifactDiagnostics,
-    SemanticPredicate, SemanticRegion, SemanticTargetConditionSource, TargetFact, VmArtifactBody,
+    NativeFunctionSummary, NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary,
+    NativeParserKind, NativeParserSummary, NativeReductionSummary, NativeRegionSummary,
+    NativeWorkerFold, NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerSummary,
+    NativeWorkerSummaryKind, NativeWorkerTerminator, RefinementStage, RegionKey,
+    SemanticArtifactDiagnostics, SemanticPredicate, SemanticRegion, SemanticTargetConditionSource,
+    TargetFact, VmArtifactBody,
 };
 pub use vm::{
     InterpreterDispatchSummary, InterpreterKind, VmBinaryOp, VmGuardCondition, VmGuardedExit,

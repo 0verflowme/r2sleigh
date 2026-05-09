@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use r2il::ArchSpec;
 use r2ssa::{
     FunctionSemanticSummary, InterprocFunctionId, InterprocFunctionInput, InterprocSolveConfig,
-    SSAOp, SSAVar, SsaArtifact, SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryRegion,
+    SsaArtifact, SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryRegion,
     solve_interproc_summary_set,
 };
 use serde::{Deserialize, Serialize};
@@ -17,8 +17,8 @@ use crate::backward::{
 use crate::path::{ExploreConfig, PathExplorer};
 use crate::runtime::seed_default_state_for_arch;
 use crate::semantics::{
-    SemanticArtifact, SemanticArtifactBody, SemanticEvidence, SemanticEvidenceCoverage,
-    SemanticEvidenceProvenance, SemanticEvidenceReason,
+    SemanticArtifact, SemanticArtifactBody, SemanticEvidence, SemanticEvidenceAmbiguity,
+    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
 };
 use crate::sim::{
     DerivedSummaryCompletion, DerivedSummarySet, PreparedFunctionScope, SummaryProfile,
@@ -26,9 +26,10 @@ use crate::sim::{
 };
 use crate::solver::SatResult;
 
-use super::region::{ControlFact, Judged, MemoryFact, RegionKey, SemanticRegion, TargetFact};
-
-const LARGE_CFG_SUMMARY_MEMORY_TERM_MAX: usize = 32;
+use super::region::{
+    ControlFact, Judged, MemoryFact, NativeRegionSummary, NativeWorkerSummary, RegionKey,
+    SemanticRegion, TargetFact,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolicReachabilityStatus {
@@ -50,6 +51,8 @@ pub struct SymbolicFunctionFactDiagnostics {
 pub(super) struct CollectedNativeSemanticRegions {
     pub regions: BTreeMap<RegionKey, SemanticRegion>,
     pub diagnostics: SymbolicFunctionFactDiagnostics,
+    pub region_summaries: Vec<NativeRegionSummary>,
+    pub worker_summaries: Vec<NativeWorkerSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,202 +223,22 @@ fn build_canonical_regions(
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct LargeCfgMemoryTransfer {
-    block_addr: u64,
-    dst_arg: usize,
-    src_arg: usize,
-    size: u32,
-}
-
-fn abi_pointer_arg_index(var: &SSAVar) -> Option<usize> {
-    let name = var
-        .name
-        .strip_prefix("reg:")
-        .unwrap_or(var.name.as_str())
-        .trim_start_matches('_')
-        .to_ascii_lowercase();
-    match name.as_str() {
-        "x0" | "w0" | "rdi" | "edi" | "di" | "a0" => Some(0),
-        "x1" | "w1" | "rsi" | "esi" | "si" | "a1" => Some(1),
-        "x2" | "w2" | "rdx" | "edx" | "dx" | "a2" => Some(2),
-        "x3" | "w3" | "rcx" | "ecx" | "cx" | "a3" => Some(3),
-        "x4" | "w4" | "r8" | "r8d" | "a4" => Some(4),
-        "x5" | "w5" | "r9" | "r9d" | "a5" => Some(5),
-        "x6" | "w6" | "a6" => Some(6),
-        "x7" | "w7" | "a7" => Some(7),
-        _ => None,
-    }
-}
-
-fn rooted_arg_var(var: &SSAVar, roots: &BTreeMap<SSAVar, usize>) -> Option<usize> {
-    abi_pointer_arg_index(var).or_else(|| roots.get(var).copied())
-}
-
-fn copy_root_if_known(dst: &SSAVar, src: &SSAVar, roots: &mut BTreeMap<SSAVar, usize>) {
-    if let Some(root) = rooted_arg_var(src, roots) {
-        roots.insert(dst.clone(), root);
-    }
-}
-
-fn copy_binary_root_if_unambiguous(
-    dst: &SSAVar,
-    a: &SSAVar,
-    b: &SSAVar,
-    roots: &mut BTreeMap<SSAVar, usize>,
-) {
-    let a_root = rooted_arg_var(a, roots);
-    let b_root = rooted_arg_var(b, roots);
-    match (a_root, b_root) {
-        (Some(root), None) | (None, Some(root)) => {
-            roots.insert(dst.clone(), root);
-        }
-        (Some(a_root), Some(b_root)) if a_root == b_root => {
-            roots.insert(dst.clone(), a_root);
-        }
-        _ => {}
-    }
-}
-
-fn copy_phi_root_if_unambiguous<'a>(
-    dst: &SSAVar,
-    sources: impl IntoIterator<Item = &'a SSAVar>,
-    roots: &mut BTreeMap<SSAVar, usize>,
-) {
-    let mut source_roots = sources
-        .into_iter()
-        .filter_map(|src| rooted_arg_var(src, roots));
-    if let Some(first) = source_roots.next()
-        && source_roots.all(|root| root == first)
-    {
-        roots.insert(dst.clone(), first);
-    }
-}
-
-fn loaded_arg_var(var: &SSAVar, load_sources: &BTreeMap<SSAVar, usize>) -> Option<usize> {
-    load_sources.get(var).copied()
-}
-
-fn copy_load_source_if_known(
-    dst: &SSAVar,
-    src: &SSAVar,
-    load_sources: &mut BTreeMap<SSAVar, usize>,
-) {
-    if let Some(source) = loaded_arg_var(src, load_sources) {
-        load_sources.insert(dst.clone(), source);
-    }
-}
-
-fn copy_phi_load_source_if_unambiguous<'a>(
-    dst: &SSAVar,
-    sources: impl IntoIterator<Item = &'a SSAVar>,
-    load_sources: &mut BTreeMap<SSAVar, usize>,
-) {
-    let mut source_roots = sources
-        .into_iter()
-        .filter_map(|src| loaded_arg_var(src, load_sources));
-    if let Some(first) = source_roots.next()
-        && source_roots.all(|root| root == first)
-    {
-        load_sources.insert(dst.clone(), first);
-    }
-}
-
-fn large_cfg_memory_transfers(func: &SsaArtifact) -> BTreeSet<LargeCfgMemoryTransfer> {
-    let mut roots = BTreeMap::<SSAVar, usize>::new();
-    let mut load_sources = BTreeMap::<SSAVar, usize>::new();
-    let mut transfers = BTreeSet::<LargeCfgMemoryTransfer>::new();
-
-    for block in func.function().blocks() {
-        for phi in &block.phis {
-            copy_phi_root_if_unambiguous(
-                &phi.dst,
-                phi.sources.iter().map(|(_, src)| src),
-                &mut roots,
-            );
-            copy_phi_load_source_if_unambiguous(
-                &phi.dst,
-                phi.sources.iter().map(|(_, src)| src),
-                &mut load_sources,
-            );
-        }
-        for op in &block.ops {
-            match op {
-                SSAOp::Phi { dst, sources } => {
-                    copy_phi_root_if_unambiguous(dst, sources, &mut roots);
-                    copy_phi_load_source_if_unambiguous(dst, sources, &mut load_sources);
-                }
-                SSAOp::Copy { dst, src }
-                | SSAOp::IntZExt { dst, src }
-                | SSAOp::IntSExt { dst, src }
-                | SSAOp::Subpiece { dst, src, .. }
-                | SSAOp::Cast { dst, src }
-                | SSAOp::Trunc { dst, src } => {
-                    copy_root_if_known(dst, src, &mut roots);
-                    copy_load_source_if_known(dst, src, &mut load_sources);
-                }
-                SSAOp::IntAdd { dst, a, b }
-                | SSAOp::IntSub { dst, a, b }
-                | SSAOp::IntAnd { dst, a, b }
-                | SSAOp::IntOr { dst, a, b }
-                | SSAOp::PtrAdd {
-                    dst,
-                    base: a,
-                    index: b,
-                    ..
-                }
-                | SSAOp::PtrSub {
-                    dst,
-                    base: a,
-                    index: b,
-                    ..
-                } => {
-                    copy_binary_root_if_unambiguous(dst, a, b, &mut roots);
-                }
-                SSAOp::Load { dst, addr, .. }
-                | SSAOp::LoadLinked { dst, addr, .. }
-                | SSAOp::LoadGuarded { dst, addr, .. } => {
-                    if let Some(src_arg) = rooted_arg_var(addr, &roots) {
-                        load_sources.insert(dst.clone(), src_arg);
-                    }
-                }
-                SSAOp::Store { addr, val, .. }
-                | SSAOp::StoreGuarded { addr, val, .. }
-                | SSAOp::StoreConditional { addr, val, .. } => {
-                    if let (Some(dst_arg), Some(src_arg)) =
-                        (rooted_arg_var(addr, &roots), load_sources.get(val).copied())
-                        && dst_arg != src_arg
-                    {
-                        transfers.insert(LargeCfgMemoryTransfer {
-                            block_addr: block.addr,
-                            dst_arg,
-                            src_arg,
-                            size: val.size,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    transfers
-}
-
 fn append_large_cfg_memory_transfer_terms(
     func: &SsaArtifact,
     regions: &mut BTreeMap<RegionKey, SemanticRegion>,
-) {
-    let transfers = large_cfg_memory_transfers(func);
+) -> Vec<NativeWorkerSummary> {
+    let transfers = super::native_worker::large_cfg_memory_transfers(func);
     if transfers.is_empty() {
-        return;
+        return Vec::new();
     }
+    let mut worker_summaries = Vec::new();
     let mut by_anchor = BTreeMap::<u64, SemanticRegion>::new();
     for region in std::mem::take(regions).into_values() {
         by_anchor.insert(region.anchor, region);
     }
     for transfer in transfers {
         let region = ensure_semantic_region(&mut by_anchor, transfer.block_addr);
+        worker_summaries.push(super::native_worker::summary_for_transfer(transfer));
         let term = BackwardMemoryCondition {
             region: BackwardMemoryRegion::Argument {
                 index: transfer.dst_arg,
@@ -442,6 +265,23 @@ fn append_large_cfg_memory_transfer_terms(
         .into_values()
         .map(|region| (region.key(), region))
         .collect();
+    worker_summaries
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct JoinedLargeCfgMemoryTermKey {
+    kind: SummaryMemoryEffectKind,
+    region: BackwardMemoryRegion,
+    size: u32,
+}
+
+#[derive(Debug, Clone)]
+struct JoinedLargeCfgMemoryTerm {
+    key: JoinedLargeCfgMemoryTermKey,
+    offset_lo: i64,
+    offset_hi: i64,
+    exact_offset: bool,
+    effect_count: usize,
 }
 
 fn summary_effect_expr(kind: SummaryMemoryEffectKind, arg_index: usize, offset: i64) -> String {
@@ -457,9 +297,63 @@ fn summary_effect_expr(kind: SummaryMemoryEffectKind, arg_index: usize, offset: 
     )
 }
 
-fn large_cfg_summary_memory_term(effect: &SummaryMemoryEffect) -> Option<BackwardMemoryCondition> {
-    let SummaryMemoryRegion::Arg { index } = effect.location.region else {
-        return None;
+fn summary_effect_range_expr(
+    kind: SummaryMemoryEffectKind,
+    region: &BackwardMemoryRegion,
+    offset_lo: i64,
+    offset_hi: i64,
+) -> String {
+    if let BackwardMemoryRegion::Argument { index } = region
+        && offset_lo == offset_hi
+    {
+        return summary_effect_expr(kind, *index, offset_lo);
+    }
+    let action = match kind {
+        SummaryMemoryEffectKind::Read => "read",
+        SummaryMemoryEffectKind::Write => "write",
+        SummaryMemoryEffectKind::Escape => "escape",
+        SummaryMemoryEffectKind::Free => "free",
+    };
+    let region = match region {
+        BackwardMemoryRegion::Argument { index } => format!("arg{index}"),
+        BackwardMemoryRegion::Region(region) => region.name.clone(),
+    };
+    format!("{action} {region}[{offset_lo}..{offset_hi}]")
+}
+
+fn summary_effect_binding(kind: SummaryMemoryEffectKind, region: &BackwardMemoryRegion) -> String {
+    let action = match kind {
+        SummaryMemoryEffectKind::Read => "read",
+        SummaryMemoryEffectKind::Write => "write",
+        SummaryMemoryEffectKind::Escape => "escape",
+        SummaryMemoryEffectKind::Free => "free",
+    };
+    match region {
+        BackwardMemoryRegion::Argument { index } => format!("{action}_arg{index}"),
+        BackwardMemoryRegion::Region(region) => format!("{action}_{}", region.name),
+    }
+}
+
+fn joined_large_cfg_memory_term_evidence(term: &JoinedLargeCfgMemoryTerm) -> SemanticEvidence {
+    let widened = term.effect_count > 1 || term.offset_lo != term.offset_hi || !term.exact_offset;
+    SemanticEvidence::likely(SemanticEvidenceReason::LargeCfg)
+        .with_coverage(SemanticEvidenceCoverage::Bounded)
+        .with_provenance(SemanticEvidenceProvenance::Stable)
+        .with_ambiguity(if widened {
+            SemanticEvidenceAmbiguity::Bounded
+        } else {
+            SemanticEvidenceAmbiguity::Single
+        })
+}
+
+fn large_cfg_summary_memory_term_seed(
+    effect: &SummaryMemoryEffect,
+) -> Option<JoinedLargeCfgMemoryTerm> {
+    let region = match effect.location.region {
+        SummaryMemoryRegion::Arg { index } => BackwardMemoryRegion::Argument { index },
+        SummaryMemoryRegion::Global { .. }
+        | SummaryMemoryRegion::HeapReturn
+        | SummaryMemoryRegion::Unknown => return None,
     };
     let (offset_lo, offset_hi, size, exact_offset) = effect
         .location
@@ -469,83 +363,78 @@ fn large_cfg_summary_memory_term(effect: &SummaryMemoryEffect) -> Option<Backwar
                 range.offset_lo,
                 range.offset_hi,
                 range.width.unwrap_or(0),
-                true,
+                range.offset_lo == range.offset_hi,
             )
         })
         .unwrap_or((0, 0, 0, false));
-    Some(BackwardMemoryCondition {
-        region: BackwardMemoryRegion::Argument { index },
+    Some(JoinedLargeCfgMemoryTerm {
+        key: JoinedLargeCfgMemoryTermKey {
+            kind: effect.kind,
+            region,
+            size,
+        },
         offset_lo,
         offset_hi,
-        size,
         exact_offset,
-        evidence: SemanticEvidence::likely(SemanticEvidenceReason::SummaryBudget)
-            .with_coverage(SemanticEvidenceCoverage::Bounded)
-            .with_provenance(SemanticEvidenceProvenance::Stable)
-            .with_budget_limited(true),
-        binding: Some(format!("{:?}_arg{}", effect.kind, index).to_ascii_lowercase()),
-        expr: summary_effect_expr(effect.kind, index, offset_lo),
-        value_expr: None,
-        exact_value: false,
+        effect_count: 1,
     })
 }
 
-fn bounded_large_cfg_summary_memory_terms(
+fn join_large_cfg_memory_term(
+    left: &mut JoinedLargeCfgMemoryTerm,
+    right: JoinedLargeCfgMemoryTerm,
+) {
+    let old_lo = left.offset_lo;
+    let old_hi = left.offset_hi;
+    left.offset_lo = left.offset_lo.min(right.offset_lo);
+    left.offset_hi = left.offset_hi.max(right.offset_hi);
+    left.exact_offset = left.exact_offset
+        && right.exact_offset
+        && old_lo == right.offset_lo
+        && old_hi == right.offset_hi;
+    left.effect_count += right.effect_count;
+}
+
+fn materialize_joined_large_cfg_memory_term(
+    term: JoinedLargeCfgMemoryTerm,
+) -> BackwardMemoryCondition {
+    BackwardMemoryCondition {
+        region: term.key.region.clone(),
+        offset_lo: term.offset_lo,
+        offset_hi: term.offset_hi,
+        size: term.key.size,
+        exact_offset: term.exact_offset,
+        evidence: joined_large_cfg_memory_term_evidence(&term),
+        binding: Some(summary_effect_binding(term.key.kind, &term.key.region)),
+        expr: summary_effect_range_expr(
+            term.key.kind,
+            &term.key.region,
+            term.offset_lo,
+            term.offset_hi,
+        ),
+        value_expr: None,
+        exact_value: false,
+    }
+}
+
+fn joined_large_cfg_summary_memory_terms(
     effects: &[SummaryMemoryEffect],
 ) -> Vec<BackwardMemoryCondition> {
-    let mut terms = effects
+    let mut joined = BTreeMap::<JoinedLargeCfgMemoryTermKey, JoinedLargeCfgMemoryTerm>::new();
+    for seed in effects
         .iter()
-        .filter_map(large_cfg_summary_memory_term)
-        .collect::<Vec<_>>();
-    terms.sort_by_key(|term| {
-        (
-            term.binding.clone(),
-            term.region.clone(),
-            term.offset_lo,
-            term.offset_hi,
-            term.size,
-            term.expr.clone(),
-            term.value_expr.clone(),
-        )
-    });
-    terms.dedup();
-    if terms.len() <= LARGE_CFG_SUMMARY_MEMORY_TERM_MAX {
-        return terms;
-    }
-
-    let mut by_binding = BTreeMap::<(Option<String>, BackwardMemoryRegion), VecDeque<_>>::new();
-    for term in terms {
-        by_binding
-            .entry((term.binding.clone(), term.region.clone()))
-            .or_default()
-            .push_back(term);
-    }
-
-    let mut selected = Vec::with_capacity(LARGE_CFG_SUMMARY_MEMORY_TERM_MAX);
-    while selected.len() < LARGE_CFG_SUMMARY_MEMORY_TERM_MAX
-        && by_binding.values().any(|terms| !terms.is_empty())
+        .filter_map(large_cfg_summary_memory_term_seed)
     {
-        for terms in by_binding.values_mut() {
-            if selected.len() >= LARGE_CFG_SUMMARY_MEMORY_TERM_MAX {
-                break;
-            }
-            if let Some(term) = terms.pop_front() {
-                selected.push(term);
-            }
+        if let Some(existing) = joined.get_mut(&seed.key) {
+            join_large_cfg_memory_term(existing, seed);
+        } else {
+            joined.insert(seed.key.clone(), seed);
         }
     }
-    selected.sort_by_key(|term| {
-        (
-            term.binding.clone(),
-            term.region.clone(),
-            term.offset_lo,
-            term.offset_hi,
-            term.size,
-            term.expr.clone(),
-            term.value_expr.clone(),
-        )
-    });
-    selected
+    joined
+        .into_values()
+        .map(materialize_joined_large_cfg_memory_term)
+        .collect()
 }
 
 fn large_cfg_root_summary(func: &SsaArtifact, arch: &ArchSpec) -> Option<FunctionSemanticSummary> {
@@ -570,13 +459,15 @@ fn append_large_cfg_summary_memory_terms(
     func: &SsaArtifact,
     arch: &ArchSpec,
     regions: &mut BTreeMap<RegionKey, SemanticRegion>,
-) {
+) -> Vec<NativeWorkerSummary> {
     let Some(summary) = large_cfg_root_summary(func, arch) else {
-        return;
+        return Vec::new();
     };
-    let terms = bounded_large_cfg_summary_memory_terms(&summary.memory_effects);
+    let worker_summaries =
+        super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, &summary);
+    let terms = joined_large_cfg_summary_memory_terms(&summary.memory_effects);
     if terms.is_empty() {
-        return;
+        return worker_summaries;
     }
     let mut by_anchor = BTreeMap::<u64, SemanticRegion>::new();
     for region in std::mem::take(regions).into_values() {
@@ -588,6 +479,7 @@ fn append_large_cfg_summary_memory_terms(
         .into_values()
         .map(|region| (region.key(), region))
         .collect();
+    worker_summaries
 }
 
 pub fn augment_semantic_artifact_with_interproc_summary(
@@ -595,14 +487,20 @@ pub fn augment_semantic_artifact_with_interproc_summary(
     anchor: u64,
     summary: &FunctionSemanticSummary,
 ) -> usize {
-    let terms = bounded_large_cfg_summary_memory_terms(&summary.memory_effects);
-    if terms.is_empty() {
-        return 0;
-    }
-
     let SemanticArtifactBody::Native(native) = &mut artifact.body else {
         return 0;
     };
+
+    let mut worker_summaries = std::mem::take(&mut native.summary.worker_summaries);
+    worker_summaries
+        .extend(super::native_worker::summaries_from_interproc_summary_unbounded(anchor, summary));
+    native.summary.worker_summaries =
+        super::native_worker::bounded_worker_summaries(worker_summaries);
+
+    let terms = joined_large_cfg_summary_memory_terms(&summary.memory_effects);
+    if terms.is_empty() {
+        return 0;
+    }
 
     let before = native
         .regions
@@ -1214,6 +1112,8 @@ pub(super) fn collect_canonical_semantic_regions_with_derived_for_branch_blocks<
             &diagnostics,
         ),
         diagnostics,
+        region_summaries: Vec::new(),
+        worker_summaries: Vec::new(),
     }
 }
 
@@ -1264,6 +1164,8 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
             CollectedNativeSemanticRegions {
                 regions: build_canonical_regions(&branch_facts, &BTreeMap::new(), &diagnostics),
                 diagnostics,
+                region_summaries: Vec::new(),
+                worker_summaries: Vec::new(),
             }
         }
     } else {
@@ -1287,10 +1189,26 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
         CollectedNativeSemanticRegions {
             regions: build_canonical_regions(&branch_facts, &BTreeMap::new(), &diagnostics),
             diagnostics,
+            region_summaries: Vec::new(),
+            worker_summaries: Vec::new(),
         }
     };
-    append_large_cfg_summary_memory_terms(func, arch, &mut collected.regions);
-    append_large_cfg_memory_transfer_terms(func, &mut collected.regions);
+    let mut canonical_worker_domain = Vec::new();
+    canonical_worker_domain.extend(append_large_cfg_summary_memory_terms(
+        func,
+        arch,
+        &mut collected.regions,
+    ));
+    canonical_worker_domain.extend(append_large_cfg_memory_transfer_terms(
+        func,
+        &mut collected.regions,
+    ));
+    canonical_worker_domain
+        .extend(super::native_worker::classify_function_worker_summaries_unbounded(func));
+    collected.region_summaries =
+        super::native_worker::classify_native_region_summaries(func, &canonical_worker_domain);
+    collected.worker_summaries =
+        super::native_worker::bounded_worker_summaries(canonical_worker_domain);
     collected.diagnostics.skipped_large_cfg = true;
     collected
 }
@@ -1310,11 +1228,14 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
                 skipped_missing_arch: true,
                 ..SymbolicFunctionFactDiagnostics::default()
             },
+            region_summaries: Vec::new(),
+            worker_summaries: Vec::new(),
         };
     };
 
     let cfg_summary = func.function().cfg_risk_summary();
-    if cfg_summary.block_count > 96 || cfg_summary.switch_block_count > 8 {
+    let branch_count = func.predicates().predicates.len();
+    if cfg_summary.block_count > 96 || branch_count > 96 || cfg_summary.switch_block_count > 8 {
         return collect_large_cfg_canonical_semantic_regions_with_limit(
             ctx,
             func,
@@ -1366,6 +1287,8 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
     CollectedNativeSemanticRegions {
         regions: build_canonical_regions(&branch_facts, &BTreeMap::new(), &diagnostics),
         diagnostics,
+        region_summaries: Vec::new(),
+        worker_summaries: Vec::new(),
     }
 }
 
@@ -1374,7 +1297,7 @@ mod tests {
     use super::*;
     use crate::{
         ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
-        RefinementStage, SemanticArtifactDiagnostics,
+        NativeWorkerSummaryKind, RefinementStage, SemanticArtifactDiagnostics,
     };
     use r2il::{RegisterDef, SpaceId, Varnode};
 
@@ -1399,14 +1322,16 @@ mod tests {
 
         let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
             .expect("copy-shaped fixture should build SSA");
-        let transfers = large_cfg_memory_transfers(&artifact);
+        let transfers = crate::semantics::native_worker::large_cfg_memory_transfers(&artifact);
 
-        assert!(transfers.contains(&LargeCfgMemoryTransfer {
-            block_addr: 0x1000,
-            dst_arg: 0,
-            src_arg: 1,
-            size: 1,
-        }));
+        assert!(
+            transfers.contains(&crate::semantics::native_worker::LargeCfgMemoryTransfer {
+                block_addr: 0x1000,
+                dst_arg: 0,
+                src_arg: 1,
+                size: 1,
+            })
+        );
     }
 
     #[test]
@@ -1456,14 +1381,16 @@ mod tests {
 
         let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
             .expect("plumbed copy-shaped fixture should build SSA");
-        let transfers = large_cfg_memory_transfers(&artifact);
+        let transfers = crate::semantics::native_worker::large_cfg_memory_transfers(&artifact);
 
-        assert!(transfers.contains(&LargeCfgMemoryTransfer {
-            block_addr: 0x1010,
-            dst_arg: 0,
-            src_arg: 1,
-            size: 8,
-        }));
+        assert!(
+            transfers.contains(&crate::semantics::native_worker::LargeCfgMemoryTransfer {
+                block_addr: 0x1010,
+                dst_arg: 0,
+                src_arg: 1,
+                size: 8,
+            })
+        );
     }
 
     #[test]
@@ -1488,7 +1415,8 @@ mod tests {
         let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch))
             .expect("copy-shaped fixture should build SSA");
         let mut regions = BTreeMap::new();
-        append_large_cfg_summary_memory_terms(&artifact, &arch, &mut regions);
+        let worker_summaries =
+            append_large_cfg_summary_memory_terms(&artifact, &arch, &mut regions);
         let terms = regions
             .values()
             .flat_map(|region| region.memory.iter())
@@ -1508,10 +1436,18 @@ mod tests {
                     BackwardMemoryRegion::Argument { index: 0 }
                 )
         }));
+        assert!(worker_summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::MemoryRead)
+                && summary.arg_indices().contains(&1)
+        }));
+        assert!(worker_summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
+                && summary.out_param_indices().contains(&0)
+        }));
     }
 
     #[test]
-    fn large_cfg_summary_budget_preserves_distinct_memory_effect_classes() {
+    fn large_cfg_summary_join_preserves_distinct_memory_effect_classes() {
         let mut effects = (0..48)
             .map(|index| SummaryMemoryEffect {
                 kind: SummaryMemoryEffectKind::Read,
@@ -1537,12 +1473,45 @@ mod tests {
             },
         });
 
-        let terms = bounded_large_cfg_summary_memory_terms(&effects);
+        let terms = joined_large_cfg_summary_memory_terms(&effects);
 
-        assert_eq!(terms.len(), LARGE_CFG_SUMMARY_MEMORY_TERM_MAX);
+        assert_eq!(terms.len(), 2);
+        assert!(terms.iter().any(|term| {
+            term.binding.as_deref() == Some("read_arg0")
+                && matches!(term.region, BackwardMemoryRegion::Argument { index: 0 })
+                && term.offset_lo == 0
+                && term.offset_hi == 383
+                && !term.exact_offset
+                && !term.evidence().budget_limited
+        }));
         assert!(terms.iter().any(|term| {
             term.binding.as_deref() == Some("write_arg1")
                 && matches!(term.region, BackwardMemoryRegion::Argument { index: 1 })
+        }));
+    }
+
+    #[test]
+    fn large_cfg_summary_join_keeps_distinct_args_beyond_old_count_cap() {
+        let effects = (0..40)
+            .map(|index| SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: r2ssa::SummaryMemoryLocation {
+                    region: SummaryMemoryRegion::Arg { index },
+                    range: Some(r2ssa::SummaryMemoryRange {
+                        offset_lo: 0,
+                        offset_hi: 7,
+                        width: Some(8),
+                    }),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let terms = joined_large_cfg_summary_memory_terms(&effects);
+
+        assert_eq!(terms.len(), 40);
+        assert!(terms.iter().any(|term| {
+            term.binding.as_deref() == Some("read_arg39")
+                && matches!(term.region, BackwardMemoryRegion::Argument { index: 39 })
         }));
     }
 
@@ -1589,6 +1558,8 @@ mod tests {
                     helper_functions: 0,
                     derived_summaries: 0,
                     derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+                    region_summaries: Vec::new(),
+                    worker_summaries: Vec::new(),
                 },
                 regions: BTreeMap::new(),
             }),
@@ -1599,6 +1570,7 @@ mod tests {
                 skipped_missing_arch: false,
                 skipped_large_cfg: true,
                 residual_reasons: vec![crate::ResidualReason::LargeCfg],
+                interpreter: None,
                 ambiguous_targets: Vec::new(),
                 cache_hit: false,
             },
@@ -1609,6 +1581,10 @@ mod tests {
 
         assert_eq!(added, 1);
         let native = artifact.native_body().expect("native semantic body");
+        assert!(native.summary.worker_summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
+                && summary.out_param_indices().contains(&0)
+        }));
         let region = native.regions.values().next().expect("summary region");
         assert!(region.memory.iter().any(|term| {
             term.value.term.binding.as_deref() == Some("write_arg0")

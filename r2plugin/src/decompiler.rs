@@ -158,18 +158,25 @@ pub(crate) fn run_full_decompile_on_large_stack(
             };
             artifact = rename_function_artifact_for_display(artifact, &display_func_name);
 
-            if let Some(r2sym::DecompilePlan::NativeLinear { reason }) =
-                artifact.function_facts.decompile_plan()
-            {
-                let route = r2dec::SemanticRoutePlan::LinearWorker { reason };
-                if let Some(output) = r2dec::render_semantic_worker_summary(
+            if let Some(route) = artifact
+                .function_facts
+                .decompile_plan()
+                .and_then(|plan| match plan {
+                    r2sym::DecompilePlan::NativeLinear { reason } => {
+                        Some(r2dec::SemanticRoutePlan::LinearWorker { reason })
+                    }
+                    r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
+                        Some(r2dec::SemanticRoutePlan::SummaryIslands { reason })
+                    }
+                    _ => None,
+                })
+                && let Some(output) = r2dec::render_semantic_worker_summary(
                     &display_func_name,
                     &artifact.function_facts,
                     &route,
                     config.clone(),
                 ) {
-                    return output;
-                }
+                return output;
             }
 
             if let Some(route) = r2dec::detached_semantic_route_plan(
@@ -186,7 +193,8 @@ pub(crate) fn run_full_decompile_on_large_stack(
                             return output;
                         }
                     }
-                    r2dec::SemanticRoutePlan::LinearWorker { .. } => {
+                    r2dec::SemanticRoutePlan::LinearWorker { .. }
+                    | r2dec::SemanticRoutePlan::SummaryIslands { .. } => {
                         if let Some(output) = r2dec::render_semantic_worker_summary(
                             &display_func_name,
                             &artifact.function_facts,

@@ -31,8 +31,6 @@ use super::vm::{build_vm_step_summary, classify_interpreter_like};
 fn residual_reasons(
     diagnostics: &DerivedSummaryDiagnostics,
     fact_diagnostics: &SymbolicFunctionFactDiagnostics,
-    interpreter_detected: bool,
-    vm_step_ready: bool,
 ) -> Vec<ResidualReason> {
     let mut reasons = Vec::new();
     if fact_diagnostics.skipped_missing_arch {
@@ -46,9 +44,6 @@ fn residual_reasons(
     }
     if diagnostics.scc_budget_exhausted > 0 {
         reasons.push(ResidualReason::SccBudgetExhausted);
-    }
-    if interpreter_detected && !vm_step_ready {
-        reasons.push(ResidualReason::InterpreterRequiresStepSummary);
     }
     reasons
 }
@@ -72,14 +67,10 @@ fn semantic_stage_for(
     derived_summaries: usize,
     diagnostics: &DerivedSummaryDiagnostics,
     collected: &CollectedNativeSemanticRegions,
-    interpreter_detected: bool,
     vm_step_ready: bool,
 ) -> RefinementStage {
     if vm_step_ready {
         return RefinementStage::Compiled;
-    }
-    if interpreter_detected {
-        return RefinementStage::Residual;
     }
     if derived_summaries > 0 && !collected.diagnostics.skipped_large_cfg {
         return RefinementStage::Compiled;
@@ -158,8 +149,7 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
         vm_step,
         vm_transfer,
     } = input;
-    let interpreter_detected = interpreter.is_some();
-    let vm_step_ready = vm_step.is_some();
+    let interpreter_diagnostic = interpreter.clone();
     let body = match execution {
         ExecutionModel::Vm => SemanticArtifactBody::Vm(Box::new(super::region::VmArtifactBody {
             interpreter,
@@ -173,6 +163,8 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
                 helper_functions,
                 derived_summaries,
                 derived_diagnostics: derived_diagnostics.clone(),
+                region_summaries: collected.region_summaries,
+                worker_summaries: collected.worker_summaries,
             },
             regions: collected.regions,
         }),
@@ -194,13 +186,9 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
             skipped_large_cfg: collected.diagnostics.skipped_large_cfg,
             residual_reasons: normalized_residual_reasons(
                 suppress_large_cfg_reason,
-                residual_reasons(
-                    &derived_diagnostics,
-                    &collected.diagnostics,
-                    interpreter_detected,
-                    vm_step_ready,
-                ),
+                residual_reasons(&derived_diagnostics, &collected.diagnostics),
             ),
+            interpreter: interpreter_diagnostic,
             ambiguous_targets,
             cache_hit: false,
         },
@@ -210,9 +198,14 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
 
 fn bounded_large_cfg_branch_limit(func: &SsaArtifact) -> usize {
     let summary = func.function().cfg_risk_summary();
-    if summary.block_count > 160 || summary.back_edge_count > 8 || summary.switch_block_count > 8 {
+    let branch_count = func.predicates().predicates.len();
+    if summary.block_count > 160
+        || branch_count > 160
+        || summary.back_edge_count > 8
+        || summary.switch_block_count > 8
+    {
         2
-    } else if summary.block_count > 96 || summary.back_edge_count > 6 {
+    } else if summary.block_count > 96 || branch_count > 96 || summary.back_edge_count > 6 {
         3
     } else {
         4
@@ -221,12 +214,30 @@ fn bounded_large_cfg_branch_limit(func: &SsaArtifact) -> usize {
 
 fn bounded_large_cfg_helper_limit(func: &SsaArtifact) -> usize {
     let summary = func.function().cfg_risk_summary();
-    if summary.block_count > 160 || summary.back_edge_count > 8 || summary.switch_block_count > 8 {
+    let branch_count = func.predicates().predicates.len();
+    if summary.block_count > 160
+        || branch_count > 160
+        || summary.back_edge_count > 8
+        || summary.switch_block_count > 8
+    {
         1
-    } else if summary.block_count > 96 || summary.back_edge_count > 6 {
+    } else if summary.block_count > 96 || branch_count > 96 || summary.back_edge_count > 6 {
         2
     } else {
         3
+    }
+}
+
+fn bounded_default_scope(
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+) -> Option<PreparedFunctionScope> {
+    let scope = scope?;
+    let helper_limit = bounded_large_cfg_helper_limit(func).max(4);
+    if scope.helper_functions().count() > helper_limit {
+        None
+    } else {
+        scope.with_prepared_root(func)
     }
 }
 
@@ -299,19 +310,23 @@ fn compile_function_semantics_uncached(
     let mut derived_summaries = 0usize;
     let mut collected = CollectedNativeSemanticRegions::default();
     let interpreter = classify_interpreter_like(func);
-    let vm_step = interpreter
+    let vm_step_candidate = interpreter
         .as_ref()
         .and_then(|dispatch| build_vm_step_summary(func, dispatch));
+    let vm_step = vm_step_candidate.filter(super::vm::VmStepSummary::has_strong_vm_evidence);
     let vm_transfer = vm_step.clone();
+    let vm_step_ready = vm_step.is_some();
 
     if let Some(arch) = arch {
         let cfg_summary = func.function().cfg_risk_summary();
+        let branch_count = func.predicates().predicates.len();
         let skip_expensive_branch_compilation = cfg_summary.block_count > 48
+            || branch_count > 48
             || cfg_summary.back_edge_count > 4
             || cfg_summary.switch_block_count > 4;
 
         if skip_expensive_branch_compilation {
-            if interpreter.is_none() {
+            if !vm_step_ready {
                 let bounded_scope = bounded_large_cfg_scope(func, scope);
                 collected = collect_large_cfg_canonical_semantic_regions_with_limit(
                     ctx,
@@ -326,7 +341,7 @@ fn compile_function_semantics_uncached(
                 collected.diagnostics.skipped_large_cfg = true;
             }
 
-            let execution = if interpreter.is_some() || vm_step.is_some() || vm_transfer.is_some() {
+            let execution = if vm_step_ready {
                 ExecutionModel::Vm
             } else {
                 ExecutionModel::Native
@@ -336,8 +351,7 @@ fn compile_function_semantics_uncached(
                 derived_summaries,
                 &derived_diagnostics,
                 &collected,
-                interpreter.is_some(),
-                vm_transfer.is_some(),
+                vm_step_ready,
             );
             let has_island_compiled_regions = matches!(execution, ExecutionModel::Native)
                 && collected.diagnostics.skipped_large_cfg
@@ -353,6 +367,7 @@ fn compile_function_semantics_uncached(
                 helper_functions,
                 &derived_diagnostics,
                 interpreter.as_ref(),
+                vm_step_ready,
             );
             return build_semantic_artifact(BuildSemanticArtifactInput {
                 stage,
@@ -405,7 +420,7 @@ fn compile_function_semantics_uncached(
     } else {
         collected.diagnostics.skipped_missing_arch = true;
     }
-    let execution = if interpreter.is_some() || vm_step.is_some() || vm_transfer.is_some() {
+    let execution = if vm_step_ready {
         ExecutionModel::Vm
     } else {
         ExecutionModel::Native
@@ -415,8 +430,7 @@ fn compile_function_semantics_uncached(
         derived_summaries,
         &derived_diagnostics,
         &collected,
-        interpreter.is_some(),
-        vm_transfer.is_some(),
+        vm_step_ready,
     );
     let has_island_compiled_regions = matches!(execution, ExecutionModel::Native)
         && collected.diagnostics.skipped_large_cfg
@@ -432,6 +446,7 @@ fn compile_function_semantics_uncached(
         helper_functions,
         &derived_diagnostics,
         interpreter.as_ref(),
+        vm_step_ready,
     );
     build_semantic_artifact(BuildSemanticArtifactInput {
         stage,
@@ -678,7 +693,7 @@ pub fn compile_semantic_artifact_default_with_scope(
     scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
 ) -> SemanticArtifact {
-    let rebound_scope = scope.and_then(|scope| scope.with_prepared_root(func));
+    let rebound_scope = bounded_default_scope(func, scope);
     compile_semantic_artifact_with_scope(
         ctx,
         func,
@@ -703,11 +718,13 @@ mod tests {
 
     use super::*;
     const RAX: u64 = 0;
+    const RBP: u64 = 8;
 
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("RAX", RAX, 8));
+        arch.add_register(RegisterDef::new("RBP", RBP, 8));
         arch
     }
 
@@ -727,6 +744,24 @@ mod tests {
             size,
             meta: None,
         }
+    }
+
+    fn make_selector_dispatch_ops() -> Vec<R2ILOp> {
+        vec![
+            R2ILOp::Load {
+                dst: make_reg(RAX, 8),
+                space: SpaceId::Ram,
+                addr: make_reg(RBP, 8),
+            },
+            R2ILOp::IntMult {
+                dst: make_reg(RAX, 8),
+                a: make_reg(RAX, 8),
+                b: make_const(8, 8),
+            },
+            R2ILOp::BranchInd {
+                target: make_reg(RAX, 8),
+            },
+        ]
     }
 
     #[test]
@@ -1089,10 +1124,7 @@ mod tests {
             R2ILBlock {
                 addr: 0x1004,
                 size: 4,
-                ops: vec![R2ILOp::Copy {
-                    dst: make_reg(RAX, 8),
-                    src: make_const(1, 8),
-                }],
+                ops: make_selector_dispatch_ops(),
                 switch_info: Some(SwitchInfo {
                     switch_addr: 0x1004,
                     min_val: 0,
@@ -1237,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn interpreter_without_step_summary_stays_residual() {
+    fn weak_switch_without_step_summary_stays_native() {
         let blocks = vec![
             R2ILBlock {
                 addr: 0x2000,
@@ -1334,20 +1366,149 @@ mod tests {
             &HashMap::new(),
             SummaryProfile::Default,
         );
-        assert_eq!(artifact.execution, ExecutionModel::Vm);
-        assert_eq!(
-            artifact.stage,
-            super::super::region::RefinementStage::Residual
+        assert_eq!(artifact.execution, ExecutionModel::Native);
+        assert!(artifact.vm_body().is_none());
+        assert_ne!(
+            artifact.slice_class(),
+            Some(crate::SliceClass::InterpreterSwitch)
         );
-        let vm_body = artifact.vm_body().expect("vm artifact body");
-        assert!(vm_body.interpreter.is_some());
-        assert!(vm_body.step_summary.is_none());
         assert!(
-            artifact
+            !artifact
                 .diagnostics
                 .residual_reasons
                 .contains(&ResidualReason::InterpreterRequiresStepSummary)
         );
+    }
+
+    #[test]
+    fn switch_loop_with_state_updates_but_no_selector_stays_native() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x2100,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x2104, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x2104,
+                size: 4,
+                ops: vec![],
+                switch_info: Some(SwitchInfo {
+                    switch_addr: 0x2104,
+                    min_val: 0,
+                    max_val: 4,
+                    default_target: Some(0x2118),
+                    cases: vec![
+                        SwitchCase {
+                            value: 0,
+                            target: 0x2108,
+                        },
+                        SwitchCase {
+                            value: 1,
+                            target: 0x210c,
+                        },
+                        SwitchCase {
+                            value: 2,
+                            target: 0x2110,
+                        },
+                        SwitchCase {
+                            value: 3,
+                            target: 0x2114,
+                        },
+                    ],
+                }),
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x2108,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntAdd {
+                        dst: make_reg(RAX, 8),
+                        a: make_reg(RAX, 8),
+                        b: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x2104, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x210c,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntSub {
+                        dst: make_reg(RAX, 8),
+                        a: make_reg(RAX, 8),
+                        b: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x2104, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x2110,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntXor {
+                        dst: make_reg(RAX, 8),
+                        a: make_reg(RAX, 8),
+                        b: make_const(0x55, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x2104, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x2114,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntLeft {
+                        dst: make_reg(RAX, 8),
+                        a: make_reg(RAX, 8),
+                        b: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x2104, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x2118,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x2104, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+        let ctx = Context::thread_local();
+        let artifact = compile_function_semantics_with_scope(
+            &ctx,
+            &func,
+            None,
+            Some(&test_arch()),
+            &HashMap::new(),
+            SummaryProfile::Default,
+        );
+
+        assert_eq!(artifact.execution, ExecutionModel::Native);
+        assert!(artifact.vm_body().is_none());
     }
 
     #[test]
@@ -1365,10 +1526,7 @@ mod tests {
             R2ILBlock {
                 addr: 0x3004,
                 size: 4,
-                ops: vec![R2ILOp::Copy {
-                    dst: make_reg(RAX, 8),
-                    src: make_const(1, 8),
-                }],
+                ops: make_selector_dispatch_ops(),
                 switch_info: Some(SwitchInfo {
                     switch_addr: 0x3004,
                     min_val: 0,
@@ -1402,7 +1560,7 @@ mod tests {
                     R2ILOp::Load {
                         dst: make_reg(RAX, 8),
                         space: SpaceId::Ram,
-                        addr: make_reg(RAX, 8),
+                        addr: make_reg(RBP, 8),
                     },
                     R2ILOp::Branch {
                         target: make_const(0x3004, 8),
@@ -1661,7 +1819,9 @@ mod tests {
         ));
         assert!(matches!(
             artifact.decompile_plan(),
-            crate::DecompilePlan::NativeStructured | crate::DecompilePlan::NativeLinear { .. }
+            crate::DecompilePlan::NativeStructured
+                | crate::DecompilePlan::NativeSummaryIslands { .. }
+                | crate::DecompilePlan::NativeLinear { .. }
         ));
         assert_eq!(artifact.diagnostics.branches_evaluated, 1);
     }
@@ -1751,6 +1911,8 @@ mod tests {
                 skipped_large_cfg: true,
                 ..Default::default()
             },
+            region_summaries: Vec::new(),
+            worker_summaries: Vec::new(),
         };
 
         let stage = semantic_stage_for(
@@ -1758,7 +1920,6 @@ mod tests {
             0,
             &DerivedSummaryDiagnostics::default(),
             &collected,
-            false,
             false,
         );
         let artifact = build_semantic_artifact(BuildSemanticArtifactInput {

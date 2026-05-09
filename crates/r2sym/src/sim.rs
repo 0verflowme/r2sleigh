@@ -1600,11 +1600,15 @@ fn build_summary_substitutions<'ctx>(
 }
 
 fn substitute_bool(ast: &Bool, substitutions: &[(BV, BV)]) -> Bool {
+    if substitutions.is_empty() {
+        return ast.clone();
+    }
     let pairs = substitutions
         .iter()
         .map(|(from, to)| (from, to))
         .collect::<Vec<_>>();
-    ast.substitute(&pairs)
+    catch_unwind(AssertUnwindSafe(|| ast.substitute(&pairs)))
+        .unwrap_or_else(|_| Bool::from_bool(true))
 }
 
 fn try_substitute_bool(ast: &Bool, substitutions: &[(BV, BV)]) -> Option<Bool> {
@@ -1616,6 +1620,9 @@ fn substitute_value<'ctx>(
     value: &SymValue<'ctx>,
     substitutions: &[(BV, BV)],
 ) -> SymValue<'ctx> {
+    if substitutions.is_empty() {
+        return value.clone();
+    }
     match value {
         SymValue::Concrete { .. } | SymValue::Unknown { .. } => value.clone(),
         SymValue::Symbolic {
@@ -1625,7 +1632,9 @@ fn substitute_value<'ctx>(
                 .iter()
                 .map(|(from, to)| (from, to))
                 .collect::<Vec<_>>();
-            SymValue::symbolic_tainted(ast.substitute(&pairs), *bits, *taint)
+            catch_unwind(AssertUnwindSafe(|| ast.substitute(&pairs)))
+                .map(|substituted| SymValue::symbolic_tainted(substituted, *bits, *taint))
+                .unwrap_or_else(|_| SymValue::unknown(*bits))
         }
     }
 }
@@ -2876,6 +2885,20 @@ mod tests {
             size,
             meta: None,
         }
+    }
+
+    #[test]
+    fn empty_summary_substitutions_are_identity() {
+        let ctx = z3::Context::thread_local();
+        let var = BV::fresh_const("empty_summary_substitution", 64);
+        let guard = var.eq(&var);
+        let value = SymValue::symbolic(var.clone(), 64);
+
+        assert_eq!(substitute_bool(&guard, &[]).to_string(), guard.to_string());
+        assert_eq!(
+            substitute_value(&ctx, &value, &[]).to_bv(&ctx).to_string(),
+            value.to_bv(&ctx).to_string()
+        );
     }
 
     #[test]

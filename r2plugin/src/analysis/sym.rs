@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
@@ -365,6 +366,14 @@ pub(crate) struct CompiledSemanticInfo {
     pub(crate) control_region_count: usize,
     pub(crate) memory_region_count: usize,
     pub(crate) memory_fact_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) native_region_summary_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) native_region_summary_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) native_worker_summary_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) native_worker_summary_kinds: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) memory_summaries: Vec<MemorySummaryInfo>,
     pub(crate) compiled_condition_count: usize,
@@ -373,6 +382,8 @@ pub(crate) struct CompiledSemanticInfo {
     pub(crate) branches_pruned: usize,
     pub(crate) branches_unknown: usize,
     pub(crate) skipped_large_cfg: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interpreter_diagnostic: Option<InterpreterDispatchInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) interpreter: Option<InterpreterDispatchInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -405,6 +416,22 @@ pub(crate) struct InterpreterDispatchInfo {
     pub(crate) selector: Option<String>,
     pub(crate) back_edges: usize,
     pub(crate) score: i32,
+}
+
+fn interpreter_dispatch_info_from_sym(
+    interpreter: &r2sym::InterpreterDispatchSummary,
+) -> InterpreterDispatchInfo {
+    InterpreterDispatchInfo {
+        kind: match interpreter.kind {
+            r2sym::InterpreterKind::SwitchDispatch => "switch_dispatch".to_string(),
+            r2sym::InterpreterKind::IndirectDispatch => "indirect_dispatch".to_string(),
+        },
+        dispatch_header: format!("0x{:x}", interpreter.dispatch_header),
+        dispatch_targets: interpreter.dispatch_targets,
+        selector: interpreter.selector.clone(),
+        back_edges: interpreter.back_edges,
+        score: interpreter.score,
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1493,6 +1520,45 @@ fn memory_summary_region_label(region: &r2sym::BackwardMemoryRegion) -> String {
     }
 }
 
+fn native_worker_summary_kind_label(kind: r2sym::NativeWorkerSummaryKind) -> &'static str {
+    match kind {
+        r2sym::NativeWorkerSummaryKind::MemoryTransfer => "memory_transfer",
+        r2sym::NativeWorkerSummaryKind::MemoryRead => "memory_read",
+        r2sym::NativeWorkerSummaryKind::MemoryWrite => "memory_write",
+        r2sym::NativeWorkerSummaryKind::MemoryEscape => "memory_escape",
+        r2sym::NativeWorkerSummaryKind::MemoryFree => "memory_free",
+        r2sym::NativeWorkerSummaryKind::StringScan => "string_scan",
+        r2sym::NativeWorkerSummaryKind::HashFold => "hash_fold",
+        r2sym::NativeWorkerSummaryKind::TableWalk => "table_walk",
+        r2sym::NativeWorkerSummaryKind::Parser => "parser",
+        r2sym::NativeWorkerSummaryKind::Allocation => "allocation",
+        r2sym::NativeWorkerSummaryKind::Lifetime => "lifetime",
+        r2sym::NativeWorkerSummaryKind::Synchronization => "synchronization",
+        r2sym::NativeWorkerSummaryKind::Atomic => "atomic",
+        r2sym::NativeWorkerSummaryKind::Unknown => "unknown",
+    }
+}
+
+fn native_worker_summary_kinds(native: Option<&r2sym::NativeArtifactBody>) -> Vec<String> {
+    native
+        .into_iter()
+        .flat_map(|body| body.summary.worker_summaries.iter())
+        .map(|summary| native_worker_summary_kind_label(summary.kind).to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn native_region_summary_kinds(native: Option<&r2sym::NativeArtifactBody>) -> Vec<String> {
+    native
+        .into_iter()
+        .flat_map(|body| body.summary.region_summaries.iter())
+        .map(|summary| native_worker_summary_kind_label(summary.kind).to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn semantic_memory_summaries(native: Option<&r2sym::NativeArtifactBody>) -> Vec<MemorySummaryInfo> {
     let mut summaries = native
         .into_iter()
@@ -1535,6 +1601,8 @@ fn compiled_semantic_info_with_seed(
 ) -> CompiledSemanticInfo {
     let native = compiled.native_body();
     let memory_summaries = semantic_memory_summaries(native);
+    let native_worker_summary_kinds = native_worker_summary_kinds(native);
+    let native_region_summary_kinds = native_region_summary_kinds(native);
     let memory_fact_count = memory_summaries.len();
     CompiledSemanticInfo {
         schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
@@ -1641,6 +1709,14 @@ fn compiled_semantic_info_with_seed(
             })
             .unwrap_or(0),
         memory_fact_count,
+        native_region_summary_count: native
+            .map(|body| body.summary.region_summaries.len())
+            .unwrap_or(0),
+        native_region_summary_kinds,
+        native_worker_summary_count: native
+            .map(|body| body.summary.worker_summaries.len())
+            .unwrap_or(0),
+        native_worker_summary_kinds,
         memory_summaries,
         compiled_condition_count: compiled.actionable_control_count(),
         exact_compiled_condition_count: compiled.exact_control_count(),
@@ -1648,21 +1724,15 @@ fn compiled_semantic_info_with_seed(
         branches_pruned: compiled.diagnostics.branches_pruned,
         branches_unknown: compiled.diagnostics.branches_unknown,
         skipped_large_cfg: compiled.diagnostics.skipped_large_cfg,
+        interpreter_diagnostic: compiled
+            .diagnostics
+            .interpreter
+            .as_ref()
+            .map(interpreter_dispatch_info_from_sym),
         interpreter: compiled
             .vm_body()
             .and_then(|body| body.interpreter.as_ref())
-            .as_ref()
-            .map(|interpreter| InterpreterDispatchInfo {
-                kind: match interpreter.kind {
-                    r2sym::InterpreterKind::SwitchDispatch => "switch_dispatch".to_string(),
-                    r2sym::InterpreterKind::IndirectDispatch => "indirect_dispatch".to_string(),
-                },
-                dispatch_header: format!("0x{:x}", interpreter.dispatch_header),
-                dispatch_targets: interpreter.dispatch_targets,
-                selector: interpreter.selector.clone(),
-                back_edges: interpreter.back_edges,
-                score: interpreter.score,
-            }),
+            .map(interpreter_dispatch_info_from_sym),
         vm_step: compiled
             .vm_body()
             .and_then(|body| body.step_summary.as_ref())

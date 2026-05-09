@@ -420,7 +420,7 @@ impl SemanticArtifact {
 
     fn has_native_semantics(&self) -> bool {
         self.native_body()
-            .is_some_and(|body| !body.regions.is_empty())
+            .is_some_and(|body| !body.regions.is_empty() || body.has_summary_islands())
     }
 
     fn supports_native_semantic_structuring(&self) -> bool {
@@ -547,6 +547,8 @@ impl SemanticArtifact {
             self.execution,
             &self.diagnostics,
             self.has_native_semantics(),
+            self.native_body()
+                .is_some_and(NativeArtifactBody::has_summary_islands),
             self.supports_native_semantic_structuring(),
         )
     }
@@ -770,6 +772,8 @@ mod tests {
                     helper_functions: 0,
                     derived_summaries: 0,
                     derived_diagnostics: DerivedSummaryDiagnostics::default(),
+                    region_summaries: Vec::new(),
+                    worker_summaries: Vec::new(),
                 },
                 regions: Default::default(),
             }),
@@ -850,6 +854,7 @@ mod tests {
                 skipped_missing_arch: false,
                 skipped_large_cfg: false,
                 residual_reasons: residuals,
+                interpreter: None,
                 ambiguous_targets: ambiguous,
                 cache_hit: false,
             });

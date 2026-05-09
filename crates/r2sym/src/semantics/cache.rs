@@ -11,7 +11,7 @@ use crate::sim::{PreparedFunctionScope, SummaryProfile};
 use super::artifact::SemanticArtifact;
 
 const SEMANTIC_CACHE_LIMIT: usize = 128;
-pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 2;
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 7;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,7 +123,34 @@ impl std::fmt::Write for HasherAdapter<'_> {
 }
 
 fn arch_hash(arch: Option<&ArchSpec>) -> u64 {
-    arch.map(hash_debug_value).unwrap_or(0)
+    let Some(arch) = arch else {
+        return 0;
+    };
+    let mut hasher = DefaultHasher::new();
+    arch.name.hash(&mut hasher);
+    arch.variant.hash(&mut hasher);
+    arch.big_endian.hash(&mut hasher);
+    format!("{:?}", arch.instruction_endianness).hash(&mut hasher);
+    format!("{:?}", arch.memory_endianness).hash(&mut hasher);
+    arch.addr_size.hash(&mut hasher);
+    arch.alignment.hash(&mut hasher);
+    for space in &arch.spaces {
+        hash_debug_value(space).hash(&mut hasher);
+    }
+    for register in &arch.registers {
+        hash_debug_value(register).hash(&mut hasher);
+    }
+    for (name, offset) in arch.register_map.iter().collect::<BTreeMap<_, _>>() {
+        name.hash(&mut hasher);
+        offset.hash(&mut hasher);
+    }
+    for userop in &arch.userops {
+        hash_debug_value(userop).hash(&mut hasher);
+    }
+    for source_file in &arch.source_files {
+        source_file.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn strip_ssa_version_suffix(name: &str) -> &str {

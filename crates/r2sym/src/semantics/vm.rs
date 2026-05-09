@@ -418,8 +418,58 @@ pub struct VmStepSummary {
     pub transfers: Vec<VmTransferArm>,
 }
 
-const MAX_HANDLER_REGION_BLOCKS: usize = 16;
-const MAX_HANDLER_REGION_DEPTH: usize = 8;
+impl VmStepSummary {
+    pub fn has_strong_vm_evidence(&self) -> bool {
+        let has_dispatch = self.dispatch_targets.len() >= 2 && !self.loop_latches.is_empty();
+        let has_redispatch = !self.redispatch_handlers.is_empty()
+            || self.transfers.iter().any(|transfer| transfer.redispatch);
+        let has_handler_transfer_graph = !self.transfers.is_empty()
+            && self
+                .transfers
+                .iter()
+                .any(|transfer| !transfer.region_blocks.is_empty())
+            && self
+                .handler_regions
+                .values()
+                .any(|blocks| !blocks.is_empty());
+        let has_state_update_evidence = self
+            .handler_state_updates
+            .values()
+            .any(|updates| !updates.is_empty())
+            || self.transfers.iter().any(|transfer| {
+                !transfer.state_updates.is_empty() || transfer.selector_update.is_some()
+            });
+        let has_selector_update_evidence = self.selector.as_ref().is_some_and(|selector| {
+            self.handler_state_updates
+                .values()
+                .flatten()
+                .any(|update| same_logical_name(&update.output, selector))
+                || self
+                    .transfers
+                    .iter()
+                    .any(|transfer| transfer.selector_update.is_some())
+        });
+        let handler_call_count = self.handler_calls.values().sum::<usize>();
+        let handler_state_update_count = self
+            .handler_state_updates
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        let logical_state_output_count = logical_state_name_count(&self.state_outputs);
+        let has_compact_state_machine_evidence = self.dispatch_targets.len() <= 16
+            && logical_state_output_count <= 64
+            && handler_call_count == 0
+            && handler_state_update_count >= self.dispatch_targets.len().min(5);
+        let has_usable_transfer = self.transfers.iter().any(|transfer| !transfer.truncated);
+
+        has_dispatch
+            && has_redispatch
+            && has_handler_transfer_graph
+            && has_state_update_evidence
+            && (has_selector_update_evidence || has_compact_state_machine_evidence)
+            && has_usable_transfer
+    }
+}
 
 #[derive(Debug, Default)]
 struct HandlerRegionSummary {
@@ -438,6 +488,37 @@ struct HandlerRegionSummary {
     reenters_dispatch: bool,
     may_return: bool,
     truncated: bool,
+    residual_guards: bool,
+    residual_memory_effects: bool,
+}
+
+#[derive(Debug, Default)]
+struct HandlerGraph {
+    blocks: BTreeSet<u64>,
+    internal_edges: BTreeMap<u64, BTreeSet<u64>>,
+    exit_targets: BTreeSet<u64>,
+    reenters_dispatch: bool,
+    may_return: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HandlerScc {
+    blocks: Vec<u64>,
+}
+
+#[derive(Debug, Default)]
+struct HandlerSccSummary {
+    blocks: BTreeSet<u64>,
+    state_inputs: BTreeSet<String>,
+    state_outputs: BTreeSet<String>,
+    state_updates: BTreeMap<String, VmValueExpr>,
+    exit_guards: Vec<VmGuardedExit>,
+    memory_read_effects: Vec<VmMemoryCondition>,
+    memory_write_effects: Vec<VmMemoryCondition>,
+    memory_reads: usize,
+    memory_writes: usize,
+    calls: usize,
+    conditional_branches: usize,
     residual_guards: bool,
     residual_memory_effects: bool,
 }
@@ -504,6 +585,14 @@ fn same_logical_name(left: &str, right: &str) -> bool {
     split_version(left)
         .0
         .eq_ignore_ascii_case(split_version(right).0)
+}
+
+fn logical_state_name_count(names: &[String]) -> usize {
+    names
+        .iter()
+        .map(|name| split_version(name).0.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 fn render_vm_var_expr(func: &SsaArtifact, var: &SSAVar, depth: u32) -> String {
@@ -1037,6 +1126,283 @@ fn vm_exit_guards_for_block(
     (guards, false)
 }
 
+fn build_handler_graph(
+    func: &SsaArtifact,
+    entry: u64,
+    dispatch_header: u64,
+    loop_header: u64,
+    dispatch_targets: &BTreeSet<u64>,
+) -> HandlerGraph {
+    let mut graph = HandlerGraph::default();
+    let mut queue = VecDeque::from([entry]);
+
+    while let Some(block_addr) = queue.pop_front() {
+        if !graph.blocks.insert(block_addr) {
+            continue;
+        }
+
+        let Some(cfg_block) = func.cfg().get_block(block_addr) else {
+            continue;
+        };
+        if matches!(cfg_block.terminator, BlockTerminator::Return) {
+            graph.may_return = true;
+        }
+
+        for succ in func.successors(block_addr) {
+            if succ == dispatch_header || succ == loop_header {
+                graph.reenters_dispatch = true;
+                graph.exit_targets.insert(succ);
+                continue;
+            }
+            if dispatch_targets.contains(&succ) && succ != entry {
+                graph.exit_targets.insert(succ);
+                continue;
+            }
+            graph
+                .internal_edges
+                .entry(block_addr)
+                .or_default()
+                .insert(succ);
+            if !graph.blocks.contains(&succ) {
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    for block in &graph.blocks {
+        graph.internal_edges.entry(*block).or_default();
+    }
+    graph
+}
+
+fn handler_graph_sccs(graph: &HandlerGraph) -> Vec<HandlerScc> {
+    struct Tarjan<'a> {
+        graph: &'a HandlerGraph,
+        next_index: usize,
+        stack: Vec<u64>,
+        on_stack: BTreeSet<u64>,
+        index_by_block: BTreeMap<u64, usize>,
+        lowlink_by_block: BTreeMap<u64, usize>,
+        sccs: Vec<HandlerScc>,
+    }
+
+    impl<'a> Tarjan<'a> {
+        fn strongconnect(&mut self, block: u64) {
+            let index = self.next_index;
+            self.next_index += 1;
+            self.index_by_block.insert(block, index);
+            self.lowlink_by_block.insert(block, index);
+            self.stack.push(block);
+            self.on_stack.insert(block);
+
+            for succ in self
+                .graph
+                .internal_edges
+                .get(&block)
+                .into_iter()
+                .flat_map(|succs| succs.iter().copied())
+                .filter(|succ| self.graph.blocks.contains(succ))
+            {
+                if !self.index_by_block.contains_key(&succ) {
+                    self.strongconnect(succ);
+                    let succ_lowlink = self.lowlink_by_block[&succ];
+                    let block_lowlink = self.lowlink_by_block[&block].min(succ_lowlink);
+                    self.lowlink_by_block.insert(block, block_lowlink);
+                } else if self.on_stack.contains(&succ) {
+                    let succ_index = self.index_by_block[&succ];
+                    let block_lowlink = self.lowlink_by_block[&block].min(succ_index);
+                    self.lowlink_by_block.insert(block, block_lowlink);
+                }
+            }
+
+            if self.lowlink_by_block[&block] == self.index_by_block[&block] {
+                let mut blocks = Vec::new();
+                while let Some(member) = self.stack.pop() {
+                    self.on_stack.remove(&member);
+                    blocks.push(member);
+                    if member == block {
+                        break;
+                    }
+                }
+                blocks.sort_unstable();
+                self.sccs.push(HandlerScc { blocks });
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        graph,
+        next_index: 0,
+        stack: Vec::new(),
+        on_stack: BTreeSet::new(),
+        index_by_block: BTreeMap::new(),
+        lowlink_by_block: BTreeMap::new(),
+        sccs: Vec::new(),
+    };
+    for block in &graph.blocks {
+        if !tarjan.index_by_block.contains_key(block) {
+            tarjan.strongconnect(*block);
+        }
+    }
+    tarjan.sccs.sort_by_key(|scc| {
+        (
+            scc.blocks.first().copied().unwrap_or(u64::MAX),
+            scc.blocks.len(),
+        )
+    });
+    tarjan.sccs
+}
+
+fn join_vm_state_update_value(output: &str, left: &mut VmValueExpr, right: VmValueExpr) {
+    if *left != right {
+        *left = VmValueExpr::Expr(format!("summary({output})"));
+    }
+}
+
+fn insert_vm_state_update(
+    updates: &mut BTreeMap<String, VmValueExpr>,
+    output: String,
+    value: VmValueExpr,
+) {
+    if let Some(existing_output) = updates
+        .keys()
+        .find(|candidate| same_logical_name(candidate, &output))
+        .cloned()
+    {
+        let existing = updates
+            .get_mut(&existing_output)
+            .expect("state update key was selected from the same map");
+        join_vm_state_update_value(&existing_output, existing, value);
+    } else {
+        updates.insert(output, value);
+    }
+}
+
+fn sort_vm_guarded_exits(guards: &mut Vec<VmGuardedExit>) {
+    guards.sort_by(|lhs, rhs| {
+        (lhs.target, &lhs.guard.expr, lhs.guard.expect_nonzero).cmp(&(
+            rhs.target,
+            &rhs.guard.expr,
+            rhs.guard.expect_nonzero,
+        ))
+    });
+    guards.dedup();
+}
+
+fn sort_vm_memory_conditions(conditions: &mut Vec<VmMemoryCondition>) {
+    conditions.sort_by(|lhs, rhs| {
+        (
+            lhs.region.id,
+            &lhs.region.name,
+            lhs.offset_lo,
+            lhs.offset_hi,
+            lhs.size,
+            lhs.binding.as_deref(),
+            &lhs.expr,
+            lhs.value_expr.as_deref(),
+            lhs.exact_value,
+        )
+            .cmp(&(
+                rhs.region.id,
+                &rhs.region.name,
+                rhs.offset_lo,
+                rhs.offset_hi,
+                rhs.size,
+                rhs.binding.as_deref(),
+                &rhs.expr,
+                rhs.value_expr.as_deref(),
+                rhs.exact_value,
+            ))
+    });
+    conditions.dedup();
+}
+
+fn summarize_handler_scc(
+    func: &SsaArtifact,
+    scc: &HandlerScc,
+    seen_exit_guards: &mut BTreeSet<(u64, bool, String)>,
+) -> HandlerSccSummary {
+    let mut summary = HandlerSccSummary::default();
+
+    for block_addr in &scc.blocks {
+        summary.blocks.insert(*block_addr);
+        let Some(block) = func.get_block(*block_addr) else {
+            continue;
+        };
+        let cfg_block = func.cfg().get_block(*block_addr);
+        if matches!(
+            cfg_block.map(|block| &block.terminator),
+            Some(BlockTerminator::ConditionalBranch { .. })
+        ) {
+            summary.conditional_branches += 1;
+            let (block_guards, residual) =
+                vm_exit_guards_for_block(func, *block_addr, seen_exit_guards);
+            if block_guards.is_empty() {
+                summary.residual_guards |= residual;
+            } else {
+                summary.exit_guards.extend(block_guards);
+            }
+        }
+
+        record_block_state(block, &mut summary.state_inputs, &mut summary.state_outputs);
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            if op.is_memory_read() {
+                summary.memory_reads += 1;
+            }
+            if op.is_memory_write() {
+                summary.memory_writes += 1;
+            }
+            let (reads, writes, residual) =
+                vm_memory_conditions_for_op(func, *block_addr, op_idx, op);
+            summary.residual_memory_effects |= residual;
+            summary.memory_read_effects.extend(reads);
+            summary.memory_write_effects.extend(writes);
+            if matches!(
+                op,
+                SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. }
+            ) {
+                summary.calls += 1;
+            }
+            if let Some(dst) = op.dst()
+                && !dst.is_const()
+                && !dst.is_temp()
+                && !dst.name.starts_with("ram:")
+            {
+                let value = classify_vm_op_value_at_site(func, *block_addr, op_idx, op, 0)
+                    .unwrap_or_else(|| VmValueExpr::Var(dst.display_name()));
+                insert_vm_state_update(&mut summary.state_updates, dst.display_name(), value);
+            }
+        }
+    }
+
+    sort_vm_guarded_exits(&mut summary.exit_guards);
+    sort_vm_memory_conditions(&mut summary.memory_read_effects);
+    sort_vm_memory_conditions(&mut summary.memory_write_effects);
+    summary
+}
+
+fn join_handler_scc_summary(acc: &mut HandlerSccSummary, summary: HandlerSccSummary) {
+    acc.blocks.extend(summary.blocks);
+    acc.state_inputs.extend(summary.state_inputs);
+    acc.state_outputs.extend(summary.state_outputs);
+    for (output, value) in summary.state_updates {
+        insert_vm_state_update(&mut acc.state_updates, output, value);
+    }
+    acc.exit_guards.extend(summary.exit_guards);
+    sort_vm_guarded_exits(&mut acc.exit_guards);
+    acc.memory_read_effects.extend(summary.memory_read_effects);
+    sort_vm_memory_conditions(&mut acc.memory_read_effects);
+    acc.memory_write_effects
+        .extend(summary.memory_write_effects);
+    sort_vm_memory_conditions(&mut acc.memory_write_effects);
+    acc.memory_reads += summary.memory_reads;
+    acc.memory_writes += summary.memory_writes;
+    acc.calls += summary.calls;
+    acc.conditional_branches += summary.conditional_branches;
+    acc.residual_guards |= summary.residual_guards;
+    acc.residual_memory_effects |= summary.residual_memory_effects;
+}
+
 fn summarize_handler_region(
     func: &SsaArtifact,
     entry: u64,
@@ -1044,162 +1410,21 @@ fn summarize_handler_region(
     loop_header: u64,
     dispatch_targets: &BTreeSet<u64>,
 ) -> HandlerRegionSummary {
-    let mut visited = BTreeSet::new();
-    let mut queue = VecDeque::from([(entry, 0usize)]);
-    let mut exit_targets = BTreeSet::new();
-    let mut state_inputs = BTreeSet::new();
-    let mut state_outputs = BTreeSet::new();
-    let mut state_updates = BTreeMap::<String, VmValueExpr>::new();
-    let mut exit_guards = Vec::new();
+    let graph = build_handler_graph(func, entry, dispatch_header, loop_header, dispatch_targets);
+    let sccs = handler_graph_sccs(&graph);
     let mut seen_exit_guards = BTreeSet::new();
-    let mut memory_read_effects = Vec::new();
-    let mut memory_write_effects = Vec::new();
-    let mut memory_reads = 0usize;
-    let mut memory_writes = 0usize;
-    let mut calls = 0usize;
-    let mut conditional_branches = 0usize;
-    let mut reenters_dispatch = false;
-    let mut may_return = false;
-    let mut truncated = false;
-    let mut residual_guards = false;
-    let mut residual_memory_effects = false;
-
-    while let Some((block_addr, depth)) = queue.pop_front() {
-        if !visited.insert(block_addr) {
-            continue;
-        }
-        if visited.len() > MAX_HANDLER_REGION_BLOCKS {
-            truncated = true;
-            visited.remove(&block_addr);
-            continue;
-        }
-
-        let Some(block) = func.get_block(block_addr) else {
-            continue;
-        };
-        let cfg_block = func.cfg().get_block(block_addr);
-        if matches!(
-            cfg_block.map(|block| &block.terminator),
-            Some(BlockTerminator::ConditionalBranch { .. })
-        ) {
-            conditional_branches += 1;
-            let (block_guards, residual) =
-                vm_exit_guards_for_block(func, block_addr, &mut seen_exit_guards);
-            if block_guards.is_empty() {
-                residual_guards |= residual;
-            } else {
-                exit_guards.extend(block_guards);
-            }
-        }
-        if matches!(
-            cfg_block.map(|block| &block.terminator),
-            Some(BlockTerminator::Return)
-        ) {
-            may_return = true;
-        }
-
-        record_block_state(block, &mut state_inputs, &mut state_outputs);
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            if op.is_memory_read() {
-                memory_reads += 1;
-            }
-            if op.is_memory_write() {
-                memory_writes += 1;
-            }
-            let (reads, writes, residual) =
-                vm_memory_conditions_for_op(func, block_addr, op_idx, op);
-            if residual {
-                residual_memory_effects = true;
-            }
-            memory_read_effects.extend(reads);
-            memory_write_effects.extend(writes);
-            if matches!(
-                op,
-                SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallOther { .. }
-            ) {
-                calls += 1;
-            }
-            if let Some(dst) = op.dst()
-                && !dst.is_const()
-                && !dst.is_temp()
-                && !dst.name.starts_with("ram:")
-            {
-                let value = classify_vm_op_value_at_site(func, block_addr, op_idx, op, 0)
-                    .unwrap_or_else(|| VmValueExpr::Var(dst.display_name()));
-                state_updates.insert(dst.display_name(), value);
-            }
-        }
-
-        let succs = func.successors(block_addr);
-        if succs.is_empty() {
-            continue;
-        }
-        for succ in succs {
-            if succ == dispatch_header || succ == loop_header {
-                reenters_dispatch = true;
-                exit_targets.insert(succ);
-                continue;
-            }
-            if dispatch_targets.contains(&succ) && succ != entry {
-                exit_targets.insert(succ);
-                continue;
-            }
-            if depth >= MAX_HANDLER_REGION_DEPTH {
-                truncated = true;
-                exit_targets.insert(succ);
-                continue;
-            }
-            queue.push_back((succ, depth + 1));
-        }
+    let mut joined = HandlerSccSummary::default();
+    for scc in &sccs {
+        let summary = summarize_handler_scc(func, scc, &mut seen_exit_guards);
+        join_handler_scc_summary(&mut joined, summary);
     }
 
-    exit_guards.sort_by(|lhs, rhs| {
-        (lhs.target, &lhs.guard.expr, lhs.guard.expect_nonzero).cmp(&(
-            rhs.target,
-            &rhs.guard.expr,
-            rhs.guard.expect_nonzero,
-        ))
-    });
-    memory_read_effects.sort_by(|lhs, rhs| {
-        (
-            lhs.region.id,
-            &lhs.region.name,
-            lhs.offset_lo,
-            lhs.size,
-            &lhs.expr,
-        )
-            .cmp(&(
-                rhs.region.id,
-                &rhs.region.name,
-                rhs.offset_lo,
-                rhs.size,
-                &rhs.expr,
-            ))
-    });
-    memory_read_effects.dedup();
-    memory_write_effects.sort_by(|lhs, rhs| {
-        (
-            lhs.region.id,
-            &lhs.region.name,
-            lhs.offset_lo,
-            lhs.size,
-            &lhs.expr,
-        )
-            .cmp(&(
-                rhs.region.id,
-                &rhs.region.name,
-                rhs.offset_lo,
-                rhs.size,
-                &rhs.expr,
-            ))
-    });
-    memory_write_effects.dedup();
-
     HandlerRegionSummary {
-        blocks: visited.into_iter().collect(),
-        state_inputs: state_inputs.into_iter().collect(),
-        state_outputs: state_outputs.into_iter().collect(),
-        state_updates: state_updates
+        blocks: joined.blocks.into_iter().collect(),
+        state_inputs: joined.state_inputs.into_iter().collect(),
+        state_outputs: joined.state_outputs.into_iter().collect(),
+        state_updates: joined
+            .state_updates
             .into_iter()
             .map(|(output, value)| VmStateUpdate {
                 output,
@@ -1208,19 +1433,19 @@ fn summarize_handler_region(
                 value,
             })
             .collect(),
-        exit_guards,
-        memory_read_effects,
-        memory_write_effects,
-        memory_reads,
-        memory_writes,
-        calls,
-        conditional_branches,
-        exit_targets: exit_targets.into_iter().collect(),
-        reenters_dispatch,
-        may_return,
-        truncated,
-        residual_guards,
-        residual_memory_effects,
+        exit_guards: joined.exit_guards,
+        memory_read_effects: joined.memory_read_effects,
+        memory_write_effects: joined.memory_write_effects,
+        memory_reads: joined.memory_reads,
+        memory_writes: joined.memory_writes,
+        calls: joined.calls,
+        conditional_branches: joined.conditional_branches,
+        exit_targets: graph.exit_targets.into_iter().collect(),
+        reenters_dispatch: graph.reenters_dispatch,
+        may_return: graph.may_return,
+        truncated: false,
+        residual_guards: joined.residual_guards,
+        residual_memory_effects: joined.residual_memory_effects,
     }
 }
 
@@ -1589,4 +1814,135 @@ pub(crate) fn build_vm_step_summary(
         truncated_handlers,
         transfers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2ssa::SsaArtifact;
+
+    use super::*;
+
+    const RAX: u64 = 0;
+
+    fn test_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", RAX, 8));
+        arch
+    }
+
+    fn make_reg(offset: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Register,
+            offset,
+            size,
+            meta: None,
+        }
+    }
+
+    fn make_const(value: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Const,
+            offset: value,
+            size,
+            meta: None,
+        }
+    }
+
+    fn branch_block(addr: u64, target: u64) -> R2ILBlock {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(R2ILOp::Branch {
+            target: make_const(target, 8),
+        });
+        block
+    }
+
+    #[test]
+    fn handler_scc_summary_does_not_truncate_large_linear_handler() {
+        let dispatch = 0x1000;
+        let entry = 0x2000;
+        let mut blocks = Vec::new();
+        for index in 0..20 {
+            let addr = entry + index * 4;
+            let target = if index == 19 { dispatch } else { addr + 4 };
+            blocks.push(branch_block(addr, target));
+        }
+        blocks.push(R2ILBlock::new(dispatch, 4));
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+
+        let summary =
+            summarize_handler_region(&func, entry, dispatch, dispatch, &BTreeSet::from([entry]));
+
+        assert_eq!(summary.blocks.len(), 20);
+        assert!(summary.reenters_dispatch);
+        assert_eq!(summary.exit_targets, vec![dispatch]);
+        assert!(!summary.truncated);
+    }
+
+    #[test]
+    fn handler_scc_summary_handles_self_loop_and_redispatch_exit() {
+        let dispatch = 0x1000;
+        let entry = 0x2000;
+        let mut loop_block = R2ILBlock::new(entry, 4);
+        loop_block.push(R2ILOp::IntAdd {
+            dst: make_reg(RAX, 8),
+            a: make_reg(RAX, 8),
+            b: make_const(1, 8),
+        });
+        loop_block.push(R2ILOp::CBranch {
+            target: make_const(entry, 8),
+            cond: make_reg(RAX, 1),
+        });
+        let blocks = vec![
+            loop_block,
+            branch_block(0x2004, dispatch),
+            R2ILBlock::new(dispatch, 4),
+        ];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+
+        let summary =
+            summarize_handler_region(&func, entry, dispatch, dispatch, &BTreeSet::from([entry]));
+
+        assert_eq!(summary.blocks, vec![entry, 0x2004]);
+        assert!(summary.reenters_dispatch);
+        assert!(!summary.truncated);
+        assert_eq!(summary.conditional_branches, 1);
+        assert!(!summary.exit_guards.is_empty());
+        assert!(!summary.state_updates.is_empty());
+    }
+
+    #[test]
+    fn handler_scc_summary_widens_conflicting_state_updates() {
+        let dispatch = 0x1000;
+        let entry = 0x3000;
+        let mut block = R2ILBlock::new(entry, 4);
+        block.push(R2ILOp::Copy {
+            dst: make_reg(RAX, 8),
+            src: make_const(1, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: make_reg(RAX, 8),
+            src: make_const(2, 8),
+        });
+        block.push(R2ILOp::Branch {
+            target: make_const(dispatch, 8),
+        });
+        let blocks = vec![block, R2ILBlock::new(dispatch, 4)];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+
+        let summary =
+            summarize_handler_region(&func, entry, dispatch, dispatch, &BTreeSet::from([entry]));
+
+        let update = summary
+            .state_updates
+            .iter()
+            .find(|update| same_logical_name(&update.output, "RAX"))
+            .expect("RAX update");
+        assert!(!update.exact);
+        assert!(matches!(update.value, VmValueExpr::Expr(_)));
+        assert!(!summary.truncated);
+    }
 }

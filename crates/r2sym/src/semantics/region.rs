@@ -1,11 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use r2ssa::{
+    SummaryAllocationEffect, SummaryAtomicEffect, SummaryLifetimeEffect, SummaryMemoryLocation,
+    SummarySyncEffect, SummaryTransferLength,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::backward::{BackwardConditionSummary, BackwardMemoryCondition};
 use crate::sim::DerivedSummaryDiagnostics;
 
-use super::artifact::{ResidualReason, SemanticEvidence, SliceClass};
+use super::artifact::{ResidualReason, SemanticConfidence, SemanticEvidence, SliceClass};
 use super::facts::SymbolicReachabilityStatus;
 use super::vm::{InterpreterDispatchSummary, VmStepSummary};
 
@@ -276,6 +280,311 @@ impl SemanticRegion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeWorkerSummaryKind {
+    MemoryTransfer,
+    MemoryRead,
+    MemoryWrite,
+    MemoryEscape,
+    MemoryFree,
+    StringScan,
+    HashFold,
+    TableWalk,
+    Parser,
+    Allocation,
+    Lifetime,
+    Synchronization,
+    Atomic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeWorkerTerminator {
+    None,
+    ZeroByte,
+    ByteEquals(u8),
+    LengthBound,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeWorkerFoldOperation {
+    Add,
+    Xor,
+    RotateMix,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeWorkerFold {
+    pub accumulator: String,
+    pub bits: u32,
+    pub operation: NativeWorkerFoldOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeParserKind {
+    Numeric,
+    Token,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeParserSummary {
+    pub kind: NativeParserKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_arg: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digit_min: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digit_max: Option<u8>,
+    #[serde(default)]
+    pub accepts_sign: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeWorkerLoopSummary {
+    pub header: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_target: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_arg: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stride: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminator: Option<NativeWorkerTerminator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<NativeWorkerFold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWorkerSummary {
+    pub anchor: u64,
+    pub kind: NativeWorkerSummaryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<SummaryMemoryLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<SummaryMemoryLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<SummaryMemoryLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<SummaryTransferLength>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<SummaryAllocationEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<SummaryLifetimeEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SummarySyncEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atomic: Option<SummaryAtomicEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser: Option<NativeParserSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_summary: Option<NativeWorkerLoopSummary>,
+    #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
+    pub evidence: SemanticEvidence,
+}
+
+impl NativeWorkerSummary {
+    pub fn arg_indices(&self) -> BTreeSet<usize> {
+        let mut indices = BTreeSet::new();
+        collect_location_arg_indices(self.dst.as_ref(), &mut indices);
+        collect_location_arg_indices(self.src.as_ref(), &mut indices);
+        collect_location_arg_indices(self.memory.as_ref(), &mut indices);
+        if let Some(SummaryTransferLength::Arg(index)) = self.len {
+            indices.insert(index);
+        }
+        if let Some(length_arg) = self
+            .loop_summary
+            .as_ref()
+            .and_then(|summary| summary.length_arg)
+        {
+            indices.insert(length_arg);
+        }
+        if let Some(effect) = self.allocation
+            && let Some(index) = effect.size_arg
+        {
+            indices.insert(index);
+        }
+        if let Some(effect) = self.lifetime {
+            indices.insert(effect.arg);
+        }
+        if let Some(effect) = self.sync {
+            indices.insert(effect.arg);
+        }
+        collect_location_arg_indices(
+            self.atomic.as_ref().map(|effect| &effect.location),
+            &mut indices,
+        );
+        if let Some(parser) = self.parser.as_ref()
+            && let Some(index) = parser.cursor_arg
+        {
+            indices.insert(index);
+        }
+        indices
+    }
+
+    pub fn out_param_indices(&self) -> BTreeSet<usize> {
+        let mut indices = BTreeSet::new();
+        match self.kind {
+            NativeWorkerSummaryKind::MemoryTransfer => {
+                collect_location_arg_indices(self.dst.as_ref(), &mut indices);
+            }
+            NativeWorkerSummaryKind::MemoryWrite | NativeWorkerSummaryKind::Atomic => {
+                collect_location_arg_indices(self.memory.as_ref(), &mut indices);
+                collect_location_arg_indices(
+                    self.atomic.as_ref().map(|effect| &effect.location),
+                    &mut indices,
+                );
+            }
+            _ => {}
+        }
+        indices
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeMemoryAccessKind {
+    Read,
+    Write,
+    Transfer,
+    Escape,
+    Free,
+    Allocation,
+    Lifetime,
+    Synchronization,
+    Atomic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeMemoryAccessSummary {
+    pub kind: NativeMemoryAccessKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<SummaryMemoryLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<SummaryMemoryLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<SummaryMemoryLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<SummaryTransferLength>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeReductionSummary {
+    pub accumulator: String,
+    pub bits: u32,
+    pub operation: NativeWorkerFoldOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SummaryMemoryLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeLoopSummary {
+    pub header: u64,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub body: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub entries: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub exits: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_arg: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stride: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminator: Option<NativeWorkerTerminator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRegionSummary {
+    pub stable_id: u64,
+    pub anchor: u64,
+    pub kind: NativeWorkerSummaryKind,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub blocks: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub entries: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub exits: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_accesses: Vec<NativeMemoryAccessSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_summary: Option<NativeLoopSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reductions: Vec<NativeReductionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser: Option<NativeParserSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_reasons: Vec<ResidualReason>,
+    pub confidence: SemanticConfidence,
+    #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
+    pub evidence: SemanticEvidence,
+}
+
+impl NativeRegionSummary {
+    pub fn arg_indices(&self) -> BTreeSet<usize> {
+        let mut indices = BTreeSet::new();
+        for access in &self.memory_accesses {
+            collect_location_arg_indices(access.location.as_ref(), &mut indices);
+            collect_location_arg_indices(access.dst.as_ref(), &mut indices);
+            collect_location_arg_indices(access.src.as_ref(), &mut indices);
+            if let Some(SummaryTransferLength::Arg(index)) = access.len {
+                indices.insert(index);
+            }
+        }
+        if let Some(length_arg) = self
+            .loop_summary
+            .as_ref()
+            .and_then(|summary| summary.length_arg)
+        {
+            indices.insert(length_arg);
+        }
+        if let Some(parser) = self.parser.as_ref()
+            && let Some(index) = parser.cursor_arg
+        {
+            indices.insert(index);
+        }
+        indices
+    }
+
+    pub fn out_param_indices(&self) -> BTreeSet<usize> {
+        let mut indices = BTreeSet::new();
+        for access in &self.memory_accesses {
+            match access.kind {
+                NativeMemoryAccessKind::Write
+                | NativeMemoryAccessKind::Transfer
+                | NativeMemoryAccessKind::Atomic => {
+                    collect_location_arg_indices(access.location.as_ref(), &mut indices);
+                    collect_location_arg_indices(access.dst.as_ref(), &mut indices);
+                }
+                _ => {}
+            }
+        }
+        indices
+    }
+}
+
+fn collect_location_arg_indices(
+    location: Option<&SummaryMemoryLocation>,
+    indices: &mut BTreeSet<usize>,
+) {
+    if let Some(SummaryMemoryLocation {
+        region: r2ssa::SummaryMemoryRegion::Arg { index },
+        ..
+    }) = location
+    {
+        indices.insert(*index);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeFunctionSummary {
     pub slice_class: SliceClass,
@@ -283,6 +592,10 @@ pub struct NativeFunctionSummary {
     pub helper_functions: usize,
     pub derived_summaries: usize,
     pub derived_diagnostics: DerivedSummaryDiagnostics,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region_summaries: Vec<NativeRegionSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_summaries: Vec<NativeWorkerSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +832,18 @@ impl NativeArtifactBody {
         })
     }
 
+    pub fn has_summary_islands(&self) -> bool {
+        !self.summary.region_summaries.is_empty() || !self.summary.worker_summaries.is_empty()
+    }
+
+    pub fn summary_island_count(&self) -> usize {
+        if self.summary.region_summaries.is_empty() {
+            self.summary.worker_summaries.len()
+        } else {
+            self.summary.region_summaries.len()
+        }
+    }
+
     pub fn supports_query_guidance(&self) -> bool {
         self.regions
             .values()
@@ -664,6 +989,8 @@ pub struct SemanticArtifactDiagnostics {
     pub skipped_missing_arch: bool,
     pub skipped_large_cfg: bool,
     pub residual_reasons: Vec<ResidualReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<InterpreterDispatchSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous_targets: Vec<u64>,
     pub cache_hit: bool,
@@ -718,6 +1045,8 @@ mod tests {
                 helper_functions: 0,
                 derived_summaries: 0,
                 derived_diagnostics: DerivedSummaryDiagnostics::default(),
+                region_summaries: Vec::new(),
+                worker_summaries: Vec::new(),
             },
             regions: regions
                 .into_iter()

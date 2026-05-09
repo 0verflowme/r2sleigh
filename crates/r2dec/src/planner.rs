@@ -6,6 +6,7 @@ use r2types::{DecompileCapabilityView, FunctionFacts, FunctionTypeFacts};
 pub enum SemanticRoutePlan {
     Standard,
     StructuredWorker { reason: String },
+    SummaryIslands { reason: String },
     LinearWorker { reason: String },
     VmSummary { reason: String },
     FallbackComment { comment: String },
@@ -22,8 +23,11 @@ pub(crate) fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFa
         .as_ref()
         .is_some_and(r2sym::DecompilePlan::allows_native_linearization)
         && capability.skipped_large_cfg
-        && matches!(capability.slice_class, Some(r2sym::SliceClass::Worker))
-        && capability.has_native_regions
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+        && (capability.has_native_regions || capability.has_summary_islands)
 }
 
 pub(crate) fn should_skip_runtime_type_inference(
@@ -114,6 +118,45 @@ pub(crate) fn preferred_semantic_linearization_reason(
     Some(preferred_semantic_worker_reason(cfg_summary))
 }
 
+pub(crate) fn preferred_semantic_summary_islands_reason(
+    function_facts: &FunctionFacts,
+    cfg_summary: &CFGRiskSummary,
+) -> Option<String> {
+    let capability = decompile_capability(function_facts);
+    if !capability.has_summary_islands
+        || !matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+    {
+        return None;
+    }
+    match capability.plan.as_ref()? {
+        r2sym::DecompilePlan::NativeStructured => {
+            let high_risk = capability.skipped_large_cfg
+                && (cfg_guard_reason_from_summary(cfg_summary).is_some()
+                    || capability.summary_island_count >= 8);
+            high_risk.then(|| preferred_semantic_worker_reason(cfg_summary))
+        }
+        r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
+            if !capability.skipped_large_cfg {
+                return None;
+            }
+            if capability.summary_conflicted || capability.assumption_conflicted {
+                Some(preferred_semantic_worker_reason(cfg_summary))
+            } else {
+                Some(reason.clone())
+            }
+        }
+        r2sym::DecompilePlan::NativeLinear { reason } => {
+            let high_risk = cfg_guard_reason_from_summary(cfg_summary).is_some()
+                || capability.summary_island_count >= 8;
+            high_risk.then(|| reason.clone())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn preferred_semantic_structuring_reason(
     func_name: &str,
     function_facts: &FunctionFacts,
@@ -196,6 +239,9 @@ pub fn semantic_route_plan(
     if let Some(comment) = preferred_semantic_fallback_comment(func_name, function_facts) {
         return SemanticRoutePlan::FallbackComment { comment };
     }
+    if let Some(reason) = preferred_semantic_summary_islands_reason(function_facts, cfg_summary) {
+        return SemanticRoutePlan::SummaryIslands { reason };
+    }
     if let Some(reason) =
         preferred_semantic_structuring_reason(func_name, function_facts, cfg_summary)
     {
@@ -228,7 +274,8 @@ pub fn detached_semantic_linearization_reason(
     function_facts: &FunctionFacts,
 ) -> Option<String> {
     match detached_semantic_route_plan(func_name, blocks, function_facts)? {
-        SemanticRoutePlan::LinearWorker { reason } => Some(reason),
+        SemanticRoutePlan::LinearWorker { reason }
+        | SemanticRoutePlan::SummaryIslands { reason } => Some(reason),
         _ => None,
     }
 }

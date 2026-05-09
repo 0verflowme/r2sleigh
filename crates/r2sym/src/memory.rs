@@ -7,6 +7,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -1045,7 +1046,9 @@ fn recognize_affine_bv_by_substitution(ast: &BV) -> Option<(BV, i64)> {
     }
     let base = leaves.into_values().next()?;
     let zero = BV::from_u64(0, base.get_size());
-    let residual = ast.substitute(&[(&base, &zero)]).simplify();
+    let residual = catch_unwind(AssertUnwindSafe(|| ast.substitute(&[(&base, &zero)])))
+        .ok()?
+        .simplify();
     let delta = affine_constant(&residual)?;
     let widened_base = widen_affine_base(&base, ast.get_size());
     let expected = if delta == 0 {

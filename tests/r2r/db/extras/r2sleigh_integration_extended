@@ -372,7 +372,7 @@ a:sla.debug.types | jq -c 'type=="object" and ((((.function_name // "") | contai
 EOF_CMDS
 RUN
 
-NAME=stress_parse_number_decompile_uses_bounded_cfg_residual_not_hard_fallback
+NAME=stress_parse_number_decompile_uses_summary_islands_not_hard_fallback
 FILE=bins/stress_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -382,11 +382,11 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~parse_number$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec residual:") and contains("loc_") and contains("goto loc_") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec summary:") and contains("native worker summaries:") and contains("worker loop:") and (contains("r2dec fallback:")|not) and (contains("r2dec residual:")|not)'
 EOF_CMDS
 RUN
 
-NAME=vm_shaped_large_cfg_records_bounded_result
+NAME=vm_shaped_large_cfg_records_scc_transfer_without_truncation
 FILE=bins/stress_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -396,6 +396,6 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~tiny_vm_dispatch$[0]` >/dev/null
 af
-a:sla.debug.types | jq -c 'type=="object" and ((((.function_name // "") | contains("tiny_vm_dispatch")) and ((.compiled_semantics // {}) | type == "object")) or (.error? | type == "string"))'
+a:sla.debug.types | jq -c 'type=="object" and ((.function_name // "") | contains("tiny_vm_dispatch")) and .compiled_semantics.execution=="vm" and (.compiled_semantics.vm_transfer != null) and (((.compiled_semantics.vm_transfer.truncated_handlers // []) | length) == 0) and (((.compiled_semantics.vm_transfer.transfers // []) | length) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | all(.truncated == false))) and (((.compiled_semantics.vm_transfer.handler_state_updates // {}) | to_entries | length) >= 5)'
 EOF_CMDS
 RUN

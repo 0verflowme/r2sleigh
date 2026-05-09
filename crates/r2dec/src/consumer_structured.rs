@@ -29,7 +29,8 @@ where
                 },
             }
         }
-        crate::SemanticRoutePlan::LinearWorker { reason } => RoutedBody {
+        crate::SemanticRoutePlan::LinearWorker { reason }
+        | crate::SemanticRoutePlan::SummaryIslands { reason } => RoutedBody {
             body_stmt: semantic_worker_linear_body(reason, linearize()),
             use_conservative_locals: true,
             is_linear_fallback: true,

@@ -31,6 +31,7 @@ pub enum TypePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DecompilePlan {
     NativeStructured,
+    NativeSummaryIslands { reason: String },
     NativeLinear { reason: String },
     VmSummaryOnly { reason: String },
     Fallback { reason: String },
@@ -109,7 +110,10 @@ impl TypePlan {
 
 impl DecompilePlan {
     pub fn allows_native_linearization(&self) -> bool {
-        matches!(self, Self::NativeStructured | Self::NativeLinear { .. })
+        matches!(
+            self,
+            Self::NativeStructured | Self::NativeSummaryIslands { .. } | Self::NativeLinear { .. }
+        )
     }
 
     pub fn allows_native_structuring(&self) -> bool {
@@ -209,6 +213,7 @@ pub fn derive_decompile_plan(
     execution: ExecutionModel,
     diagnostics: &SemanticArtifactDiagnostics,
     has_native_semantics: bool,
+    has_summary_islands: bool,
     supports_guarded_structuring: bool,
 ) -> DecompilePlan {
     if matches!(execution, ExecutionModel::Vm) {
@@ -220,6 +225,14 @@ pub fn derive_decompile_plan(
         && supports_guarded_structuring
     {
         DecompilePlan::NativeStructured
+    } else if matches!(execution, ExecutionModel::Native)
+        && diagnostics.skipped_large_cfg
+        && has_native_semantics
+        && has_summary_islands
+    {
+        DecompilePlan::NativeSummaryIslands {
+            reason: "large native worker summarized as typed islands".to_string(),
+        }
     } else if matches!(execution, ExecutionModel::Native) && has_native_semantics {
         DecompilePlan::NativeLinear {
             reason: "guarded structuring unavailable".to_string(),
@@ -356,6 +369,7 @@ mod tests {
             skipped_missing_arch: false,
             skipped_large_cfg,
             residual_reasons: Vec::new(),
+            interpreter: None,
             ambiguous_targets: Vec::new(),
             cache_hit: false,
         }
@@ -420,10 +434,12 @@ mod tests {
                 if is_vm { ExecutionModel::Vm } else { ExecutionModel::Native },
                 &diagnostics(skipped_large_cfg),
                 has_native_semantics,
+                has_native_semantics && skipped_large_cfg,
                 supports_guarded_structuring,
             );
             let is_valid = match plan {
                 DecompilePlan::NativeStructured
+                | DecompilePlan::NativeSummaryIslands { .. }
                 | DecompilePlan::NativeLinear { .. }
                 | DecompilePlan::VmSummaryOnly { .. }
                 | DecompilePlan::Fallback { .. }

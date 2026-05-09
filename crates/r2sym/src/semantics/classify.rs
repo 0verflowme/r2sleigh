@@ -10,8 +10,9 @@ pub(super) fn classify_slice(
     helper_functions: usize,
     derived_diagnostics: &DerivedSummaryDiagnostics,
     interpreter: Option<&InterpreterDispatchSummary>,
+    strong_vm_step: bool,
 ) -> SliceClass {
-    if let Some(interpreter) = interpreter {
+    if strong_vm_step && let Some(interpreter) = interpreter {
         return match interpreter.kind {
             InterpreterKind::SwitchDispatch => SliceClass::InterpreterSwitch,
             InterpreterKind::IndirectDispatch => SliceClass::InterpreterIndirect,

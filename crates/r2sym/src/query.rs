@@ -2361,6 +2361,8 @@ mod tests {
                     helper_functions: 0,
                     derived_summaries: 0,
                     derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
+                    region_summaries: Vec::new(),
+                    worker_summaries: Vec::new(),
                 },
                 regions,
             }),
@@ -2391,6 +2393,7 @@ mod tests {
             skipped_missing_arch: false,
             skipped_large_cfg: false,
             residual_reasons: Vec::new(),
+            interpreter: None,
             ambiguous_targets: Vec::new(),
             cache_hit: false,
         }

@@ -32,6 +32,7 @@ use std::os::raw::c_char;
 use std::path::Path;
 use std::ptr;
 use std::slice;
+use std::time::Instant;
 #[cfg(test)]
 use types::parse_const_value;
 #[cfg(test)]
@@ -3707,6 +3708,12 @@ struct TypeWritebackDiagnosticsJson {
     solver_warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct PhaseTimingJson {
+    phase: String,
+    elapsed_us: u64,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct InferredTypeWritebackJson {
     function_name: String,
@@ -3733,6 +3740,8 @@ struct InferredTypeWritebackJson {
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     mutation_plan: SessionMutationPlanJson,
     diagnostics: TypeWritebackDiagnosticsJson,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    phase_timings: Vec<PhaseTimingJson>,
 }
 
 #[derive(Debug, serde::Serialize, Default)]
@@ -4652,6 +4661,8 @@ struct FunctionAnalysisSessionReportJson {
     summary_diagnostics: Option<r2ssa::InterprocSummaryDiagnostics>,
     type_writeback: InferredTypeWritebackJson,
     prefer_bounded_type_plan: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    phase_timings: Vec<PhaseTimingJson>,
 }
 
 fn cfg_risk_summary_json(summary: r2ssa::CFGRiskSummary) -> CfgRiskSummaryJson {
@@ -4661,6 +4672,230 @@ fn cfg_risk_summary_json(summary: r2ssa::CFGRiskSummary) -> CfgRiskSummaryJson {
         back_edge_count: summary.back_edge_count,
         switch_block_count: summary.switch_block_count,
         max_switch_cases: summary.max_switch_cases,
+    }
+}
+
+fn cfg_risk_summary_from_json(summary: &CfgRiskSummaryJson) -> r2ssa::CFGRiskSummary {
+    r2ssa::CFGRiskSummary {
+        block_count: summary.block_count,
+        loop_count: summary.loop_count,
+        back_edge_count: summary.back_edge_count,
+        switch_block_count: summary.switch_block_count,
+        max_switch_cases: summary.max_switch_cases,
+    }
+}
+
+fn cfg_risk_prefers_bounded_type_plan(summary: &CfgRiskSummaryJson) -> bool {
+    if r2dec::cfg_guard_reason_from_summary(&cfg_risk_summary_from_json(summary)).is_some() {
+        return true;
+    }
+    summary.block_count >= 200
+        || (summary.block_count >= 96
+            && (summary.loop_count > 0
+                || summary.back_edge_count > 0
+                || summary.max_switch_cases >= 32))
+}
+
+fn cfg_risk_bounded_type_reason(summary: &CfgRiskSummaryJson) -> String {
+    r2dec::cfg_guard_reason_from_summary(&cfg_risk_summary_from_json(summary)).unwrap_or_else(|| {
+        format!(
+            "bounded type plan for large CFG (blocks={}, loops={}, back_edges={}, max_switch_cases={})",
+            summary.block_count, summary.loop_count, summary.back_edge_count, summary.max_switch_cases
+        )
+    })
+}
+
+fn caller_prefers_bounded_type_plan(interproc: &InterprocInferenceInput<'_>) -> bool {
+    interproc.max_iters <= 1 && !interproc.converged
+}
+
+fn semantic_or_cfg_prefers_bounded_type_plan(
+    artifact: &r2sym::SemanticArtifact,
+    cfg_risk: &CfgRiskSummaryJson,
+) -> bool {
+    if r2types::semantic_artifact_prefers_bounded_type_plan(artifact) {
+        return true;
+    }
+    cfg_risk_prefers_bounded_type_plan(cfg_risk)
+        && artifact.type_plan().allows_native_augmentation()
+        && matches!(
+            artifact.slice_class(),
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+}
+
+fn phase_timing(phase: &str, start: Instant) -> PhaseTimingJson {
+    PhaseTimingJson {
+        phase: phase.to_string(),
+        elapsed_us: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+struct BoundedCfgTypePayloadInput<'a> {
+    function_name: &'a str,
+    arch_name: &'a str,
+    interproc: InterprocInferenceInput<'a>,
+    function_facts: &'a r2types::FunctionFacts,
+    symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    signature_override: Option<r2types::InferredSignature>,
+    budget: TypeOutputBudget,
+    reason: String,
+}
+
+fn bounded_cfg_type_payload(input: BoundedCfgTypePayloadInput<'_>) -> InferredTypeWritebackJson {
+    let signature = input
+        .signature_override
+        .unwrap_or_else(|| r2types::InferredSignature {
+            function_name: input.function_name.to_string(),
+            signature: format!("void {}(void)", input.function_name),
+            ret_type: "void".to_string(),
+            params: Vec::new(),
+            callconv: "unknown".to_string(),
+            arch: input.arch_name.to_string(),
+            confidence: 0,
+            callconv_confidence: 0,
+        });
+    let plan = r2types::TypeWritebackPlan {
+        signature,
+        var_type_candidates: Vec::new(),
+        var_rename_candidates: Vec::new(),
+        struct_decls: Vec::new(),
+        global_type_links: Vec::new(),
+        diagnostics: r2types::TypeWritebackDiagnostics {
+            warnings: vec![input.reason],
+            ..r2types::TypeWritebackDiagnostics::default()
+        },
+    };
+    writeback_plan_json(
+        plan,
+        InterprocSummaryJson {
+            callsite_count: 0,
+            iterations: input.interproc.iter.max(1),
+            max_iterations: input.interproc.max_iters.max(input.interproc.iter.max(1)),
+            converged: input.interproc.converged,
+            summary: None,
+            summary_json: None,
+            scope: merged_interproc_scope_report(
+                input.interproc.scope_report,
+                input.symbolic_scope,
+            ),
+        },
+        input.function_facts,
+        None,
+        None,
+        input.budget,
+    )
+}
+
+fn type_facts_from_parsed_context(
+    parsed_context: &r2types::ParsedExternalContext,
+) -> r2types::FunctionTypeFacts {
+    r2types::FunctionTypeFacts {
+        merged_signature: parsed_context.merged_signature.clone(),
+        known_function_signatures: parsed_context.known_function_signatures.clone(),
+        register_params: parsed_context.register_params.clone(),
+        stack_slots: parsed_context.stack_slots.clone(),
+        external_stack_vars: parsed_context.external_stack_vars.clone(),
+        external_type_db: parsed_context.external_type_db.clone(),
+        diagnostics: parsed_context.diagnostics.clone(),
+        ..r2types::FunctionTypeFacts::default()
+    }
+}
+
+fn signature_confidence_from_spec(signature: &r2types::FunctionSignatureSpec) -> u8 {
+    let has_type_info =
+        signature.ret_type.is_some() || signature.params.iter().any(|param| param.ty.is_some());
+    let has_named_params = signature
+        .params
+        .iter()
+        .any(|param| !r2types::is_generic_arg_name(&param.name));
+    if has_type_info || has_named_params {
+        96
+    } else {
+        80
+    }
+}
+
+fn inferred_signature_from_spec(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    callconv: Option<&str>,
+    signature: &r2types::FunctionSignatureSpec,
+) -> r2types::InferredSignature {
+    let ret_type = signature
+        .ret_type
+        .as_ref()
+        .map(|ty| r2types::render_signature_type(ty, ptr_bits))
+        .unwrap_or_else(|| "void".to_string());
+    let params = signature
+        .params
+        .iter()
+        .enumerate()
+        .map(|(idx, param)| r2types::InferredSignatureParam {
+            name: if param.name.trim().is_empty() {
+                format!("arg{}", idx + 1)
+            } else {
+                param.name.clone()
+            },
+            param_type: param
+                .ty
+                .as_ref()
+                .map(|ty| r2types::render_signature_type(ty, ptr_bits))
+                .unwrap_or_else(|| "void *".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let callconv = callconv.unwrap_or("unknown").to_string();
+    let callconv_confidence = if callconv == "unknown" { 0 } else { 80 };
+    r2types::InferredSignature {
+        function_name: function_name.to_string(),
+        signature: r2types::format_afs_signature(function_name, &ret_type, &params),
+        ret_type,
+        params,
+        callconv,
+        arch: arch_name.to_string(),
+        confidence: signature_confidence_from_spec(signature),
+        callconv_confidence,
+    }
+}
+
+fn signature_override_from_type_facts(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    callconv: Option<&str>,
+    type_facts: &r2types::FunctionTypeFacts,
+) -> Option<r2types::InferredSignature> {
+    type_facts.merged_signature.as_ref().map(|signature| {
+        inferred_signature_from_spec(function_name, arch_name, ptr_bits, callconv, signature)
+    })
+}
+
+fn push_phase(timings: &mut Vec<PhaseTimingJson>, phase: &str, start: Instant) {
+    timings.push(phase_timing(phase, start));
+}
+
+fn push_missing_zero_phase(timings: &mut Vec<PhaseTimingJson>, phase: &str) {
+    if timings.iter().any(|timing| timing.phase == phase) {
+        return;
+    }
+    timings.push(PhaseTimingJson {
+        phase: phase.to_string(),
+        elapsed_us: 0,
+    });
+}
+
+fn complete_type_phase_timings(timings: &mut Vec<PhaseTimingJson>) {
+    for phase in [
+        "ssa_build",
+        "interproc_summary",
+        "semantic_artifact",
+        "local_struct_inference",
+        "local_field_access_inference",
+        "recovered_vars",
+        "writeback",
+    ] {
+        push_missing_zero_phase(timings, phase);
     }
 }
 
@@ -4678,6 +4913,11 @@ fn semantic_route_plan_json(route: r2dec::SemanticRoutePlan) -> SemanticRoutePla
         },
         r2dec::SemanticRoutePlan::LinearWorker { reason } => SemanticRoutePlanJson {
             kind: "linear_worker".to_string(),
+            reason: Some(reason),
+            comment: None,
+        },
+        r2dec::SemanticRoutePlan::SummaryIslands { reason } => SemanticRoutePlanJson {
+            kind: "summary_islands".to_string(),
             reason: Some(reason),
             comment: None,
         },
@@ -5175,6 +5415,7 @@ fn writeback_plan_json(
             warnings,
             solver_warnings: plan.diagnostics.solver_warnings,
         },
+        phase_timings: Vec::new(),
     }
 }
 
@@ -5300,6 +5541,7 @@ struct SemanticTypeFallbackPayloadInput<'a> {
     compiled: &'a r2sym::SemanticArtifact,
     function_facts: &'a r2types::FunctionFacts,
     symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    signature_override: Option<r2types::InferredSignature>,
     budget: TypeOutputBudget,
 }
 
@@ -5307,12 +5549,15 @@ fn semantic_type_fallback_payload(
     input: SemanticTypeFallbackPayloadInput<'_>,
 ) -> InferredTypeWritebackJson {
     let compiled_info = analysis::sym::compiled_semantic_info(input.compiled);
-    let plan = r2types::build_semantic_type_fallback_plan(
+    let mut plan = r2types::build_semantic_type_fallback_plan(
         input.function_name,
         input.arch_name,
         input.ptr_bits,
         input.compiled,
     );
+    if let Some(signature) = input.signature_override {
+        plan.signature = signature;
+    }
     let mutation_plan = mutation_plan_from_writeback(&plan, input.budget);
     let mut warnings = plan.diagnostics.warnings;
     if plan.struct_decls.len() > input.budget.max_type_decls {
@@ -5394,20 +5639,19 @@ fn semantic_type_fallback_payload(
             warnings,
             ..TypeWritebackDiagnosticsJson::default()
         },
+        phase_timings: Vec::new(),
     }
 }
 
 fn semantic_fallback_function_facts(
     compiled: &r2sym::SemanticArtifact,
+    type_facts: r2types::FunctionTypeFacts,
     assumptions: &r2ssa::AssumptionSet,
     interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
 ) -> r2types::FunctionFacts {
-    r2types::FunctionFacts::new(
-        r2types::FunctionTypeFacts::default(),
-        Some(compiled.clone()),
-    )
-    .with_assumptions(assumptions.clone())
-    .with_summary_set(interproc_summary_set)
+    r2types::FunctionFacts::new(type_facts, Some(compiled.clone()))
+        .with_assumptions(assumptions.clone())
+        .with_summary_set(interproc_summary_set)
 }
 
 #[cfg(test)]
@@ -7659,6 +7903,7 @@ struct FunctionAnalysisSharedBundle {
     semantic_route: Option<SemanticRoutePlanJson>,
     type_writeback: InferredTypeWritebackJson,
     prefer_bounded_type_plan: bool,
+    phase_timings: Vec<PhaseTimingJson>,
 }
 
 fn build_inference_symbolic_scope(
@@ -7682,6 +7927,8 @@ fn build_inference_symbolic_scope(
 fn build_function_analysis_shared_bundle(
     input: TypeWritebackInferenceInput<'_>,
 ) -> Option<FunctionAnalysisSharedBundle> {
+    let mut phase_timings = Vec::new();
+    let phase_start = Instant::now();
     let function_input = types::build_function_input(
         input.ctx,
         input.blocks,
@@ -7689,6 +7936,7 @@ fn build_function_analysis_shared_bundle(
         input.fcn_addr,
         input.fcn_name,
     )?;
+    push_phase(&mut phase_timings, "function_input", phase_start);
     let external_context = cstr_or_default(input.external_context_json, "{}");
     let symbolic_scope = build_inference_symbolic_scope(&input, &function_input);
     let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
@@ -7703,7 +7951,8 @@ fn build_function_analysis_shared_bundle(
         input.max_type_decls,
         input.max_mutations,
     );
-    let (cfg_risk, semantic_artifact, function_facts, type_writeback, prefer_bounded_type_plan) =
+    let caller_requested_bounded_type_plan = caller_prefers_bounded_type_plan(&input.interproc);
+    let (cfg_risk, semantic_artifact, function_facts, mut type_writeback, prefer_bounded_type_plan) =
         if let Some(cached_artifact) =
             types::get_cached_function_analysis_artifact_with_parsed_context_and_scope_facts(
                 &function_input,
@@ -7718,93 +7967,172 @@ fn build_function_analysis_shared_bundle(
                 cfg_risk_summary_json(cached_artifact.ssa_func.function().cfg_risk_summary());
             let function_facts = cached_artifact.function_facts.clone();
             let semantic_artifact = function_facts.semantics.clone();
-            let prefer_bounded_type_plan = semantic_artifact
-                .as_ref()
-                .is_some_and(r2types::semantic_artifact_prefers_bounded_type_plan);
-            if prefer_bounded_type_plan {
-                let compiled = semantic_artifact
-                    .as_ref()
-                    .expect("bounded semantic type fallback requires semantic artifact");
+            let prefer_cfg_bounded =
+                caller_requested_bounded_type_plan && cfg_risk_prefers_bounded_type_plan(&cfg_risk);
+            let prefer_semantic_bounded = semantic_artifact.as_ref().is_some_and(|artifact| {
+                semantic_or_cfg_prefers_bounded_type_plan(artifact, &cfg_risk)
+            });
+            if prefer_cfg_bounded {
+                let phase_start = Instant::now();
+                let payload = bounded_cfg_type_payload(BoundedCfgTypePayloadInput {
+                    function_name: &function_input.function_name,
+                    arch_name: &arch_name,
+                    interproc: input.interproc,
+                    function_facts: &function_facts,
+                    symbolic_scope: symbolic_scope.as_ref(),
+                    signature_override: signature_override_from_type_facts(
+                        &function_input.function_name,
+                        &arch_name,
+                        ptr_bits,
+                        parsed_context.callconv.as_deref(),
+                        &function_facts.types,
+                    ),
+                    budget: output_budget,
+                    reason: cfg_risk_bounded_type_reason(&cfg_risk),
+                });
+                push_phase(&mut phase_timings, "writeback", phase_start);
                 (
                     cfg_risk,
                     semantic_artifact.clone(),
                     function_facts.clone(),
-                    semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
-                        function_name: &function_input.function_name,
-                        arch_name: &arch_name,
+                    payload,
+                    true,
+                )
+            } else if prefer_semantic_bounded {
+                let compiled = semantic_artifact
+                    .as_ref()
+                    .expect("bounded semantic type fallback requires semantic artifact");
+                let phase_start = Instant::now();
+                let payload = semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
+                    function_name: &function_input.function_name,
+                    arch_name: &arch_name,
+                    ptr_bits,
+                    interproc: input.interproc,
+                    compiled,
+                    function_facts: &function_facts,
+                    symbolic_scope: symbolic_scope.as_ref(),
+                    signature_override: signature_override_from_type_facts(
+                        &function_input.function_name,
+                        &arch_name,
                         ptr_bits,
-                        interproc: input.interproc,
-                        compiled,
-                        function_facts: &function_facts,
-                        symbolic_scope: symbolic_scope.as_ref(),
-                        budget: output_budget,
-                    }),
+                        parsed_context.callconv.as_deref(),
+                        &function_facts.types,
+                    ),
+                    budget: output_budget,
+                });
+                push_phase(&mut phase_timings, "writeback", phase_start);
+                (
+                    cfg_risk,
+                    semantic_artifact.clone(),
+                    function_facts.clone(),
+                    payload,
                     true,
                 )
             } else {
-                (
-                    cfg_risk,
-                    semantic_artifact,
-                    function_facts,
-                    type_writeback_payload_from_artifact(
-                        cached_artifact,
-                        input.interproc,
-                        symbolic_scope.as_ref(),
-                        output_budget,
-                    ),
-                    false,
-                )
+                let phase_start = Instant::now();
+                let payload = type_writeback_payload_from_artifact(
+                    cached_artifact,
+                    input.interproc,
+                    symbolic_scope.as_ref(),
+                    output_budget,
+                );
+                push_phase(&mut phase_timings, "writeback", phase_start);
+                (cfg_risk, semantic_artifact, function_facts, payload, false)
             }
         } else {
+            let phase_start = Instant::now();
             let analysis = types::build_function_analysis(&function_input)?;
+            push_phase(&mut phase_timings, "ssa_build", phase_start);
             let cfg_risk = cfg_risk_summary_json(analysis.ssa_func.function().cfg_risk_summary());
-            let interproc_summary_set = types::build_interproc_summary_set_with_scope_facts(
-                &function_input,
-                &analysis,
-                input.interproc.scope_facts,
-                input.interproc.max_iters,
-                symbolic_scope.as_ref(),
-            );
-            let mut semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
-                &z3::Context::thread_local(),
-                &analysis.ssa_func,
-                symbolic_scope.as_ref(),
-                function_input.ctx.arch,
-            );
-            if let Some(root_summary) = interproc_summary_set
-                .root
-                .and_then(|root| interproc_summary_set.summaries.get(&root))
-            {
-                r2sym::augment_semantic_artifact_with_interproc_summary(
-                    &mut semantic_artifact,
-                    analysis.ssa_func.entry,
-                    root_summary,
-                );
-            }
-            if r2types::semantic_artifact_prefers_bounded_type_plan(&semantic_artifact) {
-                let function_facts = semantic_fallback_function_facts(
-                    &semantic_artifact,
-                    &parsed_context.assumptions,
-                    Some(interproc_summary_set),
-                );
-                (
-                    cfg_risk,
-                    Some(semantic_artifact.clone()),
-                    function_facts.clone(),
-                    semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
-                        function_name: &function_input.function_name,
-                        arch_name: &arch_name,
+            if caller_requested_bounded_type_plan && cfg_risk_prefers_bounded_type_plan(&cfg_risk) {
+                let type_facts = type_facts_from_parsed_context(&parsed_context);
+                let function_facts = r2types::FunctionFacts::new(type_facts, None)
+                    .with_assumptions(parsed_context.assumptions.clone());
+                let phase_start = Instant::now();
+                let payload = bounded_cfg_type_payload(BoundedCfgTypePayloadInput {
+                    function_name: &function_input.function_name,
+                    arch_name: &arch_name,
+                    interproc: input.interproc,
+                    function_facts: &function_facts,
+                    symbolic_scope: symbolic_scope.as_ref(),
+                    signature_override: signature_override_from_type_facts(
+                        &function_input.function_name,
+                        &arch_name,
                         ptr_bits,
-                        interproc: input.interproc,
-                        compiled: &semantic_artifact,
-                        function_facts: &function_facts,
-                        symbolic_scope: symbolic_scope.as_ref(),
-                        budget: output_budget,
-                    }),
-                    true,
-                )
+                        parsed_context.callconv.as_deref(),
+                        &function_facts.types,
+                    ),
+                    budget: output_budget,
+                    reason: cfg_risk_bounded_type_reason(&cfg_risk),
+                });
+                push_phase(&mut phase_timings, "writeback", phase_start);
+                (cfg_risk, None, function_facts, payload, true)
             } else {
-                let artifact =
+                let phase_start = Instant::now();
+                let interproc_summary_set = types::build_interproc_summary_set_with_scope_facts(
+                    &function_input,
+                    &analysis,
+                    input.interproc.scope_facts,
+                    input.interproc.max_iters,
+                    symbolic_scope.as_ref(),
+                );
+                push_phase(&mut phase_timings, "interproc_summary", phase_start);
+                let phase_start = Instant::now();
+                let mut semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
+                    &z3::Context::thread_local(),
+                    &analysis.ssa_func,
+                    symbolic_scope.as_ref(),
+                    function_input.ctx.arch,
+                );
+                if let Some(root_summary) = interproc_summary_set
+                    .root
+                    .and_then(|root| interproc_summary_set.summaries.get(&root))
+                {
+                    r2sym::augment_semantic_artifact_with_interproc_summary(
+                        &mut semantic_artifact,
+                        analysis.ssa_func.entry,
+                        root_summary,
+                    );
+                }
+                push_phase(&mut phase_timings, "semantic_artifact", phase_start);
+                if semantic_or_cfg_prefers_bounded_type_plan(&semantic_artifact, &cfg_risk) {
+                    let type_facts = type_facts_from_parsed_context(&parsed_context);
+                    let function_facts = semantic_fallback_function_facts(
+                        &semantic_artifact,
+                        type_facts,
+                        &parsed_context.assumptions,
+                        Some(interproc_summary_set),
+                    );
+                    let phase_start = Instant::now();
+                    let payload =
+                        semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
+                            function_name: &function_input.function_name,
+                            arch_name: &arch_name,
+                            ptr_bits,
+                            interproc: input.interproc,
+                            compiled: &semantic_artifact,
+                            function_facts: &function_facts,
+                            symbolic_scope: symbolic_scope.as_ref(),
+                            signature_override: signature_override_from_type_facts(
+                                &function_input.function_name,
+                                &arch_name,
+                                ptr_bits,
+                                parsed_context.callconv.as_deref(),
+                                &function_facts.types,
+                            ),
+                            budget: output_budget,
+                        });
+                    push_phase(&mut phase_timings, "writeback", phase_start);
+                    (
+                        cfg_risk,
+                        Some(semantic_artifact.clone()),
+                        function_facts.clone(),
+                        payload,
+                        true,
+                    )
+                } else {
+                    let phase_start = Instant::now();
+                    let artifact =
                     types::build_function_analysis_artifact_from_analysis_with_semantic_artifact_context(
                         &function_input,
                         analysis,
@@ -7812,20 +8140,22 @@ fn build_function_analysis_shared_bundle(
                         Some(interproc_summary_set),
                         semantic_artifact,
                     )?;
-                let function_facts = artifact.function_facts.clone();
-                let semantic_artifact = function_facts.semantics.clone();
-                (
-                    cfg_risk,
-                    semantic_artifact,
-                    function_facts,
-                    type_writeback_payload_from_artifact(
-                        artifact,
-                        input.interproc,
-                        symbolic_scope.as_ref(),
-                        output_budget,
-                    ),
-                    false,
-                )
+                    push_phase(&mut phase_timings, "writeback", phase_start);
+                    let function_facts = artifact.function_facts.clone();
+                    let semantic_artifact = function_facts.semantics.clone();
+                    (
+                        cfg_risk,
+                        semantic_artifact,
+                        function_facts,
+                        type_writeback_payload_from_artifact(
+                            artifact,
+                            input.interproc,
+                            symbolic_scope.as_ref(),
+                            output_budget,
+                        ),
+                        false,
+                    )
+                }
             }
         };
     let semantic_route = r2dec::detached_semantic_route_plan(
@@ -7834,6 +8164,8 @@ fn build_function_analysis_shared_bundle(
         &function_facts,
     )
     .map(semantic_route_plan_json);
+    complete_type_phase_timings(&mut phase_timings);
+    type_writeback.phase_timings = phase_timings.clone();
 
     Some(FunctionAnalysisSharedBundle {
         function_name: function_input.function_name.clone(),
@@ -7844,12 +8176,17 @@ fn build_function_analysis_shared_bundle(
         semantic_route,
         type_writeback,
         prefer_bounded_type_plan,
+        phase_timings,
     })
 }
 
 fn function_analysis_session_report_json(
-    bundle: FunctionAnalysisSharedBundle,
+    mut bundle: FunctionAnalysisSharedBundle,
 ) -> Option<FunctionAnalysisSessionReport> {
+    let phase_start = Instant::now();
+    let _ = serde_json::to_string(&bundle.type_writeback).ok()?;
+    push_phase(&mut bundle.phase_timings, "json_serialization", phase_start);
+    bundle.type_writeback.phase_timings = bundle.phase_timings.clone();
     let type_writeback_json = serde_json::to_string(&bundle.type_writeback).ok()?;
     let type_writeback_hash = types::hash_string_payload(&type_writeback_json);
     let (mutations, strings) =
@@ -7882,6 +8219,7 @@ fn function_analysis_session_report_json(
         summary_diagnostics,
         type_writeback: bundle.type_writeback,
         prefer_bounded_type_plan: bundle.prefer_bounded_type_plan,
+        phase_timings: bundle.phase_timings,
     };
     let report_json = serde_json::to_string(&payload).ok()?;
     Some(FunctionAnalysisSessionReport {
@@ -8048,6 +8386,51 @@ pub extern "C" fn r2sleigh_session_result_free(result: *mut R2SleighSessionResul
     }
 }
 
+/// Caller must free with r2il_string_free().
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_bounded_type_json_ffi(
+    ctx: *const R2ILContext,
+    fcn_name: *const c_char,
+    reason: *const c_char,
+    global_max_links: usize,
+    max_type_decls: usize,
+    max_mutations: usize,
+) -> *mut c_char {
+    let function_name = cstr_or_default(fcn_name, "unknown").to_string();
+    let reason = cstr_or_default(reason, "bounded type plan").to_string();
+    let arch = unsafe { ctx.as_ref().and_then(|ctx| ctx.arch.as_ref()) };
+    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(arch);
+    let scope_facts = types::empty_interproc_scope_facts();
+    let interproc = InterprocInferenceInput {
+        iter: 1,
+        max_iters: 1,
+        converged: false,
+        scope_facts: &scope_facts,
+        scope_report: None,
+    };
+    let function_facts = r2types::FunctionFacts::new(r2types::FunctionTypeFacts::default(), None);
+    let mut payload = bounded_cfg_type_payload(BoundedCfgTypePayloadInput {
+        function_name: &function_name,
+        arch_name: &arch_name,
+        interproc,
+        function_facts: &function_facts,
+        symbolic_scope: None,
+        signature_override: None,
+        budget: TypeOutputBudget::new(
+            global_max_links.max(1),
+            max_type_decls.max(1),
+            max_mutations.max(1),
+        ),
+        reason,
+    });
+    payload.phase_timings = vec![PhaseTimingJson {
+        phase: "bounded_preflight".to_string(),
+        elapsed_us: 0,
+    }];
+    CString::new(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()))
+        .map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
 fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -> *mut c_char {
     let summary = r2ssa::CFGRiskSummary {
         block_count: input.block_count,
@@ -8114,7 +8497,8 @@ fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -
         return ptr::null_mut();
     };
     let reason = match route {
-        r2dec::SemanticRoutePlan::LinearWorker { reason } => reason,
+        r2dec::SemanticRoutePlan::LinearWorker { reason }
+        | r2dec::SemanticRoutePlan::SummaryIslands { reason } => reason,
         _ => return ptr::null_mut(),
     };
     let plan = r2types::build_semantic_type_fallback_plan(
@@ -10050,6 +10434,8 @@ mod tests {
                     helper_functions: 3,
                     derived_summaries: 0,
                     derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
+                    region_summaries: Vec::new(),
+                    worker_summaries: Vec::new(),
                 },
                 regions: std::iter::once((region.key(), region)).collect(),
             }),
@@ -10060,6 +10446,7 @@ mod tests {
                 skipped_missing_arch: false,
                 skipped_large_cfg: true,
                 residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
+                interpreter: None,
                 ambiguous_targets: Vec::new(),
                 cache_hit: false,
             },
@@ -10083,7 +10470,21 @@ mod tests {
             },
             value: r2ssa::AssumptionValue::Constant { value: 0xdead },
         }]);
-        let function_facts = semantic_fallback_function_facts(&compiled, &assumptions, None);
+        let type_facts = r2types::FunctionTypeFacts {
+            merged_signature: Some(r2types::FunctionSignatureSpec {
+                ret_type: Some(r2types::CTypeLike::Void),
+                params: vec![r2types::FunctionParamSpec {
+                    name: "status".to_string(),
+                    ty: Some(r2types::CTypeLike::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                }],
+            }),
+            ..r2types::FunctionTypeFacts::default()
+        };
+        let function_facts =
+            semantic_fallback_function_facts(&compiled, type_facts, &assumptions, None);
         let scope_facts = types::empty_interproc_scope_facts();
         let payload = semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
             function_name: "fcn.401000",
@@ -10099,9 +10500,21 @@ mod tests {
             compiled: &compiled,
             function_facts: &function_facts,
             symbolic_scope: None,
+            signature_override: signature_override_from_type_facts(
+                "fcn.401000",
+                "x86-64",
+                64,
+                None,
+                &function_facts.types,
+            ),
             budget: TypeOutputBudget::new(64, usize::MAX, usize::MAX),
         });
         let value = serde_json::to_value(payload).expect("payload should serialize");
+        assert_eq!(
+            value["signature"].as_str(),
+            Some("void fcn.401000 (int32_t status)"),
+            "expected semantic fallback to preserve typed signature: {value:?}"
+        );
         let Some(items) = value["assumptions"]["items"].as_array() else {
             panic!("expected serialized assumptions, got {value:?}");
         };

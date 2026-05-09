@@ -1113,8 +1113,10 @@ impl SSAFunction {
             }
         }
 
+        let block_count = self.num_blocks().max(self.cfg.block_addrs().count());
+
         CFGRiskSummary {
-            block_count: self.num_blocks(),
+            block_count,
             loop_count,
             back_edge_count,
             switch_block_count,

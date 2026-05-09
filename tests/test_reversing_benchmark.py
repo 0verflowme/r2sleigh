@@ -4,6 +4,8 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -101,6 +103,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["score"], 100)
         self.assertEqual(result["failures"], [])
         self.assertEqual(result["targets"][0]["commands"]["types"]["json_kind"], "dict")
+        self.assertEqual(len(result["targets"][0]["command_events"]), 4)
+        self.assertFalse(result["targets"][0]["commands"]["types"]["event"]["timeout"])
         self.assertEqual(
             result["targets"][0]["commands"]["decompile_sla"]["decompile_quality"]["classification"],
             "structured",
@@ -232,6 +236,142 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(summary["average_score"], 95.0)
         self.assertEqual(list(summary["failures_by_kind"].keys()), ["a", "z"])
+
+    def test_collect_command_events_and_compare_reports(self):
+        cases = [
+            {
+                "targets": [
+                    {
+                        "command_events": [
+                            {
+                                "case": "sample",
+                                "corpus": "unit",
+                                "target": "sym.f",
+                                "command": "types",
+                                "repeat_idx": 0,
+                                "started_at": 2.0,
+                                "ended_at": 3.0,
+                                "elapsed_s": 1.0,
+                                "timeout": False,
+                                "returncode": 0,
+                            },
+                            {
+                                "case": "sample",
+                                "corpus": "unit",
+                                "target": "sym.f",
+                                "command": "decompile_sla",
+                                "repeat_idx": 0,
+                                "started_at": 1.0,
+                                "ended_at": 1.5,
+                                "elapsed_s": 0.5,
+                                "timeout": False,
+                                "returncode": 0,
+                            },
+                        ]
+                    }
+                ]
+            }
+        ]
+        self.assertEqual(
+            [event["command"] for event in benchmark.collect_command_events(cases)],
+            ["decompile_sla", "types"],
+        )
+
+        before = {
+            "status": "issues",
+            "elapsed_s": 20.0,
+            "summary": {
+                "average_score": 70.0,
+                "min_score": 10,
+                "failures_by_kind": {"command_return": 1, "json_parse": 1},
+                "quality": {
+                    "decompile": {"residual": 5},
+                    "generic_arg_total": 9,
+                    "generic_type_total": 12,
+                    "radare2_candidate_count": 2,
+                },
+                "slowest_commands": [
+                    {
+                        "corpus": "unit",
+                        "case": "sample",
+                        "target": "sym.f",
+                        "command": "types",
+                        "elapsed_s": 10.0,
+                    }
+                ],
+            },
+        }
+        after = {
+            "status": "ok",
+            "elapsed_s": 8.0,
+            "summary": {
+                "average_score": 95.0,
+                "min_score": 90,
+                "failures_by_kind": {},
+                "quality": {
+                    "decompile": {"residual": 2},
+                    "generic_arg_total": 4,
+                    "generic_type_total": 5,
+                    "radare2_candidate_count": 0,
+                },
+                "slowest_commands": [
+                    {
+                        "corpus": "unit",
+                        "case": "sample",
+                        "target": "sym.f",
+                        "command": "types",
+                        "elapsed_s": 3.0,
+                    }
+                ],
+            },
+        }
+
+        delta = benchmark.compare_reports(before, after)
+        self.assertEqual(delta["metrics"]["hard_failures"]["delta"], -2.0)
+        self.assertEqual(delta["metrics"]["average_score"]["delta"], 25.0)
+        self.assertEqual(delta["slowest_command_delta"][0]["delta_s"], -7.0)
+
+    def test_parallel_split_uses_case_and_command_workers(self):
+        self.assertEqual(benchmark.parallel_split(1, 12), (1, 1))
+        self.assertEqual(benchmark.parallel_split(64, 1), (1, 64))
+        self.assertEqual(benchmark.parallel_split(64, 6), (6, 10))
+
+    def test_task_env_isolates_mutable_radare2_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = benchmark.task_env({"KEEP": "1"}, Path(tmp), "case/name", "target 1")
+
+            self.assertIsNotNone(env)
+            assert env is not None
+            self.assertEqual(env["KEEP"], "1")
+            self.assertTrue(Path(env["HOME"]).is_dir())
+            self.assertTrue(Path(env["XDG_DATA_HOME"]).is_dir())
+            self.assertTrue(str(Path(env["HOME"])).startswith(str(Path(tmp))))
+
+    def test_limited_runner_bounds_concurrent_subprocesses(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def slow_runner(r2, path, cmd, timeout, env):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+            return cmd_result(cmd)
+
+        limited = benchmark.LimitedRunner(slow_runner, 2)
+        items = [str(idx) for idx in range(8)]
+        outputs = benchmark.run_ordered_parallel(
+            items,
+            8,
+            lambda item: limited("r2", Path("/tmp/bin"), item, 1, {}),
+        )
+
+        self.assertEqual([result.stdout for result in outputs], items)
+        self.assertLessEqual(max_active, 2)
 
 
 if __name__ == "__main__":

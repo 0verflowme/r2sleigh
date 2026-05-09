@@ -9,6 +9,7 @@ kernelcache path, then emits a sorted JSON report that can drive product work.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -16,19 +17,21 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar, cast
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_TMPDIR = "/tmp/r2sleigh-reversing-benchmark-tmp"
 DEFAULT_OUT = "/tmp/r2sleigh-reversing-benchmark.json"
 DEFAULT_MAX_BINARIES_PER_CORPUS = 8
 DEFAULT_MAX_FUNCTIONS = 6
 DEFAULT_TIMEOUT = 180
 DEFAULT_ANALYSIS = "aaa"
+DEFAULT_JOBS = max(1, os.cpu_count() or 1)
 DECOMPILER_FALLBACK_MARKERS = (
     "r2dec fallback:",
     "r2dec: decompilation panicked",
@@ -113,6 +116,27 @@ class BinaryCase:
 
 
 Runner = Callable[[str, Path, str, int, Optional[dict[str, str]]], CmdResult]
+T = TypeVar("T")
+U = TypeVar("U")
+
+
+class LimitedRunner:
+    """Bound concurrent radare2 subprocesses across nested benchmark workers."""
+
+    def __init__(self, runner: Runner, jobs: int) -> None:
+        self._runner = runner
+        self._semaphore = threading.BoundedSemaphore(max(1, jobs))
+
+    def __call__(
+        self,
+        r2: str,
+        binary: Path,
+        cmd: str,
+        timeout_s: int,
+        env: dict[str, str] | None,
+    ) -> CmdResult:
+        with self._semaphore:
+            return self._runner(r2, binary, cmd, timeout_s, env)
 
 
 def repo_root() -> Path:
@@ -158,9 +182,35 @@ def default_plugin_dir() -> str:
     return ""
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected positive integer, got {value!r}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"expected positive integer, got {value!r}")
+    return parsed
+
+
+def default_jobs() -> int:
+    raw = os.environ.get("R2SLEIGH_BENCH_JOBS", "").strip()
+    if not raw:
+        return DEFAULT_JOBS
+    try:
+        return positive_int(raw)
+    except argparse.ArgumentTypeError:
+        return DEFAULT_JOBS
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run deterministic r2sleigh reversing benchmarks over local corpora."
+    )
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        metavar=("BEFORE", "AFTER"),
+        help="compare two benchmark JSON reports and print a compact JSON delta",
     )
     parser.add_argument("--r2", default=default_r2_path(), help="radare2 executable path")
     parser.add_argument(
@@ -249,6 +299,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TIMEOUT,
         help="per-radare2 command timeout in seconds",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=positive_int,
+        default=default_jobs(),
+        help="maximum concurrent radare2 subprocesses",
     )
     parser.add_argument(
         "--strict",
@@ -441,6 +497,66 @@ def build_r2_env(r2: str, plugin_dir: str, tmpdir: Path | None) -> dict[str, str
         if sys.platform == "darwin":
             env["DYLD_LIBRARY_PATH"] = prepend_path(lib_path, env.get("DYLD_LIBRARY_PATH", ""))
     return env
+
+
+SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def safe_path_component(value: Any) -> str:
+    cleaned = SAFE_COMPONENT_RE.sub("_", str(value).strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned[:48] or "task"
+
+
+def task_env(
+    base_env: dict[str, str] | None,
+    tmpdir: Path | None,
+    *components: Any,
+) -> dict[str, str] | None:
+    if tmpdir is None:
+        return base_env
+    env = dict(base_env or os.environ.copy())
+    raw_slug = "__".join(safe_path_component(component) for component in components)
+    if len(raw_slug) > 180:
+        digest = hashlib.sha256(raw_slug.encode("utf-8")).hexdigest()[:16]
+        raw_slug = f"{raw_slug[:150]}__{digest}"
+    root = tmpdir / "workers" / raw_slug
+    home = root / "home"
+    xdg_data = root / "xdg-data"
+    root.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True)
+    xdg_data.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    env["TMPDIR"] = str(root)
+    env["TMP"] = str(root)
+    env["TEMP"] = str(root)
+    env["XDG_DATA_HOME"] = str(xdg_data)
+    return env
+
+
+def parallel_split(total_jobs: int, case_count: int) -> tuple[int, int]:
+    jobs = max(1, total_jobs)
+    if jobs == 1 or case_count <= 1:
+        return 1, jobs
+    case_jobs = min(case_count, max(1, int(jobs**0.5)))
+    command_jobs = max(1, jobs // case_jobs)
+    return case_jobs, command_jobs
+
+
+def run_ordered_parallel(
+    items: list[T],
+    jobs: int,
+    worker: Callable[[T], U],
+) -> list[U]:
+    if jobs <= 1 or len(items) <= 1:
+        return [worker(item) for item in items]
+    results: list[U | None] = [None] * len(items)
+    max_workers = min(max(1, jobs), len(items))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(worker, item): idx for idx, item in enumerate(items)}
+        for future in concurrent.futures.as_completed(futures):
+            results[futures[future]] = future.result()
+    return cast(list[U], results)
 
 
 def prepend_path(prefix: str, existing: str) -> str:
@@ -838,6 +954,33 @@ def command_summary(name: str, result: CmdResult, include_sensitive: bool) -> di
     return entry
 
 
+def command_event(
+    *,
+    case: BinaryCase,
+    target: dict[str, Any],
+    command: str,
+    repeat_idx: int,
+    started_at: float,
+    ended_at: float,
+    timeout_s: int,
+    returncode: int,
+) -> dict[str, Any]:
+    return {
+        "case": case.name,
+        "corpus": case.corpus,
+        "target": target.get("name") or target.get("requested"),
+        "addr": target.get("addr"),
+        "command": command,
+        "repeat_idx": repeat_idx,
+        "started_at": round(started_at, 6),
+        "ended_at": round(ended_at, 6),
+        "elapsed_s": round(max(0.0, ended_at - started_at), 6),
+        "timeout_s": timeout_s,
+        "timeout": returncode == 124,
+        "returncode": returncode,
+    }
+
+
 def collect_target(
     r2: str,
     case: BinaryCase,
@@ -846,6 +989,8 @@ def collect_target(
     repeat: int,
     include_sensitive: bool,
     env: dict[str, str] | None,
+    task_tmpdir: Path | None,
+    jobs: int,
     runner: Runner,
 ) -> dict[str, Any]:
     if not target.get("found", True):
@@ -861,18 +1006,65 @@ def collect_target(
     out: dict[str, Any] = dict(target)
     out["commands"] = {}
     repeat_count = max(1, repeat)
+
+    command_runs: list[tuple[str, int, str]] = []
     for name, command in commands.items():
-        runs = [
-            runner(r2, case.path, f"{prefix}; {command}", timeout_s, env)
-            for _ in range(repeat_count if name in ("decompile_sla", "types") else 1)
-        ]
+        per_command_repeats = repeat_count if name in ("decompile_sla", "types") else 1
+        for repeat_idx in range(per_command_repeats):
+            command_runs.append((name, repeat_idx, command))
+
+    def run_command(spec: tuple[str, int, str]) -> tuple[str, int, CmdResult, dict[str, Any]]:
+        name, repeat_idx, command = spec
+        command_env = task_env(
+            env,
+            task_tmpdir,
+            case.corpus,
+            case.name,
+            f"target-0x{addr:x}",
+            name,
+            f"run-{repeat_idx}",
+        )
+        started_at = time.time()
+        result = runner(r2, case.path, f"{prefix}; {command}", timeout_s, command_env)
+        ended_at = time.time()
+        return (
+            name,
+            repeat_idx,
+            result,
+            command_event(
+                case=case,
+                target=target,
+                command=name,
+                repeat_idx=repeat_idx,
+                started_at=started_at,
+                ended_at=ended_at,
+                timeout_s=timeout_s,
+                returncode=result.returncode,
+            ),
+        )
+
+    completed = run_ordered_parallel(command_runs, jobs, run_command)
+    runs_by_command: dict[str, list[CmdResult]] = {name: [] for name in commands}
+    events_by_command: dict[str, list[dict[str, Any]]] = {name: [] for name in commands}
+    out["command_events"] = []
+    for name, _repeat_idx, result, event in completed:
+        runs_by_command[name].append(result)
+        events_by_command[name].append(event)
+        out["command_events"].append(event)
+
+    for name in commands:
+        runs = runs_by_command[name]
         entry = command_summary(name, runs[0], include_sensitive)
+        events = events_by_command[name]
+        if events:
+            entry["event"] = events[0]
         if len(runs) > 1:
             hashes = [hashlib.sha256(run.stdout.encode("utf-8", "replace")).hexdigest() for run in runs]
             entry["repeat"] = {
                 "count": len(runs),
                 "stable": len(set(hashes)) == 1,
                 "hashes": hashes,
+                "events": events,
             }
         out["commands"][name] = entry
     return out
@@ -981,6 +1173,8 @@ def run_case(
     repeat: int,
     include_sensitive: bool,
     env: dict[str, str] | None,
+    task_tmpdir: Path | None = None,
+    jobs: int = 1,
     runner: Runner = run_r2,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -1007,7 +1201,7 @@ def run_case(
         r2,
         case,
         timeout_s,
-        env,
+        task_env(env, task_tmpdir, case.corpus, case.name, "native-discovery"),
         runner,
         with_plugin=False,
     )
@@ -1017,7 +1211,7 @@ def run_case(
         native_functions,
         timeout_s,
         include_sensitive,
-        env,
+        task_env(env, task_tmpdir, case.corpus, case.name, "native-pdfj-probe"),
         runner,
     )
     case_out["native_discovery"] = {
@@ -1037,7 +1231,13 @@ def run_case(
     if native_probe is not None:
         case_out["native_pdfj_probe"] = native_probe
 
-    functions, discovery, discovery_error = discover_functions(r2, case, timeout_s, env, runner)
+    functions, discovery, discovery_error = discover_functions(
+        r2,
+        case,
+        timeout_s,
+        task_env(env, task_tmpdir, case.corpus, case.name, "plugin-discovery"),
+        runner,
+    )
     case_out["discovery"] = {
         "returncode": discovery.returncode,
         "elapsed_s": round(discovery.elapsed_s, 6),
@@ -1052,8 +1252,15 @@ def run_case(
     if discovery_error:
         case_out["discovery"]["error"] = discovery_error
     selected = choose_targets(functions, case.targets, case.max_functions)
-    case_out["targets"] = [
-        collect_target(
+    target_jobs = min(max(1, jobs), len(selected)) if selected else 1
+    # Target workers overlap function-level work, while the shared LimitedRunner
+    # enforces the global subprocess cap. Let each target overlap its own command
+    # probes too, otherwise one timeout-prone target can serialize several 180s
+    # waits and dominate the whole benchmark.
+    command_jobs = max(1, jobs)
+
+    def collect_selected_target(target: dict[str, Any]) -> dict[str, Any]:
+        return collect_target(
             r2,
             case,
             target,
@@ -1061,10 +1268,12 @@ def run_case(
             repeat,
             include_sensitive,
             env,
+            task_tmpdir,
+            command_jobs,
             runner,
         )
-        for target in selected
-    ]
+
+    case_out["targets"] = run_ordered_parallel(selected, target_jobs, collect_selected_target)
     case_out["elapsed_s"] = round(time.perf_counter() - started, 6)
     case_out["failures"] = collect_failures(case_out)
     case_out["score"] = score_case(case_out)
@@ -1136,6 +1345,136 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def collect_command_events(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for case in cases:
+        for target in case.get("targets", []):
+            target_events = target.get("command_events")
+            if isinstance(target_events, list):
+                events.extend(event for event in target_events if isinstance(event, dict))
+    events.sort(
+        key=lambda item: (
+            float(item.get("started_at") or 0.0),
+            str(item.get("corpus") or ""),
+            str(item.get("case") or ""),
+            str(item.get("target") or ""),
+            str(item.get("command") or ""),
+            int(item.get("repeat_idx") or 0),
+        )
+    )
+    return events
+
+
+def load_report(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} is not a benchmark report object")
+    return payload
+
+
+def _summary_metric(report: dict[str, Any], path: tuple[str, ...], default: Any = 0) -> Any:
+    current: Any = report
+    for part in path:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(part)
+    return default if current is None else current
+
+
+def _hard_failure_count(report: dict[str, Any]) -> int:
+    failures = _summary_metric(report, ("summary", "failures_by_kind"), {})
+    if not isinstance(failures, dict):
+        return 0
+    return sum(int(failures.get(kind) or 0) for kind in ("command_return", "empty_decompile", "json_parse"))
+
+
+def _metric_delta(before: Any, after: Any) -> dict[str, Any]:
+    try:
+        delta = round(float(after) - float(before), 6)
+    except (TypeError, ValueError):
+        delta = None
+    return {"before": before, "after": after, "delta": delta}
+
+
+def _slowest_by_key(report: dict[str, Any]) -> dict[tuple[str, str, str, str], float]:
+    slowest = _summary_metric(report, ("summary", "slowest_commands"), [])
+    out: dict[tuple[str, str, str, str], float] = {}
+    if not isinstance(slowest, list):
+        return out
+    for item in slowest:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("corpus") or ""),
+            str(item.get("case") or ""),
+            str(item.get("target") or ""),
+            str(item.get("command") or ""),
+        )
+        out[key] = float(item.get("elapsed_s") or 0.0)
+    return out
+
+
+def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_slowest = _slowest_by_key(before)
+    after_slowest = _slowest_by_key(after)
+    slow_delta = []
+    for key in sorted(set(before_slowest) | set(after_slowest)):
+        before_elapsed = before_slowest.get(key, 0.0)
+        after_elapsed = after_slowest.get(key, 0.0)
+        corpus, case, target, command = key
+        slow_delta.append(
+            {
+                "corpus": corpus,
+                "case": case,
+                "target": target,
+                "command": command,
+                "before_s": round(before_elapsed, 6),
+                "after_s": round(after_elapsed, 6),
+                "delta_s": round(after_elapsed - before_elapsed, 6),
+            }
+        )
+    slow_delta.sort(key=lambda item: (-abs(float(item["delta_s"])), item["corpus"], item["case"], item["target"], item["command"]))
+
+    metrics = {
+        "status": {"before": before.get("status"), "after": after.get("status")},
+        "elapsed_s": _metric_delta(before.get("elapsed_s"), after.get("elapsed_s")),
+        "average_score": _metric_delta(
+            _summary_metric(before, ("summary", "average_score")),
+            _summary_metric(after, ("summary", "average_score")),
+        ),
+        "min_score": _metric_delta(
+            _summary_metric(before, ("summary", "min_score")),
+            _summary_metric(after, ("summary", "min_score")),
+        ),
+        "hard_failures": _metric_delta(_hard_failure_count(before), _hard_failure_count(after)),
+        "residual_decompile_count": _metric_delta(
+            _summary_metric(before, ("summary", "quality", "decompile", "residual")),
+            _summary_metric(after, ("summary", "quality", "decompile", "residual")),
+        ),
+        "generic_arg_total": _metric_delta(
+            _summary_metric(before, ("summary", "quality", "generic_arg_total")),
+            _summary_metric(after, ("summary", "quality", "generic_arg_total")),
+        ),
+        "generic_type_total": _metric_delta(
+            _summary_metric(before, ("summary", "quality", "generic_type_total")),
+            _summary_metric(after, ("summary", "quality", "generic_type_total")),
+        ),
+        "radare2_candidate_count": _metric_delta(
+            _summary_metric(before, ("summary", "quality", "radare2_candidate_count")),
+            _summary_metric(after, ("summary", "quality", "radare2_candidate_count")),
+        ),
+    }
+    return {
+        "schema": SCHEMA_VERSION,
+        "metrics": metrics,
+        "failures_by_kind": {
+            "before": _summary_metric(before, ("summary", "failures_by_kind"), {}),
+            "after": _summary_metric(after, ("summary", "failures_by_kind"), {}),
+        },
+        "slowest_command_delta": slow_delta[:20],
+    }
+
+
 def write_report(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -1143,25 +1482,46 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.compare:
+        before = load_report(Path(args.compare[0]))
+        after = load_report(Path(args.compare[1]))
+        print(json.dumps(compare_reports(before, after), indent=2, sort_keys=True))
+        return 0
+    benchmark_started = time.perf_counter()
     cases = build_cases(args)
-    env = build_r2_env(args.r2, args.plugin_dir, Path(args.tmpdir) if args.tmpdir else None)
-    results = [
-        run_case(
+    tmpdir = Path(args.tmpdir) if args.tmpdir else None
+    env = build_r2_env(args.r2, args.plugin_dir, tmpdir)
+    total_jobs = max(1, int(args.jobs))
+    case_jobs, command_jobs = parallel_split(total_jobs, len(cases))
+    runner: Runner = LimitedRunner(run_r2, total_jobs) if total_jobs > 1 else run_r2
+
+    def run_selected_case(case: BinaryCase) -> dict[str, Any]:
+        return run_case(
             args.r2,
             case,
             args.timeout,
             args.repeat,
             args.include_sensitive,
             env,
+            tmpdir,
+            command_jobs,
+            runner,
         )
-        for case in cases
-    ]
+
+    results = run_ordered_parallel(cases, case_jobs, run_selected_case)
+    elapsed_s = round(time.perf_counter() - benchmark_started, 6)
     report = {
         "schema": SCHEMA_VERSION,
         "status": "ok" if all(not result.get("failures") for result in results) else "issues",
+        "elapsed_s": elapsed_s,
         "r2": args.r2,
         "analysis": args.analysis,
         "repeat": max(1, args.repeat),
+        "parallelism": {
+            "jobs": total_jobs,
+            "case_workers": case_jobs,
+            "per_case_workers": command_jobs,
+        },
         "inputs": {
             "manifest": args.manifest or None,
             "repo_fixtures": not args.no_repo_fixtures,
@@ -1170,6 +1530,7 @@ def main() -> int:
             "juliet_dir": display_path(Path(args.juliet_dir), args.include_sensitive) if args.juliet_dir else None,
             "kernel": display_path(Path(args.kernel), args.include_sensitive) if args.kernel else None,
         },
+        "events": collect_command_events(results),
         "summary": aggregate(results),
         "cases": results,
     }
@@ -1181,7 +1542,7 @@ def main() -> int:
     print(
         "reversing benchmark "
         f"{report['status']}; cases={report['summary']['case_count']} "
-        f"avg_score={report['summary']['average_score']} wrote {out_path}"
+        f"avg_score={report['summary']['average_score']} jobs={total_jobs} wrote {out_path}"
     )
     if args.strict and report["status"] == "issues":
         return 1

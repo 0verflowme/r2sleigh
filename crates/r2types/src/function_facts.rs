@@ -97,6 +97,8 @@ pub struct DecompileCapabilityView {
     pub slice_class: Option<r2sym::SliceClass>,
     pub skipped_large_cfg: bool,
     pub has_native_regions: bool,
+    pub has_summary_islands: bool,
+    pub summary_island_count: usize,
     pub actionable_region_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous_targets: Vec<u64>,
@@ -285,6 +287,13 @@ impl FunctionFacts {
         capability.has_native_regions = semantics
             .native_body()
             .is_some_and(|body| !body.regions.is_empty());
+        capability.has_summary_islands = semantics
+            .native_body()
+            .is_some_and(r2sym::NativeArtifactBody::has_summary_islands);
+        capability.summary_island_count = semantics
+            .native_body()
+            .map(r2sym::NativeArtifactBody::summary_island_count)
+            .unwrap_or(0);
         capability.actionable_region_count = semantics.actionable_regions().len();
         capability.ambiguous_targets = semantics.ambiguous_targets();
         capability.residual_reasons = semantics.diagnostics.residual_reasons.clone();

@@ -228,7 +228,299 @@ struct SignatureContextMaps {
 struct SemanticTypeProjection {
     pointer_param_indices: BTreeSet<usize>,
     out_param_indices: BTreeSet<usize>,
+    param_type_hints: BTreeMap<usize, CTypeLike>,
     slot_field_profiles: BTreeMap<usize, BTreeMap<u64, String>>,
+}
+
+fn signed_byte_pointer_type() -> CTypeLike {
+    CTypeLike::Pointer(Box::new(CTypeLike::Int {
+        bits: 8,
+        signedness: Signedness::Signed,
+    }))
+}
+
+fn byte_pointer_type() -> CTypeLike {
+    CTypeLike::Pointer(Box::new(CTypeLike::Int {
+        bits: 8,
+        signedness: Signedness::Unsigned,
+    }))
+}
+
+fn void_pointer_type() -> CTypeLike {
+    CTypeLike::Pointer(Box::new(CTypeLike::Void))
+}
+
+fn size_type(ptr_bits: u32) -> CTypeLike {
+    CTypeLike::Int {
+        bits: ptr_bits,
+        signedness: Signedness::Unsigned,
+    }
+}
+
+fn summary_location_arg_index(location: Option<&r2ssa::SummaryMemoryLocation>) -> Option<usize> {
+    match location?.region {
+        r2ssa::SummaryMemoryRegion::Arg { index } => Some(index),
+        r2ssa::SummaryMemoryRegion::Global { .. }
+        | r2ssa::SummaryMemoryRegion::HeapReturn
+        | r2ssa::SummaryMemoryRegion::Unknown => None,
+    }
+}
+
+fn merge_param_type_hint(
+    hints: &mut BTreeMap<usize, CTypeLike>,
+    index: usize,
+    hint: CTypeLike,
+    ptr_bits: u32,
+) {
+    let Some(existing) = hints.get(&index) else {
+        hints.insert(index, hint);
+        return;
+    };
+    if render_signature_type(existing, ptr_bits) == render_signature_type(&hint, ptr_bits) {
+        return;
+    }
+    let should_replace = matches!(
+        (existing, &hint),
+        (
+            CTypeLike::Pointer(inner),
+            CTypeLike::Pointer(new_inner)
+        ) if matches!(**inner, CTypeLike::Void | CTypeLike::Unknown)
+            && !matches!(**new_inner, CTypeLike::Void | CTypeLike::Unknown)
+    );
+    if should_replace {
+        hints.insert(index, hint);
+    }
+}
+
+fn collect_worker_location_pointer_hint(
+    hints: &mut BTreeMap<usize, CTypeLike>,
+    pointer_indices: &mut BTreeSet<usize>,
+    location: Option<&r2ssa::SummaryMemoryLocation>,
+    hint: CTypeLike,
+    ptr_bits: u32,
+) {
+    if let Some(index) = summary_location_arg_index(location) {
+        pointer_indices.insert(index);
+        merge_param_type_hint(hints, index, hint, ptr_bits);
+    }
+}
+
+fn collect_worker_summary_type_hints(
+    summary: &r2sym::NativeWorkerSummary,
+    projection: &mut SemanticTypeProjection,
+    ptr_bits: u32,
+) {
+    let pointer_hint = match summary.kind {
+        r2sym::NativeWorkerSummaryKind::StringScan => signed_byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::Parser
+            if summary
+                .parser
+                .as_ref()
+                .is_some_and(|parser| matches!(parser.kind, r2sym::NativeParserKind::Numeric)) =>
+        {
+            signed_byte_pointer_type()
+        }
+        r2sym::NativeWorkerSummaryKind::HashFold
+        | r2sym::NativeWorkerSummaryKind::TableWalk
+        | r2sym::NativeWorkerSummaryKind::Parser => byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::MemoryTransfer
+        | r2sym::NativeWorkerSummaryKind::MemoryRead
+        | r2sym::NativeWorkerSummaryKind::MemoryWrite => byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::MemoryEscape
+        | r2sym::NativeWorkerSummaryKind::MemoryFree
+        | r2sym::NativeWorkerSummaryKind::Allocation
+        | r2sym::NativeWorkerSummaryKind::Lifetime
+        | r2sym::NativeWorkerSummaryKind::Synchronization
+        | r2sym::NativeWorkerSummaryKind::Atomic
+        | r2sym::NativeWorkerSummaryKind::Unknown => void_pointer_type(),
+    };
+    collect_worker_location_pointer_hint(
+        &mut projection.param_type_hints,
+        &mut projection.pointer_param_indices,
+        summary.dst.as_ref(),
+        pointer_hint.clone(),
+        ptr_bits,
+    );
+    collect_worker_location_pointer_hint(
+        &mut projection.param_type_hints,
+        &mut projection.pointer_param_indices,
+        summary.src.as_ref(),
+        pointer_hint.clone(),
+        ptr_bits,
+    );
+    collect_worker_location_pointer_hint(
+        &mut projection.param_type_hints,
+        &mut projection.pointer_param_indices,
+        summary.memory.as_ref(),
+        pointer_hint,
+        ptr_bits,
+    );
+    collect_worker_location_pointer_hint(
+        &mut projection.param_type_hints,
+        &mut projection.pointer_param_indices,
+        summary.atomic.as_ref().map(|effect| &effect.location),
+        void_pointer_type(),
+        ptr_bits,
+    );
+
+    if let Some(r2ssa::SummaryTransferLength::Arg(index)) = summary.len {
+        merge_param_type_hint(
+            &mut projection.param_type_hints,
+            index,
+            size_type(ptr_bits),
+            ptr_bits,
+        );
+    }
+    if let Some(length_arg) = summary
+        .loop_summary
+        .as_ref()
+        .and_then(|loop_summary| loop_summary.length_arg)
+    {
+        merge_param_type_hint(
+            &mut projection.param_type_hints,
+            length_arg,
+            size_type(ptr_bits),
+            ptr_bits,
+        );
+    }
+    if let Some(allocation) = summary.allocation
+        && let Some(index) = allocation.size_arg
+    {
+        merge_param_type_hint(
+            &mut projection.param_type_hints,
+            index,
+            size_type(ptr_bits),
+            ptr_bits,
+        );
+    }
+    if let Some(lifetime) = summary.lifetime {
+        projection.pointer_param_indices.insert(lifetime.arg);
+        merge_param_type_hint(
+            &mut projection.param_type_hints,
+            lifetime.arg,
+            void_pointer_type(),
+            ptr_bits,
+        );
+    }
+    if let Some(sync) = summary.sync {
+        projection.pointer_param_indices.insert(sync.arg);
+        merge_param_type_hint(
+            &mut projection.param_type_hints,
+            sync.arg,
+            void_pointer_type(),
+            ptr_bits,
+        );
+    }
+}
+
+fn region_summary_pointer_hint(summary: &r2sym::NativeRegionSummary) -> CTypeLike {
+    match summary.kind {
+        r2sym::NativeWorkerSummaryKind::StringScan => signed_byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::Parser
+            if summary
+                .parser
+                .as_ref()
+                .is_some_and(|parser| matches!(parser.kind, r2sym::NativeParserKind::Numeric)) =>
+        {
+            signed_byte_pointer_type()
+        }
+        r2sym::NativeWorkerSummaryKind::HashFold
+        | r2sym::NativeWorkerSummaryKind::TableWalk
+        | r2sym::NativeWorkerSummaryKind::Parser
+        | r2sym::NativeWorkerSummaryKind::MemoryTransfer
+        | r2sym::NativeWorkerSummaryKind::MemoryRead
+        | r2sym::NativeWorkerSummaryKind::MemoryWrite => byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::MemoryEscape
+        | r2sym::NativeWorkerSummaryKind::MemoryFree
+        | r2sym::NativeWorkerSummaryKind::Allocation
+        | r2sym::NativeWorkerSummaryKind::Lifetime
+        | r2sym::NativeWorkerSummaryKind::Synchronization
+        | r2sym::NativeWorkerSummaryKind::Atomic
+        | r2sym::NativeWorkerSummaryKind::Unknown => void_pointer_type(),
+    }
+}
+
+fn collect_region_summary_type_hints(
+    summary: &r2sym::NativeRegionSummary,
+    projection: &mut SemanticTypeProjection,
+    ptr_bits: u32,
+) {
+    let pointer_hint = region_summary_pointer_hint(summary);
+    projection
+        .out_param_indices
+        .extend(summary.out_param_indices());
+    for access in &summary.memory_accesses {
+        let access_hint = match access.kind {
+            r2sym::NativeMemoryAccessKind::Read
+            | r2sym::NativeMemoryAccessKind::Write
+            | r2sym::NativeMemoryAccessKind::Transfer => pointer_hint.clone(),
+            r2sym::NativeMemoryAccessKind::Atomic
+            | r2sym::NativeMemoryAccessKind::Escape
+            | r2sym::NativeMemoryAccessKind::Free
+            | r2sym::NativeMemoryAccessKind::Lifetime
+            | r2sym::NativeMemoryAccessKind::Synchronization
+            | r2sym::NativeMemoryAccessKind::Allocation
+            | r2sym::NativeMemoryAccessKind::Unknown => void_pointer_type(),
+        };
+        collect_worker_location_pointer_hint(
+            &mut projection.param_type_hints,
+            &mut projection.pointer_param_indices,
+            access.location.as_ref(),
+            access_hint.clone(),
+            ptr_bits,
+        );
+        collect_worker_location_pointer_hint(
+            &mut projection.param_type_hints,
+            &mut projection.pointer_param_indices,
+            access.dst.as_ref(),
+            access_hint.clone(),
+            ptr_bits,
+        );
+        collect_worker_location_pointer_hint(
+            &mut projection.param_type_hints,
+            &mut projection.pointer_param_indices,
+            access.src.as_ref(),
+            access_hint,
+            ptr_bits,
+        );
+        if let Some(r2ssa::SummaryTransferLength::Arg(index)) = access.len {
+            merge_param_type_hint(
+                &mut projection.param_type_hints,
+                index,
+                size_type(ptr_bits),
+                ptr_bits,
+            );
+        }
+    }
+    if let Some(length_arg) = summary
+        .loop_summary
+        .as_ref()
+        .and_then(|loop_summary| loop_summary.length_arg)
+    {
+        merge_param_type_hint(
+            &mut projection.param_type_hints,
+            length_arg,
+            size_type(ptr_bits),
+            ptr_bits,
+        );
+    }
+}
+
+fn semantic_hints_compatible(semantic_hint: &CTypeLike, requested_hint: &CTypeLike) -> bool {
+    if semantic_hint == requested_hint {
+        return true;
+    }
+    matches!(
+        (semantic_hint, requested_hint),
+        (CTypeLike::Pointer(_), CTypeLike::Pointer(_))
+            | (
+                CTypeLike::Int {
+                    signedness: Signedness::Unsigned,
+                    ..
+                },
+                CTypeLike::Int { .. }
+            )
+    )
 }
 
 impl SemanticTypeProjection {
@@ -265,12 +557,33 @@ impl SemanticTypeProjection {
                 projection.pointer_param_indices.insert(effect.arg);
             }
         }
+        if let Some(native) = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body) {
+            if native.summary.region_summaries.is_empty() {
+                for summary in &native.summary.worker_summaries {
+                    projection
+                        .out_param_indices
+                        .extend(summary.out_param_indices());
+                    collect_worker_summary_type_hints(summary, &mut projection, ptr_bits);
+                }
+            } else {
+                for summary in &native.summary.region_summaries {
+                    collect_region_summary_type_hints(summary, &mut projection, ptr_bits);
+                }
+            }
+        }
         projection.slot_field_profiles =
             collect_semantic_slot_profiles(semantic_artifact, ptr_bits);
         projection
     }
 
     fn corroborates_param_type_hint(&self, index: usize, hint: &CTypeLike) -> bool {
+        if self
+            .param_type_hints
+            .get(&index)
+            .is_some_and(|semantic_hint| semantic_hints_compatible(semantic_hint, hint))
+        {
+            return true;
+        }
         if !matches!(hint, CTypeLike::Pointer(_)) {
             return false;
         }
@@ -692,6 +1005,80 @@ fn upgrade_param_indices_to_pointer(
     }
 }
 
+fn summary_hint_can_replace_weak_existing(
+    existing: &CTypeLike,
+    hint: &CTypeLike,
+    ptr_bits: u32,
+) -> bool {
+    if is_generic_signature_type(Some(existing)) {
+        return true;
+    }
+    match (existing, hint) {
+        (CTypeLike::Pointer(inner), CTypeLike::Pointer(new_inner)) => {
+            matches!(**inner, CTypeLike::Void | CTypeLike::Unknown)
+                && !matches!(**new_inner, CTypeLike::Void | CTypeLike::Unknown)
+        }
+        (
+            CTypeLike::Int {
+                bits,
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+            },
+            CTypeLike::Int {
+                bits: hint_bits,
+                signedness: Signedness::Unsigned,
+            },
+        ) => *bits == ptr_bits && *hint_bits == ptr_bits,
+        (
+            CTypeLike::Int {
+                bits,
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+            },
+            CTypeLike::Pointer(_),
+        ) => *bits == ptr_bits,
+        _ => false,
+    }
+}
+
+fn upgrade_param_type_hints(
+    hints: &BTreeMap<usize, CTypeLike>,
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    inferred_signature: &mut InferredSignature,
+    ptr_bits: u32,
+) {
+    if hints.is_empty() {
+        return;
+    }
+    if merged_signature.is_none() {
+        *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
+    }
+
+    if let Some(signature) = merged_signature.as_mut() {
+        for (idx, hint) in hints {
+            if let Some(param) = signature.params.get_mut(*idx) {
+                let should_replace = param.ty.as_ref().is_none_or(|existing| {
+                    summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
+                });
+                if should_replace {
+                    param.ty = Some(hint.clone());
+                }
+            }
+        }
+    }
+
+    for (idx, hint) in hints {
+        if let Some(param) = inferred_signature.params.get_mut(*idx) {
+            let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
+            let should_replace = is_generic_type_string(&param.param_type)
+                || existing_ty.as_ref().is_some_and(|existing| {
+                    summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
+                });
+            if should_replace {
+                param.param_type = render_signature_type(hint, ptr_bits);
+            }
+        }
+    }
+}
+
 fn apply_interproc_summary_to_signature(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
@@ -707,6 +1094,12 @@ fn apply_interproc_summary_to_signature(
                 inferred_signature,
                 ptr_bits,
             );
+            upgrade_param_type_hints(
+                &projection.param_type_hints,
+                merged_signature,
+                inferred_signature,
+                ptr_bits,
+            );
         }
         return;
     };
@@ -714,6 +1107,12 @@ fn apply_interproc_summary_to_signature(
     if let Some(projection) = semantic_projection {
         upgrade_param_indices_to_pointer(
             projection.pointer_param_indices.iter().copied(),
+            merged_signature,
+            inferred_signature,
+            ptr_bits,
+        );
+        upgrade_param_type_hints(
+            &projection.param_type_hints,
             merged_signature,
             inferred_signature,
             ptr_bits,
@@ -1534,15 +1933,21 @@ pub fn semantic_artifact_prefers_bounded_type_plan(artifact: &r2sym::SemanticArt
     if !artifact.type_plan().allows_native_augmentation() {
         return true;
     }
+    let native = artifact.native_body();
+    let has_native_regions = native.is_some_and(|body| !body.regions.is_empty());
+    let has_summary_islands = native.is_some_and(r2sym::NativeArtifactBody::has_summary_islands);
+
     matches!(
         artifact.stage,
         r2sym::RefinementStage::Residual | r2sym::RefinementStage::Compiled
     ) && artifact.diagnostics.skipped_large_cfg
-        && matches!(artifact.slice_class(), Some(r2sym::SliceClass::Worker))
-        && artifact
-            .native_body()
-            .is_some_and(|body| !body.regions.is_empty())
+        && matches!(
+            artifact.slice_class(),
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+        && (has_native_regions || has_summary_islands)
         && (artifact.actionable_control_count() > 0
+            || has_summary_islands
             || artifact
                 .actionable_regions()
                 .into_iter()
@@ -4195,6 +4600,8 @@ mod tests {
             helper_functions: 0,
             derived_summaries: 0,
             derived_diagnostics: Default::default(),
+            region_summaries: Vec::new(),
+            worker_summaries: Vec::new(),
         }
     }
 
@@ -4224,10 +4631,251 @@ mod tests {
                 skipped_missing_arch: false,
                 skipped_large_cfg,
                 residual_reasons,
+                interpreter: None,
                 ambiguous_targets: Vec::new(),
                 cache_hit: false,
             },
         }
+    }
+
+    #[test]
+    fn native_worker_summary_projection_marks_transfer_params() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Residual,
+            r2sym::SliceClass::Worker,
+            true,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::MemoryTransfer,
+                dst: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                src: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                    range: None,
+                }),
+                memory: None,
+                len: Some(r2ssa::SummaryTransferLength::Arg(2)),
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(None),
+            Some(&artifact),
+            64,
+        );
+
+        assert!(projection.pointer_param_indices.contains(&0));
+        assert!(projection.pointer_param_indices.contains(&1));
+        assert!(!projection.pointer_param_indices.contains(&2));
+        assert!(projection.out_param_indices.contains(&0));
+        assert!(!projection.out_param_indices.contains(&1));
+        assert_eq!(
+            projection.param_type_hints.get(&0),
+            Some(&byte_pointer_type())
+        );
+        assert_eq!(
+            projection.param_type_hints.get(&1),
+            Some(&byte_pointer_type())
+        );
+        assert_eq!(projection.param_type_hints.get(&2), Some(&size_type(64)));
+    }
+
+    #[test]
+    fn native_worker_string_scan_projection_marks_char_pointer() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Residual,
+            r2sym::SliceClass::Worker,
+            true,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401010,
+                kind: r2sym::NativeWorkerSummaryKind::StringScan,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: Some(r2sym::NativeWorkerLoopSummary {
+                    header: 0x401010,
+                    exit_target: None,
+                    iterations: None,
+                    length_arg: None,
+                    stride: Some(1),
+                    terminator: Some(r2sym::NativeWorkerTerminator::ZeroByte),
+                    fold: None,
+                }),
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(None),
+            Some(&artifact),
+            64,
+        );
+
+        assert!(projection.pointer_param_indices.contains(&0));
+        assert_eq!(
+            projection.param_type_hints.get(&0),
+            Some(&signed_byte_pointer_type())
+        );
+    }
+
+    #[test]
+    fn native_worker_numeric_parser_projection_marks_char_pointer() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Residual,
+            r2sym::SliceClass::Worker,
+            true,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401030,
+                kind: r2sym::NativeWorkerSummaryKind::Parser,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: Some(r2sym::NativeParserSummary {
+                    kind: r2sym::NativeParserKind::Numeric,
+                    cursor_arg: Some(0),
+                    base: Some(10),
+                    digit_min: Some(b'0'),
+                    digit_max: Some(b'9'),
+                    accepts_sign: true,
+                }),
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(None),
+            Some(&artifact),
+            64,
+        );
+
+        assert!(projection.pointer_param_indices.contains(&0));
+        assert_eq!(
+            projection.param_type_hints.get(&0),
+            Some(&signed_byte_pointer_type())
+        );
+    }
+
+    #[test]
+    fn native_region_summary_projection_preferred_over_worker_projection() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Residual,
+            r2sym::SliceClass::Worker,
+            true,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .region_summaries
+            .push(r2sym::NativeRegionSummary {
+                stable_id: 0x401010,
+                anchor: 0x401010,
+                kind: r2sym::NativeWorkerSummaryKind::StringScan,
+                blocks: BTreeSet::from([0x401010]),
+                entries: BTreeSet::from([0x401010]),
+                exits: BTreeSet::new(),
+                memory_accesses: vec![r2sym::NativeMemoryAccessSummary {
+                    kind: r2sym::NativeMemoryAccessKind::Read,
+                    location: Some(r2ssa::SummaryMemoryLocation {
+                        region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                        range: None,
+                    }),
+                    dst: None,
+                    src: None,
+                    len: None,
+                    width: Some(1),
+                }],
+                loop_summary: Some(r2sym::NativeLoopSummary {
+                    header: 0x401010,
+                    body: BTreeSet::from([0x401010]),
+                    entries: BTreeSet::from([0x401010]),
+                    exits: BTreeSet::new(),
+                    iterations: None,
+                    length_arg: Some(1),
+                    stride: Some(1),
+                    terminator: Some(r2sym::NativeWorkerTerminator::ZeroByte),
+                }),
+                reductions: Vec::new(),
+                parser: None,
+                residual_reasons: vec![r2sym::ResidualReason::LargeCfg],
+                confidence: r2sym::SemanticConfidence::Likely,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(None),
+            Some(&artifact),
+            64,
+        );
+
+        assert_eq!(
+            projection.param_type_hints.get(&0),
+            Some(&signed_byte_pointer_type())
+        );
+        assert_eq!(projection.param_type_hints.get(&1), Some(&size_type(64)));
+        assert!(!projection.pointer_param_indices.contains(&1));
     }
 
     fn test_arg_memory_term(offset: i64, size: u32) -> r2sym::BackwardMemoryCondition {
