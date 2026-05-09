@@ -9,18 +9,8 @@ check_radare2() {
     "$RADARE2_CACHE_DIR/binr/radare2/radare2" -v >/dev/null 2>&1
 }
 
-select_radare2_source() {
-  local branch_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
-  if [ "$branch_name" = "codex/gold-standard-r2sleigh" ]; then
-    RADARE2_REPO_URL="${R2SLEIGH_RADARE2_REPO_URL:-https://github.com/0verflowme/radare2}"
-    RADARE2_REF="${R2SLEIGH_RADARE2_REF:-codex/gold-standard-radare2-seam}"
-  else
-    RADARE2_REPO_URL="${R2SLEIGH_RADARE2_REPO_URL:-https://github.com/radareorg/radare2}"
-    RADARE2_REF="${R2SLEIGH_RADARE2_REF:-master}"
-  fi
-}
-
-select_radare2_source
+RADARE2_REPO_URL="https://github.com/radareorg/radare2"
+RADARE2_REF="master"
 
 RADARE2_REMOTE_REF="$(git ls-remote "$RADARE2_REPO_URL" "refs/heads/$RADARE2_REF" | cut -f1)"
 if [ -z "$RADARE2_REMOTE_REF" ]; then

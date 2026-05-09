@@ -47,6 +47,8 @@ make RUST_FEATURES=all-archs install
 ```
 
 For a smaller build, you can still choose one architecture (for example, `RUST_FEATURES=x86`).
+Use `RUST_TARGET=debug` for faster local iteration, or `RUST_TARGET=dist` when
+you need the old fat-LTO distributable build.
 
 ### First commands
 

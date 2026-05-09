@@ -122,6 +122,8 @@ jobs:
           fi
       - name: Prepare shared target dir
         run: mkdir -p "$CARGO_TARGET_DIR"
+      - name: Ensure radare2 + headers
+        run: bash .github/scripts/ensure-radare2-ci.sh
 
       - name: Build release (all architectures)
         run: cargo build --release --features all-archs

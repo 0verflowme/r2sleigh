@@ -17,6 +17,14 @@ RUST_LIB_LOCAL = $(RUST_RUNTIME_SUBDIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 RUST_LINK_TARGET = $(abspath $(RUST_BUILD_DIR))/deps/$(RUST_LIB).$(RUST_LIB_EXT)
 RUST_RUNTIME_REF = @loader_path/$(RUST_LIB_LOCAL)
 
+ifeq ($(RUST_TARGET),release)
+  RUST_CARGO_PROFILE_FLAG = --release
+else ifeq ($(RUST_TARGET),debug)
+  RUST_CARGO_PROFILE_FLAG =
+else
+  RUST_CARGO_PROFILE_FLAG = --profile $(RUST_TARGET)
+endif
+
 # Detect OS
 UNAME := $(shell uname)
 ifeq ($(UNAME),Darwin)
@@ -34,7 +42,7 @@ LOCAL_R2_DIR ?= ../../radare2
 LOCAL_R2_ABS := $(abspath $(LOCAL_R2_DIR))
 LOCAL_R2_INCLUDE := $(LOCAL_R2_ABS)/libr/include
 LOCAL_R2_SDB_INCLUDE := $(LOCAL_R2_ABS)/subprojects/sdb/include
-LOCAL_R2_ANAL_LIB := $(LOCAL_R2_ABS)/libr/anal/libr_anal.so
+LOCAL_R2_ANAL_LIB := $(LOCAL_R2_ABS)/libr/anal/libr_anal.$(PLUGIN_EXT)
 LOCAL_R2_LIB_FLAGS = \
 	-L$(LOCAL_R2_ABS)/libr/core \
 	-L$(LOCAL_R2_ABS)/libr/anal \
@@ -72,9 +80,9 @@ LDFLAGS = $(R2_LDFLAGS) -L$(RUST_BUILD_DIR) -lr2sleigh_plugin $(LDFLAGS_OS) -lst
 ANAL_PLUGIN_SO = $(ANAL_PLUGIN_NAME).$(PLUGIN_EXT)
 ARCH_PLUGIN_SO = $(ARCH_PLUGIN_NAME).$(PLUGIN_EXT)
 
-.PHONY: all clean install uninstall rust rust-debug rust-release help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs FORCE
+.PHONY: all clean install uninstall rust rust-debug rust-release rust-dist help arch_sleigh.o r_anal_sleigh_arch.o fixup-dylibs FORCE
 
-RUST_MANIFESTS := $(shell find .. -maxdepth 2 \( -name Cargo.toml -o -path '../.cargo/config.toml' \) -type f)
+RUST_MANIFESTS := ../Cargo.toml $(wildcard ../.cargo/config.toml ../crates/*/Cargo.toml ../r2plugin/Cargo.toml)
 RUST_SOURCES := $(shell find ../r2plugin/src ../crates -type f -name '*.rs')
 RUST_BUILD_PREREQS := $(RUST_MANIFESTS) $(RUST_SOURCES)
 
@@ -113,28 +121,36 @@ ifeq ($(UNAME),Darwin)
 endif
 
 # Default rust target
-ifeq ($(RUST_TARGET),release)
-rust: rust-release
-rust-release: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+rust: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+rust-debug:
+	$(MAKE) rust RUST_TARGET=debug RUST_FEATURES=$(RUST_FEATURES)
+rust-release:
+	$(MAKE) rust RUST_TARGET=release RUST_FEATURES=$(RUST_FEATURES)
+rust-dist:
+	$(MAKE) rust RUST_TARGET=dist RUST_FEATURES=$(RUST_FEATURES)
+
 $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): FORCE $(RUST_BUILD_PREREQS)
-	cd .. && cargo build --release --features $(RUST_FEATURES) -p r2sleigh-plugin
-else
-rust: rust-debug
-rust-debug: $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT): FORCE $(RUST_BUILD_PREREQS)
-	cd .. && cargo build --features $(RUST_FEATURES) -p r2sleigh-plugin
-endif
+	cd .. && cargo build $(RUST_CARGO_PROFILE_FLAG) --features $(RUST_FEATURES) -p r2sleigh-plugin
 ifeq ($(UNAME),Darwin)
-	install_name_tool -id @loader_path/$(RUST_LIB).$(RUST_LIB_EXT) $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-	@codesign --force --sign - $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) >/dev/null
+	@desired='@loader_path/$(RUST_LIB).$(RUST_LIB_EXT)'; \
+	current="$$(otool -D "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" 2>/dev/null | tail -n 1)"; \
+	if [ "$$current" != "$$desired" ]; then \
+		install_name_tool -id "$$desired" "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)"; \
+	fi; \
+	if ! codesign -v "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" >/dev/null 2>&1; then \
+		codesign --force --sign - "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" >/dev/null 2>&1; \
+	fi
 endif
 
 $(RUST_LIB_LOCAL): FORCE $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
 	mkdir -p $(RUST_RUNTIME_SUBDIR)
-	rm -f $@
-	cp $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT) $@
+	@if [ ! -f "$@" ] || ! cmp -s "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" "$@"; then \
+		cp "$(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)" "$@"; \
+	fi
 ifeq ($(UNAME),Darwin)
-	@codesign --force --sign - $@ >/dev/null
+	@if ! codesign -v "$@" >/dev/null 2>&1; then \
+		codesign --force --sign - "$@" >/dev/null 2>&1; \
+	fi
 endif
 
 # Install plugins
@@ -184,10 +200,12 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  RUST_TARGET   - 'release' (default) or 'debug'"
+	@echo "                  use 'dist' for fat-LTO distributable artifacts"
 	@echo "  RUST_FEATURES - Sleigh features: 'x86' (default), 'arm' (ARM32 + AArch64), 'mips', 'riscv', 'all-archs'"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make                           # Build release with x86"
 	@echo "  make RUST_FEATURES=all-archs   # Build with all architectures"
 	@echo "  make RUST_TARGET=debug         # Build debug version"
+	@echo "  make RUST_TARGET=dist          # Build maximum-optimized release"
 	@echo "  make install                   # Install to r2 plugins"

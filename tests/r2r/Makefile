@@ -23,6 +23,22 @@ LOCAL_R2_ABS := $(abspath $(LOCAL_R2_DIR))
 LOCAL_R2_BIN := $(LOCAL_R2_ABS)/binr/radare2/radare2
 LOCAL_R2_ANAL_SO := $(LOCAL_R2_ABS)/libr/anal/libr_anal.$(SHARED_EXT)
 LOCAL_R2_LD_LIBRARY_PATH := $(shell find "$(LOCAL_R2_ABS)/libr" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | paste -sd: -)
+E2E_DIR := ../e2e
+E2E_BINS := \
+	$(E2E_DIR)/vuln_test \
+	$(E2E_DIR)/stress_test \
+	$(E2E_DIR)/stress_test_opt \
+	$(E2E_DIR)/vuln_test_x86 \
+	$(E2E_DIR)/stress_test_x86 \
+	$(E2E_DIR)/stress_test_opt_x86
+
+ifneq ($(wildcard $(E2E_DIR)/test_func.c),)
+E2E_BINS += $(E2E_DIR)/test_func $(E2E_DIR)/test_func_x86
+endif
+
+ifneq ($(wildcard $(E2E_DIR)/sym_test.c),)
+E2E_BINS += $(E2E_DIR)/sym_test $(E2E_DIR)/sym_test_x86
+endif
 
 ifeq ($(wildcard $(LOCAL_R2_BIN)),$(LOCAL_R2_BIN))
 ifeq ($(wildcard $(LOCAL_R2_ANAL_SO)),$(LOCAL_R2_ANAL_SO))
@@ -44,27 +60,54 @@ ensure-tools:
 	@command -v jq >/dev/null || { echo "jq not found in PATH"; exit 1; }
 	@command -v python3 >/dev/null || { echo "python3 not found in PATH"; exit 1; }
 
-build-bins:
-	cd ../e2e && \
-	gcc -O0 -g -fno-stack-protector -no-pie -o vuln_test vuln_test.c && \
-	gcc -O0 -g -fno-stack-protector -no-pie -o stress_test stress_test.c -lm && \
-	gcc -O2 -g -fno-stack-protector -no-pie -o stress_test_opt stress_test.c -lm && \
-	if [ -f test_func.c ]; then gcc -O0 -g -o test_func test_func.c; fi && \
-	if [ -f sym_test.c ]; then gcc -O0 -g -o sym_test sym_test.c; fi
-	cd ../e2e && \
-	if [ "$(UNAME_S)" = "Darwin" ]; then \
-		clang -arch x86_64 -Wl,-no_pie -O0 -g -fno-stack-protector -o vuln_test_x86 vuln_test.c; \
-		clang -arch x86_64 -Wl,-no_pie -O0 -g -fno-stack-protector -o stress_test_x86 stress_test.c -lm; \
-		clang -arch x86_64 -Wl,-no_pie -O2 -g -fno-stack-protector -o stress_test_opt_x86 stress_test.c -lm; \
-		if [ -f test_func.c ]; then clang -arch x86_64 -Wl,-no_pie -O0 -g -o test_func_x86 test_func.c; fi; \
-		if [ -f sym_test.c ]; then clang -arch x86_64 -Wl,-no_pie -O0 -g -o sym_test_x86 sym_test.c; fi; \
-	else \
-		gcc -m64 -O0 -g -fno-stack-protector -no-pie -o vuln_test_x86 vuln_test.c; \
-		gcc -m64 -O0 -g -fno-stack-protector -no-pie -o stress_test_x86 stress_test.c -lm; \
-		gcc -m64 -O2 -g -fno-stack-protector -no-pie -o stress_test_opt_x86 stress_test.c -lm; \
-		if [ -f test_func.c ]; then gcc -m64 -O0 -g -o test_func_x86 test_func.c; fi; \
-		if [ -f sym_test.c ]; then gcc -m64 -O0 -g -o sym_test_x86 sym_test.c; fi; \
-	fi
+build-bins: $(E2E_BINS)
+
+$(E2E_DIR)/vuln_test: $(E2E_DIR)/vuln_test.c
+	gcc -O0 -g -fno-stack-protector -no-pie -o $@ $<
+
+$(E2E_DIR)/stress_test: $(E2E_DIR)/stress_test.c
+	gcc -O0 -g -fno-stack-protector -no-pie -o $@ $< -lm
+
+$(E2E_DIR)/stress_test_opt: $(E2E_DIR)/stress_test.c
+	gcc -O2 -g -fno-stack-protector -no-pie -o $@ $< -lm
+
+$(E2E_DIR)/test_func: $(E2E_DIR)/test_func.c
+	gcc -O0 -g -o $@ $<
+
+$(E2E_DIR)/sym_test: $(E2E_DIR)/sym_test.c
+	gcc -O0 -g -o $@ $<
+
+ifeq ($(UNAME_S),Darwin)
+$(E2E_DIR)/vuln_test_x86: $(E2E_DIR)/vuln_test.c
+	clang -arch x86_64 -Wl,-no_pie -O0 -g -fno-stack-protector -o $@ $<
+
+$(E2E_DIR)/stress_test_x86: $(E2E_DIR)/stress_test.c
+	clang -arch x86_64 -Wl,-no_pie -O0 -g -fno-stack-protector -o $@ $< -lm
+
+$(E2E_DIR)/stress_test_opt_x86: $(E2E_DIR)/stress_test.c
+	clang -arch x86_64 -Wl,-no_pie -O2 -g -fno-stack-protector -o $@ $< -lm
+
+$(E2E_DIR)/test_func_x86: $(E2E_DIR)/test_func.c
+	clang -arch x86_64 -Wl,-no_pie -O0 -g -o $@ $<
+
+$(E2E_DIR)/sym_test_x86: $(E2E_DIR)/sym_test.c
+	clang -arch x86_64 -Wl,-no_pie -O0 -g -o $@ $<
+else
+$(E2E_DIR)/vuln_test_x86: $(E2E_DIR)/vuln_test.c
+	gcc -m64 -O0 -g -fno-stack-protector -no-pie -o $@ $<
+
+$(E2E_DIR)/stress_test_x86: $(E2E_DIR)/stress_test.c
+	gcc -m64 -O0 -g -fno-stack-protector -no-pie -o $@ $< -lm
+
+$(E2E_DIR)/stress_test_opt_x86: $(E2E_DIR)/stress_test.c
+	gcc -m64 -O2 -g -fno-stack-protector -no-pie -o $@ $< -lm
+
+$(E2E_DIR)/test_func_x86: $(E2E_DIR)/test_func.c
+	gcc -m64 -O0 -g -o $@ $<
+
+$(E2E_DIR)/sym_test_x86: $(E2E_DIR)/sym_test.c
+	gcc -m64 -O0 -g -o $@ $<
+endif
 
 link-bins: build-bins
 	@mkdir -p bins

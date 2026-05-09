@@ -31,7 +31,14 @@ libloading = "0.9"
 serde_json = "1"
 
 [profile.release]
-lto = true
-codegen-units = 1
+# Keep everyday release builds fast enough for local iteration and CI.
+# Use `--profile dist` when a maximum-optimized distributable artifact is needed.
+lto = false
+codegen-units = 16
 panic = "abort"
 strip = true
+
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
