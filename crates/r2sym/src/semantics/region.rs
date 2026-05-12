@@ -282,7 +282,9 @@ impl SemanticRegion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum NativeWorkerSummaryKind {
+    ProgramOrchestrator,
     MemoryTransfer,
+    FileTransfer,
     MemoryRead,
     MemoryWrite,
     MemoryEscape,
@@ -290,12 +292,87 @@ pub enum NativeWorkerSummaryKind {
     StringScan,
     HashFold,
     TableWalk,
+    PathWalk,
+    DirectoryTraversal,
+    RecordStream,
+    FieldSelection,
+    OutputStream,
+    FormatRender,
+    MetadataProbe,
+    SortMerge,
+    NumericTransform,
     Parser,
+    DiagnosticWrapper,
+    FormatArgumentFetch,
     Allocation,
     Lifetime,
     Synchronization,
     Atomic,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeSummarySpecificity {
+    ProgramOrchestrator,
+    GenericMemory,
+    MemoryTransfer,
+    FileTransfer,
+    StringScan,
+    HashFold,
+    TableWalk,
+    PathWalk,
+    DirectoryTraversal,
+    RecordStream,
+    FieldSelection,
+    OutputStream,
+    FormatRender,
+    MetadataProbe,
+    SortMerge,
+    NumericTransform,
+    Parser,
+    SemanticWrapper,
+    RuntimeEffect,
+    Unknown,
+}
+
+impl NativeSummarySpecificity {
+    pub fn is_primary_renderable(self) -> bool {
+        !matches!(self, Self::GenericMemory | Self::Unknown)
+    }
+}
+
+impl NativeWorkerSummaryKind {
+    pub fn base_specificity(self) -> NativeSummarySpecificity {
+        match self {
+            Self::ProgramOrchestrator => NativeSummarySpecificity::ProgramOrchestrator,
+            Self::MemoryTransfer => NativeSummarySpecificity::MemoryTransfer,
+            Self::FileTransfer => NativeSummarySpecificity::FileTransfer,
+            Self::MemoryRead | Self::MemoryWrite => NativeSummarySpecificity::GenericMemory,
+            Self::MemoryEscape
+            | Self::MemoryFree
+            | Self::Allocation
+            | Self::Lifetime
+            | Self::Synchronization
+            | Self::Atomic => NativeSummarySpecificity::RuntimeEffect,
+            Self::StringScan => NativeSummarySpecificity::StringScan,
+            Self::HashFold => NativeSummarySpecificity::HashFold,
+            Self::TableWalk => NativeSummarySpecificity::TableWalk,
+            Self::PathWalk => NativeSummarySpecificity::PathWalk,
+            Self::DirectoryTraversal => NativeSummarySpecificity::DirectoryTraversal,
+            Self::RecordStream => NativeSummarySpecificity::RecordStream,
+            Self::FieldSelection => NativeSummarySpecificity::FieldSelection,
+            Self::OutputStream => NativeSummarySpecificity::OutputStream,
+            Self::FormatRender => NativeSummarySpecificity::FormatRender,
+            Self::MetadataProbe => NativeSummarySpecificity::MetadataProbe,
+            Self::SortMerge => NativeSummarySpecificity::SortMerge,
+            Self::NumericTransform => NativeSummarySpecificity::NumericTransform,
+            Self::Parser => NativeSummarySpecificity::Parser,
+            Self::DiagnosticWrapper | Self::FormatArgumentFetch => {
+                NativeSummarySpecificity::SemanticWrapper
+            }
+            Self::Unknown => NativeSummarySpecificity::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -389,6 +466,48 @@ pub struct NativeWorkerSummary {
 }
 
 impl NativeWorkerSummary {
+    pub fn specificity(&self) -> NativeSummarySpecificity {
+        if self.kind == NativeWorkerSummaryKind::NumericTransform {
+            return NativeSummarySpecificity::NumericTransform;
+        }
+        if self.parser.is_some() {
+            return NativeSummarySpecificity::Parser;
+        }
+        if self
+            .loop_summary
+            .as_ref()
+            .and_then(|summary| summary.fold.as_ref())
+            .is_some()
+        {
+            return NativeSummarySpecificity::HashFold;
+        }
+        match self.kind.base_specificity() {
+            NativeSummarySpecificity::GenericMemory
+                if self.loop_summary.as_ref().is_some_and(|summary| {
+                    summary.length_arg.is_some()
+                        || summary.stride.is_some()
+                        || summary.terminator.is_some_and(|terminator| {
+                            !matches!(
+                                terminator,
+                                NativeWorkerTerminator::None | NativeWorkerTerminator::Unknown
+                            )
+                        })
+                }) =>
+            {
+                NativeSummarySpecificity::StringScan
+            }
+            specificity => specificity,
+        }
+    }
+
+    pub fn is_generic_memory_summary(&self) -> bool {
+        self.specificity() == NativeSummarySpecificity::GenericMemory
+    }
+
+    pub fn is_primary_render_summary(&self) -> bool {
+        self.specificity().is_primary_renderable()
+    }
+
     pub fn arg_indices(&self) -> BTreeSet<usize> {
         let mut indices = BTreeSet::new();
         collect_location_arg_indices(self.dst.as_ref(), &mut indices);
@@ -431,6 +550,9 @@ impl NativeWorkerSummary {
         let mut indices = BTreeSet::new();
         match self.kind {
             NativeWorkerSummaryKind::MemoryTransfer => {
+                collect_location_arg_indices(self.dst.as_ref(), &mut indices);
+            }
+            NativeWorkerSummaryKind::NumericTransform => {
                 collect_location_arg_indices(self.dst.as_ref(), &mut indices);
             }
             NativeWorkerSummaryKind::MemoryWrite | NativeWorkerSummaryKind::Atomic => {
@@ -530,6 +652,40 @@ pub struct NativeRegionSummary {
 }
 
 impl NativeRegionSummary {
+    pub fn specificity(&self) -> NativeSummarySpecificity {
+        if self.parser.is_some() {
+            return NativeSummarySpecificity::Parser;
+        }
+        if !self.reductions.is_empty() {
+            return NativeSummarySpecificity::HashFold;
+        }
+        match self.kind.base_specificity() {
+            NativeSummarySpecificity::GenericMemory
+                if self.loop_summary.as_ref().is_some_and(|summary| {
+                    summary.length_arg.is_some()
+                        || summary.stride.is_some()
+                        || summary.terminator.is_some_and(|terminator| {
+                            !matches!(
+                                terminator,
+                                NativeWorkerTerminator::None | NativeWorkerTerminator::Unknown
+                            )
+                        })
+                }) =>
+            {
+                NativeSummarySpecificity::StringScan
+            }
+            specificity => specificity,
+        }
+    }
+
+    pub fn is_generic_memory_summary(&self) -> bool {
+        self.specificity() == NativeSummarySpecificity::GenericMemory
+    }
+
+    pub fn is_primary_render_summary(&self) -> bool {
+        self.specificity().is_primary_renderable()
+    }
+
     pub fn arg_indices(&self) -> BTreeSet<usize> {
         let mut indices = BTreeSet::new();
         for access in &self.memory_accesses {
@@ -596,6 +752,60 @@ pub struct NativeFunctionSummary {
     pub region_summaries: Vec<NativeRegionSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_summaries: Vec<NativeWorkerSummary>,
+}
+
+impl NativeFunctionSummary {
+    pub fn primary_region_summary_count(&self) -> usize {
+        self.region_summaries
+            .iter()
+            .filter(|summary| summary.is_primary_render_summary())
+            .count()
+    }
+
+    pub fn primary_worker_summary_count(&self) -> usize {
+        self.worker_summaries
+            .iter()
+            .filter(|summary| summary.is_primary_render_summary())
+            .count()
+    }
+
+    pub fn primary_summary_count(&self) -> usize {
+        if self.region_summaries.is_empty() {
+            self.primary_worker_summary_count()
+        } else {
+            self.primary_region_summary_count()
+        }
+    }
+
+    pub fn generic_memory_summary_count(&self) -> usize {
+        self.region_summaries
+            .iter()
+            .filter(|summary| summary.is_generic_memory_summary())
+            .count()
+            + self
+                .worker_summaries
+                .iter()
+                .filter(|summary| summary.is_generic_memory_summary())
+                .count()
+    }
+
+    pub fn has_primary_summary(&self) -> bool {
+        self.primary_summary_count() > 0
+    }
+
+    pub fn has_memory_read_write_pair(&self) -> bool {
+        let mut has_read = false;
+        let mut has_write = false;
+        for summary in &self.region_summaries {
+            has_read |= matches!(summary.kind, NativeWorkerSummaryKind::MemoryRead);
+            has_write |= matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite);
+        }
+        for summary in &self.worker_summaries {
+            has_read |= matches!(summary.kind, NativeWorkerSummaryKind::MemoryRead);
+            has_write |= matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite);
+        }
+        has_read && has_write
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,12 +1046,28 @@ impl NativeArtifactBody {
         !self.summary.region_summaries.is_empty() || !self.summary.worker_summaries.is_empty()
     }
 
+    pub fn has_primary_summary_islands(&self) -> bool {
+        self.summary.has_primary_summary()
+    }
+
     pub fn summary_island_count(&self) -> usize {
         if self.summary.region_summaries.is_empty() {
             self.summary.worker_summaries.len()
         } else {
             self.summary.region_summaries.len()
         }
+    }
+
+    pub fn primary_summary_island_count(&self) -> usize {
+        self.summary.primary_summary_count()
+    }
+
+    pub fn generic_memory_summary_count(&self) -> usize {
+        self.summary.generic_memory_summary_count()
+    }
+
+    pub fn has_memory_read_write_summary_pair(&self) -> bool {
+        self.summary.has_memory_read_write_pair()
     }
 
     pub fn supports_query_guidance(&self) -> bool {
@@ -1003,8 +1229,9 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        ControlFact, Judged, MemoryFact, NativeArtifactBody, NativeFunctionSummary, RegionKey,
-        SemanticRegion, TargetFact,
+        ControlFact, Judged, MemoryFact, NativeArtifactBody, NativeFunctionSummary,
+        NativeSummarySpecificity, NativeWorkerSummary, NativeWorkerSummaryKind,
+        NativeWorkerTerminator, RegionKey, SemanticRegion, TargetFact,
     };
     use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
@@ -1058,6 +1285,54 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn worker_summary(kind: NativeWorkerSummaryKind) -> NativeWorkerSummary {
+        NativeWorkerSummary {
+            anchor: 0x401000,
+            kind,
+            dst: None,
+            src: None,
+            memory: None,
+            len: None,
+            allocation: None,
+            lifetime: None,
+            sync: None,
+            atomic: None,
+            parser: None,
+            loop_summary: None,
+            evidence: SemanticEvidence::exact(),
+        }
+    }
+
+    #[test]
+    fn generic_memory_worker_summary_is_not_primary_renderable() {
+        let summary = worker_summary(NativeWorkerSummaryKind::MemoryRead);
+
+        assert_eq!(
+            summary.specificity(),
+            NativeSummarySpecificity::GenericMemory
+        );
+        assert!(summary.is_generic_memory_summary());
+        assert!(!summary.is_primary_render_summary());
+    }
+
+    #[test]
+    fn terminated_memory_worker_summary_is_primary_renderable_scan() {
+        let mut summary = worker_summary(NativeWorkerSummaryKind::MemoryRead);
+        summary.loop_summary = Some(super::NativeWorkerLoopSummary {
+            header: 0x401000,
+            exit_target: None,
+            iterations: None,
+            length_arg: None,
+            stride: Some(1),
+            terminator: Some(NativeWorkerTerminator::ZeroByte),
+            fold: None,
+        });
+
+        assert_eq!(summary.specificity(), NativeSummarySpecificity::StringScan);
+        assert!(!summary.is_generic_memory_summary());
+        assert!(summary.is_primary_render_summary());
     }
 
     fn guided_region(anchor: u64, target: u64, branch_truth: bool) -> SemanticRegion {

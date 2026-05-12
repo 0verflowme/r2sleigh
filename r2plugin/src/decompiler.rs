@@ -2,6 +2,7 @@ use crate::context::PluginCtxView;
 use crate::parse_addr_name_map;
 use crate::types::FunctionAnalysisArtifact;
 use r2il::R2ILBlock;
+#[cfg(test)]
 use std::collections::HashMap;
 
 pub(crate) struct DecompilerEnv {
@@ -19,6 +20,7 @@ pub(crate) fn build_decompiler_env(ctx: &PluginCtxView<'_>) -> DecompilerEnv {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_decompiler_context(
     function_facts: r2types::FunctionFacts,
     function_names: HashMap<u64, String>,
@@ -35,6 +37,7 @@ pub(crate) fn build_decompiler_context(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn decompiler_input_from_artifact(
     artifact: FunctionAnalysisArtifact,
     function_names: HashMap<u64, String>,
@@ -47,10 +50,114 @@ pub(crate) fn decompiler_input_from_artifact(
         function_facts,
         ..
     } = artifact;
-    r2dec::DecompilerInput::new(
-        ssa_func,
-        build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits),
+    let func_name = ssa_func
+        .function()
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("sub_{:x}", ssa_func.entry));
+    let cfg_summary = ssa_func.function().cfg_risk_summary();
+    let route_decision = r2engine::decompile_route_decision(
+        &func_name,
+        &function_facts,
+        Some(&ssa_func),
+        &function_facts.types,
+        &cfg_summary,
+    );
+    let context =
+        build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits);
+    let context = r2engine::decompiler_context_with_route_decision(context, &route_decision);
+    r2dec::DecompilerInput::new(ssa_func, context)
+}
+
+pub(crate) fn render_named_native_worker_summary(
+    r2il_blocks: Vec<R2ILBlock>,
+    function_name: &str,
+    arch: Option<&r2il::ArchSpec>,
+    ptr_bits: u32,
+) -> Option<String> {
+    let (arch_name, _, config) = r2dec::DecompilerConfig::for_arch(arch);
+    let semantic_artifact = crate::types::collect_detached_native_worker_summary_artifact(
+        &r2il_blocks,
+        function_name,
+        arch,
+        None,
+        true,
+    )?;
+    let type_facts = r2engine::type_facts_with_summary_projection(
+        r2types::FunctionTypeFacts::default(),
+        function_name,
+        &arch_name,
+        ptr_bits,
+        &semantic_artifact,
+    );
+    let function_facts = r2types::FunctionFacts::new(type_facts, Some(semantic_artifact));
+    let fallback_comment =
+        r2engine::has_renderable_primary_summary_only_native_worker(&function_facts).then(|| {
+            function_facts
+                .semantics
+                .as_ref()
+                .map(|artifact| {
+                    r2engine::summary_only_native_worker_fallback(function_name, artifact)
+                })
+                .unwrap_or_else(|| {
+                    r2dec::artifact_guard_fallback_comment(
+                        function_name,
+                        "summary-only native worker without semantic artifact",
+                    )
+                })
+        });
+    render_summary_with_engine(
+        &r2il_blocks,
+        function_name,
+        arch,
+        ptr_bits,
+        &function_facts,
+        config,
+        "",
+        "",
+        "",
+        true,
+        fallback_comment,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_summary_with_engine(
+    r2il_blocks: &[R2ILBlock],
+    function_name: &str,
+    arch: Option<&r2il::ArchSpec>,
+    ptr_bits: u32,
+    function_facts: &r2types::FunctionFacts,
+    config: r2dec::DecompilerConfig,
+    func_names_payload: &str,
+    strings_payload: &str,
+    symbols_payload: &str,
+    named_worker_guarded: bool,
+    fallback_comment: Option<String>,
+) -> Option<String> {
+    let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(r2il_blocks)?.cfg_risk_summary();
+    let render_cache_key =
+        crate::types::decompile_render_cache_key(crate::types::DecompileRenderCacheKeyInput {
+            blocks: r2il_blocks,
+            function_name,
+            arch,
+            ptr_bits,
+            function_facts,
+            func_names_payload,
+            strings_payload,
+            symbols_payload,
+        });
+    crate::types::engine_session()
+        .decompile_summary(r2engine::EngineSummaryDecompileRequest {
+            function_name: function_name.to_string(),
+            cfg_summary,
+            function_facts: function_facts.clone(),
+            named_worker_guarded,
+            config,
+            render_cache_key: Some(render_cache_key),
+            fallback_comment,
+        })
+        .map(|response| response.output)
 }
 
 fn rename_function_artifact_for_display(
@@ -86,6 +193,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
     symbols_str: String,
     external_context_json: String,
     cached_artifact: Option<crate::types::FunctionAnalysisArtifact>,
+    type_facts_override: Option<r2types::FunctionTypeFacts>,
     symbolic_scope: Option<r2sym::PreparedFunctionScope>,
 ) -> String {
     const STACK_SIZE: usize = 512 * 1024 * 1024;
@@ -93,8 +201,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
     let handle = std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(move || {
-            let cfg_guard_reason = r2dec::cfg_guard_reason(&r2il_blocks);
-            let (_, _, config) = r2dec::DecompilerConfig::for_arch(arch.as_ref());
+            let (arch_name, _, config) = r2dec::DecompilerConfig::for_arch(arch.as_ref());
             let function_names = parse_addr_name_map(&func_names_str);
             let symbols = parse_addr_name_map(&symbols_str);
             let display_func_name = crate::helpers::resolve_decompiler_display_name(
@@ -103,41 +210,135 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 &function_names,
                 &symbols,
             );
-            let mut artifact = if let Some(artifact) = cached_artifact {
-                let route = r2dec::detached_semantic_route_plan(
-                    &display_func_name,
-                    &r2il_blocks,
-                    &artifact.function_facts,
-                );
-                if let Some(r2dec::SemanticRoutePlan::FallbackComment { comment }) = route {
-                    return comment;
+            let probe = r2engine::decompile_probe_decision(
+                &r2il_blocks,
+                fcn_addr,
+                &func_name_str,
+                &display_func_name,
+            );
+            let cfg_guard_reason = probe.cfg_guard_reason.clone();
+            let summary_probe_name = probe.summary_probe_name.as_str();
+            let mut artifact = if let Some(mut artifact) = cached_artifact {
+                if let Some(type_facts_override) = type_facts_override.as_ref()
+                    && let Some(signature) = type_facts_override.merged_signature.clone()
+                {
+                    artifact.function_facts.types.merged_signature = Some(signature);
+                }
+                if probe.summary_probe_needed
+                    && let Some(semantic_artifact) =
+                        crate::types::collect_detached_native_worker_summary_artifact(
+                            &r2il_blocks,
+                            summary_probe_name,
+                            arch.as_ref(),
+                            symbolic_scope.as_ref(),
+                            true,
+                        )
+                {
+                    let mut summary_type_seed = artifact.function_facts.types.clone();
+                    if let Some(type_facts_override) = type_facts_override.as_ref()
+                        && let Some(signature) = type_facts_override.merged_signature.clone()
+                    {
+                        summary_type_seed.merged_signature = Some(signature);
+                    }
+                    let summary_type_facts = r2engine::type_facts_with_summary_projection(
+                        summary_type_seed,
+                        summary_probe_name,
+                        &arch_name,
+                        ptr_bits,
+                        &semantic_artifact,
+                    );
+                    let summary_facts =
+                        r2types::FunctionFacts::new(summary_type_facts, Some(semantic_artifact.clone()));
+                    let fallback_comment =
+                        r2engine::has_renderable_primary_summary_only_native_worker(&summary_facts)
+                            .then(|| {
+                                r2engine::summary_only_native_worker_fallback(
+                                    &display_func_name,
+                                    &semantic_artifact,
+                                )
+                            });
+                    if let Some(output) = render_summary_with_engine(
+                        &r2il_blocks,
+                        &display_func_name,
+                        arch.as_ref(),
+                        ptr_bits,
+                        &summary_facts,
+                        config.clone(),
+                        &func_names_str,
+                        &strings_str,
+                        &symbols_str,
+                        probe.named_worker_guarded,
+                        fallback_comment,
+                    ) {
+                        return output;
+                    }
                 }
                 artifact
             } else {
-                let precomputed_semantic_artifact = cfg_guard_reason.as_ref().map_or_else(
-                    || None,
-                    |_| {
-                        crate::types::collect_detached_semantic_artifact(
-                            &r2il_blocks,
-                            &func_name_str,
-                            arch.as_ref(),
-                            symbolic_scope.as_ref(),
+                let summary_probe_artifact = probe.summary_probe_needed.then(|| {
+                    crate::types::collect_detached_native_worker_summary_artifact(
+                        &r2il_blocks,
+                        summary_probe_name,
+                        arch.as_ref(),
+                        symbolic_scope.as_ref(),
+                        true,
+                    )
+                }).flatten();
+                let mut summary_type_facts = type_facts_override.clone().unwrap_or_else(|| {
+                    crate::types::external_function_type_facts_from_json(
+                        &external_context_json,
+                        ptr_bits,
+                    )
+                });
+                if let Some(summary_artifact) = summary_probe_artifact.as_ref() {
+                    summary_type_facts = r2engine::type_facts_with_summary_projection(
+                        summary_type_facts,
+                        summary_probe_name,
+                        &arch_name,
+                        ptr_bits,
+                        summary_artifact,
+                    );
+                }
+                let summary_facts = r2types::FunctionFacts::new(
+                    summary_type_facts,
+                    summary_probe_artifact.clone(),
+                );
+                let fallback_comment = summary_probe_artifact
+                    .as_ref()
+                    .filter(|_| {
+                        r2engine::has_renderable_primary_summary_only_native_worker(&summary_facts)
+                    })
+                    .map(|summary_artifact| {
+                        r2engine::summary_only_native_worker_fallback(
+                            &display_func_name,
+                            summary_artifact,
                         )
-                    },
-                );
-                let route = r2dec::detached_semantic_route_plan(
-                    &display_func_name,
+                    });
+                if let Some(output) = render_summary_with_engine(
                     &r2il_blocks,
-                    &r2types::FunctionFacts::new(
-                        r2types::FunctionTypeFacts::default(),
-                        precomputed_semantic_artifact.clone(),
-                    ),
-                );
-                if let Some(r2dec::SemanticRoutePlan::FallbackComment { comment }) = route {
-                    return comment;
+                    &display_func_name,
+                    arch.as_ref(),
+                    ptr_bits,
+                    &summary_facts,
+                    config.clone(),
+                    &func_names_str,
+                    &strings_str,
+                    &symbols_str,
+                    probe.named_worker_guarded,
+                    fallback_comment,
+                ) {
+                    return output;
+                }
+                if probe.block_guarded {
+                    return r2dec::artifact_guard_fallback_comment(
+                        &display_func_name,
+                        cfg_guard_reason
+                            .as_deref()
+                            .unwrap_or("large native worker without canonical summary"),
+                    );
                 }
                 let Some(artifact) =
-                    crate::types::build_detached_function_analysis_artifact_with_scope_and_semantics(
+                    crate::types::build_detached_function_analysis_artifact_with_scope_and_optional_semantics(
                         &r2il_blocks,
                         &func_name_str,
                         arch.as_ref(),
@@ -146,7 +347,8 @@ pub(crate) fn run_full_decompile_on_large_stack(
                         &reg_type_hints,
                         &external_context_json,
                         symbolic_scope.as_ref(),
-                        precomputed_semantic_artifact,
+                        None,
+                        false,
                     )
                 else {
                     return r2dec::artifact_guard_fallback_comment(
@@ -157,57 +359,6 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 artifact
             };
             artifact = rename_function_artifact_for_display(artifact, &display_func_name);
-
-            if let Some(route) = artifact
-                .function_facts
-                .decompile_plan()
-                .and_then(|plan| match plan {
-                    r2sym::DecompilePlan::NativeLinear { reason } => {
-                        Some(r2dec::SemanticRoutePlan::LinearWorker { reason })
-                    }
-                    r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
-                        Some(r2dec::SemanticRoutePlan::SummaryIslands { reason })
-                    }
-                    _ => None,
-                })
-                && let Some(output) = r2dec::render_semantic_worker_summary(
-                    &display_func_name,
-                    &artifact.function_facts,
-                    &route,
-                    config.clone(),
-                ) {
-                return output;
-            }
-
-            if let Some(route) = r2dec::detached_semantic_route_plan(
-                &display_func_name,
-                &r2il_blocks,
-                &artifact.function_facts,
-            ) {
-                match route {
-                    r2dec::SemanticRoutePlan::VmSummary { .. } => {
-                        if let Some(output) = r2dec::render_vm_semantic_summary(
-                            &display_func_name,
-                            &artifact.function_facts,
-                        ) {
-                            return output;
-                        }
-                    }
-                    r2dec::SemanticRoutePlan::LinearWorker { .. }
-                    | r2dec::SemanticRoutePlan::SummaryIslands { .. } => {
-                        if let Some(output) = r2dec::render_semantic_worker_summary(
-                            &display_func_name,
-                            &artifact.function_facts,
-                            &route,
-                            config.clone(),
-                        ) {
-                            return output;
-                        }
-                    }
-                    r2dec::SemanticRoutePlan::FallbackComment { comment } => return comment,
-                    _ => {}
-                }
-            }
 
             let render_cache_key =
                 crate::types::decompile_render_cache_key(crate::types::DecompileRenderCacheKeyInput {
@@ -220,41 +371,29 @@ pub(crate) fn run_full_decompile_on_large_stack(
                     strings_payload: &strings_str,
                     symbols_payload: &symbols_str,
                 });
-            if let Some(output) = crate::types::cached_decompile_render(render_cache_key) {
-                return output;
-            }
 
-            let decompiler = r2dec::Decompiler::new(config);
             let semantic_fallback_output = r2dec::semantic_fallback_comment(
                 &display_func_name,
                 artifact.function_facts.semantics.as_ref(),
             );
-            let input = decompiler_input_from_artifact(
-                artifact,
+            let fallback_comment = semantic_fallback_output.or_else(|| {
+                cfg_guard_reason
+                    .as_ref()
+                    .map(|reason| r2dec::artifact_guard_fallback_comment(&func_name_str, reason))
+            });
+            let response = crate::types::engine_session().decompile(r2engine::EngineDecompileRequest {
+                function_name: display_func_name.clone(),
+                prepared_ssa: artifact.ssa_func,
+                function_facts: artifact.function_facts,
                 function_names,
-                parse_addr_name_map(&strings_str),
+                strings: parse_addr_name_map(&strings_str),
                 symbols,
                 ptr_bits,
-            );
-
-            let output = decompiler.decompile_input(&input);
-            let output = if output.trim().is_empty() {
-                semantic_fallback_output.unwrap_or_else(|| {
-                    cfg_guard_reason
-                        .as_ref()
-                        .map(|reason| r2dec::artifact_guard_fallback_comment(&func_name_str, reason))
-                        .unwrap_or_else(|| {
-                            format!(
-                                "/* r2dec fallback: skipped decompilation for {} (empty output) */",
-                                display_func_name
-                            )
-                        })
-                })
-            } else {
-                output
-            };
-            crate::types::insert_decompile_render(render_cache_key, output.clone());
-            output
+                config,
+                render_cache_key: Some(render_cache_key),
+                fallback_comment,
+            });
+            response.output
         });
 
     match handle {
@@ -263,5 +402,19 @@ pub(crate) fn run_full_decompile_on_large_stack(
             Err(_) => "/* r2dec: decompilation panicked (internal error) */".to_string(),
         },
         Err(e) => format!("/* r2dec: failed to spawn decompiler thread: {} */", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn nontrivial_program_orchestrators_use_summary_guard() {
+        assert!(!r2engine::should_guard_program_orchestrator_decompile(
+            1, 16
+        ));
+        assert!(r2engine::should_guard_program_orchestrator_decompile(5, 16));
+        assert!(r2engine::should_guard_program_orchestrator_decompile(
+            2, 128
+        ));
     }
 }

@@ -3,14 +3,14 @@
 //! These facts keep object, memory, predicate, and call-site provenance in
 //! `r2ssa` so downstream crates stop reconstructing them independently.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::assumption::{AssumptionSet, AssumptionSubject, AssumptionUsageReport, AssumptionValue};
 use crate::cfg::BlockTerminator;
 use crate::function::{DecompilePrepFacts, SSAFunction, StackAddressBase, StackAddressRoot};
-use crate::graph::{InstId, SsaGraph, ValueId};
+use crate::graph::{InstId, InstPayload, SsaGraph, ValueId};
 use crate::op::SSAOp;
 use crate::var::SSAVar;
 
@@ -188,6 +188,63 @@ pub struct CallSiteFacts {
     pub by_inst: BTreeMap<InstId, CallSiteId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredLoopKind {
+    Natural,
+    SelfLoop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredLoopFact {
+    pub id: LoopId,
+    pub kind: StructuredLoopKind,
+    pub header: u64,
+    pub latches: Vec<u64>,
+    pub body: Vec<u64>,
+    pub exits: Vec<u64>,
+    pub condition: Option<PredicateId>,
+    pub induction_phi: Option<ValueId>,
+    pub induction_init: Option<ValueId>,
+    pub induction_update: Option<ValueId>,
+    pub bound: Option<ValueId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StructuredAccessId {
+    pub inst: InstId,
+    pub ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredMemoryAccessFact {
+    pub id: StructuredAccessId,
+    pub block_addr: u64,
+    pub op_index: usize,
+    pub object: ObjectId,
+    pub address: ValueId,
+    pub value: Option<ValueId>,
+    pub is_write: bool,
+    pub width: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredRecursiveCallFact {
+    pub call_site: CallSiteId,
+    pub block_addr: u64,
+    pub op_index: usize,
+    pub target: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StructuredDataflowFacts {
+    pub loops: BTreeMap<LoopId, StructuredLoopFact>,
+    pub memory_accesses: BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
+    pub recursive_calls: BTreeMap<CallSiteId, StructuredRecursiveCallFact>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedAssumptionBindingKind {
     Predicate {
@@ -221,6 +278,7 @@ pub struct PreparedFunctionFacts {
     pub memory: MemorySSAFacts,
     pub predicates: PredicateFacts,
     pub call_sites: CallSiteFacts,
+    pub structured: StructuredDataflowFacts,
     pub assumptions: AssumptionSet,
     pub applied_assumption_bindings: Vec<PreparedAssumptionBinding>,
     pub assumption_usage: AssumptionUsageReport,
@@ -242,6 +300,14 @@ impl PreparedFunctionFacts {
             collect_predicate_facts(function, graph),
             assumptions,
         );
+        let structured = collect_structured_dataflow_facts(
+            function,
+            graph,
+            &objects,
+            &memory,
+            &predicates,
+            &call_sites,
+        );
         let (applied_assumption_bindings, assumption_usage) =
             collect_prepared_assumption_usage(graph, &objects, &predicates, assumptions);
         Self {
@@ -249,6 +315,7 @@ impl PreparedFunctionFacts {
             memory,
             predicates,
             call_sites,
+            structured,
             assumptions: assumptions.clone(),
             applied_assumption_bindings,
             assumption_usage,
@@ -859,6 +926,472 @@ fn build_memory_ssa(
     }
 }
 
+fn collect_structured_dataflow_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    memory: &MemorySSAFacts,
+    predicates: &PredicateFacts,
+    call_sites: &CallSiteFacts,
+) -> StructuredDataflowFacts {
+    StructuredDataflowFacts {
+        loops: collect_structured_loop_facts(function, graph, predicates),
+        memory_accesses: collect_structured_memory_access_facts(function, graph, objects, memory),
+        recursive_calls: collect_structured_recursive_call_facts(function, graph, call_sites),
+    }
+}
+
+fn collect_structured_loop_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+) -> BTreeMap<LoopId, StructuredLoopFact> {
+    let mut latches_by_header = BTreeMap::<u64, BTreeSet<u64>>::new();
+    for &block_addr in function.block_addrs() {
+        for succ in function.successors(block_addr) {
+            if function.dominates(succ, block_addr) {
+                latches_by_header
+                    .entry(succ)
+                    .or_default()
+                    .insert(block_addr);
+            }
+        }
+    }
+
+    let mut loops = BTreeMap::new();
+    for (idx, (header, latches)) in latches_by_header.into_iter().enumerate() {
+        let id = LoopId(idx as u32);
+        let body_set = natural_loop_body(function, header, &latches);
+        let body = body_set.iter().copied().collect::<Vec<_>>();
+        let exits = loop_exits(function, &body_set);
+        let condition = loop_condition(predicates, header, &body_set, &exits);
+        let (induction_phi, induction_init, induction_update) =
+            loop_induction_values(graph, header, &latches, &body_set);
+        let bound = loop_bound_value(
+            graph,
+            predicates,
+            condition,
+            induction_phi,
+            induction_update,
+        );
+        loops.insert(
+            id,
+            StructuredLoopFact {
+                id,
+                kind: if latches.contains(&header) {
+                    StructuredLoopKind::SelfLoop
+                } else {
+                    StructuredLoopKind::Natural
+                },
+                header,
+                latches: latches.iter().copied().collect(),
+                body,
+                exits,
+                condition,
+                induction_phi,
+                induction_init,
+                induction_update,
+                bound,
+            },
+        );
+    }
+    loops
+}
+
+fn natural_loop_body(
+    function: &SSAFunction,
+    header: u64,
+    latches: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut body = BTreeSet::new();
+    body.insert(header);
+    let mut stack = latches.iter().copied().collect::<Vec<_>>();
+    while let Some(addr) = stack.pop() {
+        if !function.dominates(header, addr) {
+            continue;
+        }
+        if !body.insert(addr) {
+            continue;
+        }
+        for pred in function.predecessors(addr) {
+            if !body.contains(&pred) {
+                stack.push(pred);
+            }
+        }
+    }
+    body
+}
+
+fn loop_exits(function: &SSAFunction, body: &BTreeSet<u64>) -> Vec<u64> {
+    let mut exits = BTreeSet::new();
+    for block in body {
+        for succ in function.successors(*block) {
+            if !body.contains(&succ) {
+                exits.insert(succ);
+            }
+        }
+    }
+    exits.into_iter().collect()
+}
+
+fn loop_condition(
+    predicates: &PredicateFacts,
+    header: u64,
+    body: &BTreeSet<u64>,
+    exits: &[u64],
+) -> Option<PredicateId> {
+    let exit_set = exits.iter().copied().collect::<BTreeSet<_>>();
+    predicates
+        .predicates
+        .values()
+        .filter(|predicate| body.contains(&predicate.block_addr))
+        .filter(|predicate| {
+            (body.contains(&predicate.true_target) && exit_set.contains(&predicate.false_target))
+                || (body.contains(&predicate.false_target)
+                    && exit_set.contains(&predicate.true_target))
+        })
+        .min_by_key(|predicate| {
+            (
+                usize::from(predicate.block_addr != header),
+                predicate.block_addr,
+                predicate.id,
+            )
+        })
+        .map(|predicate| predicate.id)
+}
+
+fn loop_induction_values(
+    graph: &SsaGraph,
+    header: u64,
+    latches: &BTreeSet<u64>,
+    body: &BTreeSet<u64>,
+) -> (Option<ValueId>, Option<ValueId>, Option<ValueId>) {
+    let Some(header_id) = graph.block_id_for_addr(header) else {
+        return (None, None, None);
+    };
+    let Some(header_block) = graph.block(header_id) else {
+        return (None, None, None);
+    };
+
+    let mut best = None;
+    for inst_id in &header_block.insts {
+        let Some(inst) = graph.inst(*inst_id) else {
+            continue;
+        };
+        let InstPayload::Phi { predecessors } = &inst.payload else {
+            continue;
+        };
+        let Some(output) = inst.output else {
+            continue;
+        };
+        let mut init = None;
+        let mut update = None;
+        for (pred_id, input) in predecessors
+            .iter()
+            .copied()
+            .zip(inst.inputs.iter().copied())
+        {
+            let Some(pred_addr) = graph.block(pred_id).map(|block| block.addr) else {
+                continue;
+            };
+            if latches.contains(&pred_addr) {
+                update = Some(input);
+            } else if !body.contains(&pred_addr) {
+                init = Some(input);
+            }
+        }
+        if init.is_none() || update.is_none() {
+            continue;
+        }
+        let score = if is_low_value_induction_phi(graph, output) {
+            1
+        } else {
+            0
+        };
+        let candidate = (score, output, init, update);
+        if best.as_ref().is_none_or(
+            |current: &(usize, ValueId, Option<ValueId>, Option<ValueId>)| candidate < *current,
+        ) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, phi, init, update)| (Some(phi), init, update))
+        .unwrap_or((None, None, None))
+}
+
+fn is_low_value_induction_phi(graph: &SsaGraph, value: ValueId) -> bool {
+    let Some(var) = graph.value(value).map(|value| &value.var) else {
+        return true;
+    };
+    let name = var.name.trim_start_matches("reg:").to_ascii_lowercase();
+    matches!(name.as_str(), "cf" | "pf" | "af" | "zf" | "sf" | "of")
+        || name.starts_with("flag")
+        || name.starts_with("tmp")
+        || name == "rsp"
+        || name == "esp"
+        || name == "rbp"
+        || name == "ebp"
+}
+
+fn loop_bound_value(
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    condition: Option<PredicateId>,
+    induction_phi: Option<ValueId>,
+    induction_update: Option<ValueId>,
+) -> Option<ValueId> {
+    let comparison = predicates
+        .predicates
+        .get(&condition?)?
+        .comparison
+        .as_ref()?;
+    let induction = induction_phi.or(induction_update)?;
+    let lhs_depends = value_depends_on(graph, comparison.lhs, induction);
+    let rhs_depends = value_depends_on(graph, comparison.rhs, induction);
+    match (lhs_depends, rhs_depends) {
+        (true, false) => Some(comparison.rhs),
+        (false, true) => Some(comparison.lhs),
+        _ => None,
+    }
+}
+
+fn value_depends_on(graph: &SsaGraph, value: ValueId, needle: ValueId) -> bool {
+    if value == needle {
+        return true;
+    }
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![(value, 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        if current == needle {
+            return true;
+        }
+        if depth >= 16 || !visited.insert(current) {
+            continue;
+        }
+        let Some(def_inst) = graph.def_inst(current) else {
+            continue;
+        };
+        let Some(inst) = graph.inst(def_inst) else {
+            continue;
+        };
+        for input in &inst.inputs {
+            stack.push((*input, depth + 1));
+        }
+    }
+    false
+}
+
+fn collect_structured_memory_access_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    memory: &MemorySSAFacts,
+) -> BTreeMap<StructuredAccessId, StructuredMemoryAccessFact> {
+    let mut access_facts = BTreeMap::new();
+    for block in function.blocks() {
+        for (op_index, op) in block.ops.iter().enumerate() {
+            let Some(inst) = graph.inst_id_for_op_site(block.addr, op_index) else {
+                continue;
+            };
+            let mut ordinal = 0u32;
+            match op {
+                SSAOp::Load { dst, addr, .. }
+                | SSAOp::LoadLinked { dst, addr, .. }
+                | SSAOp::LoadGuarded { dst, addr, .. } => {
+                    if let Some(address) = graph.value_id_for_var(addr) {
+                        for use_fact in memory.uses_by_inst.get(&inst).into_iter().flatten() {
+                            insert_structured_memory_access(
+                                &mut access_facts,
+                                inst,
+                                &mut ordinal,
+                                block.addr,
+                                op_index,
+                                use_fact.location.object,
+                                address,
+                                graph.value_id_for_var(dst),
+                                false,
+                                use_fact.location.size,
+                            );
+                        }
+                    }
+                }
+                SSAOp::Store { addr, val, .. } | SSAOp::StoreGuarded { addr, val, .. } => {
+                    if let Some(address) = graph.value_id_for_var(addr) {
+                        for def_fact in memory.defs_by_inst.get(&inst).into_iter().flatten() {
+                            insert_structured_memory_access(
+                                &mut access_facts,
+                                inst,
+                                &mut ordinal,
+                                block.addr,
+                                op_index,
+                                def_fact.location.object,
+                                address,
+                                graph.value_id_for_var(val),
+                                true,
+                                def_fact.location.size,
+                            );
+                        }
+                    }
+                }
+                SSAOp::StoreConditional { addr, val, .. } => {
+                    if let Some(address) = graph.value_id_for_var(addr) {
+                        for use_fact in memory.uses_by_inst.get(&inst).into_iter().flatten() {
+                            insert_structured_memory_access(
+                                &mut access_facts,
+                                inst,
+                                &mut ordinal,
+                                block.addr,
+                                op_index,
+                                use_fact.location.object,
+                                address,
+                                None,
+                                false,
+                                use_fact.location.size,
+                            );
+                        }
+                        for def_fact in memory.defs_by_inst.get(&inst).into_iter().flatten() {
+                            insert_structured_memory_access(
+                                &mut access_facts,
+                                inst,
+                                &mut ordinal,
+                                block.addr,
+                                op_index,
+                                def_fact.location.object,
+                                address,
+                                graph.value_id_for_var(val),
+                                true,
+                                def_fact.location.size,
+                            );
+                        }
+                    }
+                }
+                SSAOp::AtomicCAS {
+                    dst,
+                    addr,
+                    replacement,
+                    ..
+                } => {
+                    if let Some(address) = graph.value_id_for_var(addr) {
+                        for use_fact in memory.uses_by_inst.get(&inst).into_iter().flatten() {
+                            insert_structured_memory_access(
+                                &mut access_facts,
+                                inst,
+                                &mut ordinal,
+                                block.addr,
+                                op_index,
+                                use_fact.location.object,
+                                address,
+                                graph.value_id_for_var(dst),
+                                false,
+                                use_fact.location.size,
+                            );
+                        }
+                        for def_fact in memory.defs_by_inst.get(&inst).into_iter().flatten() {
+                            insert_structured_memory_access(
+                                &mut access_facts,
+                                inst,
+                                &mut ordinal,
+                                block.addr,
+                                op_index,
+                                def_fact.location.object,
+                                address,
+                                graph.value_id_for_var(replacement),
+                                true,
+                                def_fact.location.size,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if ordinal == 0
+                && (op.is_memory_read() || op.is_memory_write())
+                && let Some(address) = op
+                    .sources()
+                    .into_iter()
+                    .find_map(|source| graph.value_id_for_var(source))
+            {
+                let object = objects.escaped_unknown_object().unwrap_or(ObjectId(0));
+                insert_structured_memory_access(
+                    &mut access_facts,
+                    inst,
+                    &mut ordinal,
+                    block.addr,
+                    op_index,
+                    object,
+                    address,
+                    op.dst().and_then(|dst| graph.value_id_for_var(dst)),
+                    op.is_memory_write(),
+                    0,
+                );
+            }
+        }
+    }
+    access_facts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_structured_memory_access(
+    access_facts: &mut BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
+    inst: InstId,
+    ordinal: &mut u32,
+    block_addr: u64,
+    op_index: usize,
+    object: ObjectId,
+    address: ValueId,
+    value: Option<ValueId>,
+    is_write: bool,
+    width: u32,
+) {
+    let id = StructuredAccessId {
+        inst,
+        ordinal: *ordinal,
+    };
+    *ordinal = (*ordinal).saturating_add(1);
+    access_facts.insert(
+        id,
+        StructuredMemoryAccessFact {
+            id,
+            block_addr,
+            op_index,
+            object,
+            address,
+            value,
+            is_write,
+            width,
+        },
+    );
+}
+
+fn collect_structured_recursive_call_facts(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    call_sites: &CallSiteFacts,
+) -> BTreeMap<CallSiteId, StructuredRecursiveCallFact> {
+    let mut recursive_calls = BTreeMap::new();
+    for (call_site, fact) in &call_sites.by_id {
+        let Some(target) = fact.direct_target else {
+            continue;
+        };
+        if target != function.entry {
+            continue;
+        }
+        let Some((block_addr, op_index)) = graph.op_site_for_inst(fact.at) else {
+            continue;
+        };
+        recursive_calls.insert(
+            *call_site,
+            StructuredRecursiveCallFact {
+                call_site: *call_site,
+                block_addr,
+                op_index,
+                target,
+            },
+        );
+    }
+    recursive_calls
+}
+
 fn collect_predicate_facts(function: &SSAFunction, graph: &SsaGraph) -> PredicateFacts {
     let mut predicates = BTreeMap::new();
     let mut block_assumptions = BTreeMap::<u64, Vec<BlockAssumption>>::new();
@@ -1001,9 +1534,41 @@ fn collect_compare_defs(
     graph: &SsaGraph,
 ) -> BTreeMap<SSAVar, CompareProvenance> {
     let mut compare_defs = BTreeMap::new();
+    let mut sub_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
+    let mut signed_overflow_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
+    let mut signed_sign_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
     for block in function.blocks() {
         for op in &block.ops {
+            match op {
+                SSAOp::IntSub { dst, a, b } => {
+                    if let (Some(lhs), Some(rhs)) =
+                        (graph.value_id_for_var(a), graph.value_id_for_var(b))
+                    {
+                        sub_sources.insert(dst.clone(), (lhs, rhs));
+                    }
+                }
+                SSAOp::IntSBorrow { dst, a, b } => {
+                    if let (Some(lhs), Some(rhs)) =
+                        (graph.value_id_for_var(a), graph.value_id_for_var(b))
+                    {
+                        signed_overflow_sources.insert(dst.clone(), (lhs, rhs));
+                    }
+                }
+                SSAOp::IntSLess { dst, a, b } if const_value(b) == Some(0) => {
+                    if let Some((lhs, rhs)) = sub_sources.get(a).copied() {
+                        signed_sign_sources.insert(dst.clone(), (lhs, rhs));
+                    }
+                }
+                _ => {}
+            }
             let Some((dst, kind, lhs, rhs)) = compare_components(op) else {
+                if let Some((dst, kind, lhs, rhs)) = signed_flag_compare_components(
+                    op,
+                    &signed_overflow_sources,
+                    &signed_sign_sources,
+                ) {
+                    compare_defs.insert(dst.clone(), CompareProvenance { kind, lhs, rhs });
+                }
                 continue;
             };
             let Some(lhs_id) = graph.value_id_for_var(lhs) else {
@@ -1020,9 +1585,39 @@ fn collect_compare_defs(
                     rhs: rhs_id,
                 },
             );
+            if let Some((dst, kind, lhs, rhs)) =
+                signed_flag_compare_components(op, &signed_overflow_sources, &signed_sign_sources)
+            {
+                compare_defs.insert(dst.clone(), CompareProvenance { kind, lhs, rhs });
+            }
         }
     }
     compare_defs
+}
+
+fn signed_flag_compare_components<'a>(
+    op: &'a SSAOp,
+    signed_overflow_sources: &BTreeMap<SSAVar, (ValueId, ValueId)>,
+    signed_sign_sources: &BTreeMap<SSAVar, (ValueId, ValueId)>,
+) -> Option<(&'a SSAVar, CompareKind, ValueId, ValueId)> {
+    let SSAOp::IntNotEqual { dst, a, b } = op else {
+        return None;
+    };
+    let overflow = signed_overflow_sources.get(a);
+    let sign = signed_sign_sources.get(b);
+    let (lhs, rhs) = overflow
+        .zip(sign)
+        .filter(|(overflow, sign)| overflow == sign)
+        .map(|(overflow, _)| *overflow)
+        .or_else(|| {
+            let overflow = signed_overflow_sources.get(b);
+            let sign = signed_sign_sources.get(a);
+            overflow
+                .zip(sign)
+                .filter(|(overflow, sign)| overflow == sign)
+                .map(|(overflow, _)| *overflow)
+        })?;
+    Some((dst, CompareKind::SignedLess, lhs, rhs))
 }
 
 fn compare_components(op: &SSAOp) -> Option<(&SSAVar, CompareKind, &SSAVar, &SSAVar)> {

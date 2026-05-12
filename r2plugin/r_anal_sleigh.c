@@ -81,6 +81,8 @@ extern char *r2il_block_op_json_named(const R2ILContext *ctx, const R2ILBlock *b
 extern void r2il_string_free(char *s);
 extern char *r2sleigh_decompile_render_cache_stats_json(void);
 extern void r2sleigh_decompile_render_cache_stats_reset(void);
+extern char *r2sleigh_engine_cache_stats_json(void);
+extern void r2sleigh_engine_cache_stats_reset(void);
 
 /* Typed analysis */
 extern char *r2il_block_regs_read(const R2ILContext *ctx, const R2ILBlock *block);
@@ -244,6 +246,7 @@ typedef struct {
 	unsigned int schema_version;
 	unsigned long long dirty_epoch;
 	unsigned long long context_hash;
+	unsigned long long type_dirty_epoch;
 	const char *external_context_json;
 	const char *signature_name;
 	const char *signature_ret_type;
@@ -368,6 +371,7 @@ extern const R2SleighSignatureFact *r2sleigh_session_result_signature_fact(const
 extern void r2sleigh_session_result_free(R2SleighSessionResult *result);
 extern char *r2sleigh_bounded_type_json_ffi(const R2ILContext *ctx, const char *fcn_name,
 	const char *reason, size_t global_max_links, size_t max_type_decls, size_t max_mutations);
+extern bool r2sleigh_has_native_worker_summary_family_ffi(const char *name);
 extern void r2sleigh_type_writeback_cache_clear(void);
 extern size_t r2sleigh_type_writeback_cache_len(void);
 extern int r2sleigh_type_writeback_cache_get(unsigned long long addr, unsigned long long *key,
@@ -413,6 +417,11 @@ extern char *r2dec_function_with_context_scope(const R2ILContext *ctx, const R2I
 	const R2ILFunctionBlocks *functions, size_t num_functions);
 extern char *r2dec_function_with_session_context(const R2SleighSessionInput *input,
 	const char *func_names_json, const char *strings_json, const char *symbols_json);
+extern char *r2dec_named_native_worker_summary(const R2ILContext *ctx, const R2ILBlock **blocks,
+	size_t num_blocks, unsigned long long fcn_addr, const char *func_name);
+extern char *r2sleigh_named_native_worker_type_json(const R2ILContext *ctx,
+	unsigned long long fcn_addr, const char *func_name, const void *function_context,
+	size_t global_max_links, size_t max_type_decls, size_t max_mutations);
 extern char *r2dec_semantic_worker_linearization_scope_ffi(const R2ILContext *ctx, const R2ILBlock **blocks, size_t num_blocks,
 	unsigned long long fcn_addr, const char *func_name, size_t block_count, size_t loop_count,
 	size_t back_edge_count, size_t max_switch_cases, const R2ILFunctionBlocks *functions, size_t num_functions);
@@ -700,6 +709,7 @@ static bool sleigh_typed_function_context_build(
 	typed->context.schema_version = 1;
 	typed->context.dirty_epoch = r_anal_function_dirty_epoch (fcn);
 	typed->context.context_hash = r_anal_function_context_hash (anal, fcn);
+	typed->context.type_dirty_epoch = r_anal_types_dirty_epoch (anal);
 	typed->context.external_context_json = "{}";
 	if (sleigh_function_context_api.available && sleigh_function_context_api.collect && sleigh_function_context_api.free) {
 		typed->typed_ctx = sleigh_function_context_api.collect (anal, fcn);
@@ -3764,72 +3774,6 @@ static bool compute_decompile_cfg_risk_summary(RAnal *anal, RAnalFunction *fcn, 
 	return true;
 }
 
-static size_t decompiler_max_blocks_preflight(void) {
-	const char *raw = getenv ("SLEIGH_DEC_MAX_BLOCKS");
-	char *endptr = NULL;
-	unsigned long long parsed;
-	if (!raw || !*raw) {
-		return 200;
-	}
-	errno = 0;
-	parsed = strtoull (raw, &endptr, 10);
-	if (errno != 0 || endptr == raw || parsed == 0) {
-		return 200;
-	}
-	if (parsed > (unsigned long long)SIZE_MAX) {
-		return SIZE_MAX;
-	}
-	return (size_t)parsed;
-}
-
-static bool decompile_cfg_summary_prefers_budget(const DecompileCFGRiskSummary *summary, size_t max_blocks) {
-	if (!summary) {
-		return false;
-	}
-	if (summary->block_count > max_blocks) {
-		return true;
-	}
-	if (summary->loop_count > 8 || summary->back_edge_count > 16) {
-		return true;
-	}
-	if (summary->loop_count > 0
-		&& summary->block_count >= 32
-		&& summary->max_switch_cases >= 32) {
-		return true;
-	}
-	return summary->loop_count > 4
-		&& summary->block_count >= 96
-		&& summary->max_switch_cases >= 32;
-}
-
-static void print_decompile_cfg_budget_comment(RCons *cons, const RAnalFunction *fcn, const DecompileCFGRiskSummary *summary, size_t max_blocks) {
-	const char *fname = (fcn && fcn->name) ? fcn->name : "unknown";
-	if (!cons || !summary) {
-		return;
-	}
-	if (summary->block_count > max_blocks) {
-		char *guard_comment = r2dec_block_guard_comment_ffi (fname, summary->block_count, max_blocks);
-		if (guard_comment && guard_comment[0]) {
-			r_cons_printf (cons, "%s\n", guard_comment);
-		} else {
-			r_cons_printf (cons,
-				"/* r2dec budget: skipped decompilation for %s (%zu blocks > limit %zu). */\n",
-				fname, summary->block_count, max_blocks);
-		}
-		if (guard_comment) {
-			r2il_string_free (guard_comment);
-		}
-		return;
-	}
-	r_cons_printf (cons,
-		"/* r2dec budget: skipped decompilation for %s (complex CFG: blocks=%zu loops=%zu back_edges=%zu max_switch_cases=%zu). */\n",
-		fname,
-		summary->block_count,
-		summary->loop_count,
-		summary->back_edge_count,
-		summary->max_switch_cases);
-}
-
 static RAnalFunction *materialize_function_at(RAnal *anal, ut64 addr) {
 	RAnalFunction *fcn;
 	int ret;
@@ -5423,132 +5367,6 @@ static bool block_has_usable_switch_op(const RAnalBlock *bb) {
 	return bb && bb->switch_op && bb->switch_op != (const RAnalSwitchOp *)UT64_MAX;
 }
 
-static bool parse_case_flag_for_switch(const char *name, ut64 switch_addr, bool *is_default, ut64 *case_value) {
-	char prefix[64];
-	char default_prefix[64];
-	const char *suffix;
-	char *endptr = NULL;
-	unsigned long long parsed;
-
-	if (!name || !*name) {
-		return false;
-	}
-
-	snprintf (prefix, sizeof (prefix), "case.0x%"PFMT64x".", switch_addr);
-	if (r_str_startswith (name, prefix)) {
-		suffix = name + strlen (prefix);
-		if (!*suffix) {
-			return false;
-		}
-		parsed = strtoull (suffix, &endptr, 10);
-		if (endptr == suffix || (endptr && *endptr)) {
-			return false;
-		}
-		if (is_default) {
-			*is_default = false;
-		}
-		if (case_value) {
-			*case_value = (ut64)parsed;
-		}
-		return true;
-	}
-
-	snprintf (default_prefix, sizeof (default_prefix), "case.default.0x%"PFMT64x, switch_addr);
-	if (!strcmp (name, default_prefix)) {
-		if (is_default) {
-			*is_default = true;
-		}
-		if (case_value) {
-			*case_value = UT64_MAX;
-		}
-		return true;
-	}
-
-	return false;
-}
-
-static bool synthesize_switch_info_from_case_flags(
-	RAnal *anal,
-	RAnalFunction *fcn,
-	RAnalBlock *bb,
-	ut64 switch_addr,
-	R2ILBlock *block
-) {
-	RListIter *iter;
-	RAnalBlock *candidate;
-	unsigned long long *case_values = NULL;
-	unsigned long long *case_targets = NULL;
-	size_t ncases = 0;
-	size_t capacity = 0;
-	ut64 min_val = ULLONG_MAX;
-	ut64 max_val = 0;
-	ut64 default_target = 0;
-	bool any_case = false;
-
-	if (!anal || !fcn || !bb || !block || switch_addr == UT64_MAX || !anal->flb.get_at) {
-		return false;
-	}
-
-	r_list_foreach (fcn->bbs, iter, candidate) {
-		RFlagItem *flag;
-		bool is_default = false;
-		ut64 case_value = UT64_MAX;
-		unsigned long long *next_values;
-		unsigned long long *next_targets;
-
-		if (!candidate || candidate->addr == bb->addr) {
-			continue;
-		}
-
-		flag = anal->flb.get_at (anal->flb.f, candidate->addr, false);
-		if (!flag || !flag->name || !parse_case_flag_for_switch (flag->name, switch_addr, &is_default, &case_value)) {
-			continue;
-		}
-
-		if (is_default) {
-			default_target = candidate->addr;
-			continue;
-		}
-
-		if (ncases >= capacity) {
-			size_t new_capacity = capacity ? (capacity * 2) : 8;
-			next_values = realloc (case_values, new_capacity * sizeof (unsigned long long));
-			if (!next_values) {
-				free (case_values);
-				free (case_targets);
-				return false;
-			}
-			next_targets = realloc (case_targets, new_capacity * sizeof (unsigned long long));
-			if (!next_targets) {
-				free (next_values);
-				free (case_targets);
-				return false;
-			}
-			case_values = next_values;
-			case_targets = next_targets;
-			capacity = new_capacity;
-		}
-
-		case_values[ncases] = case_value;
-		case_targets[ncases] = candidate->addr;
-		min_val = R_MIN (min_val, case_value);
-		max_val = R_MAX (max_val, case_value);
-		ncases++;
-		any_case = true;
-	}
-
-	if (!any_case || ncases < 2) {
-		free (case_values);
-		free (case_targets);
-		return false;
-	}
-
-	r2il_block_set_switch_info (block, switch_addr, min_val, max_val, default_target, case_values, case_targets, ncases);
-	free (case_values);
-	free (case_targets);
-	return true;
-}
-
 static bool parse_switch_table_addr_from_comment(const char *comment, ut64 *table_addr) {
 	const char *needle;
 	char *endptr = NULL;
@@ -6414,9 +6232,6 @@ static bool lift_function_blocks(
 					free (case_values);
 					free (case_targets);
 				}
-			} else if (r2il_block_has_trailing_indirect_branch (block)) {
-				ut64 switch_addr = find_last_block_op_addr (anal, bb, buf, to_read);
-				(void)synthesize_switch_info_from_case_flags (anal, fcn, bb, switch_addr, block);
 			}
 
 			if (!r2il_block_validate (ctx, block)) {
@@ -6488,7 +6303,7 @@ static void sleigh_profile_clear(void) {
 	sleigh_profile_entries = NULL;
 	sleigh_profile_count = 0;
 	sleigh_profile_cap = 0;
-	r2sleigh_decompile_render_cache_stats_reset ();
+	r2sleigh_engine_cache_stats_reset ();
 }
 
 static SleighProfileEntry *sleigh_profile_entry_get(ut64 addr, const char *name) {
@@ -6574,6 +6389,7 @@ static char *sleigh_profile_json(RAnal *anal) {
 	size_t max_items = SLEIGH_PROFILE_MAX_DEFAULT;
 	SleighProfileEntry **items = NULL;
 	char *decompile_cache = r2sleigh_decompile_render_cache_stats_json ();
+	char *engine_cache = r2sleigh_engine_cache_stats_json ();
 	if (sleigh_profile_count > 0) {
 		items = calloc (sleigh_profile_count, sizeof (*items));
 		if (items) {
@@ -6590,6 +6406,10 @@ static char *sleigh_profile_json(RAnal *anal) {
 	if (decompile_cache && *decompile_cache) {
 		pj_k (pj, "decompile_cache");
 		pj_raw (pj, decompile_cache);
+	}
+	if (engine_cache && *engine_cache) {
+		pj_k (pj, "engine_cache");
+		pj_raw (pj, engine_cache);
 	}
 	pj_ka (pj, "functions");
 	size_t shown = 0;
@@ -6615,6 +6435,9 @@ static char *sleigh_profile_json(RAnal *anal) {
 	free (items);
 	if (decompile_cache) {
 		r2il_string_free (decompile_cache);
+	}
+	if (engine_cache) {
+		r2il_string_free (engine_cache);
 	}
 	return pj_drain (pj);
 }
@@ -7992,6 +7815,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				const char *target_arg = skip_cmd_spaces (cmd + prefix_len);
 				SleighAnalysisPolicy policy = sleigh_analysis_policy_for_anal (anal);
 				bool prefer_bounded_semantic_type_plan = false;
+				bool named_worker_summary_family = false;
 
 		if (!ctx) {
 			R_LOG_ERROR ("r2sleigh: no context");
@@ -8014,8 +7838,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				return strdup ("");
 			}
 			prefer_bounded_semantic_type_plan = should_skip_decompile_symbolic_scope (fcn);
+			named_worker_summary_family = r2sleigh_has_native_worker_summary_family_ffi (fcn->name);
 
-			if (!prefer_bounded_semantic_type_plan) {
+			if (!prefer_bounded_semantic_type_plan && !named_worker_summary_family) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
 					&sym_scope, &interproc_seeds);
 			}
@@ -8029,7 +7854,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				return strdup ("");
 			}
 			/* Debug reports intentionally use the same Rust analysis-session API. */
-			if (prefer_bounded_semantic_type_plan && build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
+			if (prefer_bounded_semantic_type_plan && !named_worker_summary_family
+				&& build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
 				have_sym_scope = true;
 				sleigh_interproc_seeds_init (&interproc_seeds);
 			}
@@ -8078,6 +7904,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				const char *target_arg = skip_cmd_spaces (cmd + 9);
 				SleighAnalysisPolicy policy = sleigh_analysis_policy_for_anal (anal);
 				bool prefer_bounded_semantic_type_plan = false;
+				bool named_worker_summary_family = false;
 
 		if (!ctx) {
 			R_LOG_ERROR ("r2sleigh: no context");
@@ -8095,36 +7922,14 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				}
 				return strdup ("");
 			}
-			if (should_skip_decompile_symbolic_scope (fcn)) {
-				char reason[256];
-				char *bounded_json;
-				snprintf (reason, sizeof (reason),
-					"bounded type plan for large function (blocks=%d cost=%u)",
-					function_bb_count (fcn),
-					(unsigned int)r_anal_function_cost (fcn));
-				bounded_json = r2sleigh_bounded_type_json_ffi (ctx, fcn->name, reason,
-					(size_t)policy.type_global_max_links,
-					(size_t)policy.type_max_decls,
-					(size_t)policy.type_max_mutations);
-				if (cons) {
-					if (bounded_json && *bounded_json) {
-						r_cons_printf (cons, "%s\n", bounded_json);
-					} else {
-						r_cons_println (cons, "{}");
-					}
-				}
-				if (bounded_json) {
-					r2il_string_free (bounded_json);
-				}
-				return strdup ("");
-			}
 			if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 				R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
 				return strdup ("");
-		}
+			}
 			prefer_bounded_semantic_type_plan = should_skip_decompile_symbolic_scope (fcn);
+			named_worker_summary_family = r2sleigh_has_native_worker_summary_family_ffi (fcn->name);
 
-			if (!prefer_bounded_semantic_type_plan) {
+			if (!prefer_bounded_semantic_type_plan && !named_worker_summary_family) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
 					&sym_scope, &interproc_seeds);
 			}
@@ -8137,7 +7942,31 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				block_array_free (&blocks);
 				return strdup ("");
 			}
-			if (prefer_bounded_semantic_type_plan && build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
+			if (named_worker_summary_family) {
+				result = r2sleigh_named_native_worker_type_json (ctx, fcn->addr, fcn->name,
+					&typed_context, (size_t)policy.type_global_max_links,
+					(size_t)policy.type_max_decls, (size_t)policy.type_max_mutations);
+				if (result && result[0]) {
+					if (cons) {
+						r_cons_printf (cons, "%s\n", result);
+					}
+					r2sleigh_session_result_free (session);
+					sleigh_typed_function_context_clear (&typed_context);
+					if (have_sym_scope) {
+						sym_function_scope_free (&sym_scope);
+						sleigh_interproc_seeds_free (&interproc_seeds);
+					}
+					block_array_free (&blocks);
+					r2il_string_free ((char *)result);
+					return strdup ("");
+				}
+				if (result) {
+					r2il_string_free ((char *)result);
+					result = NULL;
+				}
+			}
+			if (prefer_bounded_semantic_type_plan && !named_worker_summary_family
+				&& build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
 				have_sym_scope = true;
 				sleigh_interproc_seeds_init (&interproc_seeds);
 			}
@@ -8519,16 +8348,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			return strdup("");
 			}
-
-			size_t decompile_max_blocks = decompiler_max_blocks_preflight ();
-			DecompileCFGRiskSummary cfg_summary;
-			bool have_cfg_summary = false;
-			have_cfg_summary = compute_decompile_cfg_risk_summary (anal, fcn, &cfg_summary);
-			if (have_cfg_summary
-				&& decompile_cfg_summary_prefers_budget (&cfg_summary, decompile_max_blocks)) {
-				print_decompile_cfg_budget_comment (cons, fcn, &cfg_summary, decompile_max_blocks);
-				return strdup("");
-			}
 		/* Lift all blocks */
 		BlockArray blocks;
 		ut64 profile_start_us = r_time_now_mono ();
@@ -8542,66 +8361,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			SymFunctionScope sym_scope;
 			SleighInterprocSeeds interproc_seeds;
 			bool have_sym_scope = false;
+			bool named_worker_summary_family = r2sleigh_has_native_worker_summary_family_ffi (fcn->name);
+			bool skip_helper_scope = should_skip_decompile_symbolic_scope (fcn)
+				|| named_worker_summary_family;
+			R_LOG_DEBUG ("r2sleigh: decompile named_worker_summary_family=%d fcn=%s",
+				named_worker_summary_family? 1: 0, fcn->name? fcn->name: "");
 			sleigh_interproc_seeds_init (&interproc_seeds);
-			if (have_cfg_summary) {
-				result = r2dec_semantic_worker_linearization_scope_ffi (
-					ctx,
-					(const R2ILBlock **)blocks.blocks,
-					blocks.count,
-					fcn->addr,
-					fcn->name,
-					cfg_summary.block_count,
-					cfg_summary.loop_count,
-					cfg_summary.back_edge_count,
-					cfg_summary.max_switch_cases,
-					NULL,
-					0);
-				if (result && result[0]) {
-					if (cons) {
-						r_cons_printf (cons, "%s\n", result);
-					}
-					r2il_string_free (result);
-					sleigh_interproc_seeds_free (&interproc_seeds);
-					block_array_free (&blocks);
-					return strdup("");
-				}
-				if (result) {
-					r2il_string_free (result);
-					result = NULL;
-				}
+			if (!skip_helper_scope) {
+				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
+					&sym_scope, &interproc_seeds);
 			}
-			have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
-				&sym_scope, &interproc_seeds);
-		if (have_cfg_summary) {
-			result = r2dec_semantic_worker_linearization_scope_ffi (
-				ctx,
-				(const R2ILBlock **)blocks.blocks,
-				blocks.count,
-				fcn->addr,
-				fcn->name,
-				cfg_summary.block_count,
-				cfg_summary.loop_count,
-				cfg_summary.back_edge_count,
-				cfg_summary.max_switch_cases,
-				have_sym_scope? sym_scope.functions: NULL,
-				have_sym_scope? sym_scope.count: 0);
-			if (result && result[0]) {
-				if (cons) {
-					r_cons_printf (cons, "%s\n", result);
-				}
-				r2il_string_free (result);
-				if (have_sym_scope) {
-					sym_function_scope_free (&sym_scope);
-					sleigh_interproc_seeds_free (&interproc_seeds);
-				}
-				block_array_free (&blocks);
-				return strdup("");
-			}
-			if (result) {
-				r2il_string_free (result);
-				result = NULL;
-			}
-		}
 
 		/* Gather function names from r2 */
 			char *func_names_json = NULL;

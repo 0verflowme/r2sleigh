@@ -92,6 +92,7 @@ pub enum SemanticEvidenceAmbiguity {
 pub enum SemanticEvidenceReason {
     LargeCfg,
     SummaryBudget,
+    NameHint,
     AliasAmbiguity,
     ConflictingTargetSources,
     ReplayOverlap,

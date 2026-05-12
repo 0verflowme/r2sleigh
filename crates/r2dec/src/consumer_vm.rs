@@ -5,16 +5,6 @@ use r2types::FunctionTypeFacts;
 fn vm_summary_stats_comment(func_name: &str, vm_step: &r2sym::VmStepSummary) -> String {
     let kind = crate::format_vm_summary_kind(vm_step.kind);
     let selector = vm_step.selector.as_deref().unwrap_or("unknown");
-    let inputs = if vm_step.state_inputs.is_empty() {
-        "none".to_string()
-    } else {
-        vm_step.state_inputs.join(", ")
-    };
-    let outputs = if vm_step.state_outputs.is_empty() {
-        "none".to_string()
-    } else {
-        vm_step.state_outputs.join(", ")
-    };
     let exact_transfers = vm_step
         .transfers
         .iter()
@@ -72,41 +62,8 @@ fn vm_summary_stats_comment(func_name: &str, vm_step: &r2sym::VmStepSummary) -> 
         .sum::<usize>();
     let total_reads: usize = vm_step.handler_memory_reads.values().copied().sum();
     let total_writes: usize = vm_step.handler_memory_writes.values().copied().sum();
-    let handler_preview = vm_step
-        .dispatch_targets
-        .iter()
-        .take(3)
-        .map(|target| {
-            let values = vm_step
-                .case_values_by_target
-                .get(target)
-                .map(|values| {
-                    values
-                        .iter()
-                        .map(|value| format!("0x{value:x}"))
-                        .collect::<Vec<_>>()
-                        .join("|")
-                })
-                .unwrap_or_else(|| "default".to_string());
-            let updates = vm_step
-                .handler_state_updates
-                .get(target)
-                .map(|updates| {
-                    updates
-                        .iter()
-                        .take(3)
-                        .map(|update| format!("{}={}", update.output, update.expr))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .filter(|text| !text.is_empty())
-                .unwrap_or_else(|| "no_state_updates".to_string());
-            format!("0x{target:x}[{values}] => {updates}")
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
     format!(
-        "r2dec semantic summary: vm_summary for {} ({} @ 0x{:x}, loop_header=0x{:x}, selector={}, targets={}, redispatch={}, exact_transfers={}, likely_transfers={}, heuristic_transfers={}, redispatch_transfers={}, returning_transfers={}, selector_updates={}, exact_exit_guards={}, residual_guards={}, residual_memory={}, total_reads={}, total_writes={}, read_effects={}, write_effects={}, state_inputs=[{}], state_outputs=[{}], handlers={})",
+        "r2dec semantic summary: vm_summary for {} ({} @ 0x{:x}, loop_header=0x{:x}, selector={}, targets={}, redispatch={}, exact_transfers={}, likely_transfers={}, heuristic_transfers={}, redispatch_transfers={}, returning_transfers={}, selector_updates={}, exact_exit_guards={}, guard_gaps={}, memory_gaps={}, total_reads={}, total_writes={}, read_effects={}, write_effects={})",
         func_name,
         kind,
         vm_step.dispatch_header,
@@ -127,9 +84,6 @@ fn vm_summary_stats_comment(func_name: &str, vm_step: &r2sym::VmStepSummary) -> 
         total_writes,
         read_effects,
         write_effects,
-        inputs,
-        outputs,
-        handler_preview,
     )
 }
 
@@ -166,24 +120,6 @@ fn render_vm_signature(type_facts: &FunctionTypeFacts, func_name: &str) -> Strin
             .join(", ")
     };
     format!("{ret_ty} {func_name}({params})")
-}
-
-fn render_vm_memory_condition(effect: &r2sym::VmMemoryCondition) -> String {
-    let binding = effect.binding.as_deref().unwrap_or("value");
-    let range = if effect.offset_lo == effect.offset_hi {
-        format!("{:+#x}", effect.offset_lo)
-    } else {
-        format!("{:+#x}..{:+#x}", effect.offset_lo, effect.offset_hi)
-    };
-    let value = effect
-        .value_expr
-        .as_deref()
-        .or(Some(effect.expr.as_str()))
-        .unwrap_or(binding);
-    format!(
-        "{}[{:?} {}] size={} {}",
-        effect.region.name, effect.region.kind, range, effect.size, value
-    )
 }
 
 fn render_vm_case_block(
@@ -235,44 +171,19 @@ fn render_vm_case_block(
         .iter()
         .filter(|transfer| transfer.handler_target == target)
     {
-        for update in transfer.state_updates.iter().take(4) {
-            let _ = writeln!(out, "        {} = {};", update.output, update.expr);
-            emitted_body = true;
-        }
-        if let Some(selector_update) = transfer.selector_update.as_ref() {
-            let _ = writeln!(
-                out,
-                "        {} = {};",
-                selector_update.output, selector_update.expr
-            );
-            emitted_body = true;
-        }
-        for guard in transfer.exit_guards.iter().take(3) {
-            let _ = writeln!(
-                out,
-                "        /* if ({}) -> 0x{:x} [{:?}] */",
-                guard.guard.expr,
-                guard.target,
-                guard.guard.confidence()
-            );
-            emitted_body = true;
-        }
-        for effect in transfer.memory_reads.iter().take(2) {
-            let _ = writeln!(
-                out,
-                "        /* read {} [{:?}] */",
-                render_vm_memory_condition(effect),
-                effect.confidence()
-            );
-            emitted_body = true;
-        }
-        for effect in transfer.memory_writes.iter().take(2) {
-            let _ = writeln!(
-                out,
-                "        /* write {} [{:?}] */",
-                render_vm_memory_condition(effect),
-                effect.confidence()
-            );
+        let _ = writeln!(
+            out,
+            "        /* transfer exits={} guards={} updates={} reads={} writes={} confidence={:?} */",
+            transfer.exit_targets.len(),
+            transfer.exit_guards.len(),
+            transfer.state_updates.len() + usize::from(transfer.selector_update.is_some()),
+            transfer.memory_reads.len(),
+            transfer.memory_writes.len(),
+            transfer.confidence()
+        );
+        emitted_body = true;
+        if transfer.selector_update.is_some() {
+            let _ = writeln!(out, "        /* selector updated */");
             emitted_body = true;
         }
         if transfer.redispatch {
@@ -314,22 +225,6 @@ pub(crate) fn render_vm_semantic_summary(
         "    /* {} */",
         vm_summary_stats_comment(func_name, vm_step)
     );
-    if !vm_step.state_inputs.is_empty() || !vm_step.state_outputs.is_empty() {
-        let _ = writeln!(
-            out,
-            "    /* state_inputs=[{}] state_outputs=[{}] */",
-            if vm_step.state_inputs.is_empty() {
-                "none".to_string()
-            } else {
-                vm_step.state_inputs.join(", ")
-            },
-            if vm_step.state_outputs.is_empty() {
-                "none".to_string()
-            } else {
-                vm_step.state_outputs.join(", ")
-            },
-        );
-    }
     let _ = writeln!(out, "    switch ({selector}) {{");
     let mut default_emitted = false;
     for target in &vm_step.dispatch_targets {

@@ -21,11 +21,16 @@ pub use cache::{
 pub use compiler::compile_semantic_artifact_default_with_scope;
 pub use compiler::{
     compile_function_semantics_with_scope, compile_function_semantics_with_scope_and_replay_seed,
+    compile_named_native_worker_summary_artifact, compile_native_worker_summary_artifact,
     compile_query_semantic_artifact_with_scope,
     compile_query_semantic_artifact_with_scope_and_replay_seed,
     compile_semantic_artifact_with_scope, compile_semantic_artifact_with_scope_and_replay_seed,
+    compile_summary_dense_worker_artifact_from_interproc_summary,
 };
 pub use facts::{SymbolicReachabilityStatus, augment_semantic_artifact_with_interproc_summary};
+pub use native_worker::{
+    has_native_worker_summary_family, has_program_orchestrator_summary_family,
+};
 pub use plan::{
     ArtifactBuildPlan, DecompilePlan, QueryGuidanceMode, QueryPlan, TargetQueryExecutionRoute,
     TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
@@ -34,10 +39,10 @@ pub use region::{
     ArtifactGranularity, ControlFact, ExecutionModel, Judged, MemoryFact, NativeArtifactBody,
     NativeFunctionSummary, NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary,
     NativeParserKind, NativeParserSummary, NativeReductionSummary, NativeRegionSummary,
-    NativeWorkerFold, NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerSummary,
-    NativeWorkerSummaryKind, NativeWorkerTerminator, RefinementStage, RegionKey,
-    SemanticArtifactDiagnostics, SemanticPredicate, SemanticRegion, SemanticTargetConditionSource,
-    TargetFact, VmArtifactBody,
+    NativeSummarySpecificity, NativeWorkerFold, NativeWorkerFoldOperation, NativeWorkerLoopSummary,
+    NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator, RefinementStage,
+    RegionKey, SemanticArtifactDiagnostics, SemanticPredicate, SemanticRegion,
+    SemanticTargetConditionSource, TargetFact, VmArtifactBody,
 };
 pub use vm::{
     InterpreterDispatchSummary, InterpreterKind, VmBinaryOp, VmGuardCondition, VmGuardedExit,

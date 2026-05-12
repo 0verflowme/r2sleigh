@@ -7,7 +7,9 @@ use crate::external::{
     ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb, ExternalUnion,
     normalize_external_type_name,
 };
-use crate::facts::{FunctionParamSpec, FunctionSignatureSpec, FunctionType, parse_type_like_spec};
+use crate::facts::{
+    FunctionParamSpec, FunctionSignatureSpec, FunctionType, FunctionTypeFacts, parse_type_like_spec,
+};
 use crate::signature_infer::render_signature_type;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -34,6 +36,7 @@ pub type ExternalStackVarSpec = ExternalStackSlotSpec;
 pub struct ParsedExternalContext {
     pub context_schema_version: Option<u64>,
     pub context_dirty_epoch: Option<u64>,
+    pub type_dirty_epoch: Option<u64>,
     pub context_hash: Option<u64>,
     pub current_signature: Option<FunctionSignatureSpec>,
     pub merged_signature: Option<FunctionSignatureSpec>,
@@ -131,6 +134,8 @@ pub struct ExternalContextMetadataJson {
     pub schema_version: Option<u64>,
     #[serde(default)]
     pub dirty_epoch: Option<u64>,
+    #[serde(default)]
+    pub type_dirty_epoch: Option<u64>,
     #[serde(default)]
     pub context_hash: Option<u64>,
 }
@@ -254,17 +259,11 @@ pub fn canonical_main_signature_spec() -> FunctionSignatureSpec {
     }));
     let char_pp = CTypeLike::Pointer(Box::new(char_ptr));
     FunctionSignatureSpec {
-        ret_type: Some(CTypeLike::Int {
-            bits: 32,
-            signedness: crate::Signedness::Signed,
-        }),
+        ret_type: Some(CTypeLike::Typedef("int".to_string())),
         params: vec![
             FunctionParamSpec {
                 name: "argc".to_string(),
-                ty: Some(CTypeLike::Int {
-                    bits: 32,
-                    signedness: crate::Signedness::Signed,
-                }),
+                ty: Some(CTypeLike::Typedef("int".to_string())),
             },
             FunctionParamSpec {
                 name: "argv".to_string(),
@@ -329,6 +328,24 @@ pub fn apply_main_signature_override(
     }
 }
 
+pub fn function_type_facts_from_parsed_context(
+    function_name: &str,
+    parsed_context: &ParsedExternalContext,
+) -> FunctionTypeFacts {
+    let mut merged_signature = parsed_context.merged_signature.clone();
+    apply_main_signature_override(function_name, &mut merged_signature);
+    FunctionTypeFacts {
+        merged_signature,
+        known_function_signatures: parsed_context.known_function_signatures.clone(),
+        register_params: parsed_context.register_params.clone(),
+        stack_slots: parsed_context.stack_slots.clone(),
+        external_stack_vars: parsed_context.external_stack_vars.clone(),
+        external_type_db: parsed_context.external_type_db.clone(),
+        diagnostics: parsed_context.diagnostics.clone(),
+        ..FunctionTypeFacts::default()
+    }
+}
+
 pub fn parse_external_context_json(json_str: &str, ptr_bits: u32) -> ParsedExternalContext {
     let trimmed = json_str.trim();
     if trimmed.is_empty() || trimmed == "{}" || trimmed == "[]" {
@@ -352,6 +369,7 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
     if let Some(context) = raw.context.as_ref() {
         parsed.context_schema_version = context.schema_version;
         parsed.context_dirty_epoch = context.dirty_epoch;
+        parsed.type_dirty_epoch = context.type_dirty_epoch;
         parsed.context_hash = context.context_hash;
     }
 
@@ -1093,8 +1111,47 @@ mod tests {
         let merged = merged.expect("main signature");
         assert_eq!(merged.params.len(), 3);
         assert_eq!(merged.params[0].name, "argc");
+        assert_eq!(merged.params[0].ty, Some(CTypeLike::Typedef("int".into())));
         assert_eq!(merged.params[1].name, "argv");
         assert_eq!(merged.params[2].name, "envp");
+    }
+
+    #[test]
+    fn function_type_facts_from_context_canonicalizes_main_signature() {
+        let parsed = parse_external_context_json(
+            r#"{
+                "signature":{
+                    "ret":"int",
+                    "params":[
+                        {"name":"argc","type":"char *"},
+                        {"name":"argv","type":"char **"},
+                        {"name":"envp","type":"char **"}
+                    ]
+                }
+            }"#,
+            64,
+        );
+
+        let facts = function_type_facts_from_parsed_context("dbg.main", &parsed);
+        let signature = facts.merged_signature.expect("main signature");
+        assert_eq!(signature.ret_type, Some(CTypeLike::Typedef("int".into())));
+        assert_eq!(signature.params[0].name, "argc");
+        assert_eq!(
+            signature.params[0].ty,
+            Some(CTypeLike::Typedef("int".into()))
+        );
+        assert_eq!(
+            render_signature_type(signature.params[1].ty.as_ref().unwrap(), 64),
+            "int8_t**"
+        );
+
+        let helper = function_type_facts_from_parsed_context("dbg.helper", &parsed)
+            .merged_signature
+            .expect("helper signature");
+        assert_eq!(
+            render_signature_type(helper.params[0].ty.as_ref().unwrap(), 64),
+            "int8_t*"
+        );
     }
 
     #[test]

@@ -354,7 +354,301 @@ CMDS=<<EOF_CMDS
 aaaa
 s `afl~alloc_wrapper2[0]` >/dev/null
 af
-a:sla.debug.types | jq -c '(.ret_type == "void *" or .ret_type == "void*") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
+a:sla.debug.types | jq -c '(.ret_type == "allocation_ptr") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
+EOF_CMDS
+RUN
+
+NAME=named_file_transfer_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~main[0]` >/dev/null
+afn copy_file_data
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("file_transfer")) != null) and (.params[1].type == "stat*") and (.params[8].type == "count_t")'
+EOF_CMDS
+RUN
+
+NAME=named_sort_merge_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~main[0]` >/dev/null
+afn mergefps
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("record_stream")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("sort_merge")) != null) and (.params[0].type == "sortfile*") and (.params[3].type == "FILE*")'
+EOF_CMDS
+RUN
+
+NAME=named_output_stream_summary_uses_canonical_helper_name
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~main[0]` >/dev/null
+afn oputs_.constprop.0
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("output_stream")) != null)'
+EOF_CMDS
+RUN
+
+NAME=named_hash_fold_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _md5_process_block
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("hash_fold")) != null) and (.params[1].type == "size_t") and (.params[2].type == "md5_ctx*")'
+EOF_CMDS
+RUN
+
+NAME=named_numeric_transform_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn gregorian_to_persian
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("numeric_transform")) != null) and (.ret_type == "int") and (.params[0].type == "calendar_date*") and (.params[0].name == "result")'
+EOF_CMDS
+RUN
+
+NAME=named_randread_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn randread
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("hash_fold")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("memory_write")) != null) and (.ret_type == "void") and (.params[0].type == "randread_source*") and (.params[1].type == "int8_t*") and (.params[2].type == "size_t")'
+EOF_CMDS
+RUN
+
+NAME=named_pattern_parser_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _internal_fnwmatch
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and ((.params[0].type // "") | contains("wchar_t")) and (.params[3].name == "no_leading_period")'
+EOF_CMDS
+RUN
+
+NAME=named_getopt_parser_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _getopt_internal_r
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.params[2].name == "optstring") and (.params[3].type == "option*") and (.params[6].type == "_getopt_data*")'
+EOF_CMDS
+RUN
+
+NAME=named_digest_stream_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn digest_file.isra.0
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("hash_fold")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("record_stream")) != null) and (.params[2].type == "size_t")'
+EOF_CMDS
+RUN
+
+NAME=named_expression_eval_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn binop
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "int")'
+EOF_CMDS
+RUN
+
+NAME=named_counter_output_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn write_counts
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("output_stream")) != null) and (.ret_type == "void") and (.params[0].type == "uintmax_t") and (.params[4].type == "intmax_t")'
+EOF_CMDS
+RUN
+
+NAME=named_diagnostic_summary_feeds_void_signature
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn verror_at_line
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("diagnostic_wrapper")) != null) and (.ret_type == "void") and (.params[3].type == "unsigned int") and ((.params[5].type // "") | contains("__va_list_tag"))'
+EOF_CMDS
+RUN
+
+NAME=named_argmatch_summary_feeds_table_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn argmatch
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "ptrdiff_t") and (.params[2].type == "argmatch_value*") and (.params[3].type == "size_t")'
+EOF_CMDS
+RUN
+
+NAME=named_quotearg_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn quotearg_n_options
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (.params[2].type == "size_t") and (.params[3].type == "quoting_options*")'
+EOF_CMDS
+RUN
+
+NAME=named_selinux_path_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn defaultcon
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("path_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("metadata_probe")) != null) and (.ret_type == "int") and (.params[0].type == "selabel_handle*") and (.params[2].type == "mode_t")'
+EOF_CMDS
+RUN
+
+NAME=named_renameatu_summary_feeds_path_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn renameatu
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("path_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("metadata_probe")) != null) and (.ret_type == "int") and (.params[1].type == "int8_t*") and (.params[4].type == "unsigned int")'
+EOF_CMDS
+RUN
+
+NAME=named_streamsavedir_summary_feeds_directory_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn streamsavedir
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("directory_traversal")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (.ret_type == "int8_t*") and (.params[0].type == "DIR*") and ((.params[1].type // "") | contains("savedir_option"))'
+EOF_CMDS
+RUN
+
+NAME=named_quotearg_alloc_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn quotearg_alloc_mem
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "int8_t*") and (.params[2].type == "size_t*") and (.params[3].type == "quoting_options*")'
+EOF_CMDS
+RUN
+
+NAME=named_xpalloc_summary_feeds_allocation_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn xpalloc
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("metadata_probe")) != null) and (.ret_type == "allocation_ptr") and (.params[0].type == "allocation_ptr") and (.params[1].type == "idx_t*") and (.params[3].type == "ptrdiff_t")'
+EOF_CMDS
+RUN
+
+NAME=named_version_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn version_etc_va
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "void") and (.params[0].type == "FILE*") and ((.params[4].type // "") | contains("__va_list_tag"))'
+EOF_CMDS
+RUN
+
+NAME=named_multibyte_summary_feeds_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn rpl_mbrtowc
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (.params[0].type == "wchar_t*") and (.params[3].type == "mbstate_t*")'
 EOF_CMDS
 RUN
 
@@ -372,7 +666,7 @@ a:sla.debug.types | jq -c 'type=="object" and ((((.function_name // "") | contai
 EOF_CMDS
 RUN
 
-NAME=stress_parse_number_decompile_uses_summary_islands_not_hard_fallback
+NAME=stress_parse_number_decompile_uses_parser_summary_route
 FILE=bins/stress_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -382,7 +676,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~parse_number$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("parse_number") and contains("r2dec summary:") and contains("native worker summaries:") and contains("worker loop:") and (contains("r2dec fallback:")|not) and (contains("r2dec residual:")|not)'
+a:sla.dec | jq -Rs 'contains("parse_number") and contains("parse base10 numeric") and contains("worker summary: parser") and (contains("str != 45")|not) and (contains("str != 43")|not) and (contains("r2dec fallback:")|not) and (contains("r2dec residual:")|not)'
 EOF_CMDS
 RUN
 

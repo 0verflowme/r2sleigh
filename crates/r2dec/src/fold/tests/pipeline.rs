@@ -386,6 +386,61 @@ mod tests {
         ])));
     }
 
+    #[test]
+    fn scalar_stack_read_modify_write_drops_addr_of_aliases() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_external_stack_vars(HashMap::from([
+            (-8, stack_var_spec("sum", Some(CType::Int(32)), Some("rbp"))),
+            (-4, stack_var_spec("i", Some(CType::Int(32)), Some("rbp"))),
+        ]));
+        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
+            visible_stack_binding("sum", Some(CType::Int(32)), -8),
+            visible_stack_binding("i", Some(CType::Int(32)), -4),
+        ]));
+        ctx.set_type_hints(HashMap::from([
+            ("sum".to_string(), CType::Int(32)),
+            ("i".to_string(), CType::Int(32)),
+        ]));
+        ctx.state.analysis_ctx.stack_info.stack_vars = HashMap::from([
+            (-8, "sum".to_string()),
+            (-4, "i".to_string()),
+        ]);
+
+        let sum_rhs = ctx.collapse_scalar_stack_addr_artifact(CExpr::binary(
+            BinaryOp::Add,
+            CExpr::AddrOf(Box::new(CExpr::Var("sum".to_string()))),
+            CExpr::Subscript {
+                base: Box::new(CExpr::Var("arr".to_string())),
+                index: Box::new(CExpr::Var("i".to_string())),
+            },
+        ));
+        let i_rhs = ctx.rewrite_scalar_stack_placeholder_rhs(
+            &CExpr::Var("i".to_string()),
+            CExpr::Var("local_3".to_string()),
+        );
+
+        assert!(
+            expr_contains_var(&sum_rhs, "sum") && !expr_contains_addr_of(&sum_rhs),
+            "scalar sum update should not expose address aliases: {sum_rhs:?}"
+        );
+        assert!(
+            expr_contains_var(&i_rhs, "i") && !expr_contains_addr_of(&i_rhs),
+            "scalar loop increment should not expose address aliases: {i_rhs:?}"
+        );
+        assert!(
+            matches!(
+                &i_rhs,
+                CExpr::Binary {
+                    op: BinaryOp::Add,
+                    left,
+                    right,
+                } if matches!(left.as_ref(), CExpr::Var(name) if name == "i")
+                    && matches!(right.as_ref(), CExpr::IntLit(1))
+            ),
+            "scalar loop increment should render as `i + 1`: {i_rhs:?}"
+        );
+    }
+
     fn expr_contains_binary_op(expr: &CExpr, target: BinaryOp) -> bool {
         match expr {
             CExpr::Binary { op, left, right } => {
@@ -461,6 +516,46 @@ mod tests {
             }
             CExpr::Comma(items) => items.iter().any(|item| expr_contains_var(item, target)),
             CExpr::IntLit(_)
+            | CExpr::UIntLit(_)
+            | CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::SizeofType(_) => false,
+        }
+    }
+
+    fn expr_contains_addr_of(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::AddrOf(_) => true,
+            CExpr::Unary { operand, .. }
+            | CExpr::Paren(operand)
+            | CExpr::Deref(operand)
+            | CExpr::Sizeof(operand)
+            | CExpr::Cast { expr: operand, .. } => expr_contains_addr_of(operand),
+            CExpr::Binary { left, right, .. } => {
+                expr_contains_addr_of(left) || expr_contains_addr_of(right)
+            }
+            CExpr::Subscript { base, index } => {
+                expr_contains_addr_of(base) || expr_contains_addr_of(index)
+            }
+            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+                expr_contains_addr_of(base)
+            }
+            CExpr::Call { func, args } => {
+                expr_contains_addr_of(func) || args.iter().any(expr_contains_addr_of)
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                expr_contains_addr_of(cond)
+                    || expr_contains_addr_of(then_expr)
+                    || expr_contains_addr_of(else_expr)
+            }
+            CExpr::Comma(items) => items.iter().any(expr_contains_addr_of),
+            CExpr::Var(_)
+            | CExpr::IntLit(_)
             | CExpr::UIntLit(_)
             | CExpr::FloatLit(_)
             | CExpr::StringLit(_)
@@ -5780,6 +5875,23 @@ mod tests {
     }
 
     #[test]
+    fn test_c_int_typedef_return_context_signs_32_bit_literals() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.function_return_type = Some(Box::leak(Box::new(CType::Typedef(
+            "int".to_string(),
+        ))));
+
+        assert_eq!(
+            ctx.get_return_expr(&make_var("const:ffffffff", 0, 4)),
+            CExpr::IntLit(-1)
+        );
+        assert_eq!(
+            ctx.get_return_expr(&make_var("const:fffffffe", 0, 4)),
+            CExpr::IntLit(-2)
+        );
+    }
+
+    #[test]
     fn test_simplify_predicate_rewrites_ne_ge_zero_to_gt_zero() {
         let ctx = FoldingContext::new(64);
         let expr = CExpr::binary(
@@ -6546,7 +6658,7 @@ mod tests {
         let normalized =
             ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("tmp:2a000".to_string()));
 
-        assert_eq!(normalized, CExpr::Var("unk_2a000".to_string()));
+        assert_eq!(normalized, CExpr::Var("value_2a000".to_string()));
     }
 
     #[test]
@@ -8084,7 +8196,7 @@ mod tests {
             vec![
                 CExpr::Var("arg1".to_string()),
                 CExpr::Var("arg2".to_string()),
-                CExpr::Var("unk_2a000".to_string()),
+                CExpr::Var("value_2a000".to_string()),
                 CExpr::Member {
                     base: Box::new(CExpr::Var("class".to_string())),
                     member: "std".to_string(),
@@ -8137,7 +8249,7 @@ mod tests {
             vec![
                 CExpr::Var("arg1".to_string()),
                 CExpr::Var("arg2".to_string()),
-                CExpr::Var("unk_2a000".to_string()),
+                CExpr::Var("value_2a000".to_string()),
                 CExpr::Member {
                     base: Box::new(CExpr::Var("class".to_string())),
                     member: "std".to_string(),
@@ -16878,6 +16990,67 @@ mod tests {
                 false,
             ),
             CExpr::Var("s".to_string())
+        );
+    }
+
+    #[test]
+    fn final_public_predicate_sanitizer_hides_raw_tmp_names() {
+        let ctx = make_x86_64_ctx();
+        let normalized = ctx.normalize_final_stmt_calls(CStmt::if_stmt(
+            CExpr::binary(
+                BinaryOp::Ne,
+                CExpr::Var("tmp:3e480".to_string()),
+                CExpr::IntLit(2018),
+            ),
+            CStmt::Empty,
+            None,
+        ));
+
+        let CStmt::If { cond, .. } = normalized else {
+            panic!("expected if statement");
+        };
+        assert_eq!(
+            cond,
+            CExpr::binary(
+                BinaryOp::Ne,
+                CExpr::Var("value_3e480".to_string()),
+                CExpr::IntLit(2018),
+            )
+        );
+    }
+
+    #[test]
+    fn final_public_call_arg_sanitizer_hides_raw_stack_slots() {
+        let ctx = make_x86_64_ctx();
+        let normalized = ctx.normalize_final_stmt_calls(CStmt::Expr(CExpr::call(
+            CExpr::Var("sym.rpl_mbrtoc32".to_string()),
+            vec![CExpr::binary(
+                BinaryOp::Add,
+                CExpr::IntLit(12),
+                CExpr::binary(
+                    BinaryOp::Sub,
+                    CExpr::Var("var_8h".to_string()),
+                    CExpr::IntLit(48),
+                ),
+            )],
+        )));
+
+        let CStmt::Expr(CExpr::Call { args, .. }) = normalized else {
+            panic!("expected call statement");
+        };
+        let mut names = Vec::new();
+        args[0].visit(&mut |expr| {
+            if let CExpr::Var(name) = expr {
+                names.push(name.clone());
+            }
+        });
+        assert!(
+            names.iter().any(|name| name == "slot_8"),
+            "expected sanitized stack slot name, got {args:?}"
+        );
+        assert!(
+            names.iter().all(|name| name != "var_8h"),
+            "raw stack slot leaked in call arg: {args:?}"
         );
     }
 

@@ -1522,7 +1522,9 @@ fn memory_summary_region_label(region: &r2sym::BackwardMemoryRegion) -> String {
 
 fn native_worker_summary_kind_label(kind: r2sym::NativeWorkerSummaryKind) -> &'static str {
     match kind {
+        r2sym::NativeWorkerSummaryKind::ProgramOrchestrator => "program_orchestrator",
         r2sym::NativeWorkerSummaryKind::MemoryTransfer => "memory_transfer",
+        r2sym::NativeWorkerSummaryKind::FileTransfer => "file_transfer",
         r2sym::NativeWorkerSummaryKind::MemoryRead => "memory_read",
         r2sym::NativeWorkerSummaryKind::MemoryWrite => "memory_write",
         r2sym::NativeWorkerSummaryKind::MemoryEscape => "memory_escape",
@@ -1530,7 +1532,18 @@ fn native_worker_summary_kind_label(kind: r2sym::NativeWorkerSummaryKind) -> &'s
         r2sym::NativeWorkerSummaryKind::StringScan => "string_scan",
         r2sym::NativeWorkerSummaryKind::HashFold => "hash_fold",
         r2sym::NativeWorkerSummaryKind::TableWalk => "table_walk",
+        r2sym::NativeWorkerSummaryKind::PathWalk => "path_walk",
+        r2sym::NativeWorkerSummaryKind::DirectoryTraversal => "directory_traversal",
+        r2sym::NativeWorkerSummaryKind::RecordStream => "record_stream",
+        r2sym::NativeWorkerSummaryKind::FieldSelection => "field_selection",
+        r2sym::NativeWorkerSummaryKind::OutputStream => "output_stream",
+        r2sym::NativeWorkerSummaryKind::FormatRender => "format_render",
+        r2sym::NativeWorkerSummaryKind::MetadataProbe => "metadata_probe",
+        r2sym::NativeWorkerSummaryKind::SortMerge => "sort_merge",
+        r2sym::NativeWorkerSummaryKind::NumericTransform => "numeric_transform",
         r2sym::NativeWorkerSummaryKind::Parser => "parser",
+        r2sym::NativeWorkerSummaryKind::DiagnosticWrapper => "diagnostic_wrapper",
+        r2sym::NativeWorkerSummaryKind::FormatArgumentFetch => "format_argument_fetch",
         r2sym::NativeWorkerSummaryKind::Allocation => "allocation",
         r2sym::NativeWorkerSummaryKind::Lifetime => "lifetime",
         r2sym::NativeWorkerSummaryKind::Synchronization => "synchronization",

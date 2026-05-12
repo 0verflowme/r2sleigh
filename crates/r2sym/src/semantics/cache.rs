@@ -11,7 +11,7 @@ use crate::sim::{PreparedFunctionScope, SummaryProfile};
 use super::artifact::SemanticArtifact;
 
 const SEMANTIC_CACHE_LIMIT: usize = 128;
-pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 7;
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 8;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::facts::FunctionTypeFacts;
+use crate::facts::{FunctionSignatureProjection, FunctionTypeFacts, SignatureProjectionResult};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisPlans {
@@ -98,7 +98,11 @@ pub struct DecompileCapabilityView {
     pub skipped_large_cfg: bool,
     pub has_native_regions: bool,
     pub has_summary_islands: bool,
+    pub has_primary_summary_islands: bool,
     pub summary_island_count: usize,
+    pub primary_summary_island_count: usize,
+    pub generic_memory_summary_count: usize,
+    pub has_memory_read_write_summary_pair: bool,
     pub actionable_region_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous_targets: Vec<u64>,
@@ -246,6 +250,16 @@ impl FunctionFacts {
         self.plans.artifact_build.clone()
     }
 
+    pub fn apply_signature_projection(
+        &mut self,
+        function_name: &str,
+        projection: FunctionSignatureProjection,
+        ptr_bits: u32,
+    ) -> SignatureProjectionResult {
+        self.types
+            .apply_signature_projection(function_name, projection, ptr_bits)
+    }
+
     pub fn interproc_summary_set(&self) -> Option<&r2ssa::InterprocSummarySet> {
         self.summary_view.as_set()
     }
@@ -290,10 +304,24 @@ impl FunctionFacts {
         capability.has_summary_islands = semantics
             .native_body()
             .is_some_and(r2sym::NativeArtifactBody::has_summary_islands);
+        capability.has_primary_summary_islands = semantics
+            .native_body()
+            .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands);
         capability.summary_island_count = semantics
             .native_body()
             .map(r2sym::NativeArtifactBody::summary_island_count)
             .unwrap_or(0);
+        capability.primary_summary_island_count = semantics
+            .native_body()
+            .map(r2sym::NativeArtifactBody::primary_summary_island_count)
+            .unwrap_or(0);
+        capability.generic_memory_summary_count = semantics
+            .native_body()
+            .map(r2sym::NativeArtifactBody::generic_memory_summary_count)
+            .unwrap_or(0);
+        capability.has_memory_read_write_summary_pair = semantics
+            .native_body()
+            .is_some_and(r2sym::NativeArtifactBody::has_memory_read_write_summary_pair);
         capability.actionable_region_count = semantics.actionable_regions().len();
         capability.ambiguous_targets = semantics.ambiguous_targets();
         capability.residual_reasons = semantics.diagnostics.residual_reasons.clone();

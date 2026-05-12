@@ -1,0 +1,19 @@
+[package]
+name = "r2engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session planner and artifact orchestration for r2sleigh"
+
+[dependencies]
+r2il = { path = "../r2il" }
+r2ssa = { path = "../r2ssa" }
+r2sym = { path = "../r2sym" }
+r2types = { path = "../r2types" }
+r2dec = { path = "../r2dec" }
+serde.workspace = true
+thiserror.workspace = true
+z3 = "0.20.0"
+
+[features]
+default = []

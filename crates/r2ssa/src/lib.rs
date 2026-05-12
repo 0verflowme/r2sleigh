@@ -63,10 +63,12 @@ pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};
 pub use semantic::{
     BlockAssumption, CallMemoryEffect, CallSiteFact, CallSiteFacts, CallSiteId, CompareKind,
-    CompareProvenance, GlobalObjectKey, MemoryDefFact, MemoryLocation, MemoryPhiFact,
+    CompareProvenance, GlobalObjectKey, LoopId, MemoryDefFact, MemoryLocation, MemoryPhiFact,
     MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
     PredicateFact, PredicateFacts, PredicateId, PreparedAssumptionBinding,
-    PreparedAssumptionBindingKind, PreparedFunctionFacts, SwitchPredicateFact,
+    PreparedAssumptionBindingKind, PreparedFunctionFacts, StructuredAccessId,
+    StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
+    StructuredRecursiveCallFact, SwitchPredicateFact,
 };
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
 pub use var::SSAVar;

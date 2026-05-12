@@ -796,6 +796,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "r2engine"
+version = "0.1.0"
+dependencies = [
+ "r2dec",
+ "r2il",
+ "r2ssa",
+ "r2sym",
+ "r2types",
+ "serde",
+ "thiserror 2.0.17",
+ "z3",
+]
+
+[[package]]
 name = "r2il"
 version = "0.1.0"
 dependencies = [
@@ -862,6 +876,7 @@ name = "r2sleigh-plugin"
 version = "0.1.0"
 dependencies = [
  "r2dec",
+ "r2engine",
  "r2il",
  "r2sleigh-export",
  "r2sleigh-lift",

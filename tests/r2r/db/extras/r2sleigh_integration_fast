@@ -318,7 +318,21 @@ CMDS=<<EOF_CMDS
 aaaa
 s `isq~alloc_wrapper2[0]` >/dev/null
 af
-a:sla.debug.types | jq -c '(.ret_type == "void *" or .ret_type == "void*") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
+a:sla.debug.types | jq -c '(.ret_type == "allocation_ptr") and (.interproc.summary != null) and (((.interproc.scope.payloads // []) | length) >= 1)'
+EOF_CMDS
+RUN
+
+NAME=dec_sum_array_uses_typed_session_header_and_signed_loop_condition
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `isq~sum_array$[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t sum_array(int32_t* arr, int32_t len)") and contains("for (i = 0; i < len; i = i + 1)") and contains("sum = sum + arr[i];") and (contains("int64_t sum_array(void*")|not) and (contains("while (i < 0)")|not) and (contains("local_3")|not) and (contains("&sum")|not)'
 EOF_CMDS
 RUN
 

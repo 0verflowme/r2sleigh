@@ -9,6 +9,7 @@ pub mod lattice;
 pub mod model;
 pub mod oracle;
 pub mod prepare;
+pub mod role_registry;
 pub mod signature;
 pub mod signature_infer;
 pub mod solver;
@@ -21,9 +22,9 @@ pub use context::{
     ExternalSignatureJson, ExternalSignatureParamJson, ExternalStackBase, ExternalStackSlotRole,
     ExternalStackSlotSpec, ExternalStackVarSpec, ExternalVarJson, ExternalVarKind,
     KnownSignatureJson, ParsedExternalContext, StackSlotKey, apply_main_signature_override,
-    canonical_main_signature_spec, is_c_main_function, is_generic_arg_name,
-    merge_signature_with_register_params, normalize_function_basename, parse_external_context,
-    parse_external_context_json,
+    canonical_main_signature_spec, function_type_facts_from_parsed_context, is_c_main_function,
+    is_generic_arg_name, merge_signature_with_register_params, normalize_function_basename,
+    parse_external_context, parse_external_context_json,
 };
 pub use convert::{CTypeLike, to_c_type_like};
 pub use external::{
@@ -35,10 +36,16 @@ pub use facts::{
     CalleeAtomicOrdering, CalleeFact, CalleeLifetimeEffect, CalleeLifetimeOp, CalleeMemoryEffect,
     CalleeMemoryEffectKind, CalleeMemoryLocation, CalleeMemoryRange, CalleeMemoryRegion,
     CalleeReturnRelation, CalleeSyncEffect, CalleeSyncOp, CalleeTransferEffect,
-    CalleeTransferLength, FunctionParamSpec, FunctionSignatureSpec, FunctionType,
-    FunctionTypeFactInputs, FunctionTypeFacts, FunctionTypeFactsBuilder, InterprocFactDiagnostics,
-    LocalFieldAccessFact, ResolvedFieldLayout, VisibleBinding, VisibleBindingKind,
-    parse_type_like_spec,
+    CalleeTransferLength, FunctionParamSpec, FunctionSignatureProjection, FunctionSignatureSpec,
+    FunctionType, FunctionTypeFactInputs, FunctionTypeFacts, FunctionTypeFactsBuilder,
+    InterprocFactDiagnostics, LocalFieldAccessFact, ResolvedFieldLayout,
+    SIGNATURE_PROJECTION_STRONG_CONFIDENCE, SIGNATURE_PROJECTION_WEAK_CONFIDENCE,
+    SignatureProjectionRejection, SignatureProjectionResult, SignatureProjectionSource,
+    VisibleBinding, VisibleBindingKind, is_generic_signature_type, parse_type_like_spec,
+    signature_hint_can_replace_existing, signature_param_count_is_authoritative,
+    signature_param_name_is_weak, signature_projection_is_exact,
+    signature_return_hint_can_replace_existing, signature_strength,
+    summary_hint_can_replace_weak_existing,
 };
 pub use function_facts::{
     AnalysisPlans, DecompileCapabilityView, FunctionFacts, InterprocSummaryView,
@@ -54,6 +61,10 @@ pub use prepare::{
     size_to_type, ssa_var_block_key, ssa_var_key,
 };
 pub use r2ssa::AssumptionUsageReport;
+pub use role_registry::{
+    normalize_role_name, semantic_typedef_is_authoritative, signature_hint_for_name_candidates,
+    signature_hint_for_role_name, signature_hint_for_summary_kinds,
+};
 pub use signature::{ResolvedSignature, SignatureRegistry};
 pub use signature_infer::{
     RecoveredSignatureParam, SignatureParamCandidate, SignatureTypeEvidence,
@@ -71,8 +82,9 @@ pub use writeback::{
     RecoveredVariable, StructDeclCandidate, StructDeclSource, StructFieldCandidate,
     TypeWritebackAnalysis, TypeWritebackAnalysisInput, TypeWritebackDiagnostics, TypeWritebackPlan,
     TypeWritebackSemanticInputs, VarRenameCandidate, VarTypeCandidate, WritebackEvidence,
-    WritebackSource, augment_local_struct_artifacts_with_semantics,
-    build_semantic_type_fallback_plan, build_type_writeback_analysis,
-    build_type_writeback_analysis_with_semantics, infer_local_struct_artifacts_from_ssa,
+    WritebackSource, apply_semantic_artifact_signature_hint_to_inferred,
+    augment_local_struct_artifacts_with_semantics, build_semantic_type_fallback_plan,
+    build_type_writeback_analysis, build_type_writeback_analysis_with_semantics,
+    infer_local_struct_artifacts_from_ssa, inferred_signature_to_function_type_facts,
     semantic_artifact_prefers_bounded_type_plan,
 };

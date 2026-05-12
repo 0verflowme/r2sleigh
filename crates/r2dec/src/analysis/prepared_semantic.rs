@@ -397,7 +397,7 @@ fn overlay_param_home_stack_aliases(
     inputs: &PreparedSemanticViewInputs<'_>,
 ) {
     for block in inputs.prepared.function().blocks() {
-        for op in &block.ops {
+        for (op_idx, op) in block.ops.iter().enumerate() {
             let SSAOp::Store { addr, val, .. } = op else {
                 continue;
             };
@@ -407,7 +407,9 @@ fn overlay_param_home_stack_aliases(
             else {
                 continue;
             };
-            let Some(arg_alias) = param_alias_for_var(inputs.param_register_aliases, val) else {
+            let Some(arg_alias) =
+                param_alias_for_store_value(inputs.param_register_aliases, block, op_idx, val)
+            else {
                 continue;
             };
             let entry = view
@@ -423,6 +425,41 @@ fn overlay_param_home_stack_aliases(
             }
         }
     }
+}
+
+fn param_alias_for_store_value(
+    param_register_aliases: &HashMap<String, String>,
+    block: &r2ssa::FunctionSSABlock,
+    before_idx: usize,
+    value: &SSAVar,
+) -> Option<String> {
+    let mut current = value;
+    for _ in 0..8 {
+        if let Some(alias) = param_alias_for_var(param_register_aliases, current) {
+            return Some(alias);
+        }
+        let next = block.ops[..before_idx]
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                SSAOp::Copy { dst, src }
+                | SSAOp::IntZExt { dst, src }
+                | SSAOp::IntSExt { dst, src }
+                | SSAOp::Trunc { dst, src }
+                | SSAOp::Cast { dst, src }
+                | SSAOp::Subpiece { dst, src, .. }
+                    if dst == current =>
+                {
+                    Some(src)
+                }
+                _ => None,
+            })?;
+        if next == current {
+            return None;
+        }
+        current = next;
+    }
+    None
 }
 
 fn populate_stack_offsets(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
@@ -1197,6 +1234,15 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             && let Some(addr) = call_site.direct_target
         {
             call_view.callee_name = lookup_callee_name(inputs, addr);
+        }
+        if call_view.callee_name.is_none()
+            && inputs
+                .prepared
+                .structured()
+                .recursive_calls
+                .contains_key(&call_site.id)
+        {
+            call_view.callee_name = inputs.prepared.function().name.clone();
         }
         call_view.result_owner = infer_call_result_owner(
             site,

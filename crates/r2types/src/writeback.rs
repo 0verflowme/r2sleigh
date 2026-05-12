@@ -20,9 +20,9 @@ use crate::facts::{
     CalleeAtomicOrdering, CalleeFact, CalleeLifetimeEffect, CalleeLifetimeOp, CalleeMemoryEffect,
     CalleeMemoryEffectKind, CalleeMemoryLocation, CalleeMemoryRange, CalleeMemoryRegion,
     CalleeReturnRelation, CalleeSyncEffect, CalleeSyncOp, CalleeTransferEffect,
-    CalleeTransferLength, FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFactInputs,
-    FunctionTypeFacts, InterprocFactDiagnostics, LocalFieldAccessFact, VisibleBinding,
-    VisibleBindingKind, parse_type_like_spec,
+    CalleeTransferLength, FunctionParamSpec, FunctionSignatureProjection, FunctionSignatureSpec,
+    FunctionTypeFactInputs, FunctionTypeFacts, InterprocFactDiagnostics, LocalFieldAccessFact,
+    SignatureProjectionResult, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
 use crate::function_facts::{FunctionFacts, InterprocSummaryView};
 use crate::model::Signedness;
@@ -229,6 +229,7 @@ struct SemanticTypeProjection {
     pointer_param_indices: BTreeSet<usize>,
     out_param_indices: BTreeSet<usize>,
     param_type_hints: BTreeMap<usize, CTypeLike>,
+    param_name_hints: BTreeMap<usize, String>,
     slot_field_profiles: BTreeMap<usize, BTreeMap<u64, String>>,
 }
 
@@ -244,6 +245,34 @@ fn byte_pointer_type() -> CTypeLike {
         bits: 8,
         signedness: Signedness::Unsigned,
     }))
+}
+
+fn signed_int_type(bits: u32) -> CTypeLike {
+    CTypeLike::Int {
+        bits,
+        signedness: Signedness::Signed,
+    }
+}
+
+fn c_int_type() -> CTypeLike {
+    typedef_type("int")
+}
+
+fn c_uint_type() -> CTypeLike {
+    typedef_type("unsigned int")
+}
+
+#[cfg(test)]
+fn signed_byte_pointer_pointer_type() -> CTypeLike {
+    CTypeLike::Pointer(Box::new(signed_byte_pointer_type()))
+}
+
+fn typedef_type(name: &str) -> CTypeLike {
+    CTypeLike::Typedef(name.to_string())
+}
+
+fn typedef_pointer_type(name: &str) -> CTypeLike {
+    CTypeLike::Pointer(Box::new(typedef_type(name)))
 }
 
 fn void_pointer_type() -> CTypeLike {
@@ -305,11 +334,243 @@ fn collect_worker_location_pointer_hint(
     }
 }
 
+fn collect_projection_size_arg_hint(
+    projection: &mut SemanticTypeProjection,
+    index: usize,
+    name: &str,
+    ptr_bits: u32,
+) {
+    projection
+        .param_name_hints
+        .entry(index)
+        .or_insert_with(|| name.to_string());
+    merge_param_type_hint(
+        &mut projection.param_type_hints,
+        index,
+        size_type(ptr_bits),
+        ptr_bits,
+    );
+}
+
+fn collect_worker_scalar_arg_type_hints(
+    summary: &r2sym::NativeWorkerSummary,
+    projection: &mut SemanticTypeProjection,
+    ptr_bits: u32,
+) {
+    if let Some(r2ssa::SummaryTransferLength::Arg(index)) = summary.len {
+        collect_projection_size_arg_hint(projection, index, "len", ptr_bits);
+    }
+    if let Some(length_arg) = summary
+        .loop_summary
+        .as_ref()
+        .and_then(|loop_summary| loop_summary.length_arg)
+    {
+        collect_projection_size_arg_hint(projection, length_arg, "len", ptr_bits);
+    }
+    if let Some(allocation) = summary.allocation
+        && let Some(index) = allocation.size_arg
+    {
+        collect_projection_size_arg_hint(projection, index, "size", ptr_bits);
+    }
+}
+
 fn collect_worker_summary_type_hints(
     summary: &r2sym::NativeWorkerSummary,
     projection: &mut SemanticTypeProjection,
     ptr_bits: u32,
 ) {
+    match summary.kind {
+        r2sym::NativeWorkerSummaryKind::DiagnosticWrapper => {
+            projection
+                .param_name_hints
+                .entry(1)
+                .or_insert_with(|| "fmt".to_string());
+            merge_param_type_hint(
+                &mut projection.param_type_hints,
+                0,
+                typedef_type("errno_t"),
+                ptr_bits,
+            );
+            collect_worker_location_pointer_hint(
+                &mut projection.param_type_hints,
+                &mut projection.pointer_param_indices,
+                summary.memory.as_ref(),
+                signed_byte_pointer_type(),
+                ptr_bits,
+            );
+            return;
+        }
+        r2sym::NativeWorkerSummaryKind::FormatArgumentFetch => {
+            collect_worker_location_pointer_hint(
+                &mut projection.param_type_hints,
+                &mut projection.pointer_param_indices,
+                summary.src.as_ref(),
+                typedef_pointer_type("__va_list_tag"),
+                ptr_bits,
+            );
+            collect_worker_location_pointer_hint(
+                &mut projection.param_type_hints,
+                &mut projection.pointer_param_indices,
+                summary.dst.as_ref(),
+                typedef_pointer_type("arguments"),
+                ptr_bits,
+            );
+            projection
+                .out_param_indices
+                .extend(summary.out_param_indices());
+            return;
+        }
+        _ => {}
+    }
+    if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::Parser) {
+        if let Some(index) = summary_location_arg_index(summary.dst.as_ref()) {
+            projection
+                .param_name_hints
+                .entry(index)
+                .or_insert_with(|| "output".to_string());
+        }
+        if let Some(index) = summary
+            .parser
+            .as_ref()
+            .and_then(|parser| parser.cursor_arg)
+            .or_else(|| summary_location_arg_index(summary.memory.as_ref()))
+        {
+            projection
+                .param_name_hints
+                .entry(index)
+                .or_insert_with(|| "stream".to_string());
+        }
+    }
+    if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::FileTransfer) {
+        if let Some(index) = summary_location_arg_index(summary.src.as_ref()) {
+            projection
+                .param_name_hints
+                .entry(index)
+                .or_insert_with(|| "src".to_string());
+        }
+        if let Some(index) = summary_location_arg_index(summary.dst.as_ref()) {
+            projection
+                .param_name_hints
+                .entry(index)
+                .or_insert_with(|| "dst".to_string());
+        }
+    }
+    if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::PathWalk)
+        && let Some(index) = summary_location_arg_index(summary.memory.as_ref())
+    {
+        projection
+            .param_name_hints
+            .entry(index)
+            .or_insert_with(|| "path".to_string());
+    }
+    if matches!(
+        summary.kind,
+        r2sym::NativeWorkerSummaryKind::DirectoryTraversal
+    ) {
+        if let Some(index) = summary_location_arg_index(summary.memory.as_ref()) {
+            projection
+                .param_name_hints
+                .entry(index)
+                .or_insert_with(|| "stream".to_string());
+        }
+        if let Some(index) = summary_location_arg_index(summary.dst.as_ref()) {
+            projection
+                .param_name_hints
+                .entry(index)
+                .or_insert_with(|| "entry".to_string());
+        }
+    }
+    match summary.kind {
+        r2sym::NativeWorkerSummaryKind::RecordStream => {
+            if let Some(index) = summary_location_arg_index(summary.memory.as_ref()) {
+                projection
+                    .param_name_hints
+                    .entry(index)
+                    .or_insert_with(|| "stream".to_string());
+            }
+        }
+        r2sym::NativeWorkerSummaryKind::FieldSelection => {
+            if let Some(index) = summary_location_arg_index(summary.memory.as_ref()) {
+                projection
+                    .param_name_hints
+                    .entry(index)
+                    .or_insert_with(|| "field_spec".to_string());
+            }
+        }
+        r2sym::NativeWorkerSummaryKind::OutputStream => {
+            if let Some(index) = summary_location_arg_index(summary.memory.as_ref()) {
+                projection
+                    .param_name_hints
+                    .entry(index)
+                    .or_insert_with(|| "text".to_string());
+            }
+        }
+        r2sym::NativeWorkerSummaryKind::FormatRender => {
+            if let Some(index) = summary_location_arg_index(summary.memory.as_ref()) {
+                projection
+                    .param_name_hints
+                    .entry(index)
+                    .or_insert_with(|| "format_input".to_string());
+            }
+        }
+        r2sym::NativeWorkerSummaryKind::MetadataProbe => {
+            if let Some(index) = summary_location_arg_index(summary.memory.as_ref()) {
+                projection
+                    .param_name_hints
+                    .entry(index)
+                    .or_insert_with(|| "metadata_subject".to_string());
+            }
+        }
+        r2sym::NativeWorkerSummaryKind::SortMerge => {
+            if let Some(index) = summary_location_arg_index(summary.memory.as_ref()) {
+                projection
+                    .param_name_hints
+                    .entry(index)
+                    .or_insert_with(|| "files".to_string());
+            }
+        }
+        r2sym::NativeWorkerSummaryKind::NumericTransform => {
+            if let Some(index) = summary_location_arg_index(summary.dst.as_ref()) {
+                projection
+                    .param_name_hints
+                    .entry(index)
+                    .or_insert_with(|| "result".to_string());
+                projection.out_param_indices.insert(index);
+            }
+        }
+        _ => {}
+    }
+    collect_worker_scalar_arg_type_hints(summary, projection, ptr_bits);
+    if summary.is_generic_memory_summary() {
+        return;
+    }
+    if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::FileTransfer) {
+        if let Some(index) = summary_location_arg_index(summary.src.as_ref()) {
+            merge_param_type_hint(
+                &mut projection.param_type_hints,
+                index,
+                signed_int_type(32),
+                ptr_bits,
+            );
+        }
+        if let Some(index) = summary_location_arg_index(summary.dst.as_ref()) {
+            merge_param_type_hint(
+                &mut projection.param_type_hints,
+                index,
+                signed_int_type(32),
+                ptr_bits,
+            );
+        }
+        if let Some(r2ssa::SummaryTransferLength::Arg(index)) = summary.len {
+            merge_param_type_hint(
+                &mut projection.param_type_hints,
+                index,
+                size_type(ptr_bits),
+                ptr_bits,
+            );
+        }
+        return;
+    }
     let pointer_hint = match summary.kind {
         r2sym::NativeWorkerSummaryKind::StringScan => signed_byte_pointer_type(),
         r2sym::NativeWorkerSummaryKind::Parser
@@ -320,14 +581,27 @@ fn collect_worker_summary_type_hints(
         {
             signed_byte_pointer_type()
         }
+        r2sym::NativeWorkerSummaryKind::PathWalk => signed_byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::RecordStream => typedef_pointer_type("FILE"),
+        r2sym::NativeWorkerSummaryKind::FieldSelection => signed_byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::OutputStream => signed_byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::FormatRender
+        | r2sym::NativeWorkerSummaryKind::MetadataProbe => void_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::SortMerge => typedef_pointer_type("sortfile"),
+        r2sym::NativeWorkerSummaryKind::NumericTransform => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::HashFold
         | r2sym::NativeWorkerSummaryKind::TableWalk
         | r2sym::NativeWorkerSummaryKind::Parser => byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::DirectoryTraversal => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::MemoryTransfer
         | r2sym::NativeWorkerSummaryKind::MemoryRead
         | r2sym::NativeWorkerSummaryKind::MemoryWrite => byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::FileTransfer => signed_int_type(32),
         r2sym::NativeWorkerSummaryKind::MemoryEscape
         | r2sym::NativeWorkerSummaryKind::MemoryFree
+        | r2sym::NativeWorkerSummaryKind::ProgramOrchestrator
+        | r2sym::NativeWorkerSummaryKind::DiagnosticWrapper
+        | r2sym::NativeWorkerSummaryKind::FormatArgumentFetch
         | r2sym::NativeWorkerSummaryKind::Allocation
         | r2sym::NativeWorkerSummaryKind::Lifetime
         | r2sym::NativeWorkerSummaryKind::Synchronization
@@ -363,36 +637,6 @@ fn collect_worker_summary_type_hints(
         ptr_bits,
     );
 
-    if let Some(r2ssa::SummaryTransferLength::Arg(index)) = summary.len {
-        merge_param_type_hint(
-            &mut projection.param_type_hints,
-            index,
-            size_type(ptr_bits),
-            ptr_bits,
-        );
-    }
-    if let Some(length_arg) = summary
-        .loop_summary
-        .as_ref()
-        .and_then(|loop_summary| loop_summary.length_arg)
-    {
-        merge_param_type_hint(
-            &mut projection.param_type_hints,
-            length_arg,
-            size_type(ptr_bits),
-            ptr_bits,
-        );
-    }
-    if let Some(allocation) = summary.allocation
-        && let Some(index) = allocation.size_arg
-    {
-        merge_param_type_hint(
-            &mut projection.param_type_hints,
-            index,
-            size_type(ptr_bits),
-            ptr_bits,
-        );
-    }
     if let Some(lifetime) = summary.lifetime {
         projection.pointer_param_indices.insert(lifetime.arg);
         merge_param_type_hint(
@@ -424,12 +668,25 @@ fn region_summary_pointer_hint(summary: &r2sym::NativeRegionSummary) -> CTypeLik
         {
             signed_byte_pointer_type()
         }
+        r2sym::NativeWorkerSummaryKind::PathWalk => signed_byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::RecordStream => typedef_pointer_type("FILE"),
+        r2sym::NativeWorkerSummaryKind::FieldSelection
+        | r2sym::NativeWorkerSummaryKind::OutputStream => signed_byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::SortMerge => typedef_pointer_type("sortfile"),
+        r2sym::NativeWorkerSummaryKind::NumericTransform => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::HashFold
         | r2sym::NativeWorkerSummaryKind::TableWalk
         | r2sym::NativeWorkerSummaryKind::Parser
+        | r2sym::NativeWorkerSummaryKind::DiagnosticWrapper
+        | r2sym::NativeWorkerSummaryKind::FormatArgumentFetch
         | r2sym::NativeWorkerSummaryKind::MemoryTransfer
         | r2sym::NativeWorkerSummaryKind::MemoryRead
         | r2sym::NativeWorkerSummaryKind::MemoryWrite => byte_pointer_type(),
+        r2sym::NativeWorkerSummaryKind::FileTransfer
+        | r2sym::NativeWorkerSummaryKind::ProgramOrchestrator
+        | r2sym::NativeWorkerSummaryKind::DirectoryTraversal
+        | r2sym::NativeWorkerSummaryKind::FormatRender
+        | r2sym::NativeWorkerSummaryKind::MetadataProbe => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::MemoryEscape
         | r2sym::NativeWorkerSummaryKind::MemoryFree
         | r2sym::NativeWorkerSummaryKind::Allocation
@@ -445,10 +702,42 @@ fn collect_region_summary_type_hints(
     projection: &mut SemanticTypeProjection,
     ptr_bits: u32,
 ) {
+    for access in &summary.memory_accesses {
+        if let Some(r2ssa::SummaryTransferLength::Arg(index)) = access.len {
+            collect_projection_size_arg_hint(projection, index, "len", ptr_bits);
+        }
+    }
+    if let Some(length_arg) = summary
+        .loop_summary
+        .as_ref()
+        .and_then(|loop_summary| loop_summary.length_arg)
+    {
+        collect_projection_size_arg_hint(projection, length_arg, "len", ptr_bits);
+    }
+    if summary.is_generic_memory_summary() {
+        return;
+    }
     let pointer_hint = region_summary_pointer_hint(summary);
     projection
         .out_param_indices
         .extend(summary.out_param_indices());
+    if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::Parser)
+        && let Some(index) = summary
+            .parser
+            .as_ref()
+            .and_then(|parser| parser.cursor_arg)
+            .or_else(|| {
+                summary
+                    .memory_accesses
+                    .iter()
+                    .find_map(|access| summary_location_arg_index(access.location.as_ref()))
+            })
+    {
+        projection
+            .param_name_hints
+            .entry(index)
+            .or_insert_with(|| "stream".to_string());
+    }
     for access in &summary.memory_accesses {
         let access_hint = match access.kind {
             r2sym::NativeMemoryAccessKind::Read
@@ -483,26 +772,6 @@ fn collect_region_summary_type_hints(
             access_hint,
             ptr_bits,
         );
-        if let Some(r2ssa::SummaryTransferLength::Arg(index)) = access.len {
-            merge_param_type_hint(
-                &mut projection.param_type_hints,
-                index,
-                size_type(ptr_bits),
-                ptr_bits,
-            );
-        }
-    }
-    if let Some(length_arg) = summary
-        .loop_summary
-        .as_ref()
-        .and_then(|loop_summary| loop_summary.length_arg)
-    {
-        merge_param_type_hint(
-            &mut projection.param_type_hints,
-            length_arg,
-            size_type(ptr_bits),
-            ptr_bits,
-        );
     }
 }
 
@@ -523,6 +792,163 @@ fn semantic_hints_compatible(semantic_hint: &CTypeLike, requested_hint: &CTypeLi
     )
 }
 
+fn normalized_semantic_function_name(name: &str) -> String {
+    crate::role_registry::normalize_role_name(name)
+}
+
+fn semantic_role_name_candidates(
+    function_name: &str,
+    summary_view: &InterprocSummaryView,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(name) = summary_view
+        .root_summary()
+        .and_then(|summary| summary.name.as_deref())
+        .map(normalized_semantic_function_name)
+        .filter(|name| !name.is_empty())
+    {
+        candidates.push(name);
+    }
+    let function_name = normalized_semantic_function_name(function_name);
+    if !function_name.is_empty() && !candidates.iter().any(|name| name == &function_name) {
+        candidates.push(function_name);
+    }
+    candidates
+}
+
+fn semantic_role_signature_hint(
+    function_name: &str,
+    summary_view: &InterprocSummaryView,
+    current_param_count: usize,
+) -> Option<FunctionSignatureSpec> {
+    let effective_param_count = current_param_count.max(
+        summary_view
+            .root_summary()
+            .and_then(|summary| summary.arg_count_hint)
+            .unwrap_or(0),
+    );
+    let candidates = semantic_role_name_candidates(function_name, summary_view);
+    crate::role_registry::signature_hint_for_name_candidates(
+        candidates.iter().map(String::as_str),
+        effective_param_count,
+    )
+}
+
+fn semantic_artifact_signature_hint(
+    semantic_artifact: Option<&r2sym::SemanticArtifact>,
+    current_param_count: usize,
+) -> Option<FunctionSignatureSpec> {
+    let native = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body)?;
+    let worker_kinds = native
+        .summary
+        .worker_summaries
+        .iter()
+        .map(|summary| summary.kind)
+        .chain(
+            native
+                .summary
+                .region_summaries
+                .iter()
+                .map(|summary| summary.kind),
+        )
+        .collect::<BTreeSet<_>>();
+    crate::role_registry::signature_hint_for_summary_kinds(&worker_kinds, current_param_count)
+}
+
+fn apply_signature_projection_to_merged(
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    function_name: &str,
+    projection: FunctionSignatureProjection,
+    ptr_bits: u32,
+) -> SignatureProjectionResult {
+    let mut facts = FunctionTypeFacts {
+        merged_signature: merged_signature.take(),
+        ..FunctionTypeFacts::default()
+    };
+    let result = facts.apply_signature_projection(function_name, projection, ptr_bits);
+    *merged_signature = facts.merged_signature;
+    result
+}
+
+fn apply_signature_projection_to_inferred(
+    inferred_signature: &mut InferredSignature,
+    projection: FunctionSignatureProjection,
+    ptr_bits: u32,
+) -> SignatureProjectionResult {
+    let mut merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
+    let confidence = projection.signature_confidence();
+    let return_confidence = projection.return_confidence;
+    let exact_strong_projection =
+        projection.exact_arity && projection.has_strong_signature_confidence();
+    let param_confidences = (0..projection.signature.params.len())
+        .map(|idx| projection.param_confidence(idx))
+        .collect::<Vec<_>>();
+    let prior_confidence = inferred_signature.confidence;
+    let result = apply_signature_projection_to_merged(
+        &mut merged_signature,
+        &inferred_signature.function_name,
+        projection,
+        ptr_bits,
+    );
+    if !result.was_applied() {
+        return result;
+    }
+    if let Some(signature) = merged_signature.as_ref() {
+        apply_signature_context_overrides(inferred_signature, Some(signature), ptr_bits);
+        if exact_strong_projection && inferred_signature.params.len() > signature.params.len() {
+            inferred_signature.params.truncate(signature.params.len());
+        }
+        if return_confidence >= crate::SIGNATURE_PROJECTION_WEAK_CONFIDENCE
+            && let Some(ret_ty) = signature.ret_type.as_ref()
+        {
+            inferred_signature.ret_type = render_signature_type(ret_ty, ptr_bits);
+        }
+        for (idx, param) in signature.params.iter().enumerate() {
+            if param_confidences.get(idx).is_some_and(|confidence| {
+                *confidence >= crate::SIGNATURE_PROJECTION_WEAK_CONFIDENCE
+            }) {
+                if !param.name.is_empty()
+                    && let Some(inferred_param) = inferred_signature.params.get_mut(idx)
+                {
+                    inferred_param.name = param.name.clone();
+                }
+                if let Some(ty) = param.ty.as_ref()
+                    && let Some(inferred_param) = inferred_signature.params.get_mut(idx)
+                {
+                    inferred_param.param_type = render_signature_type(ty, ptr_bits);
+                }
+            }
+        }
+        inferred_signature.signature = format_signature(
+            &inferred_signature.function_name,
+            &inferred_signature.ret_type,
+            &inferred_signature.params,
+        );
+        inferred_signature.confidence = prior_confidence.max(confidence);
+    }
+    result
+}
+
+fn apply_semantic_signature_hint_to_inferred(
+    inferred_signature: &mut InferredSignature,
+    hint: &FunctionSignatureSpec,
+    ptr_bits: u32,
+) -> SignatureProjectionResult {
+    apply_signature_projection_to_inferred(
+        inferred_signature,
+        FunctionSignatureProjection::strong_summary(hint.clone()),
+        ptr_bits,
+    )
+}
+
+fn semantic_role_param_name_is_weak(name: &str) -> bool {
+    crate::signature_param_name_is_weak(name)
+}
+
+fn semantic_role_typedef_is_authoritative(name: &str) -> bool {
+    crate::role_registry::semantic_typedef_is_authoritative(name)
+}
+
 impl SemanticTypeProjection {
     fn from_inputs(
         summary_view: &InterprocSummaryView,
@@ -531,6 +957,16 @@ impl SemanticTypeProjection {
     ) -> Self {
         let mut projection = Self::default();
         if let Some(summary) = summary_view.root_summary() {
+            if let Some(hint) = semantic_role_signature_hint("", summary_view, 0) {
+                for (idx, param) in hint.params.into_iter().enumerate() {
+                    if !is_generic_arg_name(&param.name) {
+                        projection.param_name_hints.insert(idx, param.name);
+                    }
+                    if let Some(ty) = param.ty {
+                        merge_param_type_hint(&mut projection.param_type_hints, idx, ty, ptr_bits);
+                    }
+                }
+            }
             for idx in 0..=summary.arg_effects.keys().copied().max().unwrap_or(0) {
                 if summary_suggests_pointer_param(summary, idx) {
                     projection.pointer_param_indices.insert(idx);
@@ -558,17 +994,14 @@ impl SemanticTypeProjection {
             }
         }
         if let Some(native) = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body) {
-            if native.summary.region_summaries.is_empty() {
-                for summary in &native.summary.worker_summaries {
-                    projection
-                        .out_param_indices
-                        .extend(summary.out_param_indices());
-                    collect_worker_summary_type_hints(summary, &mut projection, ptr_bits);
-                }
-            } else {
-                for summary in &native.summary.region_summaries {
-                    collect_region_summary_type_hints(summary, &mut projection, ptr_bits);
-                }
+            for summary in &native.summary.worker_summaries {
+                projection
+                    .out_param_indices
+                    .extend(summary.out_param_indices());
+                collect_worker_summary_type_hints(summary, &mut projection, ptr_bits);
+            }
+            for summary in &native.summary.region_summaries {
+                collect_region_summary_type_hints(summary, &mut projection, ptr_bits);
             }
         }
         projection.slot_field_profiles =
@@ -911,6 +1344,16 @@ fn maybe_upgrade_param_to_pointer(
         let merged_param = signature.params.get_mut(idx);
         let inferred_param = inferred_signature.params.get_mut(idx);
 
+        if merged_param
+            .as_ref()
+            .is_some_and(|param| param_has_authoritative_named_scalar_role(param, ptr_bits))
+            || inferred_param.as_ref().is_some_and(|param| {
+                inferred_param_has_authoritative_named_scalar_role(param, ptr_bits)
+            })
+        {
+            continue;
+        }
+
         let merged_is_generic = merged_param.as_ref().is_some_and(|param| {
             param.ty.as_ref().is_none_or(|ty| {
                 is_generic_signature_type(Some(ty))
@@ -968,6 +1411,16 @@ fn upgrade_param_indices_to_pointer(
         let merged_param = signature.params.get_mut(idx);
         let inferred_param = inferred_signature.params.get_mut(idx);
 
+        if merged_param
+            .as_ref()
+            .is_some_and(|param| param_has_authoritative_named_scalar_role(param, ptr_bits))
+            || inferred_param.as_ref().is_some_and(|param| {
+                inferred_param_has_authoritative_named_scalar_role(param, ptr_bits)
+            })
+        {
+            continue;
+        }
+
         let merged_is_generic = merged_param.as_ref().is_some_and(|param| {
             param.ty.as_ref().is_none_or(|ty| {
                 is_generic_signature_type(Some(ty))
@@ -1005,38 +1458,45 @@ fn upgrade_param_indices_to_pointer(
     }
 }
 
+fn type_is_authoritative_named_scalar_role(ty: &CTypeLike) -> bool {
+    match ty {
+        CTypeLike::Bool | CTypeLike::Enum(_) => true,
+        CTypeLike::Typedef(name) => {
+            matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "int" | "unsigned int"
+            ) || semantic_role_typedef_is_authoritative(name)
+        }
+        _ => false,
+    }
+}
+
+fn param_has_authoritative_named_scalar_role(param: &FunctionParamSpec, _ptr_bits: u32) -> bool {
+    !semantic_role_param_name_is_weak(&param.name)
+        && param
+            .ty
+            .as_ref()
+            .is_some_and(type_is_authoritative_named_scalar_role)
+}
+
+fn inferred_param_has_authoritative_named_scalar_role(
+    param: &InferredSignatureParam,
+    ptr_bits: u32,
+) -> bool {
+    if semantic_role_param_name_is_weak(&param.name) {
+        return false;
+    }
+    parse_signature_type_preserving_c_typedefs(&param.param_type, ptr_bits)
+        .as_ref()
+        .is_some_and(type_is_authoritative_named_scalar_role)
+}
+
 fn summary_hint_can_replace_weak_existing(
     existing: &CTypeLike,
     hint: &CTypeLike,
     ptr_bits: u32,
 ) -> bool {
-    if is_generic_signature_type(Some(existing)) {
-        return true;
-    }
-    match (existing, hint) {
-        (CTypeLike::Pointer(inner), CTypeLike::Pointer(new_inner)) => {
-            matches!(**inner, CTypeLike::Void | CTypeLike::Unknown)
-                && !matches!(**new_inner, CTypeLike::Void | CTypeLike::Unknown)
-        }
-        (
-            CTypeLike::Int {
-                bits,
-                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
-            },
-            CTypeLike::Int {
-                bits: hint_bits,
-                signedness: Signedness::Unsigned,
-            },
-        ) => *bits == ptr_bits && *hint_bits == ptr_bits,
-        (
-            CTypeLike::Int {
-                bits,
-                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
-            },
-            CTypeLike::Pointer(_),
-        ) => *bits == ptr_bits,
-        _ => false,
-    }
+    crate::summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
 }
 
 fn upgrade_param_type_hints(
@@ -1079,6 +1539,55 @@ fn upgrade_param_type_hints(
     }
 }
 
+fn upgrade_param_name_hints(
+    hints: &BTreeMap<usize, String>,
+    merged_signature: &mut Option<FunctionSignatureSpec>,
+    inferred_signature: &mut InferredSignature,
+    ptr_bits: u32,
+) {
+    if hints.is_empty() {
+        return;
+    }
+    if merged_signature.is_none() {
+        *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
+    }
+    if let Some(signature) = merged_signature.as_mut() {
+        for (idx, hint) in hints {
+            if let Some(param) = signature.params.get_mut(*idx)
+                && (param.name.is_empty() || is_generic_arg_name(&param.name))
+            {
+                param.name = hint.clone();
+            }
+        }
+    }
+    for (idx, hint) in hints {
+        if let Some(param) = inferred_signature.params.get_mut(*idx)
+            && (param.name.is_empty() || is_generic_arg_name(&param.name))
+        {
+            param.name = hint.clone();
+        }
+    }
+    inferred_signature.signature = format_signature(
+        &inferred_signature.function_name,
+        &inferred_signature.ret_type,
+        &inferred_signature.params,
+    );
+}
+
+fn projection_pointer_upgrade_indices(projection: &SemanticTypeProjection) -> Vec<usize> {
+    projection
+        .pointer_param_indices
+        .iter()
+        .copied()
+        .filter(|idx| {
+            projection
+                .param_type_hints
+                .get(idx)
+                .is_none_or(|ty| matches!(ty, CTypeLike::Pointer(_)))
+        })
+        .collect()
+}
+
 fn apply_interproc_summary_to_signature(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
@@ -1088,8 +1597,14 @@ fn apply_interproc_summary_to_signature(
 ) {
     let Some(summary) = summary_view.root_summary() else {
         if let Some(projection) = semantic_projection {
+            upgrade_param_name_hints(
+                &projection.param_name_hints,
+                merged_signature,
+                inferred_signature,
+                ptr_bits,
+            );
             upgrade_param_indices_to_pointer(
-                projection.pointer_param_indices.iter().copied(),
+                projection_pointer_upgrade_indices(projection),
                 merged_signature,
                 inferred_signature,
                 ptr_bits,
@@ -1105,8 +1620,14 @@ fn apply_interproc_summary_to_signature(
     };
     maybe_upgrade_param_to_pointer(summary, merged_signature, inferred_signature, ptr_bits);
     if let Some(projection) = semantic_projection {
+        upgrade_param_name_hints(
+            &projection.param_name_hints,
+            merged_signature,
+            inferred_signature,
+            ptr_bits,
+        );
         upgrade_param_indices_to_pointer(
-            projection.pointer_param_indices.iter().copied(),
+            projection_pointer_upgrade_indices(projection),
             merged_signature,
             inferred_signature,
             ptr_bits,
@@ -1517,6 +2038,57 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
         input.function_name,
     );
+    let role_projection = semantic_role_signature_hint(
+        input.function_name,
+        &summary_view,
+        merged_signature
+            .as_ref()
+            .map(|signature| signature.params.len())
+            .unwrap_or(input.inferred_signature.params.len()),
+    )
+    .map(FunctionSignatureProjection::strong_summary)
+    .or_else(|| {
+        (input.inferred_signature.function_name != input.function_name).then(|| {
+            semantic_role_signature_hint(
+                &input.inferred_signature.function_name,
+                &summary_view,
+                merged_signature
+                    .as_ref()
+                    .map(|signature| signature.params.len())
+                    .unwrap_or(input.inferred_signature.params.len()),
+            )
+            .map(FunctionSignatureProjection::strong_summary)
+        })?
+    })
+    .or_else(|| {
+        semantic_artifact_signature_hint(
+            semantic_inputs.as_ref().map(|semantic| semantic.artifact),
+            merged_signature
+                .as_ref()
+                .map(|signature| signature.params.len())
+                .unwrap_or(input.inferred_signature.params.len()),
+        )
+        .map(FunctionSignatureProjection::weak_summary_kind)
+    });
+    let role_hint_has_authoritative_empty_params =
+        role_projection.as_ref().is_some_and(|projection| {
+            projection.exact_arity
+                && projection.has_strong_signature_confidence()
+                && projection.signature.params.is_empty()
+        });
+    if let Some(projection) = role_projection {
+        apply_signature_projection_to_merged(
+            &mut merged_signature,
+            input.function_name,
+            projection.clone(),
+            input.ptr_bits,
+        );
+        apply_signature_projection_to_inferred(
+            &mut input.inferred_signature,
+            projection,
+            input.ptr_bits,
+        );
+    }
     apply_interproc_summary_to_signature(
         &mut merged_signature,
         &mut input.inferred_signature,
@@ -1586,6 +2158,7 @@ fn build_type_writeback_analysis_inner(
         merged_signature,
         &local_structs.slot_type_overrides,
         input.ptr_bits,
+        role_hint_has_authoritative_empty_params,
     );
     let current_context_maps = signature_context_maps(merged_signature.as_ref(), input.ptr_bits);
     apply_signature_context_overrides(
@@ -1976,10 +2549,27 @@ pub fn build_semantic_type_fallback_plan(
         confidence: 0,
         callconv_confidence: 0,
     };
+    let empty_summary_view = InterprocSummaryView::new(None);
+    if let Some(role_hint) =
+        semantic_role_signature_hint(function_name, &empty_summary_view, signature.params.len())
+    {
+        apply_semantic_signature_hint_to_inferred(&mut signature, &role_hint, ptr_bits);
+        signature.signature = format_signature(
+            &signature.function_name,
+            &signature.ret_type,
+            &signature.params,
+        );
+        signature.confidence = signature.confidence.max(signature_strength(&role_hint));
+    }
+    apply_semantic_artifact_signature_hint_to_inferred(&mut signature, artifact, ptr_bits);
+    let semantic_projection =
+        SemanticTypeProjection::from_inputs(&empty_summary_view, Some(artifact), ptr_bits);
+    apply_semantic_projection_to_fallback_signature(&mut signature, &semantic_projection, ptr_bits);
     if let Some(merged_signature) = merge_slot_type_overrides_into_signature(
         inferred_signature_to_spec(&signature, ptr_bits),
         &local_structs.slot_type_overrides,
         ptr_bits,
+        false,
     ) {
         apply_signature_context_overrides(&mut signature, Some(&merged_signature), ptr_bits);
     }
@@ -2002,6 +2592,102 @@ pub fn build_semantic_type_fallback_plan(
             solver_warnings: Vec::new(),
         },
     }
+}
+
+fn apply_semantic_projection_to_fallback_signature(
+    signature: &mut InferredSignature,
+    projection: &SemanticTypeProjection,
+    ptr_bits: u32,
+) -> bool {
+    let max_index = projection
+        .param_type_hints
+        .keys()
+        .chain(projection.param_name_hints.keys())
+        .chain(projection.pointer_param_indices.iter())
+        .chain(projection.out_param_indices.iter())
+        .copied()
+        .max();
+    let Some(max_index) = max_index else {
+        return false;
+    };
+
+    while signature.params.len() <= max_index {
+        let idx = signature.params.len();
+        let ty = projection
+            .param_type_hints
+            .get(&idx)
+            .cloned()
+            .or_else(|| {
+                (projection.pointer_param_indices.contains(&idx)
+                    || projection.out_param_indices.contains(&idx))
+                .then(void_pointer_type)
+            })
+            .unwrap_or_else(|| typedef_type("uintptr_t"));
+        signature.params.push(InferredSignatureParam {
+            name: projection
+                .param_name_hints
+                .get(&idx)
+                .cloned()
+                .unwrap_or_else(|| format!("arg{idx}")),
+            param_type: render_signature_type(&ty, ptr_bits),
+        });
+    }
+
+    for idx in 0..=max_index {
+        if let Some(param) = signature.params.get_mut(idx) {
+            if let Some(name) = projection.param_name_hints.get(&idx)
+                && (param.name.is_empty() || is_generic_arg_name(&param.name))
+            {
+                param.name = name.clone();
+            }
+            if inferred_param_has_authoritative_named_scalar_role(param, ptr_bits) {
+                continue;
+            }
+            if let Some(ty) = projection.param_type_hints.get(&idx) {
+                let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
+                if is_generic_type_string(&param.param_type)
+                    || existing_ty.as_ref().is_some_and(|existing| {
+                        summary_hint_can_replace_weak_existing(existing, ty, ptr_bits)
+                    })
+                {
+                    param.param_type = render_signature_type(ty, ptr_bits);
+                }
+            }
+        }
+    }
+
+    signature.signature = format_signature(
+        &signature.function_name,
+        &signature.ret_type,
+        &signature.params,
+    );
+    signature.confidence = signature.confidence.max(55);
+    true
+}
+
+pub fn apply_semantic_artifact_signature_hint_to_inferred(
+    signature: &mut InferredSignature,
+    artifact: &r2sym::SemanticArtifact,
+    ptr_bits: u32,
+) -> bool {
+    let Some(hint) = semantic_artifact_signature_hint(Some(artifact), signature.params.len())
+    else {
+        return false;
+    };
+    let result = apply_signature_projection_to_inferred(
+        signature,
+        FunctionSignatureProjection::weak_summary_kind(hint),
+        ptr_bits,
+    );
+    if !result.was_applied() {
+        return false;
+    }
+    signature.signature = format_signature(
+        &signature.function_name,
+        &signature.ret_type,
+        &signature.params,
+    );
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2877,23 +3563,45 @@ fn register_family_matches(expected: &str, actual: &str) -> bool {
     family(&expected) == family(&actual)
 }
 
+fn parse_signature_type_preserving_c_typedefs(ty: &str, ptr_bits: u32) -> Option<CTypeLike> {
+    match normalize_external_type_name(ty)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "int" => Some(c_int_type()),
+        "unsigned int" => Some(c_uint_type()),
+        _ => parse_type_like_spec(ty, ptr_bits),
+    }
+}
+
 fn inferred_signature_to_spec(
     signature: &InferredSignature,
     ptr_bits: u32,
 ) -> Option<FunctionSignatureSpec> {
-    let ret_type = parse_type_like_spec(&signature.ret_type, ptr_bits);
+    let ret_type = parse_signature_type_preserving_c_typedefs(&signature.ret_type, ptr_bits);
     let params = signature
         .params
         .iter()
         .map(|param| FunctionParamSpec {
             name: param.name.clone(),
-            ty: parse_type_like_spec(&param.param_type, ptr_bits),
+            ty: parse_signature_type_preserving_c_typedefs(&param.param_type, ptr_bits),
         })
         .collect::<Vec<_>>();
     if ret_type.is_none() && params.iter().all(|param| param.ty.is_none()) {
         return None;
     }
     Some(FunctionSignatureSpec { ret_type, params })
+}
+
+pub fn inferred_signature_to_function_type_facts(
+    signature: &InferredSignature,
+    ptr_bits: u32,
+) -> FunctionTypeFacts {
+    FunctionTypeFacts {
+        merged_signature: inferred_signature_to_spec(signature, ptr_bits),
+        ..FunctionTypeFacts::default()
+    }
 }
 
 fn merge_local_signature_into_merged_signature(
@@ -3515,7 +4223,9 @@ fn signature_context_maps(
     for (idx, param) in signature.params.iter().enumerate() {
         if let Some(ty) = param.ty.as_ref() {
             let ty_str = render_signature_type(ty, ptr_bits);
-            if !is_generic_type_string(&ty_str) {
+            if !is_generic_type_string(&ty_str)
+                || param_has_authoritative_named_scalar_role(param, ptr_bits)
+            {
                 maps.param_types.insert(idx, ty_str);
             }
         }
@@ -3535,7 +4245,8 @@ fn apply_signature_context_overrides(
         return;
     };
 
-    let authoritative_param_count = signature_param_count_is_authoritative(signature);
+    let authoritative_param_count = signature_param_count_is_authoritative(signature)
+        || crate::signature_projection_is_exact(signature);
     if authoritative_param_count && signature_out.params.len() > signature.params.len() {
         signature_out.params.truncate(signature.params.len());
     }
@@ -3556,7 +4267,7 @@ fn apply_signature_context_overrides(
 
     if let Some(ret_ty) = signature.ret_type.as_ref() {
         let ret_ty = render_signature_type(ret_ty, ptr_bits);
-        if !is_generic_type_string(&ret_ty) {
+        if !is_generic_signature_type(signature.ret_type.as_ref()) {
             signature_out.ret_type = ret_ty;
         }
     }
@@ -3564,7 +4275,8 @@ fn apply_signature_context_overrides(
     for (idx, param) in signature.params.iter().enumerate() {
         if let Some(ty) = param.ty.as_ref() {
             let ty_str = render_signature_type(ty, ptr_bits);
-            if !is_generic_type_string(&ty_str)
+            if (!is_generic_type_string(&ty_str)
+                || param_has_authoritative_named_scalar_role(param, ptr_bits))
                 && let Some(inferred_param) = signature_out.params.get_mut(idx)
             {
                 inferred_param.param_type = ty_str;
@@ -3586,35 +4298,15 @@ fn apply_signature_context_overrides(
 }
 
 fn signature_strength(signature: &FunctionSignatureSpec) -> u8 {
-    let has_type_info =
-        signature.ret_type.is_some() || signature.params.iter().any(|param| param.ty.is_some());
-    let has_named_params = signature
-        .params
-        .iter()
-        .any(|param| !is_generic_arg_name(&param.name));
-    if has_type_info || has_named_params {
-        96
-    } else {
-        80
-    }
+    crate::signature_strength(signature)
 }
 
 fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec) -> bool {
-    if signature.params.is_empty() {
-        return false;
-    }
-    signature_strength(signature) >= 96
+    crate::signature_param_count_is_authoritative(signature)
 }
 
 fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
-    match ty {
-        None => true,
-        Some(CTypeLike::Unknown | CTypeLike::Void) => true,
-        Some(CTypeLike::Pointer(inner)) => {
-            matches!(inner.as_ref(), CTypeLike::Unknown | CTypeLike::Void)
-        }
-        _ => false,
-    }
+    crate::is_generic_signature_type(ty)
 }
 
 fn signature_param_allows_local_struct_override(
@@ -3647,6 +4339,7 @@ fn merge_slot_type_overrides_into_signature(
     mut signature: Option<FunctionSignatureSpec>,
     slot_type_overrides: &HashMap<usize, String>,
     ptr_bits: u32,
+    preserve_param_count: bool,
 ) -> Option<FunctionSignatureSpec> {
     if slot_type_overrides.is_empty() {
         return signature;
@@ -3654,7 +4347,8 @@ fn merge_slot_type_overrides_into_signature(
 
     let max_slot = slot_type_overrides.keys().copied().max()?;
     let sig = signature.get_or_insert_with(Default::default);
-    let allow_param_count_extension = !signature_param_count_is_authoritative(sig);
+    let allow_param_count_extension =
+        !preserve_param_count && !signature_param_count_is_authoritative(sig);
     while allow_param_count_extension && sig.params.len() <= max_slot {
         let idx = sig.params.len();
         sig.params.push(FunctionParamSpec {
@@ -3671,7 +4365,9 @@ fn merge_slot_type_overrides_into_signature(
             continue;
         };
         let param = &mut sig.params[*slot];
-        if signature_param_allows_local_struct_override(Some(param), ptr_bits) {
+        if !signature_param_blocks_generated_local_struct_override(Some(param), raw_ty, ptr_bits)
+            && signature_param_allows_local_struct_override(Some(param), ptr_bits)
+        {
             param.ty = Some(parsed);
         }
     }
@@ -3679,33 +4375,64 @@ fn merge_slot_type_overrides_into_signature(
     signature
 }
 
-fn signature_param_blocks_local_struct_override(
-    signature: &Option<FunctionSignatureSpec>,
-    slot: usize,
+fn override_type_is_generated_local_struct(raw_ty: &str, ptr_bits: u32) -> bool {
+    if parse_struct_ptr_type_name(raw_ty).is_some_and(|name| is_generated_local_struct_name(&name))
+    {
+        return true;
+    }
+    matches!(
+        parse_type_like_spec(raw_ty, ptr_bits),
+        Some(CTypeLike::Pointer(inner))
+            if matches!(
+                inner.as_ref(),
+                CTypeLike::Struct(name) | CTypeLike::Typedef(name)
+                    if is_generated_local_struct_name(name)
+            )
+    )
+}
+
+fn signature_param_blocks_generated_local_struct_override(
+    param: Option<&FunctionParamSpec>,
+    raw_ty: &str,
     ptr_bits: u32,
 ) -> bool {
-    let Some(param) = signature.as_ref().and_then(|sig| sig.params.get(slot)) else {
-        return false;
-    };
-    if signature_param_allows_local_struct_override(Some(param), ptr_bits) {
+    if !override_type_is_generated_local_struct(raw_ty, ptr_bits) {
         return false;
     }
-
+    let Some(param) = param else {
+        return false;
+    };
+    if is_generic_signature_type(param.ty.as_ref()) {
+        return false;
+    }
     let Some(ty) = param.ty.as_ref() else {
         return false;
     };
     match ty {
-        CTypeLike::Pointer(inner) => !matches!(
-            inner.as_ref(),
-            CTypeLike::Unknown
-                | CTypeLike::Void
-                | CTypeLike::Struct(_)
-                | CTypeLike::Union(_)
-                | CTypeLike::Enum(_)
-                | CTypeLike::Typedef(_)
-        ),
+        CTypeLike::Pointer(inner) => match inner.as_ref() {
+            CTypeLike::Unknown | CTypeLike::Void => false,
+            CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) => true,
+            CTypeLike::Typedef(name) => semantic_role_typedef_is_authoritative(name),
+            _ => true,
+        },
+        CTypeLike::Int { bits, .. } if *bits == ptr_bits && is_generic_arg_name(&param.name) => {
+            false
+        }
         _ => true,
     }
+}
+
+fn signature_param_blocks_local_struct_override(
+    signature: &Option<FunctionSignatureSpec>,
+    slot: usize,
+    raw_ty: &str,
+    ptr_bits: u32,
+) -> bool {
+    signature_param_blocks_generated_local_struct_override(
+        signature.as_ref().and_then(|sig| sig.params.get(slot)),
+        raw_ty,
+        ptr_bits,
+    )
 }
 
 fn prune_conflicting_local_struct_overrides(
@@ -3716,10 +4443,10 @@ fn prune_conflicting_local_struct_overrides(
     ptr_bits: u32,
 ) {
     let blocked_slots = slot_type_overrides
-        .keys()
-        .copied()
-        .filter(|slot| {
-            signature_param_blocks_local_struct_override(merged_signature, *slot, ptr_bits)
+        .iter()
+        .filter_map(|(slot, raw_ty)| {
+            signature_param_blocks_local_struct_override(merged_signature, *slot, raw_ty, ptr_bits)
+                .then_some(*slot)
         })
         .collect::<Vec<_>>();
     if blocked_slots.is_empty() {
@@ -4714,6 +5441,52 @@ mod tests {
     }
 
     #[test]
+    fn generic_memory_worker_summary_does_not_create_pointer_type_hint() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Residual,
+            r2sym::SliceClass::Worker,
+            true,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401008,
+                kind: r2sym::NativeWorkerSummaryKind::MemoryRead,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(None),
+            Some(&artifact),
+            64,
+        );
+
+        assert!(!projection.pointer_param_indices.contains(&0));
+        assert!(!projection.param_type_hints.contains_key(&0));
+    }
+
+    #[test]
     fn native_worker_string_scan_projection_marks_char_pointer() {
         let mut artifact = test_artifact(
             r2sym::RefinementStage::Residual,
@@ -4824,6 +5597,133 @@ mod tests {
             projection.param_type_hints.get(&0),
             Some(&signed_byte_pointer_type())
         );
+    }
+
+    #[test]
+    fn token_parser_summary_projection_names_output_and_stream_params() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401030,
+                kind: r2sym::NativeWorkerSummaryKind::Parser,
+                dst: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                    range: Some(r2ssa::SummaryMemoryRange {
+                        offset_lo: 0,
+                        offset_hi: 0,
+                        width: Some(1),
+                    }),
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: Some(r2sym::NativeParserSummary {
+                    kind: r2sym::NativeParserKind::Token,
+                    cursor_arg: Some(1),
+                    base: None,
+                    digit_min: None,
+                    digit_max: None,
+                    accepts_sign: false,
+                }),
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        native
+            .summary
+            .region_summaries
+            .push(r2sym::NativeRegionSummary {
+                stable_id: 0x401030,
+                anchor: 0x401030,
+                kind: r2sym::NativeWorkerSummaryKind::Parser,
+                blocks: BTreeSet::from([0x401030]),
+                entries: BTreeSet::from([0x401030]),
+                exits: BTreeSet::new(),
+                memory_accesses: vec![r2sym::NativeMemoryAccessSummary {
+                    kind: r2sym::NativeMemoryAccessKind::Read,
+                    location: Some(r2ssa::SummaryMemoryLocation {
+                        region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                        range: Some(r2ssa::SummaryMemoryRange {
+                            offset_lo: 0,
+                            offset_hi: 0,
+                            width: Some(1),
+                        }),
+                    }),
+                    dst: None,
+                    src: None,
+                    len: None,
+                    width: Some(1),
+                }],
+                loop_summary: None,
+                reductions: Vec::new(),
+                parser: Some(r2sym::NativeParserSummary {
+                    kind: r2sym::NativeParserKind::Token,
+                    cursor_arg: Some(1),
+                    base: None,
+                    digit_min: None,
+                    digit_max: None,
+                    accepts_sign: false,
+                }),
+                residual_reasons: Vec::new(),
+                confidence: r2sym::SemanticConfidence::Likely,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(None),
+            Some(&artifact),
+            64,
+        );
+
+        assert_eq!(
+            projection.param_name_hints.get(&0).map(String::as_str),
+            Some("output")
+        );
+        assert_eq!(
+            projection.param_name_hints.get(&1).map(String::as_str),
+            Some("stream")
+        );
+        assert_eq!(
+            projection.param_type_hints.get(&0),
+            Some(&byte_pointer_type())
+        );
+        assert_eq!(
+            projection.param_type_hints.get(&1),
+            Some(&byte_pointer_type())
+        );
+
+        let plan =
+            build_semantic_type_fallback_plan("readlinebuffer_delim", "x86-64", 64, &artifact);
+        assert_eq!(plan.signature.params.len(), 3);
+        assert_eq!(plan.signature.ret_type, "linebuffer*");
+        assert_eq!(plan.signature.params[0].name, "linebuffer");
+        assert_eq!(plan.signature.params[1].name, "stream");
+        assert_eq!(plan.signature.params[2].name, "delimiter");
+        assert_eq!(plan.signature.params[0].param_type, "linebuffer*");
+        assert_eq!(plan.signature.params[1].param_type, "FILE*");
+        assert_eq!(plan.signature.params[2].param_type, "int8_t");
     }
 
     #[test]
@@ -4960,6 +5860,21 @@ mod tests {
     #[test]
     fn main_signature_canonicalization_updates_signature_output() {
         let parsed_context = ParsedExternalContext::default();
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let mut summary =
+            r2ssa::FunctionSemanticSummary::unknown(root, Some("dbg.main".to_string()));
+        summary.arg_effects.insert(
+            0,
+            r2ssa::SummaryArgEffect {
+                read: true,
+                ..Default::default()
+            },
+        );
+        let summary_set = r2ssa::InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(root, summary)]),
+            diagnostics: Default::default(),
+        };
         let input = TypeWritebackAnalysisInput {
             function_name: "sym.main",
             ptr_bits: 64,
@@ -4977,13 +5892,14 @@ mod tests {
             ssa_blocks: &[],
             parsed_context,
             local_structs: LocalStructArtifacts::default(),
-            interproc_summary_set: None,
+            interproc_summary_set: Some(summary_set),
             diagnostics: TypeWritebackDiagnostics::default(),
         };
         let analysis = build_type_writeback_analysis(input);
-        assert_eq!(analysis.signature.ret_type, "int32_t");
+        assert_eq!(analysis.signature.ret_type, "int");
         assert_eq!(analysis.signature.params.len(), 3);
         assert_eq!(analysis.signature.params[0].name, "argc");
+        assert_eq!(analysis.signature.params[0].param_type, "int");
         assert_eq!(
             analysis
                 .type_facts
@@ -4993,6 +5909,149 @@ mod tests {
                 .params[1]
                 .name,
             "argv"
+        );
+    }
+
+    #[test]
+    fn main_signature_canonicalization_survives_semantic_projection_and_context() {
+        let parsed_context = ParsedExternalContext {
+            current_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(c_int_type()),
+                params: vec![
+                    FunctionParamSpec {
+                        name: "argc".to_string(),
+                        ty: Some(signed_byte_pointer_type()),
+                    },
+                    FunctionParamSpec {
+                        name: "argv".to_string(),
+                        ty: Some(signed_byte_pointer_pointer_type()),
+                    },
+                    FunctionParamSpec {
+                        name: "envp".to_string(),
+                        ty: Some(signed_byte_pointer_pointer_type()),
+                    },
+                ],
+            }),
+            ..ParsedExternalContext::default()
+        };
+        let parsed_context = ParsedExternalContext {
+            merged_signature: parsed_context.current_signature.clone(),
+            ..parsed_context
+        };
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let summary = r2ssa::FunctionSemanticSummary::unknown(root, Some("dbg.main".to_string()));
+        let summary_set = r2ssa::InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(root, summary)]),
+            diagnostics: Default::default(),
+        };
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::MemoryRead,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::ProgramOrchestrator,
+                dst: None,
+                src: None,
+                memory: None,
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let analysis = build_type_writeback_analysis_with_semantics(
+            TypeWritebackAnalysisInput {
+                function_name: "dbg.main",
+                ptr_bits: 64,
+                inferred_signature: InferredSignature {
+                    function_name: "dbg.main".to_string(),
+                    signature: "int dbg.main (int8_t* argc, int8_t** argv, int8_t** envp)"
+                        .to_string(),
+                    ret_type: "int".to_string(),
+                    params: vec![
+                        InferredSignatureParam {
+                            name: "argc".to_string(),
+                            param_type: "int8_t*".to_string(),
+                        },
+                        InferredSignatureParam {
+                            name: "argv".to_string(),
+                            param_type: "int8_t**".to_string(),
+                        },
+                        InferredSignatureParam {
+                            name: "envp".to_string(),
+                            param_type: "int8_t**".to_string(),
+                        },
+                    ],
+                    callconv: "amd64".to_string(),
+                    arch: "x86-64".to_string(),
+                    confidence: 96,
+                    callconv_confidence: 92,
+                },
+                recovered_vars: &[],
+                ssa_blocks: &[],
+                parsed_context,
+                local_structs: LocalStructArtifacts::default(),
+                interproc_summary_set: Some(summary_set),
+                diagnostics: TypeWritebackDiagnostics::default(),
+            },
+            TypeWritebackSemanticInputs {
+                artifact: &artifact,
+                local_field_accesses: &[],
+            },
+        );
+
+        assert_eq!(analysis.signature.params[0].param_type, "int");
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .unwrap()
+                .params[0]
+                .ty
+                .as_ref()
+                .map(|ty| render_signature_type(ty, 64)),
+            Some("int".to_string())
         );
     }
 
@@ -6719,6 +7778,1473 @@ mod tests {
             Some(&CTypeLike::Pointer(Box::new(CTypeLike::Void)))
         );
         assert_eq!(analysis.type_facts.interproc_diagnostics.scope_size, 1);
+    }
+
+    fn semantic_role_summary_set(
+        name: &str,
+        arg_count_hint: Option<usize>,
+    ) -> r2ssa::InterprocSummarySet {
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let mut summary = r2ssa::FunctionSemanticSummary::unknown(root, Some(name.to_string()));
+        summary.arg_count_hint = arg_count_hint;
+        r2ssa::InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(root, summary)]),
+            diagnostics: Default::default(),
+        }
+    }
+
+    #[test]
+    fn diagnostic_role_signature_hint_names_and_types_variadic_slots() {
+        let params = (0..11)
+            .map(|idx| InferredSignatureParam {
+                name: if idx == 0 {
+                    "status".to_string()
+                } else {
+                    format!("arg{}", idx + 1)
+                },
+                param_type: if idx == 0 {
+                    "int32_t".to_string()
+                } else {
+                    "int64_t".to_string()
+                },
+            })
+            .collect::<Vec<_>>();
+        let parsed_context = ParsedExternalContext {
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Void),
+                params: params
+                    .iter()
+                    .map(|param| FunctionParamSpec {
+                        name: param.name.clone(),
+                        ty: Some(CTypeLike::Typedef(param.param_type.clone())),
+                    })
+                    .collect(),
+            }),
+            assumptions: r2ssa::AssumptionSet::new(
+                ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, reg)| r2ssa::AnalysisAssumption {
+                        id: None,
+                        scope: r2ssa::AssumptionScope::Function,
+                        provenance: r2ssa::AssumptionProvenance::ImportedContext,
+                        subject: r2ssa::AssumptionSubject::Register {
+                            name: reg.to_string(),
+                        },
+                        value: r2ssa::AssumptionValue::TypeHint {
+                            ty: params[idx].param_type.clone(),
+                        },
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "fcn.00004bc0",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.diagnose".to_string(),
+                signature: "void sym.diagnose (int32_t status)".to_string(),
+                ret_type: "void".to_string(),
+                params,
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("fcn.00004bc0", Some(11))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        let params = &analysis.signature.params;
+        assert_eq!(params[0].name, "errnum");
+        assert_eq!(params[0].param_type, "errno_t");
+        assert_eq!(params[1].name, "fmt");
+        assert_eq!(params[1].param_type, "int8_t*");
+        assert_eq!(params[2].name, "diag_value1");
+        assert_eq!(params[2].param_type, "uintptr_t");
+        assert_eq!(params[10].name, "diag_value9");
+        assert_eq!(params[10].param_type, "uintptr_t");
+        let merged = analysis
+            .type_facts
+            .merged_signature
+            .as_ref()
+            .expect("semantic role should update merged signature");
+        assert_eq!(merged.params[0].name, "errnum");
+        assert_eq!(merged.params[1].name, "fmt");
+    }
+
+    #[test]
+    fn diagnostic_worker_artifact_drives_signature_hint_without_named_summary() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::DiagnosticWrapper,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        let params = (0..4)
+            .map(|idx| InferredSignatureParam {
+                name: if idx == 0 {
+                    "status".to_string()
+                } else {
+                    format!("arg{}", idx + 1)
+                },
+                param_type: if idx == 0 {
+                    "int32_t".to_string()
+                } else {
+                    "int64_t".to_string()
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let analysis = build_type_writeback_analysis_with_semantics(
+            TypeWritebackAnalysisInput {
+                function_name: "sym.diagnose",
+                ptr_bits: 64,
+                inferred_signature: InferredSignature {
+                    function_name: "sym.diagnose".to_string(),
+                    signature: "void sym.diagnose (int32_t status, int64_t arg2)".to_string(),
+                    ret_type: "void".to_string(),
+                    params,
+                    callconv: "amd64".to_string(),
+                    arch: "x86-64".to_string(),
+                    confidence: 80,
+                    callconv_confidence: 80,
+                },
+                recovered_vars: &[],
+                ssa_blocks: &[],
+                parsed_context: ParsedExternalContext::default(),
+                local_structs: LocalStructArtifacts::default(),
+                interproc_summary_set: None,
+                diagnostics: TypeWritebackDiagnostics::default(),
+            },
+            TypeWritebackSemanticInputs {
+                artifact: &artifact,
+                local_field_accesses: &[],
+            },
+        );
+
+        assert_eq!(analysis.signature.params[0].name, "errnum");
+        assert_eq!(analysis.signature.params[0].param_type, "errno_t");
+        assert_eq!(analysis.signature.params[1].name, "fmt");
+        assert_eq!(analysis.signature.params[1].param_type, "int8_t*");
+        assert_eq!(analysis.signature.params[2].param_type, "uintptr_t");
+    }
+
+    #[test]
+    fn semantic_type_fallback_plan_uses_worker_role_signature_hint() {
+        let mut artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::DiagnosticWrapper,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let plan = build_semantic_type_fallback_plan("sym.diagnose", "x86-64", 64, &artifact);
+
+        assert_eq!(plan.signature.params.len(), 2);
+        assert_eq!(plan.signature.params[0].name, "errnum");
+        assert_eq!(plan.signature.params[0].param_type, "errno_t");
+        assert_eq!(plan.signature.params[1].name, "fmt");
+        assert_eq!(plan.signature.params[1].param_type, "int8_t*");
+
+        let mut main_artifact = test_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut main_artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::MemoryRead,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::ProgramOrchestrator,
+                dst: None,
+                src: None,
+                memory: None,
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+
+        let main_plan = build_semantic_type_fallback_plan("dbg.main", "x86-64", 64, &main_artifact);
+        assert_eq!(main_plan.signature.ret_type, "int");
+        assert_eq!(main_plan.signature.params[0].name, "argc");
+        assert_eq!(main_plan.signature.params[0].param_type, "int");
+        assert_eq!(main_plan.signature.params[1].param_type, "int8_t**");
+    }
+
+    #[test]
+    fn semantic_role_signature_hint_does_not_truncate_named_authoritative_signature() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.printf_fetchargs",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.printf_fetchargs".to_string(),
+                signature: "int32_t sym.printf_fetchargs (struct parser *parser, struct slot *slot, uint32_t flags)"
+                    .to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "parser".to_string(),
+                        param_type: "struct parser *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "slot".to_string(),
+                        param_type: "struct slot *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "flags".to_string(),
+                        param_type: "uint32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext {
+                merged_signature: Some(FunctionSignatureSpec {
+                    ret_type: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    params: vec![
+                        FunctionParamSpec {
+                            name: "parser".to_string(),
+                            ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                                "parser".to_string(),
+                            )))),
+                        },
+                        FunctionParamSpec {
+                            name: "slot".to_string(),
+                            ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                                "slot".to_string(),
+                            )))),
+                        },
+                        FunctionParamSpec {
+                            name: "flags".to_string(),
+                            ty: Some(CTypeLike::Int {
+                                bits: 32,
+                                signedness: Signedness::Unsigned,
+                            }),
+                        },
+                    ],
+                }),
+                ..Default::default()
+            },
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("sym.printf_fetchargs", None)),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params.len(), 3);
+        assert_eq!(analysis.signature.params[0].name, "parser");
+        assert_eq!(analysis.signature.params[1].name, "slot");
+        assert_eq!(analysis.signature.params[2].name, "flags");
+    }
+
+    #[test]
+    fn semantic_role_zero_arity_signature_truncates_weak_entry_signature() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "entry.init0",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "entry.init0".to_string(),
+                signature: "int64_t entry.init0(void *arg1)".to_string(),
+                ret_type: "int64_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "arg1".to_string(),
+                    param_type: "void *".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 40,
+                callconv_confidence: 40,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("entry.init0", Some(1))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "void");
+        assert!(analysis.signature.params.is_empty());
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|signature| signature.ret_type.as_ref()),
+            Some(&CTypeLike::Void)
+        );
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .map(|signature| signature.params.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn semantic_role_zero_arity_signature_prunes_generated_surplus_slots() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "dbg.or",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "dbg.or".to_string(),
+                signature: "bool dbg.or(void *arg1, struct sla_struct_deadbeef *arg2)".to_string(),
+                ret_type: "bool".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arg1".to_string(),
+                        param_type: "void *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg2".to_string(),
+                        param_type: "struct sla_struct_deadbeef *".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 40,
+                callconv_confidence: 40,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts {
+                slot_type_overrides: HashMap::from([(
+                    5usize,
+                    "struct sla_struct_0e18b2bc34030602 *".to_string(),
+                )]),
+                ..Default::default()
+            },
+            interproc_summary_set: Some(semantic_role_summary_set("dbg.or", Some(2))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "bool");
+        assert!(analysis.signature.params.is_empty());
+    }
+
+    #[test]
+    fn semantic_role_void_return_replaces_weak_scalar_return() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "dbg.verror_at_line",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "dbg.verror_at_line".to_string(),
+                signature:
+                    "int64_t dbg.verror_at_line(int status, int errnum, int8_t *file_name, unsigned int line_number, int8_t *message, struct __va_list_tag *args)"
+                        .to_string(),
+                ret_type: "int64_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "status".to_string(),
+                        param_type: "int".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "errnum".to_string(),
+                        param_type: "int".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "file_name".to_string(),
+                        param_type: "int8_t *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "line_number".to_string(),
+                        param_type: "unsigned int".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "message".to_string(),
+                        param_type: "int8_t *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "args".to_string(),
+                        param_type: "struct __va_list_tag *".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 92,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("dbg.verror_at_line", Some(6))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "void");
+        assert_eq!(analysis.signature.params.len(), 6);
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|signature| signature.ret_type.as_ref()),
+            Some(&CTypeLike::Void)
+        );
+    }
+
+    #[test]
+    fn semantic_role_signature_hint_covers_file_copy_and_fts_workers() {
+        let empty = InterprocSummaryView::new(None);
+        let copy =
+            semantic_role_signature_hint("sym.copy_file_data", &empty, 0).expect("copy hint");
+        assert_eq!(copy.ret_type, Some(typedef_type("intmax_t")));
+        assert_eq!(copy.params[0].name, "ifd");
+        assert_eq!(copy.params[3].name, "iname");
+        assert_eq!(copy.params[4].name, "ofd");
+        assert_eq!(copy.params[8].name, "ibytes");
+        assert_eq!(copy.params[10].name, "debug");
+        assert_eq!(copy.params[0].ty, Some(c_int_type()));
+        assert_eq!(copy.params[3].ty, Some(signed_byte_pointer_type()));
+
+        let sparse =
+            semantic_role_signature_hint("sym.sparse_copy", &empty, 0).expect("sparse copy hint");
+        assert_eq!(sparse.params[0].name, "src_fd");
+        assert_eq!(sparse.params[1].name, "dest_fd");
+        assert_eq!(
+            sparse.params[2].ty,
+            Some(signed_byte_pointer_pointer_type())
+        );
+        assert_eq!(sparse.params[7].name, "max_n_read");
+
+        let unblock = semantic_role_signature_hint("dbg.copy_with_unblock", &empty, 0)
+            .expect("dd unblock hint");
+        assert_eq!(unblock.ret_type, Some(CTypeLike::Void));
+        assert_eq!(unblock.params[0].name, "buf");
+        assert_eq!(unblock.params[0].ty, Some(signed_byte_pointer_type()));
+        assert_eq!(unblock.params[1].ty, Some(typedef_type("idx_t")));
+
+        let iwrite = semantic_role_signature_hint("sym.iwrite.constprop.0", &empty, 0)
+            .expect("dd iwrite hint");
+        assert_eq!(iwrite.ret_type, Some(typedef_type("idx_t")));
+        assert_eq!(iwrite.params[0].ty, Some(c_int_type()));
+        assert_eq!(iwrite.params[1].ty, Some(signed_byte_pointer_type()));
+        assert_eq!(iwrite.params[2].ty, Some(typedef_type("idx_t")));
+
+        let translate = semantic_role_signature_hint("dbg.translate_charset", &empty, 0)
+            .expect("dd translate hint");
+        assert_eq!(translate.ret_type, Some(CTypeLike::Void));
+        assert_eq!(translate.params[0].ty, Some(signed_byte_pointer_type()));
+
+        let invalidate =
+            semantic_role_signature_hint("dbg.invalidate_cache", &empty, 0).expect("dd cache hint");
+        assert_eq!(invalidate.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(invalidate.params[0].ty, Some(c_int_type()));
+        assert_eq!(invalidate.params[1].ty, Some(typedef_type("off_t")));
+
+        let parse_long = semantic_role_signature_hint("dbg.parse_long_options", &empty, 0)
+            .expect("long options hint");
+        assert_eq!(parse_long.ret_type, Some(CTypeLike::Void));
+        assert_eq!(
+            parse_long.params[1].ty,
+            Some(signed_byte_pointer_pointer_type())
+        );
+        assert_eq!(parse_long.params[5].ty, Some(CTypeLike::Function));
+        assert_eq!(parse_long.params[6].name, "author1");
+        assert_eq!(parse_long.params[6].ty, Some(signed_byte_pointer_type()));
+
+        let parse_gnu =
+            semantic_role_signature_hint("dbg.parse_gnu_standard_options_only", &empty, 0)
+                .expect("GNU options hint");
+        assert_eq!(parse_gnu.ret_type, Some(CTypeLike::Void));
+        assert_eq!(parse_gnu.params[5].ty, Some(CTypeLike::Bool));
+        assert_eq!(parse_gnu.params[6].ty, Some(CTypeLike::Function));
+        assert_eq!(parse_gnu.params[7].name, "author1");
+        assert_eq!(parse_gnu.params[7].ty, Some(signed_byte_pointer_type()));
+
+        let human =
+            semantic_role_signature_hint("dbg.human_options", &empty, 0).expect("human hint");
+        assert_eq!(human.ret_type, Some(typedef_type("strtol_error")));
+        assert_eq!(human.params[0].ty, Some(signed_byte_pointer_type()));
+        assert_eq!(
+            human.params[1].ty,
+            Some(CTypeLike::Pointer(Box::new(c_int_type())))
+        );
+        assert_eq!(human.params[2].ty, Some(typedef_pointer_type("uintmax_t")));
+
+        let parse_integer = semantic_role_signature_hint("dbg.parse_integer", &empty, 0)
+            .expect("parse integer hint");
+        assert_eq!(parse_integer.ret_type, Some(typedef_type("intmax_t")));
+        assert_eq!(
+            parse_integer.params[1].ty,
+            Some(typedef_pointer_type("strtol_error"))
+        );
+
+        let sync =
+            semantic_role_signature_hint("dbg.synchronize_output", &empty, 0).expect("sync hint");
+        assert_eq!(sync.ret_type, Some(c_int_type()));
+        assert!(sync.params.is_empty());
+
+        let read =
+            semantic_role_signature_hint("sym.rpl_fts_read", &empty, 0).expect("fts read hint");
+        assert_eq!(read.ret_type, Some(typedef_pointer_type("FTSENT")));
+        assert_eq!(read.params[0].name, "sp");
+        assert_eq!(read.params[0].ty, Some(typedef_pointer_type("FTS")));
+
+        let open =
+            semantic_role_signature_hint("sym.rpl_fts_open", &empty, 0).expect("fts open hint");
+        assert_eq!(open.ret_type, Some(typedef_pointer_type("FTS")));
+        assert_eq!(open.params[0].name, "argv");
+        assert_eq!(open.params[0].ty, Some(signed_byte_pointer_pointer_type()));
+
+        let prompt =
+            semantic_role_signature_hint("sym.prompt.constprop.0", &empty, 0).expect("prompt hint");
+        assert_eq!(prompt.ret_type, Some(typedef_type("RM_status")));
+        assert_eq!(prompt.params[0].ty, Some(typedef_pointer_type("FTS")));
+        assert_eq!(prompt.params[1].ty, Some(typedef_pointer_type("FTSENT")));
+        assert_eq!(prompt.params[2].ty, Some(CTypeLike::Bool));
+        assert_eq!(prompt.params[3].name, "dir_status");
+        assert_eq!(
+            prompt.params[3].ty,
+            Some(CTypeLike::Pointer(Box::new(c_int_type())))
+        );
+    }
+
+    #[test]
+    fn semantic_role_signature_hint_covers_record_format_and_sort_workers() {
+        let empty = InterprocSummaryView::new(None);
+
+        let cut = semantic_role_signature_hint("dbg.cut_fields_bytesearch", &empty, 0)
+            .expect("cut field hint");
+        assert_eq!(cut.ret_type, Some(CTypeLike::Void));
+        assert_eq!(cut.params[0].name, "stream");
+        assert_eq!(cut.params[0].ty, Some(typedef_pointer_type("FILE")));
+
+        let skip = semantic_role_signature_hint("dbg.skip_whitespace_run", &empty, 0)
+            .expect("skip whitespace hint");
+        assert_eq!(
+            skip.ret_type,
+            Some(CTypeLike::Enum("field_terminator".to_string()))
+        );
+        assert_eq!(skip.params[0].ty, Some(typedef_pointer_type("mbbuf_t")));
+        assert_eq!(
+            skip.params[1].ty,
+            Some(typedef_pointer_type("mbfield_parser"))
+        );
+        assert_eq!(
+            skip.params[2].ty,
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Bool)))
+        );
+        assert_eq!(skip.params[3].ty, Some(CTypeLike::Bool));
+
+        let blank = semantic_role_signature_hint("dbg.scan_mb_blank_field", &empty, 0)
+            .expect("scan blank field hint");
+        assert_eq!(blank.params[0].ty, Some(typedef_pointer_type("mbbuf_t")));
+        assert_eq!(
+            blank.params[2].ty,
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Bool)))
+        );
+        assert_eq!(blank.params[4].ty, Some(typedef_pointer_type("idx_t")));
+
+        let delim = semantic_role_signature_hint("dbg.scan_mb_delim_field", &empty, 0)
+            .expect("scan delimiter field hint");
+        assert_eq!(delim.params.len(), 4);
+        assert_eq!(delim.params[0].ty, Some(typedef_pointer_type("mbbuf_t")));
+        assert_eq!(
+            delim.params[1].ty,
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Bool)))
+        );
+        assert_eq!(delim.params[3].ty, Some(typedef_pointer_type("idx_t")));
+
+        let fields =
+            semantic_role_signature_hint("dbg.set_fields", &empty, 0).expect("set fields hint");
+        assert_eq!(fields.params[0].name, "fieldstr");
+        assert_eq!(fields.params[0].ty, Some(signed_byte_pointer_type()));
+
+        let ls = semantic_role_signature_hint("dbg.print_name_with_quoting", &empty, 0)
+            .expect("ls printer hint");
+        assert_eq!(ls.ret_type, Some(typedef_type("size_t")));
+        assert_eq!(ls.params[0].ty, Some(typedef_pointer_type("fileinfo")));
+        assert_eq!(ls.params[2].ty, Some(typedef_pointer_type("obstack")));
+
+        let human =
+            semantic_role_signature_hint("dbg.human_readable", &empty, 0).expect("human hint");
+        assert_eq!(human.ret_type, Some(signed_byte_pointer_type()));
+        assert_eq!(human.params[1].name, "buf");
+
+        let merge =
+            semantic_role_signature_hint("dbg.mergefps", &empty, 0).expect("sort merge hint");
+        assert_eq!(merge.params[0].ty, Some(typedef_pointer_type("sortfile")));
+        assert_eq!(merge.params[3].ty, Some(typedef_pointer_type("FILE")));
+
+        let linebuffer = semantic_role_signature_hint("dbg.readlinebuffer_delim", &empty, 0)
+            .expect("linebuffer hint");
+        assert_eq!(
+            linebuffer.ret_type,
+            Some(typedef_pointer_type("linebuffer"))
+        );
+        assert_eq!(
+            linebuffer.params[0].ty,
+            Some(typedef_pointer_type("linebuffer"))
+        );
+        assert_eq!(linebuffer.params[1].ty, Some(typedef_pointer_type("FILE")));
+        assert_eq!(linebuffer.params[2].ty, Some(signed_int_type(8)));
+
+        let main = semantic_role_signature_hint("dbg.main", &empty, 0).expect("main hint");
+        assert_eq!(main.ret_type, Some(c_int_type()));
+        assert_eq!(main.params[0].name, "argc");
+        assert_eq!(main.params[1].ty, Some(signed_byte_pointer_pointer_type()));
+    }
+
+    #[test]
+    fn semantic_role_signature_hint_covers_text_conversion_and_quoting_workers() {
+        let empty = InterprocSummaryView::new(None);
+
+        let quote = semantic_role_signature_hint("sym.quotearg_buffer_restyled", &empty, 0)
+            .expect("quotearg hint");
+        assert_eq!(quote.ret_type, Some(typedef_type("size_t")));
+        assert_eq!(quote.params.len(), 9);
+        assert_eq!(quote.params[0].name, "buffer");
+        assert_eq!(quote.params[1].ty, Some(typedef_type("size_t")));
+        assert_eq!(
+            quote.params[4].ty,
+            Some(CTypeLike::Enum("quoting_style".to_string()))
+        );
+        assert_eq!(
+            quote.params[6].ty,
+            Some(CTypeLike::Pointer(Box::new(c_uint_type())))
+        );
+
+        let mbr =
+            semantic_role_signature_hint("sym.rpl_mbrtoc32", &empty, 0).expect("mbrtoc32 hint");
+        assert_eq!(mbr.ret_type, Some(typedef_type("size_t")));
+        assert_eq!(mbr.params[0].ty, Some(typedef_pointer_type("char32_t")));
+        assert_eq!(mbr.params[2].name, "n");
+        assert_eq!(mbr.params[3].ty, Some(typedef_pointer_type("mbstate_t")));
+
+        let strftime = semantic_role_signature_hint("sym.__strftime_internal.isra.0", &empty, 0)
+            .expect("strftime hint");
+        assert_eq!(strftime.params.len(), 6);
+        assert_eq!(strftime.params[0].ty, Some(typedef_pointer_type("FILE")));
+        assert_eq!(strftime.params[4].name, "upcase");
+        assert_eq!(
+            strftime.params[5].ty,
+            Some(CTypeLike::Enum("pad_style".to_string()))
+        );
+    }
+
+    #[test]
+    fn accepted_type_quality_roles_replace_generic_summary_signatures() {
+        fn assert_projection(
+            name: &str,
+            weak_param_count: usize,
+            expected_ret: &str,
+            expected_params: &[(&str, &str)],
+        ) {
+            let params = (0..weak_param_count)
+                .map(|idx| InferredSignatureParam {
+                    name: format!("arg{}", idx + 1),
+                    param_type: "int64_t".to_string(),
+                })
+                .collect::<Vec<_>>();
+            let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+                function_name: name,
+                ptr_bits: 64,
+                inferred_signature: InferredSignature {
+                    function_name: name.to_string(),
+                    signature: format!("int64_t {name}(...)"),
+                    ret_type: "int64_t".to_string(),
+                    params,
+                    callconv: "amd64".to_string(),
+                    arch: "x86-64".to_string(),
+                    confidence: 80,
+                    callconv_confidence: 80,
+                },
+                recovered_vars: &[],
+                ssa_blocks: &[],
+                parsed_context: ParsedExternalContext::default(),
+                local_structs: LocalStructArtifacts::default(),
+                interproc_summary_set: Some(semantic_role_summary_set(
+                    name,
+                    Some(weak_param_count),
+                )),
+                diagnostics: TypeWritebackDiagnostics::default(),
+            });
+
+            assert_eq!(analysis.signature.ret_type, expected_ret, "{name} return");
+            assert_eq!(
+                analysis.signature.params.len(),
+                expected_params.len(),
+                "{name} arity"
+            );
+            for (idx, (expected_name, expected_ty)) in expected_params.iter().enumerate() {
+                assert_eq!(
+                    analysis.signature.params[idx].name, *expected_name,
+                    "{name} param {idx} name"
+                );
+                assert_eq!(
+                    analysis.signature.params[idx].param_type, *expected_ty,
+                    "{name} param {idx} type"
+                );
+            }
+        }
+
+        assert_projection(
+            "dbg.xnumtoumax",
+            8,
+            "uintmax_t",
+            &[
+                ("n_str", "int8_t*"),
+                ("base", "int"),
+                ("min", "uintmax_t"),
+                ("max", "uintmax_t"),
+                ("suffixes", "int8_t*"),
+                ("err", "int8_t*"),
+                ("err_exit", "int"),
+            ],
+        );
+        assert_projection(
+            "sym.setlocale_null_r_unlocked",
+            4,
+            "int",
+            &[
+                ("category", "int"),
+                ("buf", "int8_t*"),
+                ("bufsize", "size_t"),
+            ],
+        );
+        assert_projection(
+            "dbg.areadlink_with_size",
+            3,
+            "int8_t*",
+            &[("filename", "int8_t*"), ("size_hint", "size_t")],
+        );
+        assert_projection("sym.hard_locale", 2, "bool", &[("category", "int")]);
+        assert_projection("sym.set_program_name", 2, "void", &[("argv0", "int8_t*")]);
+        assert_projection(
+            "sym.nstrftime",
+            7,
+            "ptrdiff_t",
+            &[
+                ("s", "int8_t*"),
+                ("maxsize", "size_t"),
+                ("format", "int8_t*"),
+                ("tp", "tm*"),
+                ("tz", "timezone_t"),
+                ("ns", "int"),
+            ],
+        );
+        assert_projection("dbg.hash_free", 2, "void", &[("table", "hash_table*")]);
+        assert_projection(
+            "dbg.num_processors",
+            2,
+            "unsigned long",
+            &[("query", "enum nproc_query")],
+        );
+        assert_projection(
+            "dbg.open_input_files",
+            4,
+            "size_t",
+            &[
+                ("files", "sortfile*"),
+                ("nfiles", "size_t"),
+                ("pfps", "FILE***"),
+            ],
+        );
+        assert_projection(
+            "dbg.physmem_claimable",
+            2,
+            "double",
+            &[("aggressivity", "double")],
+        );
+        assert_projection(
+            "dbg.randread_new",
+            3,
+            "randread_source*",
+            &[("name", "int8_t*"), ("bytes_bound", "size_t")],
+        );
+    }
+
+    #[test]
+    fn weak_summary_kind_projection_does_not_widen_authoritative_anonymous_signature() {
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Void),
+                params: vec![
+                    FunctionParamSpec {
+                        name: "dst".to_string(),
+                        ty: Some(void_pointer_type()),
+                    },
+                    FunctionParamSpec {
+                        name: "src".to_string(),
+                        ty: Some(void_pointer_type()),
+                    },
+                ],
+            }),
+            ..FunctionTypeFacts::default()
+        };
+        let projected = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Void),
+            params: vec![
+                FunctionParamSpec {
+                    name: "dst".to_string(),
+                    ty: Some(void_pointer_type()),
+                },
+                FunctionParamSpec {
+                    name: "src".to_string(),
+                    ty: Some(void_pointer_type()),
+                },
+                FunctionParamSpec {
+                    name: "len".to_string(),
+                    ty: Some(typedef_type("size_t")),
+                },
+            ],
+        };
+
+        let result = facts.apply_signature_projection(
+            "fcn.0000a200",
+            FunctionSignatureProjection::weak_summary_kind(projected),
+            64,
+        );
+
+        assert!(result.rejected.is_some());
+        assert_eq!(
+            facts
+                .merged_signature
+                .as_ref()
+                .map(|signature| signature.params.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn exact_role_signature_replaces_weak_summary_signature_slots() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.quotearg_buffer_restyled",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.quotearg_buffer_restyled".to_string(),
+                signature: "void* sym.quotearg_buffer_restyled (int8_t* arg1, int64_t arg2, int8_t* arg3, uint64_t arg4)"
+                    .to_string(),
+                ret_type: "void*".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arg1".to_string(),
+                        param_type: "int8_t*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg2".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg3".to_string(),
+                        param_type: "int8_t*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg4".to_string(),
+                        param_type: "uint64_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set(
+                "sym.quotearg_buffer_restyled",
+                Some(9),
+            )),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "size_t");
+        assert_eq!(analysis.signature.params.len(), 9);
+        assert_eq!(analysis.signature.params[0].name, "buffer");
+        assert_eq!(analysis.signature.params[1].param_type, "size_t");
+        assert_eq!(
+            analysis.signature.params[4].param_type,
+            "enum quoting_style"
+        );
+        assert_eq!(analysis.signature.params[6].param_type, "unsigned int*");
+    }
+
+    #[test]
+    fn exact_role_signature_replaces_single_letter_weak_slots() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.streamsavedir",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.streamsavedir".to_string(),
+                signature: "int32_t sym.streamsavedir (int32_t a, int32_t b)".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "a".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "b".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("sym.streamsavedir", Some(2))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "int8_t*");
+        assert_eq!(analysis.signature.params[0].name, "dirp");
+        assert_eq!(analysis.signature.params[0].param_type, "DIR*");
+        assert_eq!(analysis.signature.params[1].name, "option");
+        assert_eq!(
+            analysis.signature.params[1].param_type,
+            "enum savedir_option"
+        );
+    }
+
+    #[test]
+    fn exact_role_signature_truncates_weak_surplus_slots() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.rpl_fts_read",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.rpl_fts_read".to_string(),
+                signature: "FTSENT* sym.rpl_fts_read (void* sp, int64_t arg2)".to_string(),
+                ret_type: "FTSENT*".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "sp".to_string(),
+                        param_type: "void*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg2".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("sym.rpl_fts_read", Some(2))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params.len(), 1);
+        assert_eq!(analysis.signature.params[0].name, "sp");
+        assert_eq!(analysis.signature.params[0].param_type, "FTS*");
+    }
+
+    #[test]
+    fn mbrtoc32_role_signature_refines_parser_projection_slots() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.rpl_mbrtoc32",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.rpl_mbrtoc32".to_string(),
+                signature: "void* sym.rpl_mbrtoc32 (uint8_t* output, uint8_t* stream, uint64_t arg3, int64_t arg4)"
+                    .to_string(),
+                ret_type: "void*".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "output".to_string(),
+                        param_type: "uint8_t*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "stream".to_string(),
+                        param_type: "uint8_t*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg3".to_string(),
+                        param_type: "uint64_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg4".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("sym.rpl_mbrtoc32", Some(4))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "size_t");
+        assert_eq!(analysis.signature.params[0].name, "pwc");
+        assert_eq!(analysis.signature.params[0].param_type, "char32_t*");
+        assert_eq!(analysis.signature.params[1].name, "s");
+        assert_eq!(analysis.signature.params[1].param_type, "int8_t*");
+        assert_eq!(analysis.signature.params[2].param_type, "size_t");
+        assert_eq!(analysis.signature.params[3].param_type, "mbstate_t*");
+    }
+
+    #[test]
+    fn explicit_role_type_hint_blocks_generic_pointer_upgrade() {
+        let mut projection = SemanticTypeProjection::default();
+        projection.pointer_param_indices.insert(0);
+        projection.param_type_hints.insert(0, c_int_type());
+        projection.param_name_hints.insert(0, "argc".to_string());
+
+        let mut signature = InferredSignature {
+            function_name: "dbg.main".to_string(),
+            signature: "int dbg.main (int argc)".to_string(),
+            ret_type: "int".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "argc".to_string(),
+                param_type: "int".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 96,
+            callconv_confidence: 92,
+        };
+        let mut merged = inferred_signature_to_spec(&signature, 64);
+
+        upgrade_param_indices_to_pointer(
+            projection_pointer_upgrade_indices(&projection),
+            &mut merged,
+            &mut signature,
+            64,
+        );
+
+        assert_eq!(signature.params[0].param_type, "int");
+        assert_eq!(
+            merged
+                .as_ref()
+                .and_then(|sig| sig.params[0].ty.as_ref())
+                .map(|ty| render_signature_type(ty, 64)),
+            Some("int".to_string())
+        );
+
+        let mut summary = r2ssa::FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x401000),
+            Some("dbg.main".to_string()),
+        );
+        summary.arg_effects.insert(
+            0,
+            r2ssa::SummaryArgEffect {
+                read: true,
+                ..Default::default()
+            },
+        );
+        maybe_upgrade_param_to_pointer(&summary, &mut merged, &mut signature, 64);
+
+        assert_eq!(signature.params[0].param_type, "int");
+
+        let mut fallback_signature = InferredSignature {
+            function_name: "dbg.main".to_string(),
+            signature: "int dbg.main (int argc)".to_string(),
+            ret_type: "int".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "argc".to_string(),
+                param_type: "int".to_string(),
+            }],
+            callconv: "unknown".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 80,
+            callconv_confidence: 0,
+        };
+        let mut fallback_projection = SemanticTypeProjection::default();
+        fallback_projection
+            .param_type_hints
+            .insert(0, signed_byte_pointer_type());
+        assert!(apply_semantic_projection_to_fallback_signature(
+            &mut fallback_signature,
+            &fallback_projection,
+            64
+        ));
+        assert_eq!(fallback_signature.params[0].param_type, "int");
+    }
+
+    #[test]
+    fn printf_fetchargs_role_signature_hint_replaces_generic_dense_switch_signature() {
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.printf_fetchargs",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.printf_fetchargs".to_string(),
+                signature: "void sym.printf_fetchargs (int64_t arg1, int64_t arg2, int64_t arg3)"
+                    .to_string(),
+                ret_type: "void".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arg1".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg2".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg3".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: Some(semantic_role_summary_set("sym.printf_fetchargs", Some(2))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "printf_status_t");
+        assert_eq!(analysis.signature.params.len(), 2);
+        assert_eq!(analysis.signature.params[0].name, "args");
+        assert_eq!(analysis.signature.params[0].param_type, "__va_list_tag*");
+        assert_eq!(analysis.signature.params[1].name, "arguments_out");
+        assert_eq!(analysis.signature.params[1].param_type, "arguments*");
+    }
+
+    #[test]
+    fn semantic_role_typedef_blocks_local_generated_struct_override() {
+        let local_structs = LocalStructArtifacts {
+            struct_decls: vec![StructDeclCandidate {
+                name: "sla_struct_deadbeef".to_string(),
+                decl: "struct sla_struct_deadbeef { int32_t f_0; int32_t f_8; };".to_string(),
+                confidence: 95,
+                source: StructDeclSource::LocalInferred,
+                fields: vec![
+                    StructFieldCandidate {
+                        name: "f_0".to_string(),
+                        offset: 0,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                    StructFieldCandidate {
+                        name: "f_8".to_string(),
+                        offset: 8,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                ],
+            }],
+            slot_type_overrides: HashMap::from([(
+                1usize,
+                "struct sla_struct_deadbeef *".to_string(),
+            )]),
+            slot_field_profiles: HashMap::from([(
+                1usize,
+                BTreeMap::from([(0u64, "int32_t".to_string()), (8u64, "int32_t".to_string())]),
+            )]),
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.printf_fetchargs",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.printf_fetchargs".to_string(),
+                signature: "void sym.printf_fetchargs (int64_t arg1, int64_t arg2, int64_t arg3)"
+                    .to_string(),
+                ret_type: "void".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arg1".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg2".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg3".to_string(),
+                        param_type: "int64_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs,
+            interproc_summary_set: Some(semantic_role_summary_set("sym.printf_fetchargs", Some(2))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params[1].param_type, "arguments*");
+        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&1));
+        assert!(
+            !analysis
+                .plan
+                .struct_decls
+                .iter()
+                .any(|decl| decl.name == "sla_struct_deadbeef")
+        );
+    }
+
+    #[test]
+    fn exact_role_signature_prunes_generated_aggregate_override() {
+        let fts_local_structs = LocalStructArtifacts {
+            struct_decls: vec![StructDeclCandidate {
+                name: "sla_struct_fts".to_string(),
+                decl: "struct sla_struct_fts { int32_t f_8; int32_t f_34; };".to_string(),
+                confidence: 95,
+                source: StructDeclSource::LocalInferred,
+                fields: vec![
+                    StructFieldCandidate {
+                        name: "f_8".to_string(),
+                        offset: 8,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                    StructFieldCandidate {
+                        name: "f_34".to_string(),
+                        offset: 52,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                ],
+            }],
+            slot_type_overrides: HashMap::from([(0usize, "struct sla_struct_fts *".to_string())]),
+            slot_field_profiles: HashMap::from([(
+                0usize,
+                BTreeMap::from([
+                    (8u64, "int32_t".to_string()),
+                    (52u64, "int32_t".to_string()),
+                ]),
+            )]),
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "dbg.fts_build",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "dbg.fts_build".to_string(),
+                signature: "FTSENT* dbg.fts_build (struct sla_struct_fts * sp, int32_t type)"
+                    .to_string(),
+                ret_type: "FTSENT*".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "sp".to_string(),
+                        param_type: "struct sla_struct_fts *".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "type".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 80,
+                callconv_confidence: 80,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: fts_local_structs,
+            interproc_summary_set: Some(semantic_role_summary_set("dbg.fts_build", Some(2))),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params[0].param_type, "FTS*");
+        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&0));
+        assert!(
+            !analysis
+                .plan
+                .struct_decls
+                .iter()
+                .any(|decl| decl.name == "sla_struct_fts")
+        );
+
+        let bool_local_structs = LocalStructArtifacts {
+            struct_decls: vec![StructDeclCandidate {
+                name: "sla_struct_bool".to_string(),
+                decl: "struct sla_struct_bool { int32_t f_0; };".to_string(),
+                confidence: 95,
+                source: StructDeclSource::LocalInferred,
+                fields: vec![StructFieldCandidate {
+                    name: "f_0".to_string(),
+                    offset: 0,
+                    field_type: "int32_t".to_string(),
+                    confidence: 95,
+                }],
+            }],
+            slot_type_overrides: HashMap::from([(2usize, "struct sla_struct_bool *".to_string())]),
+            slot_field_profiles: HashMap::from([(
+                2usize,
+                BTreeMap::from([(0u64, "int32_t".to_string())]),
+            )]),
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "dbg.skip_whitespace_run",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "dbg.skip_whitespace_run".to_string(),
+                signature: "enum field_terminator dbg.skip_whitespace_run (mbbuf_t* mbuf, struct mbfield_parser* parser, _Bool* have_pending_line, _Bool have_initial_whitespace)"
+                    .to_string(),
+                ret_type: "enum field_terminator".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "mbuf".to_string(),
+                        param_type: "mbbuf_t*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "parser".to_string(),
+                        param_type: "struct mbfield_parser*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "have_pending_line".to_string(),
+                        param_type: "_Bool*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "have_initial_whitespace".to_string(),
+                        param_type: "_Bool".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 92,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context: ParsedExternalContext::default(),
+            local_structs: bool_local_structs,
+            interproc_summary_set: Some(semantic_role_summary_set(
+                "dbg.skip_whitespace_run",
+                Some(4),
+            )),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params[2].param_type, "bool*");
+        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&2));
+        assert!(
+            !analysis
+                .plan
+                .struct_decls
+                .iter()
+                .any(|decl| decl.name == "sla_struct_bool")
+        );
     }
 
     #[test]

@@ -126,10 +126,13 @@ pub use semantics::{
     VmMemoryCondition, VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp,
     VmValueExpr, augment_semantic_artifact_with_interproc_summary,
     compile_function_semantics_with_scope, compile_function_semantics_with_scope_and_replay_seed,
+    compile_named_native_worker_summary_artifact, compile_native_worker_summary_artifact,
     compile_query_semantic_artifact_with_scope,
     compile_query_semantic_artifact_with_scope_and_replay_seed,
     compile_semantic_artifact_default_with_scope, compile_semantic_artifact_with_scope,
-    compile_semantic_artifact_with_scope_and_replay_seed, stable_scope_hash,
+    compile_semantic_artifact_with_scope_and_replay_seed,
+    compile_summary_dense_worker_artifact_from_interproc_summary, has_native_worker_summary_family,
+    has_program_orchestrator_summary_family, stable_scope_hash,
 };
 pub use sim::{
     CallConv, CallInfo, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,

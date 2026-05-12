@@ -329,6 +329,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Cast { expr: inner, .. } => {
                 self.resolve_stack_alias_from_addr_expr(inner, depth + 1)
             }
+            CExpr::AddrOf(inner) => self.resolve_stack_alias_from_addr_expr(inner, depth + 1),
             CExpr::Deref(inner) => self.resolve_stack_alias_from_addr_expr(inner, depth + 1),
             _ => None,
         }

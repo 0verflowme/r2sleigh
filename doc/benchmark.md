@@ -125,7 +125,15 @@ Quality Metrics
 The JSON report includes more than pass/fail data:
 
 - decompile classification: `structured`, `residual`, `fallback`, or `empty`
+- optional `pdg` comparison when `decompile_pdg` is included in `--commands`
 - temp/register artifact density per decompile command
+- source smells such as scalar address leaks, synthetic `local_<hex>` stack
+  placeholders, and shadowed parameters
+- readability smells such as cast noise, pointer-cast noise, stack-address
+  leaks, unresolved call names, synthetic type leaks, and unstructured
+  `goto`/`while (true)` control flow
+- invalid-C readability warnings such as orphan `break;` statements and pointer
+  parameters compared directly with non-zero scalar literals
 - generic arg/type counts from `a:sla.debug.types`
 - runtime buckets: `fast`, `normal`, `slow`, and `hot`
 - native radare2 candidate counts with minimal repro commands
@@ -133,6 +141,36 @@ The JSON report includes more than pass/fail data:
 These fields are the priority queue for owner-level fixes. A green run with
 many residual or temp-heavy outputs is still useful, but it is not the end
 state.
+
+Use `--commands decompile_sla,decompile_pdg,types,profile` when the goal is to
+beat r2ghidra's `pdg` directly. If r2ghidra is installed outside the temporary
+benchmark home, add it explicitly with `--baseline-plugin-dir`, for example
+`--baseline-plugin-dir ~/.local/share/radare2/plugins`. The report records
+common-target quality wins, latency wins, artifact-count wins, baseline command
+failures, and the worst target-level gaps under
+`summary.quality.pdg_comparison`. The comparison is also grouped by corpus and
+target family so broad runs cannot hide one weak corpus behind another.
+Quality/perf wins are counted only for targets where both `decompile_sla` and
+`decompile_pdg` completed successfully.
+
+For a broad local acceptance pass over every corpus currently present on the
+machine, use the generated manifest plus explicit local corpus directories:
+
+```bash
+python3 scripts/reversing_benchmark.py \
+  --preset full \
+  --r2 /private/tmp/radare2-r2sleigh-clean/binr/radare2/radare2 \
+  --plugin-dir r2plugin \
+  --baseline-plugin-dir ~/.local/share/radare2/plugins \
+  --manifest /tmp/r2sleigh-corpora/manifest.json \
+  --coreutils-dir /tmp/r2sleigh-corpora/src/coreutils/coreutils-9.11/src \
+  --cgc-dir /tmp/r2sleigh-corpora/cgc \
+  --juliet-dir /tmp/r2sleigh-corpora/juliet \
+  --commands decompile_sla,decompile_pdg,types,profile \
+  --max-functions 12 \
+  --jobs 3 \
+  --out /tmp/r2sleigh-all-corpora-pdg.json
+```
 
 Interpreting Failures
 ---------------------

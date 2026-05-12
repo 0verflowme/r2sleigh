@@ -16,6 +16,29 @@ fn decompile_capability(function_facts: &FunctionFacts) -> DecompileCapabilityVi
     function_facts.decompile_capability()
 }
 
+fn has_generic_only_summary_islands(capability: &DecompileCapabilityView) -> bool {
+    capability.has_summary_islands && !capability.has_primary_summary_islands
+}
+
+fn has_large_bounded_memory_summary_worker(capability: &DecompileCapabilityView) -> bool {
+    capability.skipped_large_cfg
+        && capability.has_memory_read_write_summary_pair
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+}
+
+fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) -> bool {
+    !capability.has_native_regions
+        && capability.has_memory_read_write_summary_pair
+        && capability.summary_island_count >= 24
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+}
+
 pub(crate) fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) -> bool {
     let capability = decompile_capability(function_facts);
     capability
@@ -100,6 +123,21 @@ pub(crate) fn preferred_semantic_linearization_reason(
         && matches!(capability.slice_class, Some(r2sym::SliceClass::Worker))
         && !capability.assumption_conflicted
         && capability.ambiguous_targets.is_empty()
+        && (!has_generic_only_summary_islands(&capability) || capability.skipped_large_cfg)
+    {
+        return Some(reason.clone());
+    }
+    if let r2sym::DecompilePlan::NativeLinear { reason } = plan
+        && capability.has_summary_islands
+        && capability.has_primary_summary_islands
+        && !capability.has_native_regions
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+        && !capability.assumption_conflicted
+        && !capability.summary_conflicted
+        && capability.ambiguous_targets.is_empty()
     {
         return Some(reason.clone());
     }
@@ -123,7 +161,12 @@ pub(crate) fn preferred_semantic_summary_islands_reason(
     cfg_summary: &CFGRiskSummary,
 ) -> Option<String> {
     let capability = decompile_capability(function_facts);
+    let large_bounded_memory_worker = has_large_bounded_memory_summary_worker(&capability);
+    let dense_summary_only_memory_worker = has_dense_summary_only_memory_worker(&capability);
     if !capability.has_summary_islands
+        || (!capability.has_primary_summary_islands
+            && !large_bounded_memory_worker
+            && !dense_summary_only_memory_worker)
         || !matches!(
             capability.slice_class,
             Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
@@ -135,18 +178,19 @@ pub(crate) fn preferred_semantic_summary_islands_reason(
         r2sym::DecompilePlan::NativeStructured => {
             if capability.skipped_large_cfg
                 && (cfg_guard_reason_from_summary(cfg_summary).is_some()
-                    || capability.summary_island_count >= 8)
+                    || capability.primary_summary_island_count >= 8
+                    || large_bounded_memory_worker)
             {
                 return Some(preferred_semantic_worker_reason(cfg_summary));
             }
-            let summary_dense_native_worker = capability.summary_island_count >= 16
+            let summary_dense_native_worker = capability.primary_summary_island_count >= 16
                 && (cfg_summary.loop_count > 0
                     || cfg_summary.back_edge_count > 0
                     || capability.actionable_region_count >= 4);
             summary_dense_native_worker.then(|| "summary-dense semantic worker islands".to_string())
         }
         r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
-            if !capability.skipped_large_cfg && capability.summary_island_count < 16 {
+            if !capability.skipped_large_cfg && capability.primary_summary_island_count < 16 {
                 return None;
             }
             if capability.summary_conflicted || capability.assumption_conflicted {
@@ -156,8 +200,19 @@ pub(crate) fn preferred_semantic_summary_islands_reason(
             }
         }
         r2sym::DecompilePlan::NativeLinear { reason } => {
+            if dense_summary_only_memory_worker {
+                return Some("dense summary-only memory worker".to_string());
+            }
+            let summary_dense_native_worker = capability.primary_summary_island_count >= 16
+                && (cfg_summary.loop_count > 0
+                    || cfg_summary.back_edge_count > 0
+                    || capability.actionable_region_count >= 4);
+            if summary_dense_native_worker {
+                return Some("summary-dense semantic worker islands".to_string());
+            }
             let high_risk = cfg_guard_reason_from_summary(cfg_summary).is_some()
-                || capability.summary_island_count >= 8;
+                || capability.primary_summary_island_count >= 8
+                || large_bounded_memory_worker;
             high_risk.then(|| reason.clone())
         }
         _ => None,

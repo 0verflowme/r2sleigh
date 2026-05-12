@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use r2il::ArchSpec;
-use r2ssa::{InterprocFunctionId, SsaArtifact};
+use r2ssa::{FunctionSemanticSummary, InterprocFunctionId, SsaArtifact};
 use z3::Context;
 
 use crate::replay::{ReplaySeed, stable_replay_seed_fingerprint};
@@ -24,7 +24,7 @@ use super::facts::{
 };
 use super::region::{
     ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
-    RefinementStage, SemanticArtifactDiagnostics,
+    NativeWorkerSummary, RefinementStage, SemanticArtifactDiagnostics,
 };
 use super::vm::{build_vm_step_summary, classify_interpreter_like};
 
@@ -115,6 +115,249 @@ fn semantic_granularity_for(
     } else {
         ArtifactGranularity::WholeFunction
     }
+}
+
+const SUMMARY_DENSE_WORKER_ISLAND_MIN: usize = 16;
+
+fn has_named_worker_family(summaries: &[NativeWorkerSummary]) -> bool {
+    summaries.iter().any(|summary| {
+        matches!(
+            summary.kind,
+            crate::NativeWorkerSummaryKind::ProgramOrchestrator
+                | crate::NativeWorkerSummaryKind::DiagnosticWrapper
+                | crate::NativeWorkerSummaryKind::FormatArgumentFetch
+                | crate::NativeWorkerSummaryKind::FileTransfer
+                | crate::NativeWorkerSummaryKind::StringScan
+                | crate::NativeWorkerSummaryKind::HashFold
+                | crate::NativeWorkerSummaryKind::TableWalk
+                | crate::NativeWorkerSummaryKind::PathWalk
+                | crate::NativeWorkerSummaryKind::DirectoryTraversal
+                | crate::NativeWorkerSummaryKind::RecordStream
+                | crate::NativeWorkerSummaryKind::FieldSelection
+                | crate::NativeWorkerSummaryKind::OutputStream
+                | crate::NativeWorkerSummaryKind::FormatRender
+                | crate::NativeWorkerSummaryKind::MetadataProbe
+                | crate::NativeWorkerSummaryKind::SortMerge
+                | crate::NativeWorkerSummaryKind::NumericTransform
+                | crate::NativeWorkerSummaryKind::Parser
+        )
+    })
+}
+
+pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    summary: &FunctionSemanticSummary,
+) -> Option<SemanticArtifact> {
+    let worker_summaries =
+        super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, summary);
+    let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
+    let named_worker_family = has_named_worker_family(&worker_summaries);
+    if worker_summaries.len() < SUMMARY_DENSE_WORKER_ISLAND_MIN && !named_worker_family {
+        return None;
+    }
+
+    let cfg = func.function().cfg_risk_summary();
+    if cfg.loop_count == 0
+        && cfg.back_edge_count == 0
+        && cfg.block_count <= 64
+        && !named_worker_family
+    {
+        return None;
+    }
+
+    let helper_functions = scope
+        .map(|scope| scope.helper_functions().count())
+        .unwrap_or(summary.direct_callees.len());
+    let derived_diagnostics = DerivedSummaryDiagnostics::default();
+    let slice_class = classify_slice(func, helper_functions, &derived_diagnostics, None, false);
+    let slice_class = if named_worker_family
+        && !matches!(
+            slice_class,
+            crate::SliceClass::Worker | crate::SliceClass::GenericLarge
+        ) {
+        crate::SliceClass::Worker
+    } else {
+        slice_class
+    };
+    if !matches!(
+        slice_class,
+        crate::SliceClass::Worker | crate::SliceClass::GenericLarge
+    ) {
+        return None;
+    }
+
+    let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
+    SemanticArtifact {
+        stage: RefinementStage::Compiled,
+        granularity: ArtifactGranularity::SummaryOnly,
+        execution: ExecutionModel::Native,
+        body: SemanticArtifactBody::Native(NativeArtifactBody {
+            summary: NativeFunctionSummary {
+                slice_class,
+                closure_functions,
+                helper_functions,
+                derived_summaries: 0,
+                derived_diagnostics,
+                region_summaries: Vec::new(),
+                worker_summaries,
+            },
+            regions: Default::default(),
+        }),
+        diagnostics: SemanticArtifactDiagnostics {
+            branches_evaluated: 0,
+            branches_pruned: 0,
+            branches_unknown: 0,
+            skipped_missing_arch: false,
+            skipped_large_cfg: false,
+            residual_reasons: Vec::new(),
+            interpreter: None,
+            ambiguous_targets: Vec::new(),
+            cache_hit: false,
+        },
+    }
+    .normalized()
+    .into()
+}
+
+pub fn compile_named_native_worker_summary_artifact(
+    summary: &FunctionSemanticSummary,
+    skipped_large_cfg: bool,
+) -> Option<SemanticArtifact> {
+    if !summary
+        .name
+        .as_deref()
+        .is_some_and(super::native_worker::has_native_worker_summary_family)
+    {
+        return None;
+    }
+    let worker_summaries =
+        super::native_worker::summaries_from_interproc_summary_unbounded(summary.id.0, summary);
+    let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
+    let named_worker_family = has_named_worker_family(&worker_summaries);
+    if worker_summaries.is_empty() || !named_worker_family {
+        return None;
+    }
+    let derived_diagnostics = DerivedSummaryDiagnostics::default();
+    let collected = CollectedNativeSemanticRegions {
+        regions: Default::default(),
+        diagnostics: SymbolicFunctionFactDiagnostics {
+            skipped_large_cfg,
+            ..SymbolicFunctionFactDiagnostics::default()
+        },
+        region_summaries: Vec::new(),
+        worker_summaries,
+    };
+    Some(build_semantic_artifact(BuildSemanticArtifactInput {
+        stage: RefinementStage::Compiled,
+        granularity: ArtifactGranularity::SummaryOnly,
+        execution: ExecutionModel::Native,
+        suppress_large_cfg_reason: true,
+        slice_class: crate::SliceClass::Worker,
+        closure_functions: 1,
+        helper_functions: summary.direct_callees.len(),
+        derived_summaries: 0,
+        derived_diagnostics,
+        collected,
+        interpreter: None,
+        vm_step: None,
+        vm_transfer: None,
+    }))
+}
+
+pub fn compile_native_worker_summary_artifact(
+    func: &SsaArtifact,
+    scope: Option<&PreparedFunctionScope>,
+    summary: Option<&FunctionSemanticSummary>,
+    skipped_large_cfg: bool,
+) -> Option<SemanticArtifact> {
+    let mut worker_summaries = Vec::new();
+    if let Some(summary) = summary {
+        worker_summaries.extend(
+            super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, summary),
+        );
+    }
+    let has_primary_interproc_summary = worker_summaries
+        .iter()
+        .any(NativeWorkerSummary::is_primary_render_summary);
+    let cfg_summary = func.function().cfg_risk_summary();
+    let op_count = func
+        .function()
+        .blocks()
+        .map(|block| block.ops.len())
+        .sum::<usize>();
+    let cheap_native_worker_classification =
+        !skipped_large_cfg || (cfg_summary.block_count <= 32 && op_count <= 128);
+    if !has_primary_interproc_summary && cheap_native_worker_classification {
+        worker_summaries
+            .extend(super::native_worker::classify_function_worker_summaries_unbounded(func));
+    }
+    let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
+    let named_worker_family = has_named_worker_family(&worker_summaries);
+    let summary_owned_worker = summary
+        .and_then(|summary| summary.name.as_deref())
+        .is_some_and(super::native_worker::has_native_worker_summary_family);
+    let region_summaries = if summary_owned_worker && has_primary_interproc_summary {
+        Vec::new()
+    } else {
+        super::native_worker::classify_native_region_summaries(func, &worker_summaries)
+    };
+    if worker_summaries.is_empty() && region_summaries.is_empty() {
+        return None;
+    }
+
+    let derived_diagnostics = DerivedSummaryDiagnostics::default();
+    let helper_functions = scope
+        .map(|scope| scope.helper_functions().count())
+        .or_else(|| summary.map(|summary| summary.direct_callees.len()))
+        .unwrap_or(0);
+    let slice_class = classify_slice(func, helper_functions, &derived_diagnostics, None, false);
+    let slice_class = if named_worker_family
+        && !matches!(
+            slice_class,
+            crate::SliceClass::Worker | crate::SliceClass::GenericLarge
+        ) {
+        crate::SliceClass::Worker
+    } else {
+        slice_class
+    };
+    let has_primary_summary = worker_summaries
+        .iter()
+        .any(NativeWorkerSummary::is_primary_render_summary)
+        || region_summaries
+            .iter()
+            .any(crate::NativeRegionSummary::is_primary_render_summary);
+    let stage = if has_primary_summary {
+        RefinementStage::Compiled
+    } else {
+        RefinementStage::Residual
+    };
+    let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
+    let collected = CollectedNativeSemanticRegions {
+        regions: Default::default(),
+        diagnostics: SymbolicFunctionFactDiagnostics {
+            skipped_large_cfg,
+            ..SymbolicFunctionFactDiagnostics::default()
+        },
+        region_summaries,
+        worker_summaries,
+    };
+
+    Some(build_semantic_artifact(BuildSemanticArtifactInput {
+        stage,
+        granularity: ArtifactGranularity::SummaryOnly,
+        execution: ExecutionModel::Native,
+        suppress_large_cfg_reason: has_primary_summary,
+        slice_class,
+        closure_functions,
+        helper_functions,
+        derived_summaries: 0,
+        derived_diagnostics,
+        collected,
+        interpreter: None,
+        vm_step: None,
+        vm_transfer: None,
+    }))
 }
 
 struct BuildSemanticArtifactInput {
@@ -719,12 +962,14 @@ mod tests {
     use super::*;
     const RAX: u64 = 0;
     const RBP: u64 = 8;
+    const RDI: u64 = 0x20;
 
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("RAX", RAX, 8));
         arch.add_register(RegisterDef::new("RBP", RBP, 8));
+        arch.add_register(RegisterDef::new("RDI", RDI, 8));
         arch
     }
 
@@ -795,6 +1040,168 @@ mod tests {
         );
         assert!(!first.cache_hit);
         assert!(second.cache_hit);
+    }
+
+    #[test]
+    fn summary_dense_worker_artifact_uses_interproc_summaries_without_branch_regions() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1000, 8),
+                    cond: make_reg(RAX, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(RAX, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+        let mut summary =
+            r2ssa::FunctionSemanticSummary::unknown(r2ssa::InterprocFunctionId(0x1000), None);
+        for offset in 0..SUMMARY_DENSE_WORKER_ISLAND_MIN {
+            summary.memory_effects.push(r2ssa::SummaryMemoryEffect {
+                kind: r2ssa::SummaryMemoryEffectKind::Read,
+                location: r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Unknown,
+                    range: Some(r2ssa::SummaryMemoryRange {
+                        offset_lo: offset as i64,
+                        offset_hi: offset as i64,
+                        width: Some(1),
+                    }),
+                },
+            });
+        }
+
+        let artifact =
+            compile_summary_dense_worker_artifact_from_interproc_summary(&func, None, &summary)
+                .expect("summary-dense worker artifact");
+
+        let native = artifact.native_body().expect("native artifact");
+        assert_eq!(artifact.stage, RefinementStage::Compiled);
+        assert_eq!(artifact.granularity, ArtifactGranularity::SummaryOnly);
+        assert_eq!(artifact.diagnostics.branches_evaluated, 0);
+        assert!(!artifact.diagnostics.skipped_large_cfg);
+        assert!(native.regions.is_empty());
+        assert_eq!(
+            native.summary.worker_summaries.len(),
+            SUMMARY_DENSE_WORKER_ISLAND_MIN
+        );
+        assert!(matches!(
+            artifact.decompile_plan(),
+            crate::DecompilePlan::NativeLinear { .. }
+        ));
+    }
+
+    #[test]
+    fn native_worker_summary_artifact_classifies_loops_without_branch_symex() {
+        let loaded = Varnode::unique(0x10, 1);
+        let pred = Varnode::unique(0x11, 1);
+        let blocks = vec![R2ILBlock {
+            addr: 0x1100,
+            size: 4,
+            ops: vec![
+                R2ILOp::Load {
+                    dst: loaded.clone(),
+                    space: r2il::SpaceId::Ram,
+                    addr: make_reg(RDI, 8),
+                },
+                R2ILOp::IntEqual {
+                    dst: pred.clone(),
+                    a: loaded,
+                    b: make_const(0, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1100, 8),
+                    cond: pred,
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+
+        let artifact =
+            compile_native_worker_summary_artifact(&func, None, None, true).expect("summary");
+
+        let native = artifact.native_body().expect("native artifact");
+        assert_eq!(artifact.granularity, ArtifactGranularity::SummaryOnly);
+        assert_eq!(artifact.diagnostics.branches_evaluated, 0);
+        assert!(artifact.diagnostics.skipped_large_cfg);
+        assert!(native.has_primary_summary_islands());
+        assert!(
+            native.summary.worker_summaries.iter().any(|summary| {
+                matches!(summary.kind, crate::NativeWorkerSummaryKind::StringScan)
+            })
+        );
+        assert!(matches!(
+            artifact.decompile_plan(),
+            crate::DecompilePlan::NativeSummaryIslands { .. }
+        ));
+    }
+
+    #[test]
+    fn native_worker_summary_artifact_trusts_primary_interproc_summary() {
+        let loaded = Varnode::unique(0x10, 1);
+        let pred = Varnode::unique(0x11, 1);
+        let blocks = vec![R2ILBlock {
+            addr: 0x1100,
+            size: 4,
+            ops: vec![
+                R2ILOp::Load {
+                    dst: loaded.clone(),
+                    space: r2il::SpaceId::Ram,
+                    addr: make_reg(RDI, 8),
+                },
+                R2ILOp::IntEqual {
+                    dst: pred.clone(),
+                    a: loaded,
+                    b: make_const(0, 1),
+                },
+                R2ILOp::CBranch {
+                    target: make_const(0x1100, 8),
+                    cond: pred,
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+        let summary = r2ssa::FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(func.entry),
+            Some("sym.printf_fetchargs".to_string()),
+        );
+
+        let artifact = compile_native_worker_summary_artifact(&func, None, Some(&summary), true)
+            .expect("named worker summary");
+
+        let native = artifact.native_body().expect("native artifact");
+        assert!(native.summary.worker_summaries.iter().any(|summary| {
+            matches!(
+                summary.kind,
+                crate::NativeWorkerSummaryKind::FormatArgumentFetch
+            )
+        }));
+        assert!(
+            !native.summary.worker_summaries.iter().any(|summary| {
+                matches!(summary.kind, crate::NativeWorkerSummaryKind::StringScan)
+            })
+        );
+        assert_eq!(artifact.slice_class(), Some(crate::SliceClass::Worker));
+        assert!(matches!(
+            artifact.decompile_plan(),
+            crate::DecompilePlan::NativeSummaryIslands { .. }
+                | crate::DecompilePlan::NativeLinear { .. }
+        ));
     }
 
     #[test]

@@ -8,6 +8,9 @@ use crate::convert::CTypeLike;
 use crate::external::ExternalTypeDb;
 use crate::model::Signedness;
 
+pub const SIGNATURE_PROJECTION_WEAK_CONFIDENCE: u8 = 55;
+pub const SIGNATURE_PROJECTION_STRONG_CONFIDENCE: u8 = 96;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionType {
     pub return_type: CTypeLike,
@@ -70,6 +73,129 @@ pub struct FunctionParamSpec {
 pub struct FunctionSignatureSpec {
     pub ret_type: Option<CTypeLike>,
     pub params: Vec<FunctionParamSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureProjectionSource {
+    SummaryRole,
+    SummaryKind,
+    SemanticProjection,
+    InterprocSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureProjectionRejection {
+    WeakAnonymousFunction,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignatureProjectionResult {
+    pub changed: bool,
+    pub rejected: Option<SignatureProjectionRejection>,
+}
+
+impl SignatureProjectionResult {
+    pub fn applied(changed: bool) -> Self {
+        Self {
+            changed,
+            rejected: None,
+        }
+    }
+
+    pub fn rejected(rejected: SignatureProjectionRejection) -> Self {
+        Self {
+            changed: false,
+            rejected: Some(rejected),
+        }
+    }
+
+    pub fn was_applied(&self) -> bool {
+        self.rejected.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionSignatureProjection {
+    pub signature: FunctionSignatureSpec,
+    pub source: SignatureProjectionSource,
+    pub return_confidence: u8,
+    pub default_param_confidence: u8,
+    pub param_confidences: Vec<u8>,
+    pub exact_arity: bool,
+    pub allow_anonymous_function: bool,
+}
+
+impl FunctionSignatureProjection {
+    pub fn new(signature: FunctionSignatureSpec, source: SignatureProjectionSource) -> Self {
+        Self {
+            exact_arity: signature_projection_is_exact(&signature),
+            signature,
+            source,
+            return_confidence: SIGNATURE_PROJECTION_STRONG_CONFIDENCE,
+            default_param_confidence: SIGNATURE_PROJECTION_STRONG_CONFIDENCE,
+            param_confidences: Vec::new(),
+            allow_anonymous_function: true,
+        }
+    }
+
+    pub fn strong_summary(signature: FunctionSignatureSpec) -> Self {
+        Self::new(signature, SignatureProjectionSource::SummaryRole)
+    }
+
+    pub fn weak_summary_kind(signature: FunctionSignatureSpec) -> Self {
+        Self::new(signature, SignatureProjectionSource::SummaryKind)
+            .with_return_confidence(SIGNATURE_PROJECTION_WEAK_CONFIDENCE)
+            .with_default_param_confidence(SIGNATURE_PROJECTION_WEAK_CONFIDENCE)
+            .with_exact_arity(false)
+            .allow_anonymous_function(false)
+    }
+
+    pub fn with_return_confidence(mut self, confidence: u8) -> Self {
+        self.return_confidence = confidence;
+        self
+    }
+
+    pub fn with_default_param_confidence(mut self, confidence: u8) -> Self {
+        self.default_param_confidence = confidence;
+        self
+    }
+
+    pub fn with_param_confidences(mut self, confidences: Vec<u8>) -> Self {
+        self.param_confidences = confidences;
+        self
+    }
+
+    pub fn with_exact_arity(mut self, exact_arity: bool) -> Self {
+        self.exact_arity = exact_arity;
+        self
+    }
+
+    pub fn allow_anonymous_function(mut self, allow: bool) -> Self {
+        self.allow_anonymous_function = allow;
+        self
+    }
+
+    pub fn param_confidence(&self, index: usize) -> u8 {
+        self.param_confidences
+            .get(index)
+            .copied()
+            .unwrap_or(self.default_param_confidence)
+    }
+
+    pub fn signature_confidence(&self) -> u8 {
+        self.signature
+            .params
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| self.param_confidence(idx))
+            .chain(std::iter::once(self.return_confidence))
+            .min()
+            .unwrap_or(self.return_confidence)
+    }
+
+    pub fn has_strong_signature_confidence(&self) -> bool {
+        self.signature_confidence() >= SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +453,461 @@ impl FunctionTypeFacts {
     pub fn builder(inputs: FunctionTypeFactInputs) -> FunctionTypeFactsBuilder {
         FunctionTypeFactsBuilder::new(inputs)
     }
+
+    pub fn apply_signature_projection(
+        &mut self,
+        function_name: &str,
+        projection: FunctionSignatureProjection,
+        ptr_bits: u32,
+    ) -> SignatureProjectionResult {
+        if projection_rejected_for_function(function_name, &projection).is_some() {
+            return SignatureProjectionResult::rejected(
+                SignatureProjectionRejection::WeakAnonymousFunction,
+            );
+        }
+
+        let Some(existing) = self.merged_signature.as_mut() else {
+            self.merged_signature = Some(projection.signature);
+            return SignatureProjectionResult::applied(true);
+        };
+
+        let changed = apply_signature_projection_to_existing(existing, &projection, ptr_bits);
+        SignatureProjectionResult::applied(changed)
+    }
+}
+
+pub fn signature_projection_is_exact(signature: &FunctionSignatureSpec) -> bool {
+    signature.ret_type.is_some()
+        && signature
+            .params
+            .iter()
+            .all(|param| !crate::context::is_generic_arg_name(&param.name) && param.ty.is_some())
+}
+
+pub fn signature_param_name_is_weak(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || crate::context::is_generic_arg_name(&normalized)
+        || matches!(
+            normalized.as_str(),
+            "status"
+                | "err"
+                | "errno"
+                | "input"
+                | "output"
+                | "stream"
+                | "value"
+                | "val"
+                | "slot"
+                | "tmp"
+                | "a"
+                | "b"
+                | "c"
+                | "d"
+                | "e"
+                | "f"
+        )
+}
+
+pub fn signature_strength(signature: &FunctionSignatureSpec) -> u8 {
+    let has_type_info =
+        signature.ret_type.is_some() || signature.params.iter().any(|param| param.ty.is_some());
+    let has_named_params = signature
+        .params
+        .iter()
+        .any(|param| !crate::context::is_generic_arg_name(&param.name));
+    if has_type_info || has_named_params {
+        SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+    } else {
+        80
+    }
+}
+
+pub fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec) -> bool {
+    if signature.params.is_empty() {
+        return false;
+    }
+    signature_strength(signature) >= SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+}
+
+pub fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
+    match ty {
+        None => true,
+        Some(CTypeLike::Unknown | CTypeLike::Void) => true,
+        Some(CTypeLike::Pointer(inner)) => {
+            matches!(inner.as_ref(), CTypeLike::Unknown | CTypeLike::Void)
+        }
+        _ => false,
+    }
+}
+
+pub fn signature_hint_can_replace_existing(
+    existing: &CTypeLike,
+    hint: Option<&CTypeLike>,
+    ptr_bits: u32,
+) -> bool {
+    if is_generic_signature_type(Some(existing)) {
+        return true;
+    }
+    let Some(hint) = hint else {
+        return false;
+    };
+    if crate::signature_infer::render_signature_type(existing, ptr_bits)
+        == crate::signature_infer::render_signature_type(hint, ptr_bits)
+    {
+        return false;
+    }
+    if type_is_generated_local_struct_pointer(existing) && pointer_hint_is_authoritative(hint) {
+        return true;
+    }
+    match (existing, hint) {
+        (
+            CTypeLike::Int {
+                bits,
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+            },
+            CTypeLike::Typedef(name),
+        ) => {
+            let normalized = name.trim().to_ascii_lowercase();
+            semantic_typedef_is_authoritative(&normalized)
+                || matches!(normalized.as_str(), "int" | "unsigned int")
+                || (normalized == "uintptr_t" && *bits == ptr_bits)
+        }
+        (
+            CTypeLike::Int {
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+                ..
+            },
+            CTypeLike::Bool,
+        ) => true,
+        (
+            CTypeLike::Int {
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+                ..
+            },
+            CTypeLike::Enum(_),
+        ) => true,
+        (
+            CTypeLike::Int {
+                bits,
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+            },
+            CTypeLike::Pointer(_),
+        ) => *bits == ptr_bits,
+        (CTypeLike::Pointer(inner), CTypeLike::Pointer(new_inner)) => {
+            matches!(inner.as_ref(), CTypeLike::Void | CTypeLike::Unknown)
+                && !matches!(new_inner.as_ref(), CTypeLike::Void | CTypeLike::Unknown)
+                || (matches!(
+                    (inner.as_ref(), new_inner.as_ref()),
+                    (
+                        CTypeLike::Int {
+                            bits: 8,
+                            signedness: _
+                        },
+                        CTypeLike::Int {
+                            bits: 8,
+                            signedness: _
+                        }
+                    )
+                ) && crate::signature_infer::render_signature_type(existing, ptr_bits)
+                    != crate::signature_infer::render_signature_type(hint, ptr_bits))
+                || (matches!(
+                    new_inner.as_ref(),
+                    CTypeLike::Typedef(_)
+                        | CTypeLike::Struct(_)
+                        | CTypeLike::Union(_)
+                        | CTypeLike::Enum(_)
+                ) && !matches!(
+                    inner.as_ref(),
+                    CTypeLike::Typedef(_)
+                        | CTypeLike::Struct(_)
+                        | CTypeLike::Union(_)
+                        | CTypeLike::Enum(_)
+                ))
+        }
+        (CTypeLike::Typedef(existing_name), CTypeLike::Typedef(hint_name)) => {
+            is_weak_storage_scalar_typedef(existing_name, ptr_bits)
+                && semantic_typedef_is_authoritative(hint_name)
+        }
+        (CTypeLike::Typedef(existing_name), CTypeLike::Pointer(_)) => {
+            is_weak_pointer_sized_storage_typedef(existing_name, ptr_bits)
+        }
+        _ => false,
+    }
+}
+
+pub fn signature_return_hint_can_replace_existing(
+    existing: &CTypeLike,
+    hint: Option<&CTypeLike>,
+    ptr_bits: u32,
+) -> bool {
+    if signature_hint_can_replace_existing(existing, hint, ptr_bits) {
+        return true;
+    }
+    matches!(hint, Some(CTypeLike::Void)) && is_weak_storage_scalar_type(existing, ptr_bits)
+}
+
+pub fn summary_hint_can_replace_weak_existing(
+    existing: &CTypeLike,
+    hint: &CTypeLike,
+    ptr_bits: u32,
+) -> bool {
+    if is_generic_signature_type(Some(existing)) {
+        return true;
+    }
+    match (existing, hint) {
+        (CTypeLike::Pointer(inner), CTypeLike::Pointer(new_inner)) => {
+            matches!(**inner, CTypeLike::Void | CTypeLike::Unknown)
+                && !matches!(**new_inner, CTypeLike::Void | CTypeLike::Unknown)
+        }
+        (
+            CTypeLike::Int {
+                bits,
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+            },
+            CTypeLike::Int {
+                bits: hint_bits,
+                signedness: Signedness::Unsigned,
+            },
+        ) => *bits == ptr_bits && *hint_bits == ptr_bits,
+        (
+            CTypeLike::Int {
+                bits,
+                signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
+            },
+            CTypeLike::Pointer(_),
+        ) => *bits == ptr_bits,
+        (CTypeLike::Typedef(existing_name), CTypeLike::Typedef(hint_name)) => {
+            is_weak_storage_scalar_typedef(existing_name, ptr_bits)
+                && semantic_typedef_is_authoritative(hint_name)
+        }
+        (CTypeLike::Typedef(existing_name), CTypeLike::Pointer(_)) => {
+            is_weak_pointer_sized_storage_typedef(existing_name, ptr_bits)
+        }
+        _ => false,
+    }
+}
+
+pub fn type_is_generated_local_struct_pointer(ty: &CTypeLike) -> bool {
+    matches!(
+        ty,
+        CTypeLike::Pointer(inner)
+            if matches!(
+                inner.as_ref(),
+                CTypeLike::Struct(name) | CTypeLike::Typedef(name)
+                    if generated_local_struct_name(name)
+            )
+    )
+}
+
+pub fn is_weak_storage_scalar_type(ty: &CTypeLike, ptr_bits: u32) -> bool {
+    match ty {
+        CTypeLike::Int { .. } => true,
+        CTypeLike::Typedef(name) => is_weak_storage_scalar_typedef(name, ptr_bits),
+        _ => false,
+    }
+}
+
+pub fn is_weak_storage_scalar_typedef(name: &str, ptr_bits: u32) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "int" | "unsigned" | "unsigned int" | "int32_t" | "uint32_t"
+    ) || (ptr_bits == 64
+        && matches!(
+            normalized.as_str(),
+            "long" | "unsigned long" | "int64_t" | "uint64_t"
+        ))
+}
+
+pub fn is_weak_pointer_sized_storage_typedef(name: &str, ptr_bits: u32) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    (ptr_bits == 64
+        && matches!(
+            normalized.as_str(),
+            "long" | "unsigned long" | "int64_t" | "uint64_t"
+        ))
+        || (ptr_bits == 32
+            && matches!(
+                normalized.as_str(),
+                "int" | "unsigned" | "unsigned int" | "int32_t" | "uint32_t"
+            ))
+}
+
+fn apply_signature_projection_to_existing(
+    existing: &mut FunctionSignatureSpec,
+    projection: &FunctionSignatureProjection,
+    ptr_bits: u32,
+) -> bool {
+    let mut changed = false;
+    let hint = &projection.signature;
+    let exact_strong_projection =
+        projection.exact_arity && projection.has_strong_signature_confidence();
+    let can_replace_signature = exact_strong_projection
+        && signature_can_be_replaced_by_projection(existing, hint, ptr_bits);
+
+    if can_replace_signature && existing.params.len() > hint.params.len() {
+        existing.params.truncate(hint.params.len());
+        changed = true;
+    }
+
+    if existing.params.len() < hint.params.len()
+        && (can_replace_signature || !signature_param_count_is_authoritative(existing))
+    {
+        existing
+            .params
+            .resize_with(hint.params.len(), || FunctionParamSpec {
+                name: String::new(),
+                ty: None,
+            });
+        changed = true;
+    }
+
+    if projection.return_confidence >= SIGNATURE_PROJECTION_WEAK_CONFIDENCE {
+        let should_replace_return = match existing.ret_type.as_ref() {
+            None => hint.ret_type.is_some(),
+            Some(existing_ty) => {
+                if projection.return_confidence < SIGNATURE_PROJECTION_STRONG_CONFIDENCE {
+                    is_generic_signature_type(Some(existing_ty)) && hint.ret_type.is_some()
+                } else {
+                    can_replace_signature
+                        || signature_return_hint_can_replace_existing(
+                            existing_ty,
+                            hint.ret_type.as_ref(),
+                            ptr_bits,
+                        )
+                }
+            }
+        };
+        if should_replace_return && existing.ret_type != hint.ret_type {
+            existing.ret_type = hint.ret_type.clone();
+            changed = true;
+        }
+    }
+
+    for (idx, hint_param) in hint.params.iter().enumerate() {
+        let Some(existing_param) = existing.params.get_mut(idx) else {
+            continue;
+        };
+        let confidence = projection.param_confidence(idx);
+        if confidence < SIGNATURE_PROJECTION_WEAK_CONFIDENCE {
+            continue;
+        }
+
+        if !hint_param.name.is_empty()
+            && (existing_param.name.is_empty()
+                || crate::context::is_generic_arg_name(&existing_param.name)
+                || (can_replace_signature && signature_param_name_is_weak(&existing_param.name)))
+            && existing_param.name != hint_param.name
+        {
+            existing_param.name = hint_param.name.clone();
+            changed = true;
+        }
+
+        let Some(hint_ty) = hint_param.ty.as_ref() else {
+            continue;
+        };
+        let should_replace_ty = match existing_param.ty.as_ref() {
+            None => true,
+            Some(existing_ty) if confidence < SIGNATURE_PROJECTION_STRONG_CONFIDENCE => {
+                is_generic_signature_type(Some(existing_ty))
+            }
+            Some(existing_ty) => {
+                can_replace_signature
+                    || signature_hint_can_replace_existing(existing_ty, Some(hint_ty), ptr_bits)
+            }
+        };
+        if should_replace_ty && existing_param.ty.as_ref() != Some(hint_ty) {
+            existing_param.ty = Some(hint_ty.clone());
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn signature_can_be_replaced_by_projection(
+    existing: &FunctionSignatureSpec,
+    hint: &FunctionSignatureSpec,
+    ptr_bits: u32,
+) -> bool {
+    if existing.params.is_empty() {
+        return true;
+    }
+    if existing.params.len() < hint.params.len() {
+        return true;
+    }
+    existing.params.iter().enumerate().all(|(idx, param)| {
+        let weak_name = signature_param_name_is_weak(&param.name);
+        let hint_param = hint.params.get(idx);
+        let compatible_name = weak_name
+            || hint_param
+                .is_some_and(|hint_param| param.name.eq_ignore_ascii_case(&hint_param.name));
+        let weak_type = param.ty.as_ref().is_none_or(|ty| {
+            is_generic_signature_type(Some(ty))
+                || hint_param.is_some_and(|hint_param| {
+                    signature_hint_can_replace_existing(ty, hint_param.ty.as_ref(), ptr_bits)
+                })
+                || (hint_param.is_none() && type_is_generated_local_struct_pointer(ty))
+                || is_weak_storage_scalar_type(ty, ptr_bits)
+        });
+        compatible_name && weak_type
+    })
+}
+
+fn projection_rejected_for_function(
+    function_name: &str,
+    projection: &FunctionSignatureProjection,
+) -> Option<SignatureProjectionRejection> {
+    if projection.allow_anonymous_function {
+        return None;
+    }
+    if projection.signature_confidence() >= SIGNATURE_PROJECTION_STRONG_CONFIDENCE {
+        return None;
+    }
+    anonymous_function_name(function_name)
+        .then_some(SignatureProjectionRejection::WeakAnonymousFunction)
+}
+
+fn anonymous_function_name(function_name: &str) -> bool {
+    let normalized = function_name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    matches!(
+        normalized
+            .strip_prefix("sym.")
+            .or_else(|| normalized.strip_prefix("dbg."))
+            .unwrap_or(&normalized),
+        name if name.starts_with("fcn.") || name.starts_with("sub.") || name.starts_with("fcn_") || name.starts_with("sub_")
+    )
+}
+
+fn pointer_hint_is_authoritative(hint: &CTypeLike) -> bool {
+    let CTypeLike::Pointer(inner) = hint else {
+        return false;
+    };
+    match inner.as_ref() {
+        CTypeLike::Bool
+        | CTypeLike::Int { .. }
+        | CTypeLike::Struct(_)
+        | CTypeLike::Union(_)
+        | CTypeLike::Enum(_)
+        | CTypeLike::Pointer(_) => true,
+        CTypeLike::Typedef(name) => semantic_typedef_is_authoritative(name),
+        _ => false,
+    }
+}
+
+fn semantic_typedef_is_authoritative(name: &str) -> bool {
+    crate::role_registry::semantic_typedef_is_authoritative(name)
+}
+
+fn generated_local_struct_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower
+        .trim_start_matches("struct ")
+        .starts_with("sla_struct_")
 }
 
 impl FunctionTypeFactsBuilder {
@@ -482,7 +1063,7 @@ pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
     } else {
         match base_key.as_str() {
             "void" => Some(CTypeLike::Void),
-            "bool" => Some(CTypeLike::Bool),
+            "bool" | "_bool" => Some(CTypeLike::Bool),
             "char" | "signedchar" => Some(CTypeLike::Int {
                 bits: 8,
                 signedness: Signedness::Signed,
@@ -566,6 +1147,28 @@ fn is_c_typedef_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{ExternalStackBase, ExternalStackSlotRole};
+
+    fn test_int(bits: u32) -> CTypeLike {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        }
+    }
+
+    fn test_typedef(name: &str) -> CTypeLike {
+        CTypeLike::Typedef(name.to_string())
+    }
+
+    fn test_ptr(inner: CTypeLike) -> CTypeLike {
+        CTypeLike::Pointer(Box::new(inner))
+    }
+
+    fn test_param(name: &str, ty: CTypeLike) -> FunctionParamSpec {
+        FunctionParamSpec {
+            name: name.to_string(),
+            ty: Some(ty),
+        }
+    }
 
     #[test]
     fn builder_merges_local_field_accesses_into_slot_profiles() {
@@ -769,5 +1372,106 @@ mod tests {
                 "FILE".to_string()
             ))))
         );
+    }
+
+    #[test]
+    fn parse_type_like_spec_canonicalizes_c_bool_spelling() {
+        assert_eq!(parse_type_like_spec("_Bool", 64), Some(CTypeLike::Bool));
+        assert_eq!(
+            parse_type_like_spec("_Bool *", 64),
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Bool)))
+        );
+    }
+
+    #[test]
+    fn weak_summary_kind_projection_rejects_anonymous_fcn_signature() {
+        let original = FunctionSignatureSpec {
+            ret_type: Some(test_int(64)),
+            params: vec![test_param("arg1", test_int(64))],
+        };
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(original.clone()),
+            ..FunctionTypeFacts::default()
+        };
+        let projection = FunctionSignatureProjection::weak_summary_kind(FunctionSignatureSpec {
+            ret_type: None,
+            params: vec![
+                test_param("dst", test_ptr(CTypeLike::Void)),
+                test_param("src", test_ptr(CTypeLike::Void)),
+                test_param("len", test_typedef("size_t")),
+            ],
+        });
+
+        let result = facts.apply_signature_projection("fcn.00401000", projection, 64);
+
+        assert_eq!(
+            result.rejected,
+            Some(SignatureProjectionRejection::WeakAnonymousFunction)
+        );
+        assert_eq!(facts.merged_signature, Some(original));
+    }
+
+    #[test]
+    fn strong_summary_projection_preserves_exact_arity_and_names() {
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(test_int(64)),
+                params: vec![
+                    test_param("arg1", test_int(64)),
+                    test_param("arg2", test_int(64)),
+                ],
+            }),
+            ..FunctionTypeFacts::default()
+        };
+        let projection = FunctionSignatureProjection::strong_summary(FunctionSignatureSpec {
+            ret_type: Some(test_typedef("size_t")),
+            params: vec![test_param(
+                "buffer",
+                test_ptr(CTypeLike::Int {
+                    bits: 8,
+                    signedness: Signedness::Signed,
+                }),
+            )],
+        });
+
+        let result = facts.apply_signature_projection("sym.render_buffer", projection, 64);
+        let signature = facts.merged_signature.expect("signature");
+
+        assert!(result.was_applied());
+        assert_eq!(signature.ret_type, Some(test_typedef("size_t")));
+        assert_eq!(signature.params.len(), 1);
+        assert_eq!(signature.params[0].name, "buffer");
+        assert_eq!(
+            signature.params[0].ty,
+            Some(test_ptr(CTypeLike::Int {
+                bits: 8,
+                signedness: Signedness::Signed,
+            }))
+        );
+    }
+
+    #[test]
+    fn signature_projection_uses_explicit_return_and_param_confidence() {
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(test_typedef("ssize_t")),
+                params: vec![test_param("arg1", test_int(64))],
+            }),
+            ..FunctionTypeFacts::default()
+        };
+        let projection = FunctionSignatureProjection::strong_summary(FunctionSignatureSpec {
+            ret_type: Some(test_typedef("size_t")),
+            params: vec![test_param("count", test_typedef("size_t"))],
+        })
+        .with_return_confidence(10)
+        .with_default_param_confidence(SIGNATURE_PROJECTION_STRONG_CONFIDENCE);
+
+        let result = facts.apply_signature_projection("sym.count_items", projection, 64);
+        let signature = facts.merged_signature.expect("signature");
+
+        assert!(result.was_applied());
+        assert_eq!(signature.ret_type, Some(test_typedef("ssize_t")));
+        assert_eq!(signature.params[0].name, "count");
+        assert_eq!(signature.params[0].ty, Some(test_typedef("size_t")));
     }
 }

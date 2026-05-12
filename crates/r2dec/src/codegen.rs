@@ -90,9 +90,7 @@ impl CodeGenerator {
         }
 
         // Function body
-        for stmt in &func.body {
-            self.emit_stmt(stmt);
-        }
+        self.emit_stmt_sequence(&func.body);
 
         self.indent_level -= 1;
         self.output.push_str("}\n");
@@ -138,9 +136,7 @@ impl CodeGenerator {
                 self.emit_indent();
                 self.output.push_str("{\n");
                 self.indent_level += 1;
-                for s in stmts {
-                    self.emit_stmt(s);
-                }
+                self.emit_stmt_sequence(stmts);
                 self.indent_level -= 1;
                 self.emit_indent();
                 self.output.push_str("}\n");
@@ -226,9 +222,7 @@ impl CodeGenerator {
                     self.emit_expr(&case.value, 0);
                     self.output.push_str(":\n");
                     self.indent_level += 1;
-                    for s in &case.body {
-                        self.emit_stmt(s);
-                    }
+                    self.emit_stmt_sequence(&case.body);
                     self.indent_level -= 1;
                 }
 
@@ -236,9 +230,7 @@ impl CodeGenerator {
                     self.emit_indent();
                     self.output.push_str("default:\n");
                     self.indent_level += 1;
-                    for s in default_stmts {
-                        self.emit_stmt(s);
-                    }
+                    self.emit_stmt_sequence(default_stmts);
                     self.indent_level -= 1;
                 }
 
@@ -284,15 +276,27 @@ impl CodeGenerator {
         }
     }
 
+    /// Emit a straight-line sequence, coalescing adjacent scalar self-updates.
+    fn emit_stmt_sequence(&mut self, stmts: &[CStmt]) {
+        let mut idx = 0;
+        while idx < stmts.len() {
+            if let Some((run_len, stmt)) = coalesced_scalar_update_run(&stmts[idx..]) {
+                self.emit_stmt(&stmt);
+                idx += run_len;
+            } else {
+                self.emit_stmt(&stmts[idx]);
+                idx += 1;
+            }
+        }
+    }
+
     /// Emit a statement body (handles braces for single statements).
     fn emit_stmt_body(&mut self, stmt: &CStmt) {
         match stmt {
             CStmt::Block(stmts) => {
                 self.output.push_str("{\n");
                 self.indent_level += 1;
-                for s in stmts {
-                    self.emit_stmt(s);
-                }
+                self.emit_stmt_sequence(stmts);
                 self.indent_level -= 1;
                 self.emit_indent();
                 self.output.push('}');
@@ -547,6 +551,94 @@ pub fn generate(func: &CFunction) -> String {
     codegen.generate_function(func)
 }
 
+fn coalesced_scalar_update_run(stmts: &[CStmt]) -> Option<(usize, CStmt)> {
+    let (name, first_delta) = scalar_self_update_delta(stmts.first()?)?;
+    let mut total = first_delta;
+    let mut run_len = 1;
+
+    for stmt in &stmts[1..] {
+        let Some((next_name, delta)) = scalar_self_update_delta(stmt) else {
+            break;
+        };
+        if next_name != name {
+            break;
+        }
+        total = total.checked_add(delta)?;
+        run_len += 1;
+    }
+
+    if run_len < 2 {
+        return None;
+    }
+
+    Some((run_len, scalar_update_stmt(name, total)?))
+}
+
+fn scalar_update_stmt(name: &str, delta: i64) -> Option<CStmt> {
+    if delta == 0 {
+        return Some(CStmt::Empty);
+    }
+    let (op, amount) = if delta < 0 {
+        (BinaryOp::SubAssign, delta.checked_abs()?)
+    } else {
+        (BinaryOp::AddAssign, delta)
+    };
+    Some(CStmt::Expr(CExpr::binary(
+        op,
+        CExpr::Var(name.to_string()),
+        CExpr::IntLit(amount),
+    )))
+}
+
+fn scalar_self_update_delta(stmt: &CStmt) -> Option<(&str, i64)> {
+    let CStmt::Expr(CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    }) = stmt
+    else {
+        return None;
+    };
+    let CExpr::Var(lhs_name) = left.as_ref() else {
+        return None;
+    };
+    update_delta_for_rhs(lhs_name, right)
+}
+
+fn update_delta_for_rhs<'a>(lhs_name: &'a str, rhs: &CExpr) -> Option<(&'a str, i64)> {
+    let CExpr::Binary { op, left, right } = rhs else {
+        return None;
+    };
+
+    match op {
+        BinaryOp::Add => {
+            if expr_is_var(left, lhs_name) {
+                literal_i64(right).map(|delta| (lhs_name, delta))
+            } else if expr_is_var(right, lhs_name) {
+                literal_i64(left).map(|delta| (lhs_name, delta))
+            } else {
+                None
+            }
+        }
+        BinaryOp::Sub if expr_is_var(left, lhs_name) => {
+            literal_i64(right).and_then(|delta| delta.checked_neg().map(|v| (lhs_name, v)))
+        }
+        _ => None,
+    }
+}
+
+fn expr_is_var(expr: &CExpr, name: &str) -> bool {
+    matches!(expr, CExpr::Var(candidate) if candidate == name)
+}
+
+fn literal_i64(expr: &CExpr) -> Option<i64> {
+    match expr {
+        CExpr::IntLit(value) => Some(*value),
+        CExpr::UIntLit(value) => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +780,58 @@ mod tests {
         let code = generate(&func);
         assert!(code.contains("int32_t x;"));
         assert!(code.contains("int8_t* p;"));
+    }
+
+    #[test]
+    fn test_coalesces_adjacent_scalar_self_updates() {
+        let func = CFunction::new("updates", CType::Void).with_body(vec![
+            CStmt::expr(CExpr::assign(
+                CExpr::var("acc"),
+                CExpr::binary(BinaryOp::Add, CExpr::var("acc"), CExpr::int(3)),
+            )),
+            CStmt::expr(CExpr::assign(
+                CExpr::var("acc"),
+                CExpr::binary(BinaryOp::Add, CExpr::int(4), CExpr::var("acc")),
+            )),
+            CStmt::expr(CExpr::assign(
+                CExpr::var("acc"),
+                CExpr::binary(BinaryOp::Sub, CExpr::var("acc"), CExpr::int(2)),
+            )),
+            CStmt::Return(None),
+        ]);
+
+        let code = generate(&func);
+
+        assert!(
+            code.contains("acc += 5;"),
+            "expected collapsed scalar update, got:\n{code}"
+        );
+        assert_eq!(code.matches("acc = acc").count(), 0, "{code}");
+    }
+
+    #[test]
+    fn test_scalar_self_update_coalesce_stops_at_observable_statement() {
+        let func = CFunction::new("updates", CType::Void).with_body(vec![
+            CStmt::expr(CExpr::assign(
+                CExpr::var("acc"),
+                CExpr::binary(BinaryOp::Add, CExpr::var("acc"), CExpr::int(1)),
+            )),
+            CStmt::expr(CExpr::call(CExpr::var("observe"), vec![CExpr::var("acc")])),
+            CStmt::expr(CExpr::assign(
+                CExpr::var("acc"),
+                CExpr::binary(BinaryOp::Add, CExpr::var("acc"), CExpr::int(2)),
+            )),
+            CStmt::expr(CExpr::assign(
+                CExpr::var("acc"),
+                CExpr::binary(BinaryOp::Add, CExpr::var("acc"), CExpr::int(3)),
+            )),
+        ]);
+
+        let code = generate(&func);
+
+        assert!(
+            code.contains("acc = acc + 1;\n    observe(acc);\n    acc += 5;"),
+            "observable call should break the update run, got:\n{code}"
+        );
     }
 }

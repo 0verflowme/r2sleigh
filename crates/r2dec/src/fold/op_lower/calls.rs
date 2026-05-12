@@ -560,7 +560,10 @@ impl<'a> FoldingContext<'a> {
                 &self.resolve_call_target_for_site(source_call.0, source_call.1, target),
             )
         {
-            return args;
+            return args
+                .into_iter()
+                .map(|arg| self.sanitize_public_call_arg_expr(self.rewrite_stack_expr(arg)))
+                .collect();
         }
         if let Some(cached) = self
             .authoritative_source_args_cache
@@ -989,7 +992,7 @@ impl<'a> FoldingContext<'a> {
             && self.is_preservable_named_stack_slot_expr(&rewritten)
             && self.is_direct_constish_visible_expr(&best, 0)
         {
-            return rewritten;
+            return self.sanitize_public_call_arg_expr(rewritten);
         }
         let rewritten_best = self.rewrite_stack_expr(best.clone());
         let normalized = self
@@ -1077,9 +1080,9 @@ impl<'a> FoldingContext<'a> {
             && self.is_preservable_named_stack_slot_expr(&rewritten)
             && self.is_direct_constish_visible_expr(&best, 0)
         {
-            return rewritten;
+            return self.sanitize_public_call_arg_expr(rewritten);
         }
-        self.rewrite_stack_expr(best)
+        self.sanitize_public_call_arg_expr(self.rewrite_stack_expr(best))
     }
 
     fn imported_input_binding_prefers_pointer_identity(

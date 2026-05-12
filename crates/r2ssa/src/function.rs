@@ -26,7 +26,7 @@ use crate::rename::{
 };
 use crate::semantic::{
     CallSiteFacts, MemoryDefFact, MemorySSAFacts, MemoryUseFact, ObjectId, ObjectModel,
-    PredicateFacts, PreparedFunctionFacts,
+    PredicateFacts, PreparedFunctionFacts, StructuredDataflowFacts,
 };
 use crate::var::SSAVar;
 
@@ -185,6 +185,10 @@ impl SsaArtifact {
 
     pub fn call_sites(&self) -> &CallSiteFacts {
         &self.facts.call_sites
+    }
+
+    pub fn structured(&self) -> &StructuredDataflowFacts {
+        &self.facts.structured
     }
 
     pub fn resolved_call_target(&self, call: &crate::semantic::CallSiteFact) -> Option<u64> {
@@ -3144,6 +3148,189 @@ mod tests {
             .and_then(|facts| facts.first())
             .expect("load use");
         assert_eq!(load_use.version, phis[0].output_version);
+    }
+
+    #[test]
+    fn prepared_function_ssa_collects_structured_dataflow_facts() {
+        let loop_blocks = vec![
+            R2ILBlock {
+                addr: 0x1400,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1408, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1404,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1408,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Store {
+                        space: SpaceId::Ram,
+                        addr: make_const(0x5000, 8),
+                        val: make_const(7, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1400, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared = SsaArtifact::raw(&loop_blocks, None).expect("prepared SSA should build");
+        let structured = prepared.structured();
+        let loop_fact = structured.loops.values().next().expect("natural loop fact");
+        assert_eq!(structured.loops.len(), 1);
+        assert_eq!(loop_fact.header, 0x1400);
+        assert_eq!(loop_fact.latches, vec![0x1408]);
+        assert_eq!(loop_fact.exits, vec![0x1404]);
+        assert!(loop_fact.body.contains(&0x1400));
+        assert!(loop_fact.body.contains(&0x1408));
+        assert!(loop_fact.condition.is_some());
+        assert!(structured.memory_accesses.values().any(|access| {
+            access.block_addr == 0x1408 && access.op_index == 0 && access.is_write
+        }));
+
+        let recursive_blocks = vec![
+            R2ILBlock {
+                addr: 0x1500,
+                size: 4,
+                ops: vec![R2ILOp::Call {
+                    target: make_const(0x1500, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1504,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let recursive =
+            SsaArtifact::raw(&recursive_blocks, None).expect("recursive SSA should build");
+        let call = recursive
+            .structured()
+            .recursive_calls
+            .values()
+            .next()
+            .expect("recursive call fact");
+        assert_eq!(recursive.structured().recursive_calls.len(), 1);
+        assert_eq!(call.block_addr, 0x1500);
+        assert_eq!(call.target, 0x1500);
+    }
+
+    #[test]
+    fn prepared_predicates_recover_signed_less_from_of_sf_flags() {
+        let lhs = make_reg(0, 4);
+        let rhs = make_reg(4, 4);
+        let of = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x2000,
+            size: 1,
+            meta: None,
+        };
+        let sf = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x2001,
+            size: 1,
+            meta: None,
+        };
+        let sub = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x2002,
+            size: 4,
+            meta: None,
+        };
+        let cond = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x2003,
+            size: 1,
+            meta: None,
+        };
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1600,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntSBorrow {
+                        dst: of.clone(),
+                        a: lhs.clone(),
+                        b: rhs.clone(),
+                    },
+                    R2ILOp::IntSub {
+                        dst: sub.clone(),
+                        a: lhs,
+                        b: rhs,
+                    },
+                    R2ILOp::IntSLess {
+                        dst: sf.clone(),
+                        a: sub,
+                        b: make_const(0, 4),
+                    },
+                    R2ILOp::IntNotEqual {
+                        dst: cond.clone(),
+                        a: of,
+                        b: sf,
+                    },
+                    R2ILOp::CBranch {
+                        target: make_const(0x1608, 8),
+                        cond,
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1604,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1608,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(1, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared = SsaArtifact::raw(&blocks, None).expect("prepared SSA should build");
+        let predicate = prepared
+            .predicates()
+            .predicates
+            .values()
+            .next()
+            .expect("predicate fact");
+        let compare = predicate
+            .comparison
+            .as_ref()
+            .expect("signed compare provenance");
+        assert_eq!(compare.kind, crate::semantic::CompareKind::SignedLess);
+        assert_ne!(compare.lhs, compare.rhs);
     }
 
     #[test]

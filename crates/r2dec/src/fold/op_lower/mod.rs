@@ -99,6 +99,12 @@ enum FinalExprNormalizeContext {
     StatementRoot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicExprSanitizeMode {
+    Generic,
+    CallArg,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct VisibleExprQuality {
     scalar_signal: i32,
@@ -1832,6 +1838,19 @@ impl<'a> FoldingContext<'a> {
         {
             let candidate = self.rewrite_stack_expr(candidate);
             if self.prefers_visible_expr(&fallback, &candidate) {
+                return candidate;
+            }
+        }
+        if matches!(
+            self.lookup_semantic_value(&key),
+            Some(analysis::SemanticValue::Address(_))
+        ) && let Some(candidate) =
+            self.lookup_definition_with_depth(&key, 0, &mut HashSet::new())
+        {
+            let candidate = self.rewrite_stack_expr(candidate);
+            if !matches!(candidate, CExpr::AddrOf(_))
+                && self.prefers_visible_expr(&fallback, &candidate)
+            {
                 return candidate;
             }
         }
@@ -4302,7 +4321,7 @@ impl<'a> FoldingContext<'a> {
         None
     }
 
-    fn stack_offset_for_visible_storage_name(&self, name: &str) -> Option<i64> {
+    pub(crate) fn stack_offset_for_visible_storage_name(&self, name: &str) -> Option<i64> {
         let lower = name.to_ascii_lowercase();
         if lower == "stack" {
             return Some(0);
@@ -5354,7 +5373,7 @@ impl<'a> FoldingContext<'a> {
         } else {
             name.to_ascii_lowercase()
         };
-        if normalized.starts_with("unk_")
+        if (normalized.starts_with("unk_") || normalized.starts_with("value_"))
             && let Some((base, suffix)) = normalized.rsplit_once('_')
             && !base.is_empty()
             && !suffix.is_empty()
@@ -5495,7 +5514,9 @@ impl<'a> FoldingContext<'a> {
         match expr {
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
-                Self::is_opaque_public_call_arg_name(&lower) || lower.starts_with("unk_")
+                Self::is_opaque_public_call_arg_name(&lower)
+                    || lower.starts_with("unk_")
+                    || lower.starts_with("value_")
             }
             CExpr::Cast { expr, .. } | CExpr::Paren(expr) => Self::opaque_internal_call_arg(expr),
             _ => false,
@@ -5909,9 +5930,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn visible_names_share_stack_slot(&self, lhs: &str, rhs: &str) -> bool {
-        self.stack_offset_for_visible_storage_name(lhs).is_some()
-            && self.stack_offset_for_visible_storage_name(lhs)
-                == self.stack_offset_for_visible_storage_name(rhs)
+        self.public_stack_alias_offset(lhs).is_some()
+            && self.public_stack_alias_offset(lhs) == self.public_stack_alias_offset(rhs)
     }
 
     fn should_suppress_shadow_call_result_assignment(&self, dst: &SSAVar) -> bool {
@@ -6457,7 +6477,10 @@ impl<'a> FoldingContext<'a> {
         lower.starts_with("var_")
             || lower.starts_with("local_")
             || lower.starts_with("arg_")
+            || lower.starts_with("slot_")
+            || lower == "slot"
             || Self::is_opaque_public_call_arg_name(&lower)
+            || lower.starts_with("value_")
             || lower == "saved_fp"
             || lower.starts_with("stack_")
             || lower.ends_with("_home")
@@ -6578,6 +6601,44 @@ impl<'a> FoldingContext<'a> {
             CType::Int(bits) => Some((true, *bits)),
             CType::UInt(bits) => Some((false, *bits)),
             CType::Bool => Some((false, 1)),
+            CType::Typedef(name) => self.typedef_int_meta(name),
+            _ => None,
+        }
+    }
+
+    fn typedef_int_meta(&self, name: &str) -> Option<(bool, u32)> {
+        let normalized = name
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        match normalized.as_str() {
+            "signed char" | "int8_t" => Some((true, 8)),
+            "unsigned char" | "uint8_t" => Some((false, 8)),
+            "short" | "short int" | "signed short" | "signed short int" | "int16_t" => {
+                Some((true, 16))
+            }
+            "unsigned short" | "unsigned short int" | "uint16_t" => Some((false, 16)),
+            "int" | "signed" | "signed int" | "int32_t" => Some((true, 32)),
+            "unsigned" | "unsigned int" | "uint32_t" => Some((false, 32)),
+            "long long"
+            | "long long int"
+            | "signed long long"
+            | "signed long long int"
+            | "int64_t"
+            | "intmax_t" => Some((true, 64)),
+            "unsigned long long" | "unsigned long long int" | "uint64_t" | "uintmax_t" => {
+                Some((false, 64))
+            }
+            "long" | "long int" | "signed long" | "signed long int" => {
+                Some((true, self.inputs.arch.ptr_size.saturating_mul(8)))
+            }
+            "unsigned long" | "unsigned long int" | "size_t" | "uintptr_t" => {
+                Some((false, self.inputs.arch.ptr_size.saturating_mul(8)))
+            }
+            "ssize_t" | "intptr_t" | "ptrdiff_t" => {
+                Some((true, self.inputs.arch.ptr_size.saturating_mul(8)))
+            }
             _ => None,
         }
     }
@@ -6675,6 +6736,12 @@ impl<'a> FoldingContext<'a> {
     fn collapse_scalar_stack_addr_artifact(&self, expr: CExpr) -> CExpr {
         match expr {
             CExpr::AddrOf(inner) => {
+                if let CExpr::Var(name) = inner.as_ref()
+                    && !is_generic_stack_placeholder_alias(name)
+                    && self.stack_offset_for_visible_storage_name(name).is_some()
+                {
+                    return CExpr::Var(name.clone());
+                }
                 let candidate = CExpr::AddrOf(inner.clone());
                 if let Some(alias) = self.resolve_stack_alias_from_addr_expr(&candidate, 0)
                     && !is_generic_stack_placeholder_alias(&alias)
@@ -6693,6 +6760,48 @@ impl<'a> FoldingContext<'a> {
                 other.map_children(&mut |child| self.collapse_scalar_stack_addr_artifact(child))
             }
         }
+    }
+
+    fn scalar_stack_placeholder_offset_expr(&self, expr: &CExpr) -> Option<i64> {
+        match expr {
+            CExpr::Var(name) if should_replace_preserved_stack_alias(name) => {
+                self.stack_offset_for_visible_storage_name(name)
+            }
+            CExpr::AddrOf(inner) | CExpr::Paren(inner) => {
+                self.scalar_stack_placeholder_offset_expr(inner)
+            }
+            CExpr::Cast { expr: inner, .. } => self.scalar_stack_placeholder_offset_expr(inner),
+            _ => None,
+        }
+    }
+
+    fn rewrite_scalar_stack_placeholder_rhs(&self, lhs: &CExpr, rhs: CExpr) -> CExpr {
+        let CExpr::Var(lhs_name) = lhs else {
+            return rhs;
+        };
+        if is_generic_stack_placeholder_alias(lhs_name) {
+            return rhs;
+        }
+        let Some(lhs_offset) = self.stack_offset_for_visible_storage_name(lhs_name) else {
+            return rhs;
+        };
+        let Some(rhs_offset) = self.scalar_stack_placeholder_offset_expr(&rhs) else {
+            return rhs;
+        };
+
+        let delta = rhs_offset - lhs_offset;
+        if delta == 0 {
+            return CExpr::Var(lhs_name.clone());
+        }
+        if delta.unsigned_abs() > 0x1000 {
+            return rhs;
+        }
+        let op = if delta < 0 {
+            BinaryOp::Sub
+        } else {
+            BinaryOp::Add
+        };
+        CExpr::binary(op, CExpr::Var(lhs_name.clone()), CExpr::IntLit(delta.abs()))
     }
 
     fn is_pointer_typed_var(&self, var: &SSAVar) -> bool {
@@ -9023,52 +9132,57 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn sanitize_public_call_arg_expr(&self, expr: CExpr) -> CExpr {
+        self.sanitize_public_expr(expr, PublicExprSanitizeMode::CallArg)
+    }
+
+    fn sanitize_public_expr(&self, expr: CExpr, mode: PublicExprSanitizeMode) -> CExpr {
         match expr {
             CExpr::Var(name) if Self::is_opaque_public_call_arg_name(&name) => {
                 CExpr::Var(Self::opaque_public_call_arg_display_name(&name))
             }
-            CExpr::Deref(inner) => {
-                CExpr::Deref(Box::new(self.sanitize_public_call_arg_expr(*inner)))
-            }
+            CExpr::Var(name) if matches!(mode, PublicExprSanitizeMode::CallArg) => self
+                .canonical_stack_owner_display_name(&name)
+                .or_else(|| self.public_stack_call_arg_display_name(&name))
+                .map(CExpr::Var)
+                .unwrap_or(CExpr::Var(name)),
+            CExpr::Deref(inner) => CExpr::Deref(Box::new(self.sanitize_public_expr(*inner, mode))),
             CExpr::AddrOf(inner) => {
-                CExpr::AddrOf(Box::new(self.sanitize_public_call_arg_expr(*inner)))
+                CExpr::AddrOf(Box::new(self.sanitize_public_expr(*inner, mode)))
             }
-            CExpr::Paren(inner) => {
-                CExpr::Paren(Box::new(self.sanitize_public_call_arg_expr(*inner)))
-            }
+            CExpr::Paren(inner) => CExpr::Paren(Box::new(self.sanitize_public_expr(*inner, mode))),
             CExpr::Cast { ty, expr } => CExpr::Cast {
                 ty,
-                expr: Box::new(self.sanitize_public_call_arg_expr(*expr)),
+                expr: Box::new(self.sanitize_public_expr(*expr, mode)),
             },
             CExpr::Unary { op, operand } => CExpr::Unary {
                 op,
-                operand: Box::new(self.sanitize_public_call_arg_expr(*operand)),
+                operand: Box::new(self.sanitize_public_expr(*operand, mode)),
             },
             CExpr::Sizeof(inner) => {
-                CExpr::Sizeof(Box::new(self.sanitize_public_call_arg_expr(*inner)))
+                CExpr::Sizeof(Box::new(self.sanitize_public_expr(*inner, mode)))
             }
             CExpr::Binary { op, left, right } => CExpr::Binary {
                 op,
-                left: Box::new(self.sanitize_public_call_arg_expr(*left)),
-                right: Box::new(self.sanitize_public_call_arg_expr(*right)),
+                left: Box::new(self.sanitize_public_expr(*left, mode)),
+                right: Box::new(self.sanitize_public_expr(*right, mode)),
             },
             CExpr::Subscript { base, index } => CExpr::Subscript {
-                base: Box::new(self.sanitize_public_call_arg_expr(*base)),
-                index: Box::new(self.sanitize_public_call_arg_expr(*index)),
+                base: Box::new(self.sanitize_public_expr(*base, mode)),
+                index: Box::new(self.sanitize_public_expr(*index, mode)),
             },
             CExpr::Member { base, member } => CExpr::Member {
-                base: Box::new(self.sanitize_public_call_arg_expr(*base)),
+                base: Box::new(self.sanitize_public_expr(*base, mode)),
                 member,
             },
             CExpr::PtrMember { base, member } => CExpr::PtrMember {
-                base: Box::new(self.sanitize_public_call_arg_expr(*base)),
+                base: Box::new(self.sanitize_public_expr(*base, mode)),
                 member,
             },
             CExpr::Call { func, args } => CExpr::Call {
-                func: Box::new(self.sanitize_public_call_arg_expr(*func)),
+                func: Box::new(self.sanitize_public_expr(*func, PublicExprSanitizeMode::Generic)),
                 args: args
                     .into_iter()
-                    .map(|arg| self.sanitize_public_call_arg_expr(arg))
+                    .map(|arg| self.sanitize_public_expr(arg, PublicExprSanitizeMode::CallArg))
                     .collect(),
             },
             CExpr::Ternary {
@@ -9076,14 +9190,14 @@ impl<'a> FoldingContext<'a> {
                 then_expr,
                 else_expr,
             } => CExpr::Ternary {
-                cond: Box::new(self.sanitize_public_call_arg_expr(*cond)),
-                then_expr: Box::new(self.sanitize_public_call_arg_expr(*then_expr)),
-                else_expr: Box::new(self.sanitize_public_call_arg_expr(*else_expr)),
+                cond: Box::new(self.sanitize_public_expr(*cond, mode)),
+                then_expr: Box::new(self.sanitize_public_expr(*then_expr, mode)),
+                else_expr: Box::new(self.sanitize_public_expr(*else_expr, mode)),
             },
             CExpr::Comma(items) => CExpr::Comma(
                 items
                     .into_iter()
-                    .map(|item| self.sanitize_public_call_arg_expr(item))
+                    .map(|item| self.sanitize_public_expr(item, mode))
                     .collect(),
             ),
             other => other,
@@ -9115,7 +9229,70 @@ impl<'a> FoldingContext<'a> {
         if suffix.is_empty() {
             suffix.push_str("value");
         }
-        format!("unk_{suffix}")
+        format!("value_{suffix}")
+    }
+
+    fn public_stack_call_arg_display_name(&self, name: &str) -> Option<String> {
+        if !Self::is_low_quality_imported_call_arg_name(name)
+            && !is_generic_stack_placeholder_alias(name)
+        {
+            return None;
+        }
+        let offset = self.public_stack_alias_offset(name)?;
+        Some(Self::public_stack_slot_display_name(offset))
+    }
+
+    fn canonical_stack_owner_display_name(&self, name: &str) -> Option<String> {
+        if !name.eq_ignore_ascii_case("slot") {
+            return None;
+        }
+        let offset = self.stack_offset_for_visible_storage_name(name)?;
+        self.stack_vars_map()
+            .get(&offset)
+            .filter(|candidate| !candidate.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    fn public_stack_alias_offset(&self, name: &str) -> Option<i64> {
+        self.stack_offset_for_visible_storage_name(name)
+            .or_else(|| Self::parse_public_stack_alias_offset(name))
+    }
+
+    fn parse_public_stack_alias_offset(name: &str) -> Option<i64> {
+        let lower = name.trim_start_matches('&').to_ascii_lowercase();
+        if lower == "saved_fp" || lower == "stack" || lower == "slot" {
+            return Some(0);
+        }
+        if let Some(rest) = lower.strip_prefix("slot_p") {
+            return i64::from_str_radix(rest, 16).ok();
+        }
+        if let Some(rest) = lower.strip_prefix("slot_") {
+            return i64::from_str_radix(rest, 16).ok().map(|offset| -offset);
+        }
+        if let Some(rest) = lower.strip_prefix("stack_") {
+            return i64::from_str_radix(rest, 16).ok();
+        }
+        if let Some(rest) = lower
+            .strip_prefix("local_")
+            .or_else(|| lower.strip_prefix("arg_"))
+        {
+            return i64::from_str_radix(rest, 16).ok().map(|offset| -offset);
+        }
+        if let Some(rest) = lower.strip_prefix("var_") {
+            let trimmed = rest.strip_suffix('h').unwrap_or(rest);
+            if !trimmed.is_empty() && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return i64::from_str_radix(trimmed, 16).ok().map(|offset| -offset);
+            }
+        }
+        None
+    }
+
+    fn public_stack_slot_display_name(offset: i64) -> String {
+        match offset.cmp(&0) {
+            std::cmp::Ordering::Less => format!("slot_{:x}", offset.unsigned_abs()),
+            std::cmp::Ordering::Equal => "frame_base".to_string(),
+            std::cmp::Ordering::Greater => format!("slot_p{:x}", offset as u64),
+        }
     }
 
     fn normalize_final_call_expr(&self, expr: CExpr) -> CExpr {
@@ -9239,7 +9416,12 @@ impl<'a> FoldingContext<'a> {
             CStmt::Decl { ty, name, init } => CStmt::Decl {
                 ty,
                 name,
-                init: init.map(|expr| self.normalize_final_call_expr(expr)),
+                init: init.map(|expr| {
+                    self.sanitize_public_expr(
+                        self.normalize_final_call_expr(expr),
+                        PublicExprSanitizeMode::Generic,
+                    )
+                }),
             },
             CStmt::Block(stmts) => CStmt::Block(
                 self.prune_redundant_assign_return_pairs(
@@ -9254,17 +9436,26 @@ impl<'a> FoldingContext<'a> {
                 then_body,
                 else_body,
             } => CStmt::If {
-                cond: self.normalize_final_call_expr(cond),
+                cond: self.sanitize_public_expr(
+                    self.normalize_final_call_expr(cond),
+                    PublicExprSanitizeMode::Generic,
+                ),
                 then_body: Box::new(self.normalize_final_stmt_calls(*then_body)),
                 else_body: else_body.map(|stmt| Box::new(self.normalize_final_stmt_calls(*stmt))),
             },
             CStmt::While { cond, body } => CStmt::While {
-                cond: self.normalize_final_call_expr(cond),
+                cond: self.sanitize_public_expr(
+                    self.normalize_final_call_expr(cond),
+                    PublicExprSanitizeMode::Generic,
+                ),
                 body: Box::new(self.normalize_final_stmt_calls(*body)),
             },
             CStmt::DoWhile { body, cond } => CStmt::DoWhile {
                 body: Box::new(self.normalize_final_stmt_calls(*body)),
-                cond: self.normalize_final_call_expr(cond),
+                cond: self.sanitize_public_expr(
+                    self.normalize_final_call_expr(cond),
+                    PublicExprSanitizeMode::Generic,
+                ),
             },
             CStmt::For {
                 init,
@@ -9273,7 +9464,12 @@ impl<'a> FoldingContext<'a> {
                 body,
             } => CStmt::For {
                 init: init.map(|stmt| Box::new(self.normalize_final_stmt_calls(*stmt))),
-                cond: cond.map(|expr| self.normalize_final_call_expr(expr)),
+                cond: cond.map(|expr| {
+                    self.sanitize_public_expr(
+                        self.normalize_final_call_expr(expr),
+                        PublicExprSanitizeMode::Generic,
+                    )
+                }),
                 update: update.map(|expr| self.normalize_final_call_expr(expr)),
                 body: Box::new(self.normalize_final_stmt_calls(*body)),
             },
@@ -9282,11 +9478,17 @@ impl<'a> FoldingContext<'a> {
                 cases,
                 default,
             } => CStmt::Switch {
-                expr: self.normalize_final_call_expr(expr),
+                expr: self.sanitize_public_expr(
+                    self.normalize_final_call_expr(expr),
+                    PublicExprSanitizeMode::Generic,
+                ),
                 cases: cases
                     .into_iter()
                     .map(|case| crate::ast::SwitchCase {
-                        value: self.normalize_final_call_expr(case.value),
+                        value: self.sanitize_public_expr(
+                            self.normalize_final_call_expr(case.value),
+                            PublicExprSanitizeMode::Generic,
+                        ),
                         body: self.prune_redundant_assign_return_pairs(
                             case.body
                                 .into_iter()
@@ -9304,9 +9506,12 @@ impl<'a> FoldingContext<'a> {
                     )
                 }),
             },
-            CStmt::Return(expr) => {
-                CStmt::Return(expr.map(|expr| self.normalize_final_return_expr_candidate(expr)))
-            }
+            CStmt::Return(expr) => CStmt::Return(expr.map(|expr| {
+                self.sanitize_public_expr(
+                    self.normalize_final_return_expr_candidate(expr),
+                    PublicExprSanitizeMode::Generic,
+                )
+            })),
             other => other,
         }
     }
@@ -10016,6 +10221,16 @@ impl<'a> FoldingContext<'a> {
                 } else {
                     self.get_expr(val)
                 };
+                let lhs_is_pointer_typed = matches!(
+                    &lhs,
+                    CExpr::Var(name) if matches!(self.lookup_type_hint(name), Some(CType::Pointer(_)))
+                );
+                if !self.is_pointer_typed_var(val) || !lhs_is_pointer_typed {
+                    rhs = self.collapse_scalar_stack_addr_artifact(rhs);
+                }
+                if !lhs_is_pointer_typed {
+                    rhs = self.rewrite_scalar_stack_placeholder_rhs(&lhs, rhs);
+                }
                 if let Some(val_ty) = self.type_hint_for_var(val)
                     && matches!(val_ty, CType::Pointer(_))
                     && !self.looks_like_pointer(&rhs)
@@ -10514,7 +10729,11 @@ pub(crate) fn should_replace_preserved_stack_alias(existing: &str) -> bool {
 
 pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
     let normalized = existing.trim_start_matches('&');
-    normalized == "stack" || normalized.starts_with("stack_") || normalized == "saved_fp"
+    normalized == "stack"
+        || normalized.starts_with("stack_")
+        || normalized == "slot"
+        || normalized.starts_with("slot_")
+        || normalized == "saved_fp"
 }
 
 fn should_replace_preserved_stack_expr(existing: &CExpr, preserved: &CExpr) -> bool {
