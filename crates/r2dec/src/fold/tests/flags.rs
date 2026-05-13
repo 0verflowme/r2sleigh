@@ -285,6 +285,7 @@ fn actionable_control_island_shortcuts_when_branch_fact_is_not_decisive() {
         body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
             summary: r2sym::NativeFunctionSummary {
                 slice_class: r2sym::SliceClass::Worker,
+                role_identity: None,
                 closure_functions: 1,
                 helper_functions: 0,
                 derived_summaries: 0,

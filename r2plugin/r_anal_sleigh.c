@@ -372,8 +372,6 @@ extern void r2sleigh_session_result_free(R2SleighSessionResult *result);
 extern char *r2sleigh_bounded_type_json_ffi(const R2ILContext *ctx, const char *fcn_name,
 	const char *reason, size_t global_max_links, size_t max_type_decls, size_t max_mutations);
 extern bool r2sleigh_has_native_worker_summary_family_ffi(const char *name);
-extern bool r2sleigh_direct_named_worker_decompile_ffi(const char *name);
-extern bool r2sleigh_direct_named_worker_type_projection_ffi(const char *name);
 extern void r2sleigh_type_writeback_cache_clear(void);
 extern size_t r2sleigh_type_writeback_cache_len(void);
 extern int r2sleigh_type_writeback_cache_get(unsigned long long addr, unsigned long long *key,
@@ -7923,23 +7921,18 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				}
 				return strdup ("");
 			}
-			if (r2sleigh_direct_named_worker_type_projection_ffi (fcn->name)) {
-				char *direct_result = NULL;
-				if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", NULL)) {
-					R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
-					return strdup ("");
-				}
-				direct_result = r2sleigh_named_native_worker_type_json (ctx, fcn->addr, fcn->name,
-					&typed_context.context,
-					(size_t)policy.type_global_max_links,
-					(size_t)policy.type_max_decls,
-					(size_t)policy.type_max_mutations);
+			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", NULL)) {
+				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
+				return strdup ("");
+			}
+			char *direct_result = r2sleigh_named_native_worker_type_json (ctx, fcn->addr, fcn->name,
+				&typed_context.context,
+				(size_t)policy.type_global_max_links,
+				(size_t)policy.type_max_decls,
+				(size_t)policy.type_max_mutations);
+			if (direct_result && *direct_result) {
 				if (cons) {
-					if (direct_result && *direct_result) {
-						r_cons_printf (cons, "%s\n", direct_result);
-					} else {
-						r_cons_println (cons, "{}");
-					}
+					r_cons_printf (cons, "%s\n", direct_result);
 				}
 				if (direct_result) {
 					r2il_string_free (direct_result);
@@ -7947,8 +7940,12 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				sleigh_typed_function_context_clear (&typed_context);
 				return strdup ("");
 			}
+			if (direct_result) {
+				r2il_string_free (direct_result);
+			}
 			if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 				R_LOG_ERROR ("r2sleigh: failed to lift function blocks");
+				sleigh_typed_function_context_clear (&typed_context);
 				return strdup ("");
 			}
 			prefer_bounded_semantic_type_plan = should_skip_decompile_symbolic_scope (fcn);
@@ -7956,15 +7953,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			if (!prefer_bounded_semantic_type_plan) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
 					&sym_scope, &interproc_seeds);
-			}
-			if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", NULL)) {
-				R_LOG_ERROR ("r2sleigh: failed to collect typed function context");
-				if (have_sym_scope) {
-					sym_function_scope_free (&sym_scope);
-					sleigh_interproc_seeds_free (&interproc_seeds);
-				}
-				block_array_free (&blocks);
-				return strdup ("");
 			}
 			if (prefer_bounded_semantic_type_plan
 				&& build_symbolic_function_scope (anal, fcn, ctx, &sym_scope)) {
@@ -8350,20 +8338,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			return strdup("");
 			}
 		bool named_worker_summary_family = r2sleigh_has_native_worker_summary_family_ffi (fcn->name);
-		bool direct_named_worker_decompile = named_worker_summary_family
-			&& r2sleigh_direct_named_worker_decompile_ffi (fcn->name);
-		if (direct_named_worker_decompile) {
-			char *direct_result = r2dec_named_native_worker_summary_direct (ctx, fcn->addr, fcn->name);
-			if (direct_result && direct_result[0]) {
-				if (cons) {
-					r_cons_printf (cons, "%s\n", direct_result);
-				}
-				r2il_string_free (direct_result);
-				return strdup ("");
+		char *direct_result = r2dec_named_native_worker_summary_direct (ctx, fcn->addr, fcn->name);
+		if (direct_result && direct_result[0]) {
+			if (cons) {
+				r_cons_printf (cons, "%s\n", direct_result);
 			}
-			if (direct_result) {
-				r2il_string_free (direct_result);
-			}
+			r2il_string_free (direct_result);
+			return strdup ("");
+		}
+		if (direct_result) {
+			r2il_string_free (direct_result);
 		}
 		/* Lift all blocks */
 		BlockArray blocks;
@@ -8378,26 +8362,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			SymFunctionScope sym_scope;
 			SleighInterprocSeeds interproc_seeds;
 			bool have_sym_scope = false;
-			bool skip_helper_scope = should_skip_decompile_symbolic_scope (fcn)
-				|| direct_named_worker_decompile;
+			bool skip_helper_scope = should_skip_decompile_symbolic_scope (fcn);
 			R_LOG_DEBUG ("r2sleigh: decompile named_worker_summary_family=%d fcn=%s",
 				named_worker_summary_family? 1: 0, fcn->name? fcn->name: "");
-			if (direct_named_worker_decompile) {
-				result = r2dec_named_native_worker_summary (ctx, (const R2ILBlock **)blocks.blocks,
-					blocks.count, fcn->addr, fcn->name);
-				if (result && result[0]) {
-					if (cons) {
-						r_cons_printf (cons, "%s\n", result);
-					}
-					r2il_string_free (result);
-					block_array_free (&blocks);
-					return strdup ("");
-				}
-				if (result) {
-					r2il_string_free (result);
-					result = NULL;
-				}
-			}
 			sleigh_interproc_seeds_init (&interproc_seeds);
 			if (!skip_helper_scope) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,

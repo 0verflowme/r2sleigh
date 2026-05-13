@@ -195,6 +195,10 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
         body: SemanticArtifactBody::Native(NativeArtifactBody {
             summary: NativeFunctionSummary {
                 slice_class,
+                role_identity: super::native_worker::role_identity_from_worker_summaries(
+                    summary.name.as_deref(),
+                    &worker_summaries,
+                ),
                 closure_functions,
                 helper_functions,
                 derived_summaries: 0,
@@ -253,6 +257,7 @@ pub fn compile_named_native_worker_summary_artifact(
         granularity: ArtifactGranularity::SummaryOnly,
         execution: ExecutionModel::Native,
         suppress_large_cfg_reason: true,
+        role_name_hint: summary.name.clone(),
         slice_class: crate::SliceClass::Worker,
         closure_functions: 1,
         helper_functions: summary.direct_callees.len(),
@@ -348,6 +353,7 @@ pub fn compile_native_worker_summary_artifact(
         granularity: ArtifactGranularity::SummaryOnly,
         execution: ExecutionModel::Native,
         suppress_large_cfg_reason: has_primary_summary,
+        role_name_hint: summary.and_then(|summary| summary.name.clone()),
         slice_class,
         closure_functions,
         helper_functions,
@@ -365,6 +371,7 @@ struct BuildSemanticArtifactInput {
     granularity: ArtifactGranularity,
     execution: ExecutionModel,
     suppress_large_cfg_reason: bool,
+    role_name_hint: Option<String>,
     slice_class: crate::SliceClass,
     closure_functions: usize,
     helper_functions: usize,
@@ -382,6 +389,7 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
         granularity,
         execution,
         suppress_large_cfg_reason,
+        role_name_hint,
         slice_class,
         closure_functions,
         helper_functions,
@@ -393,6 +401,14 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
         vm_transfer,
     } = input;
     let interpreter_diagnostic = interpreter.clone();
+    let role_identity = if matches!(execution, ExecutionModel::Native) {
+        super::native_worker::role_identity_from_worker_summaries(
+            role_name_hint.as_deref(),
+            &collected.worker_summaries,
+        )
+    } else {
+        None
+    };
     let body = match execution {
         ExecutionModel::Vm => SemanticArtifactBody::Vm(Box::new(super::region::VmArtifactBody {
             interpreter,
@@ -402,6 +418,7 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
         ExecutionModel::Native => SemanticArtifactBody::Native(NativeArtifactBody {
             summary: NativeFunctionSummary {
                 slice_class,
+                role_identity,
                 closure_functions,
                 helper_functions,
                 derived_summaries,
@@ -618,6 +635,7 @@ fn compile_function_semantics_uncached(
                 execution,
                 suppress_large_cfg_reason: matches!(execution, ExecutionModel::Vm)
                     || has_island_compiled_regions,
+                role_name_hint: func.function().name.clone(),
                 slice_class,
                 closure_functions,
                 helper_functions,
@@ -697,6 +715,7 @@ fn compile_function_semantics_uncached(
         execution,
         suppress_large_cfg_reason: matches!(execution, ExecutionModel::Vm)
             || has_island_compiled_regions,
+        role_name_hint: func.function().name.clone(),
         slice_class,
         closure_functions,
         helper_functions,
@@ -2334,6 +2353,7 @@ mod tests {
             granularity: ArtifactGranularity::Regioned,
             execution: ExecutionModel::Native,
             suppress_large_cfg_reason: true,
+            role_name_hint: None,
             slice_class: crate::SliceClass::Worker,
             closure_functions: 0,
             helper_functions: 0,

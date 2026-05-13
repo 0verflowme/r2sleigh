@@ -4247,6 +4247,7 @@ pub(crate) fn test_native_semantic_artifact(
         body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
             summary: r2sym::NativeFunctionSummary {
                 slice_class,
+                role_identity: None,
                 closure_functions: 0,
                 helper_functions: 0,
                 derived_summaries: 0,

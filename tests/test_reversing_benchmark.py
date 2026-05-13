@@ -928,6 +928,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
             summary["quality"]["hard_failure_by_family"],
             {"argmatch": 1, "hash_table": 1},
         )
+        self.assertEqual(summary["worst_targets"][0]["target"], None)
+        self.assertEqual(summary["worst_targets"][0]["elapsed_s"], 4.75)
 
     def test_aggregate_summarizes_cache_and_summary_fast_paths(self):
         summary = benchmark.aggregate(
@@ -977,6 +979,74 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["fast_paths"]["phase_timings_us"]["semantic_summary"], 20)
         self.assertEqual(summary["fast_paths"]["counters"]["summary_attempted"], 1)
         self.assertEqual(summary["fast_paths"]["counters"]["native_worker_summary_count"], 2)
+
+    def test_aggregate_reports_worst_targets_by_actionable_signal(self):
+        summary = benchmark.aggregate(
+            [
+                {
+                    "name": "coreutils-mf12",
+                    "corpus": "coreutils",
+                    "score": 80,
+                    "failures": [
+                        {"kind": "timeout", "target": "sym.hash_worker"},
+                    ],
+                    "targets": [
+                        {
+                            "name": "sym.residual_loop",
+                            "commands": {
+                                "decompile_sla": {
+                                    "elapsed_s": 0.2,
+                                    "decompile_quality": {"classification": "residual"},
+                                },
+                                "types": {
+                                    "elapsed_s": 0.1,
+                                    "type_metrics": {
+                                        "generic_arg_count": 6,
+                                        "generic_type_count": 1,
+                                    },
+                                },
+                            },
+                        },
+                        {
+                            "name": "dbg.string_scan",
+                            "commands": {
+                                "decompile_sla": {
+                                    "elapsed_s": 0.3,
+                                    "decompile_quality": {"classification": "structured"},
+                                },
+                                "types": {
+                                    "elapsed_s": 0.2,
+                                    "type_metrics": {
+                                        "generic_arg_count": 2,
+                                        "generic_type_count": 3,
+                                    },
+                                },
+                            },
+                        },
+                        {
+                            "name": "sym.hash_worker",
+                            "commands": {
+                                "decompile_sla": {
+                                    "elapsed_s": 2.0,
+                                    "decompile_quality": {"classification": "fallback"},
+                                }
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            [target["target"] for target in summary["worst_targets"]],
+            ["sym.hash_worker", "sym.residual_loop", "dbg.string_scan"],
+        )
+        self.assertEqual(summary["worst_targets"][0]["hard_failures"], 1)
+        self.assertEqual(summary["worst_targets"][0]["failure_kinds"], ["timeout"])
+        self.assertEqual(summary["worst_targets"][1]["residual_commands"], 1)
+        self.assertEqual(summary["worst_targets"][1]["generic_arg_count"], 6)
+        self.assertEqual(summary["worst_targets"][2]["generic_type_count"], 3)
+        self.assertEqual(summary["worst_targets"][0]["elapsed_s"], 2.0)
 
     def test_aggregate_summarizes_manual_quality_gates(self):
         quality = benchmark.decompile_quality(

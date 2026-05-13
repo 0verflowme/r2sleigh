@@ -881,6 +881,15 @@ fn semantic_artifact_signature_hint(
     current_param_count: usize,
 ) -> Option<FunctionSignatureSpec> {
     let native = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body)?;
+    if let Some(role) = native.summary.role_identity.as_ref()
+        && let Some(signature) = crate::role_registry::signature_hint_for_name_candidates(
+            std::iter::once(role.role_name.as_str())
+                .chain(role.source_names.iter().map(String::as_str)),
+            current_param_count,
+        )
+    {
+        return Some(signature);
+    }
     let worker_kinds = native
         .summary
         .worker_summaries
@@ -1053,6 +1062,16 @@ impl SemanticTypeProjection {
             }
         }
         if let Some(native) = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body) {
+            if let Some(role) = native.summary.role_identity.as_ref()
+                && let Some(role_projection) =
+                    crate::role_registry::type_projection_for_name_candidates(
+                        std::iter::once(role.role_name.as_str())
+                            .chain(role.source_names.iter().map(String::as_str)),
+                        0,
+                    )
+            {
+                merge_role_type_projection(&mut projection, role_projection, ptr_bits);
+            }
             for summary in &native.summary.worker_summaries {
                 collect_worker_summary_type_hints(summary, &mut projection, ptr_bits);
             }
@@ -5571,6 +5590,7 @@ mod tests {
     fn test_native_summary(slice_class: r2sym::SliceClass) -> r2sym::NativeFunctionSummary {
         r2sym::NativeFunctionSummary {
             slice_class,
+            role_identity: None,
             closure_functions: 1,
             helper_functions: 0,
             derived_summaries: 0,

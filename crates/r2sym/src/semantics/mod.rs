@@ -40,9 +40,9 @@ pub use region::{
     NativeFunctionSummary, NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary,
     NativeParserKind, NativeParserSummary, NativeReductionSummary, NativeRegionSummary,
     NativeSummarySpecificity, NativeWorkerFold, NativeWorkerFoldOperation, NativeWorkerLoopSummary,
-    NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator, RefinementStage,
-    RegionKey, SemanticArtifactDiagnostics, SemanticPredicate, SemanticRegion,
-    SemanticTargetConditionSource, TargetFact, VmArtifactBody,
+    NativeWorkerRoleIdentity, NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryKind,
+    NativeWorkerTerminator, RefinementStage, RegionKey, SemanticArtifactDiagnostics,
+    SemanticPredicate, SemanticRegion, SemanticTargetConditionSource, TargetFact, VmArtifactBody,
 };
 pub use vm::{
     InterpreterDispatchSummary, InterpreterKind, VmBinaryOp, VmGuardCondition, VmGuardedExit,

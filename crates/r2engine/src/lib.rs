@@ -23,6 +23,93 @@ pub const ENGINE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EngineFunctionIdentity {
+    pub function_addr: u64,
+    pub canonical_name: String,
+    pub display_name: String,
+    pub aliases: Vec<String>,
+}
+
+impl EngineFunctionIdentity {
+    pub fn new(function_addr: u64, canonical_name: &str, display_name: &str) -> Self {
+        Self::with_aliases(
+            function_addr,
+            canonical_name,
+            display_name,
+            std::iter::empty::<&str>(),
+        )
+    }
+
+    pub fn with_aliases<'a>(
+        function_addr: u64,
+        canonical_name: &str,
+        display_name: &str,
+        aliases: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut identity = Self {
+            function_addr,
+            canonical_name: canonical_name.to_string(),
+            display_name: display_name.to_string(),
+            aliases: Vec::new(),
+        };
+        identity.push_alias(canonical_name);
+        identity.push_alias(display_name);
+        for alias in aliases {
+            identity.push_alias(alias);
+        }
+        identity
+    }
+
+    pub fn from_name(function_addr: u64, name: &str) -> Self {
+        Self::new(function_addr, name, name)
+    }
+
+    pub fn push_alias(&mut self, alias: &str) {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return;
+        }
+        if !self.aliases.iter().any(|existing| existing == alias) {
+            self.aliases.push(alias.to_string());
+        }
+        let normalized = normalize_engine_route_name(alias);
+        if !normalized.is_empty() && !self.aliases.iter().any(|existing| existing == &normalized) {
+            self.aliases.push(normalized);
+        }
+    }
+
+    pub fn name_candidates(&self) -> impl Iterator<Item = &str> {
+        self.aliases.iter().map(String::as_str)
+    }
+
+    pub fn primary_name(&self) -> &str {
+        if !self.display_name.trim().is_empty() {
+            &self.display_name
+        } else {
+            &self.canonical_name
+        }
+    }
+
+    pub fn summary_probe_name(&self) -> &str {
+        self.aliases
+            .iter()
+            .find(|alias| has_seeded_summary_family(self.function_addr, alias))
+            .map(String::as_str)
+            .unwrap_or_else(|| self.primary_name())
+    }
+
+    pub fn has_summary_family(&self) -> bool {
+        self.name_candidates()
+            .any(|name| has_seeded_summary_family(self.function_addr, name))
+    }
+
+    pub fn has_program_orchestrator_family(&self) -> bool {
+        self.name_candidates()
+            .any(r2sym::has_program_orchestrator_summary_family)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AnalysisCacheKey {
     pub schema_version: u32,
     pub function_addr: u64,
@@ -1178,12 +1265,12 @@ impl EngineSession {
         &self,
         request: EngineSummaryPreprobeRequest<'_>,
     ) -> Option<EngineDecompileResponse> {
-        let probe = decompile_probe_decision(
-            request.blocks,
+        let identity = EngineFunctionIdentity::new(
             request.function_addr,
             request.canonical_name,
             request.display_name,
         );
+        let probe = decompile_probe_decision_for_identity(request.blocks, &identity);
         if !probe.summary_probe_needed {
             return None;
         }
@@ -1201,9 +1288,10 @@ impl EngineSession {
             .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
         let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
         let function_facts = if let Some(semantic_artifact) = semantic_artifact {
-            let type_facts = type_facts_with_summary_projection(
+            let type_facts = type_facts_with_summary_projection_for_candidates(
                 type_seed,
-                &probe.summary_probe_name,
+                request.display_name,
+                identity.name_candidates(),
                 &arch_name,
                 request.ptr_bits,
                 &semantic_artifact,
@@ -1950,25 +2038,33 @@ pub fn decompile_probe_decision(
     canonical_name: &str,
     display_name: &str,
 ) -> DecompileProbeDecision {
+    let identity = EngineFunctionIdentity::new(function_addr, canonical_name, display_name);
+    decompile_probe_decision_for_identity(blocks, &identity)
+}
+
+pub fn decompile_probe_decision_for_identity(
+    blocks: &[R2ILBlock],
+    identity: &EngineFunctionIdentity,
+) -> DecompileProbeDecision {
     let cfg_guard_reason = cfg_guard_reason(blocks);
     let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
-    let display_summary_family = has_seeded_summary_family(function_addr, display_name);
-    let canonical_summary_family = has_seeded_summary_family(function_addr, canonical_name);
+    let display_summary_family =
+        has_seeded_summary_family(identity.function_addr, &identity.display_name);
+    let canonical_summary_family =
+        has_seeded_summary_family(identity.function_addr, &identity.canonical_name);
     let display_program_orchestrator_family =
-        r2sym::has_program_orchestrator_summary_family(display_name);
+        r2sym::has_program_orchestrator_summary_family(&identity.display_name);
     let canonical_program_orchestrator_family =
-        r2sym::has_program_orchestrator_summary_family(canonical_name);
-    let program_orchestrator_family =
-        display_program_orchestrator_family || canonical_program_orchestrator_family;
+        r2sym::has_program_orchestrator_summary_family(&identity.canonical_name);
+    let program_orchestrator_family = display_program_orchestrator_family
+        || canonical_program_orchestrator_family
+        || identity.has_program_orchestrator_family();
     let program_orchestrator_guarded = program_orchestrator_family
         && should_guard_program_orchestrator_decompile(blocks.len(), op_count);
-    let named_worker_guarded = (display_summary_family || canonical_summary_family)
-        && (!program_orchestrator_family || program_orchestrator_guarded);
-    let summary_probe_name = if canonical_summary_family {
-        canonical_name.to_string()
-    } else {
-        display_name.to_string()
-    };
+    let named_worker_guarded =
+        (display_summary_family || canonical_summary_family || identity.has_summary_family())
+            && (!program_orchestrator_family || program_orchestrator_guarded);
+    let summary_probe_name = identity.summary_probe_name().to_string();
     let skipped_large_cfg_guarded =
         cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512;
     let block_guarded =
@@ -2131,8 +2227,26 @@ pub fn summary_only_native_worker_fallback(
 }
 
 pub fn type_facts_with_summary_projection(
+    type_facts: FunctionTypeFacts,
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> FunctionTypeFacts {
+    type_facts_with_summary_projection_for_candidates(
+        type_facts,
+        function_name,
+        [function_name],
+        arch_name,
+        ptr_bits,
+        semantic_artifact,
+    )
+}
+
+pub fn type_facts_with_summary_projection_for_candidates<'a>(
     mut type_facts: FunctionTypeFacts,
     function_name: &str,
+    name_candidates: impl IntoIterator<Item = &'a str>,
     arch_name: &str,
     ptr_bits: u32,
     semantic_artifact: &r2sym::SemanticArtifact,
@@ -2142,8 +2256,33 @@ pub fn type_facts_with_summary_projection(
         .as_ref()
         .map(|signature| signature.params.len())
         .unwrap_or_default();
-    let name_signature =
-        r2types::signature_hint_for_name_candidates([function_name], current_param_count);
+    let mut candidates = Vec::new();
+    for candidate in name_candidates {
+        let candidate = candidate.trim();
+        if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push(function_name);
+    }
+    let role_identity = semantic_artifact
+        .native_body()
+        .and_then(|native| native.summary.role_identity.as_ref());
+    if let Some(role_identity) = role_identity {
+        for candidate in std::iter::once(role_identity.role_name.as_str())
+            .chain(role_identity.source_names.iter().map(String::as_str))
+        {
+            let candidate = candidate.trim();
+            if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    let name_signature = r2types::signature_hint_for_name_candidates(
+        candidates.iter().copied(),
+        current_param_count,
+    );
     let fallback_plan = r2types::build_semantic_type_fallback_plan(
         function_name,
         arch_name,
@@ -2275,7 +2414,25 @@ pub fn native_worker_type_projection(
     parsed_context: &r2types::ParsedExternalContext,
     skipped_large_cfg: bool,
 ) -> Option<NativeWorkerTypeProjection> {
-    let summary = native_worker_summary_seed(function_addr, function_name)?;
+    let identity = EngineFunctionIdentity::from_name(function_addr, function_name);
+    native_worker_type_projection_for_identity(
+        &identity,
+        arch_name,
+        ptr_bits,
+        parsed_context,
+        skipped_large_cfg,
+    )
+}
+
+pub fn native_worker_type_projection_for_identity(
+    identity: &EngineFunctionIdentity,
+    arch_name: &str,
+    ptr_bits: u32,
+    parsed_context: &r2types::ParsedExternalContext,
+    skipped_large_cfg: bool,
+) -> Option<NativeWorkerTypeProjection> {
+    let summary_name = identity.summary_probe_name();
+    let summary = native_worker_summary_seed(identity.function_addr, summary_name)?;
     let semantic_artifact =
         r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)?;
     let type_facts = type_facts_from_parsed_context(parsed_context);
@@ -2284,12 +2441,15 @@ pub fn native_worker_type_projection(
         .as_ref()
         .map(|signature| signature.params.len())
         .unwrap_or_default();
-    let name_owned_signature =
-        r2types::signature_hint_for_name_candidates([function_name], current_param_count)
-            .is_some_and(|signature| signature.ret_type.is_some());
-    let type_facts = type_facts_with_summary_projection(
+    let name_owned_signature = r2types::signature_hint_for_name_candidates(
+        identity.name_candidates(),
+        current_param_count,
+    )
+    .is_some();
+    let type_facts = type_facts_with_summary_projection_for_candidates(
         type_facts,
-        function_name,
+        identity.primary_name(),
+        identity.name_candidates(),
         arch_name,
         ptr_bits,
         &semantic_artifact,
@@ -2306,12 +2466,12 @@ pub fn native_worker_type_projection(
 pub fn type_summary_preprobe(
     request: EngineTypePreprobeRequest<'_>,
 ) -> Option<EngineTypePreprobeResponse> {
-    let probe = decompile_probe_decision(
-        request.blocks,
+    let identity = EngineFunctionIdentity::new(
         request.function_addr,
         request.canonical_name,
         request.display_name,
     );
+    let probe = decompile_probe_decision_for_identity(request.blocks, &identity);
     if !probe.summary_probe_needed {
         return None;
     }
@@ -2336,9 +2496,10 @@ pub fn type_summary_preprobe(
         .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
     let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
     let function_facts = if let Some(semantic_artifact) = semantic_artifact {
-        let type_facts = type_facts_with_summary_projection(
+        let type_facts = type_facts_with_summary_projection_for_candidates(
             type_seed,
-            &probe.summary_probe_name,
+            request.display_name,
+            identity.name_candidates(),
             &arch_name,
             request.ptr_bits,
             &semantic_artifact,
@@ -3272,6 +3433,7 @@ mod tests {
             body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
                 summary: r2sym::NativeFunctionSummary {
                     slice_class,
+                    role_identity: None,
                     closure_functions: 1,
                     helper_functions: 0,
                     derived_summaries: 0,
@@ -3626,6 +3788,30 @@ mod tests {
     }
 
     #[test]
+    fn function_identity_keeps_ordered_aliases_for_summary_and_type_routes() {
+        let identity = EngineFunctionIdentity::with_aliases(
+            0x7000,
+            "fcn.00007000",
+            "sym.limfield.isra.0",
+            ["dbg.limfield", "sym.limfield.isra.0"],
+        );
+        let candidates = identity.name_candidates().collect::<Vec<_>>();
+
+        assert_eq!(
+            candidates,
+            vec![
+                "fcn.00007000",
+                "00007000",
+                "sym.limfield.isra.0",
+                "limfield",
+                "dbg.limfield"
+            ]
+        );
+        assert_eq!(identity.summary_probe_name(), "sym.limfield.isra.0");
+        assert!(identity.has_summary_family());
+    }
+
+    #[test]
     fn direct_named_worker_decompile_fastpath_is_limited_to_timeout_prone_families() {
         assert!(should_use_direct_named_native_worker_decompile(
             "dbg.init_node"
@@ -3735,8 +3921,8 @@ mod tests {
             .expect("expected projected signature");
 
         assert!(
-            !projection.name_owned_signature,
-            "randread owns params by name, but the summary supplies the return"
+            projection.name_owned_signature,
+            "randread owns params by name while the summary supplies the return"
         );
         assert_eq!(
             signature

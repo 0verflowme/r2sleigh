@@ -3892,6 +3892,7 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
     radare2_candidates = 0
     total_targets = 0
     pdg_comparisons: list[dict[str, Any]] = []
+    target_rollups: list[dict[str, Any]] = []
     case_setup_elapsed_s = 0.0
     target_setup_elapsed_s = 0.0
     command_elapsed_s = 0.0
@@ -3929,6 +3930,21 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         for target in case.get("targets", []):
             if target.get("found", True):
                 total_targets += 1
+            target_name = target.get("name") or target.get("requested")
+            target_keys = {
+                str(value)
+                for value in (target.get("name"), target.get("requested"))
+                if value not in (None, "")
+            }
+            target_failures = [
+                failure
+                for failure in case.get("failures", [])
+                if str(failure.get("target") or "") in target_keys
+            ]
+            target_elapsed_s = 0.0
+            target_residual_count = 0
+            target_generic_arg_count = 0
+            target_generic_type_count = 0
             comparison = pdg_target_comparison(case, target)
             if comparison is not None:
                 pdg_comparisons.append(comparison)
@@ -3945,7 +3961,9 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                     }
                 )
             for command, result in target.get("commands", {}).items():
-                command_elapsed_s += _float_value(result.get("elapsed_s"))
+                elapsed_s = _float_value(result.get("elapsed_s"))
+                command_elapsed_s += elapsed_s
+                target_elapsed_s += elapsed_s
                 bucket = str(result.get("runtime_bucket") or "unknown")
                 runtime_buckets[bucket] = runtime_buckets.get(bucket, 0) + 1
                 quality = result.get("decompile_quality")
@@ -3980,10 +3998,16 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                         )
                         if classification == "fallback":
                             fallback_by_family[family] = fallback_by_family.get(family, 0) + 1
+                        if classification == "residual":
+                            target_residual_count += 1
                 type_metrics = result.get("type_metrics")
                 if isinstance(type_metrics, dict):
-                    generic_arg_total += int(type_metrics.get("generic_arg_count") or 0)
-                    generic_type_total += int(type_metrics.get("generic_type_count") or 0)
+                    generic_arg_count = int(type_metrics.get("generic_arg_count") or 0)
+                    generic_type_count = int(type_metrics.get("generic_type_count") or 0)
+                    generic_arg_total += generic_arg_count
+                    generic_type_total += generic_type_count
+                    target_generic_arg_count += generic_arg_count
+                    target_generic_type_count += generic_type_count
                 profile_metrics = result.get("profile_metrics")
                 cache_metrics = result.get("cache_metrics")
                 if isinstance(cache_metrics, dict):
@@ -4010,6 +4034,30 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                         "elapsed_s": result.get("elapsed_s", 0),
                     }
                 )
+            hard_failure_count = len(target_failures)
+            if (
+                hard_failure_count
+                or target_residual_count
+                or target_generic_arg_count
+                or target_generic_type_count
+                or target_elapsed_s >= 1.0
+            ):
+                target_rollups.append(
+                    {
+                        "case": case.get("name"),
+                        "corpus": case.get("corpus"),
+                        "target": target_name,
+                        "family": target_family(target_name),
+                        "hard_failures": hard_failure_count,
+                        "residual_commands": target_residual_count,
+                        "generic_arg_count": target_generic_arg_count,
+                        "generic_type_count": target_generic_type_count,
+                        "elapsed_s": round(target_elapsed_s, 6),
+                        "failure_kinds": sorted(
+                            {str(failure.get("kind") or "unknown") for failure in target_failures}
+                        ),
+                    }
+                )
     slow_commands.sort(
         key=lambda item: (
             -float(item["elapsed_s"]),
@@ -4017,6 +4065,18 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             str(item.get("case") or ""),
             str(item.get("target") or ""),
             str(item.get("command") or ""),
+        )
+    )
+    target_rollups.sort(
+        key=lambda item: (
+            -int(item.get("hard_failures") or 0),
+            -int(item.get("residual_commands") or 0),
+            -int(item.get("generic_arg_count") or 0),
+            -int(item.get("generic_type_count") or 0),
+            -float(item.get("elapsed_s") or 0),
+            str(item.get("corpus") or ""),
+            str(item.get("case") or ""),
+            str(item.get("target") or ""),
         )
     )
     scores = [int(case.get("score", 0)) for case in cases]
@@ -4066,6 +4126,7 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "pdg_comparison": summarize_pdg_comparisons(pdg_comparisons),
         },
         "slowest_commands": slow_commands[:20],
+        "worst_targets": target_rollups[:20],
     }
 
 

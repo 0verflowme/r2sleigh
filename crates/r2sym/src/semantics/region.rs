@@ -335,6 +335,26 @@ pub enum NativeSummarySpecificity {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeWorkerRoleSource {
+    Structural,
+    SummarySeed,
+    NameHint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWorkerRoleIdentity {
+    pub role_name: String,
+    pub source: NativeWorkerRoleSource,
+    pub confidence: SemanticConfidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub summary_kinds: BTreeSet<NativeWorkerSummaryKind>,
+    #[serde(default, skip_serializing_if = "SemanticEvidence::is_default_exact")]
+    pub evidence: SemanticEvidence,
+}
+
 impl NativeSummarySpecificity {
     pub fn is_primary_renderable(self) -> bool {
         !matches!(self, Self::GenericMemory | Self::Unknown)
@@ -342,6 +362,38 @@ impl NativeSummarySpecificity {
 }
 
 impl NativeWorkerSummaryKind {
+    pub fn canonical_role_name(self) -> &'static str {
+        match self {
+            Self::ProgramOrchestrator => "program_orchestrator",
+            Self::MemoryTransfer => "memory_transfer",
+            Self::FileTransfer => "file_transfer",
+            Self::MemoryRead => "memory_read",
+            Self::MemoryWrite => "memory_write",
+            Self::MemoryEscape => "memory_escape",
+            Self::MemoryFree => "memory_free",
+            Self::StringScan => "string_scan",
+            Self::HashFold => "hash_fold",
+            Self::TableWalk => "table_walk",
+            Self::PathWalk => "path_walk",
+            Self::DirectoryTraversal => "directory_traversal",
+            Self::RecordStream => "record_stream",
+            Self::FieldSelection => "field_selection",
+            Self::OutputStream => "output_stream",
+            Self::FormatRender => "format_render",
+            Self::MetadataProbe => "metadata_probe",
+            Self::SortMerge => "sort_merge",
+            Self::NumericTransform => "numeric_transform",
+            Self::Parser => "parser",
+            Self::DiagnosticWrapper => "diagnostic_wrapper",
+            Self::FormatArgumentFetch => "format_argument_fetch",
+            Self::Allocation => "allocation",
+            Self::Lifetime => "lifetime",
+            Self::Synchronization => "synchronization",
+            Self::Atomic => "atomic",
+            Self::Unknown => "unknown",
+        }
+    }
+
     pub fn base_specificity(self) -> NativeSummarySpecificity {
         match self {
             Self::ProgramOrchestrator => NativeSummarySpecificity::ProgramOrchestrator,
@@ -744,6 +796,8 @@ fn collect_location_arg_indices(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeFunctionSummary {
     pub slice_class: SliceClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_identity: Option<Box<NativeWorkerRoleIdentity>>,
     pub closure_functions: usize,
     pub helper_functions: usize,
     pub derived_summaries: usize,
@@ -1268,6 +1322,7 @@ mod tests {
         NativeArtifactBody {
             summary: NativeFunctionSummary {
                 slice_class: SliceClass::Worker,
+                role_identity: None,
                 closure_functions: 0,
                 helper_functions: 0,
                 derived_summaries: 0,

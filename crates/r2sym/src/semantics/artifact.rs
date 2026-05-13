@@ -769,6 +769,7 @@ mod tests {
             body: SemanticArtifactBody::Native(NativeArtifactBody {
                 summary: NativeFunctionSummary {
                     slice_class: SliceClass::Worker,
+                    role_identity: None,
                     closure_functions: 0,
                     helper_functions: 0,
                     derived_summaries: 0,

@@ -10,10 +10,10 @@ use r2ssa::{
 use crate::semantics::{
     NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary, NativeParserKind,
     NativeParserSummary, NativeReductionSummary, NativeRegionSummary, NativeWorkerFold,
-    NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerSummary,
-    NativeWorkerSummaryKind, NativeWorkerTerminator, ResidualReason, SemanticEvidence,
-    SemanticEvidenceAmbiguity, SemanticEvidenceCoverage, SemanticEvidenceProvenance,
-    SemanticEvidenceReason,
+    NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerRoleIdentity,
+    NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator,
+    ResidualReason, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
+    SemanticEvidenceProvenance, SemanticEvidenceReason,
 };
 
 mod hash;
@@ -229,6 +229,58 @@ fn mark_name_hint_summaries(mut summaries: Vec<NativeWorkerSummary>) -> Vec<Nati
         summary.evidence = summary.evidence.combined_with(&name_hint);
     }
     summaries
+}
+
+pub(super) fn role_identity_from_worker_summaries(
+    summary_name: Option<&str>,
+    worker_summaries: &[NativeWorkerSummary],
+) -> Option<Box<NativeWorkerRoleIdentity>> {
+    if worker_summaries.is_empty() {
+        return None;
+    }
+
+    let summary_kinds = worker_summaries
+        .iter()
+        .map(|summary| summary.kind)
+        .collect::<BTreeSet<_>>();
+    let primary_kind = worker_summaries
+        .iter()
+        .find(|summary| summary.is_primary_render_summary())
+        .or_else(|| worker_summaries.first())
+        .map(|summary| summary.kind)?;
+    let structural_name = primary_kind.canonical_role_name();
+    let source_name = summary_name.and_then(normalize_native_worker_role_name);
+    let role_name = source_name
+        .as_deref()
+        .unwrap_or(structural_name)
+        .to_string();
+    let source = if source_name.is_some()
+        && worker_summaries.iter().any(|summary| {
+            summary
+                .evidence
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, SemanticEvidenceReason::NameHint))
+        }) {
+        NativeWorkerRoleSource::NameHint
+    } else if source_name.is_some() {
+        NativeWorkerRoleSource::SummarySeed
+    } else {
+        NativeWorkerRoleSource::Structural
+    };
+    let evidence = worker_summaries
+        .iter()
+        .map(|summary| summary.evidence.clone())
+        .reduce(|acc, evidence| acc.combined_with(&evidence))
+        .unwrap_or_else(bounded_evidence);
+    Some(Box::new(NativeWorkerRoleIdentity {
+        role_name,
+        source,
+        confidence: evidence.tier,
+        source_names: source_name.into_iter().collect(),
+        summary_kinds,
+        evidence,
+    }))
 }
 
 fn native_worker_summary_sort_key(summary: &NativeWorkerSummary) -> NativeWorkerSummarySortKey {
@@ -597,7 +649,7 @@ fn global_location(address: u64) -> SummaryMemoryLocation {
     }
 }
 
-fn normalize_semantic_summary_name(name: &str) -> Option<String> {
+pub fn normalize_native_worker_role_name(name: &str) -> Option<String> {
     let name = name
         .trim()
         .trim_start_matches("sym.")
@@ -607,6 +659,10 @@ fn normalize_semantic_summary_name(name: &str) -> Option<String> {
         .to_ascii_lowercase();
     let name = strip_known_compiler_suffixes(&name).to_string();
     (!name.is_empty()).then_some(name)
+}
+
+fn normalize_semantic_summary_name(name: &str) -> Option<String> {
+    normalize_native_worker_role_name(name)
 }
 
 fn strip_known_compiler_suffixes(name: &str) -> &str {

@@ -3630,6 +3630,7 @@ mod tests {
             body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
                 summary: r2sym::NativeFunctionSummary {
                     slice_class: r2sym::SliceClass::Worker,
+                    role_identity: None,
                     closure_functions: 1,
                     helper_functions: 0,
                     derived_summaries: 0,
@@ -3760,6 +3761,7 @@ mod tests {
             body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
                 summary: r2sym::NativeFunctionSummary {
                     slice_class: r2sym::SliceClass::Worker,
+                    role_identity: None,
                     closure_functions: 0,
                     helper_functions: 0,
                     derived_summaries: 0,
@@ -3901,6 +3903,7 @@ mod tests {
             body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
                 summary: r2sym::NativeFunctionSummary {
                     slice_class: r2sym::SliceClass::Worker,
+                    role_identity: None,
                     closure_functions: 0,
                     helper_functions: 0,
                     derived_summaries: 0,

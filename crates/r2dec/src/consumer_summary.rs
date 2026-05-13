@@ -92,6 +92,14 @@ pub(crate) fn render_for_route(
     }
 
     if let Some(native) = semantic_artifact.native_body() {
+        if let Some(role) = native.summary.role_identity.as_ref() {
+            body.push(CStmt::comment(format!(
+                "semantic role: {}; source={:?}; confidence={:?}",
+                crate::sanitize_comment_text(&role.role_name),
+                role.source,
+                role.confidence
+            )));
+        }
         let memory_fact_count = native
             .regions
             .values()
