@@ -634,7 +634,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn version_etc_va
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "void") and (.params[0].type == "FILE*") and ((.params[4].type // "") | contains("__va_list_tag"))'
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "void") and (.params[0].type == "FILE*") and (.params[4].type == "va_list")'
 EOF_CMDS
 RUN
 

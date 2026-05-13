@@ -483,6 +483,16 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertTrue(comment_only["comment_only"])
         self.assertFalse(comment_only["missing_return_nonvoid"])
 
+    def test_quality_metrics_do_not_treat_explicit_summary_return_refusal_as_fake_missing_return(self):
+        quality = benchmark.decompile_quality(
+            "int f(void) {\n"
+            "  /* summary return unresolved; value intentionally not reconstructed */\n"
+            "}\n"
+        )
+
+        self.assertTrue(quality["explicit_unresolved_summary_return"])
+        self.assertFalse(quality["missing_return_nonvoid"])
+
     def test_quality_metrics_count_invalid_control_flow_and_pointer_literal_compare(self):
         quality = benchmark.decompile_quality(
             "int32_t parse_number(int8_t* str)\n"

@@ -16,6 +16,15 @@ use crate::semantics::{
     SemanticEvidenceReason,
 };
 
+mod hash;
+
+use self::hash::{
+    hash_fold_family_worker_summaries, hash_fold_summary, hash_fold_summary_for_island,
+    hash_statistics_worker_summaries, hash_table_family_worker_summaries,
+    hash_table_worker_summaries, is_hash_fold_family_name, is_hash_table_family_name,
+    named_hash_fold_worker_summary,
+};
+
 pub(super) const NATIVE_WORKER_SUMMARY_MAX: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -114,6 +123,7 @@ struct WorkerDataflowState {
     load_sources: BTreeMap<SSAVar, DataflowValue<LoadedSource>>,
     load_source_aliases: LoadSourceAliasIndex,
     load_source_alias_members: BTreeMap<String, BTreeSet<SSAVar>>,
+    control_sources: BTreeMap<SSAVar, DataflowValue<BTreeSet<usize>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -144,6 +154,20 @@ struct GlobalLoadObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct OptionStringReadObservation {
+    anchor: u64,
+    arg: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OptionStringWriteObservation {
+    anchor: u64,
+    arg: usize,
+    value: u8,
+    control_args: BTreeSet<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NumericTransformObservation {
     anchor: u64,
     dst_arg: Option<usize>,
@@ -166,6 +190,9 @@ struct BlockWorkerObservations {
     scans: Vec<ScanObservation>,
     folds: Vec<FoldObservation>,
     global_loads: Vec<GlobalLoadObservation>,
+    option_string_reads: Vec<OptionStringReadObservation>,
+    option_string_writes: Vec<OptionStringWriteObservation>,
+    option_string_branch_controls: BTreeSet<usize>,
     numeric_transforms: Vec<NumericTransformObservation>,
     parser_comparisons: BTreeMap<usize, ParserLoopEvidence>,
 }
@@ -664,6 +691,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "verror_at_line"
             | "printf_fetchargs"
             | "printf_parse"
+            | "oprintf_"
             | "print_formatted"
             | "print_esc"
             | "print_xfer_stats"
@@ -682,16 +710,21 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "strnumcmp"
             | "strintcmp"
             | "rpl_fopen"
+            | "openat_safer"
+            | "rpl_nanosleep"
             | "rpl_fcntl"
             | "freopen_safer"
             | "stream_open"
+            | "gettext_quote"
             | "parse_long_options"
             | "parse_gnu_standard_options_only"
             | "human_options"
             | "parse_integer"
             | "parse_number"
+            | "traverse_raw_number"
             | "synchronize_output"
             | "copy_with_unblock"
+            | "copy_bytes"
             | "iwrite"
             | "iwrite.constprop.0"
             | "translate_charset"
@@ -705,7 +738,9 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "scan_mb_blank_field"
             | "scan_mb_delim_field"
             | "mcel_scan"
+            | "mcel_cmp"
             | "mcel_scant"
+            | "mcel_scanz"
             | "copy_file_data"
             | "sparse_copy"
             | "copy_internal"
@@ -724,9 +759,12 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "make_dir_parents_private"
             | "backupfile_internal"
             | "utimecmpat"
+            | "fdutimensat"
             | "strmode"
             | "do_statx"
             | "getuidbyname"
+            | "setlocale_null_r_unlocked"
+            | "set_program_name"
             | "defaultcon"
             | "restorecon_private"
             | "restorecon"
@@ -750,6 +788,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "set_fields"
             | "print_name_with_quoting"
             | "print_long_format"
+            | "length_of_file_name_and_frills"
             | "print_filename"
             | "get_funky_string"
             | "abformat_init"
@@ -771,6 +810,9 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "fdfile_has_aclinfo"
             | "human_readable"
             | "__strftime_internal"
+            | "nstrftime"
+            | "c_nstrftime"
+            | "mktime_z"
             | "rm"
             | "close_stdin"
             | "get_dir_status"
@@ -781,6 +823,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "sortlines"
             | "pipe_child"
             | "merge"
+            | "mergefiles"
             | "init_node"
             | "fts_stat"
             | "rpl_fts_children"
@@ -808,6 +851,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "close_stdout"
             | "rpl_fclose"
             | "write_bytes"
+            | "yesno"
             | "error"
             | "error_at_line"
             | "file_escape"
@@ -817,11 +861,23 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "get_meminfo"
             | "randread_new"
             | "randread"
+            | "_gl_scratch_buffer_grow"
+            | "_gl_scratch_buffer_grow_preserve"
+            | "gl_scratch_buffer_grow"
+            | "gl_scratch_buffer_grow_preserve"
+            | "argv_iter"
+            | "argv_iter_init_argv"
+            | "argv_iter_init_stream"
+            | "argv_iter_n_args"
+            | "argv_iter_free"
             | "gregorian_to_persian"
+            | "gregorian_to_ethiopian"
             | "next_prime"
             | "num_processors"
             | "physmem_claimable"
             | "rpl_pipe2"
+            | "cycle_check_init"
+            | "cycle_check"
     )
 }
 
@@ -898,6 +954,7 @@ fn is_xalloc_family_name(name: &str) -> bool {
             | "xirealloc"
             | "xreallocarray"
             | "xireallocarray"
+            | "xnrealloc"
             | "xnmalloc"
             | "xinmalloc"
             | "x2realloc"
@@ -913,43 +970,6 @@ fn is_xalloc_family_name(name: &str) -> bool {
             | "xstrdup"
             | "xalloc_die"
     )
-}
-
-fn is_hash_table_family_name(name: &str) -> bool {
-    name.starts_with("hash_get_")
-        || matches!(
-            name,
-            "hash_clear"
-                | "hash_do_for_each"
-                | "hash_free"
-                | "hash_init"
-                | "hash_initialize"
-                | "hash_insert"
-                | "hash_insert_if_absent"
-                | "hash_lookup"
-                | "hash_print_statistics"
-                | "hash_rehash"
-                | "hash_remove"
-                | "hash_reset_tuning"
-                | "hash_table_ok"
-        )
-}
-
-fn is_hash_fold_family_name(name: &str) -> bool {
-    name.ends_with("_hash")
-        || name.ends_with("_hasher")
-        || matches!(
-            name,
-            "hash_pjw"
-                | "sha224_buffer"
-                | "sha224_process_block"
-                | "sha224_process_bytes"
-                | "sha224_stream"
-                | "sha256_buffer"
-                | "sha256_process_block"
-                | "sha256_process_bytes"
-                | "sha256_stream"
-        )
 }
 
 fn is_parser_family_name(name: &str) -> bool {
@@ -1121,48 +1141,6 @@ fn global_table_walk_worker_summary(anchor: u64) -> NativeWorkerSummary {
         atomic: None,
         parser: None,
         loop_summary: None,
-        evidence: bounded_evidence(),
-    }
-}
-
-fn named_hash_fold_worker_summary(
-    anchor: u64,
-    memory_arg: usize,
-    state_arg: Option<usize>,
-    length_arg: Option<usize>,
-    accumulator: &str,
-    bits: u32,
-    operation: NativeWorkerFoldOperation,
-) -> NativeWorkerSummary {
-    NativeWorkerSummary {
-        anchor,
-        kind: NativeWorkerSummaryKind::HashFold,
-        dst: state_arg.map(arg_location),
-        src: None,
-        memory: Some(arg_byte_location(memory_arg)),
-        len: length_arg.map(SummaryTransferLength::Arg),
-        allocation: None,
-        lifetime: None,
-        sync: None,
-        atomic: None,
-        parser: None,
-        loop_summary: Some(NativeWorkerLoopSummary {
-            header: anchor,
-            exit_target: None,
-            iterations: None,
-            length_arg,
-            stride: Some(1),
-            terminator: Some(
-                length_arg
-                    .map(|_| NativeWorkerTerminator::LengthBound)
-                    .unwrap_or(NativeWorkerTerminator::Unknown),
-            ),
-            fold: Some(NativeWorkerFold {
-                accumulator: accumulator.to_string(),
-                bits,
-                operation,
-            }),
-        }),
         evidence: bounded_evidence(),
     }
 }
@@ -1395,6 +1373,22 @@ fn file_transfer_worker_summary(
         }),
         evidence: bounded_evidence(),
     }
+}
+
+fn memory_transfer_worker_summary(
+    anchor: u64,
+    dst_arg: usize,
+    src_arg: usize,
+    length_arg: usize,
+) -> NativeWorkerSummary {
+    transfer_worker_summary(
+        anchor,
+        SummaryTransferEffect {
+            dst: arg_byte_location(dst_arg),
+            src: arg_byte_location(src_arg),
+            len: SummaryTransferLength::Arg(length_arg),
+        },
+    )
 }
 
 fn path_walk_worker_summary(anchor: u64, path_arg: usize) -> NativeWorkerSummary {
@@ -2040,6 +2034,44 @@ fn randread_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     ]
 }
 
+fn scratch_buffer_growth_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        metadata_probe_worker_summary(anchor, 0),
+        allocation_role_worker_summary(anchor, None, false),
+        memory_read_worker_summary(anchor, 0, None),
+        memory_write_worker_summary(anchor, 0, None),
+    ]
+}
+
+fn argv_iterator_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
+    match name {
+        "argv_iter_init_argv" => vec![
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+            allocation_role_worker_summary(anchor, None, false),
+        ],
+        "argv_iter_init_stream" => vec![
+            record_stream_worker_summary(anchor, 0, None),
+            memory_write_worker_summary(anchor, 0, None),
+            allocation_role_worker_summary(anchor, None, false),
+        ],
+        "argv_iter" => vec![
+            argv_option_parser_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "argv_iter_n_args" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 0),
+        ],
+        "argv_iter_free" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            global_lifetime_worker_summary(anchor),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 fn stream_read_worker_summaries(
     anchor: u64,
     memory_arg: usize,
@@ -2165,86 +2197,6 @@ fn directory_extraction_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary
         path_walk_worker_summary(anchor, 0),
         directory_traversal_worker_summary(anchor, 0, None),
         metadata_probe_worker_summary(anchor, 0),
-    ]
-}
-
-fn hash_table_worker_summaries(
-    anchor: u64,
-    table_arg: usize,
-    key_arg: Option<usize>,
-) -> Vec<NativeWorkerSummary> {
-    let mut summaries = vec![table_walk_worker_summary(anchor, table_arg)];
-    if let Some(key_arg) = key_arg {
-        summaries.push(named_hash_fold_worker_summary(
-            anchor,
-            key_arg,
-            Some(table_arg),
-            None,
-            "hash_state",
-            64,
-            NativeWorkerFoldOperation::Xor,
-        ));
-    }
-    summaries
-}
-
-fn hash_table_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
-    match name {
-        "hash_initialize" | "hash_init" | "hash_rehash" => vec![
-            table_walk_worker_summary(anchor, 0),
-            allocation_role_worker_summary(anchor, None, false),
-        ],
-        "hash_insert" | "hash_insert_if_absent" | "hash_lookup" | "hash_remove" => {
-            hash_table_worker_summaries(anchor, 0, Some(1))
-        }
-        "hash_clear" | "hash_free" => vec![
-            table_walk_worker_summary(anchor, 0),
-            global_lifetime_worker_summary(anchor),
-        ],
-        "hash_print_statistics" => hash_statistics_worker_summaries(anchor),
-        _ if name.starts_with("hash_get_")
-            || matches!(
-                name,
-                "hash_do_for_each" | "hash_reset_tuning" | "hash_table_ok"
-            ) =>
-        {
-            vec![table_walk_worker_summary(anchor, 0)]
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn hash_fold_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
-    let accumulator = if name.starts_with("sha") {
-        "sha_state"
-    } else {
-        "hash_key"
-    };
-    let length_arg = name
-        .contains("_process_")
-        .then_some(1)
-        .or_else(|| name.ends_with("_buffer").then_some(1));
-    let state_arg = if name.starts_with("sha") && name.contains("_process_") {
-        Some(2)
-    } else {
-        None
-    };
-    vec![named_hash_fold_worker_summary(
-        anchor,
-        0,
-        state_arg,
-        length_arg,
-        accumulator,
-        64,
-        NativeWorkerFoldOperation::RotateMix,
-    )]
-}
-
-fn hash_statistics_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
-    vec![
-        table_walk_worker_summary(anchor, 0),
-        format_render_worker_summary(anchor, 1, None),
-        output_stream_worker_summary(anchor, 1, None),
     ]
 }
 
@@ -2662,7 +2614,7 @@ fn xalloc_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> 
             allocation_role_worker_summary(anchor, Some(1), false),
             metadata_probe_worker_summary(anchor, 0),
         ],
-        "xreallocarray" | "xireallocarray" => vec![
+        "xreallocarray" | "xireallocarray" | "xnrealloc" => vec![
             allocation_role_worker_summary(anchor, None, false),
             metadata_probe_worker_summary(anchor, 0),
         ],
@@ -2716,6 +2668,56 @@ fn libc_file_wrapper_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
         path_walk_worker_summary(anchor, 0),
         format_render_worker_summary(anchor, 1, None),
         metadata_probe_worker_summary(anchor, 0),
+    ]
+}
+
+fn locale_buffer_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        metadata_probe_worker_summary(anchor, 0),
+        string_scan_worker_summary(
+            anchor,
+            1,
+            Some(1),
+            Some(2),
+            NativeWorkerTerminator::LengthBound,
+        ),
+        memory_write_worker_summary(anchor, 1, Some(2)),
+    ]
+}
+
+fn gettext_quote_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+        table_walk_worker_summary(anchor, 1),
+    ]
+}
+
+fn program_name_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+        global_synchronization_worker_summary(anchor),
+    ]
+}
+
+fn time_format_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        format_render_worker_summary(anchor, 0, Some(1)),
+        metadata_probe_worker_summary(anchor, 3),
+    ]
+}
+
+fn time_zone_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        metadata_probe_worker_summary(anchor, 0),
+        metadata_probe_worker_summary(anchor, 1),
+        numeric_transform_worker_summary(anchor, Some(1), None, "time_value"),
+    ]
+}
+
+fn yesno_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        token_parser_worker_summary(anchor, 0, None, None),
+        record_stream_worker_summary(anchor, 0, None),
     ]
 }
 
@@ -2773,6 +2775,10 @@ fn semantic_family_worker_summaries(
         "printf_parse" | "print_formatted" | "print_esc" | "vasnprintf" => {
             printf_parser_worker_summaries(anchor)
         }
+        "oprintf_" => vec![
+            format_render_worker_summary(anchor, 1, None),
+            output_stream_worker_summary(anchor, 1, None),
+        ],
         "print_xfer_stats" => transfer_stats_worker_summaries(anchor),
         "unicode_to_mb" => multibyte_worker_summaries(anchor),
         "readlinebuffer_delim" => vec![linebuffer_delimiter_summary(anchor)],
@@ -2790,12 +2796,22 @@ fn semantic_family_worker_summaries(
             numeric_parser_worker_summary(anchor, 1),
         ],
         "rpl_fopen" | "freopen_safer" => libc_file_wrapper_summaries(anchor),
+        "openat_safer" => vec![
+            path_walk_worker_summary(anchor, 1),
+            metadata_probe_worker_summary(anchor, 0),
+        ],
+        "gettext_quote" => gettext_quote_worker_summaries(anchor),
+        "rpl_nanosleep" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            metadata_probe_worker_summary(anchor, 1),
+            global_synchronization_worker_summary(anchor),
+        ],
         "stream_open" => stream_open_worker_summaries(anchor),
         "rpl_fcntl" => vec![metadata_probe_worker_summary(anchor, 0)],
         "parse_long_options" | "parse_gnu_standard_options_only" => {
             vec![argv_option_parser_worker_summary(anchor, 1)]
         }
-        "human_options" | "parse_integer" | "parse_number" => {
+        "human_options" | "parse_integer" | "parse_number" | "traverse_raw_number" => {
             vec![numeric_parser_worker_summary(anchor, 0)]
         }
         "synchronize_output" => vec![global_synchronization_worker_summary(anchor)],
@@ -2805,6 +2821,7 @@ fn semantic_family_worker_summaries(
             None,
             Some(1),
         )],
+        "copy_bytes" => vec![memory_transfer_worker_summary(anchor, 0, 1, 2)],
         "iwrite" => vec![output_stream_worker_summary_with_len(
             anchor,
             1,
@@ -2826,6 +2843,8 @@ fn semantic_family_worker_summaries(
             numeric_parser_worker_summary(anchor, 1),
         ],
         "is_utf8_charset" => vec![global_synchronization_worker_summary(anchor)],
+        "setlocale_null_r_unlocked" => locale_buffer_worker_summaries(anchor),
+        "set_program_name" => program_name_worker_summaries(anchor),
         "canonicalize_filename_mode" => vec![string_scan_worker_summary(
             anchor,
             0,
@@ -2837,7 +2856,11 @@ fn semantic_family_worker_summaries(
             vec![token_parser_worker_summary(anchor, 0, None, None)]
         }
         "mcel_scan" => multibyte_cell_scan_worker_summaries(anchor),
+        "mcel_cmp" => vec![numeric_transform_worker_summary(
+            anchor, None, None, "mcel_cmp",
+        )],
         "mcel_scant" => multibyte_cell_scant_worker_summaries(anchor),
+        "mcel_scanz" => multibyte_cell_scan_worker_summaries(anchor),
         "copy_file_data" => vec![file_transfer_worker_summary(anchor, 0, 4, Some(8))],
         "sparse_copy" => vec![file_transfer_worker_summary(anchor, 0, 1, Some(7))],
         "copy_internal" => vec![
@@ -2880,6 +2903,11 @@ fn semantic_family_worker_summaries(
         ],
         "make_dir_parents_private" => vec![path_walk_worker_summary(anchor, 0)],
         "backupfile_internal" | "utimecmpat" => vec![path_walk_worker_summary(anchor, 1)],
+        "fdutimensat" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            metadata_probe_worker_summary(anchor, 1),
+            path_walk_worker_summary(anchor, 2),
+        ],
         "strmode" => file_mode_render_worker_summaries(anchor),
         "do_statx" => stat_probe_worker_summaries(anchor),
         "getuidbyname" => user_id_lookup_worker_summaries(anchor),
@@ -2925,6 +2953,7 @@ fn semantic_family_worker_summaries(
             format_render_worker_summary(anchor, 0, Some(2)),
             path_walk_worker_summary(anchor, 0),
         ],
+        "length_of_file_name_and_frills" => file_name_frills_worker_summaries(anchor),
         "print_long_format" => vec![
             format_render_worker_summary(anchor, 0, None),
             metadata_probe_worker_summary(anchor, 0),
@@ -2989,6 +3018,8 @@ fn semantic_family_worker_summaries(
             path_walk_worker_summary(anchor, 1),
         ],
         "human_readable" => vec![format_render_worker_summary(anchor, 0, Some(1))],
+        "nstrftime" | "c_nstrftime" => time_format_worker_summaries(anchor),
+        "mktime_z" => time_zone_worker_summaries(anchor),
         "__strftime_internal" => vec![
             format_render_worker_summary(anchor, 2, Some(0)),
             record_stream_worker_summary(anchor, 2, Some(0)),
@@ -3018,6 +3049,10 @@ fn semantic_family_worker_summaries(
         ],
         "pipe_child" => vec![format_render_worker_summary(anchor, 0, Some(1))],
         "merge" => vec![sort_merge_worker_summary(anchor, 0, None)],
+        "mergefiles" => vec![
+            sort_merge_worker_summary(anchor, 0, Some(3)),
+            record_stream_worker_summary(anchor, 0, Some(3)),
+        ],
         "init_node" => merge_node_init_worker_summaries(anchor),
         "fts_stat" => vec![
             directory_traversal_worker_summary(anchor, 0, Some(1)),
@@ -3083,6 +3118,7 @@ fn semantic_family_worker_summaries(
         "close_stdout" => stream_close_worker_summaries(anchor, None),
         "rpl_fclose" => stream_close_worker_summaries(anchor, Some(0)),
         "write_bytes" => byte_output_worker_summaries(anchor),
+        "yesno" => yesno_worker_summaries(anchor),
         "error" => vec![diagnostic_wrapper_summary_for_arg(anchor, 2)],
         "error_at_line" => vec![diagnostic_wrapper_summary_for_arg(anchor, 4)],
         "file_escape" => file_escape_worker_summaries(anchor),
@@ -3092,10 +3128,30 @@ fn semantic_family_worker_summaries(
         "get_meminfo" => get_meminfo_worker_summaries(anchor),
         "randread_new" => randread_new_worker_summaries(anchor),
         "randread" => randread_worker_summaries(anchor),
-        "gregorian_to_persian" => calendar_transform_worker_summaries(anchor),
+        "_gl_scratch_buffer_grow"
+        | "_gl_scratch_buffer_grow_preserve"
+        | "gl_scratch_buffer_grow"
+        | "gl_scratch_buffer_grow_preserve" => scratch_buffer_growth_worker_summaries(anchor),
+        "argv_iter"
+        | "argv_iter_init_argv"
+        | "argv_iter_init_stream"
+        | "argv_iter_n_args"
+        | "argv_iter_free" => argv_iterator_worker_summaries(anchor, &name),
+        "gregorian_to_persian" | "gregorian_to_ethiopian" => {
+            calendar_transform_worker_summaries(anchor)
+        }
         "next_prime" => prime_search_worker_summaries(anchor),
         "num_processors" | "physmem_claimable" => processor_probe_worker_summaries(anchor),
         "rpl_pipe2" => pipe_wrapper_worker_summaries(anchor),
+        "cycle_check_init" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "cycle_check" => vec![
+            metadata_probe_worker_summary(anchor, 1),
+            memory_read_worker_summary(anchor, 0, None),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
         name if is_hash_table_family_name(name) => hash_table_family_worker_summaries(anchor, name),
         name if is_hash_fold_family_name(name) => hash_fold_family_worker_summaries(anchor, name),
         name if is_parser_family_name(name) => parser_family_worker_summaries(anchor, name),
@@ -3613,10 +3669,11 @@ fn join_dataflow_map<K: Clone + Ord, T: Clone + Eq>(
 fn join_worker_state(left: &mut WorkerDataflowState, right: &WorkerDataflowState) -> bool {
     let roots_changed = join_dataflow_map(&mut left.roots, &right.roots);
     let loads_changed = join_dataflow_map(&mut left.load_sources, &right.load_sources);
+    let controls_changed = join_dataflow_map(&mut left.control_sources, &right.control_sources);
     if loads_changed {
         rebuild_load_source_alias_index(left);
     }
-    roots_changed || loads_changed
+    roots_changed || loads_changed || controls_changed
 }
 
 fn insert_exact_dataflow_value<K: Clone + Ord, T: Clone + Eq>(
@@ -3699,6 +3756,18 @@ fn insert_unknown_load_source_value(state: &mut WorkerDataflowState, key: &SSAVa
     insert_load_source_dataflow_value(state, key, DataflowValue::Unknown);
 }
 
+fn insert_exact_control_source_value(
+    state: &mut WorkerDataflowState,
+    key: &SSAVar,
+    value: BTreeSet<usize>,
+) {
+    insert_exact_dataflow_value(&mut state.control_sources, key, value);
+}
+
+fn insert_unknown_control_source_value(state: &mut WorkerDataflowState, key: &SSAVar) {
+    insert_dataflow_value(&mut state.control_sources, key, DataflowValue::Unknown);
+}
+
 fn rebuild_load_source_alias_index(state: &mut WorkerDataflowState) {
     state.load_source_aliases.clear();
     state.load_source_alias_members.clear();
@@ -3751,10 +3820,42 @@ fn dataflow_loaded_source(var: &SSAVar, state: &WorkerDataflowState) -> Option<L
         .map(|(_, _, source)| source)
 }
 
+fn source_control_args(source: LoadedSource) -> Option<BTreeSet<usize>> {
+    let arg = source_arg(source)?;
+    Some(BTreeSet::from([arg]))
+}
+
+fn dataflow_control_args(var: &SSAVar, state: &WorkerDataflowState) -> Option<BTreeSet<usize>> {
+    state.control_sources.get(var)?.exact().cloned()
+}
+
+fn dataflow_control_args_from_operand(
+    var: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<BTreeSet<usize>> {
+    dataflow_control_args(var, state)
+        .or_else(|| dataflow_loaded_source(var, state).and_then(source_control_args))
+}
+
+fn merge_control_args(
+    left: Option<BTreeSet<usize>>,
+    right: Option<BTreeSet<usize>>,
+) -> Option<BTreeSet<usize>> {
+    match (left, right) {
+        (Some(mut left), Some(right)) => {
+            left.extend(right);
+            Some(left)
+        }
+        (Some(left), None) | (None, Some(left)) => Some(left),
+        (None, None) => None,
+    }
+}
+
 fn dataflow_kill_load_source_aliases(dst: &SSAVar, state: &mut WorkerDataflowState) {
     let Some(dst_spec) = x86_register_alias_spec(register_base_name(dst)) else {
         state.load_sources.remove(dst);
         insert_unknown_load_source_value(state, dst);
+        insert_unknown_control_source_value(state, dst);
         return;
     };
     if let Some(members) = state.load_source_alias_members.remove(&dst_spec.family) {
@@ -3764,6 +3865,7 @@ fn dataflow_kill_load_source_aliases(dst: &SSAVar, state: &mut WorkerDataflowSta
     }
     state.load_source_aliases.remove(&dst_spec.family);
     insert_unknown_load_source_value(state, dst);
+    insert_unknown_control_source_value(state, dst);
 }
 
 fn dataflow_copy_root_if_known(dst: &SSAVar, src: &SSAVar, state: &mut WorkerDataflowState) {
@@ -3774,9 +3876,13 @@ fn dataflow_copy_root_if_known(dst: &SSAVar, src: &SSAVar, state: &mut WorkerDat
 
 fn dataflow_copy_load_source_if_known(dst: &SSAVar, src: &SSAVar, state: &mut WorkerDataflowState) {
     let source = dataflow_loaded_source(src, state);
+    let control_args = dataflow_control_args_from_operand(src, state);
     dataflow_kill_load_source_aliases(dst, state);
     if let Some(source) = source {
         insert_exact_load_source_value(state, dst, source);
+    }
+    if let Some(control_args) = control_args {
+        insert_exact_control_source_value(state, dst, control_args);
     }
 }
 
@@ -3892,6 +3998,10 @@ fn dataflow_copy_binary_load_source_if_unambiguous(
 ) {
     let a_source = dataflow_loaded_source(a, state);
     let b_source = dataflow_loaded_source(b, state);
+    let control_args = merge_control_args(
+        dataflow_control_args_from_operand(a, state),
+        dataflow_control_args_from_operand(b, state),
+    );
     let source = match (a_source, b_source) {
         (Some(source), None) | (None, Some(source)) => Some(source),
         (Some(a_source), Some(b_source)) if a_source == b_source => Some(a_source),
@@ -3900,6 +4010,9 @@ fn dataflow_copy_binary_load_source_if_unambiguous(
     dataflow_kill_load_source_aliases(dst, state);
     if let Some(source) = source {
         insert_exact_load_source_value(state, dst, source);
+    }
+    if let Some(control_args) = control_args {
+        insert_exact_control_source_value(state, dst, control_args);
     }
 }
 
@@ -4405,6 +4518,17 @@ fn dataflow_loaded_compare<'a>(
         .or_else(|| dataflow_loaded_source(b, state).map(|source| (source, a)))
 }
 
+fn dataflow_compare_control_args(
+    a: &SSAVar,
+    b: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<BTreeSet<usize>> {
+    merge_control_args(
+        dataflow_control_args_from_operand(a, state),
+        dataflow_control_args_from_operand(b, state),
+    )
+}
+
 fn dataflow_loaded_binary_source(
     a: &SSAVar,
     b: &SSAVar,
@@ -4650,72 +4774,6 @@ fn table_walk_summary_for_island(island: &LoopIsland, source: LoadedSource) -> N
             island,
             NativeWorkerTerminator::Unknown,
             None,
-            None,
-        )),
-        evidence: bounded_evidence(),
-    }
-}
-
-fn hash_fold_summary(
-    func: &SsaArtifact,
-    anchor: u64,
-    source: LoadedSource,
-    accumulator: String,
-    operation: NativeWorkerFoldOperation,
-) -> NativeWorkerSummary {
-    NativeWorkerSummary {
-        anchor,
-        kind: NativeWorkerSummaryKind::HashFold,
-        dst: None,
-        src: None,
-        memory: Some(source.location),
-        len: None,
-        allocation: None,
-        lifetime: None,
-        sync: None,
-        atomic: None,
-        parser: None,
-        loop_summary: Some(loop_summary(
-            func,
-            anchor,
-            NativeWorkerTerminator::Unknown,
-            Some(NativeWorkerFold {
-                accumulator,
-                bits: source.size.saturating_mul(8),
-                operation,
-            }),
-        )),
-        evidence: bounded_evidence(),
-    }
-}
-
-fn hash_fold_summary_for_island(
-    island: &LoopIsland,
-    source: LoadedSource,
-    accumulator: String,
-    operation: NativeWorkerFoldOperation,
-) -> NativeWorkerSummary {
-    let fold = NativeWorkerFold {
-        accumulator,
-        bits: source.size.saturating_mul(8),
-        operation,
-    };
-    NativeWorkerSummary {
-        anchor: island.header,
-        kind: NativeWorkerSummaryKind::HashFold,
-        dst: None,
-        src: None,
-        memory: Some(source.location),
-        len: None,
-        allocation: None,
-        lifetime: None,
-        sync: None,
-        atomic: None,
-        parser: None,
-        loop_summary: Some(loop_summary_from_island(
-            island,
-            NativeWorkerTerminator::Unknown,
-            Some(fold),
             None,
         )),
         evidence: bounded_evidence(),
@@ -4979,6 +5037,7 @@ fn transfer_worker_block(
                 dataflow_kill_load_source_aliases(dst, &mut state);
             }
             SSAOp::IntEqual { dst, a, b } | SSAOp::IntNotEqual { dst, a, b } => {
+                let control_args = dataflow_compare_control_args(a, b, &state);
                 if let Some(observations) = observations.as_deref_mut()
                     && let Some((source, other)) = dataflow_loaded_compare(a, b, &state)
                 {
@@ -5003,8 +5062,12 @@ fn transfer_worker_block(
                     });
                 }
                 dataflow_kill_load_source_aliases(dst, &mut state);
+                if let Some(control_args) = control_args {
+                    insert_exact_control_source_value(&mut state, dst, control_args);
+                }
             }
             SSAOp::IntLess { dst, a, b } | SSAOp::IntSLess { dst, a, b } => {
+                let control_args = dataflow_compare_control_args(a, b, &state);
                 if let Some(observations) = observations.as_deref_mut() {
                     if let Some(source) = dataflow_loaded_source(a, &state) {
                         record_parser_range_compare(
@@ -5028,8 +5091,12 @@ fn transfer_worker_block(
                     }
                 }
                 dataflow_kill_load_source_aliases(dst, &mut state);
+                if let Some(control_args) = control_args {
+                    insert_exact_control_source_value(&mut state, dst, control_args);
+                }
             }
             SSAOp::IntLessEqual { dst, a, b } | SSAOp::IntSLessEqual { dst, a, b } => {
+                let control_args = dataflow_compare_control_args(a, b, &state);
                 if let Some(observations) = observations.as_deref_mut() {
                     if let Some(source) = dataflow_loaded_source(a, &state) {
                         record_parser_range_compare(
@@ -5053,6 +5120,28 @@ fn transfer_worker_block(
                     }
                 }
                 dataflow_kill_load_source_aliases(dst, &mut state);
+                if let Some(control_args) = control_args {
+                    insert_exact_control_source_value(&mut state, dst, control_args);
+                }
+            }
+            SSAOp::BoolNot { dst, src } => {
+                let control_args = dataflow_control_args_from_operand(src, &state);
+                dataflow_kill_load_source_aliases(dst, &mut state);
+                if let Some(control_args) = control_args {
+                    insert_exact_control_source_value(&mut state, dst, control_args);
+                }
+            }
+            SSAOp::BoolAnd { dst, a, b }
+            | SSAOp::BoolOr { dst, a, b }
+            | SSAOp::BoolXor { dst, a, b } => {
+                let control_args = merge_control_args(
+                    dataflow_control_args_from_operand(a, &state),
+                    dataflow_control_args_from_operand(b, &state),
+                );
+                dataflow_kill_load_source_aliases(dst, &mut state);
+                if let Some(control_args) = control_args {
+                    insert_exact_control_source_value(&mut state, dst, control_args);
+                }
             }
             SSAOp::Load { dst, addr, .. }
             | SSAOp::LoadLinked { dst, addr, .. }
@@ -5073,7 +5162,64 @@ fn transfer_worker_block(
                             source,
                         });
                     }
+                    if let Some(observations) = observations.as_deref_mut()
+                        && let SummaryMemoryRegion::Arg { index } = region
+                    {
+                        observations
+                            .option_string_reads
+                            .push(OptionStringReadObservation {
+                                anchor: block.addr,
+                                arg: index,
+                            });
+                    }
                     insert_exact_load_source_value(&mut state, dst, source);
+                }
+            }
+            SSAOp::Store { addr, val, .. } => {
+                if let Some(observations) = observations.as_deref_mut()
+                    && let Some(SummaryMemoryRegion::Arg { index }) =
+                        dataflow_rooted_region(addr, &state)
+                    && let Some(value) =
+                        const_value(val).filter(|value| *value <= u64::from(u8::MAX))
+                {
+                    observations
+                        .option_string_writes
+                        .push(OptionStringWriteObservation {
+                            anchor: block.addr,
+                            arg: index,
+                            value: value as u8,
+                            control_args: BTreeSet::new(),
+                        });
+                }
+            }
+            SSAOp::StoreGuarded {
+                addr, val, guard, ..
+            } => {
+                let control_args =
+                    dataflow_control_args_from_operand(guard, &state).unwrap_or_default();
+                if let Some(observations) = observations.as_deref_mut()
+                    && let Some(SummaryMemoryRegion::Arg { index }) =
+                        dataflow_rooted_region(addr, &state)
+                    && let Some(value) =
+                        const_value(val).filter(|value| *value <= u64::from(u8::MAX))
+                {
+                    observations
+                        .option_string_writes
+                        .push(OptionStringWriteObservation {
+                            anchor: block.addr,
+                            arg: index,
+                            value: value as u8,
+                            control_args,
+                        });
+                }
+            }
+            SSAOp::CBranch { cond, .. } => {
+                if let Some(control_args) = dataflow_control_args_from_operand(cond, &state)
+                    && let Some(observations) = observations.as_deref_mut()
+                {
+                    observations
+                        .option_string_branch_controls
+                        .extend(control_args);
                 }
             }
             SSAOp::CpuId { dst } => {
@@ -5231,9 +5377,105 @@ fn parser_summary_from_evidence(
     })
 }
 
+fn option_string_control_args_by_block(
+    func: &SsaArtifact,
+    observations: &BTreeMap<u64, BlockWorkerObservations>,
+) -> BTreeMap<u64, BTreeSet<usize>> {
+    let mut controls = BTreeMap::<u64, BTreeSet<usize>>::new();
+    for (block_addr, assumptions) in &func.predicates().block_assumptions {
+        for assumption in assumptions {
+            let Some(branch_controls) = observations
+                .get(&assumption.predecessor)
+                .map(|block| &block.option_string_branch_controls)
+                .filter(|controls| !controls.is_empty())
+            else {
+                continue;
+            };
+            controls
+                .entry(*block_addr)
+                .or_default()
+                .extend(branch_controls.iter().copied());
+        }
+    }
+
+    for (&branch_addr, block) in observations {
+        if block.option_string_branch_controls.is_empty() {
+            continue;
+        }
+        for succ in func.function().successors(branch_addr) {
+            controls
+                .entry(succ)
+                .or_default()
+                .extend(block.option_string_branch_controls.iter().copied());
+        }
+    }
+    controls
+}
+
+fn option_string_render_summaries(
+    func: &SsaArtifact,
+    observations: &BTreeMap<u64, BlockWorkerObservations>,
+) -> Vec<NativeWorkerSummary> {
+    const MIN_INPUT_READS: usize = 4;
+    const MIN_OPTION_BYTES: usize = 4;
+
+    let mut input_reads = BTreeMap::<usize, (usize, u64)>::new();
+    let mut output_bytes = BTreeMap::<(usize, usize), BTreeSet<u8>>::new();
+    let mut output_zeroes = BTreeSet::<(usize, usize)>::new();
+    let mut output_anchors = BTreeMap::<(usize, usize), u64>::new();
+    let block_controls = option_string_control_args_by_block(func, observations);
+
+    for (block_addr, block) in observations {
+        for read in &block.option_string_reads {
+            let entry = input_reads.entry(read.arg).or_insert((0, read.anchor));
+            entry.0 += 1;
+            entry.1 = entry.1.min(read.anchor);
+        }
+        for write in &block.option_string_writes {
+            let mut control_args = write.control_args.clone();
+            if let Some(block_control_args) = block_controls.get(block_addr) {
+                control_args.extend(block_control_args.iter().copied());
+            }
+            for input_arg in control_args.into_iter().filter(|arg| *arg != write.arg) {
+                let key = (input_arg, write.arg);
+                output_anchors
+                    .entry(key)
+                    .and_modify(|anchor| *anchor = (*anchor).min(write.anchor))
+                    .or_insert(write.anchor);
+                if write.value == 0 {
+                    output_zeroes.insert(key);
+                } else if write.value.is_ascii_alphanumeric() {
+                    output_bytes.entry(key).or_default().insert(write.value);
+                }
+            }
+        }
+    }
+
+    output_bytes
+        .into_iter()
+        .filter(|(key, bytes)| output_zeroes.contains(key) && bytes.len() >= MIN_OPTION_BYTES)
+        .filter_map(|((input_arg, output_arg), _)| {
+            let (_, read_anchor) = input_reads
+                .get(&input_arg)
+                .filter(|(count, _)| *count >= MIN_INPUT_READS)?;
+            let anchor = output_anchors
+                .get(&(input_arg, output_arg))
+                .copied()
+                .unwrap_or(func.entry)
+                .min(*read_anchor);
+            Some(format_render_worker_summary(
+                anchor,
+                input_arg,
+                Some(output_arg),
+            ))
+        })
+        .collect()
+}
+
 fn summaries_from_loop_effects(func: &SsaArtifact) -> Vec<NativeWorkerSummary> {
     let observations = collect_block_worker_observations(func);
     let mut summaries = Vec::<NativeWorkerSummary>::new();
+    summaries.extend(option_string_render_summaries(func, &observations));
     for effect in loop_effect_summaries(func, observations) {
         let mut seen_scans = BTreeSet::new();
         for scan in effect.scans {
@@ -5435,20 +5677,145 @@ mod tests {
         let summaries =
             bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
 
-        assert!(summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::HashFold)
-                && matches!(
-                    summary.memory.map(|memory| memory.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && summary
-                    .loop_summary
-                    .as_ref()
-                    .and_then(|loop_summary| loop_summary.fold.as_ref())
-                    .is_some_and(|fold| {
-                        fold.operation == NativeWorkerFoldOperation::Add && fold.bits == 8
-                    })
-        }));
+        let hash_fold = summaries
+            .iter()
+            .find(|summary| {
+                matches!(summary.kind, NativeWorkerSummaryKind::HashFold)
+                    && matches!(
+                        summary.memory.map(|memory| memory.region),
+                        Some(SummaryMemoryRegion::Arg { index: 0 })
+                    )
+                    && summary
+                        .loop_summary
+                        .as_ref()
+                        .and_then(|loop_summary| loop_summary.fold.as_ref())
+                        .is_some_and(|fold| {
+                            fold.operation == NativeWorkerFoldOperation::Add && fold.bits == 8
+                        })
+            })
+            .expect("evidence-first hash fold summary");
+        assert_eq!(hash_fold.evidence.tier, SemanticConfidence::Likely);
+        assert_eq!(
+            hash_fold.evidence.coverage,
+            SemanticEvidenceCoverage::Bounded
+        );
+        assert_eq!(
+            hash_fold.evidence.provenance,
+            SemanticEvidenceProvenance::Stable
+        );
+        assert_eq!(
+            hash_fold.evidence.reasons,
+            vec![SemanticEvidenceReason::SummaryBudget]
+        );
+    }
+
+    #[test]
+    fn classifier_detects_option_string_render_without_name() {
+        let arch = aarch64_test_arch();
+        let guard = Varnode::unique(0x2f, 1);
+        let mut block = R2ILBlock::new(0x4030, 4);
+        for idx in 0..4 {
+            let loaded = Varnode::unique(0x30 + idx, 1);
+            block.push(R2ILOp::Load {
+                dst: loaded.clone(),
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x00, 8),
+            });
+            if idx == 0 {
+                block.push(R2ILOp::IntNotEqual {
+                    dst: guard.clone(),
+                    a: loaded,
+                    b: Varnode::constant(0, 1),
+                });
+            }
+        }
+        for byte in [b'b', b'd', b'f', b'g', 0] {
+            block.push(R2ILOp::StoreGuarded {
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x08, 8),
+                val: Varnode::constant(u64::from(byte), 1),
+                guard: guard.clone(),
+                ordering: r2il::MemoryOrdering::Unknown,
+            });
+        }
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("option render SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        let render = summaries
+            .iter()
+            .find(|summary| {
+                matches!(summary.kind, NativeWorkerSummaryKind::FormatRender)
+                    && matches!(
+                        summary.memory.map(|memory| memory.region),
+                        Some(SummaryMemoryRegion::Arg { index: 0 })
+                    )
+                    && matches!(
+                        summary.dst.map(|dst| dst.region),
+                        Some(SummaryMemoryRegion::Arg { index: 1 })
+                    )
+            })
+            .expect("structural option string render summary");
+        assert_eq!(render.evidence.tier, SemanticConfidence::Likely);
+        assert_eq!(
+            render.evidence.reasons,
+            vec![SemanticEvidenceReason::SummaryBudget]
+        );
+        assert!(
+            !render
+                .evidence
+                .reasons
+                .contains(&SemanticEvidenceReason::NameHint)
+        );
+    }
+
+    #[test]
+    fn classifier_rejects_uncorrelated_option_reads_and_writes() {
+        let arch = aarch64_test_arch();
+        let mut block = R2ILBlock::new(0x4038, 4);
+        for idx in 0..4 {
+            let loaded = Varnode::unique(0x38 + idx, 1);
+            block.push(R2ILOp::Load {
+                dst: loaded,
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x00, 8),
+            });
+        }
+        for byte in [b'b', b'd', b'f', b'g', 0] {
+            block.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x08, 8),
+                val: Varnode::constant(u64::from(byte), 1),
+            });
+        }
+        let artifact =
+            SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("uncorrelated option SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::FormatRender)),
+            "uncorrelated reads/writes must not produce option-string summary: {summaries:?}"
+        );
+    }
+
+    #[test]
+    fn key_to_opts_name_alone_does_not_create_summary() {
+        let summary = FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x4030),
+            Some("dbg.key_to_opts".to_string()),
+        );
+
+        assert!(!has_native_worker_summary_family("dbg.key_to_opts"));
+        assert!(
+            summaries_from_interproc_summary_unbounded(0x4030, &summary)
+                .iter()
+                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::FormatRender))
+        );
     }
 
     #[test]
@@ -6847,6 +7214,44 @@ mod tests {
                     NativeWorkerSummaryKind::MemoryWrite,
                 ],
             ),
+            (
+                "dbg.cycle_check",
+                &[
+                    NativeWorkerSummaryKind::MetadataProbe,
+                    NativeWorkerSummaryKind::MemoryRead,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            ("dbg.copy_bytes", &[NativeWorkerSummaryKind::MemoryTransfer]),
+            (
+                "sym.oprintf_.constprop.0",
+                &[
+                    NativeWorkerSummaryKind::FormatRender,
+                    NativeWorkerSummaryKind::OutputStream,
+                ],
+            ),
+            (
+                "dbg.setlocale_null_r_unlocked",
+                &[
+                    NativeWorkerSummaryKind::MetadataProbe,
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.gettext_quote",
+                &[
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::TableWalk,
+                ],
+            ),
+            (
+                "dbg.set_program_name",
+                &[
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::Synchronization,
+                ],
+            ),
         ];
 
         for (idx, (name, expected_kinds)) in cases.iter().enumerate() {
@@ -6871,6 +7276,7 @@ mod tests {
     fn native_worker_family_predicate_recognizes_summary_owned_names() {
         assert!(has_native_worker_summary_family("dbg.readlinebuffer_delim"));
         assert!(has_native_worker_summary_family("sym.printf_fetchargs"));
+        assert!(has_native_worker_summary_family("sym.oprintf_.constprop.0"));
         assert!(has_native_worker_summary_family(
             "sym.quotearg_buffer_restyled"
         ));
@@ -6894,9 +7300,12 @@ mod tests {
         assert!(has_native_worker_summary_family("sym.xpalloc"));
         assert!(has_native_worker_summary_family("sym.rpl_mbrtowc"));
         assert!(has_native_worker_summary_family("sym.rpl_fopen"));
+        assert!(has_native_worker_summary_family("dbg.openat_safer"));
+        assert!(has_native_worker_summary_family("dbg.rpl_nanosleep"));
         assert!(has_native_worker_summary_family("entry.init0"));
         assert!(has_native_worker_summary_family("sym.copy_file_data"));
         assert!(has_native_worker_summary_family("dbg.copy_with_unblock"));
+        assert!(has_native_worker_summary_family("dbg.copy_bytes"));
         assert!(has_native_worker_summary_family("sym.iwrite.constprop.0"));
         assert!(has_native_worker_summary_family("dbg.translate_charset"));
         assert!(has_native_worker_summary_family("dbg.invalidate_cache"));
@@ -6907,6 +7316,7 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.human_options"));
         assert!(has_native_worker_summary_family("dbg.parse_integer"));
         assert!(has_native_worker_summary_family("dbg.parse_number"));
+        assert!(has_native_worker_summary_family("dbg.traverse_raw_number"));
         assert!(has_native_worker_summary_family("dbg.synchronize_output"));
         assert!(has_native_worker_summary_family("sym.rpl_fts_read"));
         assert!(has_native_worker_summary_family("sym.rpl_fts_close"));
@@ -6937,6 +7347,7 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.stream_open"));
         assert!(has_native_worker_summary_family("dbg.same_nameat"));
         assert!(has_native_worker_summary_family("sym.mcel_scan"));
+        assert!(has_native_worker_summary_family("sym.mcel_cmp"));
         assert!(has_native_worker_summary_family(
             "dbg.set_process_security_ctx"
         ));
@@ -6947,6 +7358,8 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.mfile_name_concat"));
         assert!(has_native_worker_summary_family("dbg.getuidbyname"));
         assert!(has_native_worker_summary_family("dbg.init_node"));
+        assert!(has_native_worker_summary_family("dbg.mergefiles"));
+        assert!(has_native_worker_summary_family("dbg.xnrealloc"));
         assert!(has_native_worker_summary_family("sym.mcel_scant"));
         assert!(has_native_worker_summary_family("dbg.filenvercmp"));
         assert!(has_native_worker_summary_family(
@@ -6977,10 +7390,36 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.get_meminfo"));
         assert!(has_native_worker_summary_family("dbg.randread_new"));
         assert!(has_native_worker_summary_family("dbg.randread"));
+        assert!(has_native_worker_summary_family(
+            "dbg._gl_scratch_buffer_grow_preserve"
+        ));
+        assert!(has_native_worker_summary_family("dbg.argv_iter"));
+        assert!(has_native_worker_summary_family("dbg.argv_iter_init_argv"));
+        assert!(has_native_worker_summary_family(
+            "dbg.argv_iter_init_stream"
+        ));
         assert!(has_native_worker_summary_family("dbg.gregorian_to_persian"));
+        assert!(has_native_worker_summary_family(
+            "dbg.gregorian_to_ethiopian"
+        ));
         assert!(has_native_worker_summary_family("dbg.next_prime"));
         assert!(has_native_worker_summary_family("dbg.num_processors"));
         assert!(has_native_worker_summary_family("sym.rpl_pipe2"));
+        assert!(has_native_worker_summary_family("dbg.cycle_check_init"));
+        assert!(has_native_worker_summary_family("dbg.cycle_check"));
+        assert!(has_native_worker_summary_family("dbg.fdutimensat"));
+        assert!(has_native_worker_summary_family(
+            "dbg.setlocale_null_r_unlocked"
+        ));
+        assert!(has_native_worker_summary_family("dbg.gettext_quote"));
+        assert!(has_native_worker_summary_family("dbg.set_program_name"));
+        assert!(has_native_worker_summary_family("dbg.mcel_scanz"));
+        assert!(has_native_worker_summary_family("dbg.nstrftime"));
+        assert!(has_native_worker_summary_family("dbg.mktime_z"));
+        assert!(has_native_worker_summary_family(
+            "dbg.length_of_file_name_and_frills"
+        ));
+        assert!(has_native_worker_summary_family("dbg.yesno"));
         assert!(has_native_worker_summary_family("sym.sha256_process_block"));
         assert!(has_native_worker_summary_family("dbg.hash_lookup"));
         assert!(has_native_worker_summary_family("dbg.hash_get_entries"));
@@ -7049,6 +7488,95 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn named_hash_fold_family_remains_weak_hint() {
+        let summary = FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x9000),
+            Some("dbg.raw_hasher".to_string()),
+        );
+
+        let summaries = summaries_from_interproc_summary_unbounded(0x9000, &summary);
+        let hash_fold = summaries
+            .iter()
+            .find(|summary| matches!(summary.kind, NativeWorkerSummaryKind::HashFold))
+            .expect("named hash fold summary");
+
+        assert_eq!(hash_fold.evidence.tier, SemanticConfidence::Heuristic);
+        assert_eq!(
+            hash_fold.evidence.provenance,
+            SemanticEvidenceProvenance::Ranked
+        );
+        assert_eq!(
+            hash_fold.evidence.ambiguity,
+            SemanticEvidenceAmbiguity::Ranked
+        );
+        assert_eq!(
+            hash_fold.evidence.reasons,
+            vec![
+                SemanticEvidenceReason::SummaryBudget,
+                SemanticEvidenceReason::NameHint
+            ]
+        );
+    }
+
+    #[test]
+    fn scratch_buffer_growth_summary_is_bounded_name_hint_not_transfer_proof() {
+        let summary = FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x9100),
+            Some("dbg._gl_scratch_buffer_grow_preserve".to_string()),
+        );
+
+        let summaries = summaries_from_interproc_summary_unbounded(0x9100, &summary);
+
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::Allocation)
+                && summary
+                    .evidence
+                    .reasons
+                    .contains(&SemanticEvidenceReason::NameHint)
+        }));
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
+                && matches!(
+                    summary.memory.map(|memory| memory.region),
+                    Some(SummaryMemoryRegion::Arg { index: 0 })
+                )
+        }));
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::MemoryTransfer)),
+            "grow_preserve must not claim a copy/preserve transfer without evidence"
+        );
+    }
+
+    #[test]
+    fn argv_iterator_summary_is_bounded_name_hint() {
+        let summary = FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x9200),
+            Some("dbg.argv_iter".to_string()),
+        );
+
+        let summaries = summaries_from_interproc_summary_unbounded(0x9200, &summary);
+
+        let parser = summaries
+            .iter()
+            .find(|summary| matches!(summary.kind, NativeWorkerSummaryKind::Parser))
+            .expect("argv iterator parser summary");
+        assert_eq!(parser.evidence.tier, SemanticConfidence::Heuristic);
+        assert!(
+            parser
+                .evidence
+                .reasons
+                .contains(&SemanticEvidenceReason::NameHint)
+        );
+        assert!(
+            summaries
+                .iter()
+                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::TableWalk))
+        );
     }
 
     #[test]

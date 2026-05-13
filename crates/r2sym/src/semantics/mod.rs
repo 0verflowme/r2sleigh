@@ -47,6 +47,6 @@ pub use region::{
 pub use vm::{
     InterpreterDispatchSummary, InterpreterKind, VmBinaryOp, VmGuardCondition, VmGuardedExit,
     VmMemoryCondition, VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp,
-    VmValueExpr,
+    VmValueExpr, has_strong_vm_evidence, strong_vm_step_summary,
 };
 pub(crate) use vm::{build_vm_step_summary, classify_interpreter_like};

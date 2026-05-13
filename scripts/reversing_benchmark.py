@@ -1004,6 +1004,10 @@ def has_return_statement(body_text: str) -> bool:
     return bool(re.search(r"\breturn\b", body_text))
 
 
+def has_explicit_unresolved_summary_return(body_text: str) -> bool:
+    return "summary return unresolved; value intentionally not reconstructed" in body_text
+
+
 def _pointer_param_names(text: str) -> set[str]:
     for line in text.splitlines():
         stripped = line.strip()
@@ -1112,10 +1116,12 @@ def decompile_quality(text: str) -> dict[str, Any]:
     header = _first_function_header(text)
     body_text = _source_body_text(text)
     header_ret_type = header.get("ret_type") if header else None
+    explicit_unresolved_summary_return = has_explicit_unresolved_summary_return(body_text)
     missing_return_nonvoid = (
         bool(header_ret_type)
         and not is_void_type(header_ret_type)
         and not has_return_statement(body_text)
+        and not explicit_unresolved_summary_return
     )
     metrics.update(
         {
@@ -1129,6 +1135,7 @@ def decompile_quality(text: str) -> dict[str, Any]:
             "header_param_count": header.get("param_count") if header else None,
             "header_name": header.get("name") if header else None,
             "has_return_statement": has_return_statement(body_text),
+            "explicit_unresolved_summary_return": explicit_unresolved_summary_return,
             "missing_return_nonvoid": missing_return_nonvoid,
             **source_smell_metrics(text),
         }

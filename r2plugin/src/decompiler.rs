@@ -75,87 +75,64 @@ pub(crate) fn render_named_native_worker_summary(
     arch: Option<&r2il::ArchSpec>,
     ptr_bits: u32,
 ) -> Option<String> {
-    let (arch_name, _, config) = r2dec::DecompilerConfig::for_arch(arch);
-    let semantic_artifact = crate::types::collect_detached_native_worker_summary_artifact(
-        &r2il_blocks,
-        function_name,
-        arch,
-        None,
-        true,
-    )?;
-    let type_facts = r2engine::type_facts_with_summary_projection(
-        r2types::FunctionTypeFacts::default(),
-        function_name,
-        &arch_name,
-        ptr_bits,
-        &semantic_artifact,
-    );
-    let function_facts = r2types::FunctionFacts::new(type_facts, Some(semantic_artifact));
-    let fallback_comment =
-        r2engine::has_renderable_primary_summary_only_native_worker(&function_facts).then(|| {
-            function_facts
-                .semantics
-                .as_ref()
-                .map(|artifact| {
-                    r2engine::summary_only_native_worker_fallback(function_name, artifact)
-                })
-                .unwrap_or_else(|| {
-                    r2dec::artifact_guard_fallback_comment(
-                        function_name,
-                        "summary-only native worker without semantic artifact",
-                    )
-                })
-        });
-    render_summary_with_engine(
-        &r2il_blocks,
-        function_name,
-        arch,
-        ptr_bits,
-        &function_facts,
-        config,
-        "",
-        "",
-        "",
-        true,
-        fallback_comment,
-    )
+    let (_, _, config) = r2dec::DecompilerConfig::for_arch(arch);
+    let parsed_context = r2types::ParsedExternalContext::default();
+    let function_addr = r2il_blocks
+        .first()
+        .map(|block| block.addr)
+        .unwrap_or_default();
+    crate::types::engine_session()
+        .decompile_summary_preprobe(r2engine::EngineSummaryPreprobeRequest {
+            blocks: &r2il_blocks,
+            function_addr,
+            canonical_name: function_name,
+            display_name: function_name,
+            arch,
+            ptr_bits,
+            parsed_context: &parsed_context,
+            symbolic_scope: None,
+            type_seed: Some(r2types::FunctionTypeFacts::default()),
+            config,
+            func_names_payload: "",
+            strings_payload: "",
+            symbols_payload: "",
+            fallback_if_guarded_without_summary: false,
+        })
+        .map(|response| response.output)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_summary_with_engine(
-    r2il_blocks: &[R2ILBlock],
+pub(crate) fn render_direct_named_native_worker_summary(
+    function_addr: u64,
     function_name: &str,
     arch: Option<&r2il::ArchSpec>,
     ptr_bits: u32,
-    function_facts: &r2types::FunctionFacts,
-    config: r2dec::DecompilerConfig,
-    func_names_payload: &str,
-    strings_payload: &str,
-    symbols_payload: &str,
-    named_worker_guarded: bool,
-    fallback_comment: Option<String>,
 ) -> Option<String> {
-    let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(r2il_blocks)?.cfg_risk_summary();
-    let render_cache_key =
-        crate::types::decompile_render_cache_key(crate::types::DecompileRenderCacheKeyInput {
-            blocks: r2il_blocks,
-            function_name,
-            arch,
-            ptr_bits,
-            function_facts,
-            func_names_payload,
-            strings_payload,
-            symbols_payload,
-        });
+    let (arch_name, _, config) = r2dec::DecompilerConfig::for_arch(arch);
+    let parsed_context = r2types::ParsedExternalContext::default();
+    let projection = r2engine::native_worker_type_projection(
+        function_addr,
+        function_name,
+        &arch_name,
+        ptr_bits,
+        &parsed_context,
+        true,
+    )?;
+    let cfg_summary = r2ssa::CFGRiskSummary {
+        block_count: 0,
+        loop_count: 0,
+        back_edge_count: 0,
+        switch_block_count: 0,
+        max_switch_cases: 0,
+    };
     crate::types::engine_session()
         .decompile_summary(r2engine::EngineSummaryDecompileRequest {
             function_name: function_name.to_string(),
             cfg_summary,
-            function_facts: function_facts.clone(),
-            named_worker_guarded,
+            function_facts: projection.function_facts,
+            named_worker_guarded: true,
             config,
-            render_cache_key: Some(render_cache_key),
-            fallback_comment,
+            render_cache_key: None,
+            fallback_comment: None,
         })
         .map(|response| response.output)
 }
@@ -201,7 +178,7 @@ pub(crate) fn run_full_decompile_on_large_stack(
     let handle = std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(move || {
-            let (arch_name, _, config) = r2dec::DecompilerConfig::for_arch(arch.as_ref());
+            let (_, _, config) = r2dec::DecompilerConfig::for_arch(arch.as_ref());
             let function_names = parse_addr_name_map(&func_names_str);
             let symbols = parse_addr_name_map(&symbols_str);
             let display_func_name = crate::helpers::resolve_decompiler_display_name(
@@ -210,6 +187,8 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 &function_names,
                 &symbols,
             );
+            let parsed_context =
+                r2types::parse_external_context_json(&external_context_json, ptr_bits);
             let probe = r2engine::decompile_probe_decision(
                 &r2il_blocks,
                 fcn_addr,
@@ -217,124 +196,83 @@ pub(crate) fn run_full_decompile_on_large_stack(
                 &display_func_name,
             );
             let cfg_guard_reason = probe.cfg_guard_reason.clone();
-            let summary_probe_name = probe.summary_probe_name.as_str();
             let mut artifact = if let Some(mut artifact) = cached_artifact {
                 if let Some(type_facts_override) = type_facts_override.as_ref()
                     && let Some(signature) = type_facts_override.merged_signature.clone()
                 {
                     artifact.function_facts.types.merged_signature = Some(signature);
                 }
-                if probe.summary_probe_needed
-                    && let Some(semantic_artifact) =
-                        crate::types::collect_detached_native_worker_summary_artifact(
-                            &r2il_blocks,
-                            summary_probe_name,
-                            arch.as_ref(),
-                            symbolic_scope.as_ref(),
-                            true,
-                        )
-                {
+                if probe.summary_probe_needed {
                     let mut summary_type_seed = artifact.function_facts.types.clone();
                     if let Some(type_facts_override) = type_facts_override.as_ref()
                         && let Some(signature) = type_facts_override.merged_signature.clone()
                     {
                         summary_type_seed.merged_signature = Some(signature);
                     }
-                    let summary_type_facts = r2engine::type_facts_with_summary_projection(
-                        summary_type_seed,
-                        summary_probe_name,
-                        &arch_name,
-                        ptr_bits,
-                        &semantic_artifact,
-                    );
-                    let summary_facts =
-                        r2types::FunctionFacts::new(summary_type_facts, Some(semantic_artifact.clone()));
-                    let fallback_comment =
-                        r2engine::has_renderable_primary_summary_only_native_worker(&summary_facts)
-                            .then(|| {
-                                r2engine::summary_only_native_worker_fallback(
-                                    &display_func_name,
-                                    &semantic_artifact,
-                                )
-                            });
-                    if let Some(output) = render_summary_with_engine(
-                        &r2il_blocks,
-                        &display_func_name,
-                        arch.as_ref(),
-                        ptr_bits,
-                        &summary_facts,
-                        config.clone(),
-                        &func_names_str,
-                        &strings_str,
-                        &symbols_str,
-                        probe.named_worker_guarded,
-                        fallback_comment,
-                    ) {
-                        return output;
+                    if let Some(output) =
+                        crate::types::engine_session().decompile_summary_preprobe(
+                            r2engine::EngineSummaryPreprobeRequest {
+                                blocks: &r2il_blocks,
+                                function_addr: fcn_addr,
+                                canonical_name: &func_name_str,
+                                display_name: &display_func_name,
+                                arch: arch.as_ref(),
+                                ptr_bits,
+                                parsed_context: &parsed_context,
+                                symbolic_scope: symbolic_scope.as_ref(),
+                                type_seed: Some(summary_type_seed),
+                                config: config.clone(),
+                                func_names_payload: &func_names_str,
+                                strings_payload: &strings_str,
+                                symbols_payload: &symbols_str,
+                                fallback_if_guarded_without_summary: false,
+                            },
+                        )
+                    {
+                        return output.output;
                     }
                 }
                 artifact
             } else {
-                let summary_probe_artifact = probe.summary_probe_needed.then(|| {
-                    crate::types::collect_detached_native_worker_summary_artifact(
-                        &r2il_blocks,
-                        summary_probe_name,
-                        arch.as_ref(),
-                        symbolic_scope.as_ref(),
-                        true,
-                    )
-                }).flatten();
-                let mut summary_type_facts = type_facts_override.clone().unwrap_or_else(|| {
-                    crate::types::external_function_type_facts_from_json(
-                        &external_context_json,
-                        ptr_bits,
+                let summary_type_seed = type_facts_override.clone().unwrap_or_else(|| {
+                    r2types::function_type_facts_from_parsed_context(
+                        &display_func_name,
+                        &parsed_context,
                     )
                 });
-                if let Some(summary_artifact) = summary_probe_artifact.as_ref() {
-                    summary_type_facts = r2engine::type_facts_with_summary_projection(
-                        summary_type_facts,
-                        summary_probe_name,
-                        &arch_name,
-                        ptr_bits,
-                        summary_artifact,
-                    );
-                }
-                let summary_facts = r2types::FunctionFacts::new(
-                    summary_type_facts,
-                    summary_probe_artifact.clone(),
-                );
-                let fallback_comment = summary_probe_artifact
-                    .as_ref()
-                    .filter(|_| {
-                        r2engine::has_renderable_primary_summary_only_native_worker(&summary_facts)
-                    })
-                    .map(|summary_artifact| {
-                        r2engine::summary_only_native_worker_fallback(
-                            &display_func_name,
-                            summary_artifact,
-                        )
-                    });
-                if let Some(output) = render_summary_with_engine(
-                    &r2il_blocks,
-                    &display_func_name,
-                    arch.as_ref(),
-                    ptr_bits,
-                    &summary_facts,
-                    config.clone(),
-                    &func_names_str,
-                    &strings_str,
-                    &symbols_str,
-                    probe.named_worker_guarded,
-                    fallback_comment,
-                ) {
-                    return output;
+                if let Some(output) =
+                    crate::types::engine_session().decompile_summary_preprobe(
+                        r2engine::EngineSummaryPreprobeRequest {
+                            blocks: &r2il_blocks,
+                            function_addr: fcn_addr,
+                            canonical_name: &func_name_str,
+                            display_name: &display_func_name,
+                            arch: arch.as_ref(),
+                            ptr_bits,
+                            parsed_context: &parsed_context,
+                            symbolic_scope: symbolic_scope.as_ref(),
+                            type_seed: Some(summary_type_seed),
+                            config: config.clone(),
+                            func_names_payload: &func_names_str,
+                            strings_payload: &strings_str,
+                            symbols_payload: &symbols_str,
+                            fallback_if_guarded_without_summary: true,
+                        },
+                    )
+                {
+                    return output.output;
                 }
                 if probe.block_guarded {
-                    return r2dec::artifact_guard_fallback_comment(
-                        &display_func_name,
+                    let guard_reason = if probe.summary_probe_skipped_large_cfg {
                         cfg_guard_reason
                             .as_deref()
-                            .unwrap_or("large native worker without canonical summary"),
+                            .unwrap_or("large native worker without canonical summary")
+                    } else {
+                        "bounded native-worker preprobe without canonical summary"
+                    };
+                    return r2dec::artifact_guard_fallback_comment(
+                        &display_func_name,
+                        guard_reason,
                     );
                 }
                 let Some(artifact) =
@@ -407,6 +345,8 @@ pub(crate) fn run_full_decompile_on_large_stack(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn nontrivial_program_orchestrators_use_summary_guard() {
         assert!(!r2engine::should_guard_program_orchestrator_decompile(
@@ -416,5 +356,15 @@ mod tests {
         assert!(r2engine::should_guard_program_orchestrator_decompile(
             2, 128
         ));
+    }
+
+    #[test]
+    fn direct_named_worker_summary_renders_without_blocks() {
+        let output = render_direct_named_native_worker_summary(0x401000, "dbg.init_node", None, 64)
+            .expect("direct init_node summary");
+
+        assert!(output.contains("init_node"));
+        assert!(output.contains("r2dec summary:"));
+        assert!(output.contains("worker summary:"));
     }
 }

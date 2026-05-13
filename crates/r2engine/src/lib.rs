@@ -5,7 +5,7 @@
 //! the session-level scheduler/cache boundary that decides which artifacts are
 //! needed for a request and how they are reused.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Write as _};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
@@ -96,6 +96,114 @@ pub enum EnginePlan {
     SemanticStructured,
     ReplayValidated,
     RefuseWithEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EngineCacheLayer {
+    Analysis,
+    Artifact,
+    Render,
+    MetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EngineCacheReuse {
+    Disabled,
+    Miss,
+    Hit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EngineCachePlan {
+    pub request: EngineRequestKind,
+    pub layer: EngineCacheLayer,
+    pub lookup: bool,
+    pub store_on_miss: bool,
+}
+
+impl EngineCachePlan {
+    pub fn lookup_store(request: EngineRequestKind, layer: EngineCacheLayer) -> Self {
+        Self {
+            request,
+            layer,
+            lookup: true,
+            store_on_miss: true,
+        }
+    }
+
+    pub fn disabled(request: EngineRequestKind, layer: EngineCacheLayer) -> Self {
+        Self {
+            request,
+            layer,
+            lookup: false,
+            store_on_miss: false,
+        }
+    }
+
+    pub fn for_request(request: EngineRequestKind) -> Self {
+        match request {
+            EngineRequestKind::Decompile => Self::lookup_store(request, EngineCacheLayer::Render),
+            EngineRequestKind::Types | EngineRequestKind::SymbolicQuery => {
+                Self::lookup_store(request, EngineCacheLayer::Artifact)
+            }
+            EngineRequestKind::DebugFacts => {
+                Self::lookup_store(request, EngineCacheLayer::Analysis)
+            }
+            EngineRequestKind::Profile => {
+                Self::disabled(request, EngineCacheLayer::MetricsSnapshot)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineCacheReuseDecision {
+    pub request: EngineRequestKind,
+    pub layer: EngineCacheLayer,
+    pub reuse: EngineCacheReuse,
+    pub reason: Option<String>,
+}
+
+impl EngineCacheReuseDecision {
+    pub fn disabled(
+        request: EngineRequestKind,
+        layer: EngineCacheLayer,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            request,
+            layer,
+            reuse: EngineCacheReuse::Disabled,
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn from_lookup(
+        request: EngineRequestKind,
+        layer: EngineCacheLayer,
+        cache_hit: bool,
+    ) -> Self {
+        Self {
+            request,
+            layer,
+            reuse: if cache_hit {
+                EngineCacheReuse::Hit
+            } else {
+                EngineCacheReuse::Miss
+            },
+            reason: None,
+        }
+    }
+
+    pub fn is_hit(&self) -> bool {
+        matches!(self.reuse, EngineCacheReuse::Hit)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineCacheLookup<T> {
+    pub value: Option<T>,
+    pub decision: EngineCacheReuseDecision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -198,6 +306,42 @@ impl RenderCacheKey {
     }
 }
 
+pub struct DecompileRenderCacheKeyInput<'a> {
+    pub blocks: &'a [R2ILBlock],
+    pub function_name: &'a str,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub ptr_bits: u32,
+    pub function_facts: &'a FunctionFacts,
+    pub func_names_payload: &'a str,
+    pub strings_payload: &'a str,
+    pub symbols_payload: &'a str,
+}
+
+pub fn decompile_render_cache_key(input: DecompileRenderCacheKeyInput<'_>) -> RenderCacheKey {
+    let analysis = AnalysisCacheKey::from_hashes(
+        0,
+        stable_fnv1a_hash(input.function_name),
+        stable_fnv1a_debug_hash(&input.arch),
+        stable_blocks_hash(input.blocks),
+        stable_fnv1a_debug_hash(input.function_facts),
+        u64::from(input.ptr_bits),
+        stable_fnv1a_hash("decompile-render-v1"),
+    );
+    let artifact = ArtifactCacheKey::from_hashes(analysis, 0, 0);
+    let render_payload_hash = stable_fnv1a_hash(&(
+        "decompile-render-payload-v1",
+        stable_fnv1a_hash(input.func_names_payload),
+        stable_fnv1a_hash(input.strings_payload),
+        stable_fnv1a_hash(input.symbols_payload),
+    ));
+    let render_config_hash = stable_fnv1a_hash(&(
+        "decompile-render-config-v1",
+        stable_fnv1a_debug_hash(&input.arch),
+        input.ptr_bits,
+    ));
+    RenderCacheKey::from_artifact(artifact, render_payload_hash, render_config_hash)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineMetrics {
     pub cache_hit: bool,
@@ -242,6 +386,108 @@ pub struct EngineTypeRouteDecision {
     pub prefer_bounded_type_plan: bool,
     pub reason: Option<String>,
     pub apply_artifact_signature_hint: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EngineProfileRouteKind {
+    MetricsSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineProfileRouteDecision {
+    pub request: EngineRequestKind,
+    pub plan: EnginePlan,
+    pub kind: EngineProfileRouteKind,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineTypedRouteDecision {
+    Decompile(EngineRouteDecision),
+    Types(EngineTypeRouteDecision),
+    Profile(EngineProfileRouteDecision),
+}
+
+impl EngineTypedRouteDecision {
+    pub fn request(&self) -> EngineRequestKind {
+        match self {
+            Self::Decompile(decision) => decision.request,
+            Self::Types(decision) => decision.request,
+            Self::Profile(decision) => decision.request,
+        }
+    }
+
+    pub fn plan(&self) -> EnginePlan {
+        match self {
+            Self::Decompile(decision) => decision.plan,
+            Self::Types(decision) => decision.plan,
+            Self::Profile(decision) => decision.plan,
+        }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Decompile(decision) => decision.route_reason.clone(),
+            Self::Types(decision) => decision.reason.clone(),
+            Self::Profile(decision) => decision.reason.clone(),
+        }
+    }
+
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Decompile(decision) => decision.refusal.clone(),
+            Self::Types(_) | Self::Profile(_) => None,
+        }
+    }
+
+    pub fn diagnostics(&self) -> EngineDiagnostics {
+        EngineDiagnostics {
+            plan: Some(self.plan()),
+            route_reason: self.reason(),
+            refusal: self.refusal(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineRequestPlan {
+    pub decision: EngineTypedRouteDecision,
+    pub cache: EngineCachePlan,
+}
+
+impl EngineRequestPlan {
+    pub fn new(decision: EngineTypedRouteDecision) -> Self {
+        let request = decision.request();
+        Self {
+            decision,
+            cache: EngineCachePlan::for_request(request),
+        }
+    }
+
+    pub fn decompile(decision: EngineRouteDecision) -> Self {
+        Self::new(EngineTypedRouteDecision::Decompile(decision))
+    }
+
+    pub fn types(decision: EngineTypeRouteDecision) -> Self {
+        Self::new(EngineTypedRouteDecision::Types(decision))
+    }
+
+    pub fn profile(decision: EngineProfileRouteDecision) -> Self {
+        Self::new(EngineTypedRouteDecision::Profile(decision))
+    }
+
+    pub fn request(&self) -> EngineRequestKind {
+        self.decision.request()
+    }
+
+    pub fn engine_plan(&self) -> EnginePlan {
+        self.decision.plan()
+    }
+
+    pub fn diagnostics(&self) -> EngineDiagnostics {
+        self.decision.diagnostics()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -386,6 +632,43 @@ pub struct EngineSummaryDecompileRequest {
     pub fallback_comment: Option<String>,
 }
 
+pub struct EngineSummaryPreprobeRequest<'a> {
+    pub blocks: &'a [R2ILBlock],
+    pub function_addr: u64,
+    pub canonical_name: &'a str,
+    pub display_name: &'a str,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub ptr_bits: u32,
+    pub parsed_context: &'a r2types::ParsedExternalContext,
+    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    pub type_seed: Option<FunctionTypeFacts>,
+    pub config: r2dec::DecompilerConfig,
+    pub func_names_payload: &'a str,
+    pub strings_payload: &'a str,
+    pub symbols_payload: &'a str,
+    pub fallback_if_guarded_without_summary: bool,
+}
+
+pub struct EngineTypePreprobeRequest<'a> {
+    pub blocks: &'a [R2ILBlock],
+    pub function_addr: u64,
+    pub canonical_name: &'a str,
+    pub display_name: &'a str,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub ptr_bits: u32,
+    pub parsed_context: &'a r2types::ParsedExternalContext,
+    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    pub type_seed: Option<FunctionTypeFacts>,
+    pub caller_prefers_bounded_type_plan: bool,
+    pub fallback_if_guarded_without_summary: bool,
+}
+
+pub struct EngineTypePreprobeResponse {
+    pub cfg_summary: CFGRiskSummary,
+    pub function_facts: FunctionFacts,
+    pub route_decision: EngineTypeRouteDecision,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineDecompileResponse {
     pub output: String,
@@ -424,6 +707,15 @@ impl EngineSessionCacheMetrics {
                 + self.artifacts.insertions
                 + self.renders.insertions,
             evictions: self.analysis.evictions + self.artifacts.evictions + self.renders.evictions,
+        }
+    }
+
+    pub fn counters_for_layer(self, layer: EngineCacheLayer) -> CacheCounters {
+        match layer {
+            EngineCacheLayer::Analysis => self.analysis,
+            EngineCacheLayer::Artifact => self.artifacts,
+            EngineCacheLayer::Render => self.renders,
+            EngineCacheLayer::MetricsSnapshot => self.total(),
         }
     }
 }
@@ -553,7 +845,22 @@ impl EngineSession {
     }
 
     pub fn cached_analysis(&self, key: &AnalysisCacheKey) -> Option<EngineArtifacts> {
-        self.analysis_cache.get_cloned(key)
+        self.cached_analysis_with_decision(EngineRequestKind::DebugFacts, key)
+            .value
+    }
+
+    pub fn cached_analysis_with_decision(
+        &self,
+        request: EngineRequestKind,
+        key: &AnalysisCacheKey,
+    ) -> EngineCacheLookup<EngineArtifacts> {
+        let value = self.analysis_cache.get_cloned(key);
+        let decision = EngineCacheReuseDecision::from_lookup(
+            request,
+            EngineCacheLayer::Analysis,
+            value.is_some(),
+        );
+        EngineCacheLookup { value, decision }
     }
 
     pub fn insert_analysis(
@@ -565,7 +872,22 @@ impl EngineSession {
     }
 
     pub fn cached_artifacts(&self, key: &EngineFunctionKey) -> Option<EngineArtifacts> {
-        self.artifact_cache.get_cloned(key)
+        self.cached_artifacts_with_decision(EngineRequestKind::Types, key)
+            .value
+    }
+
+    pub fn cached_artifacts_with_decision(
+        &self,
+        request: EngineRequestKind,
+        key: &EngineFunctionKey,
+    ) -> EngineCacheLookup<EngineArtifacts> {
+        let value = self.artifact_cache.get_cloned(key);
+        let decision = EngineCacheReuseDecision::from_lookup(
+            request,
+            EngineCacheLayer::Artifact,
+            value.is_some(),
+        );
+        EngineCacheLookup { value, decision }
     }
 
     pub fn insert_artifacts(
@@ -589,7 +911,32 @@ impl EngineSession {
     }
 
     pub fn cached_render(&self, key: &RenderCacheKey) -> Option<String> {
-        self.render_cache.get_cloned(key)
+        self.cached_render_with_decision(EngineRequestKind::Decompile, Some(key))
+            .value
+    }
+
+    pub fn cached_render_with_decision(
+        &self,
+        request: EngineRequestKind,
+        key: Option<&RenderCacheKey>,
+    ) -> EngineCacheLookup<String> {
+        let Some(key) = key else {
+            return EngineCacheLookup {
+                value: None,
+                decision: EngineCacheReuseDecision::disabled(
+                    request,
+                    EngineCacheLayer::Render,
+                    "render cache key unavailable",
+                ),
+            };
+        };
+        let value = self.render_cache.get_cloned(key);
+        let decision = EngineCacheReuseDecision::from_lookup(
+            request,
+            EngineCacheLayer::Render,
+            value.is_some(),
+        );
+        EngineCacheLookup { value, decision }
     }
 
     pub fn insert_render(&self, key: RenderCacheKey, rendered: String) -> String {
@@ -704,24 +1051,24 @@ impl EngineSession {
     pub fn decompile(&self, request: EngineDecompileRequest) -> EngineDecompileResponse {
         let started = std::time::Instant::now();
         let cfg_summary = request.prepared_ssa.function().cfg_risk_summary();
-        let decision = decompile_route_decision(
+        let request_plan = plan_decompile_request(
             &request.function_name,
             &request.function_facts,
             Some(&request.prepared_ssa),
             &request.function_facts.types,
             &cfg_summary,
         );
-        let planning_time = started.elapsed();
-        let diagnostics = EngineDiagnostics {
-            plan: Some(decision.plan),
-            route_reason: decision.route_reason.clone(),
-            refusal: decision.refusal.clone(),
-            warnings: Vec::new(),
+        let diagnostics = request_plan.diagnostics();
+        let EngineTypedRouteDecision::Decompile(decision) = request_plan.decision else {
+            unreachable!("decompile request planning returned non-decompile decision");
         };
+        let planning_time = started.elapsed();
 
-        if let Some(cache_key) = request.render_cache_key.as_ref()
-            && let Some(output) = self.cached_render(cache_key)
-        {
+        let cache_lookup = self.cached_render_with_decision(
+            EngineRequestKind::Decompile,
+            request.render_cache_key.as_ref(),
+        );
+        if let Some(output) = cache_lookup.value {
             return EngineDecompileResponse {
                 output,
                 decision,
@@ -778,22 +1125,23 @@ impl EngineSession {
                 _ => None,
             };
         }
-        let planning_time = started.elapsed();
-        let diagnostics = EngineDiagnostics {
-            plan: Some(decision.plan),
-            route_reason: decision.route_reason.clone(),
-            refusal: decision.refusal.clone(),
-            warnings: Vec::new(),
+        let request_plan = EngineRequestPlan::decompile(decision);
+        let diagnostics = request_plan.diagnostics();
+        let EngineTypedRouteDecision::Decompile(decision) = request_plan.decision else {
+            unreachable!("decompile request planning returned non-decompile decision");
         };
+        let planning_time = started.elapsed();
         if matches!(decision.route, r2dec::SemanticRoutePlan::Standard)
             && request.fallback_comment.is_none()
         {
             return None;
         }
 
-        if let Some(cache_key) = request.render_cache_key.as_ref()
-            && let Some(output) = self.cached_render(cache_key)
-        {
+        let cache_lookup = self.cached_render_with_decision(
+            EngineRequestKind::Decompile,
+            request.render_cache_key.as_ref(),
+        );
+        if let Some(output) = cache_lookup.value {
             return Some(EngineDecompileResponse {
                 output,
                 decision,
@@ -823,6 +1171,90 @@ impl EngineSession {
                 ..EngineMetrics::default()
             },
             diagnostics,
+        })
+    }
+
+    pub fn decompile_summary_preprobe(
+        &self,
+        request: EngineSummaryPreprobeRequest<'_>,
+    ) -> Option<EngineDecompileResponse> {
+        let probe = decompile_probe_decision(
+            request.blocks,
+            request.function_addr,
+            request.canonical_name,
+            request.display_name,
+        );
+        if !probe.summary_probe_needed {
+            return None;
+        }
+
+        let cfg_summary = raw_cfg_risk_summary_for_preprobe(request.blocks);
+        let semantic_artifact = native_worker_summary_artifact(
+            request.blocks,
+            &probe.summary_probe_name,
+            request.arch,
+            request.symbolic_scope,
+            probe.summary_probe_skipped_large_cfg,
+        );
+        let type_seed = request
+            .type_seed
+            .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
+        let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
+        let function_facts = if let Some(semantic_artifact) = semantic_artifact {
+            let type_facts = type_facts_with_summary_projection(
+                type_seed,
+                &probe.summary_probe_name,
+                &arch_name,
+                request.ptr_bits,
+                &semantic_artifact,
+            );
+            r2types::FunctionFacts::new(type_facts, Some(semantic_artifact))
+                .with_assumptions(request.parsed_context.assumptions.clone())
+        } else if request.fallback_if_guarded_without_summary && probe.block_guarded {
+            r2types::FunctionFacts::new(type_seed, None)
+                .with_assumptions(request.parsed_context.assumptions.clone())
+        } else {
+            return None;
+        };
+        let fallback_comment = function_facts
+            .semantic_artifact()
+            .filter(|_| has_renderable_primary_summary_only_native_worker(&function_facts))
+            .map(|artifact| summary_only_native_worker_fallback(request.display_name, artifact))
+            .or_else(|| {
+                (request.fallback_if_guarded_without_summary
+                    && function_facts.semantic_artifact().is_none()
+                    && probe.block_guarded)
+                    .then(|| {
+                        let reason = if probe.summary_probe_skipped_large_cfg {
+                            probe
+                                .cfg_guard_reason
+                                .as_deref()
+                                .unwrap_or("large native worker without canonical summary")
+                        } else {
+                            "bounded native-worker preprobe without canonical summary"
+                        };
+                        r2dec::artifact_guard_fallback_comment(request.display_name, reason)
+                    })
+            });
+        let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
+            blocks: request.blocks,
+            function_name: request.display_name,
+            arch: request.arch,
+            ptr_bits: request.ptr_bits,
+            function_facts: &function_facts,
+            func_names_payload: request.func_names_payload,
+            strings_payload: request.strings_payload,
+            symbols_payload: request.symbols_payload,
+        });
+
+        self.decompile_summary(EngineSummaryDecompileRequest {
+            function_name: request.display_name.to_string(),
+            cfg_summary,
+            function_facts,
+            named_worker_guarded: probe.named_worker_guarded,
+            config: request.config,
+            render_cache_key: Some(render_cache_key),
+            fallback_comment,
         })
     }
 }
@@ -1145,6 +1577,8 @@ fn build_engine_analysis_artifact(
         if matches!(request.semantic_mode, EngineSemanticMode::Full) {
             return Some(compile_semantic_artifact_for_analysis(
                 &semantic_analysis.ssa_func,
+                request.function_addr,
+                &request.function_name,
                 request.symbolic_scope.as_ref(),
                 request.arch.as_ref(),
                 root_summary,
@@ -1202,16 +1636,35 @@ fn build_engine_analysis_artifact(
 
 fn compile_semantic_artifact_for_analysis(
     ssa_func: &SsaArtifact,
+    function_addr: u64,
+    function_name: &str,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     arch: Option<&r2il::ArchSpec>,
     root_summary: Option<&r2ssa::FunctionSemanticSummary>,
 ) -> r2sym::SemanticArtifact {
-    if let Some(summary) = root_summary
+    let summary_seed = root_summary
+        .cloned()
+        .or_else(|| native_worker_summary_seed(function_addr, function_name));
+    let summary_seed = summary_seed.as_ref();
+    if let Some(summary) = summary_seed
         && let Some(artifact) = r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
             ssa_func,
             symbolic_scope,
             summary,
         )
+    {
+        return artifact;
+    }
+    if should_probe_native_worker_summary_before_full_semantics(ssa_func, summary_seed)
+        && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
+            ssa_func,
+            symbolic_scope,
+            summary_seed,
+            false,
+        )
+        && artifact
+            .native_body()
+            .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
     {
         return artifact;
     }
@@ -1221,7 +1674,7 @@ fn compile_semantic_artifact_for_analysis(
         symbolic_scope,
         arch,
     );
-    if let Some(summary) = root_summary {
+    if let Some(summary) = summary_seed {
         r2sym::augment_semantic_artifact_with_interproc_summary(
             &mut artifact,
             ssa_func.entry,
@@ -1229,6 +1682,15 @@ fn compile_semantic_artifact_for_analysis(
         );
     }
     artifact
+}
+
+fn should_probe_native_worker_summary_before_full_semantics(
+    _ssa_func: &SsaArtifact,
+    root_summary: Option<&r2ssa::FunctionSemanticSummary>,
+) -> bool {
+    root_summary
+        .and_then(|summary| summary.name.as_deref())
+        .is_some_and(should_use_direct_named_native_worker_decompile)
 }
 
 fn infer_signature_from_engine_analysis(
@@ -1390,6 +1852,82 @@ fn interproc_scope_identity_hash(
     stable_fnv1a_debug_hash(summaries)
 }
 
+fn raw_cfg_risk_summary_for_preprobe(blocks: &[R2ILBlock]) -> CFGRiskSummary {
+    let block_addrs = blocks
+        .iter()
+        .map(|block| block.addr)
+        .collect::<BTreeSet<_>>();
+    let mut loop_headers = BTreeSet::new();
+    let mut back_edge_count = 0usize;
+    let mut switch_block_count = 0usize;
+    let mut max_switch_cases = 0usize;
+
+    for block in blocks {
+        if let Some(switch_info) = block.switch_info.as_ref() {
+            switch_block_count += 1;
+            max_switch_cases = max_switch_cases
+                .max(switch_info.cases.len() + usize::from(switch_info.default_target.is_some()));
+            for target in switch_info
+                .cases
+                .iter()
+                .map(|case| case.target)
+                .chain(switch_info.default_target)
+            {
+                if target <= block.addr && block_addrs.contains(&target) {
+                    back_edge_count += 1;
+                    loop_headers.insert(target);
+                }
+            }
+        }
+
+        for target in raw_block_successors_for_preprobe(block) {
+            if target <= block.addr && block_addrs.contains(&target) {
+                back_edge_count += 1;
+                loop_headers.insert(target);
+            }
+        }
+    }
+
+    CFGRiskSummary {
+        block_count: blocks.len(),
+        loop_count: loop_headers.len(),
+        back_edge_count,
+        switch_block_count,
+        max_switch_cases,
+    }
+}
+
+fn raw_block_successors_for_preprobe(block: &R2ILBlock) -> Vec<u64> {
+    let fallthrough = block.addr.saturating_add(block.size as u64);
+    for op in block.ops.iter().rev() {
+        match op {
+            r2il::R2ILOp::Branch { target } => {
+                return raw_const_addr_for_preprobe(target).into_iter().collect();
+            }
+            r2il::R2ILOp::CBranch { target, .. } => {
+                let mut successors = Vec::with_capacity(2);
+                if let Some(target) = raw_const_addr_for_preprobe(target) {
+                    successors.push(target);
+                }
+                successors.push(fallthrough);
+                return successors;
+            }
+            r2il::R2ILOp::Call { .. } | r2il::R2ILOp::CallInd { .. } => {
+                return vec![fallthrough];
+            }
+            r2il::R2ILOp::BranchInd { .. } | r2il::R2ILOp::Return { .. } => {
+                return Vec::new();
+            }
+            _ => {}
+        }
+    }
+    vec![fallthrough]
+}
+
+fn raw_const_addr_for_preprobe(varnode: &r2il::Varnode) -> Option<u64> {
+    matches!(varnode.space, r2il::SpaceId::Const | r2il::SpaceId::Ram).then_some(varnode.offset)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecompileProbeDecision {
     pub op_count: usize,
@@ -1402,6 +1940,7 @@ pub struct DecompileProbeDecision {
     pub named_worker_guarded: bool,
     pub summary_probe_name: String,
     pub summary_probe_needed: bool,
+    pub summary_probe_skipped_large_cfg: bool,
     pub block_guarded: bool,
 }
 
@@ -1430,7 +1969,10 @@ pub fn decompile_probe_decision(
     } else {
         display_name.to_string()
     };
-    let block_guarded = named_worker_guarded || blocks.len() > 200 || op_count > 512;
+    let skipped_large_cfg_guarded =
+        cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512;
+    let block_guarded =
+        named_worker_guarded || skipped_large_cfg_guarded || blocks.len() >= 8 && op_count > 128;
     let summary_probe_needed = block_guarded || cfg_guard_reason.is_some();
 
     DecompileProbeDecision {
@@ -1444,6 +1986,7 @@ pub fn decompile_probe_decision(
         named_worker_guarded,
         summary_probe_name,
         summary_probe_needed,
+        summary_probe_skipped_large_cfg: skipped_large_cfg_guarded,
         block_guarded,
     }
 }
@@ -1454,6 +1997,47 @@ fn has_seeded_summary_family(function_addr: u64, name: &str) -> bool {
         || r2sym::has_native_worker_summary_family(name)
 }
 
+pub fn should_use_direct_named_native_worker_decompile(function_name: &str) -> bool {
+    let name = normalize_engine_route_name(function_name);
+    matches!(
+        name.as_str(),
+        "cycle_check"
+            | "init_node"
+            | "mergefiles"
+            | "rpl_nanosleep"
+            | "xinmalloc"
+            | "xnmalloc"
+            | "xnrealloc"
+    )
+}
+
+pub fn should_use_direct_named_native_worker_type_projection(function_name: &str) -> bool {
+    should_use_direct_named_native_worker_decompile(function_name)
+        || r2sym::has_program_orchestrator_summary_family(function_name)
+        || (r2sym::has_native_worker_summary_family(function_name)
+            && r2types::signature_hint_for_name_candidates([function_name], 0).is_some())
+}
+
+fn normalize_engine_route_name(name: &str) -> String {
+    let mut name = name.trim();
+    for prefix in ["dbg.", "sym.", "fcn."] {
+        if let Some(stripped) = name.strip_prefix(prefix) {
+            name = stripped;
+            break;
+        }
+    }
+    for marker in [".isra.", ".constprop.", ".part.", ".llvm."] {
+        if let Some((prefix, suffix)) = name.rsplit_once(marker)
+            && !prefix.is_empty()
+            && !suffix.is_empty()
+            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return prefix.to_string();
+        }
+    }
+    name.to_string()
+}
+
 pub fn should_guard_program_orchestrator_decompile(block_count: usize, op_count: usize) -> bool {
     block_count > 4 || op_count > 96
 }
@@ -1462,7 +2046,9 @@ pub fn semantic_route_from_artifact_plan(
     semantic_artifact: &r2sym::SemanticArtifact,
 ) -> Option<r2dec::SemanticRoutePlan> {
     match semantic_artifact.decompile_plan() {
-        r2sym::DecompilePlan::NativeLinear { reason } => {
+        r2sym::DecompilePlan::NativeLinear { reason }
+            if native_linear_artifact_plan_allows_summary_route(semantic_artifact) =>
+        {
             Some(r2dec::SemanticRoutePlan::LinearWorker { reason })
         }
         r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
@@ -1473,6 +2059,40 @@ pub fn semantic_route_from_artifact_plan(
         }
         _ => None,
     }
+}
+
+fn native_linear_artifact_plan_allows_summary_route(
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> bool {
+    if semantic_artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly
+        && !semantic_artifact.diagnostics.skipped_large_cfg
+    {
+        return false;
+    }
+    let Some(native) = semantic_artifact.native_body() else {
+        return false;
+    };
+    let summary_count =
+        native.summary.region_summaries.len() + native.summary.worker_summaries.len();
+    let has_specific_summary = native.has_memory_read_write_summary_pair()
+        || native.summary.worker_summaries.iter().any(|summary| {
+            !matches!(
+                summary.kind,
+                r2sym::NativeWorkerSummaryKind::MemoryRead
+                    | r2sym::NativeWorkerSummaryKind::MemoryWrite
+                    | r2sym::NativeWorkerSummaryKind::Unknown
+            )
+        });
+    summary_count >= 8
+        && has_specific_summary
+        && matches!(
+            semantic_artifact.slice_class(),
+            Some(
+                r2sym::SliceClass::Worker
+                    | r2sym::SliceClass::GenericLarge
+                    | r2sym::SliceClass::Wrapper
+            )
+        )
 }
 
 pub fn has_primary_summary_only_native_worker(semantic_artifact: &r2sym::SemanticArtifact) -> bool {
@@ -1593,6 +2213,10 @@ pub fn native_worker_summary_artifact(
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     skipped_large_cfg: bool,
 ) -> Option<r2sym::SemanticArtifact> {
+    let ssa_func = r2ssa::SsaArtifact::for_decompile(blocks, arch)?.with_name(function_name);
+    if r2sym::has_strong_vm_evidence(&ssa_func) {
+        return None;
+    }
     let summary_id =
         r2ssa::InterprocFunctionId(blocks.first().map(|block| block.addr).unwrap_or_default());
     let root_summary =
@@ -1604,13 +2228,24 @@ pub fn native_worker_summary_artifact(
     {
         return Some(artifact);
     }
-    let ssa_func = r2ssa::SsaArtifact::for_decompile(blocks, arch)?.with_name(function_name);
     r2sym::compile_native_worker_summary_artifact(
         &ssa_func,
         symbolic_scope,
         Some(&root_summary),
         skipped_large_cfg,
     )
+}
+
+fn fast_program_orchestrator_summary_artifact(
+    function_addr: u64,
+    function_name: &str,
+    skipped_large_cfg: bool,
+) -> Option<r2sym::SemanticArtifact> {
+    if !r2sym::has_program_orchestrator_summary_family(function_name) {
+        return None;
+    }
+    let summary = native_worker_summary_seed(function_addr, function_name)?;
+    r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)
 }
 
 pub fn type_facts_from_parsed_context(
@@ -1668,6 +2303,118 @@ pub fn native_worker_type_projection(
     })
 }
 
+pub fn type_summary_preprobe(
+    request: EngineTypePreprobeRequest<'_>,
+) -> Option<EngineTypePreprobeResponse> {
+    let probe = decompile_probe_decision(
+        request.blocks,
+        request.function_addr,
+        request.canonical_name,
+        request.display_name,
+    );
+    if !probe.summary_probe_needed {
+        return None;
+    }
+
+    let cfg_summary = raw_cfg_risk_summary_for_preprobe(request.blocks);
+    let semantic_artifact = fast_program_orchestrator_summary_artifact(
+        request.function_addr,
+        &probe.summary_probe_name,
+        probe.summary_probe_skipped_large_cfg,
+    )
+    .or_else(|| {
+        native_worker_summary_artifact(
+            request.blocks,
+            &probe.summary_probe_name,
+            request.arch,
+            request.symbolic_scope,
+            probe.summary_probe_skipped_large_cfg,
+        )
+    });
+    let type_seed = request
+        .type_seed
+        .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
+    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
+    let function_facts = if let Some(semantic_artifact) = semantic_artifact {
+        let type_facts = type_facts_with_summary_projection(
+            type_seed,
+            &probe.summary_probe_name,
+            &arch_name,
+            request.ptr_bits,
+            &semantic_artifact,
+        );
+        r2types::FunctionFacts::new(type_facts, Some(semantic_artifact))
+            .with_assumptions(request.parsed_context.assumptions.clone())
+    } else if request.fallback_if_guarded_without_summary && probe.block_guarded {
+        r2types::FunctionFacts::new(type_seed, None)
+            .with_assumptions(request.parsed_context.assumptions.clone())
+    } else {
+        return None;
+    };
+
+    let route_decision = if let Some(artifact) = function_facts.semantic_artifact()
+        && summary_preprobe_type_payload_prefers_semantic_fallback(artifact)
+    {
+        EngineTypeRouteDecision {
+            request: EngineRequestKind::Types,
+            plan: EnginePlan::SemanticSummary,
+            kind: EngineTypeRouteKind::SemanticFallback,
+            prefer_bounded_type_plan: true,
+            reason: Some("summary preprobe type projection".to_string()),
+            apply_artifact_signature_hint: false,
+        }
+    } else {
+        let decision = type_route_decision(
+            &function_facts,
+            &cfg_summary,
+            request.caller_prefers_bounded_type_plan,
+        );
+        if !matches!(decision.kind, EngineTypeRouteKind::FullWriteback) {
+            decision
+        } else if request.fallback_if_guarded_without_summary
+            && function_facts.semantic_artifact().is_none()
+            && probe.block_guarded
+        {
+            let reason = if probe.summary_probe_skipped_large_cfg {
+                type_cfg_bounded_reason(&cfg_summary)
+            } else {
+                "bounded native-worker preprobe without canonical summary".to_string()
+            };
+            EngineTypeRouteDecision {
+                request: EngineRequestKind::Types,
+                plan: EnginePlan::BoundedType,
+                kind: EngineTypeRouteKind::BoundedCfg,
+                prefer_bounded_type_plan: true,
+                reason: Some(reason),
+                apply_artifact_signature_hint: false,
+            }
+        } else {
+            return None;
+        }
+    };
+
+    Some(EngineTypePreprobeResponse {
+        cfg_summary,
+        function_facts,
+        route_decision,
+    })
+}
+
+fn summary_preprobe_type_payload_prefers_semantic_fallback(
+    artifact: &r2sym::SemanticArtifact,
+) -> bool {
+    matches!(
+        artifact.granularity,
+        r2sym::ArtifactGranularity::SummaryOnly
+    ) && artifact
+        .native_body()
+        .is_some_and(r2sym::NativeArtifactBody::has_summary_islands)
+        && matches!(
+            artifact.slice_class(),
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+}
+
 pub fn render_semantic_route(
     function_name: &str,
     function_facts: &FunctionFacts,
@@ -1721,6 +2468,47 @@ pub fn select_engine_plan(
     }
 }
 
+pub fn plan_decompile_request(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+    prepared: Option<&SsaArtifact>,
+    type_facts: &FunctionTypeFacts,
+    cfg_summary: &CFGRiskSummary,
+) -> EngineRequestPlan {
+    EngineRequestPlan::decompile(decompile_route_decision(
+        func_name,
+        function_facts,
+        prepared,
+        type_facts,
+        cfg_summary,
+    ))
+}
+
+pub fn plan_type_request(
+    function_facts: &FunctionFacts,
+    cfg_summary: &CFGRiskSummary,
+    caller_prefers_bounded_type_plan: bool,
+) -> EngineRequestPlan {
+    EngineRequestPlan::types(type_route_decision(
+        function_facts,
+        cfg_summary,
+        caller_prefers_bounded_type_plan,
+    ))
+}
+
+pub fn profile_route_decision() -> EngineProfileRouteDecision {
+    EngineProfileRouteDecision {
+        request: EngineRequestKind::Profile,
+        plan: select_engine_plan(EngineRequestKind::Profile, None, None),
+        kind: EngineProfileRouteKind::MetricsSnapshot,
+        reason: Some("session cache metrics snapshot".to_string()),
+    }
+}
+
+pub fn plan_profile_request() -> EngineRequestPlan {
+    EngineRequestPlan::profile(profile_route_decision())
+}
+
 pub fn semantic_route_plan(
     func_name: &str,
     function_facts: &FunctionFacts,
@@ -1744,6 +2532,12 @@ pub fn semantic_route_plan(
         preferred_semantic_linearization_reason(func_name, function_facts, cfg_summary)
     {
         return r2dec::SemanticRoutePlan::LinearWorker { reason };
+    }
+    if let Some(route) = function_facts
+        .semantic_artifact()
+        .and_then(semantic_route_from_artifact_plan)
+    {
+        return route;
     }
     r2dec::SemanticRoutePlan::Standard
 }
@@ -2129,7 +2923,7 @@ fn preferred_semantic_summary_islands_reason(
                 return Some("summary-dense semantic worker islands".to_string());
             }
             let high_risk = cfg_guard_reason_from_summary(cfg_summary).is_some()
-                || capability.primary_summary_island_count >= 8
+                || (capability.skipped_large_cfg && capability.primary_summary_island_count >= 8)
                 || large_bounded_memory_worker;
             high_risk.then(|| reason.clone())
         }
@@ -2395,6 +3189,7 @@ pub fn stable_blocks_hash(blocks: &[R2ILBlock]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn const_return_blocks(addr: u64, value: u64) -> Vec<R2ILBlock> {
         let mut block = R2ILBlock::new(addr, 4);
@@ -2402,6 +3197,102 @@ mod tests {
             target: r2il::Varnode::constant(value, 8),
         });
         vec![block]
+    }
+
+    #[test]
+    fn raw_cfg_preprobe_summary_counts_back_edges_without_ssa() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::constant(0x1000, 8),
+            cond: r2il::Varnode::constant(1, 1),
+        });
+        let mut switch = R2ILBlock::new(0x1004, 4);
+        switch.switch_info = Some(r2il::SwitchInfo {
+            switch_addr: 0x1004,
+            min_val: 0,
+            max_val: 1,
+            default_target: Some(0x1008),
+            cases: vec![r2il::SwitchCase {
+                value: 0,
+                target: 0x1000,
+            }],
+        });
+
+        let summary = raw_cfg_risk_summary_for_preprobe(&[entry, switch]);
+
+        assert_eq!(summary.block_count, 2);
+        assert_eq!(summary.loop_count, 1);
+        assert_eq!(summary.back_edge_count, 2);
+        assert_eq!(summary.switch_block_count, 1);
+        assert_eq!(summary.max_switch_cases, 2);
+    }
+
+    fn native_linear_artifact(slice_class: r2sym::SliceClass) -> r2sym::SemanticArtifact {
+        let region = r2sym::SemanticRegion {
+            anchor: 0x401000,
+            frontier: BTreeSet::from([0x401010]),
+            control: Vec::new(),
+            memory: Vec::new(),
+            pre: Vec::new(),
+            post: Vec::new(),
+            targets: Vec::new(),
+        };
+        let regions = BTreeMap::from([(region.key(), region)]);
+        let mut worker_summaries = Vec::new();
+        for idx in 0..8 {
+            worker_summaries.push(r2sym::NativeWorkerSummary {
+                anchor: 0x401100 + idx,
+                kind: if idx % 2 == 0 {
+                    r2sym::NativeWorkerSummaryKind::MemoryRead
+                } else {
+                    r2sym::NativeWorkerSummaryKind::MemoryWrite
+                },
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        }
+        r2sym::SemanticArtifact {
+            stage: r2sym::RefinementStage::Compiled,
+            granularity: r2sym::ArtifactGranularity::Regioned,
+            execution: r2sym::ExecutionModel::Native,
+            body: r2sym::SemanticArtifactBody::Native(r2sym::NativeArtifactBody {
+                summary: r2sym::NativeFunctionSummary {
+                    slice_class,
+                    closure_functions: 1,
+                    helper_functions: 0,
+                    derived_summaries: 0,
+                    derived_diagnostics: Default::default(),
+                    region_summaries: Vec::new(),
+                    worker_summaries,
+                },
+                regions,
+            }),
+            diagnostics: r2sym::SemanticArtifactDiagnostics {
+                branches_evaluated: 0,
+                branches_pruned: 0,
+                branches_unknown: 0,
+                skipped_missing_arch: false,
+                skipped_large_cfg: false,
+                residual_reasons: Vec::new(),
+                interpreter: None,
+                ambiguous_targets: Vec::new(),
+                cache_hit: false,
+            },
+        }
     }
 
     #[test]
@@ -2708,7 +3599,115 @@ mod tests {
         assert!(decision.display_summary_family);
         assert!(decision.named_worker_guarded);
         assert!(decision.summary_probe_needed);
+        assert!(decision.summary_probe_skipped_large_cfg);
         assert_eq!(decision.summary_probe_name, "readlinebuffer_delim");
+    }
+
+    #[test]
+    fn decompile_probe_decision_probes_medium_op_workers() {
+        let mut blocks = (0..8)
+            .map(|idx| R2ILBlock::new(0x6000 + idx, 1))
+            .collect::<Vec<_>>();
+        for idx in 0..129 {
+            blocks[0].push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(0x100 + idx, 8),
+                src: r2il::Varnode::constant(idx, 8),
+            });
+        }
+
+        let decision =
+            decompile_probe_decision(&blocks, 0x6000, "dbg.key_to_opts", "dbg.key_to_opts");
+
+        assert!(decision.block_guarded);
+        assert!(decision.summary_probe_needed);
+        assert!(!decision.summary_probe_skipped_large_cfg);
+        assert_eq!(decision.summary_probe_name, "dbg.key_to_opts");
+        assert!(!decision.named_worker_guarded);
+    }
+
+    #[test]
+    fn direct_named_worker_decompile_fastpath_is_limited_to_timeout_prone_families() {
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.init_node"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "sym.rpl_nanosleep"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.mergefiles"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.xnrealloc"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.xnmalloc"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.xinmalloc"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.init_node.isra.0"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.cycle_check"
+        ));
+        assert!(!should_use_direct_named_native_worker_decompile(
+            "dbg.hash_initialize"
+        ));
+        assert!(!should_use_direct_named_native_worker_decompile(
+            "dbg.canonicalize_filename_mode"
+        ));
+    }
+
+    #[test]
+    fn direct_named_worker_type_projection_includes_program_orchestrators() {
+        assert!(should_use_direct_named_native_worker_type_projection(
+            "dbg.main"
+        ));
+        assert!(should_use_direct_named_native_worker_type_projection(
+            "dbg.xnmalloc"
+        ));
+        assert!(should_use_direct_named_native_worker_type_projection(
+            "randread"
+        ));
+        assert!(!should_use_direct_named_native_worker_type_projection(
+            "sym.sha256_process_block"
+        ));
+    }
+
+    #[test]
+    fn semantic_compile_prefers_named_native_worker_seed_before_full_semantics() {
+        let blocks = const_return_blocks(0x8b50, 0);
+        let ssa_func = r2ssa::SsaArtifact::for_decompile(&blocks, None)
+            .expect("prepared ssa")
+            .with_name("dbg.init_node");
+
+        let artifact = compile_semantic_artifact_for_analysis(
+            &ssa_func,
+            0x8b50,
+            "dbg.init_node",
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            artifact.granularity,
+            r2sym::ArtifactGranularity::SummaryOnly
+        );
+        assert!(matches!(
+            artifact.decompile_plan(),
+            r2sym::DecompilePlan::NativeSummaryIslands { .. }
+                | r2sym::DecompilePlan::NativeLinear { .. }
+        ));
+        let native = artifact.native_body().expect("native summary body");
+        assert!(
+            native
+                .summary
+                .worker_summaries
+                .iter()
+                .any(|summary| { summary.kind == r2sym::NativeWorkerSummaryKind::SortMerge })
+        );
     }
 
     #[test]
@@ -2850,6 +3849,53 @@ mod tests {
     }
 
     #[test]
+    fn type_summary_preprobe_bounds_large_program_orchestrator_without_full_analysis() {
+        let mut blocks = const_return_blocks(0x55a0, 0);
+        for idx in 0..210 {
+            blocks.push(R2ILBlock::new(0x5600 + idx, 1));
+        }
+        let parsed_context = r2types::parse_external_context_json("{}", 64);
+
+        let response = type_summary_preprobe(EngineTypePreprobeRequest {
+            blocks: &blocks,
+            function_addr: 0x55a0,
+            canonical_name: "dbg.main",
+            display_name: "dbg.main",
+            arch: None,
+            ptr_bits: 64,
+            parsed_context: &parsed_context,
+            symbolic_scope: None,
+            type_seed: Some(FunctionTypeFacts::default()),
+            caller_prefers_bounded_type_plan: false,
+            fallback_if_guarded_without_summary: false,
+        })
+        .expect("large program orchestrator should use summary type preprobe");
+
+        assert_eq!(
+            response.route_decision.kind,
+            EngineTypeRouteKind::SemanticFallback
+        );
+        let signature = response
+            .function_facts
+            .types
+            .merged_signature
+            .as_ref()
+            .expect("main role signature");
+        assert_eq!(signature.params[0].name, "argc");
+        assert!(
+            response
+                .function_facts
+                .semantic_artifact()
+                .and_then(r2sym::SemanticArtifact::native_body)
+                .is_some_and(|native| {
+                    native.summary.worker_summaries.iter().any(|summary| {
+                        summary.kind == r2sym::NativeWorkerSummaryKind::ProgramOrchestrator
+                    })
+                })
+        );
+    }
+
+    #[test]
     fn engine_plan_maps_routes_to_work_levels() {
         let route = r2dec::SemanticRoutePlan::SummaryIslands {
             reason: "summary".to_string(),
@@ -2861,6 +3907,128 @@ mod tests {
         assert_eq!(
             select_engine_plan(EngineRequestKind::Decompile, None, None),
             EnginePlan::FastLocal
+        );
+    }
+
+    #[test]
+    fn request_plans_cover_decompile_types_and_profile_cache_layers() {
+        let blocks = const_return_blocks(0x3010, 0);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
+        let cfg_summary = prepared.function().cfg_risk_summary();
+        let function_facts = FunctionFacts::default();
+
+        let decompile = plan_decompile_request(
+            "sym.simple",
+            &function_facts,
+            Some(&prepared),
+            &function_facts.types,
+            &cfg_summary,
+        );
+        assert_eq!(decompile.request(), EngineRequestKind::Decompile);
+        assert_eq!(decompile.engine_plan(), EnginePlan::FastLocal);
+        assert_eq!(decompile.cache.layer, EngineCacheLayer::Render);
+        assert!(decompile.cache.lookup);
+        assert!(decompile.cache.store_on_miss);
+        assert_eq!(decompile.diagnostics().plan, Some(EnginePlan::FastLocal));
+
+        let types = plan_type_request(&function_facts, &cfg_summary, false);
+        assert_eq!(types.request(), EngineRequestKind::Types);
+        assert_eq!(types.engine_plan(), EnginePlan::PreparedOnly);
+        assert_eq!(types.cache.layer, EngineCacheLayer::Artifact);
+        assert!(types.cache.lookup);
+
+        let profile = plan_profile_request();
+        assert_eq!(profile.request(), EngineRequestKind::Profile);
+        assert_eq!(profile.engine_plan(), EnginePlan::PreparedOnly);
+        assert_eq!(profile.cache.layer, EngineCacheLayer::MetricsSnapshot);
+        assert!(!profile.cache.lookup);
+        assert!(!profile.cache.store_on_miss);
+    }
+
+    #[test]
+    fn request_plan_preserves_refusal_diagnostics() {
+        let comment = "/* r2dec fallback: semantic evidence unavailable */".to_string();
+        let route = r2dec::SemanticRoutePlan::FallbackComment {
+            comment: comment.clone(),
+        };
+        let decision = EngineRouteDecision {
+            request: EngineRequestKind::Decompile,
+            plan: select_engine_plan(EngineRequestKind::Decompile, Some(&route), None),
+            route,
+            route_reason: Some(comment.clone()),
+            skip_runtime_type_inference: false,
+            use_prepared_semantic_view: false,
+            refusal: Some(comment.clone()),
+        };
+
+        let request_plan = EngineRequestPlan::decompile(decision);
+        let diagnostics = request_plan.diagnostics();
+
+        assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
+        assert_eq!(request_plan.cache.layer, EngineCacheLayer::Render);
+        assert_eq!(diagnostics.refusal, Some(comment.clone()));
+        assert_eq!(diagnostics.route_reason, Some(comment));
+    }
+
+    #[test]
+    fn native_linear_artifact_plan_keeps_regioned_generic_workers_standard_by_default() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+
+        for slice_class in [r2sym::SliceClass::GenericLarge, r2sym::SliceClass::Wrapper] {
+            let artifact = native_linear_artifact(slice_class);
+            assert!(matches!(
+                artifact.decompile_plan(),
+                r2sym::DecompilePlan::NativeLinear { .. }
+            ));
+            let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+            let route = semantic_route_plan("dbg.worker", &function_facts, &cfg_summary);
+            assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+            assert_eq!(
+                detached_semantic_route_plan("dbg.worker", &blocks, &function_facts),
+                Some(route)
+            );
+        }
+    }
+
+    #[test]
+    fn cache_lookup_decisions_report_repeated_request_reuse() {
+        let session = EngineSession::new(4);
+        let blocks = const_return_blocks(0x403000, 0);
+        let analysis =
+            AnalysisCacheKey::from_parts(0x403000, "sym.cache", None, &blocks, 1, 2, "aa");
+        let artifact = ArtifactCacheKey::from_hashes(analysis, 3, 4);
+        let render = RenderCacheKey::from_artifact(artifact, 5, 6);
+
+        let disabled = session.cached_render_with_decision(EngineRequestKind::Decompile, None);
+        assert_eq!(disabled.value, None);
+        assert_eq!(disabled.decision.reuse, EngineCacheReuse::Disabled);
+
+        let miss = session.cached_render_with_decision(EngineRequestKind::Decompile, Some(&render));
+        assert_eq!(miss.value, None);
+        assert_eq!(miss.decision.reuse, EngineCacheReuse::Miss);
+
+        session.insert_render(render.clone(), "cached output".to_string());
+        let hit = session.cached_render_with_decision(EngineRequestKind::Decompile, Some(&render));
+        assert_eq!(hit.value.as_deref(), Some("cached output"));
+        assert!(hit.decision.is_hit());
+
+        let metrics = session.cache_metrics();
+        assert_eq!(
+            metrics.counters_for_layer(EngineCacheLayer::Render),
+            CacheCounters {
+                hits: 1,
+                misses: 1,
+                insertions: 1,
+                evictions: 0,
+            }
+        );
+        assert_eq!(
+            metrics.counters_for_layer(EngineCacheLayer::MetricsSnapshot),
+            metrics.total()
         );
     }
 

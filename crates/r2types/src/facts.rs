@@ -712,7 +712,20 @@ pub fn is_weak_storage_scalar_typedef(name: &str, ptr_bits: u32) -> bool {
     let normalized = name.trim().to_ascii_lowercase();
     matches!(
         normalized.as_str(),
-        "int" | "unsigned" | "unsigned int" | "int32_t" | "uint32_t"
+        "char"
+            | "signed char"
+            | "unsigned char"
+            | "short"
+            | "unsigned short"
+            | "int"
+            | "unsigned"
+            | "unsigned int"
+            | "int8_t"
+            | "uint8_t"
+            | "int16_t"
+            | "uint16_t"
+            | "int32_t"
+            | "uint32_t"
     ) || (ptr_bits == 64
         && matches!(
             normalized.as_str(),

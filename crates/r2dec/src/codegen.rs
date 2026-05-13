@@ -269,7 +269,7 @@ impl CodeGenerator {
                 if self.config.emit_comments {
                     self.emit_indent();
                     self.output.push_str("/* ");
-                    self.output.push_str(text);
+                    self.emit_comment_text(text);
                     self.output.push_str(" */\n");
                 }
             }
@@ -424,30 +424,38 @@ impl CodeGenerator {
                 }
             }
             CExpr::Binary { op, left, right } => {
-                self.emit_expr(left, my_prec);
-                self.output.push(' ');
-                self.output.push_str(op.as_str());
-                self.output.push(' ');
-                // Right associativity for assignment operators
-                let right_prec = if matches!(
-                    op,
-                    BinaryOp::Assign
-                        | BinaryOp::AddAssign
-                        | BinaryOp::SubAssign
-                        | BinaryOp::MulAssign
-                        | BinaryOp::DivAssign
-                        | BinaryOp::ModAssign
-                        | BinaryOp::BitAndAssign
-                        | BinaryOp::BitOrAssign
-                        | BinaryOp::BitXorAssign
-                        | BinaryOp::ShlAssign
-                        | BinaryOp::ShrAssign
-                ) {
-                    my_prec
+                if let Some((render_op, magnitude)) = additive_negative_rhs_rewrite(*op, right) {
+                    self.emit_expr(left, my_prec);
+                    self.output.push(' ');
+                    self.output.push_str(render_op.as_str());
+                    self.output.push(' ');
+                    self.emit_positive_literal_magnitude(magnitude);
                 } else {
-                    my_prec + 1
-                };
-                self.emit_expr(right, right_prec);
+                    self.emit_expr(left, my_prec);
+                    self.output.push(' ');
+                    self.output.push_str(op.as_str());
+                    self.output.push(' ');
+                    // Right associativity for assignment operators
+                    let right_prec = if matches!(
+                        op,
+                        BinaryOp::Assign
+                            | BinaryOp::AddAssign
+                            | BinaryOp::SubAssign
+                            | BinaryOp::MulAssign
+                            | BinaryOp::DivAssign
+                            | BinaryOp::ModAssign
+                            | BinaryOp::BitAndAssign
+                            | BinaryOp::BitOrAssign
+                            | BinaryOp::BitXorAssign
+                            | BinaryOp::ShlAssign
+                            | BinaryOp::ShrAssign
+                    ) {
+                        my_prec
+                    } else {
+                        my_prec + 1
+                    };
+                    self.emit_expr(right, right_prec);
+                }
             }
             CExpr::Ternary {
                 cond,
@@ -541,6 +549,18 @@ impl CodeGenerator {
     fn emit_indent(&mut self) {
         for _ in 0..self.indent_level {
             self.output.push_str(&self.config.indent);
+        }
+    }
+
+    fn emit_comment_text(&mut self, text: &str) {
+        self.output.push_str(&sanitize_comment_text(text));
+    }
+
+    fn emit_positive_literal_magnitude(&mut self, literal: PositiveLiteralMagnitude) {
+        if literal.prefer_hex || literal.value > 0xffff {
+            self.output.push_str(&format!("0x{:x}", literal.value));
+        } else {
+            self.output.push_str(&literal.value.to_string());
         }
     }
 }
@@ -637,6 +657,44 @@ fn literal_i64(expr: &CExpr) -> Option<i64> {
         CExpr::UIntLit(value) => i64::try_from(*value).ok(),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PositiveLiteralMagnitude {
+    value: u64,
+    prefer_hex: bool,
+}
+
+fn additive_negative_rhs_rewrite(
+    op: BinaryOp,
+    rhs: &CExpr,
+) -> Option<(BinaryOp, PositiveLiteralMagnitude)> {
+    let magnitude = negative_literal_magnitude(rhs)?;
+    match op {
+        BinaryOp::Add => Some((BinaryOp::Sub, magnitude)),
+        BinaryOp::Sub => Some((BinaryOp::Add, magnitude)),
+        _ => None,
+    }
+}
+
+fn negative_literal_magnitude(expr: &CExpr) -> Option<PositiveLiteralMagnitude> {
+    match expr {
+        CExpr::IntLit(value) if *value < 0 => Some(PositiveLiteralMagnitude {
+            value: value.unsigned_abs(),
+            prefer_hex: false,
+        }),
+        CExpr::UIntLit(value) if *value > LIKELY_NEGATIVE_THRESHOLD => {
+            Some(PositiveLiteralMagnitude {
+                value: (!*value).wrapping_add(1),
+                prefer_hex: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn sanitize_comment_text(text: &str) -> String {
+    text.replace("*/", "* /").replace(['\r', '\n'], " ")
 }
 
 #[cfg(test)]
@@ -749,11 +807,35 @@ mod tests {
     }
 
     #[test]
+    fn test_additive_negative_literals_render_without_stack_placeholder_noise() {
+        let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+
+        let expr = CExpr::binary(BinaryOp::Add, CExpr::var("stack_8"), CExpr::int(-8));
+        assert_eq!(codegen.generate_expr(&expr), "stack_8 - 8");
+
+        let expr = CExpr::binary(
+            BinaryOp::Sub,
+            CExpr::var("rsp"),
+            CExpr::uint(0xffffffffffffffb8),
+        );
+        assert_eq!(codegen.generate_expr(&expr), "rsp + 0x48");
+    }
+
+    #[test]
     fn test_string_literal_escaping() {
         let mut codegen = CodeGenerator::new(CodeGenConfig::default());
         let expr = CExpr::StringLit("line1\n\t\"quote\"\\slash\u{0001}".to_string());
         let code = codegen.generate_expr(&expr);
         assert_eq!(code, "\"line1\\n\\t\\\"quote\\\"\\\\slash\\x01\"");
+    }
+
+    #[test]
+    fn test_comment_text_is_sanitized_at_render_boundary() {
+        let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+        let code = codegen.generate_stmt(&CStmt::comment("bad */\nnext"));
+
+        assert!(code.contains("bad * / next"));
+        assert!(!code.contains("bad */"));
     }
 
     #[test]

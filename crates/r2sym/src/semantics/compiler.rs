@@ -287,7 +287,7 @@ pub fn compile_native_worker_summary_artifact(
         .map(|block| block.ops.len())
         .sum::<usize>();
     let cheap_native_worker_classification =
-        !skipped_large_cfg || (cfg_summary.block_count <= 32 && op_count <= 128);
+        !skipped_large_cfg || (cfg_summary.block_count <= 64 && op_count <= 256);
     if !has_primary_interproc_summary && cheap_native_worker_classification {
         worker_summaries
             .extend(super::native_worker::classify_function_worker_summaries_unbounded(func));

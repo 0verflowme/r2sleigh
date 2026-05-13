@@ -39,6 +39,34 @@ fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) ->
         )
 }
 
+fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> bool {
+    let Some(signature) = function_facts.types.merged_signature.as_ref() else {
+        return false;
+    };
+    let Some(native) = function_facts
+        .semantic_artifact()
+        .and_then(r2sym::SemanticArtifact::native_body)
+    else {
+        return false;
+    };
+    let param_count = signature.params.len();
+    let weak_worker_conflict = native.summary.worker_summaries.iter().any(|summary| {
+        !summary.evidence.allows_guarded_structuring()
+            && summary
+                .arg_indices()
+                .into_iter()
+                .any(|index| index >= param_count)
+    });
+    let weak_region_conflict = native.summary.region_summaries.iter().any(|summary| {
+        !summary.evidence.allows_guarded_structuring()
+            && summary
+                .arg_indices()
+                .into_iter()
+                .any(|index| index >= param_count)
+    });
+    weak_worker_conflict || weak_region_conflict
+}
+
 pub(crate) fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) -> bool {
     let capability = decompile_capability(function_facts);
     capability
@@ -110,6 +138,54 @@ pub(crate) fn preferred_vm_summary_reason(function_facts: &FunctionFacts) -> Opt
     }
 }
 
+fn semantic_route_from_artifact_plan(
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> Option<SemanticRoutePlan> {
+    match semantic_artifact.decompile_plan() {
+        r2sym::DecompilePlan::NativeLinear { reason }
+            if native_linear_artifact_plan_allows_summary_route(semantic_artifact) =>
+        {
+            Some(SemanticRoutePlan::LinearWorker { reason })
+        }
+        r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
+            Some(SemanticRoutePlan::SummaryIslands { reason })
+        }
+        r2sym::DecompilePlan::VmSummaryOnly { reason } => {
+            Some(SemanticRoutePlan::VmSummary { reason })
+        }
+        _ => None,
+    }
+}
+
+fn native_linear_artifact_plan_allows_summary_route(
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> bool {
+    let Some(native) = semantic_artifact.native_body() else {
+        return false;
+    };
+    let summary_count =
+        native.summary.region_summaries.len() + native.summary.worker_summaries.len();
+    let has_specific_summary = native.has_memory_read_write_summary_pair()
+        || native.summary.worker_summaries.iter().any(|summary| {
+            !matches!(
+                summary.kind,
+                r2sym::NativeWorkerSummaryKind::MemoryRead
+                    | r2sym::NativeWorkerSummaryKind::MemoryWrite
+                    | r2sym::NativeWorkerSummaryKind::Unknown
+            )
+        });
+    summary_count >= 8
+        && has_specific_summary
+        && matches!(
+            semantic_artifact.slice_class(),
+            Some(
+                r2sym::SliceClass::Worker
+                    | r2sym::SliceClass::GenericLarge
+                    | r2sym::SliceClass::Wrapper
+            )
+        )
+}
+
 pub(crate) fn preferred_semantic_linearization_reason(
     func_name: &str,
     function_facts: &FunctionFacts,
@@ -135,6 +211,7 @@ pub(crate) fn preferred_semantic_linearization_reason(
             capability.slice_class,
             Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
         )
+        && !has_weak_summary_arg_contract_conflict(function_facts)
         && !capability.assumption_conflicted
         && !capability.summary_conflicted
         && capability.ambiguous_targets.is_empty()
@@ -161,6 +238,9 @@ pub(crate) fn preferred_semantic_summary_islands_reason(
     cfg_summary: &CFGRiskSummary,
 ) -> Option<String> {
     let capability = decompile_capability(function_facts);
+    if has_weak_summary_arg_contract_conflict(function_facts) {
+        return None;
+    }
     let large_bounded_memory_worker = has_large_bounded_memory_summary_worker(&capability);
     let dense_summary_only_memory_worker = has_dense_summary_only_memory_worker(&capability);
     if !capability.has_summary_islands
@@ -320,6 +400,12 @@ pub fn semantic_route_plan(
         preferred_semantic_linearization_reason(func_name, function_facts, cfg_summary)
     {
         return SemanticRoutePlan::LinearWorker { reason };
+    }
+    if let Some(route) = function_facts
+        .semantic_artifact()
+        .and_then(semantic_route_from_artifact_plan)
+    {
+        return route;
     }
     SemanticRoutePlan::Standard
 }

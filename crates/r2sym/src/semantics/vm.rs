@@ -471,6 +471,17 @@ impl VmStepSummary {
     }
 }
 
+pub fn strong_vm_step_summary(func: &SsaArtifact) -> Option<VmStepSummary> {
+    classify_interpreter_like(func)
+        .as_ref()
+        .and_then(|dispatch| build_vm_step_summary(func, dispatch))
+        .filter(VmStepSummary::has_strong_vm_evidence)
+}
+
+pub fn has_strong_vm_evidence(func: &SsaArtifact) -> bool {
+    strong_vm_step_summary(func).is_some()
+}
+
 #[derive(Debug, Default)]
 struct HandlerRegionSummary {
     blocks: Vec<u64>,
