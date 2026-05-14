@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use r2ssa::{SSABlock, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 
 use crate::convert::CTypeLike;
-use crate::facts::{FunctionType, FunctionTypeFacts};
+use crate::facts::{FunctionSignatureSpec, FunctionType, FunctionTypeFacts, signature_strength};
 use crate::inference::TypeInference;
 use crate::model::Signedness;
 use crate::prepare::{SignatureTypeEvidenceContext, scalar_register_family_key};
@@ -814,6 +814,49 @@ pub fn format_afs_signature(
     format!("{ret_type} {function_name} ({params_str})")
 }
 
+pub fn inferred_signature_from_signature_spec(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    callconv: Option<&str>,
+    signature: &FunctionSignatureSpec,
+) -> InferredSignature {
+    let ret_type = signature
+        .ret_type
+        .as_ref()
+        .map(|ty| render_signature_type(ty, ptr_bits))
+        .unwrap_or_else(|| "void".to_string());
+    let params = signature
+        .params
+        .iter()
+        .enumerate()
+        .map(|(idx, param)| InferredSignatureParam {
+            name: if param.name.trim().is_empty() {
+                format!("arg{}", idx + 1)
+            } else {
+                param.name.clone()
+            },
+            param_type: param
+                .ty
+                .as_ref()
+                .map(|ty| render_signature_type(ty, ptr_bits))
+                .unwrap_or_else(|| "void *".to_string()),
+        })
+        .collect::<Vec<_>>();
+    let callconv = callconv.unwrap_or("unknown").to_string();
+    let callconv_confidence = if callconv == "unknown" { 0 } else { 80 };
+    InferredSignature {
+        function_name: function_name.to_string(),
+        signature: format_afs_signature(function_name, &ret_type, &params),
+        ret_type,
+        params,
+        callconv,
+        arch: arch_name.to_string(),
+        confidence: signature_strength(signature),
+        callconv_confidence,
+    }
+}
+
 pub fn build_inferred_signature(
     function_name: &str,
     arch_name: &str,
@@ -1014,5 +1057,34 @@ mod tests {
         );
         assert!(facts.known_function_signatures.contains_key("__printf_chk"));
         assert!(facts.known_function_signatures.contains_key("printf"));
+    }
+
+    #[test]
+    fn inferred_signature_from_signature_spec_materializes_callconv_and_types() {
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Void),
+            params: vec![crate::FunctionParamSpec {
+                name: "status".to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                }),
+            }],
+        };
+
+        let inferred = inferred_signature_from_signature_spec(
+            "fcn.401000",
+            "x86-64",
+            64,
+            Some("amd64"),
+            &signature,
+        );
+
+        assert_eq!(inferred.signature, "void fcn.401000 (int32_t status)");
+        assert_eq!(inferred.callconv, "amd64");
+        assert_eq!(
+            inferred.confidence,
+            crate::SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+        );
     }
 }

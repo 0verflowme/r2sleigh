@@ -2002,52 +2002,6 @@ fn prepared_assumption_conditioning(
     (usage, conditioned)
 }
 
-struct PredictedTargetQueryRouteInput<'ctx, 'a> {
-    z3_ctx: &'ctx Context,
-    prepared: &'a r2ssa::SsaArtifact,
-    scope: Option<&'a r2sym::PreparedFunctionScope>,
-    compiled: &'a r2sym::SemanticArtifact,
-    target_addr: u64,
-    arch: Option<&'a ArchSpec>,
-    symbol_map: &'a HashMap<u64, String>,
-    summary_profile: r2sym::SummaryProfile,
-    assumption_conflicted: bool,
-}
-
-fn predicted_target_query_route(
-    input: PredictedTargetQueryRouteInput<'_, '_>,
-) -> r2sym::TargetQueryRoutePlan {
-    let PredictedTargetQueryRouteInput {
-        z3_ctx,
-        prepared,
-        scope,
-        compiled,
-        target_addr,
-        arch,
-        symbol_map,
-        summary_profile,
-        assumption_conflicted,
-    } = input;
-    let probe_config = r2sym::SymQueryConfig {
-        explore: sym_default_config(),
-        mode: r2sym::QueryMode::TargetGuided,
-        summary_profile,
-        solve_tactics: r2sym::SolveTacticConfig::default(),
-    };
-    let mut explorer = probe_config.make_explorer(z3_ctx);
-    if let Some(scope) = scope {
-        r2sym::install_runtime_hooks_for_scope(&mut explorer, scope, arch, symbol_map);
-    }
-    r2sym::selected_target_query_route_in_scope(
-        &mut explorer,
-        prepared,
-        scope,
-        Some(compiled),
-        target_addr,
-        assumption_conflicted,
-    )
-}
-
 fn parse_scope_assumptions(
     external_context_json: *const c_char,
     arch: Option<&ArchSpec>,
@@ -2394,17 +2348,19 @@ pub extern "C" fn r2sym_explore_to(
         );
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let selected_route = predicted_target_query_route(PredictedTargetQueryRouteInput {
-            z3_ctx: &z3_ctx,
-            prepared: &prepared,
-            scope: Some(&scope),
-            compiled: &compiled,
-            target_addr,
-            arch: ctx_view.arch,
-            symbol_map: &symbol_map,
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(&prepared),
-        });
+        let selected_route =
+            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
+                z3_ctx: &z3_ctx,
+                prepared: &prepared,
+                scope: Some(&scope),
+                compiled: &compiled,
+                target_addr,
+                arch: ctx_view.arch,
+                symbol_map: &symbol_map,
+                explore_config: query_config.explore.clone(),
+                summary_profile: query_config.summary_profile,
+                assumption_conflicted: prepared_assumption_conflicted(&prepared),
+            });
         let query_policy = tune_query_config_for_state(
             &mut query_config,
             &prepared,
@@ -2520,17 +2476,19 @@ pub extern "C" fn r2sym_solve_to(
         );
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let selected_route = predicted_target_query_route(PredictedTargetQueryRouteInput {
-            z3_ctx: &z3_ctx,
-            prepared: &prepared,
-            scope: Some(&scope),
-            compiled: &compiled,
-            target_addr,
-            arch: ctx_view.arch,
-            symbol_map: &symbol_map,
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(&prepared),
-        });
+        let selected_route =
+            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
+                z3_ctx: &z3_ctx,
+                prepared: &prepared,
+                scope: Some(&scope),
+                compiled: &compiled,
+                target_addr,
+                arch: ctx_view.arch,
+                symbol_map: &symbol_map,
+                explore_config: query_config.explore.clone(),
+                summary_profile: query_config.summary_profile,
+                assumption_conflicted: prepared_assumption_conflicted(&prepared),
+            });
         let query_policy = tune_query_config_for_state(
             &mut query_config,
             &prepared,
@@ -2966,17 +2924,19 @@ pub extern "C" fn r2sym_explore_to_scope(
         );
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_scope_state_for_arch(&mut initial_state, prepared, &scope, ctx_view.arch);
-        let selected_route = predicted_target_query_route(PredictedTargetQueryRouteInput {
-            z3_ctx: &z3_ctx,
-            prepared,
-            scope: Some(&scope),
-            compiled: &compiled,
-            target_addr,
-            arch: ctx_view.arch,
-            symbol_map: &symbol_map,
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(prepared),
-        });
+        let selected_route =
+            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
+                z3_ctx: &z3_ctx,
+                prepared,
+                scope: Some(&scope),
+                compiled: &compiled,
+                target_addr,
+                arch: ctx_view.arch,
+                symbol_map: &symbol_map,
+                explore_config: query_config.explore.clone(),
+                summary_profile: query_config.summary_profile,
+                assumption_conflicted: prepared_assumption_conflicted(prepared),
+            });
         let query_policy = tune_query_config_for_state(
             &mut query_config,
             prepared,
@@ -3117,17 +3077,19 @@ pub extern "C" fn r2sym_solve_to_scope(
         let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
         r2sym::seed_scope_state_for_arch(&mut initial_state, prepared, &scope, ctx_view.arch);
         solve_pipeline_debug_stage("solve_to_scope:seed_ready");
-        let selected_route = predicted_target_query_route(PredictedTargetQueryRouteInput {
-            z3_ctx: &z3_ctx,
-            prepared,
-            scope: Some(&scope),
-            compiled: &compiled,
-            target_addr,
-            arch: ctx_view.arch,
-            symbol_map: &symbol_map,
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(prepared),
-        });
+        let selected_route =
+            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
+                z3_ctx: &z3_ctx,
+                prepared,
+                scope: Some(&scope),
+                compiled: &compiled,
+                target_addr,
+                arch: ctx_view.arch,
+                symbol_map: &symbol_map,
+                explore_config: query_config.explore.clone(),
+                summary_profile: query_config.summary_profile,
+                assumption_conflicted: prepared_assumption_conflicted(prepared),
+            });
         let query_policy = tune_query_config_for_state(
             &mut query_config,
             prepared,
@@ -3402,17 +3364,19 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
         );
         let initial_state =
             build_replay_seeded_state(&z3_ctx, entry_addr, prepared, ctx_view.arch, &replay_seed);
-        let selected_route = predicted_target_query_route(PredictedTargetQueryRouteInput {
-            z3_ctx: &z3_ctx,
-            prepared,
-            scope: Some(&scope),
-            compiled: &compiled,
-            target_addr,
-            arch: ctx_view.arch,
-            symbol_map: &symbol_map,
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(prepared),
-        });
+        let selected_route =
+            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
+                z3_ctx: &z3_ctx,
+                prepared,
+                scope: Some(&scope),
+                compiled: &compiled,
+                target_addr,
+                arch: ctx_view.arch,
+                symbol_map: &symbol_map,
+                explore_config: query_config.explore.clone(),
+                summary_profile: query_config.summary_profile,
+                assumption_conflicted: prepared_assumption_conflicted(prepared),
+            });
         let query_policy = tune_query_config_for_state(
             &mut query_config,
             prepared,
@@ -3545,17 +3509,19 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
         );
         let initial_state =
             build_replay_seeded_state(&z3_ctx, entry_addr, prepared, ctx_view.arch, &replay_seed);
-        let selected_route = predicted_target_query_route(PredictedTargetQueryRouteInput {
-            z3_ctx: &z3_ctx,
-            prepared,
-            scope: Some(&scope),
-            compiled: &compiled,
-            target_addr,
-            arch: ctx_view.arch,
-            symbol_map: &symbol_map,
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(prepared),
-        });
+        let selected_route =
+            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
+                z3_ctx: &z3_ctx,
+                prepared,
+                scope: Some(&scope),
+                compiled: &compiled,
+                target_addr,
+                arch: ctx_view.arch,
+                symbol_map: &symbol_map,
+                explore_config: query_config.explore.clone(),
+                summary_profile: query_config.summary_profile,
+                assumption_conflicted: prepared_assumption_conflicted(prepared),
+            });
         let query_policy = tune_query_config_for_state(
             &mut query_config,
             prepared,

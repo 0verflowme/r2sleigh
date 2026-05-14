@@ -27,7 +27,6 @@ pub(crate) type FunctionAnalysisArtifact = r2engine::EngineAnalysisArtifact;
 
 type FunctionAnalysisCacheKey = r2engine::AnalysisCacheKey;
 type FunctionArtifactCacheKey = r2engine::ArtifactCacheKey;
-type DecompileRenderCacheKey = r2engine::RenderCacheKey;
 
 fn hash_debug_payload<T: std::fmt::Debug>(value: &T) -> u64 {
     r2engine::stable_fnv1a_debug_hash(value)
@@ -176,32 +175,6 @@ fn rename_function_analysis_artifact(
     function_name: &str,
 ) -> FunctionAnalysisArtifact {
     r2engine::rename_engine_analysis_artifact(artifact, function_name)
-}
-
-pub(crate) struct DecompileRenderCacheKeyInput<'a> {
-    pub(crate) blocks: &'a [R2ILBlock],
-    pub(crate) function_name: &'a str,
-    pub(crate) arch: Option<&'a ArchSpec>,
-    pub(crate) ptr_bits: u32,
-    pub(crate) function_facts: &'a r2types::FunctionFacts,
-    pub(crate) func_names_payload: &'a str,
-    pub(crate) strings_payload: &'a str,
-    pub(crate) symbols_payload: &'a str,
-}
-
-pub(crate) fn decompile_render_cache_key(
-    input: DecompileRenderCacheKeyInput<'_>,
-) -> DecompileRenderCacheKey {
-    r2engine::decompile_render_cache_key(r2engine::DecompileRenderCacheKeyInput {
-        blocks: input.blocks,
-        function_name: input.function_name,
-        arch: input.arch,
-        ptr_bits: input.ptr_bits,
-        function_facts: input.function_facts,
-        func_names_payload: input.func_names_payload,
-        strings_payload: input.strings_payload,
-        symbols_payload: input.symbols_payload,
-    })
 }
 
 fn cache_counters_json(counters: r2engine::CacheCounters) -> String {
@@ -410,7 +383,7 @@ pub(crate) fn function_analysis_artifact_cache_identity_hash_with_parsed_context
 }
 
 #[allow(clippy::too_many_arguments)]
-fn engine_analyze_request_with_scope_facts(
+pub(crate) fn engine_analyze_request_with_scope_facts(
     input: &FunctionInput<'_>,
     parsed_context: &r2types::ParsedExternalContext,
     external_context_fallback_hash: u64,

@@ -1,5 +1,5 @@
 use crate::context::PluginCtxView;
-use crate::parse_addr_name_map;
+#[cfg(test)]
 use crate::types::FunctionAnalysisArtifact;
 use r2il::R2ILBlock;
 #[cfg(test)]
@@ -137,201 +137,17 @@ pub(crate) fn render_direct_named_native_worker_summary(
         .map(|response| response.output)
 }
 
-fn rename_function_artifact_for_display(
-    artifact: FunctionAnalysisArtifact,
-    function_name: &str,
-) -> FunctionAnalysisArtifact {
-    let FunctionAnalysisArtifact {
-        ssa_func,
-        pattern_ssa_func,
-        function_facts,
-        writeback_plan,
-        ..
-    } = artifact;
-    FunctionAnalysisArtifact {
-        ssa_func: ssa_func.with_name(function_name),
-        pattern_ssa_func: pattern_ssa_func.with_name(function_name),
-        function_facts,
-        writeback_plan,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_full_decompile_on_large_stack(
-    r2il_blocks: Vec<R2ILBlock>,
-    fcn_addr: u64,
-    func_name_str: String,
-    arch: Option<r2il::ArchSpec>,
-    ptr_bits: u32,
-    semantic_metadata_enabled: bool,
-    reg_type_hints: std::collections::HashMap<String, crate::types::TypeHint>,
-    func_names_str: String,
-    strings_str: String,
-    symbols_str: String,
-    external_context_json: String,
-    cached_artifact: Option<crate::types::FunctionAnalysisArtifact>,
-    type_facts_override: Option<r2types::FunctionTypeFacts>,
-    symbolic_scope: Option<r2sym::PreparedFunctionScope>,
+pub(crate) fn run_engine_decompile_on_large_stack(
+    request: r2engine::EngineFunctionDecompileRequest,
 ) -> String {
     const STACK_SIZE: usize = 512 * 1024 * 1024;
 
     let handle = std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(move || {
-            let (_, _, config) = r2dec::DecompilerConfig::for_arch(arch.as_ref());
-            let function_names = parse_addr_name_map(&func_names_str);
-            let symbols = parse_addr_name_map(&symbols_str);
-            let display_func_name = crate::helpers::resolve_decompiler_display_name(
-                fcn_addr,
-                &func_name_str,
-                &function_names,
-                &symbols,
-            );
-            let parsed_context =
-                r2types::parse_external_context_json(&external_context_json, ptr_bits);
-            let probe = r2engine::decompile_probe_decision(
-                &r2il_blocks,
-                fcn_addr,
-                &func_name_str,
-                &display_func_name,
-            );
-            let cfg_guard_reason = probe.cfg_guard_reason.clone();
-            let mut artifact = if let Some(mut artifact) = cached_artifact {
-                if let Some(type_facts_override) = type_facts_override.as_ref()
-                    && let Some(signature) = type_facts_override.merged_signature.clone()
-                {
-                    artifact.function_facts.types.merged_signature = Some(signature);
-                }
-                if probe.summary_probe_needed {
-                    let mut summary_type_seed = artifact.function_facts.types.clone();
-                    if let Some(type_facts_override) = type_facts_override.as_ref()
-                        && let Some(signature) = type_facts_override.merged_signature.clone()
-                    {
-                        summary_type_seed.merged_signature = Some(signature);
-                    }
-                    if let Some(output) =
-                        crate::types::engine_session().decompile_summary_preprobe(
-                            r2engine::EngineSummaryPreprobeRequest {
-                                blocks: &r2il_blocks,
-                                function_addr: fcn_addr,
-                                canonical_name: &func_name_str,
-                                display_name: &display_func_name,
-                                arch: arch.as_ref(),
-                                ptr_bits,
-                                parsed_context: &parsed_context,
-                                symbolic_scope: symbolic_scope.as_ref(),
-                                type_seed: Some(summary_type_seed),
-                                config: config.clone(),
-                                func_names_payload: &func_names_str,
-                                strings_payload: &strings_str,
-                                symbols_payload: &symbols_str,
-                                fallback_if_guarded_without_summary: false,
-                            },
-                        )
-                    {
-                        return output.output;
-                    }
-                }
-                artifact
-            } else {
-                let summary_type_seed = type_facts_override.clone().unwrap_or_else(|| {
-                    r2types::function_type_facts_from_parsed_context(
-                        &display_func_name,
-                        &parsed_context,
-                    )
-                });
-                if let Some(output) =
-                    crate::types::engine_session().decompile_summary_preprobe(
-                        r2engine::EngineSummaryPreprobeRequest {
-                            blocks: &r2il_blocks,
-                            function_addr: fcn_addr,
-                            canonical_name: &func_name_str,
-                            display_name: &display_func_name,
-                            arch: arch.as_ref(),
-                            ptr_bits,
-                            parsed_context: &parsed_context,
-                            symbolic_scope: symbolic_scope.as_ref(),
-                            type_seed: Some(summary_type_seed),
-                            config: config.clone(),
-                            func_names_payload: &func_names_str,
-                            strings_payload: &strings_str,
-                            symbols_payload: &symbols_str,
-                            fallback_if_guarded_without_summary: true,
-                        },
-                    )
-                {
-                    return output.output;
-                }
-                if probe.block_guarded {
-                    let guard_reason = if probe.summary_probe_skipped_large_cfg {
-                        cfg_guard_reason
-                            .as_deref()
-                            .unwrap_or("large native worker without canonical summary")
-                    } else {
-                        "bounded native-worker preprobe without canonical summary"
-                    };
-                    return r2dec::artifact_guard_fallback_comment(
-                        &display_func_name,
-                        guard_reason,
-                    );
-                }
-                let Some(artifact) =
-                    crate::types::build_detached_function_analysis_artifact_with_scope_and_optional_semantics(
-                        &r2il_blocks,
-                        &func_name_str,
-                        arch.as_ref(),
-                        ptr_bits,
-                        semantic_metadata_enabled,
-                        &reg_type_hints,
-                        &external_context_json,
-                        symbolic_scope.as_ref(),
-                        None,
-                        false,
-                    )
-                else {
-                    return r2dec::artifact_guard_fallback_comment(
-                        &func_name_str,
-                        "failed to build detached analysis artifact",
-                    );
-                };
-                artifact
-            };
-            artifact = rename_function_artifact_for_display(artifact, &display_func_name);
-
-            let render_cache_key =
-                crate::types::decompile_render_cache_key(crate::types::DecompileRenderCacheKeyInput {
-                    blocks: &r2il_blocks,
-                    function_name: &display_func_name,
-                    arch: arch.as_ref(),
-                    ptr_bits,
-                    function_facts: &artifact.function_facts,
-                    func_names_payload: &func_names_str,
-                    strings_payload: &strings_str,
-                    symbols_payload: &symbols_str,
-                });
-
-            let semantic_fallback_output = r2dec::semantic_fallback_comment(
-                &display_func_name,
-                artifact.function_facts.semantics.as_ref(),
-            );
-            let fallback_comment = semantic_fallback_output.or_else(|| {
-                cfg_guard_reason
-                    .as_ref()
-                    .map(|reason| r2dec::artifact_guard_fallback_comment(&func_name_str, reason))
-            });
-            let response = crate::types::engine_session().decompile(r2engine::EngineDecompileRequest {
-                function_name: display_func_name.clone(),
-                prepared_ssa: artifact.ssa_func,
-                function_facts: artifact.function_facts,
-                function_names,
-                strings: parse_addr_name_map(&strings_str),
-                symbols,
-                ptr_bits,
-                config,
-                render_cache_key: Some(render_cache_key),
-                fallback_comment,
-            });
-            response.output
+            crate::types::engine_session()
+                .decompile_function(request)
+                .output
         });
 
     match handle {

@@ -72,9 +72,9 @@ pub use signature_infer::{
     compute_callconv_inference, compute_signature_confidence,
     enrich_known_function_signatures_from_names, format_afs_signature,
     infer_signature_from_prepared_ssa, infer_signature_return_type,
-    materialize_signature_type_like, merge_initial_signature_type_evidence,
-    merge_pointer_slot_evidence_into_signature_params, render_signature_type,
-    resolve_evidence_driven_signature_type,
+    inferred_signature_from_signature_spec, materialize_signature_type_like,
+    merge_initial_signature_type_evidence, merge_pointer_slot_evidence_into_signature_params,
+    render_signature_type, resolve_evidence_driven_signature_type,
 };
 pub use solver::{SolvedTypes, SolverConfig, SolverDiagnostics, TypeSolver};
 pub use writeback::{

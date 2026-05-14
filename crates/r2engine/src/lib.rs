@@ -709,6 +709,32 @@ pub struct EngineDecompileRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct EngineFunctionDecompileRequest {
+    pub analysis: EngineAnalyzeRequest,
+    pub display_name: String,
+    pub function_names: HashMap<u64, String>,
+    pub strings: HashMap<u64, String>,
+    pub symbols: HashMap<u64, String>,
+    pub config: r2dec::DecompilerConfig,
+    pub func_names_payload: String,
+    pub strings_payload: String,
+    pub symbols_payload: String,
+}
+
+pub struct EngineTargetQueryRouteRequest<'ctx, 'a> {
+    pub z3_ctx: &'ctx z3::Context,
+    pub prepared: &'a SsaArtifact,
+    pub scope: Option<&'a r2sym::PreparedFunctionScope>,
+    pub compiled: &'a r2sym::SemanticArtifact,
+    pub target_addr: u64,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub symbol_map: &'a HashMap<u64, String>,
+    pub explore_config: r2sym::ExploreConfig,
+    pub summary_profile: r2sym::SummaryProfile,
+    pub assumption_conflicted: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct EngineSummaryDecompileRequest {
     pub function_name: String,
     pub cfg_summary: CFGRiskSummary,
@@ -754,6 +780,27 @@ pub struct EngineTypePreprobeResponse {
     pub cfg_summary: CFGRiskSummary,
     pub function_facts: FunctionFacts,
     pub route_decision: EngineTypeRouteDecision,
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineTypeAnalysisRequest {
+    pub analysis: EngineAnalyzeRequest,
+    pub caller_prefers_bounded_type_plan: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineTypeAnalysisResponse {
+    pub cfg_summary: CFGRiskSummary,
+    pub function_facts: FunctionFacts,
+    pub writeback_plan: TypeWritebackPlan,
+    pub route_decision: EngineTypeRouteDecision,
+    pub semantic_route: Option<r2dec::SemanticRoutePlan>,
+    pub callsite_count: usize,
+    pub current_summary: Option<r2ssa::FunctionSemanticSummary>,
+    pub artifact_cache_hit: bool,
+    pub artifact_key: Option<ArtifactCacheKey>,
+    pub metrics: EngineMetrics,
+    pub diagnostics: EngineDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -1069,6 +1116,17 @@ impl EngineSession {
             return Some(response);
         }
 
+        self.analyze_uncached_with_key(request, artifact_key, started)
+    }
+
+    fn analyze_uncached_with_key(
+        &self,
+        request: EngineAnalyzeRequest,
+        artifact_key: ArtifactCacheKey,
+        started: std::time::Instant,
+    ) -> Option<EngineAnalyzeResponse> {
+        let function_name = request.function_name.clone();
+
         let analysis_key = function_analysis_cache_key(
             &request.function_name,
             request.arch.as_ref(),
@@ -1078,10 +1136,10 @@ impl EngineSession {
             .cached_analysis(&analysis_key)
             .and_then(engine_artifacts_to_analysis)
         {
-            (rename_engine_analysis(cached, &request.function_name), true)
+            (rename_engine_analysis(cached, &function_name), true)
         } else {
             let analysis = build_engine_analysis_from_parts(
-                &request.function_name,
+                &function_name,
                 &request.blocks,
                 request.arch.as_ref(),
             )?;
@@ -1105,6 +1163,118 @@ impl EngineSession {
                 ..EngineMetrics::default()
             },
             diagnostics: EngineDiagnostics::default(),
+        })
+    }
+
+    pub fn type_function(
+        &self,
+        request: EngineTypeAnalysisRequest,
+    ) -> Option<EngineTypeAnalysisResponse> {
+        let started = std::time::Instant::now();
+        let analysis_request = request.analysis;
+        let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(analysis_request.arch.as_ref());
+        let type_seed = r2types::function_type_facts_from_parsed_context(
+            &analysis_request.function_name,
+            &analysis_request.parsed_context,
+        );
+
+        let preprobe = type_summary_preprobe(EngineTypePreprobeRequest {
+            blocks: analysis_request.blocks.as_slice(),
+            function_addr: analysis_request.function_addr,
+            canonical_name: &analysis_request.function_name,
+            display_name: &analysis_request.function_name,
+            arch: analysis_request.arch.as_ref(),
+            ptr_bits: analysis_request.ptr_bits,
+            parsed_context: &analysis_request.parsed_context,
+            symbolic_scope: analysis_request.symbolic_scope.as_ref(),
+            type_seed: Some(type_seed),
+            caller_prefers_bounded_type_plan: request.caller_prefers_bounded_type_plan,
+            fallback_if_guarded_without_summary: false,
+        })
+        .filter(|preprobe| {
+            !matches!(
+                preprobe.route_decision.kind,
+                EngineTypeRouteKind::FullWriteback
+            )
+        });
+        if let Some(preprobe) = preprobe {
+            let writeback_plan = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
+                function_name: &analysis_request.function_name,
+                arch_name: &arch_name,
+                ptr_bits: analysis_request.ptr_bits,
+                callconv: analysis_request.parsed_context.callconv.as_deref(),
+                function_facts: &preprobe.function_facts,
+                cfg_summary: &preprobe.cfg_summary,
+                route: &preprobe.route_decision,
+                full_writeback_plan: None,
+            })?;
+            let semantic_route = detached_semantic_route_plan(
+                &analysis_request.function_name,
+                analysis_request.blocks.as_slice(),
+                &preprobe.function_facts,
+            );
+            return Some(EngineTypeAnalysisResponse {
+                cfg_summary: preprobe.cfg_summary,
+                function_facts: preprobe.function_facts,
+                writeback_plan,
+                route_decision: preprobe.route_decision,
+                semantic_route,
+                callsite_count: 0,
+                current_summary: None,
+                artifact_cache_hit: false,
+                artifact_key: None,
+                metrics: EngineMetrics {
+                    cache_hit: false,
+                    planning_time: started.elapsed(),
+                    ..EngineMetrics::default()
+                },
+                diagnostics: EngineDiagnostics::default(),
+            });
+        }
+
+        let analyze_response = self.analyze(analysis_request.clone())?;
+        let artifact = analyze_response.artifact;
+        let cfg_summary = artifact.ssa_func.function().cfg_risk_summary();
+        let route_decision = type_route_decision(
+            &artifact.function_facts,
+            &cfg_summary,
+            request.caller_prefers_bounded_type_plan,
+        );
+        let writeback_plan = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
+            function_name: &analysis_request.function_name,
+            arch_name: &arch_name,
+            ptr_bits: analysis_request.ptr_bits,
+            callconv: analysis_request.parsed_context.callconv.as_deref(),
+            function_facts: &artifact.function_facts,
+            cfg_summary: &cfg_summary,
+            route: &route_decision,
+            full_writeback_plan: Some(artifact.writeback_plan),
+        })?;
+        let semantic_route = detached_semantic_route_plan(
+            &analysis_request.function_name,
+            analysis_request.blocks.as_slice(),
+            &artifact.function_facts,
+        );
+        let callsite_count =
+            count_prepared_callsites(&artifact.pattern_ssa_func.local_ssa_blocks());
+        let current_summary = current_interproc_summary(&artifact.function_facts);
+
+        Some(EngineTypeAnalysisResponse {
+            cfg_summary,
+            function_facts: artifact.function_facts,
+            writeback_plan,
+            route_decision,
+            semantic_route,
+            callsite_count,
+            current_summary,
+            artifact_cache_hit: analyze_response.artifact_cache_hit,
+            artifact_key: Some(analyze_response.artifact_key),
+            metrics: EngineMetrics {
+                cache_hit: analyze_response.metrics.cache_hit,
+                planning_time: started.elapsed(),
+                ..analyze_response.metrics
+            },
+            diagnostics: analyze_response.diagnostics,
         })
     }
 
@@ -1132,6 +1302,149 @@ impl EngineSession {
                 ..EngineMetrics::default()
             },
             diagnostics: EngineDiagnostics::default(),
+        })
+    }
+
+    pub fn decompile_function(
+        &self,
+        request: EngineFunctionDecompileRequest,
+    ) -> EngineDecompileResponse {
+        let started = std::time::Instant::now();
+        let EngineFunctionDecompileRequest {
+            analysis: analysis_request,
+            display_name,
+            function_names,
+            strings,
+            symbols,
+            config,
+            func_names_payload,
+            strings_payload,
+            symbols_payload,
+        } = request;
+        let canonical_name = analysis_request.function_name.clone();
+        let display_name = if display_name.trim().is_empty() {
+            canonical_name.clone()
+        } else {
+            display_name
+        };
+        let identity = EngineFunctionIdentity::new(
+            analysis_request.function_addr,
+            &canonical_name,
+            &display_name,
+        );
+        let probe = decompile_probe_decision_for_identity(&analysis_request.blocks, &identity);
+        let artifact_key = function_artifact_cache_key(&analysis_request);
+        let cached = self.cached_analyze_with_key(&artifact_key, Duration::default());
+
+        if cached.is_none() {
+            let type_seed = r2types::function_type_facts_from_parsed_context(
+                &display_name,
+                &analysis_request.parsed_context,
+            );
+            if let Some(response) = self.decompile_summary_preprobe(EngineSummaryPreprobeRequest {
+                blocks: &analysis_request.blocks,
+                function_addr: analysis_request.function_addr,
+                canonical_name: &canonical_name,
+                display_name: &display_name,
+                arch: analysis_request.arch.as_ref(),
+                ptr_bits: analysis_request.ptr_bits,
+                parsed_context: &analysis_request.parsed_context,
+                symbolic_scope: analysis_request.symbolic_scope.as_ref(),
+                type_seed: Some(type_seed),
+                config: config.clone(),
+                func_names_payload: &func_names_payload,
+                strings_payload: &strings_payload,
+                symbols_payload: &symbols_payload,
+                fallback_if_guarded_without_summary: false,
+            }) {
+                return response;
+            }
+        }
+
+        let analyze_response = if let Some(response) = cached {
+            response
+        } else if let Some(response) =
+            self.analyze_uncached_with_key(analysis_request.clone(), artifact_key, started)
+        {
+            response
+        } else {
+            let type_seed = r2types::function_type_facts_from_parsed_context(
+                &display_name,
+                &analysis_request.parsed_context,
+            );
+            if let Some(response) = self.decompile_summary_preprobe(EngineSummaryPreprobeRequest {
+                blocks: &analysis_request.blocks,
+                function_addr: analysis_request.function_addr,
+                canonical_name: &canonical_name,
+                display_name: &display_name,
+                arch: analysis_request.arch.as_ref(),
+                ptr_bits: analysis_request.ptr_bits,
+                parsed_context: &analysis_request.parsed_context,
+                symbolic_scope: analysis_request.symbolic_scope.as_ref(),
+                type_seed: Some(type_seed),
+                config: config.clone(),
+                func_names_payload: &func_names_payload,
+                strings_payload: &strings_payload,
+                symbols_payload: &symbols_payload,
+                fallback_if_guarded_without_summary: true,
+            }) {
+                return response;
+            }
+            let reason = if probe.block_guarded {
+                if probe.summary_probe_skipped_large_cfg {
+                    probe
+                        .cfg_guard_reason
+                        .as_deref()
+                        .unwrap_or("large native worker without canonical summary")
+                } else {
+                    "bounded native-worker preprobe without canonical summary"
+                }
+            } else {
+                "failed to build detached analysis artifact"
+            };
+            return refused_decompile_response(&display_name, reason, started.elapsed());
+        };
+
+        let mut artifact =
+            rename_engine_analysis_artifact(analyze_response.artifact, &display_name);
+        if let Some(signature) = decompile_type_override(&identity, &analysis_request, &artifact)
+            .and_then(|facts| facts.merged_signature)
+        {
+            artifact.function_facts.types.merged_signature = Some(signature);
+        }
+
+        let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
+            blocks: &analysis_request.blocks,
+            function_name: &display_name,
+            arch: analysis_request.arch.as_ref(),
+            ptr_bits: analysis_request.ptr_bits,
+            function_facts: &artifact.function_facts,
+            func_names_payload: &func_names_payload,
+            strings_payload: &strings_payload,
+            symbols_payload: &symbols_payload,
+        });
+        let fallback_comment = r2dec::semantic_fallback_comment(
+            &display_name,
+            artifact.function_facts.semantics.as_ref(),
+        )
+        .or_else(|| {
+            probe
+                .cfg_guard_reason
+                .as_ref()
+                .map(|reason| r2dec::artifact_guard_fallback_comment(&display_name, reason))
+        });
+
+        self.decompile(EngineDecompileRequest {
+            function_name: display_name,
+            prepared_ssa: artifact.ssa_func,
+            function_facts: artifact.function_facts,
+            function_names,
+            strings,
+            symbols,
+            ptr_bits: analysis_request.ptr_bits,
+            config,
+            render_cache_key: Some(render_cache_key),
+            fallback_comment,
         })
     }
 
@@ -1380,6 +1693,69 @@ fn render_engine_decompile_request(
             request.function_name
         )
     })
+}
+
+fn decompile_type_override(
+    identity: &EngineFunctionIdentity,
+    request: &EngineAnalyzeRequest,
+    artifact: &EngineAnalysisArtifact,
+) -> Option<FunctionTypeFacts> {
+    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch.as_ref());
+    native_worker_type_projection_for_identity(
+        identity,
+        &arch_name,
+        request.ptr_bits,
+        &request.parsed_context,
+        true,
+    )
+    .map(|projection| projection.function_facts.types)
+    .or_else(|| {
+        let facts = r2types::inferred_signature_to_function_type_facts(
+            &artifact.writeback_plan.signature,
+            request.ptr_bits,
+        );
+        facts.merged_signature.is_some().then_some(facts)
+    })
+    .or_else(|| {
+        let facts = r2types::function_type_facts_from_parsed_context(
+            &request.function_name,
+            &request.parsed_context,
+        );
+        facts.merged_signature.is_some().then_some(facts)
+    })
+}
+
+fn refused_decompile_response(
+    function_name: &str,
+    reason: &str,
+    planning_time: Duration,
+) -> EngineDecompileResponse {
+    let output = r2dec::artifact_guard_fallback_comment(function_name, reason);
+    EngineDecompileResponse {
+        output: output.clone(),
+        decision: EngineRouteDecision {
+            request: EngineRequestKind::Decompile,
+            plan: EnginePlan::RefuseWithEvidence,
+            route: r2dec::SemanticRoutePlan::FallbackComment {
+                comment: output.clone(),
+            },
+            route_reason: Some(reason.to_string()),
+            skip_runtime_type_inference: true,
+            use_prepared_semantic_view: false,
+            refusal: Some(output.clone()),
+        },
+        metrics: EngineMetrics {
+            cache_hit: false,
+            planning_time,
+            ..EngineMetrics::default()
+        },
+        diagnostics: EngineDiagnostics {
+            plan: Some(EnginePlan::RefuseWithEvidence),
+            route_reason: Some(reason.to_string()),
+            warnings: Vec::new(),
+            refusal: Some(output),
+        },
+    }
 }
 
 fn render_engine_summary_decompile_request(
@@ -2596,6 +2972,34 @@ pub fn render_semantic_route(
     }
 }
 
+pub fn target_query_route_decision(
+    request: EngineTargetQueryRouteRequest<'_, '_>,
+) -> r2sym::TargetQueryRoutePlan {
+    let probe_config = r2sym::SymQueryConfig {
+        explore: request.explore_config,
+        mode: r2sym::QueryMode::TargetGuided,
+        summary_profile: request.summary_profile,
+        solve_tactics: r2sym::SolveTacticConfig::default(),
+    };
+    let mut explorer = probe_config.make_explorer(request.z3_ctx);
+    if let Some(scope) = request.scope {
+        r2sym::install_runtime_hooks_for_scope(
+            &mut explorer,
+            scope,
+            request.arch,
+            request.symbol_map,
+        );
+    }
+    r2sym::selected_target_query_route_in_scope(
+        &mut explorer,
+        request.prepared,
+        request.scope,
+        Some(request.compiled),
+        request.target_addr,
+        request.assumption_conflicted,
+    )
+}
+
 pub fn select_engine_plan(
     request: EngineRequestKind,
     route: Option<&r2dec::SemanticRoutePlan>,
@@ -2906,6 +3310,152 @@ pub fn type_route_decision(
         reason: None,
         apply_artifact_signature_hint: false,
     }
+}
+
+pub fn signature_override_from_type_facts(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    callconv: Option<&str>,
+    type_facts: &r2types::FunctionTypeFacts,
+) -> Option<r2types::InferredSignature> {
+    type_facts.merged_signature.as_ref().map(|signature| {
+        r2types::inferred_signature_from_signature_spec(
+            function_name,
+            arch_name,
+            ptr_bits,
+            callconv,
+            signature,
+        )
+    })
+}
+
+pub fn bounded_cfg_type_writeback_plan(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    callconv: Option<&str>,
+    function_facts: &FunctionFacts,
+    reason: String,
+) -> TypeWritebackPlan {
+    let signature = signature_override_from_type_facts(
+        function_name,
+        arch_name,
+        ptr_bits,
+        callconv,
+        &function_facts.types,
+    )
+    .unwrap_or_else(|| r2types::InferredSignature {
+        function_name: function_name.to_string(),
+        signature: format!("void {}(void)", function_name),
+        ret_type: "void".to_string(),
+        params: Vec::new(),
+        callconv: "unknown".to_string(),
+        arch: arch_name.to_string(),
+        confidence: 0,
+        callconv_confidence: 0,
+    });
+    TypeWritebackPlan {
+        signature,
+        var_type_candidates: Vec::new(),
+        var_rename_candidates: Vec::new(),
+        struct_decls: Vec::new(),
+        global_type_links: Vec::new(),
+        diagnostics: r2types::TypeWritebackDiagnostics {
+            warnings: vec![reason],
+            ..r2types::TypeWritebackDiagnostics::default()
+        },
+    }
+}
+
+pub fn semantic_fallback_type_writeback_plan(
+    function_name: &str,
+    arch_name: &str,
+    ptr_bits: u32,
+    callconv: Option<&str>,
+    artifact: &r2sym::SemanticArtifact,
+    function_facts: &FunctionFacts,
+    apply_artifact_signature_hint: bool,
+) -> TypeWritebackPlan {
+    let mut plan =
+        r2types::build_semantic_type_fallback_plan(function_name, arch_name, ptr_bits, artifact);
+    let mut signature_override = signature_override_from_type_facts(
+        function_name,
+        arch_name,
+        ptr_bits,
+        callconv,
+        &function_facts.types,
+    );
+    if apply_artifact_signature_hint && let Some(signature) = signature_override.as_mut() {
+        r2types::apply_semantic_artifact_signature_hint_to_inferred(signature, artifact, ptr_bits);
+    }
+    if let Some(signature) = signature_override {
+        plan.signature = signature;
+    }
+    plan
+}
+
+struct TypeWritebackPlanRouteInput<'a> {
+    function_name: &'a str,
+    arch_name: &'a str,
+    ptr_bits: u32,
+    callconv: Option<&'a str>,
+    function_facts: &'a FunctionFacts,
+    cfg_summary: &'a CFGRiskSummary,
+    route: &'a EngineTypeRouteDecision,
+    full_writeback_plan: Option<TypeWritebackPlan>,
+}
+
+fn type_writeback_plan_for_route(
+    input: TypeWritebackPlanRouteInput<'_>,
+) -> Option<TypeWritebackPlan> {
+    match input.route.kind {
+        EngineTypeRouteKind::FullWriteback => input.full_writeback_plan,
+        EngineTypeRouteKind::BoundedCfg => Some(bounded_cfg_type_writeback_plan(
+            input.function_name,
+            input.arch_name,
+            input.ptr_bits,
+            input.callconv,
+            input.function_facts,
+            input
+                .route
+                .reason
+                .clone()
+                .unwrap_or_else(|| type_cfg_bounded_reason(input.cfg_summary)),
+        )),
+        EngineTypeRouteKind::SemanticFallback => {
+            let artifact = input.function_facts.semantic_artifact()?;
+            Some(semantic_fallback_type_writeback_plan(
+                input.function_name,
+                input.arch_name,
+                input.ptr_bits,
+                input.callconv,
+                artifact,
+                input.function_facts,
+                input.route.apply_artifact_signature_hint,
+            ))
+        }
+    }
+}
+
+fn current_interproc_summary(
+    function_facts: &FunctionFacts,
+) -> Option<r2ssa::FunctionSemanticSummary> {
+    function_facts
+        .interproc_summary_set()
+        .and_then(|summary_set| {
+            summary_set
+                .root
+                .and_then(|root| summary_set.summaries.get(&root).cloned())
+        })
+}
+
+fn count_prepared_callsites(ssa_blocks: &[r2ssa::SSABlock]) -> usize {
+    ssa_blocks
+        .iter()
+        .flat_map(|block| block.ops.iter())
+        .filter(|op| matches!(op, r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. }))
+        .count()
 }
 
 pub fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) -> bool {
@@ -3350,7 +3900,7 @@ pub fn stable_blocks_hash(blocks: &[R2ILBlock]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     fn const_return_blocks(addr: u64, value: u64) -> Vec<R2ILBlock> {
         let mut block = R2ILBlock::new(addr, 4);
@@ -4035,6 +4585,78 @@ mod tests {
     }
 
     #[test]
+    fn bounded_cfg_writeback_plan_preserves_signature_context() {
+        let type_facts = FunctionTypeFacts {
+            merged_signature: Some(r2types::FunctionSignatureSpec {
+                ret_type: Some(r2types::CTypeLike::Void),
+                params: vec![r2types::FunctionParamSpec {
+                    name: "status".to_string(),
+                    ty: Some(r2types::CTypeLike::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                }],
+            }),
+            ..FunctionTypeFacts::default()
+        };
+        let function_facts = FunctionFacts::new(type_facts, None);
+        let plan = bounded_cfg_type_writeback_plan(
+            "fcn.401000",
+            "x86-64",
+            64,
+            Some("amd64"),
+            &function_facts,
+            "bounded type plan for large CFG".to_string(),
+        );
+
+        assert_eq!(plan.signature.signature, "void fcn.401000 (int32_t status)");
+        assert_eq!(plan.signature.callconv, "amd64");
+        assert_eq!(
+            plan.diagnostics.warnings,
+            vec!["bounded type plan for large CFG"]
+        );
+    }
+
+    #[test]
+    fn semantic_fallback_writeback_plan_preserves_name_owned_role_signature() {
+        let summary = r2ssa::FunctionSemanticSummary::seed_for_name(
+            r2ssa::InterprocFunctionId(0x11a9),
+            "verror_at_line",
+        )
+        .unwrap_or_else(|| {
+            r2ssa::FunctionSemanticSummary::unknown(
+                r2ssa::InterprocFunctionId(0x11a9),
+                Some("verror_at_line".to_string()),
+            )
+        });
+        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
+            .expect("expected named diagnostic summary artifact");
+        let role_signature = r2types::signature_hint_for_name_candidates(["verror_at_line"], 6)
+            .expect("expected exact diagnostic role signature");
+        let function_facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(role_signature),
+                ..FunctionTypeFacts::default()
+            },
+            Some(artifact.clone()),
+        );
+
+        let plan = semantic_fallback_type_writeback_plan(
+            "verror_at_line",
+            "x86-64",
+            64,
+            Some("amd64"),
+            &artifact,
+            &function_facts,
+            false,
+        );
+
+        assert_eq!(plan.signature.ret_type, "void");
+        assert_eq!(plan.signature.params[3].param_type, "unsigned int");
+        assert_eq!(plan.signature.params[5].param_type, "__va_list_tag*");
+    }
+
+    #[test]
     fn type_summary_preprobe_bounds_large_program_orchestrator_without_full_analysis() {
         let mut blocks = const_return_blocks(0x55a0, 0);
         for idx in 0..210 {
@@ -4079,6 +4701,89 @@ mod tests {
                     })
                 })
         );
+    }
+
+    #[test]
+    fn type_function_uses_engine_summary_preprobe_without_artifact_cache_key() {
+        let mut blocks = const_return_blocks(0x55a0, 0);
+        for idx in 0..210 {
+            blocks.push(R2ILBlock::new(0x5600 + idx, 1));
+        }
+        let parsed_context = r2types::parse_external_context_json("{}", 64);
+        let session = EngineSession::new(8);
+
+        let response = session
+            .type_function(EngineTypeAnalysisRequest {
+                analysis: EngineAnalyzeRequest {
+                    function_name: "dbg.main".to_string(),
+                    function_addr: 0x55a0,
+                    blocks,
+                    arch: None,
+                    ptr_bits: 64,
+                    semantic_metadata_enabled: false,
+                    reg_type_hints: HashMap::new(),
+                    parsed_context,
+                    external_context_fallback_hash: 0,
+                    scope_facts: InterprocScopeFacts::empty(),
+                    interproc_max_iterations: 1,
+                    symbolic_scope: None,
+                    precomputed_semantic_artifact: None,
+                    semantic_mode: EngineSemanticMode::Full,
+                    include_interproc_summary_set: true,
+                },
+                caller_prefers_bounded_type_plan: false,
+            })
+            .expect("large program orchestrator should be typed by engine preprobe");
+
+        assert_eq!(
+            response.route_decision.kind,
+            EngineTypeRouteKind::SemanticFallback
+        );
+        assert!(response.artifact_key.is_none());
+        assert_eq!(response.writeback_plan.signature.params[0].name, "argc");
+        assert_eq!(response.writeback_plan.signature.params[1].name, "argv");
+    }
+
+    #[test]
+    fn decompile_function_uses_engine_summary_preprobe_without_plugin_policy() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let parsed_context = r2types::parse_external_context_json("{}", 64);
+        let session = EngineSession::new(8);
+
+        let response = session.decompile_function(EngineFunctionDecompileRequest {
+            analysis: EngineAnalyzeRequest {
+                function_name: "dbg.init_node".to_string(),
+                function_addr: 0x401000,
+                blocks,
+                arch: None,
+                ptr_bits: 64,
+                semantic_metadata_enabled: false,
+                reg_type_hints: HashMap::new(),
+                parsed_context,
+                external_context_fallback_hash: 0,
+                scope_facts: InterprocScopeFacts::empty(),
+                interproc_max_iterations: 1,
+                symbolic_scope: None,
+                precomputed_semantic_artifact: None,
+                semantic_mode: EngineSemanticMode::Full,
+                include_interproc_summary_set: true,
+            },
+            display_name: "init_node".to_string(),
+            function_names: HashMap::new(),
+            strings: HashMap::new(),
+            symbols: HashMap::new(),
+            config: r2dec::DecompilerConfig::default(),
+            func_names_payload: "{}".to_string(),
+            strings_payload: "{}".to_string(),
+            symbols_payload: "{}".to_string(),
+        });
+
+        assert!(response.output.contains("r2dec summary:"));
+        assert!(response.output.contains("init_node"));
+        assert!(matches!(
+            response.decision.route,
+            r2dec::SemanticRoutePlan::SummaryIslands { .. }
+        ));
     }
 
     #[test]
