@@ -1,6 +1,9 @@
+#[cfg(test)]
 use r2il::R2ILBlock;
-use r2ssa::{CFGRiskSummary, SSAFunction, SsaArtifact};
-use r2types::{DecompileCapabilityView, FunctionFacts, FunctionTypeFacts};
+#[cfg(test)]
+use r2ssa::{CFGRiskSummary, SSAFunction};
+#[cfg(test)]
+use r2types::{DecompileCapabilityView, FunctionFacts};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticRoutePlan {
@@ -12,14 +15,17 @@ pub enum SemanticRoutePlan {
     FallbackComment { comment: String },
 }
 
+#[cfg(test)]
 fn decompile_capability(function_facts: &FunctionFacts) -> DecompileCapabilityView {
     function_facts.decompile_capability()
 }
 
+#[cfg(test)]
 fn has_generic_only_summary_islands(capability: &DecompileCapabilityView) -> bool {
     capability.has_summary_islands && !capability.has_primary_summary_islands
 }
 
+#[cfg(test)]
 fn has_large_bounded_memory_summary_worker(capability: &DecompileCapabilityView) -> bool {
     capability.skipped_large_cfg
         && capability.has_memory_read_write_summary_pair
@@ -29,6 +35,7 @@ fn has_large_bounded_memory_summary_worker(capability: &DecompileCapabilityView)
         )
 }
 
+#[cfg(test)]
 fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) -> bool {
     !capability.has_native_regions
         && capability.has_memory_read_write_summary_pair
@@ -39,6 +46,7 @@ fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) ->
         )
 }
 
+#[cfg(test)]
 fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> bool {
     let Some(signature) = function_facts.types.merged_signature.as_ref() else {
         return false;
@@ -67,45 +75,7 @@ fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> boo
     weak_worker_conflict || weak_region_conflict
 }
 
-pub(crate) fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) -> bool {
-    let capability = decompile_capability(function_facts);
-    capability
-        .plan
-        .as_ref()
-        .is_some_and(r2sym::DecompilePlan::allows_native_linearization)
-        && capability.skipped_large_cfg
-        && matches!(
-            capability.slice_class,
-            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
-        )
-        && (capability.has_native_regions || capability.has_summary_islands)
-}
-
-pub(crate) fn should_skip_runtime_type_inference(
-    prepared: Option<&SsaArtifact>,
-    _type_facts: &FunctionTypeFacts,
-    function_facts: &FunctionFacts,
-) -> bool {
-    if prefer_symbolic_large_worker_decompile(function_facts) {
-        return true;
-    }
-    let Some(prepared) = prepared else {
-        return false;
-    };
-    let summary = prepared.function().cfg_risk_summary();
-    summary.block_count >= 96
-        && summary.switch_block_count > 0
-        && summary.max_switch_cases >= 32
-        && summary.back_edge_count == 0
-}
-
-pub(crate) fn should_use_prepared_semantic_view(
-    prepared: Option<&SsaArtifact>,
-    function_facts: &FunctionFacts,
-) -> bool {
-    prepared.is_some() && !prefer_symbolic_large_worker_decompile(function_facts)
-}
-
+#[cfg(test)]
 pub(crate) fn preferred_semantic_fallback_comment(
     func_name: &str,
     function_facts: &FunctionFacts,
@@ -131,6 +101,7 @@ pub(crate) fn preferred_semantic_fallback_comment(
         .flatten()
 }
 
+#[cfg(test)]
 pub(crate) fn preferred_vm_summary_reason(function_facts: &FunctionFacts) -> Option<String> {
     match function_facts.decompile_plan()? {
         r2sym::DecompilePlan::VmSummaryOnly { reason } => Some(reason),
@@ -138,6 +109,7 @@ pub(crate) fn preferred_vm_summary_reason(function_facts: &FunctionFacts) -> Opt
     }
 }
 
+#[cfg(test)]
 fn semantic_route_from_artifact_plan(
     semantic_artifact: &r2sym::SemanticArtifact,
 ) -> Option<SemanticRoutePlan> {
@@ -157,6 +129,7 @@ fn semantic_route_from_artifact_plan(
     }
 }
 
+#[cfg(test)]
 fn native_linear_artifact_plan_allows_summary_route(
     semantic_artifact: &r2sym::SemanticArtifact,
 ) -> bool {
@@ -186,6 +159,7 @@ fn native_linear_artifact_plan_allows_summary_route(
         )
 }
 
+#[cfg(test)]
 pub(crate) fn preferred_semantic_linearization_reason(
     func_name: &str,
     function_facts: &FunctionFacts,
@@ -233,6 +207,7 @@ pub(crate) fn preferred_semantic_linearization_reason(
     Some(preferred_semantic_worker_reason(cfg_summary))
 }
 
+#[cfg(test)]
 pub(crate) fn preferred_semantic_summary_islands_reason(
     function_facts: &FunctionFacts,
     cfg_summary: &CFGRiskSummary,
@@ -299,6 +274,7 @@ pub(crate) fn preferred_semantic_summary_islands_reason(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn preferred_semantic_structuring_reason(
     func_name: &str,
     function_facts: &FunctionFacts,
@@ -328,11 +304,13 @@ pub(crate) fn preferred_semantic_structuring_reason(
     Some(preferred_semantic_worker_reason(cfg_summary))
 }
 
+#[cfg(test)]
 pub(crate) fn preferred_semantic_worker_reason(cfg_summary: &CFGRiskSummary) -> String {
     cfg_guard_reason_from_summary(cfg_summary)
         .unwrap_or_else(|| "semantic worker islands".to_string())
 }
 
+#[cfg(test)]
 pub fn cfg_guard_reason_from_summary(summary: &CFGRiskSummary) -> Option<String> {
     if summary.loop_count > 8 || summary.back_edge_count > 16 {
         return Some(format!(
@@ -358,6 +336,7 @@ pub fn cfg_guard_reason_from_summary(summary: &CFGRiskSummary) -> Option<String>
     None
 }
 
+#[cfg(test)]
 pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
     let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
     cfg_guard_reason_from_summary(&ssa_func.cfg_risk_summary())
@@ -377,6 +356,7 @@ pub fn artifact_guard_fallback_comment(func_name: &str, reason: &str) -> String 
     )
 }
 
+#[cfg(test)]
 pub fn semantic_route_plan(
     func_name: &str,
     function_facts: &FunctionFacts,
@@ -410,6 +390,7 @@ pub fn semantic_route_plan(
     SemanticRoutePlan::Standard
 }
 
+#[cfg(test)]
 pub fn detached_semantic_route_plan(
     func_name: &str,
     blocks: &[R2ILBlock],
@@ -423,6 +404,7 @@ pub fn detached_semantic_route_plan(
     ))
 }
 
+#[cfg(test)]
 pub fn detached_semantic_linearization_reason(
     func_name: &str,
     blocks: &[R2ILBlock],

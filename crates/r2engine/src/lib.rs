@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 
 pub const ENGINE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
+pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
+pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
+pub const SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
+pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_STATES: usize = 8;
+pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_DEPTH: usize = 32;
+pub const SYMBOLIC_PATHS_TIMEOUT_MS: u64 = 500;
+pub const SYMBOLIC_PATHS_SOLUTION_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EngineFunctionIdentity {
@@ -734,6 +741,114 @@ pub struct EngineTargetQueryRouteRequest<'ctx, 'a> {
     pub assumption_conflicted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EngineSymbolicConfigProfile {
+    DefaultQuery,
+    PathListing,
+}
+
+pub enum EngineSymbolicStateSeed<'a> {
+    Default {
+        entry_addr: u64,
+    },
+    Scope {
+        entry_addr: u64,
+    },
+    Replay {
+        entry_addr: u64,
+        seed: &'a r2sym::ReplaySeed,
+    },
+}
+
+impl EngineSymbolicStateSeed<'_> {
+    pub fn entry_addr(&self) -> u64 {
+        match self {
+            Self::Default { entry_addr }
+            | Self::Scope { entry_addr }
+            | Self::Replay { entry_addr, .. } => *entry_addr,
+        }
+    }
+
+    pub fn display_entry_addr(&self) -> u64 {
+        match self {
+            Self::Replay { entry_addr, seed } => seed.entry_pc.unwrap_or(*entry_addr),
+            Self::Default { entry_addr } | Self::Scope { entry_addr } => *entry_addr,
+        }
+    }
+}
+
+pub struct EngineSymbolicContextRequest<'ctx, 'a> {
+    pub z3_ctx: &'ctx z3::Context,
+    pub prepared: &'a SsaArtifact,
+    pub scope: Option<&'a r2sym::PreparedFunctionScope>,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub symbol_map: &'a HashMap<u64, String>,
+    pub merge_states: bool,
+    pub config_profile: EngineSymbolicConfigProfile,
+    pub seed: EngineSymbolicStateSeed<'a>,
+}
+
+pub struct EngineSymbolicSummaryRequest<'ctx, 'a> {
+    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
+    pub compile_semantics: bool,
+}
+
+pub struct EngineSymbolicSummaryResponse<'ctx> {
+    pub summary: r2sym::SymbolicFunctionSummary<'ctx>,
+    pub compiled: Option<r2sym::SemanticArtifact>,
+    pub query_policy: r2sym::QueryExecutionPolicy,
+}
+
+pub struct EngineSymbolicPathsRequest<'ctx, 'a> {
+    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
+}
+
+pub struct EngineSymbolicPathsResponse<'ctx> {
+    pub summary: r2sym::SymbolicFunctionSummary<'ctx>,
+    pub explorer: r2sym::PathExplorer<'ctx>,
+    pub solution_limit: usize,
+    pub query_policy: r2sym::QueryExecutionPolicy,
+}
+
+pub struct EngineTargetExploreRequest<'ctx, 'a> {
+    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
+    pub target_addr: u64,
+}
+
+pub struct EngineTargetExploreResponse<'ctx> {
+    pub reach: r2sym::ReachabilityResult<'ctx>,
+    pub explorer: r2sym::PathExplorer<'ctx>,
+    pub compiled: r2sym::SemanticArtifact,
+    pub selected_route: r2sym::TargetQueryRoutePlan,
+    pub query_policy: r2sym::QueryExecutionPolicy,
+}
+
+pub struct EngineTargetSolveRequest<'ctx, 'a> {
+    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
+    pub target_addr: u64,
+}
+
+pub struct EngineTargetSolveResponse<'ctx> {
+    pub solve: r2sym::SolveResult<'ctx>,
+    pub explorer: r2sym::PathExplorer<'ctx>,
+    pub compiled: r2sym::SemanticArtifact,
+    pub selected_route: r2sym::TargetQueryRoutePlan,
+    pub query_policy: r2sym::QueryExecutionPolicy,
+}
+
+pub struct EngineRunSpecRequest<'ctx, 'a> {
+    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
+    pub spec: &'a r2sym::ExplorationSpec,
+}
+
+pub struct EngineRunSpecResponse<'ctx> {
+    pub result: r2sym::path::SpecExploreResult<'ctx>,
+    pub explorer: r2sym::PathExplorer<'ctx>,
+    pub stats: r2sym::path::ExploreStats,
+    pub solver_stats: r2sym::SolverStats,
+    pub query_policy: r2sym::QueryExecutionPolicy,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineSummaryDecompileRequest {
     pub function_name: String,
@@ -800,6 +915,19 @@ pub struct EngineTypeAnalysisResponse {
     pub artifact_cache_hit: bool,
     pub artifact_key: Option<ArtifactCacheKey>,
     pub metrics: EngineMetrics,
+    pub diagnostics: EngineDiagnostics,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineProfileRequest {
+    pub reset_after_read: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineProfileResponse {
+    pub route_decision: EngineProfileRouteDecision,
+    pub metrics: EngineSessionCacheMetrics,
+    pub total: CacheCounters,
     pub diagnostics: EngineDiagnostics,
 }
 
@@ -1089,6 +1217,21 @@ impl EngineSession {
         self.analysis_cache.reset_counters();
         self.artifact_cache.reset_counters();
         self.render_cache.reset_counters();
+    }
+
+    pub fn profile(&self, request: EngineProfileRequest) -> EngineProfileResponse {
+        let route_decision = profile_route_decision();
+        let metrics = self.cache_metrics();
+        let response = EngineProfileResponse {
+            route_decision: route_decision.clone(),
+            total: metrics.total(),
+            metrics,
+            diagnostics: EngineRequestPlan::profile(route_decision).diagnostics(),
+        };
+        if request.reset_after_read {
+            self.reset_cache_metrics();
+        }
+        response
     }
 
     pub fn prepare_analysis(
@@ -1658,6 +1801,389 @@ impl EngineSession {
             fallback_comment,
         })
     }
+
+    pub fn symbolic_summary<'ctx>(
+        &self,
+        request: EngineSymbolicSummaryRequest<'ctx, '_>,
+    ) -> EngineSymbolicSummaryResponse<'ctx> {
+        let context = request.context;
+        let mut query_config = symbolic_query_config_for_context(&context);
+        let compiled = request.compile_semantics.then(|| {
+            r2sym::compile_semantic_artifact_with_scope(
+                context.z3_ctx,
+                context.prepared,
+                context.scope,
+                context.arch,
+                context.symbol_map,
+                query_config.summary_profile,
+            )
+        });
+        if compiled.as_ref().is_some_and(|compiled| {
+            should_skip_expensive_symbolic_summary(compiled, context.prepared)
+        }) {
+            let initial_state = symbolic_initial_state(&context);
+            let query_policy = symbolic_query_policy_for_state(
+                &mut query_config,
+                context.prepared,
+                &initial_state,
+                None,
+            );
+            return EngineSymbolicSummaryResponse {
+                summary: empty_symbolic_summary(),
+                compiled,
+                query_policy,
+            };
+        }
+
+        let initial_state = symbolic_initial_state(&context);
+        let query_policy = symbolic_query_policy_for_state(
+            &mut query_config,
+            context.prepared,
+            &initial_state,
+            None,
+        );
+        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
+        let summary = explorer.summarize_function(context.prepared, initial_state);
+        EngineSymbolicSummaryResponse {
+            summary,
+            compiled,
+            query_policy,
+        }
+    }
+
+    pub fn symbolic_paths<'ctx>(
+        &self,
+        request: EngineSymbolicPathsRequest<'ctx, '_>,
+    ) -> EngineSymbolicPathsResponse<'ctx> {
+        let context = request.context;
+        let mut query_config = symbolic_query_config_for_context(&context);
+        let initial_state = symbolic_initial_state(&context);
+        let query_policy = symbolic_query_policy_for_state(
+            &mut query_config,
+            context.prepared,
+            &initial_state,
+            None,
+        );
+        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
+        let summary = explorer.summarize_function(context.prepared, initial_state);
+        let solution_limit = path_listing_solution_limit(summary.paths.len(), context.prepared);
+        EngineSymbolicPathsResponse {
+            summary,
+            explorer,
+            solution_limit,
+            query_policy,
+        }
+    }
+
+    pub fn symbolic_target_explore<'ctx>(
+        &self,
+        request: EngineTargetExploreRequest<'ctx, '_>,
+    ) -> EngineTargetExploreResponse<'ctx> {
+        let context = request.context;
+        let mut query_config = symbolic_query_config_for_context(&context);
+        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
+            context.z3_ctx,
+            context.prepared,
+            context.scope,
+            request.target_addr,
+            context.arch,
+            context.symbol_map,
+            query_config.summary_profile,
+        );
+        let initial_state = symbolic_initial_state(&context);
+        let selected_route = target_query_route_decision(EngineTargetQueryRouteRequest {
+            z3_ctx: context.z3_ctx,
+            prepared: context.prepared,
+            scope: context.scope,
+            compiled: &compiled,
+            target_addr: request.target_addr,
+            arch: context.arch,
+            symbol_map: context.symbol_map,
+            explore_config: query_config.explore.clone(),
+            summary_profile: query_config.summary_profile,
+            assumption_conflicted: prepared_assumption_conflicted(context.prepared),
+        });
+        let query_policy = symbolic_query_policy_for_state(
+            &mut query_config,
+            context.prepared,
+            &initial_state,
+            Some(&selected_route),
+        );
+        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
+        let reach = explorer.can_reach_with_artifact_in_scope(
+            context.prepared,
+            context.scope,
+            Some(&compiled),
+            initial_state,
+            request.target_addr,
+        );
+        let selected_route = reach.selected_route.clone();
+        EngineTargetExploreResponse {
+            reach,
+            explorer,
+            compiled,
+            selected_route,
+            query_policy,
+        }
+    }
+
+    pub fn symbolic_target_solve<'ctx>(
+        &self,
+        request: EngineTargetSolveRequest<'ctx, '_>,
+    ) -> EngineTargetSolveResponse<'ctx> {
+        let context = request.context;
+        let mut query_config = symbolic_query_config_for_context(&context);
+        let compiled = match context.seed {
+            EngineSymbolicStateSeed::Replay { seed, .. } => {
+                r2sym::compile_query_semantic_artifact_with_scope_and_replay_seed(
+                    context.z3_ctx,
+                    context.prepared,
+                    context.scope,
+                    request.target_addr,
+                    context.arch,
+                    context.symbol_map,
+                    query_config.summary_profile,
+                    Some(seed),
+                )
+            }
+            EngineSymbolicStateSeed::Default { .. } | EngineSymbolicStateSeed::Scope { .. } => {
+                r2sym::compile_query_semantic_artifact_with_scope(
+                    context.z3_ctx,
+                    context.prepared,
+                    context.scope,
+                    request.target_addr,
+                    context.arch,
+                    context.symbol_map,
+                    query_config.summary_profile,
+                )
+            }
+        };
+        let initial_state = symbolic_initial_state(&context);
+        let selected_route = target_query_route_decision(EngineTargetQueryRouteRequest {
+            z3_ctx: context.z3_ctx,
+            prepared: context.prepared,
+            scope: context.scope,
+            compiled: &compiled,
+            target_addr: request.target_addr,
+            arch: context.arch,
+            symbol_map: context.symbol_map,
+            explore_config: query_config.explore.clone(),
+            summary_profile: query_config.summary_profile,
+            assumption_conflicted: prepared_assumption_conflicted(context.prepared),
+        });
+        let query_policy = symbolic_query_policy_for_state(
+            &mut query_config,
+            context.prepared,
+            &initial_state,
+            Some(&selected_route),
+        );
+        let mut explorer = query_config.make_explorer(context.z3_ctx);
+        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
+        let solve = explorer.solve_for_target_with_artifact_in_scope(
+            context.prepared,
+            context.scope,
+            Some(&compiled),
+            initial_state,
+            request.target_addr,
+        );
+        let selected_route = solve.selected_route.clone();
+        EngineTargetSolveResponse {
+            solve,
+            explorer,
+            compiled,
+            selected_route,
+            query_policy,
+        }
+    }
+
+    pub fn symbolic_run_spec<'ctx>(
+        &self,
+        request: EngineRunSpecRequest<'ctx, '_>,
+    ) -> Result<EngineRunSpecResponse<'ctx>, String> {
+        let context = request.context;
+        let mut query_config = symbolic_query_config_for_context(&context);
+        let start_pc = request.spec.start_pc(context.seed.entry_addr())?;
+        let mut initial_state = symbolic_initial_state_at(&context, start_pc);
+        request.spec.apply_to_state(&mut initial_state);
+        let query_policy = symbolic_query_policy_for_state(
+            &mut query_config,
+            context.prepared,
+            &initial_state,
+            None,
+        );
+        let mut explorer = r2sym::PathExplorer::with_config(
+            context.z3_ctx,
+            request.spec.to_explore_config(&query_config.explore),
+        );
+        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
+        let result = explorer.run_spec(context.prepared, initial_state, request.spec)?;
+        let stats = explorer.stats().clone();
+        let solver_stats = explorer.solver().stats();
+        Ok(EngineRunSpecResponse {
+            result,
+            explorer,
+            stats,
+            solver_stats,
+            query_policy,
+        })
+    }
+}
+
+pub fn default_symbolic_query_config(merge_states: bool) -> r2sym::SymQueryConfig {
+    r2sym::SymQueryConfig {
+        explore: r2sym::ExploreConfig {
+            max_states: 200,
+            max_depth: 800,
+            merge_states,
+            timeout: Some(Duration::from_secs(20)),
+            ..Default::default()
+        },
+        mode: r2sym::QueryMode::TargetGuided,
+        summary_profile: r2sym::SummaryProfile::Default,
+        solve_tactics: r2sym::SolveTacticConfig::default(),
+    }
+}
+
+pub fn path_listing_query_config(
+    prepared: &r2ssa::SsaArtifact,
+    merge_states: bool,
+) -> r2sym::SymQueryConfig {
+    let mut config = default_symbolic_query_config(merge_states);
+    if prepared.call_sites().by_id.is_empty() {
+        config.explore.max_states = SYMBOLIC_PATHS_CALL_FREE_MAX_STATES;
+        config.explore.max_depth = SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH;
+    } else {
+        config.explore.max_states = SYMBOLIC_PATHS_CALL_HEAVY_MAX_STATES;
+        config.explore.max_depth = SYMBOLIC_PATHS_CALL_HEAVY_MAX_DEPTH;
+    }
+    config.explore.timeout = Some(Duration::from_millis(SYMBOLIC_PATHS_TIMEOUT_MS));
+    config.explore.max_completed_paths = Some(SYMBOLIC_PATHS_LIMIT);
+    config.summary_profile = r2sym::SummaryProfile::PathListing;
+    config
+}
+
+pub fn path_listing_solution_limit(result_count: usize, prepared: &r2ssa::SsaArtifact) -> usize {
+    if !prepared.call_sites().by_id.is_empty() {
+        return 0;
+    }
+    if result_count <= SYMBOLIC_PATHS_SOLUTION_LIMIT {
+        result_count
+    } else {
+        0
+    }
+}
+
+pub fn symbolic_query_policy_for_state(
+    config: &mut r2sym::SymQueryConfig,
+    prepared: &r2ssa::SsaArtifact,
+    initial_state: &r2sym::SymState<'_>,
+    route: Option<&r2sym::TargetQueryRoutePlan>,
+) -> r2sym::QueryExecutionPolicy {
+    let route = route
+        .cloned()
+        .unwrap_or_else(r2sym::TargetQueryRoutePlan::dynamic_fallback);
+    let policy = r2sym::QueryExecutionPolicy::for_route(config, prepared, initial_state, route);
+    r2sym::apply_query_execution_policy(config, &policy);
+    policy
+}
+
+pub fn prepared_assumption_conflicted(prepared: &r2ssa::SsaArtifact) -> bool {
+    !prepared.facts().assumption_usage.conflicts.is_empty()
+}
+
+fn symbolic_query_config_for_context(
+    context: &EngineSymbolicContextRequest<'_, '_>,
+) -> r2sym::SymQueryConfig {
+    match context.config_profile {
+        EngineSymbolicConfigProfile::DefaultQuery => {
+            default_symbolic_query_config(context.merge_states)
+        }
+        EngineSymbolicConfigProfile::PathListing => {
+            path_listing_query_config(context.prepared, context.merge_states)
+        }
+    }
+}
+
+fn symbolic_initial_state<'ctx>(
+    context: &EngineSymbolicContextRequest<'ctx, '_>,
+) -> r2sym::SymState<'ctx> {
+    symbolic_initial_state_at(context, context.seed.display_entry_addr())
+}
+
+fn symbolic_initial_state_at<'ctx>(
+    context: &EngineSymbolicContextRequest<'ctx, '_>,
+    entry_addr: u64,
+) -> r2sym::SymState<'ctx> {
+    let mut initial_state = r2sym::SymState::new(context.z3_ctx, entry_addr);
+    match context.seed {
+        EngineSymbolicStateSeed::Default { .. } => {
+            r2sym::seed_default_state_for_arch(&mut initial_state, context.prepared, context.arch);
+        }
+        EngineSymbolicStateSeed::Scope { .. } => {
+            if let Some(scope) = context.scope {
+                r2sym::seed_scope_state_for_arch(
+                    &mut initial_state,
+                    context.prepared,
+                    scope,
+                    context.arch,
+                );
+            } else {
+                r2sym::seed_default_state_for_arch(
+                    &mut initial_state,
+                    context.prepared,
+                    context.arch,
+                );
+            }
+        }
+        EngineSymbolicStateSeed::Replay { seed, .. } => {
+            r2sym::seed_replay_state_for_arch(
+                &mut initial_state,
+                Some(context.prepared),
+                context.arch,
+                seed,
+            );
+        }
+    }
+    initial_state
+}
+
+fn install_symbolic_hooks_for_context<'ctx>(
+    explorer: &mut r2sym::PathExplorer<'ctx>,
+    context: &EngineSymbolicContextRequest<'ctx, '_>,
+    policy: &r2sym::QueryExecutionPolicy,
+) {
+    if let Some(scope) = context.scope {
+        r2sym::install_symbolic_hooks_for_query_policy(
+            explorer,
+            context.z3_ctx,
+            scope,
+            context.arch,
+            context.symbol_map,
+            symbolic_query_config_for_context(context).summary_profile,
+            policy,
+        );
+    }
+}
+
+fn empty_symbolic_summary<'ctx>() -> r2sym::SymbolicFunctionSummary<'ctx> {
+    r2sym::SymbolicFunctionSummary {
+        completion: r2sym::QueryCompletion::Complete,
+        paths: Vec::new(),
+        feasible_paths: 0,
+        stats: r2sym::path::ExploreStats::default(),
+        solver_stats: r2sym::SolverStats::default(),
+    }
+}
+
+fn should_skip_expensive_symbolic_summary(
+    compiled: &r2sym::SemanticArtifact,
+    prepared: &r2ssa::SsaArtifact,
+) -> bool {
+    compiled.diagnostics.skipped_large_cfg
+        || prepared.function().cfg_risk_summary().block_count > 96
 }
 
 fn render_engine_decompile_request(
@@ -4834,6 +5360,78 @@ mod tests {
         assert_eq!(profile.cache.layer, EngineCacheLayer::MetricsSnapshot);
         assert!(!profile.cache.lookup);
         assert!(!profile.cache.store_on_miss);
+    }
+
+    #[test]
+    fn symbolic_path_listing_runs_through_engine_policy() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let scope = r2sym::PreparedFunctionScope::new(
+            0x401000,
+            vec![r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x401000),
+                name: Some("sym.simple".to_string()),
+                prepared: prepared.clone(),
+            }],
+        )
+        .expect("scope");
+        let z3_ctx = z3::Context::thread_local();
+        let symbols = HashMap::new();
+        let session = EngineSession::new(4);
+
+        let response = session.symbolic_paths(EngineSymbolicPathsRequest {
+            context: EngineSymbolicContextRequest {
+                z3_ctx: &z3_ctx,
+                prepared: &prepared,
+                scope: Some(&scope),
+                arch: None,
+                symbol_map: &symbols,
+                merge_states: false,
+                config_profile: EngineSymbolicConfigProfile::PathListing,
+                seed: EngineSymbolicStateSeed::Default {
+                    entry_addr: 0x401000,
+                },
+            },
+        });
+
+        assert_eq!(
+            response.query_policy.route,
+            r2sym::TargetQueryRoutePlan::dynamic_fallback()
+        );
+        assert!(response.summary.stats.states_explored <= SYMBOLIC_PATHS_CALL_FREE_MAX_STATES);
+        assert_eq!(
+            response.solution_limit,
+            path_listing_solution_limit(response.summary.paths.len(), &prepared)
+        );
+    }
+
+    #[test]
+    fn engine_profile_snapshots_cache_metrics_with_route_decision() {
+        let session = EngineSession::new(4);
+        let blocks = const_return_blocks(0x403000, 0);
+        let analysis =
+            AnalysisCacheKey::from_parts(0x403000, "sym.profile", None, &blocks, 1, 2, "aa");
+        let artifact = ArtifactCacheKey::from_hashes(analysis, 3, 4);
+        let render = RenderCacheKey::from_artifact(artifact, 5, 6);
+
+        let _ = session.cached_render_with_decision(EngineRequestKind::Decompile, Some(&render));
+        let profile = session.profile(EngineProfileRequest {
+            reset_after_read: true,
+        });
+
+        assert_eq!(
+            profile.route_decision.kind,
+            EngineProfileRouteKind::MetricsSnapshot
+        );
+        assert_eq!(profile.metrics.renders.misses, 1);
+        assert_eq!(profile.total.misses, 1);
+        assert_eq!(
+            session
+                .profile(EngineProfileRequest::default())
+                .total
+                .misses,
+            0
+        );
     }
 
     #[test]

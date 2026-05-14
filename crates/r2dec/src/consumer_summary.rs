@@ -18,17 +18,9 @@ pub(crate) fn render_for_route(
         route,
         crate::planner::SemanticRoutePlan::SummaryIslands { .. }
     );
-    let is_explicit_dense_native_linear_route =
-        should_render_explicit_dense_native_linear_route(semantic_artifact, route);
     let is_residual_route = !is_summary_island_route
         && (matches!(semantic_artifact.stage, r2sym::RefinementStage::Residual)
             || !semantic_artifact.diagnostics.residual_reasons.is_empty());
-    if !(crate::should_render_bounded_semantic_worker_summary(function_facts, semantic_artifact)
-        || is_explicit_dense_native_linear_route
-        || is_summary_island_route && crate::should_render_summary_island_route(semantic_artifact))
-    {
-        return None;
-    }
 
     let mut body = Vec::new();
     if is_summary_island_route {
@@ -241,45 +233,6 @@ pub(crate) fn render_for_route(
         codegen.generate_function(&c_func),
         &function_facts.types,
     ))
-}
-
-fn should_render_explicit_dense_native_linear_route(
-    semantic_artifact: &r2sym::SemanticArtifact,
-    route: &crate::planner::SemanticRoutePlan,
-) -> bool {
-    if !matches!(
-        route,
-        crate::planner::SemanticRoutePlan::LinearWorker { .. }
-    ) || !matches!(
-        semantic_artifact.decompile_plan(),
-        r2sym::DecompilePlan::NativeLinear { .. }
-    ) {
-        return false;
-    }
-    let Some(native) = semantic_artifact.native_body() else {
-        return false;
-    };
-    let dense_summary_count =
-        native.summary.region_summaries.len() + native.summary.worker_summaries.len();
-    let has_specific_summary = native.has_memory_read_write_summary_pair()
-        || native.summary.worker_summaries.iter().any(|summary| {
-            !matches!(
-                summary.kind,
-                r2sym::NativeWorkerSummaryKind::MemoryRead
-                    | r2sym::NativeWorkerSummaryKind::MemoryWrite
-                    | r2sym::NativeWorkerSummaryKind::Unknown
-            )
-        });
-    dense_summary_count >= 8
-        && has_specific_summary
-        && matches!(
-            semantic_artifact.slice_class(),
-            Some(
-                r2sym::SliceClass::Worker
-                    | r2sym::SliceClass::GenericLarge
-                    | r2sym::SliceClass::Wrapper
-            )
-        )
 }
 
 fn semantic_worker_summary_function(

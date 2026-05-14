@@ -10096,7 +10096,8 @@ mod tests {
             max_switch_cases: 40,
         };
 
-        let reason = r2dec::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
+        let reason =
+            r2engine::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
         assert!(
             reason.contains("dense switch") || reason.contains("max_switch_cases"),
             "unexpected reason: {reason}"
@@ -10113,7 +10114,8 @@ mod tests {
             max_switch_cases: 47,
         };
 
-        let reason = r2dec::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
+        let reason =
+            r2engine::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
         assert!(
             reason.contains("dense switch in looped CFG"),
             "unexpected reason: {reason}"
@@ -10130,7 +10132,8 @@ mod tests {
             max_switch_cases: 0,
         };
 
-        let reason = r2dec::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
+        let reason =
+            r2engine::cfg_guard_reason_from_summary(&summary).expect("guard reason expected");
         assert!(
             reason.contains("back_edges=38"),
             "expected back-edge detail in reason, got: {reason}"
@@ -10147,7 +10150,7 @@ mod tests {
             max_switch_cases: 0,
         };
 
-        assert_eq!(r2dec::cfg_guard_reason_from_summary(&summary), None);
+        assert_eq!(r2engine::cfg_guard_reason_from_summary(&summary), None);
     }
 
     #[test]
@@ -10750,9 +10753,26 @@ mod tests {
     #[test]
     fn decompile_ready_large_cfg_worker_keeps_real_decompile_path() {
         let compiled = test_large_cfg_semantic_artifact();
-        assert!(
-            r2dec::preferred_semantic_fallback_comment("fcn.401000", Some(&compiled)).is_none()
+        let function_facts =
+            r2types::FunctionFacts::new(r2types::FunctionTypeFacts::default(), Some(compiled));
+        let cfg_summary = r2ssa::CFGRiskSummary {
+            block_count: 1,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let decision = r2engine::decompile_route_decision(
+            "fcn.401000",
+            &function_facts,
+            None,
+            &function_facts.types,
+            &cfg_summary,
         );
+        assert!(!matches!(
+            decision.route,
+            r2dec::SemanticRoutePlan::FallbackComment { .. }
+        ));
     }
 
     #[test]

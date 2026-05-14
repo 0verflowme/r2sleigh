@@ -19,13 +19,6 @@ use std::sync::{Mutex, OnceLock};
 use z3::{Config, Context};
 
 static MERGE_STATES: AtomicBool = AtomicBool::new(false);
-const SYM_PATHS_LIMIT: usize = 32;
-const SYM_PATHS_CALL_FREE_MAX_STATES: usize = 16;
-const SYM_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
-const SYM_PATHS_CALL_HEAVY_MAX_STATES: usize = 8;
-const SYM_PATHS_CALL_HEAVY_MAX_DEPTH: usize = 32;
-const SYM_PATHS_TIMEOUT_MS: u64 = 500;
-const SYM_PATHS_SOLUTION_LIMIT: usize = 4;
 
 fn solve_pipeline_debug_enabled() -> bool {
     std::env::var_os("R2SLEIGH_DEBUG_SOLVE_PIPELINE").is_some()
@@ -176,65 +169,6 @@ pub extern "C" fn r2sym_merge_is_enabled() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sym_merge_set_enabled(enabled: i32) {
     MERGE_STATES.store(enabled != 0, Ordering::Relaxed);
-}
-
-fn sym_default_config() -> r2sym::ExploreConfig {
-    r2sym::ExploreConfig {
-        max_states: 200,
-        max_depth: 800,
-        merge_states: merge_states_enabled(),
-        timeout: Some(std::time::Duration::from_secs(20)),
-        ..Default::default()
-    }
-}
-
-fn sym_default_query_config() -> r2sym::SymQueryConfig {
-    r2sym::SymQueryConfig {
-        explore: sym_default_config(),
-        mode: r2sym::QueryMode::TargetGuided,
-        summary_profile: r2sym::SummaryProfile::Default,
-        solve_tactics: r2sym::SolveTacticConfig::default(),
-    }
-}
-
-fn tune_query_config_for_state(
-    config: &mut r2sym::SymQueryConfig,
-    prepared: &r2ssa::SsaArtifact,
-    initial_state: &r2sym::SymState<'_>,
-    route: Option<&r2sym::TargetQueryRoutePlan>,
-) -> r2sym::QueryExecutionPolicy {
-    let route = route
-        .cloned()
-        .unwrap_or_else(r2sym::TargetQueryRoutePlan::dynamic_fallback);
-    let policy = r2sym::QueryExecutionPolicy::for_route(config, prepared, initial_state, route);
-    r2sym::apply_query_execution_policy(config, &policy);
-    policy
-}
-
-fn sym_paths_query_config(prepared: &r2ssa::SsaArtifact) -> r2sym::SymQueryConfig {
-    let mut config = sym_default_query_config();
-    if prepared.call_sites().by_id.is_empty() {
-        config.explore.max_states = SYM_PATHS_CALL_FREE_MAX_STATES;
-        config.explore.max_depth = SYM_PATHS_CALL_FREE_MAX_DEPTH;
-    } else {
-        config.explore.max_states = SYM_PATHS_CALL_HEAVY_MAX_STATES;
-        config.explore.max_depth = SYM_PATHS_CALL_HEAVY_MAX_DEPTH;
-    }
-    config.explore.timeout = Some(std::time::Duration::from_millis(SYM_PATHS_TIMEOUT_MS));
-    config.explore.max_completed_paths = Some(SYM_PATHS_LIMIT);
-    config.summary_profile = r2sym::SummaryProfile::PathListing;
-    config
-}
-
-fn sym_paths_solution_limit(result_count: usize, prepared: &r2ssa::SsaArtifact) -> usize {
-    if !prepared.call_sites().by_id.is_empty() {
-        return 0;
-    }
-    if result_count <= SYM_PATHS_SOLUTION_LIMIT {
-        result_count
-    } else {
-        0
-    }
 }
 
 fn sym_error_json(message: &str) -> *mut c_char {
@@ -1491,24 +1425,6 @@ fn final_constraint_precision_string(precision: r2sym::FinalConstraintPrecision)
     .to_string()
 }
 
-fn empty_symbolic_summary<'ctx>() -> r2sym::SymbolicFunctionSummary<'ctx> {
-    r2sym::SymbolicFunctionSummary {
-        completion: r2sym::QueryCompletion::Complete,
-        paths: Vec::new(),
-        feasible_paths: 0,
-        stats: r2sym::path::ExploreStats::default(),
-        solver_stats: r2sym::SolverStats::default(),
-    }
-}
-
-fn should_skip_expensive_symbolic_summary(
-    compiled: &r2sym::SemanticArtifact,
-    prepared: &r2ssa::SsaArtifact,
-) -> bool {
-    compiled.diagnostics.skipped_large_cfg
-        || prepared.function().cfg_risk_summary().block_count > 96
-}
-
 pub(crate) fn compiled_semantic_info(compiled: &r2sym::SemanticArtifact) -> CompiledSemanticInfo {
     compiled_semantic_info_with_seed(compiled, None)
 }
@@ -1990,8 +1906,25 @@ fn scope_root_prepared(scope: &r2sym::PreparedFunctionScope) -> Option<&r2ssa::S
     scope.root().map(|function| &function.prepared)
 }
 
-fn prepared_assumption_conflicted(prepared: &r2ssa::SsaArtifact) -> bool {
-    !prepared.facts().assumption_usage.conflicts.is_empty()
+fn engine_symbolic_context<'ctx, 'a>(
+    z3_ctx: &'ctx Context,
+    prepared: &'a r2ssa::SsaArtifact,
+    scope: Option<&'a r2sym::PreparedFunctionScope>,
+    arch: Option<&'a ArchSpec>,
+    symbol_map: &'a HashMap<u64, String>,
+    config_profile: r2engine::EngineSymbolicConfigProfile,
+    seed: r2engine::EngineSymbolicStateSeed<'a>,
+) -> r2engine::EngineSymbolicContextRequest<'ctx, 'a> {
+    r2engine::EngineSymbolicContextRequest {
+        z3_ctx,
+        prepared,
+        scope,
+        arch,
+        symbol_map,
+        merge_states: merge_states_enabled(),
+        config_profile,
+        seed,
+    }
 }
 
 fn prepared_assumption_conditioning(
@@ -2136,19 +2069,6 @@ unsafe fn replay_seed_from_ffi(
     })
 }
 
-fn build_replay_seeded_state<'ctx>(
-    z3_ctx: &'ctx Context,
-    entry_addr: u64,
-    prepared: &r2ssa::SsaArtifact,
-    arch: Option<&ArchSpec>,
-    replay_seed: &r2sym::ReplaySeed,
-) -> r2sym::SymState<'ctx> {
-    let mut initial_state =
-        r2sym::SymState::new(z3_ctx, replay_seed.entry_pc.unwrap_or(entry_addr));
-    r2sym::seed_replay_state_for_arch(&mut initial_state, Some(prepared), arch, replay_seed);
-    initial_state
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sym_function(
     ctx: *const R2ILContext,
@@ -2172,41 +2092,23 @@ pub extern "C" fn r2sym_function(
     };
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
-    let mut query_config = sym_paths_query_config(&prepared);
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_semantic_artifact_with_scope(
-            &z3_ctx,
-            &prepared,
-            Some(&scope),
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-        );
-        if should_skip_expensive_symbolic_summary(&compiled, &prepared) {
-            return (empty_symbolic_summary(), compiled);
-        }
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let query_policy =
-            tune_query_config_for_state(&mut query_config, &prepared, &initial_state, None);
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        (
-            explorer.summarize_function(&prepared, initial_state),
-            compiled,
-        )
+        crate::types::engine_session().symbolic_summary(r2engine::EngineSymbolicSummaryRequest {
+            context: engine_symbolic_context(
+                &z3_ctx,
+                &prepared,
+                Some(&scope),
+                ctx_view.arch,
+                &symbol_map,
+                r2engine::EngineSymbolicConfigProfile::PathListing,
+                r2engine::EngineSymbolicStateSeed::Default { entry_addr },
+            ),
+            compile_semantics: true,
+        })
     }));
 
-    let (summary, compiled) = match explore_result {
+    let response = match explore_result {
         Ok(r) => r,
         Err(err) => {
             return sym_panic_json("symbolic execution failed", err);
@@ -2214,13 +2116,13 @@ pub extern "C" fn r2sym_function(
     };
 
     let output = build_sym_exec_summary(
-        &summary.stats,
-        &summary.solver_stats,
-        summary.feasible_paths,
+        &response.summary.stats,
+        &response.summary.solver_stats,
+        response.summary.feasible_paths,
         r2ssa::AssumptionUsageReport::default(),
         false,
         false,
-        Some(&compiled),
+        response.compiled.as_ref(),
     );
     match serde_json::to_string_pretty(&output) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
@@ -2269,40 +2171,41 @@ pub extern "C" fn r2sym_paths(
     };
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
-    let mut query_config = sym_paths_query_config(&prepared);
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let query_policy =
-            tune_query_config_for_state(&mut query_config, &prepared, &initial_state, None);
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        let summary = explorer.summarize_function(&prepared, initial_state);
-        (summary, explorer)
+        crate::types::engine_session().symbolic_paths(r2engine::EngineSymbolicPathsRequest {
+            context: engine_symbolic_context(
+                &z3_ctx,
+                &prepared,
+                Some(&scope),
+                ctx_view.arch,
+                &symbol_map,
+                r2engine::EngineSymbolicConfigProfile::PathListing,
+                r2engine::EngineSymbolicStateSeed::Default { entry_addr },
+            ),
+        })
     }));
 
-    let (summary, explorer) = match explore_result {
+    let response = match explore_result {
         Ok(r) => r,
         Err(err) => {
             return sym_panic_json("symbolic execution failed", err);
         }
     };
 
-    let solution_limit = sym_paths_solution_limit(summary.paths.len(), &prepared);
-    let paths: Vec<PathInfo> = summary
+    let paths: Vec<PathInfo> = response
+        .summary
         .paths
         .iter()
         .enumerate()
-        .map(|(i, r)| path_info_from_result_with_solution(i, r, &explorer, i < solution_limit))
+        .map(|(i, r)| {
+            path_info_from_result_with_solution(
+                i,
+                r,
+                &response.explorer,
+                i < response.solution_limit,
+            )
+        })
         .collect();
     match serde_json::to_string_pretty(&paths) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
@@ -2333,72 +2236,39 @@ pub extern "C" fn r2sym_explore_to(
         return sym_error_json("failed to build symbolic scope");
     };
     let symbol_map = symbol_map_snapshot();
-    let mut query_config = sym_default_query_config();
 
     let z3_ctx = Context::thread_local();
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
-            &z3_ctx,
-            &prepared,
-            Some(&scope),
-            target_addr,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-        );
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let selected_route =
-            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
-                z3_ctx: &z3_ctx,
-                prepared: &prepared,
-                scope: Some(&scope),
-                compiled: &compiled,
+        let response = crate::types::engine_session().symbolic_target_explore(
+            r2engine::EngineTargetExploreRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    &prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Default { entry_addr },
+                ),
                 target_addr,
-                arch: ctx_view.arch,
-                symbol_map: &symbol_map,
-                explore_config: query_config.explore.clone(),
-                summary_profile: query_config.summary_profile,
-                assumption_conflicted: prepared_assumption_conflicted(&prepared),
-            });
-        let query_policy = tune_query_config_for_state(
-            &mut query_config,
-            &prepared,
-            &initial_state,
-            Some(&selected_route),
+            },
         );
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        let reach = explorer.can_reach_with_artifact_in_scope(
-            &prepared,
-            Some(&scope),
-            Some(&compiled),
-            initial_state,
-            target_addr,
-        );
-        let paths: Vec<PathInfo> = reach
+        let paths: Vec<PathInfo> = response
+            .reach
             .paths
             .iter()
             .enumerate()
-            .map(|(i, r)| path_info_from_result(i, r, &explorer))
+            .map(|(i, r)| path_info_from_result(i, r, &response.explorer))
             .collect();
         (
             paths,
-            reach.stats,
-            reach.solver_stats,
-            reach.assumption_usage,
-            reach.assumption_conditioned,
-            reach.summary_conditioned,
-            reach.selected_route,
-            compiled.clone(),
+            response.reach.stats,
+            response.reach.solver_stats,
+            response.reach.assumption_usage,
+            response.reach.assumption_conditioned,
+            response.reach.summary_conditioned,
+            response.selected_route,
+            response.compiled,
         )
     }));
 
@@ -2461,76 +2331,54 @@ pub extern "C" fn r2sym_solve_to(
         return sym_error_json("failed to build symbolic scope");
     };
     let symbol_map = symbol_map_snapshot();
-    let mut query_config = sym_default_query_config();
     let z3_ctx = Context::thread_local();
 
     let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
-            &z3_ctx,
-            &prepared,
-            Some(&scope),
-            target_addr,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-        );
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        let selected_route =
-            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
-                z3_ctx: &z3_ctx,
-                prepared: &prepared,
-                scope: Some(&scope),
-                compiled: &compiled,
+        let response = crate::types::engine_session().symbolic_target_solve(
+            r2engine::EngineTargetSolveRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    &prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Default { entry_addr },
+                ),
                 target_addr,
-                arch: ctx_view.arch,
-                symbol_map: &symbol_map,
-                explore_config: query_config.explore.clone(),
-                summary_profile: query_config.summary_profile,
-                assumption_conflicted: prepared_assumption_conflicted(&prepared),
-            });
-        let query_policy = tune_query_config_for_state(
-            &mut query_config,
-            &prepared,
-            &initial_state,
-            Some(&selected_route),
+            },
         );
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        let solve = explorer.solve_for_target_with_artifact_in_scope(
-            &prepared,
-            Some(&scope),
-            Some(&compiled),
-            initial_state,
-            target_addr,
-        );
-        let selected = solve
+        let selected = response
+            .solve
             .selected_path_index
-            .and_then(|idx| solve.matched_paths.get(idx).map(|path| (idx, path)))
+            .and_then(|idx| {
+                response
+                    .solve
+                    .matched_paths
+                    .get(idx)
+                    .map(|path| (idx, path))
+            })
             .map(|(idx, path)| {
-                path_info_from_result_with_solution(idx, path, &explorer, solve_found(solve.status))
+                path_info_from_result_with_solution(
+                    idx,
+                    path,
+                    &response.explorer,
+                    solve_found(response.solve.status),
+                )
             });
         (
-            solve.status,
-            solve.matched_paths.len(),
+            response.solve.status,
+            response.solve.matched_paths.len(),
             selected,
-            solve.verification,
-            solve.witness,
-            solve.stats,
-            solve.solver_stats,
-            solve.assumption_usage,
-            solve.assumption_conditioned,
-            solve.summary_conditioned,
-            solve.selected_route,
-            compiled.clone(),
+            response.solve.verification,
+            response.solve.witness,
+            response.solve.stats,
+            response.solve.solver_stats,
+            response.solve.assumption_usage,
+            response.solve.assumption_conditioned,
+            response.solve.summary_conditioned,
+            response.selected_route,
+            response.compiled,
         )
     }));
 
@@ -2622,39 +2470,34 @@ pub extern "C" fn r2sym_run_spec_json(
     };
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
-    let mut default_config = sym_default_query_config();
 
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let start_pc = spec.start_pc(entry_addr)?;
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, start_pc);
-        r2sym::seed_default_state_for_arch(&mut initial_state, &prepared, ctx_view.arch);
-        spec.apply_to_state(&mut initial_state);
-        let query_policy =
-            tune_query_config_for_state(&mut default_config, &prepared, &initial_state, None);
-
-        let mut explorer = r2sym::PathExplorer::with_config(
-            &z3_ctx,
-            spec.to_explore_config(&default_config.explore),
-        );
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            default_config.summary_profile,
-            &query_policy,
-        );
-        let result = explorer.run_spec(&prepared, initial_state, &spec)?;
-        let stats = explorer.stats().clone();
-        let solver_stats = explorer.solver().stats();
-        let found_paths = result
+        let response =
+            crate::types::engine_session().symbolic_run_spec(r2engine::EngineRunSpecRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    &prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Default { entry_addr },
+                ),
+                spec: &spec,
+            })?;
+        let found_paths = response
+            .result
             .found_paths
             .iter()
             .enumerate()
-            .map(|(idx, path)| run_path_info_from_result(idx, path, &explorer))
+            .map(|(idx, path)| run_path_info_from_result(idx, path, &response.explorer))
             .collect::<Vec<_>>();
-        Ok::<_, String>((result, stats, solver_stats, found_paths))
+        Ok::<_, String>((
+            response.result,
+            response.stats,
+            response.solver_stats,
+            found_paths,
+        ))
     }));
 
     let (result, stats, solver_stats, found_paths) = match run_result {
@@ -2719,41 +2562,23 @@ pub extern "C" fn r2sym_function_scope(
     let (assumption_usage, assumption_conditioned) = prepared_assumption_conditioning(prepared);
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
-    let mut query_config = sym_paths_query_config(prepared);
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_semantic_artifact_with_scope(
-            &z3_ctx,
-            prepared,
-            Some(&scope),
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-        );
-        if should_skip_expensive_symbolic_summary(&compiled, prepared) {
-            return (empty_symbolic_summary(), compiled);
-        }
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_scope_state_for_arch(&mut initial_state, prepared, &scope, ctx_view.arch);
-        let query_policy =
-            tune_query_config_for_state(&mut query_config, prepared, &initial_state, None);
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        (
-            explorer.summarize_function(prepared, initial_state),
-            compiled,
-        )
+        crate::types::engine_session().symbolic_summary(r2engine::EngineSymbolicSummaryRequest {
+            context: engine_symbolic_context(
+                &z3_ctx,
+                prepared,
+                Some(&scope),
+                ctx_view.arch,
+                &symbol_map,
+                r2engine::EngineSymbolicConfigProfile::PathListing,
+                r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
+            ),
+            compile_semantics: true,
+        })
     }));
 
-    let (summary, compiled) = match explore_result {
+    let response = match explore_result {
         Ok(r) => r,
         Err(err) => {
             return sym_panic_json("symbolic execution failed", err);
@@ -2761,13 +2586,13 @@ pub extern "C" fn r2sym_function_scope(
     };
 
     let output = build_sym_exec_summary(
-        &summary.stats,
-        &summary.solver_stats,
-        summary.feasible_paths,
+        &response.summary.stats,
+        &response.summary.solver_stats,
+        response.summary.feasible_paths,
         assumption_usage,
         assumption_conditioned,
         false,
-        Some(&compiled),
+        response.compiled.as_ref(),
     );
     match serde_json::to_string_pretty(&output) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
@@ -2801,7 +2626,7 @@ pub extern "C" fn r2sym_compile_semantics_scope(
     };
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
-    let query_config = sym_default_query_config();
+    let query_config = r2engine::default_symbolic_query_config(merge_states_enabled());
     let compiled = r2sym::compile_semantic_artifact_with_scope(
         &z3_ctx,
         prepared,
@@ -2842,40 +2667,41 @@ pub extern "C" fn r2sym_paths_scope(
     };
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
-    let mut query_config = sym_paths_query_config(prepared);
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_scope_state_for_arch(&mut initial_state, prepared, &scope, ctx_view.arch);
-        let query_policy =
-            tune_query_config_for_state(&mut query_config, prepared, &initial_state, None);
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        let summary = explorer.summarize_function(prepared, initial_state);
-        (summary, explorer)
+        crate::types::engine_session().symbolic_paths(r2engine::EngineSymbolicPathsRequest {
+            context: engine_symbolic_context(
+                &z3_ctx,
+                prepared,
+                Some(&scope),
+                ctx_view.arch,
+                &symbol_map,
+                r2engine::EngineSymbolicConfigProfile::PathListing,
+                r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
+            ),
+        })
     }));
 
-    let (summary, explorer) = match explore_result {
+    let response = match explore_result {
         Ok(r) => r,
         Err(err) => {
             return sym_panic_json("symbolic execution failed", err);
         }
     };
 
-    let solution_limit = sym_paths_solution_limit(summary.paths.len(), prepared);
-    let paths: Vec<PathInfo> = summary
+    let paths: Vec<PathInfo> = response
+        .summary
         .paths
         .iter()
         .enumerate()
-        .map(|(i, r)| path_info_from_result_with_solution(i, r, &explorer, i < solution_limit))
+        .map(|(i, r)| {
+            path_info_from_result_with_solution(
+                i,
+                r,
+                &response.explorer,
+                i < response.solution_limit,
+            )
+        })
         .collect();
     match serde_json::to_string_pretty(&paths) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
@@ -2909,72 +2735,39 @@ pub extern "C" fn r2sym_explore_to_scope(
         return sym_error_json("failed to build root SSA function");
     };
     let symbol_map = symbol_map_snapshot();
-    let mut query_config = sym_default_query_config();
 
     let z3_ctx = Context::thread_local();
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
-            &z3_ctx,
-            prepared,
-            Some(&scope),
-            target_addr,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-        );
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_scope_state_for_arch(&mut initial_state, prepared, &scope, ctx_view.arch);
-        let selected_route =
-            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
-                z3_ctx: &z3_ctx,
-                prepared,
-                scope: Some(&scope),
-                compiled: &compiled,
+        let response = crate::types::engine_session().symbolic_target_explore(
+            r2engine::EngineTargetExploreRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
+                ),
                 target_addr,
-                arch: ctx_view.arch,
-                symbol_map: &symbol_map,
-                explore_config: query_config.explore.clone(),
-                summary_profile: query_config.summary_profile,
-                assumption_conflicted: prepared_assumption_conflicted(prepared),
-            });
-        let query_policy = tune_query_config_for_state(
-            &mut query_config,
-            prepared,
-            &initial_state,
-            Some(&selected_route),
+            },
         );
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        let reach = explorer.can_reach_with_artifact_in_scope(
-            prepared,
-            Some(&scope),
-            Some(&compiled),
-            initial_state,
-            target_addr,
-        );
-        let paths: Vec<PathInfo> = reach
+        let paths: Vec<PathInfo> = response
+            .reach
             .paths
             .iter()
             .enumerate()
-            .map(|(i, r)| path_info_from_result(i, r, &explorer))
+            .map(|(i, r)| path_info_from_result(i, r, &response.explorer))
             .collect();
         (
             paths,
-            reach.stats,
-            reach.solver_stats,
-            reach.assumption_usage,
-            reach.assumption_conditioned,
-            reach.summary_conditioned,
-            reach.selected_route,
-            compiled.clone(),
+            response.reach.stats,
+            response.reach.solver_stats,
+            response.reach.assumption_usage,
+            response.reach.assumption_conditioned,
+            response.reach.summary_conditioned,
+            response.selected_route,
+            response.compiled,
         )
     }));
 
@@ -3052,7 +2845,6 @@ pub extern "C" fn r2sym_solve_to_scope(
         prepared.call_sites().by_id.len()
     ));
     let symbol_map = symbol_map_snapshot();
-    let mut query_config = sym_default_query_config();
     let z3_ctx = Context::thread_local();
     solve_pipeline_debug_log(&format!(
         "solve_to_scope:compile_begin target={:#x}",
@@ -3060,96 +2852,75 @@ pub extern "C" fn r2sym_solve_to_scope(
     ));
 
     let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
-            &z3_ctx,
-            prepared,
-            Some(&scope),
-            target_addr,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
+        let response = crate::types::engine_session().symbolic_target_solve(
+            r2engine::EngineTargetSolveRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
+                ),
+                target_addr,
+            },
         );
         solve_pipeline_debug_log(&format!(
             "solve_to_scope:compile_done stage={:?} route={:?}",
-            compiled.stage,
-            compiled.target_query_route_plan(target_addr)
+            response.compiled.stage,
+            response.compiled.target_query_route_plan(target_addr)
         ));
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, entry_addr);
-        r2sym::seed_scope_state_for_arch(&mut initial_state, prepared, &scope, ctx_view.arch);
         solve_pipeline_debug_stage("solve_to_scope:seed_ready");
-        let selected_route =
-            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
-                z3_ctx: &z3_ctx,
-                prepared,
-                scope: Some(&scope),
-                compiled: &compiled,
-                target_addr,
-                arch: ctx_view.arch,
-                symbol_map: &symbol_map,
-                explore_config: query_config.explore.clone(),
-                summary_profile: query_config.summary_profile,
-                assumption_conflicted: prepared_assumption_conflicted(prepared),
-            });
-        let query_policy = tune_query_config_for_state(
-            &mut query_config,
-            prepared,
-            &initial_state,
-            Some(&selected_route),
-        );
         solve_pipeline_debug_log(&format!(
             "solve_to_scope:query_config max_states={} max_depth={} timeout_ms={}",
-            query_config.explore.max_states,
-            query_config.explore.max_depth,
-            query_config
-                .explore
+            response.query_policy.max_states,
+            response.query_policy.max_depth,
+            response
+                .query_policy
                 .timeout
                 .map(|timeout| timeout.as_millis())
                 .unwrap_or(0)
         ));
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
         solve_pipeline_debug_stage("solve_to_scope:hooks_ready");
-        let solve = explorer.solve_for_target_with_artifact_in_scope(
-            prepared,
-            Some(&scope),
-            Some(&compiled),
-            initial_state,
-            target_addr,
-        );
         solve_pipeline_debug_log(&format!(
             "solve_to_scope:solve_done status={:?} matched={} explored={} route={:?}",
-            solve.status,
-            solve.matched_paths.len(),
-            solve.stats.states_explored,
-            solve.selected_route
+            response.solve.status,
+            response.solve.matched_paths.len(),
+            response.solve.stats.states_explored,
+            response.solve.selected_route
         ));
-        let selected = solve
+        let selected = response
+            .solve
             .selected_path_index
-            .and_then(|idx| solve.matched_paths.get(idx).map(|path| (idx, path)))
+            .and_then(|idx| {
+                response
+                    .solve
+                    .matched_paths
+                    .get(idx)
+                    .map(|path| (idx, path))
+            })
             .map(|(idx, path)| {
-                path_info_from_result_with_solution(idx, path, &explorer, solve_found(solve.status))
+                path_info_from_result_with_solution(
+                    idx,
+                    path,
+                    &response.explorer,
+                    solve_found(response.solve.status),
+                )
             });
         (
-            solve.status,
-            solve.matched_paths.len(),
+            response.solve.status,
+            response.solve.matched_paths.len(),
             selected,
-            solve.verification,
-            solve.witness,
-            solve.stats,
-            solve.solver_stats,
-            solve.assumption_usage,
-            solve.assumption_conditioned,
-            solve.summary_conditioned,
-            solve.selected_route,
-            compiled.clone(),
+            response.solve.verification,
+            response.solve.witness,
+            response.solve.stats,
+            response.solve.solver_stats,
+            response.solve.assumption_usage,
+            response.solve.assumption_conditioned,
+            response.solve.summary_conditioned,
+            response.selected_route,
+            response.compiled,
         )
     }));
 
@@ -3245,39 +3016,34 @@ pub extern "C" fn r2sym_run_spec_json_scope(
     let (assumption_usage, assumption_conditioned) = prepared_assumption_conditioning(prepared);
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
-    let mut default_config = sym_default_query_config();
 
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let start_pc = spec.start_pc(entry_addr)?;
-        let mut initial_state = r2sym::SymState::new(&z3_ctx, start_pc);
-        r2sym::seed_scope_state_for_arch(&mut initial_state, prepared, &scope, ctx_view.arch);
-        spec.apply_to_state(&mut initial_state);
-        let query_policy =
-            tune_query_config_for_state(&mut default_config, prepared, &initial_state, None);
-
-        let mut explorer = r2sym::PathExplorer::with_config(
-            &z3_ctx,
-            spec.to_explore_config(&default_config.explore),
-        );
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            default_config.summary_profile,
-            &query_policy,
-        );
-        let result = explorer.run_spec(prepared, initial_state, &spec)?;
-        let stats = explorer.stats().clone();
-        let solver_stats = explorer.solver().stats();
-        let found_paths = result
+        let response =
+            crate::types::engine_session().symbolic_run_spec(r2engine::EngineRunSpecRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Scope { entry_addr },
+                ),
+                spec: &spec,
+            })?;
+        let found_paths = response
+            .result
             .found_paths
             .iter()
             .enumerate()
-            .map(|(idx, path)| run_path_info_from_result(idx, path, &explorer))
+            .map(|(idx, path)| run_path_info_from_result(idx, path, &response.explorer))
             .collect::<Vec<_>>();
-        Ok::<_, String>((result, stats, solver_stats, found_paths))
+        Ok::<_, String>((
+            response.result,
+            response.stats,
+            response.solver_stats,
+            found_paths,
+        ))
     }));
 
     let (result, stats, solver_stats, found_paths) = match run_result {
@@ -3348,73 +3114,43 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
         return sym_error_json("failed to build root SSA function");
     };
     let symbol_map = symbol_map_snapshot();
-    let mut query_config = sym_default_query_config();
     let start_pc = replay_seed.entry_pc.unwrap_or(entry_addr);
     let z3_ctx = Context::thread_local();
 
     let explore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
-            &z3_ctx,
-            prepared,
-            Some(&scope),
-            target_addr,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-        );
-        let initial_state =
-            build_replay_seeded_state(&z3_ctx, entry_addr, prepared, ctx_view.arch, &replay_seed);
-        let selected_route =
-            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
-                z3_ctx: &z3_ctx,
-                prepared,
-                scope: Some(&scope),
-                compiled: &compiled,
+        let response = crate::types::engine_session().symbolic_target_explore(
+            r2engine::EngineTargetExploreRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Replay {
+                        entry_addr,
+                        seed: &replay_seed,
+                    },
+                ),
                 target_addr,
-                arch: ctx_view.arch,
-                symbol_map: &symbol_map,
-                explore_config: query_config.explore.clone(),
-                summary_profile: query_config.summary_profile,
-                assumption_conflicted: prepared_assumption_conflicted(prepared),
-            });
-        let query_policy = tune_query_config_for_state(
-            &mut query_config,
-            prepared,
-            &initial_state,
-            Some(&selected_route),
+            },
         );
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        let reach = explorer.can_reach_with_artifact_in_scope(
-            prepared,
-            Some(&scope),
-            Some(&compiled),
-            initial_state,
-            target_addr,
-        );
-        let paths: Vec<PathInfo> = reach
+        let paths: Vec<PathInfo> = response
+            .reach
             .paths
             .iter()
             .enumerate()
-            .map(|(i, r)| path_info_from_result(i, r, &explorer))
+            .map(|(i, r)| path_info_from_result(i, r, &response.explorer))
             .collect();
         (
             paths,
-            reach.stats,
-            reach.solver_stats,
-            reach.assumption_usage,
-            reach.assumption_conditioned,
-            reach.summary_conditioned,
-            reach.selected_route,
-            compiled.clone(),
+            response.reach.stats,
+            response.reach.solver_stats,
+            response.reach.assumption_usage,
+            response.reach.assumption_conditioned,
+            response.reach.summary_conditioned,
+            response.selected_route,
+            response.compiled,
         )
     }));
 
@@ -3492,78 +3228,58 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
         return sym_error_json("failed to build root SSA function");
     };
     let symbol_map = symbol_map_snapshot();
-    let mut query_config = sym_default_query_config();
     let start_pc = replay_seed.entry_pc.unwrap_or(entry_addr);
     let z3_ctx = Context::thread_local();
 
     let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope_and_replay_seed(
-            &z3_ctx,
-            prepared,
-            Some(&scope),
-            target_addr,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            Some(&replay_seed),
-        );
-        let initial_state =
-            build_replay_seeded_state(&z3_ctx, entry_addr, prepared, ctx_view.arch, &replay_seed);
-        let selected_route =
-            r2engine::target_query_route_decision(r2engine::EngineTargetQueryRouteRequest {
-                z3_ctx: &z3_ctx,
-                prepared,
-                scope: Some(&scope),
-                compiled: &compiled,
+        let response = crate::types::engine_session().symbolic_target_solve(
+            r2engine::EngineTargetSolveRequest {
+                context: engine_symbolic_context(
+                    &z3_ctx,
+                    prepared,
+                    Some(&scope),
+                    ctx_view.arch,
+                    &symbol_map,
+                    r2engine::EngineSymbolicConfigProfile::DefaultQuery,
+                    r2engine::EngineSymbolicStateSeed::Replay {
+                        entry_addr,
+                        seed: &replay_seed,
+                    },
+                ),
                 target_addr,
-                arch: ctx_view.arch,
-                symbol_map: &symbol_map,
-                explore_config: query_config.explore.clone(),
-                summary_profile: query_config.summary_profile,
-                assumption_conflicted: prepared_assumption_conflicted(prepared),
-            });
-        let query_policy = tune_query_config_for_state(
-            &mut query_config,
-            prepared,
-            &initial_state,
-            Some(&selected_route),
+            },
         );
-        let mut explorer = query_config.make_explorer(&z3_ctx);
-        r2sym::install_symbolic_hooks_for_query_policy(
-            &mut explorer,
-            &z3_ctx,
-            &scope,
-            ctx_view.arch,
-            &symbol_map,
-            query_config.summary_profile,
-            &query_policy,
-        );
-        let solve = explorer.solve_for_target_with_artifact_in_scope(
-            prepared,
-            Some(&scope),
-            Some(&compiled),
-            initial_state,
-            target_addr,
-        );
-        let selected = solve
+        let selected = response
+            .solve
             .selected_path_index
-            .and_then(|idx| solve.matched_paths.get(idx).map(|path| (idx, path)))
+            .and_then(|idx| {
+                response
+                    .solve
+                    .matched_paths
+                    .get(idx)
+                    .map(|path| (idx, path))
+            })
             .map(|(idx, path)| {
-                path_info_from_result_with_solution(idx, path, &explorer, solve_found(solve.status))
+                path_info_from_result_with_solution(
+                    idx,
+                    path,
+                    &response.explorer,
+                    solve_found(response.solve.status),
+                )
             });
         (
-            solve.status,
-            solve.matched_paths.len(),
+            response.solve.status,
+            response.solve.matched_paths.len(),
             selected,
-            solve.verification,
-            solve.witness,
-            solve.stats,
-            solve.solver_stats,
-            solve.assumption_usage,
-            solve.assumption_conditioned,
-            solve.summary_conditioned,
-            solve.selected_route,
-            compiled.clone(),
+            response.solve.verification,
+            response.solve.witness,
+            response.solve.stats,
+            response.solve.solver_stats,
+            response.solve.assumption_usage,
+            response.solve.assumption_conditioned,
+            response.solve.summary_conditioned,
+            response.selected_route,
+            response.compiled,
         )
     }));
 
