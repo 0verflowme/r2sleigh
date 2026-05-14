@@ -3593,6 +3593,28 @@ pub extern "C" fn r2dec_named_native_worker_summary(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_direct_named_worker_decompile_summary_ffi(
+    ctx: *const R2ILContext,
+    fcn_addr: u64,
+    fcn_name: *const c_char,
+) -> *mut c_char {
+    let Some(ctx_view) = context::require_ctx_view(ctx) else {
+        return ptr::null_mut();
+    };
+    let function_name = helpers::resolve_function_name(fcn_addr, fcn_name);
+    let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
+    let output = decompiler::render_direct_named_native_worker_summary(
+        fcn_addr,
+        &function_name,
+        ctx_view.arch,
+        ptr_bits,
+    );
+    output
+        .and_then(|output| CString::new(output).ok())
+        .map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn r2dec_named_native_worker_summary_direct(
     ctx: *const R2ILContext,
     fcn_addr: u64,

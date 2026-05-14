@@ -107,32 +107,16 @@ pub(crate) fn render_direct_named_native_worker_summary(
     arch: Option<&r2il::ArchSpec>,
     ptr_bits: u32,
 ) -> Option<String> {
-    let (arch_name, _, config) = r2dec::DecompilerConfig::for_arch(arch);
+    let (_, _, config) = r2dec::DecompilerConfig::for_arch(arch);
     let parsed_context = r2types::ParsedExternalContext::default();
-    let projection = r2engine::native_worker_type_projection(
-        function_addr,
-        function_name,
-        &arch_name,
-        ptr_bits,
-        &parsed_context,
-        true,
-    )?;
-    let cfg_summary = r2ssa::CFGRiskSummary {
-        block_count: 0,
-        loop_count: 0,
-        back_edge_count: 0,
-        switch_block_count: 0,
-        max_switch_cases: 0,
-    };
     crate::types::engine_session()
-        .decompile_summary(r2engine::EngineSummaryDecompileRequest {
-            function_name: function_name.to_string(),
-            cfg_summary,
-            function_facts: projection.function_facts,
-            named_worker_guarded: true,
+        .decompile_direct_named_worker_summary(r2engine::EngineDirectNamedWorkerDecompileRequest {
+            function_addr,
+            function_name,
+            arch,
+            ptr_bits,
+            parsed_context: &parsed_context,
             config,
-            render_cache_key: None,
-            fallback_comment: None,
         })
         .map(|response| response.output)
 }

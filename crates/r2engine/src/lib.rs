@@ -100,7 +100,16 @@ impl EngineFunctionIdentity {
     pub fn summary_probe_name(&self) -> &str {
         self.aliases
             .iter()
-            .find(|alias| has_seeded_summary_family(self.function_addr, alias))
+            .find(|alias| {
+                should_use_direct_named_native_worker_decompile(alias)
+                    || (has_seeded_summary_family(self.function_addr, alias)
+                        && !is_anonymous_engine_route_name(alias))
+            })
+            .or_else(|| {
+                self.aliases
+                    .iter()
+                    .find(|alias| has_seeded_summary_family(self.function_addr, alias))
+            })
             .map(String::as_str)
             .unwrap_or_else(|| self.primary_name())
     }
@@ -877,6 +886,15 @@ pub struct EngineSummaryPreprobeRequest<'a> {
     pub fallback_if_guarded_without_summary: bool,
 }
 
+pub struct EngineDirectNamedWorkerDecompileRequest<'a> {
+    pub function_addr: u64,
+    pub function_name: &'a str,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub ptr_bits: u32,
+    pub parsed_context: &'a r2types::ParsedExternalContext,
+    pub config: r2dec::DecompilerConfig,
+}
+
 pub struct EngineTypePreprobeRequest<'a> {
     pub blocks: &'a [R2ILBlock],
     pub function_addr: u64,
@@ -1470,10 +1488,19 @@ impl EngineSession {
         } else {
             display_name
         };
-        let identity = EngineFunctionIdentity::new(
+        let identity_aliases = [
+            function_names
+                .get(&analysis_request.function_addr)
+                .map(String::as_str),
+            symbols
+                .get(&analysis_request.function_addr)
+                .map(String::as_str),
+        ];
+        let identity = EngineFunctionIdentity::with_aliases(
             analysis_request.function_addr,
             &canonical_name,
             &display_name,
+            identity_aliases.into_iter().flatten(),
         );
         let probe = decompile_probe_decision_for_identity(&analysis_request.blocks, &identity);
         let artifact_key = function_artifact_cache_key(&analysis_request);
@@ -1799,6 +1826,46 @@ impl EngineSession {
             config: request.config,
             render_cache_key: Some(render_cache_key),
             fallback_comment,
+        })
+    }
+
+    pub fn decompile_direct_named_worker_summary(
+        &self,
+        request: EngineDirectNamedWorkerDecompileRequest<'_>,
+    ) -> Option<EngineDecompileResponse> {
+        let identity =
+            EngineFunctionIdentity::from_name(request.function_addr, request.function_name);
+        if !identity
+            .name_candidates()
+            .any(should_use_direct_named_native_worker_decompile)
+        {
+            return None;
+        }
+
+        let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
+        let projection = native_worker_type_projection_for_identity(
+            &identity,
+            &arch_name,
+            request.ptr_bits,
+            request.parsed_context,
+            true,
+        )?;
+        let cfg_summary = CFGRiskSummary {
+            block_count: 0,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+
+        self.decompile_summary(EngineSummaryDecompileRequest {
+            function_name: identity.primary_name().to_string(),
+            cfg_summary,
+            function_facts: projection.function_facts,
+            named_worker_guarded: true,
+            config: request.config,
+            render_cache_key: None,
+            fallback_comment: None,
         })
     }
 
@@ -2958,19 +3025,28 @@ pub fn decompile_probe_decision_for_identity(
         r2sym::has_program_orchestrator_summary_family(&identity.display_name);
     let canonical_program_orchestrator_family =
         r2sym::has_program_orchestrator_summary_family(&identity.canonical_name);
+    let summary_family =
+        display_summary_family || canonical_summary_family || identity.has_summary_family();
     let program_orchestrator_family = display_program_orchestrator_family
         || canonical_program_orchestrator_family
         || identity.has_program_orchestrator_family();
     let program_orchestrator_guarded = program_orchestrator_family
         && should_guard_program_orchestrator_decompile(blocks.len(), op_count);
-    let named_worker_guarded =
-        (display_summary_family || canonical_summary_family || identity.has_summary_family())
-            && (!program_orchestrator_family || program_orchestrator_guarded);
     let summary_probe_name = identity.summary_probe_name().to_string();
-    let skipped_large_cfg_guarded =
-        cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512;
-    let block_guarded =
-        named_worker_guarded || skipped_large_cfg_guarded || blocks.len() >= 8 && op_count > 128;
+    let prefer_full_named_worker = identity
+        .name_candidates()
+        .any(should_prefer_full_decompile_for_named_worker);
+    let skipped_large_cfg_guarded = !prefer_full_named_worker
+        && (cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512);
+    let direct_named_worker_guarded = identity
+        .name_candidates()
+        .any(should_use_direct_named_native_worker_decompile);
+    let named_worker_guarded = summary_family
+        && (direct_named_worker_guarded
+            || skipped_large_cfg_guarded
+            || program_orchestrator_guarded)
+        && (!program_orchestrator_family || program_orchestrator_guarded);
+    let block_guarded = named_worker_guarded || skipped_large_cfg_guarded;
     let summary_probe_needed = block_guarded || cfg_guard_reason.is_some();
 
     DecompileProbeDecision {
@@ -2997,15 +3073,105 @@ fn has_seeded_summary_family(function_addr: u64, name: &str) -> bool {
 
 pub fn should_use_direct_named_native_worker_decompile(function_name: &str) -> bool {
     let name = normalize_engine_route_name(function_name);
+    if is_direct_fileinfo_sort_comparator(&name) || is_direct_allocation_wrapper(&name) {
+        return true;
+    }
     matches!(
         name.as_str(),
-        "cycle_check"
+        "alloc_ibuf"
+            | "alloc_obuf"
+            | "check_tuning"
+            | "close_stream"
+            | "compare"
+            | "create_hard_link"
+            | "cycle_check"
+            | "__do_global_dtors_aux"
+            | "deregister_tm_clones"
+            | "entry.fini0"
+            | "entry0"
+            | "exit_cleanup"
+            | "file_prefixlen"
+            | "filename_unescape"
+            | "flush_stdout"
+            | "fopen_safer"
+            | "format_user_or_group"
+            | "getmonth"
+            | "has_xattr"
+            | "hwcap_allowed"
+            | "imaxtostr"
             | "init_node"
+            | "_init"
+            | "key_to_opts"
+            | "localtime_rz"
+            | "maybe_close_stdout"
+            | "memcoll"
             | "mergefiles"
+            | "num_processors_via_affinity_mask"
+            | "operand_matches"
+            | "process_signals"
+            | "print_stats"
+            | "quotearg_free"
+            | "reap"
+            | "record_file"
+            | "register_tm_clones"
+            | "rpl_fflush"
+            | "rpl_fseeko"
             | "rpl_nanosleep"
+            | "rpl_obstack_allocated_p"
+            | "rpl_obstack_free"
+            | "save_token"
+            | "set_file_security_ctx"
+            | "tzalloc"
+            | "umaxtostr"
             | "xinmalloc"
+            | "xget_version"
+            | "xmemcoll"
             | "xnmalloc"
+            | "xstrxfrm"
+            | "xstrtol_fatal"
             | "xnrealloc"
+    )
+}
+
+fn is_direct_fileinfo_sort_comparator(name: &str) -> bool {
+    name.starts_with("xstrcoll_df_")
+        || name.starts_with("rev_xstrcoll_df_")
+        || name.starts_with("strcmp_df_")
+        || name.starts_with("rev_strcmp_df_")
+}
+
+fn is_direct_allocation_wrapper(name: &str) -> bool {
+    matches!(
+        name,
+        "xmalloc"
+            | "ximalloc"
+            | "xcharalloc"
+            | "xrealloc"
+            | "xirealloc"
+            | "xreallocarray"
+            | "rpl_reallocarray"
+            | "xnrealloc"
+            | "xnmalloc"
+            | "xinmalloc"
+            | "x2realloc"
+            | "x2nrealloc"
+            | "xpalloc"
+            | "xzalloc"
+            | "xizalloc"
+            | "xcalloc"
+            | "xicalloc"
+            | "xmemdup"
+            | "ximemdup"
+            | "ximemdup0"
+            | "xstrdup"
+            | "xalloc_die"
+    )
+}
+
+fn should_prefer_full_decompile_for_named_worker(function_name: &str) -> bool {
+    matches!(
+        normalize_engine_route_name(function_name).as_str(),
+        "diagnose"
     )
 }
 
@@ -3034,6 +3200,18 @@ fn normalize_engine_route_name(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+fn is_anonymous_engine_route_name(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    let base = normalized
+        .strip_prefix("sym.")
+        .or_else(|| normalized.strip_prefix("dbg."))
+        .unwrap_or(&normalized);
+    base.starts_with("fcn.")
+        || base.starts_with("fcn_")
+        || base.starts_with("sub.")
+        || base.starts_with("sub_")
 }
 
 pub fn should_guard_program_orchestrator_decompile(block_count: usize, op_count: usize) -> bool {
@@ -3153,11 +3331,12 @@ pub fn type_facts_with_summary_projection_for_candidates<'a>(
     ptr_bits: u32,
     semantic_artifact: &r2sym::SemanticArtifact,
 ) -> FunctionTypeFacts {
-    let current_param_count = type_facts
+    let signature_param_count = type_facts
         .merged_signature
         .as_ref()
         .map(|signature| signature.params.len())
         .unwrap_or_default();
+    let current_param_count = signature_param_count.max(type_facts.register_params.len());
     let mut candidates = Vec::new();
     for candidate in name_candidates {
         let candidate = candidate.trim();
@@ -4842,7 +5021,7 @@ mod tests {
     }
 
     #[test]
-    fn decompile_probe_decision_probes_medium_op_workers() {
+    fn decompile_probe_decision_keeps_medium_non_workers_on_full_route() {
         let mut blocks = (0..8)
             .map(|idx| R2ILBlock::new(0x6000 + idx, 1))
             .collect::<Vec<_>>();
@@ -4854,13 +5033,31 @@ mod tests {
         }
 
         let decision =
-            decompile_probe_decision(&blocks, 0x6000, "dbg.key_to_opts", "dbg.key_to_opts");
+            decompile_probe_decision(&blocks, 0x6000, "dbg.medium_helper", "dbg.medium_helper");
 
-        assert!(decision.block_guarded);
-        assert!(decision.summary_probe_needed);
+        assert!(!decision.block_guarded);
+        assert!(!decision.summary_probe_needed);
         assert!(!decision.summary_probe_skipped_large_cfg);
-        assert_eq!(decision.summary_probe_name, "dbg.key_to_opts");
+        assert_eq!(decision.summary_probe_name, "dbg.medium_helper");
         assert!(!decision.named_worker_guarded);
+    }
+
+    #[test]
+    fn decompile_probe_decision_prefers_full_diagnostic_wrappers() {
+        let mut blocks = const_return_blocks(0x4bc0, 0);
+        for idx in 0..600 {
+            blocks[0].push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(0x200 + idx, 8),
+                src: r2il::Varnode::constant(idx, 8),
+            });
+        }
+
+        let decision = decompile_probe_decision(&blocks, 0x4bc0, "sym.diagnose", "sym.diagnose");
+
+        assert!(decision.display_summary_family);
+        assert!(!decision.block_guarded);
+        assert!(!decision.summary_probe_needed);
+        assert!(!decision.summary_probe_skipped_large_cfg);
     }
 
     #[test]
@@ -4888,7 +5085,24 @@ mod tests {
     }
 
     #[test]
-    fn direct_named_worker_decompile_fastpath_is_limited_to_timeout_prone_families() {
+    fn function_identity_uses_address_name_aliases_for_route_policy() {
+        let identity = EngineFunctionIdentity::with_aliases(
+            0x8b50,
+            "fcn.00008b50",
+            "fcn.00008b50",
+            ["dbg.key_to_opts"],
+        );
+
+        assert!(
+            identity
+                .name_candidates()
+                .any(should_use_direct_named_native_worker_decompile)
+        );
+        assert_eq!(identity.summary_probe_name(), "dbg.key_to_opts");
+    }
+
+    #[test]
+    fn direct_named_worker_decompile_fastpath_covers_noisy_summary_owned_families() {
         assert!(should_use_direct_named_native_worker_decompile(
             "dbg.init_node"
         ));
@@ -4913,11 +5127,70 @@ mod tests {
         assert!(should_use_direct_named_native_worker_decompile(
             "dbg.cycle_check"
         ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.key_to_opts"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.file_prefixlen"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "sym.operand_matches"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.xstrcoll_df_version"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.rev_strcmp_df_mtime"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile("entry0"));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "sym.register_tm_clones"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.save_token"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.filename_unescape"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "sym.compare"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.close_stream"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.rpl_fseeko"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile("dbg.reap"));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.record_file"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.quotearg_free"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.num_processors_via_affinity_mask"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "sym.format_user_or_group"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "entry.fini0"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "sym.xmalloc"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.rpl_reallocarray"
+        ));
         assert!(!should_use_direct_named_native_worker_decompile(
             "dbg.hash_initialize"
         ));
         assert!(!should_use_direct_named_native_worker_decompile(
             "dbg.canonicalize_filename_mode"
+        ));
+        assert!(should_prefer_full_decompile_for_named_worker(
+            "sym.diagnose"
         ));
     }
 
@@ -4932,9 +5205,51 @@ mod tests {
         assert!(should_use_direct_named_native_worker_type_projection(
             "randread"
         ));
-        assert!(!should_use_direct_named_native_worker_type_projection(
+        assert!(should_use_direct_named_native_worker_type_projection(
             "sym.sha256_process_block"
         ));
+    }
+
+    #[test]
+    fn direct_named_worker_decompile_summary_renders_without_blocks() {
+        let (_, ptr_bits, config) = r2dec::DecompilerConfig::for_arch(None);
+        let parsed_context = r2types::ParsedExternalContext::default();
+        let response = EngineSession::new(4)
+            .decompile_direct_named_worker_summary(EngineDirectNamedWorkerDecompileRequest {
+                function_addr: 0x8b50,
+                function_name: "dbg.init_node",
+                arch: None,
+                ptr_bits,
+                parsed_context: &parsed_context,
+                config,
+            })
+            .expect("direct init_node summary");
+
+        assert!(response.output.contains("init_node"));
+        assert!(response.output.contains("r2dec summary:"));
+        assert!(response.output.contains("worker summary:"));
+        assert!(matches!(
+            response.decision.plan,
+            EnginePlan::SemanticSummary
+        ));
+    }
+
+    #[test]
+    fn direct_named_worker_decompile_summary_rejects_full_route_names() {
+        let (_, ptr_bits, config) = r2dec::DecompilerConfig::for_arch(None);
+        let parsed_context = r2types::ParsedExternalContext::default();
+        let response = EngineSession::new(4).decompile_direct_named_worker_summary(
+            EngineDirectNamedWorkerDecompileRequest {
+                function_addr: 0x401000,
+                function_name: "sym.diagnose",
+                arch: None,
+                ptr_bits,
+                parsed_context: &parsed_context,
+                config,
+            },
+        );
+
+        assert!(response.is_none());
     }
 
     #[test]
@@ -5036,6 +5351,45 @@ mod tests {
                 .as_deref(),
             Some("size_t")
         );
+    }
+
+    #[test]
+    fn summary_projection_uses_register_params_when_signature_is_absent() {
+        let summary = native_worker_summary_seed(0x401000, "sym.diagnose")
+            .expect("expected diagnostic summary seed");
+        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
+            .expect("expected diagnostic summary artifact");
+        let type_facts = FunctionTypeFacts {
+            register_params: [
+                "rdi", "rsi", "rdx", "rcx", "r8", "r9", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, reg)| r2types::ExternalRegisterParamSpec {
+                name: format!("arg{}", idx + 1),
+                ty: None,
+                reg: reg.to_string(),
+            })
+            .collect(),
+            ..FunctionTypeFacts::default()
+        };
+
+        let projected = type_facts_with_summary_projection_for_candidates(
+            type_facts,
+            "sym.diagnose",
+            ["sym.diagnose"],
+            "x86-64",
+            64,
+            &artifact,
+        );
+        let signature = projected
+            .merged_signature
+            .expect("diagnostic summary should project a signature");
+
+        assert_eq!(signature.params.len(), 11);
+        assert_eq!(signature.params[0].name, "errnum");
+        assert_eq!(signature.params[1].name, "fmt");
+        assert_eq!(signature.params[10].name, "diag_value9");
     }
 
     #[test]

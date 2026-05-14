@@ -332,7 +332,10 @@ pub fn function_type_facts_from_parsed_context(
     function_name: &str,
     parsed_context: &ParsedExternalContext,
 ) -> FunctionTypeFacts {
-    let mut merged_signature = parsed_context.merged_signature.clone();
+    let mut merged_signature = parsed_context
+        .merged_signature
+        .clone()
+        .or_else(|| parsed_context.current_signature.clone());
     apply_main_signature_override(function_name, &mut merged_signature);
     FunctionTypeFacts {
         merged_signature,
@@ -1152,6 +1155,51 @@ mod tests {
             render_signature_type(helper.params[0].ty.as_ref().unwrap(), 64),
             "int8_t*"
         );
+    }
+
+    #[test]
+    fn function_type_facts_preserve_current_signature_when_no_merged_signature() {
+        let parsed = ParsedExternalContext {
+            current_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                    bits: 8,
+                    signedness: crate::Signedness::Signed,
+                }))),
+                params: vec![
+                    FunctionParamSpec {
+                        name: "name".to_string(),
+                        ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                            bits: 8,
+                            signedness: crate::Signedness::Signed,
+                        }))),
+                    },
+                    FunctionParamSpec {
+                        name: "can_mode".to_string(),
+                        ty: Some(CTypeLike::Typedef("canonicalize_mode_t".to_string())),
+                    },
+                ],
+            }),
+            merged_signature: None,
+            ..ParsedExternalContext::default()
+        };
+
+        let facts =
+            function_type_facts_from_parsed_context("dbg.canonicalize_filename_mode", &parsed);
+        let signature = facts
+            .merged_signature
+            .expect("current signature should seed function facts");
+
+        assert_eq!(
+            signature
+                .ret_type
+                .as_ref()
+                .map(|ty| render_signature_type(ty, 64))
+                .as_deref(),
+            Some("int8_t*")
+        );
+        assert_eq!(signature.params.len(), 2);
+        assert_eq!(signature.params[0].name, "name");
+        assert_eq!(signature.params[1].name, "can_mode");
     }
 
     #[test]

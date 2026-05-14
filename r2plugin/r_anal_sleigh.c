@@ -372,6 +372,7 @@ extern void r2sleigh_session_result_free(R2SleighSessionResult *result);
 extern char *r2sleigh_bounded_type_json_ffi(const R2ILContext *ctx, const char *fcn_name,
 	const char *reason, size_t global_max_links, size_t max_type_decls, size_t max_mutations);
 extern bool r2sleigh_has_native_worker_summary_family_ffi(const char *name);
+extern bool r2sleigh_direct_named_worker_decompile_ffi(const char *name);
 extern void r2sleigh_type_writeback_cache_clear(void);
 extern size_t r2sleigh_type_writeback_cache_len(void);
 extern int r2sleigh_type_writeback_cache_get(unsigned long long addr, unsigned long long *key,
@@ -419,6 +420,8 @@ extern char *r2dec_function_with_session_context(const R2SleighSessionInput *inp
 	const char *func_names_json, const char *strings_json, const char *symbols_json);
 extern char *r2dec_named_native_worker_summary(const R2ILContext *ctx, const R2ILBlock **blocks,
 	size_t num_blocks, unsigned long long fcn_addr, const char *func_name);
+extern char *r2sleigh_direct_named_worker_decompile_summary_ffi(const R2ILContext *ctx,
+	unsigned long long fcn_addr, const char *func_name);
 extern char *r2dec_named_native_worker_summary_direct(const R2ILContext *ctx,
 	unsigned long long fcn_addr, const char *func_name);
 extern char *r2sleigh_named_native_worker_type_json(const R2ILContext *ctx,
@@ -8336,17 +8339,16 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 				R_LOG_ERROR ("r2sleigh: no function at current address");
 			}
 			return strdup("");
-			}
-		bool named_worker_summary_family = r2sleigh_has_native_worker_summary_family_ffi (fcn->name);
-		char *direct_result = r2dec_named_native_worker_summary_direct (ctx, fcn->addr, fcn->name);
-		if (direct_result && direct_result[0]) {
-			if (cons) {
-				r_cons_printf (cons, "%s\n", direct_result);
-			}
-			r2il_string_free (direct_result);
-			return strdup ("");
 		}
+		char *direct_result = r2sleigh_direct_named_worker_decompile_summary_ffi (ctx, fcn->addr, fcn->name);
 		if (direct_result) {
+			if (direct_result[0]) {
+				if (cons) {
+					r_cons_printf (cons, "%s\n", direct_result);
+				}
+				r2il_string_free (direct_result);
+				return strdup("");
+			}
 			r2il_string_free (direct_result);
 		}
 		/* Lift all blocks */
@@ -8362,9 +8364,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			SymFunctionScope sym_scope;
 			SleighInterprocSeeds interproc_seeds;
 			bool have_sym_scope = false;
-			bool skip_helper_scope = should_skip_decompile_symbolic_scope (fcn);
-			R_LOG_DEBUG ("r2sleigh: decompile named_worker_summary_family=%d fcn=%s",
-				named_worker_summary_family? 1: 0, fcn->name? fcn->name: "");
+			bool skip_helper_scope = should_skip_decompile_symbolic_scope (fcn)
+				|| r2sleigh_direct_named_worker_decompile_ffi (fcn->name);
 			sleigh_interproc_seeds_init (&interproc_seeds);
 			if (!skip_helper_scope) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,

@@ -708,6 +708,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
         || is_path_family_name(&name)
         || is_directory_family_name(&name)
         || is_record_memory_family_name(&name)
+        || is_fileinfo_sort_comparator_family_name(&name)
     {
         return true;
     }
@@ -759,6 +760,12 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "mbrtoc32"
             | "rpl_mbrtowc"
             | "mbrtowc"
+            | "entry0"
+            | "entry.fini0"
+            | "__do_global_dtors_aux"
+            | "register_tm_clones"
+            | "deregister_tm_clones"
+            | "_init"
             | "xstrtoumax"
             | "xnumtoumax"
             | "xstrtoimax"
@@ -766,11 +773,16 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "strnumcmp"
             | "strintcmp"
             | "rpl_fopen"
+            | "fopen_safer"
+            | "rpl_fflush"
             | "openat_safer"
             | "rpl_nanosleep"
             | "rpl_fcntl"
             | "freopen_safer"
             | "stream_open"
+            | "close_stream"
+            | "rpl_fseeko"
+            | "maybe_close_stdout"
             | "gettext_quote"
             | "parse_long_options"
             | "parse_gnu_standard_options_only"
@@ -778,6 +790,42 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "parse_integer"
             | "parse_number"
             | "traverse_raw_number"
+            | "save_token"
+            | "filename_unescape"
+            | "compare"
+            | "memcoll"
+            | "xmemcoll"
+            | "print_stats"
+            | "create_hard_link"
+            | "record_file"
+            | "reap"
+            | "num_processors_via_affinity_mask"
+            | "process_signals"
+            | "exit_cleanup"
+            | "clear_files"
+            | "flush_stdout"
+            | "format_user_or_group"
+            | "xstrtol_fatal"
+            | "tzalloc"
+            | "xget_version"
+            | "rpl_obstack_free"
+            | "rpl_obstack_allocated_p"
+            | "has_xattr"
+            | "check_tuning"
+            | "imaxtostr"
+            | "umaxtostr"
+            | "hwcap_allowed"
+            | "file_prefixlen"
+            | "getmonth"
+            | "operand_matches"
+            | "xstrxfrm"
+            | "set_file_security_ctx"
+            | "localtime_rz"
+            | "locale_charset"
+            | "current_timespec"
+            | "rpl_obstack_memory_used"
+            | "alloc_ibuf"
+            | "alloc_obuf"
             | "synchronize_output"
             | "copy_with_unblock"
             | "copy_bytes"
@@ -941,7 +989,7 @@ pub fn has_program_orchestrator_summary_family(name: &str) -> bool {
     let Some(name) = normalize_semantic_summary_name(name) else {
         return false;
     };
-    matches!(name.as_str(), "main" | "wmain")
+    matches!(name.as_str(), "main" | "wmain" | "entry0" | "_start")
 }
 
 fn is_quotearg_family_name(name: &str) -> bool {
@@ -1010,6 +1058,7 @@ fn is_xalloc_family_name(name: &str) -> bool {
             | "xirealloc"
             | "xreallocarray"
             | "xireallocarray"
+            | "rpl_reallocarray"
             | "xnrealloc"
             | "xnmalloc"
             | "xinmalloc"
@@ -1088,6 +1137,13 @@ fn is_record_memory_family_name(name: &str) -> bool {
             | "write_output"
             | "write_zeros"
     )
+}
+
+fn is_fileinfo_sort_comparator_family_name(name: &str) -> bool {
+    name.starts_with("xstrcoll_df_")
+        || name.starts_with("rev_xstrcoll_df_")
+        || name.starts_with("strcmp_df_")
+        || name.starts_with("rev_strcmp_df_")
 }
 
 fn semantic_summary_name(summary: &FunctionSemanticSummary) -> Option<String> {
@@ -2670,7 +2726,7 @@ fn xalloc_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> 
             allocation_role_worker_summary(anchor, Some(1), false),
             metadata_probe_worker_summary(anchor, 0),
         ],
-        "xreallocarray" | "xireallocarray" | "xnrealloc" => vec![
+        "xreallocarray" | "xireallocarray" | "rpl_reallocarray" | "xnrealloc" => vec![
             allocation_role_worker_summary(anchor, None, false),
             metadata_probe_worker_summary(anchor, 0),
         ],
@@ -2777,6 +2833,210 @@ fn yesno_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     ]
 }
 
+fn token_buffer_finalize_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 0),
+        memory_write_worker_summary(anchor, 0, None),
+        global_lifetime_worker_summary(anchor),
+    ]
+}
+
+fn filename_unescape_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        token_parser_worker_summary(anchor, 0, Some(0), Some(1)),
+        string_scan_worker_summary(
+            anchor,
+            0,
+            Some(0),
+            Some(1),
+            NativeWorkerTerminator::LengthBound,
+        ),
+        memory_write_worker_summary(anchor, 0, Some(1)),
+    ]
+}
+
+fn line_compare_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 0),
+        table_walk_worker_summary(anchor, 1),
+        metadata_probe_worker_summary(anchor, 0),
+        metadata_probe_worker_summary(anchor, 1),
+    ]
+}
+
+fn memory_collation_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        memory_read_worker_summary(anchor, 0, Some(1)),
+        memory_read_worker_summary(anchor, 2, Some(3)),
+        numeric_transform_worker_summary(anchor, None, None, "collation_order"),
+    ]
+}
+
+fn create_hard_link_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        path_walk_worker_summary(anchor, 0),
+        path_walk_worker_summary(anchor, 2),
+        path_walk_worker_summary(anchor, 3),
+        path_walk_worker_summary(anchor, 5),
+        metadata_probe_worker_summary(anchor, 1),
+        metadata_probe_worker_summary(anchor, 4),
+        global_synchronization_worker_summary(anchor),
+    ]
+}
+
+fn record_file_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 0),
+        path_walk_worker_summary(anchor, 1),
+        metadata_probe_worker_summary(anchor, 2),
+        memory_write_worker_summary(anchor, 0, None),
+        allocation_role_worker_summary(anchor, None, false),
+    ]
+}
+
+fn reap_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        metadata_probe_worker_summary(anchor, 0),
+        global_synchronization_worker_summary(anchor),
+        numeric_transform_worker_summary(anchor, None, None, "child_pid"),
+    ]
+}
+
+fn format_user_or_group_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+        numeric_transform_worker_summary(anchor, None, None, "user_or_group_id"),
+        format_render_worker_summary(anchor, 0, None),
+    ]
+}
+
+fn obstack_free_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 0),
+        metadata_probe_worker_summary(anchor, 1),
+        global_lifetime_worker_summary(anchor),
+    ]
+}
+
+fn obstack_allocated_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 0),
+        metadata_probe_worker_summary(anchor, 1),
+        numeric_transform_worker_summary(anchor, None, None, "obstack_membership"),
+    ]
+}
+
+fn has_xattr_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+        metadata_probe_worker_summary(anchor, 1),
+        metadata_probe_worker_summary(anchor, 2),
+        path_walk_worker_summary(anchor, 3),
+    ]
+}
+
+fn integer_to_string_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        numeric_transform_worker_summary(anchor, Some(1), None, "integer_string"),
+        memory_write_worker_summary(anchor, 1, None),
+    ]
+}
+
+fn time_zone_alloc_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+        allocation_role_worker_summary(anchor, None, false),
+        global_table_walk_worker_summary(anchor),
+    ]
+}
+
+fn version_lookup_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+        string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::ZeroByte),
+        global_table_walk_worker_summary(anchor),
+    ]
+}
+
+fn file_prefixlen_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+        memory_write_worker_summary(anchor, 1, None),
+    ]
+}
+
+fn operand_match_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::Unknown),
+        string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::Unknown),
+        token_parser_worker_summary(anchor, 0, None, None),
+    ]
+}
+
+fn string_transform_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(
+            anchor,
+            1,
+            Some(0),
+            Some(2),
+            NativeWorkerTerminator::LengthBound,
+        ),
+        memory_write_worker_summary(anchor, 0, Some(2)),
+    ]
+}
+
+fn file_security_context_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        path_walk_worker_summary(anchor, 0),
+        metadata_probe_worker_summary(anchor, 2),
+    ]
+}
+
+fn localtime_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        metadata_probe_worker_summary(anchor, 0),
+        metadata_probe_worker_summary(anchor, 1),
+        memory_write_worker_summary(anchor, 2, None),
+    ]
+}
+
+fn locale_charset_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![global_table_walk_worker_summary(anchor)]
+}
+
+fn current_timespec_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![numeric_transform_worker_summary(
+        anchor,
+        None,
+        None,
+        "timespec_now",
+    )]
+}
+
+fn obstack_memory_used_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 0),
+        numeric_transform_worker_summary(anchor, Some(0), None, "obstack_bytes"),
+    ]
+}
+
+fn allocation_buffer_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        allocation_role_worker_summary(anchor, None, false),
+        global_table_walk_worker_summary(anchor),
+    ]
+}
+
+fn fileinfo_sort_comparator_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        metadata_probe_worker_summary(anchor, 0),
+        metadata_probe_worker_summary(anchor, 1),
+        string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::Unknown),
+        string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::Unknown),
+    ]
+}
+
 fn semantic_family_worker_summaries(
     anchor: u64,
     summary: &FunctionSemanticSummary,
@@ -2785,8 +3045,17 @@ fn semantic_family_worker_summaries(
         return Vec::new();
     };
     let summaries = match name.as_str() {
-        "main" | "wmain" => vec![program_orchestrator_worker_summary(anchor)],
+        "main" | "wmain" | "entry0" | "_start" => {
+            vec![program_orchestrator_worker_summary(anchor)]
+        }
         name if name.starts_with("entry.init") => vec![program_orchestrator_worker_summary(anchor)],
+        "register_tm_clones"
+        | "deregister_tm_clones"
+        | "_init"
+        | "entry.fini0"
+        | "__do_global_dtors_aux" => {
+            vec![global_lifetime_worker_summary(anchor)]
+        }
         name if is_quotearg_family_name(name) => quote_worker_summaries_for_name(anchor, name),
         name if is_quoting_options_family_name(name) => {
             quoting_options_worker_summaries_for_name(anchor, name)
@@ -2851,7 +3120,8 @@ fn semantic_family_worker_summaries(
             numeric_parser_worker_summary(anchor, 0),
             numeric_parser_worker_summary(anchor, 1),
         ],
-        "rpl_fopen" | "freopen_safer" => libc_file_wrapper_summaries(anchor),
+        "rpl_fopen" | "freopen_safer" | "fopen_safer" => libc_file_wrapper_summaries(anchor),
+        "rpl_fflush" => stream_close_worker_summaries(anchor, Some(0)),
         "openat_safer" => vec![
             path_walk_worker_summary(anchor, 1),
             metadata_probe_worker_summary(anchor, 0),
@@ -2863,6 +3133,15 @@ fn semantic_family_worker_summaries(
             global_synchronization_worker_summary(anchor),
         ],
         "stream_open" => stream_open_worker_summaries(anchor),
+        "close_stream" => stream_close_worker_summaries(anchor, Some(0)),
+        "rpl_fseeko" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            numeric_transform_worker_summary(anchor, None, Some(1), "stream_seek"),
+        ],
+        "maybe_close_stdout" => vec![
+            global_synchronization_worker_summary(anchor),
+            metadata_probe_worker_summary_for_memory(anchor, None),
+        ],
         "rpl_fcntl" => vec![metadata_probe_worker_summary(anchor, 0)],
         "parse_long_options" | "parse_gnu_standard_options_only" => {
             vec![argv_option_parser_worker_summary(anchor, 1)]
@@ -2870,6 +3149,45 @@ fn semantic_family_worker_summaries(
         "human_options" | "parse_integer" | "parse_number" | "traverse_raw_number" => {
             vec![numeric_parser_worker_summary(anchor, 0)]
         }
+        "save_token" => token_buffer_finalize_worker_summaries(anchor),
+        "filename_unescape" => filename_unescape_worker_summaries(anchor),
+        "compare" => line_compare_worker_summaries(anchor),
+        "memcoll" | "xmemcoll" => memory_collation_worker_summaries(anchor),
+        "print_stats" => transfer_stats_worker_summaries(anchor),
+        "create_hard_link" => create_hard_link_worker_summaries(anchor),
+        "record_file" => record_file_worker_summaries(anchor),
+        "reap" => reap_worker_summaries(anchor),
+        "num_processors_via_affinity_mask" => processor_probe_worker_summaries(anchor),
+        "process_signals" | "exit_cleanup" | "clear_files" | "flush_stdout" => {
+            vec![global_synchronization_worker_summary(anchor)]
+        }
+        "format_user_or_group" => format_user_or_group_worker_summaries(anchor),
+        "xstrtol_fatal" => vec![diagnostic_wrapper_summary_for_arg(anchor, 4)],
+        "tzalloc" => time_zone_alloc_worker_summaries(anchor),
+        "xget_version" => version_lookup_worker_summaries(anchor),
+        "rpl_obstack_free" => obstack_free_worker_summaries(anchor),
+        "rpl_obstack_allocated_p" => obstack_allocated_worker_summaries(anchor),
+        "has_xattr" => has_xattr_worker_summaries(anchor),
+        "check_tuning" => vec![table_walk_worker_summary(anchor, 0)],
+        "imaxtostr" | "umaxtostr" => integer_to_string_worker_summaries(anchor),
+        "hwcap_allowed" => vec![
+            string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+            global_table_walk_worker_summary(anchor),
+        ],
+        "file_prefixlen" => file_prefixlen_worker_summaries(anchor),
+        "getmonth" => vec![
+            token_parser_worker_summary(anchor, 0, None, None),
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 1, None),
+        ],
+        "operand_matches" => operand_match_worker_summaries(anchor),
+        "xstrxfrm" => string_transform_worker_summaries(anchor),
+        "set_file_security_ctx" => file_security_context_worker_summaries(anchor),
+        "localtime_rz" => localtime_worker_summaries(anchor),
+        "locale_charset" => locale_charset_worker_summaries(anchor),
+        "current_timespec" => current_timespec_worker_summaries(anchor),
+        "rpl_obstack_memory_used" => obstack_memory_used_worker_summaries(anchor),
+        "alloc_ibuf" | "alloc_obuf" => allocation_buffer_worker_summaries(anchor),
         "synchronize_output" => vec![global_synchronization_worker_summary(anchor)],
         "copy_with_unblock" => vec![output_stream_worker_summary_with_len(
             anchor,
@@ -3213,6 +3531,9 @@ fn semantic_family_worker_summaries(
         name if is_parser_family_name(name) => parser_family_worker_summaries(anchor, name),
         name if is_path_family_name(name) => path_family_worker_summaries(anchor, name),
         name if is_directory_family_name(name) => directory_family_worker_summaries(anchor, name),
+        name if is_fileinfo_sort_comparator_family_name(name) => {
+            fileinfo_sort_comparator_worker_summaries(anchor)
+        }
         name if is_record_memory_family_name(name) => {
             record_memory_family_worker_summaries(anchor, name)
         }
@@ -6946,6 +7267,50 @@ mod tests {
                 "sym.sha256_process_block",
                 &[NativeWorkerSummaryKind::HashFold],
             ),
+            ("entry0", &[NativeWorkerSummaryKind::ProgramOrchestrator]),
+            (
+                "dbg.save_token",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.filename_unescape",
+                &[
+                    NativeWorkerSummaryKind::Parser,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "sym.compare",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::MetadataProbe,
+                ],
+            ),
+            (
+                "dbg.close_stream",
+                &[
+                    NativeWorkerSummaryKind::OutputStream,
+                    NativeWorkerSummaryKind::MetadataProbe,
+                ],
+            ),
+            (
+                "dbg.record_file",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.reap",
+                &[
+                    NativeWorkerSummaryKind::Synchronization,
+                    NativeWorkerSummaryKind::NumericTransform,
+                ],
+            ),
+            ("dbg.quotearg_free", &[NativeWorkerSummaryKind::Lifetime]),
             (
                 "sym.print_filename.part.0",
                 &[
@@ -7308,6 +7673,28 @@ mod tests {
                     NativeWorkerSummaryKind::Synchronization,
                 ],
             ),
+            (
+                "dbg.file_prefixlen",
+                &[
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "sym.operand_matches",
+                &[
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::Parser,
+                ],
+            ),
+            (
+                "dbg.xstrcoll_df_version",
+                &[
+                    NativeWorkerSummaryKind::MetadataProbe,
+                    NativeWorkerSummaryKind::StringScan,
+                ],
+            ),
+            ("dbg.alloc_ibuf", &[NativeWorkerSummaryKind::Allocation]),
         ];
 
         for (idx, (name, expected_kinds)) in cases.iter().enumerate() {
@@ -7359,6 +7746,10 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.openat_safer"));
         assert!(has_native_worker_summary_family("dbg.rpl_nanosleep"));
         assert!(has_native_worker_summary_family("entry.init0"));
+        assert!(has_native_worker_summary_family("entry0"));
+        assert!(has_native_worker_summary_family("entry.fini0"));
+        assert!(has_native_worker_summary_family("sym.register_tm_clones"));
+        assert!(has_native_worker_summary_family("sym._init"));
         assert!(has_native_worker_summary_family("sym.copy_file_data"));
         assert!(has_native_worker_summary_family("dbg.copy_with_unblock"));
         assert!(has_native_worker_summary_family("dbg.copy_bytes"));
@@ -7477,6 +7868,58 @@ mod tests {
         ));
         assert!(has_native_worker_summary_family("dbg.yesno"));
         assert!(has_native_worker_summary_family("sym.sha256_process_block"));
+        assert!(has_native_worker_summary_family("sym.sha256_process_bytes"));
+        assert!(has_native_worker_summary_family("dbg.save_token"));
+        assert!(has_native_worker_summary_family("dbg.filename_unescape"));
+        assert!(has_native_worker_summary_family("sym.compare"));
+        assert!(has_native_worker_summary_family("dbg.memcoll"));
+        assert!(has_native_worker_summary_family("dbg.close_stream"));
+        assert!(has_native_worker_summary_family("dbg.rpl_fseeko"));
+        assert!(has_native_worker_summary_family("sym.maybe_close_stdout"));
+        assert!(has_native_worker_summary_family("dbg.print_stats"));
+        assert!(has_native_worker_summary_family("dbg.create_hard_link"));
+        assert!(has_native_worker_summary_family("dbg.fopen_safer"));
+        assert!(has_native_worker_summary_family("dbg.rpl_fflush"));
+        assert!(has_native_worker_summary_family("dbg.tzalloc"));
+        assert!(has_native_worker_summary_family("dbg.xget_version"));
+        assert!(has_native_worker_summary_family("dbg.rpl_reallocarray"));
+        assert!(has_native_worker_summary_family("dbg.record_file"));
+        assert!(has_native_worker_summary_family("dbg.reap"));
+        assert!(has_native_worker_summary_family(
+            "dbg.num_processors_via_affinity_mask"
+        ));
+        assert!(has_native_worker_summary_family("dbg.process_signals"));
+        assert!(has_native_worker_summary_family("dbg.exit_cleanup"));
+        assert!(has_native_worker_summary_family("dbg.clear_files"));
+        assert!(has_native_worker_summary_family("sym.flush_stdout"));
+        assert!(has_native_worker_summary_family("sym.format_user_or_group"));
+        assert!(has_native_worker_summary_family("sym.xstrtol_fatal"));
+        assert!(has_native_worker_summary_family("sym.rpl_obstack_free"));
+        assert!(has_native_worker_summary_family(
+            "dbg.rpl_obstack_allocated_p"
+        ));
+        assert!(has_native_worker_summary_family("dbg.has_xattr"));
+        assert!(has_native_worker_summary_family("dbg.check_tuning"));
+        assert!(has_native_worker_summary_family("dbg.imaxtostr"));
+        assert!(has_native_worker_summary_family("dbg.umaxtostr"));
+        assert!(has_native_worker_summary_family("dbg.hwcap_allowed"));
+        assert!(has_native_worker_summary_family("dbg.file_prefixlen"));
+        assert!(has_native_worker_summary_family("dbg.getmonth"));
+        assert!(has_native_worker_summary_family("sym.operand_matches"));
+        assert!(has_native_worker_summary_family("dbg.xstrxfrm"));
+        assert!(has_native_worker_summary_family(
+            "dbg.set_file_security_ctx"
+        ));
+        assert!(has_native_worker_summary_family("dbg.localtime_rz"));
+        assert!(has_native_worker_summary_family("dbg.locale_charset"));
+        assert!(has_native_worker_summary_family("dbg.current_timespec"));
+        assert!(has_native_worker_summary_family(
+            "dbg.rpl_obstack_memory_used"
+        ));
+        assert!(has_native_worker_summary_family("dbg.alloc_ibuf"));
+        assert!(has_native_worker_summary_family("dbg.alloc_obuf"));
+        assert!(has_native_worker_summary_family("dbg.xstrcoll_df_version"));
+        assert!(has_native_worker_summary_family("dbg.rev_strcmp_df_mtime"));
         assert!(has_native_worker_summary_family("dbg.hash_lookup"));
         assert!(has_native_worker_summary_family("dbg.hash_get_entries"));
         assert!(has_native_worker_summary_family("dbg.raw_hasher"));

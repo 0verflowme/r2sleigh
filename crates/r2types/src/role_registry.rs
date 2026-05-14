@@ -346,6 +346,13 @@ pub fn normalize_role_name(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn is_fileinfo_sort_comparator_role(name: &str) -> bool {
+    name.starts_with("xstrcoll_df_")
+        || name.starts_with("rev_xstrcoll_df_")
+        || name.starts_with("strcmp_df_")
+        || name.starts_with("rev_strcmp_df_")
+}
+
 pub fn signature_hint_for_name_candidates<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     current_param_count: usize,
@@ -481,7 +488,12 @@ pub fn signature_hint_for_role_name(
                 p("envp", signed_byte_pointer_pointer_type()),
             ],
         ),
-        "entry.init0" => sig(CTypeLike::Void, Vec::new()),
+        "entry.init0" | "entry0" | "_start" => sig(CTypeLike::Void, Vec::new()),
+        "entry.fini0"
+        | "__do_global_dtors_aux"
+        | "register_tm_clones"
+        | "deregister_tm_clones"
+        | "_init" => sig(CTypeLike::Void, Vec::new()),
         "diagnose" => diagnostic_signature(current_param_count),
         "usage" => sig(CTypeLike::Void, vec![p("status", c_int_type())]),
         "printf_fetchargs" => format_argument_fetch_signature(),
@@ -512,6 +524,234 @@ pub fn signature_hint_for_role_name(
                 p("pattern", signed_byte_pointer_type()),
                 p("string", signed_byte_pointer_type()),
                 p("flags", c_int_type()),
+            ],
+        ),
+        "canonicalize_filename_mode" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("name", signed_byte_pointer_type()),
+                p("can_mode", typedef_type("canonicalize_mode_t")),
+            ],
+        ),
+        "file_prefixlen" => sig(
+            typedef_type("idx_t"),
+            vec![
+                p("s", signed_byte_pointer_type()),
+                p("len", typedef_pointer_type("ptrdiff_t")),
+            ],
+        ),
+        "getmonth" => sig(
+            c_int_type(),
+            vec![
+                p("month", signed_byte_pointer_type()),
+                p("ea", signed_byte_pointer_pointer_type()),
+            ],
+        ),
+        "operand_matches" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("str", signed_byte_pointer_type()),
+                p("pattern", signed_byte_pointer_type()),
+                p("delim", signed_int_type(8)),
+            ],
+        ),
+        "xstrxfrm" => sig(
+            typedef_type("size_t"),
+            vec![
+                p("dest", signed_byte_pointer_type()),
+                p("src", signed_byte_pointer_type()),
+                p("destsize", typedef_type("size_t")),
+            ],
+        ),
+        "set_file_security_ctx" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("dst_name", signed_byte_pointer_type()),
+                p("recurse", CTypeLike::Bool),
+                p("x", typedef_pointer_type("cp_options")),
+            ],
+        ),
+        "localtime_rz" => sig(
+            struct_pointer_type("tm"),
+            vec![
+                p("tz", typedef_type("timezone_t")),
+                p("t", typedef_pointer_type("time_t")),
+                p("tm", struct_pointer_type("tm")),
+            ],
+        ),
+        "locale_charset" => sig(signed_byte_pointer_type(), Vec::new()),
+        "current_timespec" => sig(CTypeLike::Struct("timespec".to_string()), Vec::new()),
+        "rpl_obstack_memory_used" => sig(
+            typedef_type("size_t"),
+            vec![p("h", struct_pointer_type("obstack"))],
+        ),
+        "alloc_ibuf" | "alloc_obuf" => sig(CTypeLike::Void, Vec::new()),
+        "save_token" => sig(CTypeLike::Void, vec![p("t", struct_pointer_type("Tokens"))]),
+        "filename_unescape" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("s", signed_byte_pointer_type()),
+                p("s_len", typedef_type("idx_t")),
+            ],
+        ),
+        "compare" => sig(
+            c_int_type(),
+            vec![
+                p("a", struct_pointer_type("line")),
+                p("b", struct_pointer_type("line")),
+            ],
+        ),
+        "memcoll" | "xmemcoll" => sig(
+            c_int_type(),
+            vec![
+                p("s1", signed_byte_pointer_type()),
+                p("s1len", typedef_type("size_t")),
+                p("s2", signed_byte_pointer_type()),
+                p("s2len", typedef_type("size_t")),
+            ],
+        ),
+        "print_stats" | "maybe_close_stdout" => sig(CTypeLike::Void, Vec::new()),
+        "create_hard_link" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("src_name", signed_byte_pointer_type()),
+                p("src_dirfd", c_int_type()),
+                p("src_relname", signed_byte_pointer_type()),
+                p("dst_name", signed_byte_pointer_type()),
+                p("dst_dirfd", c_int_type()),
+                p("dst_relname", signed_byte_pointer_type()),
+                p("replace", CTypeLike::Bool),
+                p("verbose", CTypeLike::Bool),
+                p("dereference", CTypeLike::Bool),
+            ],
+        ),
+        "close_stream" => sig(
+            c_int_type(),
+            vec![p("stream", typedef_pointer_type("FILE"))],
+        ),
+        "rpl_fseeko" => sig(
+            c_int_type(),
+            vec![
+                p("fp", typedef_pointer_type("FILE")),
+                p("offset", typedef_type("off_t")),
+                p("whence", c_int_type()),
+            ],
+        ),
+        "fopen_safer" => sig(
+            typedef_pointer_type("FILE"),
+            vec![
+                p("file", signed_byte_pointer_type()),
+                p("mode", signed_byte_pointer_type()),
+            ],
+        ),
+        "tzalloc" => sig(
+            typedef_type("timezone_t"),
+            vec![p("name", signed_byte_pointer_type())],
+        ),
+        "xget_version" => sig(
+            CTypeLike::Enum("backup_type".to_string()),
+            vec![
+                p("context", signed_byte_pointer_type()),
+                p("version", signed_byte_pointer_type()),
+            ],
+        ),
+        "reap" => sig(typedef_type("pid_t"), vec![p("pid", typedef_type("pid_t"))]),
+        "record_file" => sig(
+            CTypeLike::Void,
+            vec![
+                p("ht", typedef_pointer_type("hash_table")),
+                p("file", signed_byte_pointer_type()),
+                p("stats", typedef_pointer_type("stat")),
+            ],
+        ),
+        "num_processors_via_affinity_mask" => sig(c_ulong_type(), Vec::new()),
+        "process_signals" | "exit_cleanup" | "clear_files" | "flush_stdout" => {
+            sig(CTypeLike::Void, Vec::new())
+        }
+        "format_user_or_group" => sig(
+            CTypeLike::Void,
+            vec![
+                p("name", signed_byte_pointer_type()),
+                p("id", typedef_type("uintmax_t")),
+                p("width", c_int_type()),
+            ],
+        ),
+        "xstrtol_fatal" => sig(
+            CTypeLike::Void,
+            vec![
+                p("err", typedef_type("strtol_error")),
+                p("opt_idx", c_int_type()),
+                p("c", signed_int_type(8)),
+                p("long_options", typedef_pointer_type("option")),
+                p("arg", signed_byte_pointer_type()),
+            ],
+        ),
+        "rpl_obstack_free" => sig(
+            CTypeLike::Void,
+            vec![
+                p("h", struct_pointer_type("obstack")),
+                p("obj", void_pointer_type()),
+            ],
+        ),
+        "rpl_obstack_allocated_p" => sig(
+            c_int_type(),
+            vec![
+                p("h", struct_pointer_type("obstack")),
+                p("obj", void_pointer_type()),
+            ],
+        ),
+        "has_xattr" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("xattr", signed_byte_pointer_type()),
+                p("ai", typedef_pointer_type("aclinfo")),
+                p("fd", c_int_type()),
+                p("name", signed_byte_pointer_type()),
+                p("flags", c_int_type()),
+            ],
+        ),
+        "check_tuning" => sig(
+            CTypeLike::Bool,
+            vec![p("table", typedef_pointer_type("hash_table"))],
+        ),
+        "rpl_fflush" => sig(
+            c_int_type(),
+            vec![p("stream", typedef_pointer_type("FILE"))],
+        ),
+        "imaxtostr" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("value", typedef_type("intmax_t")),
+                p("buf", signed_byte_pointer_type()),
+            ],
+        ),
+        "umaxtostr" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("value", typedef_type("uintmax_t")),
+                p("buf", signed_byte_pointer_type()),
+            ],
+        ),
+        "hwcap_allowed" => sig(
+            CTypeLike::Bool,
+            vec![p("glibc_hwcap", signed_byte_pointer_type())],
+        ),
+        "sha224_process_block"
+        | "sha224_process_bytes"
+        | "sha256_process_block"
+        | "sha256_process_bytes" => sig(
+            CTypeLike::Void,
+            vec![
+                p("buffer", void_pointer_type()),
+                p("len", typedef_type("size_t")),
+                p("ctx", typedef_pointer_type("sha256_ctx")),
+            ],
+        ),
+        name if is_fileinfo_sort_comparator_role(name) => sig(
+            c_int_type(),
+            vec![
+                p("a", typedef_pointer_type("fileinfo")),
+                p("b", typedef_pointer_type("fileinfo")),
             ],
         ),
         "getopt" | "rpl_getopt" => sig(
@@ -2322,6 +2562,14 @@ pub fn signature_hint_for_role_name(
                 p("size", typedef_type("size_t")),
             ],
         ),
+        "rpl_reallocarray" => sig(
+            allocation_ptr_type(),
+            vec![
+                p("ptr", allocation_ptr_type()),
+                p("n", typedef_type("size_t")),
+                p("size", typedef_type("size_t")),
+            ],
+        ),
         "xnrealloc" => sig(
             allocation_ptr_type(),
             vec![
@@ -2480,6 +2728,7 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "timespec"
             | "tm"
             | "timezone_t"
+            | "tokens"
             | "uid_t"
             | "unicode_callback_context"
             | "unicode_failure_callback"
@@ -2531,6 +2780,11 @@ mod tests {
             "getopt_long",
             "digest_file.isra.0",
             "shaxxx_stream.isra.0",
+            "entry0",
+            "entry.fini0",
+            "register_tm_clones",
+            "deregister_tm_clones",
+            "_init",
             "entry.init0",
             "usage",
             "binop",
@@ -2646,6 +2900,11 @@ mod tests {
             "xnumtoumax",
             "synchronize_output",
             "stream_open",
+            "close_stream",
+            "rpl_fseeko",
+            "fopen_safer",
+            "rpl_fflush",
+            "maybe_close_stdout",
             "openat_safer",
             "is_utf8_charset",
             "mcel_scan",
@@ -2677,6 +2936,7 @@ mod tests {
             "close_stdin",
             "close_stdout",
             "rpl_fclose",
+            "rpl_reallocarray",
             "write_bytes",
             "init_node",
             "open_input_files",
@@ -2694,12 +2954,130 @@ mod tests {
             "gregorian_to_ethiopian",
             "cycle_check_init",
             "cycle_check",
+            "canonicalize_filename_mode",
+            "save_token",
+            "filename_unescape",
+            "compare",
+            "memcoll",
+            "xmemcoll",
+            "print_stats",
+            "create_hard_link",
+            "record_file",
+            "reap",
+            "num_processors_via_affinity_mask",
+            "process_signals",
+            "exit_cleanup",
+            "clear_files",
+            "flush_stdout",
+            "format_user_or_group",
+            "xstrtol_fatal",
+            "tzalloc",
+            "xget_version",
+            "rpl_obstack_free",
+            "rpl_obstack_allocated_p",
+            "has_xattr",
+            "check_tuning",
+            "imaxtostr",
+            "umaxtostr",
+            "hwcap_allowed",
+            "file_prefixlen",
+            "getmonth",
+            "operand_matches",
+            "xstrxfrm",
+            "set_file_security_ctx",
+            "localtime_rz",
+            "locale_charset",
+            "current_timespec",
+            "rpl_obstack_memory_used",
+            "alloc_ibuf",
+            "alloc_obuf",
+            "sha256_process_block",
+            "xstrcoll_df_version",
+            "rev_strcmp_df_mtime",
         ] {
             assert!(
                 signature_hint_for_role_name(name, 0).is_some(),
                 "missing registry role for {name}"
             );
         }
+    }
+
+    #[test]
+    fn registry_keeps_canonicalize_filename_mode_exact() {
+        let signature = signature_hint_for_name_candidates(["dbg.canonicalize_filename_mode"], 3)
+            .expect("expected canonicalize filename signature");
+
+        assert_eq!(signature.ret_type, Some(signed_byte_pointer_type()));
+        assert_eq!(signature.params.len(), 2);
+        assert_eq!(signature.params[0].name, "name");
+        assert_eq!(signature.params[1].name, "can_mode");
+        assert_eq!(
+            signature.params[1].ty,
+            Some(typedef_type("canonicalize_mode_t"))
+        );
+    }
+
+    #[test]
+    fn registry_covers_coreutils_mf100_gap_signatures() {
+        let sha = signature_hint_for_name_candidates(["sym.sha256_process_block"], 0)
+            .expect("sha256 signature");
+        assert_eq!(sha.ret_type, Some(CTypeLike::Void));
+        assert_eq!(sha.params[0].name, "buffer");
+        assert_eq!(sha.params[1].ty, Some(typedef_type("size_t")));
+        assert_eq!(sha.params[2].ty, Some(typedef_pointer_type("sha256_ctx")));
+
+        let prefix = signature_hint_for_name_candidates(["dbg.file_prefixlen"], 0)
+            .expect("file_prefixlen signature");
+        assert_eq!(prefix.ret_type, Some(typedef_type("idx_t")));
+        assert_eq!(prefix.params[1].name, "len");
+
+        let comparator = signature_hint_for_name_candidates(["dbg.rev_xstrcoll_df_version"], 0)
+            .expect("fileinfo comparator signature");
+        assert_eq!(comparator.ret_type, Some(c_int_type()));
+        assert_eq!(
+            comparator.params[0].ty,
+            Some(typedef_pointer_type("fileinfo"))
+        );
+
+        let obstack = signature_hint_for_name_candidates(["dbg.rpl_obstack_memory_used"], 0)
+            .expect("obstack signature");
+        assert_eq!(obstack.ret_type, Some(typedef_type("size_t")));
+        assert_eq!(obstack.params[0].ty, Some(struct_pointer_type("obstack")));
+
+        let save_token =
+            signature_hint_for_name_candidates(["dbg.save_token"], 0).expect("save_token");
+        assert_eq!(save_token.ret_type, Some(CTypeLike::Void));
+        assert_eq!(save_token.params[0].ty, Some(struct_pointer_type("Tokens")));
+
+        let compare = signature_hint_for_name_candidates(["sym.compare"], 0).expect("compare");
+        assert_eq!(compare.ret_type, Some(c_int_type()));
+        assert_eq!(compare.params[0].ty, Some(struct_pointer_type("line")));
+
+        let fseeko = signature_hint_for_name_candidates(["dbg.rpl_fseeko"], 0).expect("rpl_fseeko");
+        assert_eq!(fseeko.ret_type, Some(c_int_type()));
+        assert_eq!(fseeko.params[1].ty, Some(typedef_type("off_t")));
+
+        let start = signature_hint_for_name_candidates(["entry0"], 1).expect("entry0");
+        assert_eq!(start.ret_type, Some(CTypeLike::Void));
+        assert!(start.params.is_empty());
+
+        let record =
+            signature_hint_for_name_candidates(["dbg.record_file"], 0).expect("record_file");
+        assert_eq!(record.ret_type, Some(CTypeLike::Void));
+        assert_eq!(
+            record.params[0].ty,
+            Some(typedef_pointer_type("hash_table"))
+        );
+
+        let xstrtol =
+            signature_hint_for_name_candidates(["sym.xstrtol_fatal"], 0).expect("xstrtol_fatal");
+        assert_eq!(xstrtol.params.len(), 5);
+        assert_eq!(xstrtol.params[3].ty, Some(typedef_pointer_type("option")));
+
+        let formatter = signature_hint_for_name_candidates(["sym.format_user_or_group"], 0)
+            .expect("format_user_or_group");
+        assert_eq!(formatter.ret_type, Some(CTypeLike::Void));
+        assert_eq!(formatter.params[1].ty, Some(typedef_type("uintmax_t")));
     }
 
     #[test]
