@@ -540,6 +540,104 @@ a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity =
 EOF_CMDS
 RUN
 
+NAME=named_error_tail_summary_feeds_non_generic_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn error_tail
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("diagnostic_wrapper")) != null) and (.ret_type == "void") and (.params[0].type == "int") and (.params[1].type == "int") and ((.params[3].type // "") | contains("__va_list_tag"))'
+EOF_CMDS
+RUN
+
+NAME=named_argmatch_to_argument_summary_feeds_table_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn argmatch_to_argument
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "int8_t*") and (.params[0].type == "argmatch_value*") and (.params[1].type == "int8_t**") and (.params[3].type == "size_t")'
+EOF_CMDS
+RUN
+
+NAME=named_strcoll_loop_summary_feeds_bounded_string_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn strcoll_loop
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("numeric_transform")) != null) and (.ret_type == "int") and (.params[0].type == "int8_t*") and (.params[1].type == "size_t") and (.params[2].type == "int8_t*") and (.params[3].type == "size_t")'
+EOF_CMDS
+RUN
+
+NAME=named_indent_summary_feeds_size_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn indent
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("numeric_transform")) != null) and (.ret_type == "void") and (.params[0].type == "size_t") and (.params[1].type == "size_t")'
+EOF_CMDS
+RUN
+
+NAME=named_dired_obstack_summary_feeds_obstack_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn dired_dump_obstack
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "void") and (.params[0].type == "int8_t*") and (.params[1].type == "struct obstack*")'
+EOF_CMDS
+RUN
+
+NAME=named_obstack_begin_summary_feeds_obstack_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn _obstack_begin_worker
+a:sla.debug.types | jq -c 'type=="object" and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("memory_write")) != null) and (.ret_type == "int") and (.params[0].type == "struct obstack*") and (.params[1].type == "idx_t") and (.params[2].type == "idx_t")'
+EOF_CMDS
+RUN
+
+NAME=named_heap_remove_top_summary_feeds_heap_types
+FILE=bins/test_func_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~add[0]` >/dev/null
+afn heap_remove_top
+a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("memory_write")) != null) and (.ret_type == "memory_ptr") and (.params[0].type == "heap*")'
+EOF_CMDS
+RUN
+
 NAME=named_quotearg_summary_feeds_types
 FILE=bins/test_func_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true

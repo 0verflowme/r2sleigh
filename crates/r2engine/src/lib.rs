@@ -3191,6 +3191,7 @@ fn is_direct_named_worker_summary_role(function_name: &str) -> bool {
         name.as_str(),
         "alloc_ibuf"
             | "alloc_obuf"
+            | "argmatch_to_argument"
             | "check_tuning"
             | "close_stream"
             | "compare"
@@ -3201,7 +3202,11 @@ fn is_direct_named_worker_summary_role(function_name: &str) -> bool {
             | "deregister_tm_clones"
             | "entry.fini0"
             | "entry0"
+            | "error_tail"
             | "exit_cleanup"
+            | "emit_verbose"
+            | "fadvise"
+            | "fd_safer"
             | "file_prefixlen"
             | "filename_unescape"
             | "flush_stdout"
@@ -3222,8 +3227,11 @@ fn is_direct_named_worker_summary_role(function_name: &str) -> bool {
             | "mergefiles"
             | "num_processors_via_affinity_mask"
             | "open_safer"
+            | "opendirat"
             | "operand_matches"
             | "parse_field_count"
+            | "posix2_version"
+            | "print_errno_message"
             | "process_signals"
             | "print_stats"
             | "quotearg_free"
@@ -5425,6 +5433,24 @@ mod tests {
         ));
         assert!(should_use_direct_named_native_worker_decompile(
             "dbg.mcel_tocmp"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.error_tail"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.argmatch_to_argument"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.opendirat"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.fd_safer"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.emit_verbose"
+        ));
+        assert!(should_use_direct_named_native_worker_decompile(
+            "dbg.posix2_version"
         ));
         assert!(!should_use_direct_named_native_worker_decompile(
             "dbg.hash_initialize"

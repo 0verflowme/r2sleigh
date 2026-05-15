@@ -897,6 +897,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "rpl_getopt_long_only"
             | "argmatch"
             | "argmatch_exact"
+            | "argmatch_to_argument"
             | "argmatch_invalid"
             | "argmatch_valid"
             | "__xargmatch_internal"
@@ -906,7 +907,10 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "or"
             | "three_arguments"
             | "write_counts"
+            | "error_tail"
             | "verror_at_line"
+            | "verror"
+            | "print_errno_message"
             | "printf_fetchargs"
             | "printf_parse"
             | "oprintf_"
@@ -935,6 +939,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "strintcmp"
             | "rpl_fopen"
             | "fopen_safer"
+            | "fd_safer"
             | "rpl_fflush"
             | "open_safer"
             | "openat_safer"
@@ -968,12 +973,15 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "exit_cleanup"
             | "clear_files"
             | "flush_stdout"
+            | "indent"
+            | "dired_dump_obstack"
             | "format_user_or_group"
             | "xstrtol_fatal"
             | "tzalloc"
             | "xget_version"
             | "rpl_obstack_free"
             | "rpl_obstack_allocated_p"
+            | "_obstack_begin_worker"
             | "has_xattr"
             | "check_tuning"
             | "imaxtostr"
@@ -1011,6 +1019,8 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "mcel_scant"
             | "mcel_scanz"
             | "copy_file_data"
+            | "create_hole"
+            | "fadvise"
             | "sparse_copy"
             | "copy_internal"
             | "do_copy"
@@ -1043,6 +1053,10 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "rpl_fts_open"
             | "rpl_fts_read"
             | "rpl_fts_close"
+            | "rpl_getfilecon"
+            | "rpl_getfilecon_raw"
+            | "rpl_lgetfilecon"
+            | "rpl_lgetfilecon_raw"
             | "fts_build"
             | "fts_safe_changedir"
             | "oputs_"
@@ -1053,6 +1067,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "cut_file"
             | "cut_bytes"
             | "memchr2"
+            | "begfield"
             | "limfield"
             | "set_fields"
             | "print_name_with_quoting"
@@ -1105,6 +1120,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "hash_clear"
             | "hash_free"
             | "heap_insert"
+            | "heap_remove_top"
             | "hash_remove"
             | "get_root_dev_ino"
             | "getuser"
@@ -1127,8 +1143,10 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "rpl_fclose"
             | "write_bytes"
             | "yesno"
+            | "posix2_version"
             | "error"
             | "error_at_line"
+            | "emit_verbose"
             | "file_escape"
             | "zaptemp"
             | "sequential_sort"
@@ -2010,6 +2028,14 @@ fn argmatch_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     ]
 }
 
+fn argmatch_to_argument_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 1),
+        table_walk_worker_summary(anchor, 2),
+        memory_read_worker_summary(anchor, 0, None),
+    ]
+}
+
 fn xargmatch_internal_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     vec![
         string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::ZeroByte),
@@ -2525,9 +2551,21 @@ fn parser_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSu
             table_walk_worker_summary(anchor, 0),
         ],
         "strcoll_loop" => vec![
-            string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::Unknown),
-            string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::Unknown),
-            table_walk_worker_summary(anchor, 2),
+            string_scan_worker_summary(
+                anchor,
+                0,
+                None,
+                Some(1),
+                NativeWorkerTerminator::LengthBound,
+            ),
+            string_scan_worker_summary(
+                anchor,
+                2,
+                None,
+                Some(3),
+                NativeWorkerTerminator::LengthBound,
+            ),
+            numeric_transform_worker_summary(anchor, None, None, "collation_order"),
         ],
         _ => vec![numeric_parser_worker_summary(anchor, 0)],
     }
@@ -2568,7 +2606,12 @@ fn directory_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorke
             directory_traversal_worker_summary(anchor, 0, None),
             allocation_role_worker_summary(anchor, None, false),
         ],
-        "savedir" | "opendirat" | "setup_dir" | "enter_dir" => vec![
+        "opendirat" => vec![
+            path_walk_worker_summary(anchor, 1),
+            directory_traversal_worker_summary(anchor, 1, None),
+            memory_write_worker_summary(anchor, 3, None),
+        ],
+        "savedir" | "setup_dir" | "enter_dir" => vec![
             path_walk_worker_summary(anchor, 0),
             directory_traversal_worker_summary(anchor, 0, None),
         ],
@@ -3056,6 +3099,21 @@ fn memory_collation_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     ]
 }
 
+fn dired_dump_obstack_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        format_render_worker_summary(anchor, 0, None),
+        table_walk_worker_summary(anchor, 1),
+        output_stream_worker_summary(anchor, 0, None),
+    ]
+}
+
+fn obstack_begin_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        memory_write_worker_summary(anchor, 0, None),
+        allocation_role_worker_summary(anchor, Some(1), false),
+    ]
+}
+
 fn create_hard_link_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     vec![
         path_walk_worker_summary(anchor, 0),
@@ -3270,6 +3328,7 @@ fn semantic_family_worker_summaries(
         | "rpl_getopt_long"
         | "rpl_getopt_long_only" => getopt_worker_summaries(anchor, true),
         "argmatch" | "argmatch_exact" | "argmatch_valid" => argmatch_worker_summaries(anchor),
+        "argmatch_to_argument" => argmatch_to_argument_worker_summaries(anchor),
         "__xargmatch_internal" => xargmatch_internal_worker_summaries(anchor),
         "argmatch_invalid" => vec![diagnostic_wrapper_summary_for_arg(anchor, 1)],
         name if name.starts_with("digest_file") => digest_stream_worker_summaries(anchor),
@@ -3279,7 +3338,9 @@ fn semantic_family_worker_summaries(
             expression_evaluator_worker_summaries(anchor, None)
         }
         "write_counts" => counter_output_worker_summaries(anchor),
+        "error_tail" | "verror" => vec![diagnostic_wrapper_summary_for_arg(anchor, 2)],
         "verror_at_line" => vec![diagnostic_wrapper_summary_for_arg(anchor, 4)],
+        "print_errno_message" => vec![usage_wrapper_summary(anchor)],
         "printf_fetchargs" => vec![format_argument_fetch_summary(anchor)],
         "printf_parse" | "print_formatted" | "print_esc" | "vasnprintf" => {
             printf_parser_worker_summaries(anchor)
@@ -3305,6 +3366,7 @@ fn semantic_family_worker_summaries(
             numeric_parser_worker_summary(anchor, 1),
         ],
         "rpl_fopen" | "freopen_safer" | "fopen_safer" => libc_file_wrapper_summaries(anchor),
+        "fd_safer" => vec![metadata_probe_worker_summary(anchor, 0)],
         "rpl_fflush" => stream_close_worker_summaries(anchor, Some(0)),
         "open_safer" => vec![
             path_walk_worker_summary(anchor, 0),
@@ -3357,12 +3419,20 @@ fn semantic_family_worker_summaries(
         "process_signals" | "exit_cleanup" | "clear_files" | "flush_stdout" => {
             vec![global_synchronization_worker_summary(anchor)]
         }
+        "indent" => vec![numeric_transform_worker_summary(
+            anchor,
+            Some(0),
+            Some(1),
+            "column_indent",
+        )],
+        "dired_dump_obstack" => dired_dump_obstack_worker_summaries(anchor),
         "format_user_or_group" => format_user_or_group_worker_summaries(anchor),
         "xstrtol_fatal" => vec![diagnostic_wrapper_summary_for_arg(anchor, 4)],
         "tzalloc" => time_zone_alloc_worker_summaries(anchor),
         "xget_version" => version_lookup_worker_summaries(anchor),
         "rpl_obstack_free" => obstack_free_worker_summaries(anchor),
         "rpl_obstack_allocated_p" => obstack_allocated_worker_summaries(anchor),
+        "_obstack_begin_worker" => obstack_begin_worker_summaries(anchor),
         "has_xattr" => has_xattr_worker_summaries(anchor),
         "check_tuning" => vec![table_walk_worker_summary(anchor, 0)],
         "imaxtostr" | "umaxtostr" => integer_to_string_worker_summaries(anchor),
@@ -3436,6 +3506,12 @@ fn semantic_family_worker_summaries(
         "mcel_scant" => multibyte_cell_scant_worker_summaries(anchor),
         "mcel_scanz" => multibyte_cell_scan_worker_summaries(anchor),
         "copy_file_data" => vec![file_transfer_worker_summary(anchor, 0, 4, Some(8))],
+        "create_hole" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            path_walk_worker_summary(anchor, 1),
+            numeric_transform_worker_summary(anchor, None, Some(2), "sparse_hole"),
+        ],
+        "fadvise" => vec![metadata_probe_worker_summary(anchor, 0)],
         "sparse_copy" => vec![file_transfer_worker_summary(anchor, 0, 1, Some(7))],
         "copy_internal" => vec![
             path_walk_worker_summary(anchor, 0),
@@ -3494,6 +3570,13 @@ fn semantic_family_worker_summaries(
         "rpl_fts_open" | "rpl_fts_read" | "rpl_fts_close" | "fts_build" => {
             vec![directory_traversal_worker_summary(anchor, 0, None)]
         }
+        "rpl_getfilecon" | "rpl_getfilecon_raw" | "rpl_lgetfilecon" | "rpl_lgetfilecon_raw" => {
+            vec![
+                path_walk_worker_summary(anchor, 0),
+                metadata_probe_worker_summary(anchor, 0),
+                memory_write_worker_summary(anchor, 1, None),
+            ]
+        }
         "fts_safe_changedir" => vec![
             directory_traversal_worker_summary(anchor, 0, Some(1)),
             path_walk_worker_summary(anchor, 3),
@@ -3517,7 +3600,7 @@ fn semantic_family_worker_summaries(
         "cut_file" => byte_stream_selection_worker_summaries(anchor, 0),
         "cut_bytes" => byte_stream_selection_worker_summaries(anchor, 0),
         "memchr2" => memchr2_worker_summaries(anchor),
-        "limfield" => vec![
+        "begfield" | "limfield" => vec![
             field_selection_worker_summary(anchor, 0, None),
             token_parser_worker_summary(anchor, 0, None, None),
             numeric_parser_worker_summary(anchor, 0),
@@ -3660,6 +3743,10 @@ fn semantic_family_worker_summaries(
             table_walk_worker_summary(anchor, 0),
             memory_write_worker_summary(anchor, 0, None),
         ],
+        "heap_remove_top" => vec![
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
         "hash_remove" => hash_table_worker_summaries(anchor, 0, Some(1)),
         "get_root_dev_ino" => vec![
             metadata_probe_worker_summary(anchor, 0),
@@ -3716,8 +3803,15 @@ fn semantic_family_worker_summaries(
         "rpl_fclose" => stream_close_worker_summaries(anchor, Some(0)),
         "write_bytes" => byte_output_worker_summaries(anchor),
         "yesno" => yesno_worker_summaries(anchor),
+        "posix2_version" => vec![metadata_probe_worker_summary_for_memory(anchor, None)],
         "error" => vec![diagnostic_wrapper_summary_for_arg(anchor, 2)],
         "error_at_line" => vec![diagnostic_wrapper_summary_for_arg(anchor, 4)],
+        "emit_verbose" => vec![
+            format_render_worker_summary(anchor, 0, None),
+            path_walk_worker_summary(anchor, 1),
+            path_walk_worker_summary(anchor, 2),
+            output_stream_worker_summary(anchor, 0, None),
+        ],
         "file_escape" => file_escape_worker_summaries(anchor),
         "zaptemp" => temp_cleanup_worker_summaries(anchor),
         "sequential_sort" => sequential_sort_worker_summaries(anchor),
@@ -8164,9 +8258,115 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.full_read"));
         assert!(has_native_worker_summary_family("dbg.full_write"));
         assert!(has_native_worker_summary_family("dbg.copy_with_block"));
+        assert!(has_native_worker_summary_family("dbg.error_tail"));
+        assert!(has_native_worker_summary_family("dbg.argmatch_to_argument"));
+        assert!(has_native_worker_summary_family("dbg.opendirat"));
+        assert!(has_native_worker_summary_family("dbg.fd_safer"));
+        assert!(has_native_worker_summary_family("dbg.verror"));
+        assert!(has_native_worker_summary_family("dbg.print_errno_message"));
+        assert!(has_native_worker_summary_family("sym.begfield.isra.0"));
+        assert!(has_native_worker_summary_family("dbg.emit_verbose"));
+        assert!(has_native_worker_summary_family("dbg.create_hole"));
+        assert!(has_native_worker_summary_family("dbg.posix2_version"));
+        assert!(has_native_worker_summary_family("dbg.rpl_getfilecon_raw"));
+        assert!(has_native_worker_summary_family("dbg.fadvise"));
+        assert!(has_native_worker_summary_family("dbg.indent"));
+        assert!(has_native_worker_summary_family("dbg.dired_dump_obstack"));
+        assert!(has_native_worker_summary_family(
+            "dbg._obstack_begin_worker"
+        ));
+        assert!(has_native_worker_summary_family("dbg.heap_remove_top"));
         assert!(!has_native_worker_summary_family(
             "dbg.test_symbolic_xor_guard"
         ));
+    }
+
+    #[test]
+    fn named_coreutils_tail_helpers_project_specific_summary_kinds() {
+        let cases: &[(&str, &[NativeWorkerSummaryKind])] = &[
+            (
+                "dbg.error_tail",
+                &[NativeWorkerSummaryKind::DiagnosticWrapper],
+            ),
+            (
+                "dbg.argmatch_to_argument",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::MemoryRead,
+                ],
+            ),
+            (
+                "dbg.opendirat",
+                &[
+                    NativeWorkerSummaryKind::PathWalk,
+                    NativeWorkerSummaryKind::DirectoryTraversal,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            ("dbg.fd_safer", &[NativeWorkerSummaryKind::MetadataProbe]),
+            (
+                "dbg.print_errno_message",
+                &[NativeWorkerSummaryKind::DiagnosticWrapper],
+            ),
+            (
+                "dbg.emit_verbose",
+                &[
+                    NativeWorkerSummaryKind::FormatRender,
+                    NativeWorkerSummaryKind::PathWalk,
+                    NativeWorkerSummaryKind::OutputStream,
+                ],
+            ),
+            (
+                "dbg.posix2_version",
+                &[NativeWorkerSummaryKind::MetadataProbe],
+            ),
+            (
+                "dbg.rpl_getfilecon_raw",
+                &[
+                    NativeWorkerSummaryKind::PathWalk,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.dired_dump_obstack",
+                &[
+                    NativeWorkerSummaryKind::FormatRender,
+                    NativeWorkerSummaryKind::TableWalk,
+                ],
+            ),
+            (
+                "dbg._obstack_begin_worker",
+                &[
+                    NativeWorkerSummaryKind::Allocation,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.heap_remove_top",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            ("dbg.indent", &[NativeWorkerSummaryKind::NumericTransform]),
+        ];
+
+        for (idx, (name, expected_kinds)) in cases.iter().enumerate() {
+            let summary = FunctionSemanticSummary::unknown(
+                r2ssa::InterprocFunctionId(0x9100 + idx as u64),
+                Some((*name).to_string()),
+            );
+            let summaries =
+                summaries_from_interproc_summary_unbounded(0x9100 + idx as u64, &summary);
+            for expected_kind in *expected_kinds {
+                assert!(
+                    summaries
+                        .iter()
+                        .any(|summary| summary.kind == *expected_kind),
+                    "missing {expected_kind:?} for {name}: {summaries:?}"
+                );
+            }
+        }
     }
 
     #[test]

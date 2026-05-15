@@ -314,6 +314,23 @@ fn error_at_line_signature(current_param_count: usize) -> FunctionSignatureSpec 
     sig(CTypeLike::Void, params)
 }
 
+fn verror_signature(current_param_count: usize) -> FunctionSignatureSpec {
+    let count = current_param_count.max(4);
+    let mut params = vec![
+        p("status", c_int_type()),
+        p("errnum", c_int_type()),
+        p("message", signed_byte_pointer_type()),
+        p("args", typedef_pointer_type("__va_list_tag")),
+    ];
+    for idx in 4..count {
+        params.push(p(
+            &format!("diag_value{}", idx - 3),
+            typedef_type("uintptr_t"),
+        ));
+    }
+    sig(CTypeLike::Void, params)
+}
+
 fn long_options_signature(current_param_count: usize, scan_all: bool) -> FunctionSignatureSpec {
     let mut params = vec![
         p("argc", c_int_type()),
@@ -610,6 +627,15 @@ pub fn signature_hint_for_role_name(
                 p("s2len", typedef_type("size_t")),
             ],
         ),
+        "strcoll_loop" => sig(
+            c_int_type(),
+            vec![
+                p("s1", signed_byte_pointer_type()),
+                p("s1size", typedef_type("size_t")),
+                p("s2", signed_byte_pointer_type()),
+                p("s2size", typedef_type("size_t")),
+            ],
+        ),
         "print_stats" | "maybe_close_stdout" => sig(CTypeLike::Void, Vec::new()),
         "create_hard_link" => sig(
             CTypeLike::Bool,
@@ -676,6 +702,20 @@ pub fn signature_hint_for_role_name(
         "process_signals" | "exit_cleanup" | "clear_files" | "flush_stdout" => {
             sig(CTypeLike::Void, Vec::new())
         }
+        "indent" => sig(
+            CTypeLike::Void,
+            vec![
+                p("from", typedef_type("size_t")),
+                p("to", typedef_type("size_t")),
+            ],
+        ),
+        "dired_dump_obstack" => sig(
+            CTypeLike::Void,
+            vec![
+                p("prefix", signed_byte_pointer_type()),
+                p("os", struct_pointer_type("obstack")),
+            ],
+        ),
         "calc_req_mask" => sig(c_uint_type(), Vec::new()),
         "getuser" => sig(
             signed_byte_pointer_type(),
@@ -715,6 +755,14 @@ pub fn signature_hint_for_role_name(
             vec![
                 p("h", struct_pointer_type("obstack")),
                 p("obj", void_pointer_type()),
+            ],
+        ),
+        "_obstack_begin_worker" => sig(
+            c_int_type(),
+            vec![
+                p("h", struct_pointer_type("obstack")),
+                p("chunk_size", typedef_type("idx_t")),
+                p("alignment", typedef_type("idx_t")),
             ],
         ),
         "has_xattr" => sig(
@@ -905,6 +953,31 @@ pub fn signature_hint_for_role_name(
                 p("ibytes", typedef_type("count_t")),
                 p("x", typedef_pointer_type("cp_options")),
                 p("debug", typedef_pointer_type("copy_debug")),
+            ],
+        ),
+        "create_hole" => sig(
+            typedef_type("off_t"),
+            vec![
+                p("fd", c_int_type()),
+                p("name", signed_byte_pointer_type()),
+                p("size", typedef_type("off_t")),
+            ],
+        ),
+        "full_write" => sig(
+            typedef_type("idx_t"),
+            vec![
+                p("fd", c_int_type()),
+                p("buf", memory_ptr_type()),
+                p("count", typedef_type("idx_t")),
+            ],
+        ),
+        "write_zeros" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("fd", c_int_type()),
+                p("n_bytes", typedef_type("off_t")),
+                p("abuf", signed_byte_pointer_pointer_type()),
+                p("buf_size", typedef_type("idx_t")),
             ],
         ),
         "sparse_copy" => sig(
@@ -1787,8 +1860,19 @@ pub fn signature_hint_for_role_name(
                 p("valsize", typedef_type("size_t")),
             ],
         ),
+        "argmatch_to_argument" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("value", typedef_pointer_type("argmatch_value")),
+                p("arglist", signed_byte_pointer_pointer_type()),
+                p("vallist", typedef_pointer_type("argmatch_value")),
+                p("valsize", typedef_type("size_t")),
+            ],
+        ),
         "error" => error_signature(current_param_count),
         "error_at_line" => error_at_line_signature(current_param_count),
+        "error_tail" | "verror" => verror_signature(current_param_count),
+        "print_errno_message" => sig(CTypeLike::Void, vec![p("errnum", c_int_type())]),
         "verror_at_line" => sig(
             CTypeLike::Void,
             vec![
@@ -1855,6 +1939,23 @@ pub fn signature_hint_for_role_name(
                 p("mode", signed_byte_pointer_type()),
             ],
         ),
+        "fd_safer" => sig(c_int_type(), vec![p("fd", c_int_type())]),
+        "fadvise" => sig(
+            CTypeLike::Void,
+            vec![
+                p("fp", typedef_pointer_type("FILE")),
+                p("advice", typedef_type("fadvice_t")),
+            ],
+        ),
+        "opendirat" => sig(
+            typedef_pointer_type("DIR"),
+            vec![
+                p("dir_fd", c_int_type()),
+                p("dir", signed_byte_pointer_type()),
+                p("extra_flags", c_int_type()),
+                p("pnew_fd", CTypeLike::Pointer(Box::new(c_int_type()))),
+            ],
+        ),
         "stream_open" => sig(
             typedef_pointer_type("FILE"),
             vec![
@@ -1899,6 +2000,13 @@ pub fn signature_hint_for_role_name(
                 p("line", typedef_pointer_type("line")),
                 p("field", typedef_type("size_t")),
                 p("offset", typedef_type("size_t")),
+            ],
+        ),
+        "key_to_opts" => sig(
+            CTypeLike::Void,
+            vec![
+                p("key", typedef_pointer_type("keyfield")),
+                p("opts", signed_byte_pointer_type()),
             ],
         ),
         "sequential_sort" => sig(
@@ -1977,6 +2085,15 @@ pub fn signature_hint_for_role_name(
                 ),
             ],
         ),
+        "emit_verbose" => sig(
+            CTypeLike::Void,
+            vec![
+                p("format", signed_byte_pointer_type()),
+                p("src", signed_byte_pointer_type()),
+                p("dst", signed_byte_pointer_type()),
+                p("backup_dst_name", signed_byte_pointer_type()),
+            ],
+        ),
         "do_move" => sig(
             CTypeLike::Bool,
             vec![
@@ -2041,6 +2158,13 @@ pub fn signature_hint_for_role_name(
                 p("mode", typedef_type("mode_t")),
                 p("new_dst", CTypeLike::Bool),
                 p("x", typedef_pointer_type("cp_options")),
+            ],
+        ),
+        "rpl_getfilecon" | "rpl_getfilecon_raw" | "rpl_lgetfilecon" | "rpl_lgetfilecon_raw" => sig(
+            c_int_type(),
+            vec![
+                p("file", signed_byte_pointer_type()),
+                p("con", signed_byte_pointer_pointer_type()),
             ],
         ),
         "same_nameat" => sig(
@@ -2330,6 +2454,10 @@ pub fn signature_hint_for_role_name(
                 p("item", memory_ptr_type()),
             ],
         ),
+        "heap_remove_top" => sig(
+            memory_ptr_type(),
+            vec![p("heap", typedef_pointer_type("heap"))],
+        ),
         "hash_get_first" => sig(
             memory_ptr_type(),
             vec![p("table", typedef_pointer_type("hash_table"))],
@@ -2522,6 +2650,7 @@ pub fn signature_hint_for_role_name(
             ],
         ),
         "yesno" => sig(CTypeLike::Bool, Vec::new()),
+        "posix2_version" => sig(c_int_type(), Vec::new()),
         "parse_field_count" => sig(
             signed_byte_pointer_type(),
             vec![
@@ -2748,6 +2877,7 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "dir_list"
             | "dir"
             | "errno_t"
+            | "fadvice_t"
             | "fcntl_arg"
             | "file"
             | "fileinfo"
@@ -2762,6 +2892,7 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "int"
             | "intmax_t"
             | "ino_t"
+            | "keyfield"
             | "line"
             | "linebuffer"
             | "long"
@@ -3165,6 +3296,54 @@ mod tests {
             .expect("format_user_or_group");
         assert_eq!(formatter.ret_type, Some(CTypeLike::Void));
         assert_eq!(formatter.params[1].ty, Some(typedef_type("uintmax_t")));
+
+        let error_tail = signature_hint_for_name_candidates(["dbg.error_tail"], 4)
+            .expect("error_tail signature");
+        assert_eq!(error_tail.ret_type, Some(CTypeLike::Void));
+        assert_eq!(error_tail.params[0].ty, Some(c_int_type()));
+        assert_eq!(error_tail.params[1].ty, Some(c_int_type()));
+        assert_eq!(
+            error_tail.params[3].ty,
+            Some(typedef_pointer_type("__va_list_tag"))
+        );
+
+        let argmatch_to_argument =
+            signature_hint_for_name_candidates(["dbg.argmatch_to_argument"], 4)
+                .expect("argmatch_to_argument signature");
+        assert_eq!(
+            argmatch_to_argument.params[0].ty,
+            Some(typedef_pointer_type("argmatch_value"))
+        );
+        assert_eq!(
+            argmatch_to_argument.params[1].ty,
+            Some(signed_byte_pointer_pointer_type())
+        );
+        assert_eq!(
+            argmatch_to_argument.params[3].ty,
+            Some(typedef_type("size_t"))
+        );
+
+        let indent =
+            signature_hint_for_name_candidates(["dbg.indent"], 2).expect("indent signature");
+        assert_eq!(indent.ret_type, Some(CTypeLike::Void));
+        assert_eq!(indent.params[0].ty, Some(typedef_type("size_t")));
+        assert_eq!(indent.params[1].ty, Some(typedef_type("size_t")));
+
+        let dired = signature_hint_for_name_candidates(["dbg.dired_dump_obstack"], 2)
+            .expect("dired_dump_obstack signature");
+        assert_eq!(dired.ret_type, Some(CTypeLike::Void));
+        assert_eq!(dired.params[0].ty, Some(signed_byte_pointer_type()));
+        assert_eq!(dired.params[1].ty, Some(struct_pointer_type("obstack")));
+
+        let obstack_begin = signature_hint_for_name_candidates(["dbg._obstack_begin_worker"], 3)
+            .expect("obstack begin worker signature");
+        assert_eq!(obstack_begin.ret_type, Some(c_int_type()));
+        assert_eq!(
+            obstack_begin.params[0].ty,
+            Some(struct_pointer_type("obstack"))
+        );
+        assert_eq!(obstack_begin.params[1].ty, Some(typedef_type("idx_t")));
+        assert_eq!(obstack_begin.params[2].ty, Some(typedef_type("idx_t")));
     }
 
     #[test]
@@ -3278,6 +3457,14 @@ mod tests {
         assert_eq!(parse_gnu.params[6].ty, Some(CTypeLike::Function));
         assert_eq!(parse_gnu.params[7].name, "author1");
         assert_eq!(parse_gnu.params[7].ty, Some(signed_byte_pointer_type()));
+
+        let strcoll = signature_hint_for_role_name("strcoll_loop", 0)
+            .expect("expected strcoll_loop signature");
+        assert_eq!(strcoll.ret_type, Some(c_int_type()));
+        assert_eq!(strcoll.params[0].ty, Some(signed_byte_pointer_type()));
+        assert_eq!(strcoll.params[1].ty, Some(typedef_type("size_t")));
+        assert_eq!(strcoll.params[2].ty, Some(signed_byte_pointer_type()));
+        assert_eq!(strcoll.params[3].ty, Some(typedef_type("size_t")));
     }
 
     #[test]
@@ -3334,6 +3521,11 @@ mod tests {
             Some(typedef_pointer_type("__va_list_tag"))
         );
 
+        let plain_verror = signature_hint_for_role_name("verror", 0).expect("expected verror");
+        assert_eq!(plain_verror.ret_type, Some(CTypeLike::Void));
+        assert_eq!(plain_verror.params[0].ty, Some(c_int_type()));
+        assert_eq!(plain_verror.params[1].ty, Some(c_int_type()));
+
         let argmatch = signature_hint_for_role_name("argmatch", 0).expect("expected argmatch");
         assert_eq!(
             argmatch.params[1].ty,
@@ -3363,6 +3555,23 @@ mod tests {
         assert_eq!(
             streamsavedir.params[0].ty,
             Some(typedef_pointer_type("DIR"))
+        );
+
+        let key_to_opts =
+            signature_hint_for_role_name("key_to_opts", 0).expect("expected key_to_opts");
+        assert_eq!(key_to_opts.ret_type, Some(CTypeLike::Void));
+        assert_eq!(
+            key_to_opts.params[0].ty,
+            Some(typedef_pointer_type("keyfield"))
+        );
+        assert_eq!(key_to_opts.params[1].ty, Some(signed_byte_pointer_type()));
+
+        let heap_remove_top =
+            signature_hint_for_role_name("heap_remove_top", 0).expect("expected heap_remove_top");
+        assert_eq!(heap_remove_top.ret_type, Some(memory_ptr_type()));
+        assert_eq!(
+            heap_remove_top.params[0].ty,
+            Some(typedef_pointer_type("heap"))
         );
 
         let skip = signature_hint_for_role_name("skip", 0).expect("expected dd skip");
@@ -3662,6 +3871,16 @@ mod tests {
             signature_hint_for_role_name("write_bytes", 0).expect("expected write_bytes");
         assert_eq!(write_bytes.ret_type, Some(CTypeLike::Void));
         assert_eq!(write_bytes.params[1].ty, Some(typedef_type("size_t")));
+
+        let opendirat = signature_hint_for_role_name("opendirat", 0).expect("expected opendirat");
+        assert_eq!(opendirat.ret_type, Some(typedef_pointer_type("DIR")));
+        assert_eq!(opendirat.params[0].ty, Some(c_int_type()));
+        assert_eq!(opendirat.params[2].ty, Some(c_int_type()));
+
+        let emit_verbose =
+            signature_hint_for_role_name("emit_verbose", 0).expect("expected emit_verbose");
+        assert_eq!(emit_verbose.ret_type, Some(CTypeLike::Void));
+        assert_eq!(emit_verbose.params[0].ty, Some(signed_byte_pointer_type()));
     }
 
     #[test]
@@ -3706,6 +3925,23 @@ mod tests {
         let copy_bytes = signature_hint_for_role_name("copy_bytes", 0).expect("copy_bytes");
         assert_eq!(copy_bytes.ret_type, Some(CTypeLike::Void));
         assert_eq!(copy_bytes.params[2].ty, Some(typedef_type("size_t")));
+
+        let create_hole = signature_hint_for_role_name("create_hole", 0).expect("create_hole");
+        assert_eq!(create_hole.ret_type, Some(typedef_type("off_t")));
+        assert_eq!(create_hole.params[0].ty, Some(c_int_type()));
+
+        let full_write = signature_hint_for_role_name("full_write", 0).expect("full_write");
+        assert_eq!(full_write.ret_type, Some(typedef_type("idx_t")));
+        assert_eq!(full_write.params[0].ty, Some(c_int_type()));
+        assert_eq!(full_write.params[1].ty, Some(memory_ptr_type()));
+
+        let filecon =
+            signature_hint_for_role_name("rpl_getfilecon_raw", 0).expect("getfilecon wrapper");
+        assert_eq!(filecon.ret_type, Some(c_int_type()));
+        assert_eq!(
+            filecon.params[1].ty,
+            Some(signed_byte_pointer_pointer_type())
+        );
 
         let locale = signature_hint_for_role_name("setlocale_null_r_unlocked", 0)
             .expect("expected locale helper");
