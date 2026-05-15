@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::time::Duration;
 
 use r2il::ArchSpec;
 use r2ssa::{
@@ -692,6 +693,8 @@ fn symbolic_condition_hint(summary: Option<&BackwardConditionSummary>) -> Option
         .filter(|text| !text.is_empty() && text != "true")
 }
 
+const SYMBOLIC_FACT_TIMEOUT_MS: u64 = 250;
+
 fn symbolic_fact_explorer<'ctx>(ctx: &'ctx Context) -> PathExplorer<'ctx> {
     let mut explorer = PathExplorer::with_config(
         ctx,
@@ -700,6 +703,7 @@ fn symbolic_fact_explorer<'ctx>(ctx: &'ctx Context) -> PathExplorer<'ctx> {
             max_states: 256,
             max_depth: 96,
             max_completed_paths: Some(8),
+            timeout: Some(Duration::from_millis(SYMBOLIC_FACT_TIMEOUT_MS)),
             merge_states: false,
             ..ExploreConfig::default()
         },
@@ -1126,8 +1130,18 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
     summary_profile: SummaryProfile,
     branch_limit: usize,
 ) -> CollectedNativeSemanticRegions {
-    let branch_blocks = limited_branch_blocks(func, branch_limit.max(1));
-    let mut collected = if let Some(scope) = scope {
+    let mut collected = if branch_limit == 0 {
+        CollectedNativeSemanticRegions {
+            regions: BTreeMap::new(),
+            diagnostics: SymbolicFunctionFactDiagnostics {
+                skipped_large_cfg: true,
+                ..SymbolicFunctionFactDiagnostics::default()
+            },
+            region_summaries: Vec::new(),
+            worker_summaries: Vec::new(),
+        }
+    } else if let Some(scope) = scope {
+        let branch_blocks = limited_branch_blocks(func, branch_limit);
         if let Some(registry) =
             SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
         {
@@ -1169,6 +1183,7 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
             }
         }
     } else {
+        let branch_blocks = limited_branch_blocks(func, branch_limit);
         let (branch_facts, diagnostics) = collect_branch_observations_for_branch_blocks(
             ctx,
             func,
@@ -1194,11 +1209,13 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
         }
     };
     let mut canonical_worker_domain = Vec::new();
-    canonical_worker_domain.extend(append_large_cfg_summary_memory_terms(
-        func,
-        arch,
-        &mut collected.regions,
-    ));
+    if branch_limit > 0 {
+        canonical_worker_domain.extend(append_large_cfg_summary_memory_terms(
+            func,
+            arch,
+            &mut collected.regions,
+        ));
+    }
     canonical_worker_domain.extend(append_large_cfg_memory_transfer_terms(
         func,
         &mut collected.regions,

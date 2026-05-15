@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use r2ssa::{
-    FunctionSemanticSummary, SSAOp, SSAVar, SsaArtifact, SummaryAllocationEffect,
-    SummaryAtomicEffect, SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect,
-    SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion,
-    SummaryReturnRelation, SummarySyncEffect, SummaryTransferEffect, SummaryTransferLength,
+    FunctionSemanticSummary, InterprocFunctionId, SSAOp, SSAVar, SsaArtifact,
+    SummaryAllocationEffect, SummaryAtomicEffect, SummaryLifetimeEffect, SummaryLifetimeOp,
+    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange,
+    SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect, SummaryTransferEffect,
+    SummaryTransferLength,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::semantics::{
     NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary, NativeParserKind,
@@ -70,6 +72,60 @@ type NativeMemoryAccessJoinKey = (
 type LoadSourceAliasKey = (u32, u32, u32);
 type LoadSourceAliasValues = BTreeMap<LoadSourceAliasKey, DataflowValue<LoadedSource>>;
 type LoadSourceAliasIndex = BTreeMap<String, LoadSourceAliasValues>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum NativeWorkerSummaryApplicabilitySource {
+    Structural,
+    TypedContext,
+    Callsite,
+    ConstantPattern,
+    LoopShape,
+    MemoryEffect,
+    TransferEffect,
+    AllocationEffect,
+    LifetimeEffect,
+    SyncEffect,
+    AtomicEffect,
+    TrustedSymbol,
+    NameHint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWorkerSummaryApplicability {
+    pub normalized_name: Option<String>,
+    pub worker_kinds: BTreeSet<NativeWorkerSummaryKind>,
+    pub sources: BTreeSet<NativeWorkerSummaryApplicabilitySource>,
+    pub evidence: SemanticEvidence,
+}
+
+impl NativeWorkerSummaryApplicability {
+    pub fn unsupported(normalized_name: Option<String>) -> Self {
+        Self {
+            normalized_name,
+            worker_kinds: BTreeSet::new(),
+            sources: BTreeSet::new(),
+            evidence: SemanticEvidence::residual(SemanticEvidenceReason::ResidualSearchRequired),
+        }
+    }
+
+    pub fn is_supported(&self) -> bool {
+        !self.worker_kinds.is_empty()
+    }
+
+    pub fn is_name_hint_only(&self) -> bool {
+        self.is_supported()
+            && self.sources.len() == 1
+            && self
+                .sources
+                .contains(&NativeWorkerSummaryApplicabilitySource::NameHint)
+    }
+
+    pub fn has_non_name_evidence(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| !matches!(source, NativeWorkerSummaryApplicabilitySource::NameHint))
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LoopIsland {
@@ -229,6 +285,111 @@ fn mark_name_hint_summaries(mut summaries: Vec<NativeWorkerSummary>) -> Vec<Nati
         summary.evidence = summary.evidence.combined_with(&name_hint);
     }
     summaries
+}
+
+fn applicability_sources_from_summary(
+    summary: &FunctionSemanticSummary,
+    worker_summaries: &[NativeWorkerSummary],
+) -> BTreeSet<NativeWorkerSummaryApplicabilitySource> {
+    let mut sources = BTreeSet::new();
+    if worker_summaries.iter().any(|worker| {
+        worker
+            .evidence
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason, SemanticEvidenceReason::NameHint))
+    }) {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::NameHint);
+    }
+    if summary.callsite_count > 0 || !summary.direct_callees.is_empty() || summary.has_unknown_calls
+    {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::Callsite);
+    }
+    if !summary.transfer_effects.is_empty() {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::TransferEffect);
+        sources.insert(NativeWorkerSummaryApplicabilitySource::MemoryEffect);
+    }
+    if !summary.memory_effects.is_empty() {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::MemoryEffect);
+    }
+    if !summary.allocation_effects.is_empty() {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::AllocationEffect);
+    }
+    if !summary.lifetime_effects.is_empty() {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::LifetimeEffect);
+    }
+    if !summary.sync_effects.is_empty() {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::SyncEffect);
+    }
+    if !summary.atomic_effects.is_empty() {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::AtomicEffect);
+    }
+    if worker_summaries
+        .iter()
+        .any(|worker| worker.loop_summary.is_some())
+    {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::LoopShape);
+    }
+    if summary.return_relation != SummaryReturnRelation::Unknown {
+        sources.insert(NativeWorkerSummaryApplicabilitySource::Structural);
+    }
+    sources
+}
+
+fn applicability_from_worker_summaries(
+    summary: &FunctionSemanticSummary,
+    worker_summaries: &[NativeWorkerSummary],
+) -> NativeWorkerSummaryApplicability {
+    let normalized_name = summary
+        .name
+        .as_deref()
+        .and_then(normalize_native_worker_role_name);
+    if worker_summaries.is_empty() {
+        return NativeWorkerSummaryApplicability::unsupported(normalized_name);
+    }
+    let worker_kinds = worker_summaries
+        .iter()
+        .map(|worker| worker.kind)
+        .collect::<BTreeSet<_>>();
+    let sources = applicability_sources_from_summary(summary, worker_summaries);
+    let evidence = worker_summaries
+        .iter()
+        .map(|worker| worker.evidence.clone())
+        .reduce(|acc, evidence| acc.combined_with(&evidence))
+        .unwrap_or_else(bounded_evidence);
+    NativeWorkerSummaryApplicability {
+        normalized_name,
+        worker_kinds,
+        sources,
+        evidence,
+    }
+}
+
+pub fn native_worker_summary_applicability_for_summary(
+    anchor: u64,
+    summary: &FunctionSemanticSummary,
+) -> NativeWorkerSummaryApplicability {
+    let worker_summaries =
+        bounded_worker_summaries(summaries_from_interproc_summary_unbounded(anchor, summary));
+    applicability_from_worker_summaries(summary, &worker_summaries)
+}
+
+pub fn native_worker_summary_applicability_for_name(
+    function_addr: u64,
+    name: &str,
+) -> NativeWorkerSummaryApplicability {
+    let Some(normalized) = normalize_native_worker_role_name(name) else {
+        return NativeWorkerSummaryApplicability::unsupported(None);
+    };
+    let summary =
+        FunctionSemanticSummary::seed_for_name(InterprocFunctionId(function_addr), &normalized)
+            .unwrap_or_else(|| {
+                FunctionSemanticSummary::unknown(
+                    InterprocFunctionId(function_addr),
+                    Some(normalized),
+                )
+            });
+    native_worker_summary_applicability_for_summary(function_addr, &summary)
 }
 
 pub(super) fn role_identity_from_worker_summaries(
@@ -775,8 +936,10 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "rpl_fopen"
             | "fopen_safer"
             | "rpl_fflush"
+            | "open_safer"
             | "openat_safer"
             | "rpl_nanosleep"
+            | "xnanosleep"
             | "rpl_fcntl"
             | "freopen_safer"
             | "stream_open"
@@ -798,6 +961,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "print_stats"
             | "create_hard_link"
             | "record_file"
+            | "calc_req_mask"
             | "reap"
             | "num_processors_via_affinity_mask"
             | "process_signals"
@@ -843,6 +1007,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "scan_mb_delim_field"
             | "mcel_scan"
             | "mcel_cmp"
+            | "mcel_tocmp"
             | "mcel_scant"
             | "mcel_scanz"
             | "copy_file_data"
@@ -928,6 +1093,8 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "pipe_child"
             | "merge"
             | "mergefiles"
+            | "cwd_advance_fd"
+            | "restore_initial_cwd"
             | "init_node"
             | "fts_stat"
             | "rpl_fts_children"
@@ -937,7 +1104,11 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "hash_rehash"
             | "hash_clear"
             | "hash_free"
+            | "heap_insert"
             | "hash_remove"
+            | "get_root_dev_ino"
+            | "getuser"
+            | "getgroup"
             | "excise"
             | "fillbuf"
             | "maybe_create_temp"
@@ -1093,6 +1264,7 @@ fn is_path_family_name(name: &str) -> bool {
     matches!(
         name,
         "concatenated_filename"
+            | "last_component"
             | "dir_len"
             | "dir_name"
             | "dir_suffix"
@@ -2344,6 +2516,10 @@ fn vector_line_count_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
 
 fn parser_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
     match name {
+        "parse_field_count" => vec![
+            numeric_parser_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 1, None),
+        ],
         "parse_symbols" | "sort_args" => vec![
             token_parser_worker_summary(anchor, 0, None, None),
             table_walk_worker_summary(anchor, 0),
@@ -2359,6 +2535,14 @@ fn parser_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSu
 
 fn path_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
     match name {
+        "last_component" => vec![
+            path_walk_worker_summary(anchor, 0),
+            string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::Unknown),
+        ],
+        "mdir_name" | "dir_name" => vec![
+            path_walk_worker_summary(anchor, 0),
+            allocation_role_worker_summary(anchor, None, false),
+        ],
         "file_name_concat" | "concatenated_filename" => file_name_concat_worker_summaries(anchor),
         "find_backup_file_name" => vec![
             path_walk_worker_summary(anchor, 0),
@@ -3122,6 +3306,10 @@ fn semantic_family_worker_summaries(
         ],
         "rpl_fopen" | "freopen_safer" | "fopen_safer" => libc_file_wrapper_summaries(anchor),
         "rpl_fflush" => stream_close_worker_summaries(anchor, Some(0)),
+        "open_safer" => vec![
+            path_walk_worker_summary(anchor, 0),
+            metadata_probe_worker_summary(anchor, 0),
+        ],
         "openat_safer" => vec![
             path_walk_worker_summary(anchor, 1),
             metadata_probe_worker_summary(anchor, 0),
@@ -3130,6 +3318,10 @@ fn semantic_family_worker_summaries(
         "rpl_nanosleep" => vec![
             metadata_probe_worker_summary(anchor, 0),
             metadata_probe_worker_summary(anchor, 1),
+            global_synchronization_worker_summary(anchor),
+        ],
+        "xnanosleep" => vec![
+            metadata_probe_worker_summary(anchor, 0),
             global_synchronization_worker_summary(anchor),
         ],
         "stream_open" => stream_open_worker_summaries(anchor),
@@ -3156,6 +3348,10 @@ fn semantic_family_worker_summaries(
         "print_stats" => transfer_stats_worker_summaries(anchor),
         "create_hard_link" => create_hard_link_worker_summaries(anchor),
         "record_file" => record_file_worker_summaries(anchor),
+        "calc_req_mask" => vec![
+            global_table_walk_worker_summary(anchor),
+            numeric_transform_worker_summary(anchor, None, None, "statx_request_mask"),
+        ],
         "reap" => reap_worker_summaries(anchor),
         "num_processors_via_affinity_mask" => processor_probe_worker_summaries(anchor),
         "process_signals" | "exit_cleanup" | "clear_files" | "flush_stdout" => {
@@ -3233,6 +3429,10 @@ fn semantic_family_worker_summaries(
         "mcel_cmp" => vec![numeric_transform_worker_summary(
             anchor, None, None, "mcel_cmp",
         )],
+        "mcel_tocmp" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            numeric_transform_worker_summary(anchor, None, None, "mcel_tocmp"),
+        ],
         "mcel_scant" => multibyte_cell_scant_worker_summaries(anchor),
         "mcel_scanz" => multibyte_cell_scan_worker_summaries(anchor),
         "copy_file_data" => vec![file_transfer_worker_summary(anchor, 0, 4, Some(8))],
@@ -3427,6 +3627,15 @@ fn semantic_family_worker_summaries(
             sort_merge_worker_summary(anchor, 0, Some(3)),
             record_stream_worker_summary(anchor, 0, Some(3)),
         ],
+        "cwd_advance_fd" => vec![
+            directory_traversal_worker_summary(anchor, 0, None),
+            metadata_probe_worker_summary(anchor, 1),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "restore_initial_cwd" => vec![
+            directory_traversal_worker_summary(anchor, 0, None),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
         "init_node" => merge_node_init_worker_summaries(anchor),
         "fts_stat" => vec![
             directory_traversal_worker_summary(anchor, 0, Some(1)),
@@ -3447,7 +3656,21 @@ fn semantic_family_worker_summaries(
             table_walk_worker_summary(anchor, 0),
             global_lifetime_worker_summary(anchor),
         ],
+        "heap_insert" => vec![
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
         "hash_remove" => hash_table_worker_summaries(anchor, 0, Some(1)),
+        "get_root_dev_ino" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+            path_walk_worker_summary(anchor, 0),
+        ],
+        "getuser" | "getgroup" => vec![
+            table_walk_worker_summary(anchor, 0),
+            global_table_walk_worker_summary(anchor),
+            allocation_role_worker_summary(anchor, None, false),
+        ],
         "excise" => vec![
             directory_traversal_worker_summary(anchor, 0, Some(1)),
             path_walk_worker_summary(anchor, 1),
@@ -7745,6 +7968,7 @@ mod tests {
         assert!(has_native_worker_summary_family("sym.rpl_fopen"));
         assert!(has_native_worker_summary_family("dbg.openat_safer"));
         assert!(has_native_worker_summary_family("dbg.rpl_nanosleep"));
+        assert!(has_native_worker_summary_family("dbg.xnanosleep"));
         assert!(has_native_worker_summary_family("entry.init0"));
         assert!(has_native_worker_summary_family("entry0"));
         assert!(has_native_worker_summary_family("entry.fini0"));
@@ -7795,6 +8019,7 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.same_nameat"));
         assert!(has_native_worker_summary_family("sym.mcel_scan"));
         assert!(has_native_worker_summary_family("sym.mcel_cmp"));
+        assert!(has_native_worker_summary_family("sym.mcel_tocmp"));
         assert!(has_native_worker_summary_family(
             "dbg.set_process_security_ctx"
         ));
@@ -7879,11 +8104,13 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.print_stats"));
         assert!(has_native_worker_summary_family("dbg.create_hard_link"));
         assert!(has_native_worker_summary_family("dbg.fopen_safer"));
+        assert!(has_native_worker_summary_family("dbg.open_safer"));
         assert!(has_native_worker_summary_family("dbg.rpl_fflush"));
         assert!(has_native_worker_summary_family("dbg.tzalloc"));
         assert!(has_native_worker_summary_family("dbg.xget_version"));
         assert!(has_native_worker_summary_family("dbg.rpl_reallocarray"));
         assert!(has_native_worker_summary_family("dbg.record_file"));
+        assert!(has_native_worker_summary_family("sym.calc_req_mask"));
         assert!(has_native_worker_summary_family("dbg.reap"));
         assert!(has_native_worker_summary_family(
             "dbg.num_processors_via_affinity_mask"
@@ -7891,6 +8118,12 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.process_signals"));
         assert!(has_native_worker_summary_family("dbg.exit_cleanup"));
         assert!(has_native_worker_summary_family("dbg.clear_files"));
+        assert!(has_native_worker_summary_family("dbg.cwd_advance_fd"));
+        assert!(has_native_worker_summary_family("dbg.restore_initial_cwd"));
+        assert!(has_native_worker_summary_family("dbg.get_root_dev_ino"));
+        assert!(has_native_worker_summary_family("dbg.getuser"));
+        assert!(has_native_worker_summary_family("dbg.getgroup"));
+        assert!(has_native_worker_summary_family("dbg.last_component"));
         assert!(has_native_worker_summary_family("sym.flush_stdout"));
         assert!(has_native_worker_summary_family("sym.format_user_or_group"));
         assert!(has_native_worker_summary_family("sym.xstrtol_fatal"));
@@ -7922,6 +8155,7 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.rev_strcmp_df_mtime"));
         assert!(has_native_worker_summary_family("dbg.hash_lookup"));
         assert!(has_native_worker_summary_family("dbg.hash_get_entries"));
+        assert!(has_native_worker_summary_family("dbg.heap_insert"));
         assert!(has_native_worker_summary_family("dbg.raw_hasher"));
         assert!(has_native_worker_summary_family("dbg.parse_field_count"));
         assert!(has_native_worker_summary_family("dbg.parse_symbols"));
@@ -7933,6 +8167,59 @@ mod tests {
         assert!(!has_native_worker_summary_family(
             "dbg.test_symbolic_xor_guard"
         ));
+    }
+
+    #[test]
+    fn native_worker_summary_applicability_marks_name_hint_families() {
+        let applicability =
+            native_worker_summary_applicability_for_name(0x401000, "dbg.save_token");
+
+        assert!(applicability.is_supported());
+        assert!(applicability.is_name_hint_only());
+        assert!(
+            applicability
+                .worker_kinds
+                .contains(&NativeWorkerSummaryKind::TableWalk)
+        );
+        assert!(
+            applicability
+                .sources
+                .contains(&NativeWorkerSummaryApplicabilitySource::NameHint)
+        );
+        assert!(
+            applicability
+                .evidence
+                .reasons
+                .contains(&SemanticEvidenceReason::NameHint)
+        );
+    }
+
+    #[test]
+    fn native_worker_summary_applicability_marks_structural_seed_evidence() {
+        let applicability = native_worker_summary_applicability_for_name(0x401000, "malloc");
+
+        assert!(applicability.is_supported());
+        assert!(!applicability.is_name_hint_only());
+        assert!(applicability.has_non_name_evidence());
+        assert!(
+            applicability
+                .worker_kinds
+                .contains(&NativeWorkerSummaryKind::Allocation)
+        );
+        assert!(
+            applicability
+                .sources
+                .contains(&NativeWorkerSummaryApplicabilitySource::AllocationEffect)
+        );
+    }
+
+    #[test]
+    fn native_worker_summary_applicability_rejects_unknown_names() {
+        let applicability =
+            native_worker_summary_applicability_for_name(0x401000, "dbg.not_a_known_worker");
+
+        assert!(!applicability.is_supported());
+        assert!(applicability.worker_kinds.is_empty());
     }
 
     #[test]

@@ -29,7 +29,9 @@ pub use compiler::{
 };
 pub use facts::{SymbolicReachabilityStatus, augment_semantic_artifact_with_interproc_summary};
 pub use native_worker::{
+    NativeWorkerSummaryApplicability, NativeWorkerSummaryApplicabilitySource,
     has_native_worker_summary_family, has_program_orchestrator_summary_family,
+    native_worker_summary_applicability_for_name, native_worker_summary_applicability_for_summary,
 };
 pub use plan::{
     ArtifactBuildPlan, DecompilePlan, QueryGuidanceMode, QueryPlan, TargetQueryExecutionRoute,

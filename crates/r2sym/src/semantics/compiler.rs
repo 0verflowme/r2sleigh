@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use r2il::ArchSpec;
-use r2ssa::{FunctionSemanticSummary, InterprocFunctionId, SsaArtifact};
+use r2ssa::{CFGRiskSummary, FunctionSemanticSummary, InterprocFunctionId, SsaArtifact};
 use z3::Context;
 
 use crate::replay::{ReplaySeed, stable_replay_seed_fingerprint};
@@ -118,6 +118,17 @@ fn semantic_granularity_for(
 }
 
 const SUMMARY_DENSE_WORKER_ISLAND_MIN: usize = 16;
+
+fn should_skip_expensive_branch_compilation(
+    cfg_summary: &CFGRiskSummary,
+    branch_count: usize,
+) -> bool {
+    cfg_summary.block_count > 48
+        || branch_count > 48
+        || cfg_summary.back_edge_count > 4
+        || cfg_summary.switch_block_count > 4
+        || branch_count >= 8
+}
 
 fn has_named_worker_family(summaries: &[NativeWorkerSummary]) -> bool {
     summaries.iter().any(|summary| {
@@ -459,6 +470,9 @@ fn build_semantic_artifact(input: BuildSemanticArtifactInput) -> SemanticArtifac
 fn bounded_large_cfg_branch_limit(func: &SsaArtifact) -> usize {
     let summary = func.function().cfg_risk_summary();
     let branch_count = func.predicates().predicates.len();
+    if branch_count >= 8 || summary.back_edge_count > 4 || summary.switch_block_count > 4 {
+        return 0;
+    }
     if summary.block_count > 160
         || branch_count > 160
         || summary.back_edge_count > 8
@@ -580,10 +594,8 @@ fn compile_function_semantics_uncached(
     if let Some(arch) = arch {
         let cfg_summary = func.function().cfg_risk_summary();
         let branch_count = func.predicates().predicates.len();
-        let skip_expensive_branch_compilation = cfg_summary.block_count > 48
-            || branch_count > 48
-            || cfg_summary.back_edge_count > 4
-            || cfg_summary.switch_block_count > 4;
+        let skip_expensive_branch_compilation =
+            should_skip_expensive_branch_compilation(&cfg_summary, branch_count);
 
         if skip_expensive_branch_compilation {
             if !vm_step_ready {
@@ -635,7 +647,7 @@ fn compile_function_semantics_uncached(
                 execution,
                 suppress_large_cfg_reason: matches!(execution, ExecutionModel::Vm)
                     || has_island_compiled_regions,
-                role_name_hint: func.function().name.clone(),
+                role_name_hint: None,
                 slice_class,
                 closure_functions,
                 helper_functions,
@@ -1059,6 +1071,80 @@ mod tests {
         );
         assert!(!first.cache_hit);
         assert!(second.cache_hit);
+    }
+
+    #[test]
+    fn looped_branch_fanout_uses_bounded_semantic_compilation() {
+        let looped = CFGRiskSummary {
+            block_count: 23,
+            loop_count: 1,
+            back_edge_count: 1,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let straight = CFGRiskSummary {
+            block_count: 23,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+
+        assert!(should_skip_expensive_branch_compilation(&looped, 8));
+        assert!(should_skip_expensive_branch_compilation(&straight, 8));
+        assert!(!should_skip_expensive_branch_compilation(&straight, 7));
+        assert!(!should_skip_expensive_branch_compilation(&looped, 7));
+    }
+
+    #[test]
+    fn bounded_large_cfg_branch_fanout_uses_solver_free_budget() {
+        let mut blocks = Vec::new();
+        for idx in 0..8u64 {
+            blocks.push(R2ILBlock {
+                addr: 0x3000 + idx * 8,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x3100, 8),
+                    cond: make_reg(RAX, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            });
+            blocks.push(R2ILBlock {
+                addr: 0x3004 + idx * 8,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_const(0x3008 + idx * 8, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            });
+        }
+        blocks.push(R2ILBlock {
+            addr: 0x3100,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_reg(RAX, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        });
+        let func = SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa");
+
+        assert_eq!(bounded_large_cfg_branch_limit(&func), 0);
+        let ctx = Context::thread_local();
+        let artifact = compile_function_semantics_with_scope(
+            &ctx,
+            &func,
+            None,
+            Some(&test_arch()),
+            &HashMap::new(),
+            SummaryProfile::Default,
+        );
+        let native = artifact.native_body().expect("native body");
+        assert!(artifact.diagnostics.skipped_large_cfg);
+        assert_eq!(artifact.diagnostics.branches_evaluated, 0);
+        assert!(native.regions.is_empty());
     }
 
     #[test]

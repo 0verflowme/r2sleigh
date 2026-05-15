@@ -236,7 +236,7 @@ fn file_transfer_signature(current_param_count: usize) -> FunctionSignatureSpec 
 }
 
 fn version_etc_signature(current_param_count: usize) -> FunctionSignatureSpec {
-    let count = current_param_count.max(4);
+    let count = current_param_count.max(5);
     let mut params = vec![
         p("stream", typedef_pointer_type("FILE")),
         p("command_name", signed_byte_pointer_type()),
@@ -644,6 +644,14 @@ pub fn signature_hint_for_role_name(
                 p("mode", signed_byte_pointer_type()),
             ],
         ),
+        "open_safer" => sig(
+            c_int_type(),
+            vec![
+                p("file", signed_byte_pointer_type()),
+                p("flags", c_int_type()),
+                p("mode", c_int_type()),
+            ],
+        ),
         "tzalloc" => sig(
             typedef_type("timezone_t"),
             vec![p("name", signed_byte_pointer_type())],
@@ -668,6 +676,15 @@ pub fn signature_hint_for_role_name(
         "process_signals" | "exit_cleanup" | "clear_files" | "flush_stdout" => {
             sig(CTypeLike::Void, Vec::new())
         }
+        "calc_req_mask" => sig(c_uint_type(), Vec::new()),
+        "getuser" => sig(
+            signed_byte_pointer_type(),
+            vec![p("uid", typedef_type("uid_t"))],
+        ),
+        "getgroup" => sig(
+            signed_byte_pointer_type(),
+            vec![p("gid", typedef_type("gid_t"))],
+        ),
         "format_user_or_group" => sig(
             CTypeLike::Void,
             vec![
@@ -1020,6 +1037,7 @@ pub fn signature_hint_for_role_name(
                 p("remaining_delay", struct_pointer_type("timespec")),
             ],
         ),
+        "xnanosleep" => sig(c_int_type(), vec![p("seconds", CTypeLike::Float(64))]),
         "fts_build" => sig(
             typedef_pointer_type("FTSENT"),
             vec![
@@ -1131,10 +1149,19 @@ pub fn signature_hint_for_role_name(
                 p("package", signed_byte_pointer_type()),
                 p("version", signed_byte_pointer_type()),
                 p("authors", typedef_type("va_list")),
+                p("author_probe", typedef_type("uintptr_t")),
             ],
         ),
         "version_etc" => version_etc_signature(current_param_count),
         "emit_bug_reporting_address" => sig(CTypeLike::Void, Vec::new()),
+        "last_component" => sig(
+            signed_byte_pointer_type(),
+            vec![p("filename", signed_byte_pointer_type())],
+        ),
+        "mdir_name" | "dir_name" => sig(
+            signed_byte_pointer_type(),
+            vec![p("file", signed_byte_pointer_type())],
+        ),
         "oputs_" | "oputs_.constprop.0" => {
             sig(CTypeLike::Void, vec![p("text", signed_byte_pointer_type())])
         }
@@ -1916,6 +1943,14 @@ pub fn signature_hint_for_role_name(
                 p("right", typedef_type("mcel_t")),
             ],
         ),
+        "mcel_tocmp" => sig(
+            c_int_type(),
+            vec![
+                p("to", typedef_type("wint_transform")),
+                p("c1", typedef_type("mcel_t")),
+                p("c2", typedef_type("mcel_t")),
+            ],
+        ),
         "mcel_scant" => sig(
             typedef_type("mcel_t"),
             vec![
@@ -2288,6 +2323,13 @@ pub fn signature_hint_for_role_name(
                 p("entry", memory_ptr_type()),
             ],
         ),
+        "heap_insert" => sig(
+            c_int_type(),
+            vec![
+                p("heap", typedef_pointer_type("heap")),
+                p("item", memory_ptr_type()),
+            ],
+        ),
         "hash_get_first" => sig(
             memory_ptr_type(),
             vec![p("table", typedef_pointer_type("hash_table"))],
@@ -2478,6 +2520,36 @@ pub fn signature_hint_for_role_name(
                 p("buf", signed_byte_pointer_type()),
                 p("n_bytes", typedef_type("size_t")),
             ],
+        ),
+        "yesno" => sig(CTypeLike::Bool, Vec::new()),
+        "parse_field_count" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("string", signed_byte_pointer_type()),
+                p("val", typedef_pointer_type("size_t")),
+                p("msgid", signed_byte_pointer_type()),
+            ],
+        ),
+        "cwd_advance_fd" => sig(
+            CTypeLike::Void,
+            vec![
+                p("sp", typedef_pointer_type("FTS")),
+                p("fd", c_int_type()),
+                p("chdir_down_one", CTypeLike::Bool),
+            ],
+        ),
+        "restore_initial_cwd" => sig(c_int_type(), vec![p("sp", typedef_pointer_type("FTS"))]),
+        "fts_sort" => sig(
+            typedef_pointer_type("FTSENT"),
+            vec![
+                p("sp", typedef_pointer_type("FTS")),
+                p("head", typedef_pointer_type("FTSENT")),
+                p("nitems", typedef_type("size_t")),
+            ],
+        ),
+        "get_root_dev_ino" => sig(
+            struct_pointer_type("dev_ino"),
+            vec![p("root_d_i", struct_pointer_type("dev_ino"))],
         ),
         "get_meminfo" => sig(
             CTypeLike::Bool,
@@ -2740,6 +2812,7 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "va_list"
             | "wchar_t"
             | "wc_lines"
+            | "wint_transform"
             | "xtime_t"
     )
 }
@@ -2832,6 +2905,7 @@ mod tests {
             "unicode_to_mb",
             "rpl_fopen",
             "rpl_nanosleep",
+            "xnanosleep",
             "rpl_fcntl",
             "vstrtoimax",
             "find_field.isra.0",
@@ -2905,10 +2979,12 @@ mod tests {
             "fopen_safer",
             "rpl_fflush",
             "maybe_close_stdout",
+            "open_safer",
             "openat_safer",
             "is_utf8_charset",
             "mcel_scan",
             "mcel_cmp",
+            "mcel_tocmp",
             "mcel_scant",
             "copy",
             "do_move",
@@ -2938,6 +3014,12 @@ mod tests {
             "rpl_fclose",
             "rpl_reallocarray",
             "write_bytes",
+            "yesno",
+            "parse_field_count",
+            "cwd_advance_fd",
+            "restore_initial_cwd",
+            "fts_sort",
+            "get_root_dev_ino",
             "init_node",
             "open_input_files",
             "filenvercmp",
@@ -2963,12 +3045,15 @@ mod tests {
             "print_stats",
             "create_hard_link",
             "record_file",
+            "calc_req_mask",
             "reap",
             "num_processors_via_affinity_mask",
             "process_signals",
             "exit_cleanup",
             "clear_files",
             "flush_stdout",
+            "getuser",
+            "getgroup",
             "format_user_or_group",
             "xstrtol_fatal",
             "tzalloc",
@@ -2981,6 +3066,8 @@ mod tests {
             "umaxtostr",
             "hwcap_allowed",
             "file_prefixlen",
+            "last_component",
+            "mdir_name",
             "getmonth",
             "operand_matches",
             "xstrxfrm",
@@ -3399,7 +3486,9 @@ mod tests {
         let version =
             signature_hint_for_role_name("version_etc_va", 0).expect("expected version_etc_va");
         assert_eq!(version.ret_type, Some(CTypeLike::Void));
+        assert_eq!(version.params.len(), 6);
         assert_eq!(version.params[4].ty, Some(typedef_type("va_list")));
+        assert_eq!(version.params[5].ty, Some(typedef_type("uintptr_t")));
 
         let xpalloc = signature_hint_for_role_name("xpalloc", 0).expect("expected xpalloc");
         assert_eq!(xpalloc.ret_type, Some(allocation_ptr_type()));
@@ -3440,6 +3529,11 @@ mod tests {
             signature_hint_for_role_name("hash_lookup", 0).expect("expected hash lookup");
         assert_eq!(hash_lookup.ret_type, Some(memory_ptr_type()));
         assert_eq!(hash_lookup.params[1].ty, Some(memory_ptr_type()));
+        let heap_insert =
+            signature_hint_for_role_name("heap_insert", 0).expect("expected heap insert");
+        assert_eq!(heap_insert.ret_type, Some(c_int_type()));
+        assert_eq!(heap_insert.params[0].ty, Some(typedef_pointer_type("heap")));
+        assert_eq!(heap_insert.params[1].ty, Some(memory_ptr_type()));
         let hash_entries =
             signature_hint_for_role_name("hash_get_entries", 0).expect("expected hash entries");
         assert_eq!(hash_entries.ret_type, Some(typedef_type("size_t")));
@@ -3447,6 +3541,23 @@ mod tests {
             hash_entries.params[1].ty,
             Some(CTypeLike::Pointer(Box::new(memory_ptr_type())))
         );
+        let parse_field =
+            signature_hint_for_role_name("parse_field_count", 0).expect("expected field parser");
+        assert_eq!(parse_field.ret_type, Some(signed_byte_pointer_type()));
+        assert_eq!(
+            parse_field.params[1].ty,
+            Some(typedef_pointer_type("size_t"))
+        );
+        let fts_sort = signature_hint_for_role_name("fts_sort", 0).expect("expected fts_sort");
+        assert_eq!(fts_sort.ret_type, Some(typedef_pointer_type("FTSENT")));
+        assert_eq!(fts_sort.params[0].ty, Some(typedef_pointer_type("FTS")));
+        let root_dev =
+            signature_hint_for_role_name("get_root_dev_ino", 0).expect("expected root dev ino");
+        assert_eq!(root_dev.ret_type, Some(struct_pointer_type("dev_ino")));
+        assert_eq!(root_dev.params[0].ty, Some(struct_pointer_type("dev_ino")));
+        let last_component =
+            signature_hint_for_role_name("last_component", 0).expect("expected last_component");
+        assert_eq!(last_component.ret_type, Some(signed_byte_pointer_type()));
 
         let quote_name = signature_hint_for_role_name("quote_name_buf.constprop.0", 0)
             .expect("expected quote_name_buf");
@@ -3479,6 +3590,19 @@ mod tests {
         let mcel = signature_hint_for_role_name("mcel_scan", 0).expect("expected mcel_scan");
         assert_eq!(mcel.ret_type, Some(typedef_type("mcel_t")));
         assert_eq!(mcel.params[1].ty, Some(signed_byte_pointer_type()));
+        let mcel_tocmp =
+            signature_hint_for_role_name("mcel_tocmp", 0).expect("expected mcel_tocmp");
+        assert_eq!(mcel_tocmp.ret_type, Some(c_int_type()));
+        assert_eq!(
+            mcel_tocmp.params[0].ty,
+            Some(typedef_type("wint_transform"))
+        );
+        assert_eq!(mcel_tocmp.params[1].ty, Some(typedef_type("mcel_t")));
+
+        let xnanosleep =
+            signature_hint_for_role_name("xnanosleep", 0).expect("expected xnanosleep");
+        assert_eq!(xnanosleep.ret_type, Some(c_int_type()));
+        assert_eq!(xnanosleep.params[0].ty, Some(CTypeLike::Float(64)));
 
         let mfile = signature_hint_for_role_name("mfile_name_concat", 0)
             .expect("expected mfile_name_concat");
@@ -3668,6 +3792,7 @@ mod tests {
         assert!(semantic_typedef_is_authoritative("md5_ctx"));
         assert!(semantic_typedef_is_authoritative("ptrdiff_t"));
         assert!(semantic_typedef_is_authoritative("wchar_t"));
+        assert!(semantic_typedef_is_authoritative("wint_transform"));
         assert!(semantic_typedef_is_authoritative("quoting_options"));
         assert!(semantic_typedef_is_authoritative("selabel_handle"));
         assert!(semantic_typedef_is_authoritative("printf_directive"));

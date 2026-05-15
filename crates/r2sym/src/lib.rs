@@ -115,7 +115,8 @@ pub use semantics::{
     NativeFunctionSummary, NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary,
     NativeParserKind, NativeParserSummary, NativeReductionSummary, NativeRegionSummary,
     NativeWorkerFold, NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerRoleIdentity,
-    NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator,
+    NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryApplicability,
+    NativeWorkerSummaryApplicabilitySource, NativeWorkerSummaryKind, NativeWorkerTerminator,
     QueryGuidanceMode, QueryPlan, RefinementStage, RegionKey, ResidualReason,
     SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticArtifact, SemanticArtifactBody,
     SemanticArtifactDiagnostics, SemanticCompilationResult, SemanticConfidence, SemanticEvidence,
@@ -133,8 +134,9 @@ pub use semantics::{
     compile_semantic_artifact_default_with_scope, compile_semantic_artifact_with_scope,
     compile_semantic_artifact_with_scope_and_replay_seed,
     compile_summary_dense_worker_artifact_from_interproc_summary, has_native_worker_summary_family,
-    has_program_orchestrator_summary_family, has_strong_vm_evidence, stable_scope_hash,
-    strong_vm_step_summary,
+    has_program_orchestrator_summary_family, has_strong_vm_evidence,
+    native_worker_summary_applicability_for_name, native_worker_summary_applicability_for_summary,
+    stable_scope_hash, strong_vm_step_summary,
 };
 pub use sim::{
     CallConv, CallInfo, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,
