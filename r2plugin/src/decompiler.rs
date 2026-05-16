@@ -159,12 +159,12 @@ mod tests {
     }
 
     #[test]
-    fn direct_named_worker_summary_renders_without_blocks() {
-        let output = render_direct_named_native_worker_summary(0x401000, "dbg.init_node", None, 64)
-            .expect("direct init_node summary");
+    fn direct_named_worker_summary_refuses_name_only_blocks() {
+        let output = render_direct_named_native_worker_summary(0x401000, "dbg.init_node", None, 64);
 
-        assert!(output.contains("init_node"));
-        assert!(output.contains("r2dec summary:"));
-        assert!(output.contains("worker summary:"));
+        assert!(
+            output.is_none(),
+            "direct native-worker rendering must not trust a symbol name without structural evidence"
+        );
     }
 }

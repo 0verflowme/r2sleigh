@@ -159,7 +159,7 @@ af
 a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
 s `afl~test_struct_array_index[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct") and contains("[idx].third") and contains("[idx].fourteenth") and (contains("[idx].f_8")|not) and (contains("[idx].f_34")|not) and (contains("sla_struct_")|not) and (contains("*(arr +")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 

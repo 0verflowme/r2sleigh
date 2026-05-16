@@ -115,6 +115,7 @@ Each benchmark case starts at 100 and loses points for:
 - invalid JSON from typed/debug report commands
 - nondeterministic repeated output
 - budget/residual markers in decompile output
+- source-gold oracle failures from `--gold-manifest`
 
 The score is intentionally simple. It is not a scientific truth metric; it is a
 deterministic triage signal.
@@ -126,6 +127,11 @@ The JSON report includes more than pass/fail data:
 
 - decompile classification: `structured`, `residual`, `fallback`, or `empty`
 - optional `pdg` comparison when `decompile_pdg` is included in `--commands`
+- optional source-gold oracle status under `summary.quality.gold_oracle`
+- owner buckets for actionable fix routing across `../radare2`, `r2ssa`,
+  `r2sym`, `r2types`, `r2engine`, `r2dec`, and plugin glue
+- `summary.next_work`, a deterministic owner-ranked backlog with target
+  examples, setup/command bottleneck status, and PDG quality-gap status
 - temp/register artifact density per decompile command
 - source smells such as scalar address leaks, synthetic `local_<hex>` stack
   placeholders, and shadowed parameters
@@ -141,6 +147,13 @@ The JSON report includes more than pass/fail data:
 These fields are the priority queue for owner-level fixes. A green run with
 many residual or temp-heavy outputs is still useful, but it is not the end
 state.
+
+Start broad-tranche triage from `summary.next_work`. If `status` is
+`owner_work`, fix the first `owner_work_items` entry at that canonical owner.
+If `status` is `pdg_quality_gap`, compare the listed `pdg` counts and
+`summary.quality.pdg_comparison.worst_quality_gaps`. If `status` is
+`setup_bottleneck`, improve benchmark batching, cache reuse, or setup reuse
+before spending time on semantic quality.
 
 Use `--commands decompile_sla,decompile_pdg,types,profile` when the goal is to
 beat r2ghidra's `pdg` directly. If r2ghidra is installed outside the temporary
@@ -172,6 +185,62 @@ python3 scripts/reversing_benchmark.py \
   --out /tmp/r2sleigh-all-corpora-pdg.json
 ```
 
+Use strict quality thresholds when the benchmark is acting as an acceptance
+gate, not just a report generator:
+
+```bash
+python3 scripts/reversing_benchmark.py \
+  --preset tier1 \
+  --strict \
+  --max-hard-failures 0 \
+  --max-residual-decompile 0 \
+  --max-generic-args 0 \
+  --max-generic-types 0 \
+  --min-average-score 99.0 \
+  --out /tmp/r2sleigh-coreutils-gate.json
+```
+
+Use the closure gate when the benchmark is intended to answer "are we done for
+this tranche?" It applies the default gold bar: strict mode, hard failures `0`,
+residual decompiles `0`, generic args/types `0`, average score `>= 99.5`, and
+setup/command ratio `<= 2.0`. If `decompile_pdg` is included in `--commands`,
+it also requires a successful PDG comparison, zero PDG quality wins, and zero
+PDG quality-then-performance wins unless explicitly overridden. Raw elapsed
+performance is still reported separately so a fast fallback cannot count as a
+gold-standard win.
+
+```bash
+python3 scripts/reversing_benchmark.py \
+  --preset tier1 \
+  --closure-gate \
+  --coreutils-dir /tmp/r2sleigh-corpora/src/coreutils/coreutils-9.11/src \
+  --max-binaries-per-corpus 108 \
+  --max-functions 12 \
+  --out /tmp/r2sleigh-coreutils-closure.json
+```
+
+Use source-gold manifests when PDG/r2ghidra is not enough. These checks pin
+source-level facts that must appear in our output and fake artifacts that must
+not appear. They are intentionally separate from smell metrics, because a
+decompiler can look structured and still be semantically wrong.
+
+```bash
+python3 scripts/reversing_benchmark.py \
+  --preset smoke \
+  --gold-manifest tests/gold/source_oracle.json \
+  --target test_struct_array_index \
+  --commands decompile_sla,types,profile \
+  --strict \
+  --require-gold \
+  --max-gold-failures 0 \
+  --out /tmp/r2sleigh-source-gold.json
+```
+
+Gold manifest expectations match by corpus/case/target/command. `contains` and
+`regex` entries must be present in the command output; `not_contains` and
+`not_regex` entries must be absent. Set `owner` when the failure should route
+directly to a canonical component such as `r2types` or `r2dec`.
+
 Interpreting Failures
 ---------------------
 
@@ -184,6 +253,8 @@ Use this ownership map when turning benchmark output into implementation work:
 | residual/budgeted symbolic facts | `r2sym` |
 | bad return/arg/out-param/type facts | `r2types` |
 | fallback, repeated calls, temp-heavy C | `r2dec` |
+| `source_oracle_failure` | manifest `owner`, otherwise classify before fixing |
+| timeout or nondeterministic route/cache behavior | `r2engine` |
 | command not registered, dylib mismatch | `r2plugin` harness/glue |
 | nondeterministic report order | owner producing the unordered data |
 
@@ -195,6 +266,14 @@ curated one manually for exact targets:
 
 ```json
 {
+  "availability": [
+    {
+      "corpus": "coreutils",
+      "status": "available",
+      "binary_count": 1,
+      "skip_reasons": []
+    }
+  ],
   "binaries": [
     {
       "name": "ls-O2",
@@ -214,13 +293,37 @@ Run with:
 python3 scripts/reversing_benchmark.py --manifest /path/to/manifest.json
 ```
 
+`availability` is the setup/discovery gate. A tier with `status: "skipped"` is
+not a semantic failure; it means the local corpus is absent or not buildable yet.
+
+Source-gold manifests use a separate top-level `expectations` array:
+
+```json
+{
+  "schema": 1,
+  "expectations": [
+    {
+      "id": "repo-vuln-struct-array-index",
+      "corpus": "repo-fixtures",
+      "case": "vuln_test_x86",
+      "target": "test_struct_array_index",
+      "command": "decompile_sla",
+      "owner": "r2types",
+      "contains": ["arr[idx].third"],
+      "regex": ["DemoStruct\\s*\\*\\s*arr"],
+      "not_contains": ["sla_struct_", "*(arr +"]
+    }
+  ]
+}
+```
+
 Improvement Loop
 ----------------
 
 1. Run the benchmark for the tier being improved.
-2. Sort by low score and slowest commands.
+2. Start from `summary.next_work`, then inspect low scores and slowest commands.
 3. Pick one failure family, not one symptom.
-4. Fix at the canonical owner.
+4. Fix at the canonical owner named by the report.
 5. Add a focused unit or `r2r` regression.
 6. Rerun the benchmark and compare JSON reports.
 

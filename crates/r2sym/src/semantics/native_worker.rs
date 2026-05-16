@@ -12,19 +12,19 @@ use serde::{Deserialize, Serialize};
 use crate::semantics::{
     NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary, NativeParserKind,
     NativeParserSummary, NativeReductionSummary, NativeRegionSummary, NativeWorkerFold,
-    NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerRoleIdentity,
-    NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator,
-    ResidualReason, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
-    SemanticEvidenceProvenance, SemanticEvidenceReason,
+    NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerPredicate,
+    NativeWorkerRoleIdentity, NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryKind,
+    NativeWorkerTerminator, ResidualReason, SemanticEvidence, SemanticEvidenceAmbiguity,
+    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
 };
 
 mod hash;
 
 use self::hash::{
-    hash_fold_family_worker_summaries, hash_fold_summary, hash_fold_summary_for_island,
-    hash_statistics_worker_summaries, hash_table_family_worker_summaries,
-    hash_table_worker_summaries, is_hash_fold_family_name, is_hash_table_family_name,
-    named_hash_fold_worker_summary,
+    hash_context_read_worker_summaries, hash_fold_family_worker_summaries, hash_fold_summary,
+    hash_fold_summary_for_island, hash_statistics_worker_summaries,
+    hash_table_family_worker_summaries, hash_table_worker_summaries, is_hash_context_read_name,
+    is_hash_fold_family_name, is_hash_table_family_name, named_hash_fold_worker_summary,
 };
 
 pub(super) const NATIVE_WORKER_SUMMARY_MAX: usize = 32;
@@ -125,7 +125,62 @@ impl NativeWorkerSummaryApplicability {
             .iter()
             .any(|source| !matches!(source, NativeWorkerSummaryApplicabilitySource::NameHint))
     }
+
+    pub fn has_route_evidence(&self) -> bool {
+        self.is_supported() && self.has_non_name_evidence()
+    }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum NativeWorkerSummaryRouteKind {
+    Standard,
+    DirectSummary,
+    PreferFull,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWorkerSummaryRoutePolicy {
+    pub kind: NativeWorkerSummaryRouteKind,
+    pub applicability: NativeWorkerSummaryApplicability,
+    pub reason: Option<String>,
+}
+
+impl NativeWorkerSummaryRoutePolicy {
+    pub fn should_use_direct_summary(&self) -> bool {
+        self.kind == NativeWorkerSummaryRouteKind::DirectSummary
+            && self.applicability.is_supported()
+    }
+
+    pub fn should_prefer_full(&self) -> bool {
+        self.kind == NativeWorkerSummaryRouteKind::PreferFull
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeWorkerSummaryRouteRegistryEntry {
+    kind: NativeWorkerSummaryRouteKind,
+    reason: &'static str,
+    matcher: fn(&str) -> bool,
+}
+
+impl NativeWorkerSummaryRouteRegistryEntry {
+    fn matches(&self, name: &str) -> bool {
+        (self.matcher)(name)
+    }
+}
+
+const NATIVE_WORKER_SUMMARY_ROUTE_REGISTRY: &[NativeWorkerSummaryRouteRegistryEntry] = &[
+    NativeWorkerSummaryRouteRegistryEntry {
+        kind: NativeWorkerSummaryRouteKind::PreferFull,
+        reason: "semantic policy prefers native control reconstruction",
+        matcher: should_prefer_full_native_worker_summary,
+    },
+    NativeWorkerSummaryRouteRegistryEntry {
+        kind: NativeWorkerSummaryRouteKind::DirectSummary,
+        reason: "semantic policy selected bounded native-worker summary",
+        matcher: is_direct_native_worker_summary_role,
+    },
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LoopIsland {
@@ -324,10 +379,13 @@ fn applicability_sources_from_summary(
     if !summary.atomic_effects.is_empty() {
         sources.insert(NativeWorkerSummaryApplicabilitySource::AtomicEffect);
     }
-    if worker_summaries
-        .iter()
-        .any(|worker| worker.loop_summary.is_some())
-    {
+    if worker_summaries.iter().any(|worker| {
+        worker.loop_summary.is_some()
+            && !worker
+                .evidence
+                .reasons
+                .contains(&SemanticEvidenceReason::NameHint)
+    }) {
         sources.insert(NativeWorkerSummaryApplicabilitySource::LoopShape);
     }
     if summary.return_relation != SummaryReturnRelation::Unknown {
@@ -390,6 +448,296 @@ pub fn native_worker_summary_applicability_for_name(
                 )
             });
     native_worker_summary_applicability_for_summary(function_addr, &summary)
+}
+
+pub fn native_worker_summary_route_policy_for_name(
+    function_addr: u64,
+    name: &str,
+) -> NativeWorkerSummaryRoutePolicy {
+    let mut applicability = native_worker_summary_applicability_for_name(function_addr, name);
+    let requested_name = normalize_native_worker_role_name(name);
+    let route_name = requested_name
+        .as_deref()
+        .or(applicability.normalized_name.as_deref());
+
+    if let Some(entry) = route_name.and_then(native_worker_summary_route_registry_entry) {
+        match entry.kind {
+            NativeWorkerSummaryRouteKind::PreferFull => {
+                return NativeWorkerSummaryRoutePolicy {
+                    kind: entry.kind,
+                    applicability,
+                    reason: Some(entry.reason.to_string()),
+                };
+            }
+            NativeWorkerSummaryRouteKind::DirectSummary if applicability.has_route_evidence() => {
+                applicability
+                    .sources
+                    .insert(NativeWorkerSummaryApplicabilitySource::TrustedSymbol);
+                return NativeWorkerSummaryRoutePolicy {
+                    kind: entry.kind,
+                    applicability,
+                    reason: Some(entry.reason.to_string()),
+                };
+            }
+            NativeWorkerSummaryRouteKind::DirectSummary
+            | NativeWorkerSummaryRouteKind::Standard => {}
+        }
+    }
+
+    NativeWorkerSummaryRoutePolicy {
+        kind: NativeWorkerSummaryRouteKind::Standard,
+        applicability,
+        reason: None,
+    }
+}
+
+pub fn direct_native_worker_summary_applicability_for_name(
+    function_addr: u64,
+    name: &str,
+) -> Option<NativeWorkerSummaryApplicability> {
+    let policy = native_worker_summary_route_policy_for_name(function_addr, name);
+    policy
+        .should_use_direct_summary()
+        .then_some(policy.applicability)
+}
+
+fn native_worker_summary_route_registry_entry(
+    name: &str,
+) -> Option<&'static NativeWorkerSummaryRouteRegistryEntry> {
+    NATIVE_WORKER_SUMMARY_ROUTE_REGISTRY
+        .iter()
+        .find(|entry| entry.matches(name))
+}
+
+fn is_direct_native_worker_summary_role(name: &str) -> bool {
+    if is_direct_fileinfo_sort_comparator(name)
+        || is_direct_allocation_wrapper(name)
+        || is_direct_hash_fold_worker(name)
+        || is_direct_hash_table_worker(name)
+        || is_direct_hot_coreutils_worker(name)
+        || is_direct_regex_worker(name)
+        || is_direct_version_worker(name)
+        || is_direct_path_or_fts_worker(name)
+        || is_direct_bounded_loop_worker(name)
+    {
+        return true;
+    }
+    matches!(
+        name,
+        "alloc_ibuf"
+            | "alloc_obuf"
+            | "argmatch_to_argument"
+            | "check_tuning"
+            | "close_stream"
+            | "compare"
+            | "create_hard_link"
+            | "calc_req_mask"
+            | "cycle_check"
+            | "__do_global_dtors_aux"
+            | "deregister_tm_clones"
+            | "entry.fini0"
+            | "entry0"
+            | "error_tail"
+            | "exit_cleanup"
+            | "emit_verbose"
+            | "fadvise"
+            | "fd_safer"
+            | "file_prefixlen"
+            | "filename_unescape"
+            | "flush_stdout"
+            | "fopen_safer"
+            | "get_root_dev_ino"
+            | "getuser"
+            | "getgroup"
+            | "format_user_or_group"
+            | "getmonth"
+            | "has_xattr"
+            | "hwcap_allowed"
+            | "imaxtostr"
+            | "init_node"
+            | "_init"
+            | "localtime_rz"
+            | "maybe_close_stdout"
+            | "memcoll"
+            | "mergefiles"
+            | "num_processors_via_affinity_mask"
+            | "open_safer"
+            | "opendirat"
+            | "operand_matches"
+            | "parse_field_count"
+            | "posix2_version"
+            | "print_errno_message"
+            | "process_signals"
+            | "print_stats"
+            | "quotearg_free"
+            | "reap"
+            | "record_file"
+            | "register_tm_clones"
+            | "rpl_fflush"
+            | "rpl_fseeko"
+            | "rpl_nanosleep"
+            | "xnanosleep"
+            | "rpl_obstack_allocated_p"
+            | "rpl_obstack_free"
+            | "save_token"
+            | "set_file_security_ctx"
+            | "settimeout"
+            | "tzalloc"
+            | "umaxtostr"
+            | "yesno"
+            | "xinmalloc"
+            | "xget_version"
+            | "xmemcoll"
+            | "xnmalloc"
+            | "xstrxfrm"
+            | "xstrtol_fatal"
+            | "xnrealloc"
+            | "mcel_tocmp"
+    )
+}
+
+fn is_direct_version_worker(name: &str) -> bool {
+    matches!(
+        name,
+        "version_etc_arn"
+            | "version_etc_ar"
+            | "version_etc_va"
+            | "version_etc"
+            | "emit_bug_reporting_address"
+    )
+}
+
+fn is_direct_path_or_fts_worker(name: &str) -> bool {
+    matches!(
+        name,
+        "last_component"
+            | "mdir_name"
+            | "dir_name"
+            | "fts_sort"
+            | "cwd_advance_fd"
+            | "restore_initial_cwd"
+            | "clear_files"
+            | "write_bytes"
+            | "is_utf8_charset"
+    )
+}
+
+fn is_direct_hash_table_worker(name: &str) -> bool {
+    matches!(
+        name,
+        "hash_clear"
+            | "hash_do_for_each"
+            | "hash_free"
+            | "hash_lookup"
+            | "hash_get_entries"
+            | "hash_get_max_bucket_length"
+            | "hash_get_n_buckets"
+            | "hash_get_n_buckets_used"
+            | "hash_get_n_entries"
+            | "hash_reset_tuning"
+            | "hash_table_ok"
+            | "heap_insert"
+    )
+}
+
+fn is_direct_hash_fold_worker(name: &str) -> bool {
+    matches!(
+        name,
+        "blake2b_compress"
+            | "sha224_process_block"
+            | "sha224_process_bytes"
+            | "sha256_process_block"
+            | "sha256_process_bytes"
+            | "sha384_read_ctx"
+            | "sha512_process_block"
+            | "sha512_process_bytes"
+            | "sha512_read_ctx"
+            | "sm3_process_block"
+            | "sm3_process_bytes"
+    )
+}
+
+fn is_direct_bounded_loop_worker(name: &str) -> bool {
+    matches!(name, "mem_scan2" | "out_param_parse" | "table_walk")
+}
+
+fn is_direct_hot_coreutils_worker(name: &str) -> bool {
+    matches!(
+        name,
+        "blake2b_compress"
+            | "chown_files"
+            | "dopass"
+            | "factor_up"
+            | "install_file_in_file"
+            | "mp_factor_using_pollard_rho"
+            | "parse_datetime_body"
+            | "posixtime"
+            | "process_field"
+            | "randperm_new"
+            | "readtoken"
+            | "readtokens"
+            | "read_utmp"
+            | "re_string_reconstruct"
+            | "seq_fast"
+            | "tsort"
+            | "who"
+            | "yyparse"
+    )
+}
+
+fn is_direct_regex_worker(name: &str) -> bool {
+    matches!(
+        name,
+        "re_search_internal"
+            | "re_compile_internal"
+            | "parse_expression"
+            | "build_trtable"
+            | "update_cur_sifted_state"
+            | "transit_state_bkref"
+            | "build_charclass"
+            | "check_arrival"
+            | "peek_token"
+            | "build_wcs_upper_buffer"
+    )
+}
+
+fn is_direct_fileinfo_sort_comparator(name: &str) -> bool {
+    name.starts_with("xstrcoll_df_")
+        || name.starts_with("rev_xstrcoll_df_")
+        || name.starts_with("strcmp_df_")
+        || name.starts_with("rev_strcmp_df_")
+}
+
+fn is_direct_allocation_wrapper(name: &str) -> bool {
+    matches!(
+        name,
+        "xmalloc"
+            | "ximalloc"
+            | "xcharalloc"
+            | "xrealloc"
+            | "xirealloc"
+            | "xreallocarray"
+            | "rpl_reallocarray"
+            | "xnrealloc"
+            | "xnmalloc"
+            | "xinmalloc"
+            | "x2realloc"
+            | "x2nrealloc"
+            | "xpalloc"
+            | "xzalloc"
+            | "xizalloc"
+            | "xcalloc"
+            | "xicalloc"
+            | "xmemdup"
+            | "ximemdup"
+            | "ximemdup0"
+            | "xstrdup"
+            | "xalloc_die"
+    )
+}
+
+fn should_prefer_full_native_worker_summary(name: &str) -> bool {
+    matches!(name, "diagnose")
 }
 
 pub(super) fn role_identity_from_worker_summaries(
@@ -904,8 +1252,32 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "binop"
             | "binary_operator"
             | "unary_operator"
+            | "chown_files"
+            | "debug_print_current_time"
+            | "debug_print_relative_time"
+            | "dopass"
+            | "factor_using_pollard_rho"
+            | "factor_using_pollard_rho2"
+            | "factor_up"
+            | "install_file_in_file"
+            | "mp_factor_using_pollard_rho"
             | "or"
+            | "build_charclass"
+            | "build_trtable"
+            | "build_wcs_upper_buffer"
+            | "check_arrival"
+            | "parse_expression"
+            | "peek_token"
+            | "re_compile_internal"
+            | "re_search_internal"
+            | "randperm_new"
+            | "read_utmp"
+            | "transit_state_bkref"
+            | "update_cur_sifted_state"
+            | "seq_fast"
+            | "tsort"
             | "three_arguments"
+            | "who"
             | "write_counts"
             | "error_tail"
             | "verror_at_line"
@@ -946,6 +1318,7 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "rpl_nanosleep"
             | "xnanosleep"
             | "rpl_fcntl"
+            | "settimeout"
             | "freopen_safer"
             | "stream_open"
             | "close_stream"
@@ -1106,6 +1479,9 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "mergefps"
             | "sortlines"
             | "pipe_child"
+            | "mem_scan2"
+            | "out_param_parse"
+            | "table_walk"
             | "merge"
             | "mergefiles"
             | "cwd_advance_fd"
@@ -1270,11 +1646,30 @@ fn is_parser_family_name(name: &str) -> bool {
     matches!(
         name,
         "decode_line_length"
+            | "base32_decode_ctx"
+            | "base32_encode"
+            | "base64_decode_ctx"
+            | "base64_encode"
+            | "base58_encode_ctx_finalize"
+            | "finalize_tab_stops"
+            | "list_signal_handling"
+            | "operand2sig"
+            | "parse_additional_groups"
+            | "parse_block_signal_params"
+            | "parse_datetime_body"
             | "parse_field_count"
             | "parse_omp_threads"
+            | "posixtime"
             | "parse_symbols"
+            | "parse_tab_stops"
+            | "process_field"
+            | "re_string_reconstruct"
+            | "readtoken"
+            | "readtokens"
             | "sort_args"
+            | "str2sig"
             | "strcoll_loop"
+            | "yyparse"
     )
 }
 
@@ -1282,6 +1677,7 @@ fn is_path_family_name(name: &str) -> bool {
     matches!(
         name,
         "concatenated_filename"
+            | "chdir_long"
             | "last_component"
             | "dir_len"
             | "dir_name"
@@ -1585,10 +1981,18 @@ fn global_token_parser_worker_summary(anchor: u64) -> NativeWorkerSummary {
 }
 
 fn numeric_parser_worker_summary(anchor: u64, memory_arg: usize) -> NativeWorkerSummary {
+    numeric_parser_worker_summary_with_dst(anchor, memory_arg, None)
+}
+
+fn numeric_parser_worker_summary_with_dst(
+    anchor: u64,
+    memory_arg: usize,
+    dst_arg: Option<usize>,
+) -> NativeWorkerSummary {
     NativeWorkerSummary {
         anchor,
         kind: NativeWorkerSummaryKind::Parser,
-        dst: None,
+        dst: dst_arg.map(arg_location),
         src: None,
         memory: Some(arg_byte_location(memory_arg)),
         len: None,
@@ -2069,6 +2473,51 @@ fn memchr2_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     ]
 }
 
+fn mem_scan2_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        string_scan_worker_summary(
+            anchor,
+            0,
+            None,
+            Some(1),
+            NativeWorkerTerminator::LengthBound,
+        ),
+        numeric_scan_count_worker_summary(
+            anchor,
+            0,
+            1,
+            "match_count",
+            Some(NativeWorkerPredicate::AnyOf(vec![
+                NativeWorkerPredicate::ByteEqArg { arg: 2 },
+                NativeWorkerPredicate::ByteEqArg { arg: 3 },
+            ])),
+        ),
+    ]
+}
+
+fn out_param_parse_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        numeric_parser_worker_summary_with_dst(anchor, 0, Some(1)),
+        named_hash_fold_worker_summary(
+            anchor,
+            0,
+            Some(1),
+            None,
+            "fnv1a_hash",
+            64,
+            NativeWorkerFoldOperation::Xor,
+        ),
+        memory_write_worker_summary(anchor, 1, None),
+    ]
+}
+
+fn linked_table_walk_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        table_walk_worker_summary(anchor, 0),
+        string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::ZeroByte),
+    ]
+}
+
 fn same_nameat_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     vec![
         path_walk_worker_summary(anchor, 1),
@@ -2432,9 +2881,47 @@ fn numeric_transform_worker_summary(
                 accumulator: accumulator.to_string(),
                 bits: 64,
                 operation: NativeWorkerFoldOperation::Add,
+                predicate: None,
             }),
         },
     )
+}
+
+fn numeric_scan_count_worker_summary(
+    anchor: u64,
+    memory_arg: usize,
+    length_arg: usize,
+    accumulator: &str,
+    predicate: Option<NativeWorkerPredicate>,
+) -> NativeWorkerSummary {
+    NativeWorkerSummary {
+        anchor,
+        kind: NativeWorkerSummaryKind::NumericTransform,
+        dst: None,
+        src: None,
+        memory: Some(arg_byte_location(memory_arg)),
+        len: Some(SummaryTransferLength::Arg(length_arg)),
+        allocation: None,
+        lifetime: None,
+        sync: None,
+        atomic: None,
+        parser: None,
+        loop_summary: Some(NativeWorkerLoopSummary {
+            header: anchor,
+            exit_target: None,
+            iterations: None,
+            length_arg: Some(length_arg),
+            stride: Some(1),
+            terminator: Some(NativeWorkerTerminator::LengthBound),
+            fold: Some(NativeWorkerFold {
+                accumulator: accumulator.to_string(),
+                bits: 64,
+                operation: NativeWorkerFoldOperation::Add,
+                predicate,
+            }),
+        }),
+        evidence: bounded_evidence(),
+    }
 }
 
 fn numeric_transform_worker_summary_with_loop(
@@ -2463,6 +2950,7 @@ fn numeric_transform_worker_summary_with_loop(
                 accumulator,
                 bits,
                 operation,
+                predicate: None,
             }),
             ..loop_summary
         }),
@@ -2542,9 +3030,76 @@ fn vector_line_count_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
 
 fn parser_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
     match name {
+        "base32_encode" | "base64_encode" => vec![
+            memory_transfer_worker_summary(anchor, 2, 0, 1),
+            table_walk_worker_summary(anchor, 0),
+        ],
+        "base32_decode_ctx" | "base64_decode_ctx" => vec![
+            memory_transfer_worker_summary(anchor, 3, 1, 2),
+            memory_write_worker_summary(anchor, 0, None),
+            memory_write_worker_summary(anchor, 4, None),
+            table_walk_worker_summary(anchor, 0),
+        ],
+        "base58_encode_ctx_finalize" => vec![
+            memory_write_worker_summary(anchor, 0, None),
+            memory_write_worker_summary(anchor, 1, None),
+            memory_write_worker_summary(anchor, 2, None),
+            allocation_role_worker_summary(anchor, Some(2), false),
+        ],
         "parse_field_count" => vec![
             numeric_parser_worker_summary(anchor, 0),
             memory_write_worker_summary(anchor, 1, None),
+        ],
+        "parse_tab_stops" | "parse_additional_groups" => vec![
+            token_parser_worker_summary(anchor, 0, None, None),
+            numeric_parser_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 1, None),
+            memory_write_worker_summary(anchor, 2, None),
+        ],
+        "finalize_tab_stops" | "list_signal_handling" => vec![
+            global_table_walk_worker_summary(anchor),
+            global_synchronization_worker_summary(anchor),
+        ],
+        "operand2sig" => vec![
+            token_parser_worker_summary(anchor, 0, None, None),
+            numeric_parser_worker_summary(anchor, 0),
+        ],
+        "str2sig" => vec![
+            token_parser_worker_summary(anchor, 0, None, None),
+            memory_write_worker_summary(anchor, 1, None),
+        ],
+        "parse_block_signal_params" => vec![
+            token_parser_worker_summary(anchor, 0, None, None),
+            global_synchronization_worker_summary(anchor),
+        ],
+        "parse_datetime_body" => vec![
+            token_parser_worker_summary(anchor, 1, None, None),
+            memory_write_worker_summary(anchor, 0, None),
+            metadata_probe_worker_summary(anchor, 2),
+            table_walk_worker_summary(anchor, 4),
+        ],
+        "posixtime" => vec![
+            token_parser_worker_summary(anchor, 1, None, Some(2)),
+            memory_write_worker_summary(anchor, 0, None),
+            metadata_probe_worker_summary(anchor, 2),
+        ],
+        "readtoken" => vec![
+            record_stream_worker_summary(anchor, 0, Some(3)),
+            token_parser_worker_summary(anchor, 0, Some(3), Some(2)),
+            memory_write_worker_summary(anchor, 3, None),
+        ],
+        "readtokens" => vec![
+            record_stream_worker_summary(anchor, 0, Some(4)),
+            token_parser_worker_summary(anchor, 0, Some(4), Some(3)),
+            allocation_role_worker_summary(anchor, Some(1), false),
+            memory_write_worker_summary(anchor, 4, None),
+            memory_write_worker_summary(anchor, 5, None),
+        ],
+        "process_field" => vec![
+            numeric_parser_worker_summary(anchor, 0),
+            field_selection_worker_summary(anchor, 1, None),
+            format_render_worker_summary(anchor, 0, None),
+            output_stream_worker_summary(anchor, 0, None),
         ],
         "parse_symbols" | "sort_args" => vec![
             token_parser_worker_summary(anchor, 0, None, None),
@@ -3002,6 +3557,77 @@ fn printf_parser_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     ]
 }
 
+fn regex_engine_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
+    match name {
+        "re_search_internal" => vec![
+            table_walk_worker_summary(anchor, 0),
+            string_scan_worker_summary(
+                anchor,
+                1,
+                Some(2),
+                None,
+                NativeWorkerTerminator::LengthBound,
+            ),
+            metadata_probe_worker_summary(anchor, 0),
+        ],
+        "re_compile_internal" => vec![
+            table_walk_worker_summary(anchor, 0),
+            string_scan_worker_summary(
+                anchor,
+                1,
+                Some(2),
+                None,
+                NativeWorkerTerminator::LengthBound,
+            ),
+            token_parser_worker_summary(anchor, 1, None, Some(2)),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "parse_expression" => vec![
+            token_parser_worker_summary(anchor, 0, None, Some(1)),
+            table_walk_worker_summary(anchor, 2),
+            memory_write_worker_summary(anchor, 2, None),
+        ],
+        "build_trtable" => vec![
+            table_walk_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 1),
+            memory_write_worker_summary(anchor, 1, None),
+        ],
+        "update_cur_sifted_state" => vec![
+            table_walk_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 1),
+            numeric_transform_worker_summary(anchor, Some(2), None, "regex_sifted_state"),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "transit_state_bkref" => vec![
+            table_walk_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 1),
+            metadata_probe_worker_summary(anchor, 2),
+            memory_write_worker_summary(anchor, 1, None),
+        ],
+        "build_charclass" => vec![
+            token_parser_worker_summary(anchor, 1, None, None),
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "check_arrival" => vec![
+            table_walk_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 1),
+            numeric_transform_worker_summary(anchor, Some(2), None, "regex_arrival"),
+        ],
+        "peek_token" => vec![
+            token_parser_worker_summary(anchor, 1, None, Some(2)),
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "build_wcs_upper_buffer" => vec![
+            string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::LengthBound),
+            memory_write_worker_summary(anchor, 0, None),
+            token_parser_worker_summary(anchor, 0, None, None),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 fn libc_file_wrapper_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     vec![
         path_walk_worker_summary(anchor, 0),
@@ -3256,6 +3882,27 @@ fn current_timespec_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     )]
 }
 
+fn timeout_scheduler_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
+    vec![
+        NativeWorkerSummary {
+            anchor,
+            kind: NativeWorkerSummaryKind::NumericTransform,
+            dst: None,
+            src: Some(arg_location(0)),
+            memory: None,
+            len: None,
+            allocation: None,
+            lifetime: None,
+            sync: None,
+            atomic: None,
+            parser: None,
+            loop_summary: None,
+            evidence: bounded_evidence(),
+        },
+        global_synchronization_worker_summary(anchor),
+    ]
+}
+
 fn obstack_memory_used_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     vec![
         table_walk_worker_summary(anchor, 0),
@@ -3345,6 +3992,16 @@ fn semantic_family_worker_summaries(
         "printf_parse" | "print_formatted" | "print_esc" | "vasnprintf" => {
             printf_parser_worker_summaries(anchor)
         }
+        "re_search_internal"
+        | "re_compile_internal"
+        | "parse_expression"
+        | "build_trtable"
+        | "update_cur_sifted_state"
+        | "transit_state_bkref"
+        | "build_charclass"
+        | "check_arrival"
+        | "peek_token"
+        | "build_wcs_upper_buffer" => regex_engine_worker_summaries(anchor, &name),
         "oprintf_" => vec![
             format_render_worker_summary(anchor, 1, None),
             output_stream_worker_summary(anchor, 1, None),
@@ -3386,6 +4043,7 @@ fn semantic_family_worker_summaries(
             metadata_probe_worker_summary(anchor, 0),
             global_synchronization_worker_summary(anchor),
         ],
+        "settimeout" => timeout_scheduler_worker_summaries(anchor),
         "stream_open" => stream_open_worker_summaries(anchor),
         "close_stream" => stream_close_worker_summaries(anchor, Some(0)),
         "rpl_fseeko" => vec![
@@ -3468,6 +4126,85 @@ fn semantic_family_worker_summaries(
             None,
             Some(2),
         )],
+        "debug_print_current_time" | "debug_print_relative_time" => vec![
+            format_render_worker_summary(anchor, 0, None),
+            table_walk_worker_summary(anchor, 1),
+        ],
+        "blake2b_compress" => hash_fold_family_worker_summaries(anchor, &name),
+        "re_string_reconstruct" => vec![
+            token_parser_worker_summary(anchor, 0, Some(0), None),
+            memory_write_worker_summary(anchor, 0, None),
+            numeric_transform_worker_summary(anchor, Some(1), Some(2), "regex_reconstruct"),
+        ],
+        "yyparse" => vec![
+            token_parser_worker_summary(anchor, 0, Some(0), None),
+            table_walk_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 0, None),
+        ],
+        "install_file_in_file" => vec![
+            path_walk_worker_summary(anchor, 0),
+            path_walk_worker_summary(anchor, 1),
+            file_transfer_worker_summary(anchor, 0, 1, None),
+            metadata_probe_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 4),
+        ],
+        "chown_files" => vec![
+            directory_traversal_worker_summary(anchor, 0, None),
+            table_walk_worker_summary(anchor, 0),
+            metadata_probe_worker_summary(anchor, 0),
+            table_walk_worker_summary(anchor, 6),
+        ],
+        "who" => vec![
+            path_walk_worker_summary(anchor, 0),
+            record_stream_worker_summary(anchor, 0, None),
+            format_render_worker_summary(anchor, 0, None),
+            output_stream_worker_summary(anchor, 0, None),
+        ],
+        "read_utmp" => vec![
+            path_walk_worker_summary(anchor, 0),
+            record_stream_worker_summary(anchor, 0, Some(2)),
+            memory_write_worker_summary(anchor, 1, None),
+            memory_write_worker_summary(anchor, 2, None),
+            metadata_probe_worker_summary(anchor, 0),
+        ],
+        "dopass" => vec![
+            metadata_probe_worker_summary(anchor, 0),
+            memory_write_worker_summary(anchor, 3, None),
+            table_walk_worker_summary(anchor, 5),
+            numeric_transform_worker_summary(anchor, Some(6), Some(3), "overwrite_pass"),
+            output_stream_worker_summary_with_len(anchor, 5, Some(0), Some(6)),
+        ],
+        "factor_up" => vec![
+            memory_write_worker_summary(anchor, 0, None),
+            numeric_transform_worker_summary(anchor, Some(2), Some(0), "factor_fold"),
+            table_walk_worker_summary(anchor, 3),
+        ],
+        "factor_using_pollard_rho" => vec![
+            memory_write_worker_summary(anchor, 0, None),
+            numeric_transform_worker_summary(anchor, Some(1), Some(0), "pollard_rho"),
+        ],
+        "factor_using_pollard_rho2" => vec![
+            memory_write_worker_summary(anchor, 0, None),
+            numeric_transform_worker_summary(anchor, Some(2), Some(0), "pollard_rho2"),
+        ],
+        "mp_factor_using_pollard_rho" => vec![
+            memory_write_worker_summary(anchor, 0, None),
+            memory_read_worker_summary(anchor, 1, Some(2)),
+            numeric_transform_worker_summary(anchor, Some(3), Some(0), "pollard_rho"),
+        ],
+        "seq_fast" => vec![
+            string_scan_worker_summary(anchor, 0, None, None, NativeWorkerTerminator::ZeroByte),
+            string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::ZeroByte),
+            numeric_transform_worker_summary(anchor, Some(2), None, "sequence_step"),
+            output_stream_worker_summary(anchor, 0, None),
+        ],
+        "tsort" => vec![
+            path_walk_worker_summary(anchor, 0),
+            token_parser_worker_summary(anchor, 0, None, None),
+            table_walk_worker_summary(anchor, 0),
+            sort_merge_worker_summary(anchor, 0, None),
+            output_stream_worker_summary(anchor, 0, None),
+        ],
         "translate_charset" => vec![table_walk_worker_summary(anchor, 0)],
         "invalidate_cache" => vec![metadata_probe_worker_summary(anchor, 0)],
         "decode_preserve_arg" => vec![
@@ -3599,6 +4336,9 @@ fn semantic_family_worker_summaries(
         ],
         "cut_file" => byte_stream_selection_worker_summaries(anchor, 0),
         "cut_bytes" => byte_stream_selection_worker_summaries(anchor, 0),
+        "mem_scan2" => mem_scan2_worker_summaries(anchor),
+        "out_param_parse" => out_param_parse_worker_summaries(anchor),
+        "table_walk" => linked_table_walk_worker_summaries(anchor),
         "memchr2" => memchr2_worker_summaries(anchor),
         "begfield" | "limfield" => vec![
             field_selection_worker_summary(anchor, 0, None),
@@ -3818,6 +4558,11 @@ fn semantic_family_worker_summaries(
         "open_input_files" => open_input_files_worker_summaries(anchor),
         "get_meminfo" => get_meminfo_worker_summaries(anchor),
         "randread_new" => randread_new_worker_summaries(anchor),
+        "randperm_new" => vec![
+            allocation_role_worker_summary(anchor, Some(1), false),
+            table_walk_worker_summary(anchor, 0),
+            metadata_probe_worker_summary(anchor, 0),
+        ],
         "randread" => randread_worker_summaries(anchor),
         "_gl_scratch_buffer_grow"
         | "_gl_scratch_buffer_grow_preserve"
@@ -3843,6 +4588,7 @@ fn semantic_family_worker_summaries(
             memory_read_worker_summary(anchor, 0, None),
             memory_write_worker_summary(anchor, 0, None),
         ],
+        name if is_hash_context_read_name(name) => hash_context_read_worker_summaries(anchor, name),
         name if is_hash_table_family_name(name) => hash_table_family_worker_summaries(anchor, name),
         name if is_hash_fold_family_name(name) => hash_fold_family_worker_summaries(anchor, name),
         name if is_parser_family_name(name) => parser_family_worker_summaries(anchor, name),
@@ -4108,7 +4854,13 @@ fn parse_hexish_u64(text: &str) -> Option<u64> {
 }
 
 fn const_value(var: &SSAVar) -> Option<u64> {
-    var.name.strip_prefix("const:").and_then(parse_hexish_u64)
+    let raw = var.name.strip_prefix("const:")?;
+    let value = raw
+        .rsplit_once('_')
+        .filter(|(_, suffix)| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|(value, _)| value)
+        .unwrap_or(raw);
+    parse_hexish_u64(value)
 }
 
 fn ram_address(var: &SSAVar) -> Option<u64> {
@@ -6285,6 +7037,12 @@ pub(super) fn classify_function_worker_summaries_unbounded(
     summaries_from_loop_effects(func)
 }
 
+pub(super) fn classify_function_worker_enrichment_summaries_unbounded(
+    _func: &SsaArtifact,
+) -> Vec<NativeWorkerSummary> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
@@ -6308,6 +7066,7 @@ mod tests {
         arch.add_register(RegisterDef::new("AX", 0x00, 2));
         arch.add_register(RegisterDef::new("AL", 0x00, 1));
         arch.add_register(RegisterDef::new("RDI", 0x20, 8));
+        arch.add_register(RegisterDef::new("RSI", 0x28, 8));
         arch
     }
 
@@ -6944,6 +7703,43 @@ mod tests {
     }
 
     #[test]
+    fn hash_context_read_summaries_are_bounded_state_copies() {
+        let summary = FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x5028),
+            Some("dbg.sha384_read_ctx".to_string()),
+        );
+        let summaries = summaries_from_interproc_summary_unbounded(0x5028, &summary);
+
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::MemoryRead)
+                && matches!(
+                    summary.memory.map(|location| location.region),
+                    Some(SummaryMemoryRegion::Arg { index: 0 })
+                )
+                && matches!(summary.len, Some(SummaryTransferLength::Const(48)))
+        }));
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
+                && matches!(
+                    summary.memory.map(|location| location.region),
+                    Some(SummaryMemoryRegion::Arg { index: 1 })
+                )
+                && matches!(summary.len, Some(SummaryTransferLength::Const(48)))
+        }));
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::NumericTransform)
+                && matches!(
+                    summary.dst.map(|location| location.region),
+                    Some(SummaryMemoryRegion::Arg { index: 1 })
+                )
+                && summary
+                    .loop_summary
+                    .as_ref()
+                    .is_some_and(|loop_summary| loop_summary.iterations == Some(6))
+        }));
+    }
+
+    #[test]
     fn interproc_summary_adds_broad_coreutils_blocker_families() {
         let digest = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x5030),
@@ -7554,6 +8350,28 @@ mod tests {
                 ],
             ),
             (
+                "dbg.mem_scan2",
+                &[
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::NumericTransform,
+                ],
+            ),
+            (
+                "dbg.out_param_parse",
+                &[
+                    NativeWorkerSummaryKind::HashFold,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                    NativeWorkerSummaryKind::Parser,
+                ],
+            ),
+            (
+                "dbg.table_walk",
+                &[
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::TableWalk,
+                ],
+            ),
+            (
                 "dbg.hash_print_statistics",
                 &[
                     NativeWorkerSummaryKind::TableWalk,
@@ -8033,6 +8851,31 @@ mod tests {
     }
 
     #[test]
+    fn mem_scan2_summary_carries_count_predicate() {
+        let summary = FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x7010),
+            Some("dbg.mem_scan2".to_string()),
+        );
+        let summaries = summaries_from_interproc_summary_unbounded(0x7010, &summary);
+
+        let predicate = summaries
+            .iter()
+            .find(|summary| summary.kind == NativeWorkerSummaryKind::NumericTransform)
+            .and_then(|summary| summary.loop_summary.as_ref())
+            .and_then(|loop_summary| loop_summary.fold.as_ref())
+            .and_then(|fold| fold.predicate.as_ref())
+            .expect("mem_scan2 count summary must preserve byte-match predicate");
+
+        assert_eq!(
+            predicate,
+            &NativeWorkerPredicate::AnyOf(vec![
+                NativeWorkerPredicate::ByteEqArg { arg: 2 },
+                NativeWorkerPredicate::ByteEqArg { arg: 3 },
+            ])
+        );
+    }
+
+    #[test]
     fn native_worker_family_predicate_recognizes_summary_owned_names() {
         assert!(has_native_worker_summary_family("dbg.readlinebuffer_delim"));
         assert!(has_native_worker_summary_family("sym.printf_fetchargs"));
@@ -8041,6 +8884,7 @@ mod tests {
             "sym.quotearg_buffer_restyled"
         ));
         assert!(has_native_worker_summary_family("sym._md5_process_block"));
+        assert!(has_native_worker_summary_family("dbg.sha384_read_ctx"));
         assert!(has_native_worker_summary_family("sym._internal_fnwmatch"));
         assert!(has_native_worker_summary_family("sym._getopt_internal_r"));
         assert!(has_native_worker_summary_family("sym.digest_file.isra.0"));
@@ -8063,6 +8907,7 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.openat_safer"));
         assert!(has_native_worker_summary_family("dbg.rpl_nanosleep"));
         assert!(has_native_worker_summary_family("dbg.xnanosleep"));
+        assert!(has_native_worker_summary_family("dbg.settimeout"));
         assert!(has_native_worker_summary_family("entry.init0"));
         assert!(has_native_worker_summary_family("entry0"));
         assert!(has_native_worker_summary_family("entry.fini0"));
@@ -8188,6 +9033,7 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.yesno"));
         assert!(has_native_worker_summary_family("sym.sha256_process_block"));
         assert!(has_native_worker_summary_family("sym.sha256_process_bytes"));
+        assert!(has_native_worker_summary_family("sym.sm3_process_block"));
         assert!(has_native_worker_summary_family("dbg.save_token"));
         assert!(has_native_worker_summary_family("dbg.filename_unescape"));
         assert!(has_native_worker_summary_family("sym.compare"));
@@ -8251,6 +9097,40 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.hash_get_entries"));
         assert!(has_native_worker_summary_family("dbg.heap_insert"));
         assert!(has_native_worker_summary_family("dbg.raw_hasher"));
+        assert!(has_native_worker_summary_family("sym.blake2b_compress"));
+        assert!(has_native_worker_summary_family(
+            "dbg.re_string_reconstruct"
+        ));
+        assert!(has_native_worker_summary_family("dbg.parse_datetime_body"));
+        assert!(has_native_worker_summary_family("dbg.posixtime"));
+        assert!(has_native_worker_summary_family("dbg.randperm_new"));
+        assert!(has_native_worker_summary_family("dbg.readtoken"));
+        assert!(has_native_worker_summary_family("dbg.readtokens"));
+        assert!(has_native_worker_summary_family("dbg.re_search_internal"));
+        assert!(has_native_worker_summary_family("dbg.re_compile_internal"));
+        assert!(has_native_worker_summary_family("dbg.parse_expression"));
+        assert!(has_native_worker_summary_family("dbg.build_trtable"));
+        assert!(has_native_worker_summary_family(
+            "dbg.update_cur_sifted_state"
+        ));
+        assert!(has_native_worker_summary_family("dbg.transit_state_bkref"));
+        assert!(has_native_worker_summary_family("dbg.build_charclass"));
+        assert!(has_native_worker_summary_family("dbg.check_arrival"));
+        assert!(has_native_worker_summary_family("dbg.peek_token"));
+        assert!(has_native_worker_summary_family(
+            "dbg.build_wcs_upper_buffer"
+        ));
+        assert!(has_native_worker_summary_family("dbg.yyparse"));
+        assert!(has_native_worker_summary_family("dbg.install_file_in_file"));
+        assert!(has_native_worker_summary_family("dbg.chown_files"));
+        assert!(has_native_worker_summary_family("dbg.read_utmp"));
+        assert!(has_native_worker_summary_family("dbg.dopass"));
+        assert!(has_native_worker_summary_family("sym.factor_up.part.0"));
+        assert!(has_native_worker_summary_family(
+            "dbg.mp_factor_using_pollard_rho"
+        ));
+        assert!(has_native_worker_summary_family("dbg.seq_fast"));
+        assert!(has_native_worker_summary_family("dbg.tsort"));
         assert!(has_native_worker_summary_family("dbg.parse_field_count"));
         assert!(has_native_worker_summary_family("dbg.parse_symbols"));
         assert!(has_native_worker_summary_family("dbg.file_name_concat"));
@@ -8349,6 +9229,137 @@ mod tests {
                 ],
             ),
             ("dbg.indent", &[NativeWorkerSummaryKind::NumericTransform]),
+            ("sym.blake2b_compress", &[NativeWorkerSummaryKind::HashFold]),
+            (
+                "sym.sm3_process_block",
+                &[NativeWorkerSummaryKind::HashFold],
+            ),
+            (
+                "dbg.re_string_reconstruct",
+                &[
+                    NativeWorkerSummaryKind::Parser,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                    NativeWorkerSummaryKind::NumericTransform,
+                ],
+            ),
+            (
+                "dbg.re_search_internal",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::MetadataProbe,
+                ],
+            ),
+            (
+                "dbg.parse_datetime_body",
+                &[
+                    NativeWorkerSummaryKind::Parser,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                    NativeWorkerSummaryKind::MetadataProbe,
+                    NativeWorkerSummaryKind::TableWalk,
+                ],
+            ),
+            (
+                "dbg.posixtime",
+                &[
+                    NativeWorkerSummaryKind::Parser,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                    NativeWorkerSummaryKind::MetadataProbe,
+                ],
+            ),
+            (
+                "dbg.randperm_new",
+                &[
+                    NativeWorkerSummaryKind::Allocation,
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::MetadataProbe,
+                ],
+            ),
+            (
+                "dbg.readtoken",
+                &[
+                    NativeWorkerSummaryKind::RecordStream,
+                    NativeWorkerSummaryKind::Parser,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.readtokens",
+                &[
+                    NativeWorkerSummaryKind::RecordStream,
+                    NativeWorkerSummaryKind::Parser,
+                    NativeWorkerSummaryKind::Allocation,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.re_compile_internal",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::Parser,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.update_cur_sifted_state",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::NumericTransform,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                ],
+            ),
+            (
+                "dbg.check_arrival",
+                &[
+                    NativeWorkerSummaryKind::TableWalk,
+                    NativeWorkerSummaryKind::NumericTransform,
+                ],
+            ),
+            (
+                "dbg.install_file_in_file",
+                &[
+                    NativeWorkerSummaryKind::PathWalk,
+                    NativeWorkerSummaryKind::FileTransfer,
+                    NativeWorkerSummaryKind::MetadataProbe,
+                ],
+            ),
+            (
+                "dbg.chown_files",
+                &[
+                    NativeWorkerSummaryKind::DirectoryTraversal,
+                    NativeWorkerSummaryKind::TableWalk,
+                ],
+            ),
+            (
+                "dbg.read_utmp",
+                &[
+                    NativeWorkerSummaryKind::PathWalk,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                    NativeWorkerSummaryKind::RecordStream,
+                ],
+            ),
+            (
+                "dbg.dopass",
+                &[
+                    NativeWorkerSummaryKind::MetadataProbe,
+                    NativeWorkerSummaryKind::MemoryWrite,
+                    NativeWorkerSummaryKind::NumericTransform,
+                ],
+            ),
+            (
+                "sym.factor_up.part.0.constprop.0",
+                &[
+                    NativeWorkerSummaryKind::MemoryWrite,
+                    NativeWorkerSummaryKind::NumericTransform,
+                ],
+            ),
+            (
+                "dbg.seq_fast",
+                &[
+                    NativeWorkerSummaryKind::StringScan,
+                    NativeWorkerSummaryKind::OutputStream,
+                ],
+            ),
         ];
 
         for (idx, (name, expected_kinds)) in cases.iter().enumerate() {
@@ -8420,6 +9431,58 @@ mod tests {
 
         assert!(!applicability.is_supported());
         assert!(applicability.worker_kinds.is_empty());
+    }
+
+    #[test]
+    fn native_worker_summary_route_policy_rejects_name_only_direct_summary_roles() {
+        for name in [
+            "sym.blake2b_compress",
+            "dbg.sha384_read_ctx",
+            "dbg.settimeout",
+            "dbg.xnmalloc",
+            "dbg.mem_scan2",
+            "dbg.out_param_parse",
+            "dbg.table_walk",
+        ] {
+            let policy = native_worker_summary_route_policy_for_name(0x401000, name);
+
+            assert_eq!(
+                policy.kind,
+                NativeWorkerSummaryRouteKind::Standard,
+                "unexpected policy for {name}: {policy:?}"
+            );
+            assert!(!policy.should_use_direct_summary());
+            assert!(policy.applicability.is_supported());
+            assert!(policy.applicability.is_name_hint_only());
+            assert!(
+                !policy
+                    .applicability
+                    .sources
+                    .contains(&NativeWorkerSummaryApplicabilitySource::TrustedSymbol),
+                "name-only route must not be upgraded to trusted symbol for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_worker_summary_route_policy_prefers_full_when_configured() {
+        let policy = native_worker_summary_route_policy_for_name(0x401000, "dbg.diagnose");
+
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::PreferFull);
+        assert!(policy.should_prefer_full());
+        assert!(!policy.should_use_direct_summary());
+        assert!(policy.applicability.is_supported());
+    }
+
+    #[test]
+    fn native_worker_summary_route_policy_keeps_unknown_names_standard() {
+        let policy =
+            native_worker_summary_route_policy_for_name(0x401000, "dbg.not_a_known_worker");
+
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
+        assert!(!policy.should_use_direct_summary());
+        assert!(!policy.should_prefer_full());
+        assert!(!policy.applicability.is_supported());
     }
 
     #[test]

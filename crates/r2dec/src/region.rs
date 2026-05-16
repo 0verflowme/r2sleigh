@@ -862,54 +862,44 @@ impl<'a> RegionAnalyzer<'a> {
             return None;
         }
 
-        self.processed.insert(entry);
-
         // Find the common merge point for all targets
         let merge = self.find_switch_merge(targets);
 
-        // Try to get real switch info from the CFG
-        let switch_info = self.normalized_switch_info(entry);
+        let Some(NormalizedSwitchInfo {
+            cases: switch_cases,
+            default: def,
+        }) = self.normalized_switch_info(entry)
+        else {
+            if self.analysis_reason.is_none() {
+                self.analysis_reason = Some(format!(
+                    "switch-like block 0x{entry:x} has multiple successors but no canonical case values"
+                ));
+            }
+            return None;
+        };
+
+        self.processed.insert(entry);
 
         // Build case regions for each target
         let mut cases = Vec::new();
-        let mut default_target = None;
+        let default_target = def;
 
-        if let Some(NormalizedSwitchInfo {
-            cases: switch_cases,
-            default: def,
-        }) = switch_info
-        {
-            // Use real case values from switch info
-            default_target = def;
-
-            // Group cases by target and deduplicate
-            let mut target_to_values: HashMap<u64, Vec<u64>> = HashMap::new();
-            for (value, target) in &switch_cases {
-                target_to_values.entry(*target).or_default().push(*value);
-            }
-
-            for (&target, values) in &target_to_values {
-                if Some(target) == merge || Some(target) == default_target {
-                    continue;
-                }
-                // Use the first value for this target
-                let case_value = values.first().copied();
-                let case_region = Box::new(self.analyze_region_recursive(target));
-                cases.push((case_value, case_region));
-            }
-        } else {
-            // Fallback: use indices as placeholder values
-            for (idx, &target) in targets.iter().enumerate() {
-                if Some(target) == merge {
-                    default_target = Some(target);
-                    continue;
-                }
-
-                let case_value = Some(idx as u64);
-                let case_region = Box::new(self.analyze_region_recursive(target));
-                cases.push((case_value, case_region));
-            }
+        // Group cases by target and deduplicate
+        let mut target_to_values: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for (value, target) in &switch_cases {
+            target_to_values.entry(*target).or_default().push(*value);
         }
+
+        for (&target, values) in &target_to_values {
+            if Some(target) == merge || Some(target) == default_target {
+                continue;
+            }
+            // Use the first value for this target
+            let case_value = values.first().copied();
+            let case_region = Box::new(self.analyze_region_recursive(target));
+            cases.push((case_value, case_region));
+        }
+        cases.sort_by_key(|(value, _)| value.unwrap_or(u64::MAX));
 
         // Build default region if we have one
         let default = default_target.map(|addr| Box::new(self.analyze_region_recursive(addr)));
@@ -939,7 +929,7 @@ impl<'a> RegionAnalyzer<'a> {
 
         let merge = self.find_switch_merge(&targets);
 
-        let mut target_to_values: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut target_to_values: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         for (value, target) in switch_cases {
             target_to_values.entry(*target).or_default().push(*value);
         }
@@ -2892,6 +2882,19 @@ mod tests {
         assert!(
             analyzer.normalized_switch_info(0x1000).is_none(),
             "switch metadata with only out-of-function targets should not structure as a local switch"
+        );
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let region = analyzer.detect_switch(0x1000, &[0x401000, 0x401100, 0x401200]);
+        assert!(
+            region.is_none(),
+            "external-only switch targets must not synthesize placeholder case values"
+        );
+        assert!(
+            analyzer
+                .analysis_reason()
+                .is_some_and(|reason| reason.contains("no canonical case values")),
+            "refused switch structuring should leave an explicit analysis reason"
         );
     }
 

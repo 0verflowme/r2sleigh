@@ -234,7 +234,7 @@ pub struct ExternalContextJson {
 
 pub fn normalize_function_basename(name: &str) -> String {
     let mut lower = name.trim().to_ascii_lowercase();
-    for prefix in ["sym.imp.", "sym.", "dbg.", "fcn."] {
+    for prefix in ["sym.imp.", "sym.", "dbg.", "fcn.", "imp."] {
         if let Some(rest) = lower.strip_prefix(prefix) {
             lower = rest.to_string();
             break;
@@ -246,6 +246,64 @@ pub fn normalize_function_basename(name: &str) -> String {
         return "main".to_string();
     }
     lower
+}
+
+fn function_signature_lookup_names(name: &str) -> Vec<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+
+    push_signature_lookup_name(&mut candidates, trimmed);
+
+    let mut stripped = trimmed;
+    loop {
+        let Some(next) = ["sym.imp.", "sym.", "dbg.", "fcn.", "imp."]
+            .into_iter()
+            .find_map(|prefix| stripped.strip_prefix(prefix))
+        else {
+            break;
+        };
+        push_signature_lookup_name(&mut candidates, next);
+        stripped = next;
+    }
+
+    let snapshot = candidates.clone();
+    for candidate in snapshot {
+        if let Some(alias) = compiler_helper_signature_alias(&candidate) {
+            push_signature_lookup_name(&mut candidates, alias);
+        }
+    }
+
+    candidates
+}
+
+fn push_signature_lookup_name(candidates: &mut Vec<String>, candidate: &str) {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return;
+    }
+    if !candidates.iter().any(|existing| existing == candidate) {
+        candidates.push(candidate.to_string());
+    }
+}
+
+fn compiler_helper_signature_alias(name: &str) -> Option<&str> {
+    for prefix in ["__isoc99_", "__libc_", "__GI_"] {
+        if let Some(rest) = name.strip_prefix(prefix)
+            && !rest.is_empty()
+            && (prefix != "__libc_" || !rest.contains("_main"))
+        {
+            return Some(rest);
+        }
+    }
+    let stripped = name.trim_start_matches('_');
+    if stripped.len() < name.len() && !stripped.is_empty() {
+        return Some(stripped);
+    }
+    None
 }
 
 pub fn is_c_main_function(name: &str) -> bool {
@@ -383,6 +441,14 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
     }
 
     parsed.external_type_db = external_type_db_from_base_types(&raw.base_types, ptr_bits);
+    parsed.known_function_signatures = parse_known_signatures(&raw.known_signatures, ptr_bits);
+    if parsed.current_signature.is_none()
+        && let Some(signature) = raw.signature.as_ref()
+        && let Some(name) = signature.name.as_deref()
+    {
+        parsed.current_signature =
+            signature_spec_from_known_name(name, &parsed.known_function_signatures);
+    }
     if let Some(signature) = parsed.current_signature.as_mut() {
         resolve_signature_aliases_from_type_db(signature, &parsed.external_type_db);
     }
@@ -392,8 +458,12 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
         .as_ref()
         .filter(|signature| signature_param_count_is_authoritative(signature))
         .map(|signature| signature.params.len());
-    let (register_params, stack_slots) =
-        parse_external_vars(&raw.vars, ptr_bits, max_register_params);
+    let (register_params, stack_slots) = parse_external_vars(
+        &raw.vars,
+        ptr_bits,
+        max_register_params,
+        parsed.current_signature.as_ref(),
+    );
     parsed.register_params = register_params;
     parsed.stack_slots = stack_slots;
     resolve_register_param_aliases_from_type_db(
@@ -401,7 +471,6 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
         &parsed.external_type_db,
     );
     resolve_stack_slot_aliases_from_type_db(&mut parsed.stack_slots, &parsed.external_type_db);
-    parsed.known_function_signatures = parse_known_signatures(&raw.known_signatures, ptr_bits);
     parsed.merged_signature = merge_signature_with_register_params(
         parsed.current_signature.clone(),
         &parsed.register_params,
@@ -459,6 +528,9 @@ fn resolve_type_alias_from_type_db(ty: &mut CTypeLike, type_db: &ExternalTypeDb)
             resolve_type_alias_from_type_db(inner, type_db);
         }
         CTypeLike::Typedef(name) => {
+            if type_db.is_aggregate_typedef(name) {
+                return;
+            }
             let key = name.trim().to_ascii_lowercase();
             if let Some(st) = type_db.structs.get(&key) {
                 *ty = CTypeLike::Struct(st.name.clone());
@@ -556,7 +628,7 @@ fn parse_signature_json(
                 ty: arg
                     .ty
                     .as_deref()
-                    .and_then(|raw| parse_type_like_spec(raw, ptr_bits)),
+                    .and_then(|raw| parse_context_type_spec(raw, ptr_bits)),
             }
         })
         .collect();
@@ -571,7 +643,7 @@ fn parse_signature_json(
     let ret_type = signature
         .ret_type
         .as_deref()
-        .and_then(|raw| parse_type_like_spec(raw, ptr_bits));
+        .and_then(|raw| parse_context_type_spec(raw, ptr_bits));
 
     if params.is_empty() && ret_type.is_none() {
         return None;
@@ -580,15 +652,92 @@ fn parse_signature_json(
     Some(FunctionSignatureSpec { ret_type, params })
 }
 
+fn parse_context_type_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
+    let mut ty = spec.trim();
+    if ty.is_empty() {
+        return None;
+    }
+
+    let mut array_size = None;
+    if let Some(start) = ty.rfind('[')
+        && ty.ends_with(']')
+    {
+        let len_str = &ty[start + 1..ty.len() - 1];
+        array_size = if len_str.is_empty() {
+            Some(None)
+        } else {
+            len_str.parse::<usize>().ok().map(Some)
+        };
+        ty = ty[..start].trim_end();
+    }
+
+    let mut ptr_count = 0usize;
+    while let Some(rest) = ty.strip_suffix('*') {
+        ptr_count += 1;
+        ty = rest.trim_end();
+    }
+
+    let qualifier_filtered = ty
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                token.to_ascii_lowercase().as_str(),
+                "const"
+                    | "volatile"
+                    | "restrict"
+                    | "__restrict"
+                    | "__restrict__"
+                    | "__const"
+                    | "__const__"
+                    | "__volatile"
+                    | "__volatile__"
+            )
+        })
+        .collect::<Vec<_>>();
+    let normalized = qualifier_filtered.join(" ");
+    let normalized_key = normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    let mut base = match normalized_key.as_str() {
+        "short" | "short int" => Some(CTypeLike::Typedef("short".to_string())),
+        "unsigned short" | "unsigned short int" => {
+            Some(CTypeLike::Typedef("unsigned short".to_string()))
+        }
+        "long" | "long int" => Some(CTypeLike::Typedef("long".to_string())),
+        "unsigned long" | "unsigned long int" => {
+            Some(CTypeLike::Typedef("unsigned long".to_string()))
+        }
+        "size_t" => Some(CTypeLike::Typedef("size_t".to_string())),
+        "ssize_t" => Some(CTypeLike::Typedef("ssize_t".to_string())),
+        "ptrdiff_t" => Some(CTypeLike::Typedef("ptrdiff_t".to_string())),
+        "uintptr_t" => Some(CTypeLike::Typedef("uintptr_t".to_string())),
+        "intptr_t" => Some(CTypeLike::Typedef("intptr_t".to_string())),
+        _ => parse_type_like_spec(&normalized, ptr_bits),
+    }?;
+
+    if let Some(size) = array_size {
+        base = CTypeLike::Array(Box::new(base), size);
+    }
+    for _ in 0..ptr_count {
+        base = CTypeLike::Pointer(Box::new(base));
+    }
+    Some(base)
+}
+
 fn parse_external_vars(
     vars: &[ExternalVarJson],
     ptr_bits: u32,
     max_register_params: Option<usize>,
+    signature: Option<&FunctionSignatureSpec>,
 ) -> (
     Vec<ExternalRegisterParamSpec>,
     BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
 ) {
-    let mut register_params = Vec::new();
+    let mut register_params_by_index = BTreeMap::<usize, (i32, ExternalRegisterParamSpec)>::new();
+    let mut inferred_register_index = 0usize;
     let mut stack_slots = BTreeMap::new();
     let mut used_names = HashSet::new();
 
@@ -603,19 +752,49 @@ fn parse_external_vars(
         let ty = var
             .ty
             .as_deref()
-            .and_then(|raw| parse_type_like_spec(raw, ptr_bits));
+            .and_then(|raw| parse_context_type_spec(raw, ptr_bits));
 
         match var.kind {
             ExternalVarKind::Register => {
-                let param_index = var.param_index.unwrap_or(register_params.len());
+                let param_index = var.param_index.unwrap_or(inferred_register_index);
+                let matches_expected_param_reg = expected_sysv64_param_reg(param_index)
+                    .is_some_and(|expected| {
+                        register_name_matches(var.reg.as_deref().unwrap_or_default(), expected)
+                    });
+                if max_register_params.is_some()
+                    && !var.is_arg
+                    && var.param_index.is_none()
+                    && !matches_expected_param_reg
+                {
+                    continue;
+                }
+                inferred_register_index = inferred_register_index.max(param_index + 1);
                 if max_register_params.is_some_and(|limit| param_index >= limit) {
                     continue;
                 }
-                register_params.push(ExternalRegisterParamSpec {
+                let candidate = ExternalRegisterParamSpec {
                     name,
                     ty,
                     reg: var.reg.clone().unwrap_or_default(),
-                });
+                };
+                let score = register_param_candidate_score(
+                    var,
+                    &candidate,
+                    signature,
+                    param_index,
+                    ptr_bits,
+                );
+                register_params_by_index
+                    .entry(param_index)
+                    .and_modify(|(existing_score, existing)| {
+                        if score > *existing_score
+                            || (score == *existing_score && candidate.reg < existing.reg)
+                        {
+                            *existing_score = score;
+                            *existing = candidate.clone();
+                        }
+                    })
+                    .or_insert((score, candidate));
             }
             ExternalVarKind::Stack => {
                 let Some(offset) = var.offset else {
@@ -644,7 +823,91 @@ fn parse_external_vars(
         }
     }
 
+    let register_params = register_params_by_index
+        .into_iter()
+        .map(|(param_index, (_, mut param))| {
+            apply_signature_param_to_register_param(signature, param_index, &mut param);
+            param
+        })
+        .collect();
     (register_params, stack_slots)
+}
+
+fn apply_signature_param_to_register_param(
+    signature: Option<&FunctionSignatureSpec>,
+    param_index: usize,
+    reg_param: &mut ExternalRegisterParamSpec,
+) {
+    let Some(param) = signature
+        .filter(|signature| signature_param_count_is_authoritative(signature))
+        .and_then(|signature| signature.params.get(param_index))
+    else {
+        return;
+    };
+    if !is_generic_arg_name(&param.name) {
+        reg_param.name = param.name.clone();
+    }
+    if !is_generic_signature_type(param.ty.as_ref()) {
+        reg_param.ty = param.ty.clone();
+    }
+}
+
+fn register_param_candidate_score(
+    var: &ExternalVarJson,
+    candidate: &ExternalRegisterParamSpec,
+    signature: Option<&FunctionSignatureSpec>,
+    param_index: usize,
+    ptr_bits: u32,
+) -> i32 {
+    let mut score = 0;
+    if var.is_arg {
+        score += 20;
+    }
+    if var.param_index.is_some() {
+        score += 20;
+    }
+    if !is_generic_arg_name(&candidate.name) {
+        score += 5;
+    }
+    if !is_generic_signature_type(candidate.ty.as_ref()) {
+        score += 5;
+    }
+    if let Some(expected) = expected_sysv64_param_reg(param_index)
+        && register_name_matches(&candidate.reg, expected)
+    {
+        score += 30;
+    }
+    if let Some(param) = signature.and_then(|signature| signature.params.get(param_index)) {
+        if !is_generic_arg_name(&param.name) && candidate.name.eq_ignore_ascii_case(&param.name) {
+            score += 20;
+        }
+        if let (Some(left), Some(right)) = (candidate.ty.as_ref(), param.ty.as_ref())
+            && render_signature_type(left, ptr_bits) == render_signature_type(right, ptr_bits)
+        {
+            score += 10;
+        }
+    }
+    score
+}
+
+fn expected_sysv64_param_reg(index: usize) -> Option<&'static str> {
+    ["rdi", "rsi", "rdx", "rcx", "r8", "r9"].get(index).copied()
+}
+
+fn register_name_matches(actual: &str, expected: &str) -> bool {
+    let actual = actual.trim().to_ascii_lowercase();
+    if actual == expected {
+        return true;
+    }
+    matches!(
+        (actual.as_str(), expected),
+        ("edi" | "di" | "dil", "rdi")
+            | ("esi" | "si" | "sil", "rsi")
+            | ("edx" | "dx" | "dl", "rdx")
+            | ("ecx" | "cx" | "cl", "rcx")
+            | ("r8d" | "r8w" | "r8b", "r8")
+            | ("r9d" | "r9w" | "r9b", "r9")
+    )
 }
 
 fn parse_external_stack_base(raw: Option<&str>) -> ExternalStackBase {
@@ -777,14 +1040,14 @@ fn parse_known_signatures(
             .map(|arg| {
                 arg.ty
                     .as_deref()
-                    .and_then(|raw| parse_type_like_spec(raw, ptr_bits))
+                    .and_then(|raw| parse_context_type_spec(raw, ptr_bits))
                     .unwrap_or(CTypeLike::Unknown)
             })
             .collect::<Vec<_>>();
         let return_type = entry
             .ret_type
             .as_deref()
-            .and_then(|raw| parse_type_like_spec(raw, ptr_bits))
+            .and_then(|raw| parse_context_type_spec(raw, ptr_bits))
             .unwrap_or(CTypeLike::Unknown);
         let sig = FunctionType {
             return_type,
@@ -802,18 +1065,30 @@ fn maybe_insert_known_signature(
     name: &str,
     sig: FunctionType,
 ) {
-    if name.is_empty() {
-        return;
+    for candidate in function_signature_lookup_names(name) {
+        known.insert(candidate, sig.clone());
     }
-    known.insert(name.to_string(), sig.clone());
+}
 
-    for prefix in ["sym.imp.", "sym.", "dbg.", "fcn."] {
-        if let Some(stripped) = name.strip_prefix(prefix)
-            && !stripped.is_empty()
-        {
-            known.insert(stripped.to_string(), sig.clone());
-        }
-    }
+fn signature_spec_from_known_name(
+    name: &str,
+    known: &HashMap<String, FunctionType>,
+) -> Option<FunctionSignatureSpec> {
+    let sig = function_signature_lookup_names(name)
+        .into_iter()
+        .find_map(|candidate| known.get(&candidate))?;
+    Some(FunctionSignatureSpec {
+        ret_type: Some(sig.return_type.clone()),
+        params: sig
+            .params
+            .iter()
+            .enumerate()
+            .map(|(idx, ty)| FunctionParamSpec {
+                name: format!("arg{}", idx + 1),
+                ty: Some(ty.clone()),
+            })
+            .collect(),
+    })
 }
 
 fn external_member_type(member: &ExternalBaseTypeMemberJson, ptr_bits: u32) -> String {
@@ -916,6 +1191,17 @@ fn external_type_db_from_base_types(
             ExternalBaseTypeKind::Typedef | ExternalBaseTypeKind::Atomic => {}
         }
     }
+
+    for base_type in base_types {
+        if !matches!(base_type.kind, ExternalBaseTypeKind::Typedef) {
+            continue;
+        }
+        let Some(target) = base_type.ty.as_deref() else {
+            continue;
+        };
+        out.insert_typedef(base_type.name.clone(), target.to_string());
+    }
+    out.materialize_typedef_aggregate_aliases();
 
     out
 }
@@ -1080,6 +1366,91 @@ mod tests {
     }
 
     #[test]
+    fn parse_external_context_indexes_polluted_register_params_by_authoritative_signature_order() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature":{
+                    "ret":"int32_t",
+                    "params":[
+                        {"name":"arr","type":"DemoStruct *"},
+                        {"name":"idx","type":"int32_t"},
+                        {"name":"v","type":"int32_t"}
+                    ]
+                },
+                "vars":[
+                    {"kind":"register","name":"v","type":"int32_t","reg":"AL"},
+                    {"kind":"register","name":"arg0","type":"void *","reg":"RDI","is_arg":true,"param_index":0},
+                    {"kind":"register","name":"arg1","type":"int64_t","reg":"RSI","is_arg":true,"param_index":1},
+                    {"kind":"register","name":"arg2","type":"void *","reg":"RDX","is_arg":true,"param_index":2},
+                    {"kind":"register","name":"arr","type":"DemoStruct *","reg":"rdi","is_arg":true,"param_index":0}
+                ]
+            }"#,
+            64,
+        );
+
+        assert_eq!(ctx.register_params.len(), 3);
+        assert_eq!(ctx.register_params[0].name, "arr");
+        assert_eq!(ctx.register_params[0].reg, "rdi");
+        assert_eq!(ctx.register_params[1].reg, "RSI");
+        assert_eq!(ctx.register_params[2].reg, "RDX");
+        let merged = ctx.merged_signature.expect("merged signature");
+        assert_eq!(merged.params[1].name, "idx");
+        assert_eq!(merged.params[2].name, "v");
+    }
+
+    #[test]
+    fn parse_external_context_preserves_source_typedefs_over_narrow_register_vars() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature":{
+                    "ret":"size_t",
+                    "params":[
+                        {"name":"buf","type":"unsigned char const *"},
+                        {"name":"n","type":"size_t"},
+                        {"name":"a","type":"unsigned char"},
+                        {"name":"b","type":"unsigned char"}
+                    ]
+                },
+                "vars":[
+                    {"kind":"register","name":"arg0","type":"uint8_t *","reg":"rdi","is_arg":true,"param_index":0},
+                    {"kind":"register","name":"arg1","type":"uint8_t","reg":"rsi","is_arg":true,"param_index":1},
+                    {"kind":"register","name":"arg2","type":"uint8_t","reg":"rdx","is_arg":true,"param_index":2},
+                    {"kind":"register","name":"arg3","type":"uint8_t","reg":"rcx","is_arg":true,"param_index":3}
+                ]
+            }"#,
+            64,
+        );
+
+        let signature = ctx.current_signature.as_ref().expect("current signature");
+        assert_eq!(
+            signature
+                .ret_type
+                .as_ref()
+                .map(|ty| render_signature_type(ty, 64))
+                .as_deref(),
+            Some("size_t")
+        );
+        assert_eq!(signature.params[1].name, "n");
+        assert_eq!(
+            signature.params[1]
+                .ty
+                .as_ref()
+                .map(|ty| render_signature_type(ty, 64))
+                .as_deref(),
+            Some("size_t")
+        );
+        assert_eq!(ctx.register_params[1].name, "n");
+        assert_eq!(
+            ctx.register_params[1]
+                .ty
+                .as_ref()
+                .map(|ty| render_signature_type(ty, 64))
+                .as_deref(),
+            Some("size_t")
+        );
+    }
+
+    #[test]
     fn parse_external_context_resolves_known_aggregate_typedef_aliases() {
         let ctx = parse_external_context_json(
             r#"{
@@ -1105,6 +1476,96 @@ mod tests {
                 "DemoStruct".to_string()
             ))))
         );
+    }
+
+    #[test]
+    fn parse_external_context_preserves_debug_typedef_alias_to_placeholder_struct() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature":{
+                    "ret":"int32_t",
+                    "params":[{"name":"arr","type":"DemoStruct *"}]
+                },
+                "base_types":[
+                    {
+                        "kind":"struct",
+                        "name":"type_0x261",
+                        "members":[
+                            {"name":"third","type":"int","offset":8},
+                            {"name":"fourteenth","type":"int","offset":52}
+                        ]
+                    },
+                    {"kind":"typedef","name":"DemoStruct","type":"type_0x261"}
+                ]
+            }"#,
+            64,
+        );
+
+        let merged = ctx.merged_signature.expect("merged signature");
+        assert_eq!(
+            merged.params.first().and_then(|param| param.ty.as_ref()),
+            Some(&CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
+                "DemoStruct".to_string()
+            ))))
+        );
+        let alias = ctx
+            .external_type_db
+            .structs
+            .get("demostruct")
+            .expect("typedef-backed aggregate alias");
+        assert_eq!(
+            alias.fields.get(&8).map(|field| field.name.as_str()),
+            Some("third")
+        );
+        assert_eq!(
+            alias.fields.get(&52).map(|field| field.name.as_str()),
+            Some("fourteenth")
+        );
+    }
+
+    #[test]
+    fn parse_external_context_recovers_import_signature_from_known_alias() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature":{"name":"sym.imp.__stack_chk_fail","noreturn":true},
+                "known_signatures":[{"name":"stack_chk_fail","ret":"void","args":[]}]
+            }"#,
+            64,
+        );
+
+        let signature = ctx
+            .current_signature
+            .as_ref()
+            .expect("known signature should seed missing typed signature");
+        assert_eq!(signature.ret_type, Some(CTypeLike::Void));
+        assert!(signature.params.is_empty());
+        assert!(ctx.noreturn);
+
+        let merged = ctx.merged_signature.expect("merged signature");
+        assert_eq!(merged.ret_type, Some(CTypeLike::Void));
+        assert!(merged.params.is_empty());
+    }
+
+    #[test]
+    fn known_signature_aliases_include_import_and_compiler_helper_names() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "known_signatures":[
+                    {"name":"sym.imp.__stack_chk_fail","ret":"void","args":[]}
+                ]
+            }"#,
+            64,
+        );
+
+        assert!(
+            ctx.known_function_signatures
+                .contains_key("sym.imp.__stack_chk_fail")
+        );
+        assert!(
+            ctx.known_function_signatures
+                .contains_key("__stack_chk_fail")
+        );
+        assert!(ctx.known_function_signatures.contains_key("stack_chk_fail"));
     }
 
     #[test]

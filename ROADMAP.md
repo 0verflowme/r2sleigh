@@ -52,10 +52,21 @@ Recent high-value progress:
 - added bounded native-linear semantic summaries for large Coreutils workers
 - strengthened native-worker summaries for file, FTS, parser, sort, format,
   metadata, record-stream, and memory families
+- added broad Coreutils hot-worker coverage for BLAKE2, regex reconstruction,
+  yacc/date parsing, install/chown/who/read-utmp/shred/factor/seq/tsort, base
+  codecs, tab stops, and signal parsing
 - improved `r2types` semantic role projection and aggregate identity handling
+- moved direct native-worker summary route policy into `r2sym`, with `r2engine`
+  consuming a typed semantic route policy instead of maintaining a parallel
+  allowlist
+- tightened semantic type algebra so role out-param projection requires
+  write/escape evidence; role signatures may still contribute concrete
+  types/names, but not fake out-param behavior
+- added explicit benchmark strict-threshold gates for hard failures, residual
+  decompiles, generic args/types, and average score
 - cleaned focused Coreutils quality: no generic args, no residual decompile
-  markers, no generated `sla_struct_*` signature leaks, and only small tracked
-  generic type residue remains
+  markers, no generated `sla_struct_*` signature leaks, and no remaining
+  generic type residue in the focused/fair `max_functions=100` gate
 - kept benchmark outputs and local corpus artifacts out of source control
 - expanded r2r/plugin validation around typed sessions and decompiler behavior
 - added the initial `r2engine` crate so plugin decompile routing can move out of
@@ -64,21 +75,36 @@ Recent high-value progress:
 Current benchmark signal:
 
 - focused Tier 1 Coreutils, `max_functions=12`: green
+- focused/fair Tier 1 Coreutils, `max_functions=100`: green on `603` targets
 - average score: `100.0`
 - hard failures: `0`
 - residual decompile count: `0`
 - radare2 candidate count: `0`
 - generic arg total: `0`
-- generic type total: `15`
+- generic type total: `0`
 - generated aggregate signature leaks: `0`
-- summary-only native worker routes: `77`
-- setup time still dominates command time in this gate
-- `tests/r2r`: green on 85 plugin tests
+- summary-only native worker routes: `586`
+- setup time still dominates a meaningful part of this gate
+- `tests/r2r`: green on 92 plugin tests
+- broad Coreutils hot-worker manifest: green on `32` targets, hard failures
+  `0`, generic args `0`, generic types `0`, residuals `0`
+- broad Coreutils `max_binaries=108`, `max_functions=12`: closure-clean on
+  `111` cases / `1,270` targets, average score `100.0`, min score `100`,
+  hard failures `0`, failure kinds `{}`, residual decompile count `0`,
+  generic args `0`, generic types `0`, radare2 candidates `0`
+- broad Coreutils timeouts are eliminated in the current gate; the old
+  timeout-heavy broad run had `case_setup_s=309.7`, `command_s=2271.6`, and 14
+  command timeouts concentrated in `blake2b_compress`,
+  `re_string_reconstruct`, `yyparse`, `install_file_in_file`, `chown_files`,
+  and `who`
+- current broad Coreutils timing is `case_setup_s=339.1`, `target_setup_s=12.3`,
+  `setup_s=351.4`, `command_s=243.8`, and `setup_to_command_ratio=1.44`; setup
+  reuse remains the visible performance bottleneck
 
-This is a strong focused signal, not a declaration of "gold standard" yet.
-Focused Coreutils is hard-failure clean with tracked generic type residue; broad
-Coreutils, CGC, Juliet, and real kernel acceptance still need to become
-recurring gates.
+This is now a strong Coreutils signal, not a declaration of "gold standard"
+yet. Focused and broad Coreutils are hard-failure, residual, and generic-type
+clean. PDG comparison, CGC, Juliet, and real kernel acceptance still need to
+become recurring gates, and setup reuse still needs performance work.
 
 Architecture Rewrite Direction
 ------------------------------
@@ -256,17 +282,24 @@ Done:
 - corpus setup helper
 - benchmark documentation
 - focused Coreutils benchmark
+- broad Coreutils strict gate at `max_binaries=108`, `max_functions=12`
+- closure-gate benchmark thresholds for hard failures, residual decompiles,
+  generic args/types, average score, setup/command ratio, and optional
+  quality-aware PDG wins
+- owner-bucket benchmark triage so remaining failures point at `../radare2`,
+  `r2ssa`, `r2sym`, `r2types`, `r2engine`, `r2dec`, or plugin glue
 - kernel smoke harness
 - strict checks for generated output/corpus isolation
 
 Remaining:
 
-- broad Coreutils gate, not only focused targets
+- recurring broad Coreutils closure gate in local acceptance
 - CGC gate after broad Coreutils quality holds
 - Juliet/CWE gate after CGC signal is stable
 - recurring real kernel smoke gate, local-only
 - trend reports that highlight slowest commands, residual families, generic type
-  regressions, and candidate radare2 issues
+  regressions, owner buckets, PDG losses, setup bottlenecks, and candidate
+  radare2 issues
 
 What Is Not Done
 ----------------
@@ -574,6 +607,26 @@ Success criteria:
 - CGC/Julet results classify failures into owner buckets
 - kernel smoke remains local-only and reproducible
 
+Gold Closure Checklist
+----------------------
+
+This is the closure bar for claiming a tranche moved the engine toward a real
+gold-standard state:
+
+- Coreutils broad closure gate passes with hard failures `0`, residual
+  decompiles `0`, generic args `0`, generic types `0`, average score `>= 99.5`,
+  and setup/command ratio `<= 2.0`.
+- PDG comparison is run when r2ghidra is available; `decompile_sla` must have
+  no systematic quality or quality-then-performance losses before the result is
+  called a win.
+- CGC and Juliet are run at least as discovery gates; every failure family is
+  bucketed to its canonical owner before implementation work starts.
+- Kernel smoke remains local-only and strict when a kernelcache is available.
+- Benchmark reports include owner buckets, worst targets, slowest commands,
+  generic/residual counts, setup timing, cache reuse, and PDG deltas.
+- Any fix that changes rendered C adds a regression that proves the output is
+  backed by canonical facts or is visibly marked summary/residual.
+
 Component Status
 ----------------
 
@@ -607,6 +660,8 @@ State:
 
 - semantic artifact authority is established
 - native worker summaries and evidence algebra are much stronger
+- broad Coreutils hot-worker timeout families now route through bounded
+  summaries
 
 Next:
 
@@ -620,8 +675,10 @@ Next:
 State:
 
 - canonical `FunctionFacts` path is established
-- focused Coreutils hard failures and generic args are clean
-- remaining focused-gate generic type residue is tracked
+- focused Coreutils hard failures, residuals, generic args, and generic types
+  are clean
+- broad Coreutils is closure-clean for hard failures, residuals, generic args,
+  and generic types
 - generated aggregate leakage is fixed for current hot targets
 
 Next:

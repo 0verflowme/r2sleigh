@@ -1507,7 +1507,9 @@ impl EngineSession {
         let artifact_key = function_artifact_cache_key(&analysis_request);
         let cached = self.cached_analyze_with_key(&artifact_key, Duration::default());
 
-        if cached.is_none() {
+        if cached.is_none()
+            || should_prefer_full_decompile_for_named_worker(&probe.summary_probe_name)
+        {
             let type_seed = r2types::function_type_facts_from_parsed_context(
                 &display_name,
                 &analysis_request.parsed_context,
@@ -1772,13 +1774,17 @@ impl EngineSession {
             .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
         let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
         let function_facts = if let Some(semantic_artifact) = semantic_artifact {
-            let type_facts = type_facts_with_summary_projection_for_candidates(
+            let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
                 type_seed,
                 request.display_name,
                 identity.name_candidates(),
                 &arch_name,
                 request.ptr_bits,
                 &semantic_artifact,
+                SummaryProjectionOptions {
+                    preserve_authoritative_context_signature:
+                        parsed_context_current_signature_is_authoritative(request.parsed_context),
+                },
             );
             r2types::FunctionFacts::new(type_facts, Some(semantic_artifact))
                 .with_assumptions(request.parsed_context.assumptions.clone())
@@ -2639,7 +2645,7 @@ fn build_engine_analysis_artifact(
     let semantic_artifact = request.precomputed_semantic_artifact.clone().or_else(|| {
         if matches!(request.semantic_mode, EngineSemanticMode::Full) {
             return maybe_compile_semantic_artifact_for_analysis(
-                &semantic_analysis.ssa_func,
+                &semantic_analysis.pattern_ssa_func,
                 request.function_addr,
                 &request.function_name,
                 request.symbolic_scope.as_ref(),
@@ -2741,7 +2747,10 @@ fn should_skip_unbounded_semantic_artifact_after_worker_preprobe(
 ) -> bool {
     if root_summary
         .and_then(|summary| summary.name.as_deref())
-        .is_some_and(should_use_direct_named_native_worker_decompile)
+        .is_some_and(|name| {
+            should_use_direct_named_native_worker_decompile(name)
+                || should_prefer_full_decompile_for_named_worker(name)
+        })
     {
         return false;
     }
@@ -2806,7 +2815,10 @@ fn should_probe_native_worker_summary_before_full_semantics(
 ) -> bool {
     if root_summary
         .and_then(|summary| summary.name.as_deref())
-        .is_some_and(should_use_direct_named_native_worker_decompile)
+        .is_some_and(|name| {
+            should_use_direct_named_native_worker_decompile(name)
+                || should_prefer_full_decompile_for_named_worker(name)
+        })
     {
         return true;
     }
@@ -3079,6 +3091,78 @@ pub struct DecompileProbeDecision {
     pub block_guarded: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineNameRouteFacts {
+    display_summary_family: bool,
+    canonical_summary_family: bool,
+    display_program_orchestrator_family: bool,
+    canonical_program_orchestrator_family: bool,
+    summary_family: bool,
+    program_orchestrator_family: bool,
+    prefer_full_named_worker: bool,
+    direct_named_worker_guarded: bool,
+    summary_probe_name: String,
+}
+
+fn engine_name_route_facts(identity: &EngineFunctionIdentity) -> EngineNameRouteFacts {
+    let mut display_summary_family = false;
+    let mut canonical_summary_family = false;
+    let mut display_program_orchestrator_family = false;
+    let mut canonical_program_orchestrator_family = false;
+    let mut summary_family = false;
+    let mut program_orchestrator_family = false;
+    let mut prefer_full_named_worker = false;
+    let mut direct_named_worker_guarded = false;
+    let mut first_preferred_summary_name: Option<String> = None;
+    let mut first_supported_summary_name: Option<String> = None;
+
+    for name in identity.name_candidates() {
+        let policy =
+            r2sym::native_worker_summary_route_policy_for_name(identity.function_addr, name);
+        let summary_supported = policy.applicability.is_supported();
+        let program_orchestrator = r2sym::has_program_orchestrator_summary_family(name);
+
+        if name == identity.display_name {
+            display_summary_family |= summary_supported;
+            display_program_orchestrator_family |= program_orchestrator;
+        }
+        if name == identity.canonical_name {
+            canonical_summary_family |= summary_supported;
+            canonical_program_orchestrator_family |= program_orchestrator;
+        }
+
+        summary_family |= summary_supported;
+        program_orchestrator_family |= program_orchestrator;
+        prefer_full_named_worker |= policy.should_prefer_full();
+        direct_named_worker_guarded |= policy.should_use_direct_summary();
+
+        if summary_supported {
+            first_supported_summary_name.get_or_insert_with(|| name.to_string());
+            if first_preferred_summary_name.is_none()
+                && (policy.should_use_direct_summary() || !is_anonymous_engine_route_name(name))
+            {
+                first_preferred_summary_name = Some(name.to_string());
+            }
+        }
+    }
+
+    let summary_probe_name = first_preferred_summary_name
+        .or(first_supported_summary_name)
+        .unwrap_or_else(|| identity.primary_name().to_string());
+
+    EngineNameRouteFacts {
+        display_summary_family,
+        canonical_summary_family,
+        display_program_orchestrator_family,
+        canonical_program_orchestrator_family,
+        summary_family,
+        program_orchestrator_family,
+        prefer_full_named_worker,
+        direct_named_worker_guarded,
+        summary_probe_name,
+    }
+}
+
 pub fn decompile_probe_decision(
     blocks: &[R2ILBlock],
     function_addr: u64,
@@ -3093,49 +3177,32 @@ pub fn decompile_probe_decision_for_identity(
     blocks: &[R2ILBlock],
     identity: &EngineFunctionIdentity,
 ) -> DecompileProbeDecision {
+    let name_facts = engine_name_route_facts(identity);
     let cfg_guard_reason = cfg_guard_reason(blocks);
     let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
-    let display_summary_family =
-        has_summary_applicability(identity.function_addr, &identity.display_name);
-    let canonical_summary_family =
-        has_summary_applicability(identity.function_addr, &identity.canonical_name);
-    let display_program_orchestrator_family =
-        r2sym::has_program_orchestrator_summary_family(&identity.display_name);
-    let canonical_program_orchestrator_family =
-        r2sym::has_program_orchestrator_summary_family(&identity.canonical_name);
-    let summary_family =
-        display_summary_family || canonical_summary_family || identity.has_summary_family();
-    let program_orchestrator_family = display_program_orchestrator_family
-        || canonical_program_orchestrator_family
-        || identity.has_program_orchestrator_family();
-    let program_orchestrator_guarded = program_orchestrator_family
+    let program_orchestrator_guarded = name_facts.program_orchestrator_family
         && should_guard_program_orchestrator_decompile(blocks.len(), op_count);
-    let summary_probe_name = identity.summary_probe_name().to_string();
-    let prefer_full_named_worker = identity
-        .name_candidates()
-        .any(should_prefer_full_decompile_for_named_worker);
-    let skipped_large_cfg_guarded = !prefer_full_named_worker
+    let skipped_large_cfg_guarded = !name_facts.prefer_full_named_worker
         && (cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512);
-    let direct_named_worker_guarded =
-        direct_named_worker_summary_applicability_for_identity(identity).is_some();
-    let named_worker_guarded = summary_family
-        && (direct_named_worker_guarded
+    let named_worker_guarded = name_facts.summary_family
+        && (name_facts.direct_named_worker_guarded
             || skipped_large_cfg_guarded
             || program_orchestrator_guarded)
-        && (!program_orchestrator_family || program_orchestrator_guarded);
+        && (!name_facts.program_orchestrator_family || program_orchestrator_guarded);
     let block_guarded = named_worker_guarded || skipped_large_cfg_guarded;
-    let summary_probe_needed = block_guarded || cfg_guard_reason.is_some();
+    let summary_probe_needed =
+        block_guarded || cfg_guard_reason.is_some() || name_facts.prefer_full_named_worker;
 
     DecompileProbeDecision {
         op_count,
         cfg_guard_reason,
-        display_summary_family,
-        canonical_summary_family,
-        display_program_orchestrator_family,
-        canonical_program_orchestrator_family,
+        display_summary_family: name_facts.display_summary_family,
+        canonical_summary_family: name_facts.canonical_summary_family,
+        display_program_orchestrator_family: name_facts.display_program_orchestrator_family,
+        canonical_program_orchestrator_family: name_facts.canonical_program_orchestrator_family,
         program_orchestrator_guarded,
         named_worker_guarded,
-        summary_probe_name,
+        summary_probe_name: name_facts.summary_probe_name,
         summary_probe_needed,
         summary_probe_skipped_large_cfg: skipped_large_cfg_guarded,
         block_guarded,
@@ -3165,191 +3232,18 @@ fn direct_named_worker_summary_applicability_for_name(
     function_addr: u64,
     function_name: &str,
 ) -> Option<r2sym::NativeWorkerSummaryApplicability> {
-    let applicability =
-        r2sym::native_worker_summary_applicability_for_name(function_addr, function_name);
-    if !applicability.is_supported() {
-        return None;
-    }
-    let role_name = normalize_engine_route_name(function_name);
-    if role_name.is_empty() {
-        return None;
-    }
-    is_direct_named_worker_summary_role(&role_name).then_some(applicability)
-}
-
-fn is_direct_named_worker_summary_role(function_name: &str) -> bool {
-    let name = normalize_engine_route_name(function_name);
-    if is_direct_fileinfo_sort_comparator(&name)
-        || is_direct_allocation_wrapper(&name)
-        || is_direct_hash_table_worker(&name)
-        || is_direct_version_worker(&name)
-        || is_direct_path_or_fts_worker(&name)
-    {
-        return true;
-    }
-    matches!(
-        name.as_str(),
-        "alloc_ibuf"
-            | "alloc_obuf"
-            | "argmatch_to_argument"
-            | "check_tuning"
-            | "close_stream"
-            | "compare"
-            | "create_hard_link"
-            | "calc_req_mask"
-            | "cycle_check"
-            | "__do_global_dtors_aux"
-            | "deregister_tm_clones"
-            | "entry.fini0"
-            | "entry0"
-            | "error_tail"
-            | "exit_cleanup"
-            | "emit_verbose"
-            | "fadvise"
-            | "fd_safer"
-            | "file_prefixlen"
-            | "filename_unescape"
-            | "flush_stdout"
-            | "fopen_safer"
-            | "get_root_dev_ino"
-            | "getuser"
-            | "getgroup"
-            | "format_user_or_group"
-            | "getmonth"
-            | "has_xattr"
-            | "hwcap_allowed"
-            | "imaxtostr"
-            | "init_node"
-            | "_init"
-            | "localtime_rz"
-            | "maybe_close_stdout"
-            | "memcoll"
-            | "mergefiles"
-            | "num_processors_via_affinity_mask"
-            | "open_safer"
-            | "opendirat"
-            | "operand_matches"
-            | "parse_field_count"
-            | "posix2_version"
-            | "print_errno_message"
-            | "process_signals"
-            | "print_stats"
-            | "quotearg_free"
-            | "reap"
-            | "record_file"
-            | "register_tm_clones"
-            | "rpl_fflush"
-            | "rpl_fseeko"
-            | "rpl_nanosleep"
-            | "xnanosleep"
-            | "rpl_obstack_allocated_p"
-            | "rpl_obstack_free"
-            | "save_token"
-            | "set_file_security_ctx"
-            | "tzalloc"
-            | "umaxtostr"
-            | "yesno"
-            | "xinmalloc"
-            | "xget_version"
-            | "xmemcoll"
-            | "xnmalloc"
-            | "xstrxfrm"
-            | "xstrtol_fatal"
-            | "xnrealloc"
-            | "mcel_tocmp"
-    )
-}
-
-fn is_direct_version_worker(name: &str) -> bool {
-    matches!(
-        name,
-        "version_etc_arn"
-            | "version_etc_ar"
-            | "version_etc_va"
-            | "version_etc"
-            | "emit_bug_reporting_address"
-    )
-}
-
-fn is_direct_path_or_fts_worker(name: &str) -> bool {
-    matches!(
-        name,
-        "last_component"
-            | "mdir_name"
-            | "dir_name"
-            | "fts_sort"
-            | "cwd_advance_fd"
-            | "restore_initial_cwd"
-            | "clear_files"
-            | "write_bytes"
-            | "is_utf8_charset"
-    )
-}
-
-fn is_direct_hash_table_worker(name: &str) -> bool {
-    matches!(
-        name,
-        "hash_clear"
-            | "hash_do_for_each"
-            | "hash_free"
-            | "hash_lookup"
-            | "hash_get_entries"
-            | "hash_get_max_bucket_length"
-            | "hash_get_n_buckets"
-            | "hash_get_n_buckets_used"
-            | "hash_get_n_entries"
-            | "hash_reset_tuning"
-            | "hash_table_ok"
-            | "heap_insert"
-    )
-}
-
-fn is_direct_fileinfo_sort_comparator(name: &str) -> bool {
-    name.starts_with("xstrcoll_df_")
-        || name.starts_with("rev_xstrcoll_df_")
-        || name.starts_with("strcmp_df_")
-        || name.starts_with("rev_strcmp_df_")
-}
-
-fn is_direct_allocation_wrapper(name: &str) -> bool {
-    matches!(
-        name,
-        "xmalloc"
-            | "ximalloc"
-            | "xcharalloc"
-            | "xrealloc"
-            | "xirealloc"
-            | "xreallocarray"
-            | "rpl_reallocarray"
-            | "xnrealloc"
-            | "xnmalloc"
-            | "xinmalloc"
-            | "x2realloc"
-            | "x2nrealloc"
-            | "xpalloc"
-            | "xzalloc"
-            | "xizalloc"
-            | "xcalloc"
-            | "xicalloc"
-            | "xmemdup"
-            | "ximemdup"
-            | "ximemdup0"
-            | "xstrdup"
-            | "xalloc_die"
-    )
+    r2sym::direct_native_worker_summary_applicability_for_name(function_addr, function_name)
 }
 
 fn should_prefer_full_decompile_for_named_worker(function_name: &str) -> bool {
-    matches!(
-        normalize_engine_route_name(function_name).as_str(),
-        "diagnose"
-    )
+    r2sym::native_worker_summary_route_policy_for_name(0, function_name).should_prefer_full()
 }
 
 pub fn should_use_direct_named_native_worker_type_projection(function_name: &str) -> bool {
+    let applicability = r2sym::native_worker_summary_applicability_for_name(0, function_name);
     should_use_direct_named_native_worker_decompile(function_name)
         || r2sym::has_program_orchestrator_summary_family(function_name)
-        || (r2sym::native_worker_summary_applicability_for_name(0, function_name).is_supported()
+        || (applicability.has_route_evidence()
             && r2types::signature_hint_for_name_candidates([function_name], 0).is_some())
 }
 
@@ -3446,7 +3340,7 @@ pub fn has_primary_summary_only_native_worker(semantic_artifact: &r2sym::Semanti
     semantic_artifact.granularity == r2sym::ArtifactGranularity::SummaryOnly
         && semantic_artifact
             .native_body()
-            .is_some_and(|native| native.has_primary_summary_islands())
+            .is_some_and(|native| native.has_primary_non_name_summary_islands())
 }
 
 pub fn has_renderable_primary_summary_only_native_worker(function_facts: &FunctionFacts) -> bool {
@@ -3495,12 +3389,37 @@ pub fn type_facts_with_summary_projection(
 }
 
 pub fn type_facts_with_summary_projection_for_candidates<'a>(
+    type_facts: FunctionTypeFacts,
+    function_name: &str,
+    name_candidates: impl IntoIterator<Item = &'a str>,
+    arch_name: &str,
+    ptr_bits: u32,
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> FunctionTypeFacts {
+    type_facts_with_summary_projection_for_candidates_with_options(
+        type_facts,
+        function_name,
+        name_candidates,
+        arch_name,
+        ptr_bits,
+        semantic_artifact,
+        SummaryProjectionOptions::default(),
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct SummaryProjectionOptions {
+    preserve_authoritative_context_signature: bool,
+}
+
+fn type_facts_with_summary_projection_for_candidates_with_options<'a>(
     mut type_facts: FunctionTypeFacts,
     function_name: &str,
     name_candidates: impl IntoIterator<Item = &'a str>,
     arch_name: &str,
     ptr_bits: u32,
     semantic_artifact: &r2sym::SemanticArtifact,
+    options: SummaryProjectionOptions,
 ) -> FunctionTypeFacts {
     let signature_param_count = type_facts
         .merged_signature
@@ -3561,6 +3480,15 @@ pub fn type_facts_with_summary_projection_for_candidates<'a>(
     let Some(projected_signature) = projected_signature else {
         return type_facts;
     };
+    if options.preserve_authoritative_context_signature
+        && name_signature.is_none()
+        && type_facts
+            .merged_signature
+            .as_ref()
+            .is_some_and(signature_is_authoritative_context_seed)
+    {
+        return type_facts;
+    }
     let name_owned_exact_arity = name_signature.is_some()
         && projected_signature.ret_type.is_some()
         && projected_signature
@@ -3582,11 +3510,33 @@ pub fn type_facts_with_summary_projection_for_candidates<'a>(
     type_facts
 }
 
+fn parsed_context_current_signature_is_authoritative(
+    parsed_context: &r2types::ParsedExternalContext,
+) -> bool {
+    parsed_context
+        .current_signature
+        .as_ref()
+        .is_some_and(signature_is_authoritative_context_seed)
+}
+
+fn signature_is_authoritative_context_seed(signature: &r2types::FunctionSignatureSpec) -> bool {
+    r2types::signature_param_count_is_authoritative(signature)
+        && signature.params.iter().any(|param| {
+            !r2types::is_generic_arg_name(&param.name)
+                && !r2types::is_generic_signature_type(param.ty.as_ref())
+        })
+        && signature
+            .params
+            .iter()
+            .all(|param| !r2types::is_generic_signature_type(param.ty.as_ref()))
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeWorkerTypeProjection {
     pub function_facts: FunctionFacts,
     pub semantic_artifact: r2sym::SemanticArtifact,
     pub name_owned_signature: bool,
+    pub context_owned_signature: bool,
 }
 
 pub fn native_worker_summary_seed(
@@ -3614,7 +3564,7 @@ pub fn native_worker_summary_artifact(
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     skipped_large_cfg: bool,
 ) -> Option<r2sym::SemanticArtifact> {
-    let ssa_func = r2ssa::SsaArtifact::for_decompile(blocks, arch)?.with_name(function_name);
+    let ssa_func = r2ssa::SsaArtifact::for_symbolic(blocks, arch)?.with_name(function_name);
     if r2sym::has_strong_vm_evidence(&ssa_func) {
         return None;
     }
@@ -3624,17 +3574,15 @@ pub fn native_worker_summary_artifact(
         native_worker_summary_seed(summary_id.0, function_name).unwrap_or_else(|| {
             r2ssa::FunctionSemanticSummary::unknown(summary_id, Some(function_name.to_string()))
         });
-    if let Some(artifact) =
-        r2sym::compile_named_native_worker_summary_artifact(&root_summary, skipped_large_cfg)
-    {
-        return Some(artifact);
-    }
-    r2sym::compile_native_worker_summary_artifact(
+    if let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
         &ssa_func,
         symbolic_scope,
         Some(&root_summary),
         skipped_large_cfg,
-    )
+    ) {
+        return Some(artifact);
+    }
+    r2sym::compile_named_native_worker_summary_artifact(&root_summary, skipped_large_cfg)
 }
 
 fn fast_program_orchestrator_summary_artifact(
@@ -3697,6 +3645,12 @@ pub fn native_worker_type_projection_for_identity(
     let summary = native_worker_summary_seed(identity.function_addr, summary_name)?;
     let semantic_artifact =
         r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)?;
+    if !semantic_artifact
+        .native_body()
+        .is_some_and(|native| native.has_primary_non_name_summary_islands())
+    {
+        return None;
+    }
     let type_facts = type_facts_from_parsed_context(parsed_context);
     let current_param_count = type_facts
         .merged_signature
@@ -3708,13 +3662,18 @@ pub fn native_worker_type_projection_for_identity(
         current_param_count,
     )
     .is_some();
-    let type_facts = type_facts_with_summary_projection_for_candidates(
+    let context_owned_signature =
+        parsed_context_current_signature_is_authoritative(parsed_context) && !name_owned_signature;
+    let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
         type_facts,
         identity.primary_name(),
         identity.name_candidates(),
         arch_name,
         ptr_bits,
         &semantic_artifact,
+        SummaryProjectionOptions {
+            preserve_authoritative_context_signature: context_owned_signature,
+        },
     );
     let function_facts = FunctionFacts::new(type_facts, Some(semantic_artifact.clone()))
         .with_assumptions(parsed_context.assumptions.clone());
@@ -3722,6 +3681,7 @@ pub fn native_worker_type_projection_for_identity(
         function_facts,
         semantic_artifact,
         name_owned_signature,
+        context_owned_signature,
     })
 }
 
@@ -3758,13 +3718,17 @@ pub fn type_summary_preprobe(
         .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
     let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
     let function_facts = if let Some(semantic_artifact) = semantic_artifact {
-        let type_facts = type_facts_with_summary_projection_for_candidates(
+        let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
             type_seed,
             request.display_name,
             identity.name_candidates(),
             &arch_name,
             request.ptr_bits,
             &semantic_artifact,
+            SummaryProjectionOptions {
+                preserve_authoritative_context_signature:
+                    parsed_context_current_signature_is_authoritative(request.parsed_context),
+            },
         );
         r2types::FunctionFacts::new(type_facts, Some(semantic_artifact))
             .with_assumptions(request.parsed_context.assumptions.clone())
@@ -5237,7 +5201,7 @@ mod tests {
 
         assert!(decision.display_summary_family);
         assert!(!decision.block_guarded);
-        assert!(!decision.summary_probe_needed);
+        assert!(decision.summary_probe_needed);
         assert!(!decision.summary_probe_skipped_large_cfg);
     }
 
@@ -5274,8 +5238,12 @@ mod tests {
             ["dbg.init_node"],
         );
 
+        assert!(identity.name_candidates().any(|name| {
+            r2sym::native_worker_summary_applicability_for_name(identity.function_addr, name)
+                .is_supported()
+        }));
         assert!(
-            identity
+            !identity
                 .name_candidates()
                 .any(should_use_direct_named_native_worker_decompile)
         );
@@ -5283,174 +5251,108 @@ mod tests {
     }
 
     #[test]
-    fn direct_named_worker_decompile_fastpath_covers_noisy_summary_owned_families() {
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.init_node"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.rpl_nanosleep"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.xnanosleep"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.mergefiles"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.xnrealloc"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.xnmalloc"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.xinmalloc"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.init_node.isra.0"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.cycle_check"
-        ));
+    fn name_only_worker_families_do_not_select_direct_decompile() {
+        for name in [
+            "dbg.init_node",
+            "sym.rpl_nanosleep",
+            "dbg.xnanosleep",
+            "dbg.mergefiles",
+            "dbg.xnrealloc",
+            "dbg.xnmalloc",
+            "dbg.xinmalloc",
+            "dbg.init_node.isra.0",
+            "dbg.cycle_check",
+            "dbg.file_prefixlen",
+            "sym.operand_matches",
+            "dbg.xstrcoll_df_version",
+            "dbg.rev_strcmp_df_mtime",
+            "entry0",
+            "sym.register_tm_clones",
+            "dbg.save_token",
+            "dbg.filename_unescape",
+            "sym.compare",
+            "dbg.close_stream",
+            "dbg.rpl_fseeko",
+            "dbg.reap",
+            "dbg.record_file",
+            "dbg.quotearg_free",
+            "dbg.num_processors_via_affinity_mask",
+            "sym.format_user_or_group",
+            "entry.fini0",
+            "sym.xmalloc",
+            "dbg.rpl_reallocarray",
+            "dbg.hash_clear",
+            "sym.hash_get_max_bucket_length",
+            "sym.hash_lookup",
+            "dbg.hash_get_entries",
+            "dbg.hash_do_for_each",
+            "dbg.heap_insert",
+            "sym.version_etc_va",
+            "dbg.mdir_name",
+            "dbg.last_component",
+            "dbg.restore_initial_cwd",
+            "sym.cwd_advance_fd",
+            "dbg.parse_field_count",
+            "dbg.yesno",
+            "dbg.get_root_dev_ino",
+            "dbg.getuser",
+            "dbg.getgroup",
+            "dbg.open_safer",
+            "sym.calc_req_mask",
+            "dbg.clear_files",
+            "dbg.fts_sort",
+            "dbg.write_bytes",
+            "dbg.is_utf8_charset",
+            "dbg.mcel_tocmp",
+            "sym.blake2b_compress",
+            "sym.sm3_process_block",
+            "sym.sha256_process_block",
+            "dbg.re_string_reconstruct",
+            "dbg.parse_datetime_body",
+            "dbg.posixtime",
+            "dbg.randperm_new",
+            "dbg.readtoken",
+            "dbg.readtokens",
+            "dbg.re_search_internal",
+            "dbg.re_compile_internal",
+            "dbg.parse_expression",
+            "dbg.build_trtable",
+            "dbg.update_cur_sifted_state",
+            "dbg.transit_state_bkref",
+            "dbg.build_charclass",
+            "dbg.check_arrival",
+            "dbg.peek_token",
+            "dbg.build_wcs_upper_buffer",
+            "dbg.yyparse",
+            "dbg.install_file_in_file",
+            "dbg.chown_files",
+            "dbg.read_utmp",
+            "dbg.dopass",
+            "sym.factor_up.part.0.constprop.0",
+            "dbg.mp_factor_using_pollard_rho",
+            "dbg.seq_fast",
+            "dbg.tsort",
+            "dbg.error_tail",
+            "dbg.argmatch_to_argument",
+            "dbg.opendirat",
+            "dbg.fd_safer",
+            "dbg.emit_verbose",
+            "dbg.posix2_version",
+        ] {
+            let applicability = r2sym::native_worker_summary_applicability_for_name(0, name);
+            assert!(applicability.is_supported(), "missing hint for {name}");
+            assert!(
+                applicability.is_name_hint_only(),
+                "expected name-only hint for {name}: {applicability:?}"
+            );
+            assert!(
+                !should_use_direct_named_native_worker_decompile(name),
+                "name-only hint must not select direct decompile for {name}"
+            );
+        }
+
         assert!(!should_use_direct_named_native_worker_decompile(
             "dbg.key_to_opts"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.file_prefixlen"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.operand_matches"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.xstrcoll_df_version"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.rev_strcmp_df_mtime"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile("entry0"));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.register_tm_clones"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.save_token"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.filename_unescape"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.compare"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.close_stream"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.rpl_fseeko"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile("dbg.reap"));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.record_file"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.quotearg_free"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.num_processors_via_affinity_mask"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.format_user_or_group"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "entry.fini0"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.xmalloc"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.rpl_reallocarray"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.hash_clear"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.hash_get_max_bucket_length"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.hash_lookup"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.hash_get_entries"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.hash_do_for_each"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.heap_insert"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.version_etc_va"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.mdir_name"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.last_component"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.restore_initial_cwd"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.cwd_advance_fd"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.parse_field_count"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile("dbg.yesno"));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.get_root_dev_ino"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.getuser"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.getgroup"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.open_safer"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "sym.calc_req_mask"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.clear_files"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.fts_sort"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.write_bytes"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.is_utf8_charset"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.mcel_tocmp"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.error_tail"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.argmatch_to_argument"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.opendirat"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.fd_safer"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.emit_verbose"
-        ));
-        assert!(should_use_direct_named_native_worker_decompile(
-            "dbg.posix2_version"
         ));
         assert!(!should_use_direct_named_native_worker_decompile(
             "dbg.hash_initialize"
@@ -5468,52 +5370,39 @@ mod tests {
         assert!(should_use_direct_named_native_worker_type_projection(
             "dbg.main"
         ));
-        assert!(should_use_direct_named_native_worker_type_projection(
-            "dbg.xnmalloc"
-        ));
-        assert!(should_use_direct_named_native_worker_type_projection(
-            "randread"
-        ));
-        assert!(should_use_direct_named_native_worker_type_projection(
-            "sym.sha256_process_block"
-        ));
+        for name in [
+            "dbg.xnmalloc",
+            "randread",
+            "sym.sha256_process_block",
+            "sym.blake2b_compress",
+            "dbg.posixtime",
+            "dbg.randperm_new",
+            "dbg.readtoken",
+            "dbg.readtokens",
+        ] {
+            assert!(
+                !should_use_direct_named_native_worker_type_projection(name),
+                "name-only hint must not select type projection for {name}"
+            );
+        }
     }
 
     #[test]
-    fn direct_named_worker_decompile_summary_renders_without_blocks() {
+    fn direct_named_worker_decompile_summary_rejects_name_only_workers() {
         let (_, ptr_bits, config) = r2dec::DecompilerConfig::for_arch(None);
         let parsed_context = r2types::ParsedExternalContext::default();
-        let session = EngineSession::new(4);
-        let response = session
-            .decompile_direct_named_worker_summary(EngineDirectNamedWorkerDecompileRequest {
-                function_addr: 0x8b50,
-                function_name: "dbg.init_node",
-                arch: None,
-                ptr_bits,
-                parsed_context: &parsed_context,
-                config: config.clone(),
-            })
-            .expect("direct init_node summary");
-        let cached = session
-            .decompile_direct_named_worker_summary(EngineDirectNamedWorkerDecompileRequest {
+        let response = EngineSession::new(4).decompile_direct_named_worker_summary(
+            EngineDirectNamedWorkerDecompileRequest {
                 function_addr: 0x8b50,
                 function_name: "dbg.init_node",
                 arch: None,
                 ptr_bits,
                 parsed_context: &parsed_context,
                 config,
-            })
-            .expect("cached direct init_node summary");
+            },
+        );
 
-        assert!(response.output.contains("init_node"));
-        assert!(response.output.contains("r2dec summary:"));
-        assert!(response.output.contains("worker summary:"));
-        assert!(matches!(
-            response.decision.plan,
-            EnginePlan::SemanticSummary
-        ));
-        assert_eq!(response.output, cached.output);
-        assert!(cached.metrics.cache_hit);
+        assert!(response.is_none());
     }
 
     #[test]
@@ -5535,7 +5424,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_compile_prefers_named_native_worker_seed_before_full_semantics() {
+    fn semantic_compile_does_not_prefer_name_only_worker_seed_before_full_semantics() {
         let blocks = const_return_blocks(0x8b50, 0);
         let ssa_func = r2ssa::SsaArtifact::for_decompile(&blocks, None)
             .expect("prepared ssa")
@@ -5550,23 +5439,14 @@ mod tests {
             None,
         );
 
-        assert_eq!(
+        assert_ne!(
             artifact.granularity,
             r2sym::ArtifactGranularity::SummaryOnly
         );
-        assert!(matches!(
+        assert!(!matches!(
             artifact.decompile_plan(),
             r2sym::DecompilePlan::NativeSummaryIslands { .. }
-                | r2sym::DecompilePlan::NativeLinear { .. }
         ));
-        let native = artifact.native_body().expect("native summary body");
-        assert!(
-            native
-                .summary
-                .worker_summaries
-                .iter()
-                .any(|summary| { summary.kind == r2sym::NativeWorkerSummaryKind::SortMerge })
-        );
     }
 
     #[test]
@@ -5590,6 +5470,15 @@ mod tests {
             &straight_ssa,
             None
         ));
+    }
+
+    #[test]
+    fn prefer_full_named_workers_request_decompile_preprobe() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let decision = decompile_probe_decision(&blocks, 0x401000, "dbg.diagnose", "dbg.diagnose");
+
+        assert!(decision.summary_probe_needed);
+        assert!(!decision.summary_probe_skipped_large_cfg);
     }
 
     #[test]
@@ -5618,7 +5507,7 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_type_projection_uses_name_params_and_summary_return() {
+    fn native_worker_type_projection_rejects_name_only_params_and_summary_return() {
         let parsed_context = r2types::parse_external_context_json(
             r#"{
                 "signature":{
@@ -5632,49 +5521,66 @@ mod tests {
             64,
         );
 
-        let projection =
-            native_worker_type_projection(0x11a9, "randread", "x86-64", 64, &parsed_context, true)
-                .expect("expected randread native-worker projection");
-        let signature = projection
-            .function_facts
-            .types
-            .merged_signature
-            .expect("expected projected signature");
-
         assert!(
-            projection.name_owned_signature,
-            "randread owns params by name while the summary supplies the return"
+            native_worker_type_projection(0x11a9, "randread", "x86-64", 64, &parsed_context, true)
+                .is_none(),
+            "name-only worker hints must not create authoritative type projection"
         );
+    }
+
+    #[test]
+    fn summary_fallback_projection_preserves_authoritative_context_signature() {
+        let artifact = native_linear_artifact(r2sym::SliceClass::Worker);
+        let source_signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Typedef("size_t".to_string())),
+            params: vec![
+                r2types::FunctionParamSpec {
+                    name: "buf".to_string(),
+                    ty: r2types::parse_type_like_spec("uint8_t*", 64),
+                },
+                r2types::FunctionParamSpec {
+                    name: "n".to_string(),
+                    ty: Some(r2types::CTypeLike::Typedef("size_t".to_string())),
+                },
+                r2types::FunctionParamSpec {
+                    name: "a".to_string(),
+                    ty: r2types::parse_type_like_spec("uint8_t", 64),
+                },
+                r2types::FunctionParamSpec {
+                    name: "b".to_string(),
+                    ty: r2types::parse_type_like_spec("uint8_t", 64),
+                },
+            ],
+        };
+        let projected = type_facts_with_summary_projection_for_candidates_with_options(
+            FunctionTypeFacts {
+                merged_signature: Some(source_signature),
+                ..FunctionTypeFacts::default()
+            },
+            "dbg.mem_scan2",
+            ["dbg.mem_scan2"],
+            "x86-64",
+            64,
+            &artifact,
+            SummaryProjectionOptions {
+                preserve_authoritative_context_signature: true,
+            },
+        );
+        let signature = projected
+            .merged_signature
+            .expect("source signature should remain available");
+
         assert_eq!(
             signature
                 .ret_type
                 .as_ref()
                 .map(|ty| r2types::render_signature_type(ty, 64))
                 .as_deref(),
-            Some("void")
+            Some("size_t")
         );
-        assert_eq!(signature.params.len(), 3);
-        assert_eq!(signature.params[0].name, "source");
-        assert_eq!(
-            signature.params[0]
-                .ty
-                .as_ref()
-                .map(|ty| r2types::render_signature_type(ty, 64))
-                .as_deref(),
-            Some("randread_source*")
-        );
-        assert_eq!(signature.params[1].name, "buf");
+        assert_eq!(signature.params[1].name, "n");
         assert_eq!(
             signature.params[1]
-                .ty
-                .as_ref()
-                .map(|ty| r2types::render_signature_type(ty, 64))
-                .as_deref(),
-            Some("int8_t*")
-        );
-        assert_eq!(signature.params[2].name, "size");
-        assert_eq!(
-            signature.params[2]
                 .ty
                 .as_ref()
                 .map(|ty| r2types::render_signature_type(ty, 64))
@@ -6034,9 +5940,8 @@ mod tests {
             symbols_payload: "{}".to_string(),
         });
 
-        assert!(response.output.contains("r2dec summary:"));
         assert!(response.output.contains("init_node"));
-        assert!(matches!(
+        assert!(!matches!(
             response.decision.route,
             r2dec::SemanticRoutePlan::SummaryIslands { .. }
         ));
@@ -6252,7 +6157,7 @@ mod tests {
     }
 
     #[test]
-    fn named_summary_route_accepts_weak_arg_contract_for_summary_only_worker() {
+    fn named_summary_route_rejects_name_only_summary_worker() {
         let summary = native_worker_summary_seed(0xe0a0, "dbg.print_current_files")
             .expect("expected print_current_files native-worker seed");
         let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
@@ -6268,13 +6173,10 @@ mod tests {
             Some(artifact),
         );
 
-        assert!(has_renderable_primary_summary_only_native_worker(
+        assert!(!has_renderable_primary_summary_only_native_worker(
             &function_facts
         ));
-        assert!(matches!(
-            named_worker_summary_route(true, &function_facts),
-            Some(r2dec::SemanticRoutePlan::SummaryIslands { .. })
-        ));
+        assert!(named_worker_summary_route(true, &function_facts).is_none());
     }
 
     #[test]

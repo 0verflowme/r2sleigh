@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
 
@@ -27,11 +27,25 @@ pub struct ExternalEnum {
     pub variants: BTreeMap<i64, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExternalTypedef {
+    pub name: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAggregateKind {
+    Struct,
+    Union,
+    Enum,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternalTypeDb {
     pub structs: HashMap<String, ExternalStruct>,
     pub unions: HashMap<String, ExternalUnion>,
     pub enums: HashMap<String, ExternalEnum>,
+    pub typedefs: BTreeMap<String, ExternalTypedef>,
     pub diagnostics: Vec<String>,
 }
 
@@ -78,6 +92,7 @@ fn normalize_prefixed_aggregate_type(ty: &str, prefix: &str) -> Option<String> {
 
 fn normalize_primitive_alias(base: &str) -> Option<&'static str> {
     match base.to_ascii_lowercase().as_str() {
+        "idx" => Some("idx_t"),
         "long" | "long int" | "longint" => Some("long"),
         "longu" | "unsigned long" | "unsigned long int" | "unsignedlong" | "unsignedlongint" => {
             Some("unsigned long")
@@ -184,6 +199,51 @@ fn normalize_aggregate_name(name: &str, prefix: &str) -> String {
         .to_string()
 }
 
+fn normalize_typedef_name(name: &str) -> String {
+    let trimmed = name.trim();
+    trimmed
+        .strip_prefix("typedef.")
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
+fn aggregate_lookup_keys(name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_key = |candidate: &str| {
+        let key = candidate.trim().to_ascii_lowercase();
+        if !key.is_empty() && !out.contains(&key) {
+            out.push(key);
+        }
+    };
+
+    let trimmed = name.trim();
+    push_key(trimmed);
+    for prefix in ["struct ", "union ", "enum "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            push_key(rest);
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in ["type.", "struct type.", "union type.", "enum type."] {
+        if lower.starts_with(prefix) {
+            push_key(&trimmed[prefix.len()..]);
+        }
+    }
+
+    let normalized = normalize_external_type_name(trimmed);
+    if normalized != "void *" {
+        push_key(&normalized);
+        for prefix in ["struct ", "union ", "enum "] {
+            if let Some(rest) = normalized.strip_prefix(prefix) {
+                push_key(rest);
+            }
+        }
+    }
+
+    out
+}
+
 impl ExternalTypeDb {
     pub fn from_tsj_json(json_str: &str) -> Self {
         let trimmed = json_str.trim();
@@ -202,7 +262,116 @@ impl ExternalTypeDb {
         };
 
         out.walk_value(&value);
+        out.materialize_typedef_aggregate_aliases();
         out
+    }
+
+    pub fn insert_typedef(&mut self, name: impl Into<String>, target: impl Into<String>) {
+        let name = normalize_typedef_name(&name.into());
+        let target = target.into().trim().to_string();
+        if name.is_empty() || target.is_empty() {
+            return;
+        }
+        self.typedefs
+            .insert(name.to_ascii_lowercase(), ExternalTypedef { name, target });
+    }
+
+    pub fn is_aggregate_typedef(&self, name: &str) -> bool {
+        aggregate_lookup_keys(name)
+            .iter()
+            .any(|key| self.typedefs.contains_key(key))
+            && self.resolve_typedef_aggregate(name).is_some()
+    }
+
+    pub fn resolve_aggregate_kind(&self, name: &str) -> Option<ExternalAggregateKind> {
+        for key in aggregate_lookup_keys(name) {
+            if self.structs.contains_key(&key) {
+                return Some(ExternalAggregateKind::Struct);
+            }
+            if self.unions.contains_key(&key) {
+                return Some(ExternalAggregateKind::Union);
+            }
+            if self.enums.contains_key(&key) {
+                return Some(ExternalAggregateKind::Enum);
+            }
+        }
+        self.resolve_typedef_aggregate(name).map(|(kind, _)| kind)
+    }
+
+    fn resolve_typedef_aggregate(&self, name: &str) -> Option<(ExternalAggregateKind, String)> {
+        let mut keys = aggregate_lookup_keys(name);
+        let mut seen = BTreeSet::new();
+        for _ in 0..16 {
+            for key in &keys {
+                if self.structs.contains_key(key) {
+                    return Some((ExternalAggregateKind::Struct, key.clone()));
+                }
+                if self.unions.contains_key(key) {
+                    return Some((ExternalAggregateKind::Union, key.clone()));
+                }
+                if self.enums.contains_key(key) {
+                    return Some((ExternalAggregateKind::Enum, key.clone()));
+                }
+            }
+
+            let typedef = keys.iter().find_map(|key| self.typedefs.get(key))?;
+            let typedef_key = typedef.name.to_ascii_lowercase();
+            if !seen.insert(typedef_key) {
+                return None;
+            }
+            keys = aggregate_lookup_keys(&typedef.target);
+        }
+        None
+    }
+
+    pub fn materialize_typedef_aggregate_aliases(&mut self) {
+        let aliases = self.typedefs.values().cloned().collect::<Vec<_>>();
+        for alias in aliases {
+            let alias_key = alias.name.to_ascii_lowercase();
+            if self.structs.contains_key(&alias_key)
+                || self.unions.contains_key(&alias_key)
+                || self.enums.contains_key(&alias_key)
+            {
+                continue;
+            }
+
+            match self.resolve_typedef_aggregate(&alias.name) {
+                Some((ExternalAggregateKind::Struct, target_key)) => {
+                    if let Some(target) = self.structs.get(&target_key).cloned() {
+                        self.structs.insert(
+                            alias_key,
+                            ExternalStruct {
+                                name: alias.name,
+                                fields: target.fields,
+                            },
+                        );
+                    }
+                }
+                Some((ExternalAggregateKind::Union, target_key)) => {
+                    if let Some(target) = self.unions.get(&target_key).cloned() {
+                        self.unions.insert(
+                            alias_key,
+                            ExternalUnion {
+                                name: alias.name,
+                                fields: target.fields,
+                            },
+                        );
+                    }
+                }
+                Some((ExternalAggregateKind::Enum, target_key)) => {
+                    if let Some(target) = self.enums.get(&target_key).cloned() {
+                        self.enums.insert(
+                            alias_key,
+                            ExternalEnum {
+                                name: alias.name,
+                                variants: target.variants,
+                            },
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
     }
 
     fn walk_value(&mut self, value: &Value) {
@@ -596,6 +765,7 @@ mod tests {
         assert_eq!(normalize_external_type_name("type.bool"), "bool");
         assert_eq!(normalize_external_type_name("type.LONG"), "long");
         assert_eq!(normalize_external_type_name("type.LONGU"), "unsigned long");
+        assert_eq!(normalize_external_type_name("Idx"), "idx_t");
         assert_eq!(normalize_external_type_name("type.uintptr_t"), "size_t");
         assert_eq!(
             normalize_external_type_name("type.struct.IOCPU_Data *"),
@@ -638,6 +808,35 @@ mod tests {
         assert_eq!(
             st.fields.get(&16).and_then(|f| f.ty.as_deref()),
             Some("unsigned long")
+        );
+    }
+
+    #[test]
+    fn materializes_aggregate_typedef_alias_with_source_name() {
+        let mut db = ExternalTypeDb::default();
+        db.structs.insert(
+            "type_0x261".to_string(),
+            ExternalStruct {
+                name: "type_0x261".to_string(),
+                fields: BTreeMap::from([(
+                    8,
+                    ExternalField {
+                        name: "third".to_string(),
+                        offset: 8,
+                        ty: Some("int".to_string()),
+                    },
+                )]),
+            },
+        );
+        db.insert_typedef("DemoStruct", "type_0x261");
+        db.materialize_typedef_aggregate_aliases();
+
+        assert!(db.is_aggregate_typedef("DemoStruct"));
+        let alias = db.structs.get("demostruct").expect("alias struct");
+        assert_eq!(alias.name, "DemoStruct");
+        assert_eq!(
+            alias.fields.get(&8).map(|field| field.name.as_str()),
+            Some("third")
         );
     }
 }

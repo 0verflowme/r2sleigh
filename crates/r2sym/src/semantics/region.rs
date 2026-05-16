@@ -9,7 +9,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::backward::{BackwardConditionSummary, BackwardMemoryCondition};
 use crate::sim::DerivedSummaryDiagnostics;
 
-use super::artifact::{ResidualReason, SemanticConfidence, SemanticEvidence, SliceClass};
+use super::artifact::{
+    ResidualReason, SemanticConfidence, SemanticEvidence, SemanticEvidenceReason, SliceClass,
+};
 use super::facts::SymbolicReachabilityStatus;
 use super::vm::{InterpreterDispatchSummary, VmStepSummary};
 
@@ -444,10 +446,20 @@ pub enum NativeWorkerFoldOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeWorkerPredicate {
+    ByteEqArg { arg: usize },
+    ByteEqConst { value: u8 },
+    AnyOf(Vec<NativeWorkerPredicate>),
+    AllOf(Vec<NativeWorkerPredicate>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NativeWorkerFold {
     pub accumulator: String,
     pub bits: u32,
     pub operation: NativeWorkerFoldOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<NativeWorkerPredicate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -558,6 +570,16 @@ impl NativeWorkerSummary {
 
     pub fn is_primary_render_summary(&self) -> bool {
         self.specificity().is_primary_renderable()
+    }
+
+    pub fn has_name_hint_evidence(&self) -> bool {
+        self.evidence
+            .reasons
+            .contains(&SemanticEvidenceReason::NameHint)
+    }
+
+    pub fn is_primary_non_name_summary(&self) -> bool {
+        self.is_primary_render_summary() && !self.has_name_hint_evidence()
     }
 
     pub fn arg_indices(&self) -> BTreeSet<usize> {
@@ -738,6 +760,16 @@ impl NativeRegionSummary {
         self.specificity().is_primary_renderable()
     }
 
+    pub fn has_name_hint_evidence(&self) -> bool {
+        self.evidence
+            .reasons
+            .contains(&SemanticEvidenceReason::NameHint)
+    }
+
+    pub fn is_primary_non_name_summary(&self) -> bool {
+        self.is_primary_render_summary() && !self.has_name_hint_evidence()
+    }
+
     pub fn arg_indices(&self) -> BTreeSet<usize> {
         let mut indices = BTreeSet::new();
         for access in &self.memory_accesses {
@@ -845,6 +877,18 @@ impl NativeFunctionSummary {
 
     pub fn has_primary_summary(&self) -> bool {
         self.primary_summary_count() > 0
+    }
+
+    pub fn has_primary_non_name_summary(&self) -> bool {
+        if self.region_summaries.is_empty() {
+            self.worker_summaries
+                .iter()
+                .any(NativeWorkerSummary::is_primary_non_name_summary)
+        } else {
+            self.region_summaries
+                .iter()
+                .any(NativeRegionSummary::is_primary_non_name_summary)
+        }
     }
 
     pub fn has_memory_read_write_pair(&self) -> bool {
@@ -1102,6 +1146,10 @@ impl NativeArtifactBody {
 
     pub fn has_primary_summary_islands(&self) -> bool {
         self.summary.has_primary_summary()
+    }
+
+    pub fn has_primary_non_name_summary_islands(&self) -> bool {
+        self.summary.has_primary_non_name_summary()
     }
 
     pub fn summary_island_count(&self) -> usize {

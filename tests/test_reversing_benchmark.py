@@ -147,6 +147,37 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual([item["name"] for item in selected], ["sym.large_worker", "sym.mid"])
 
+    def test_choose_targets_skips_import_boilerplate_and_anonymous_samples(self):
+        functions = [
+            {"name": "sym.imp.free", "addr": 0x1000, "size": 4096, "blocks": 3},
+            {"name": "fcn.00000000", "addr": 0, "size": 8192, "blocks": 8},
+            {"name": "fcn.00002000", "addr": 0x2000, "size": 2048, "blocks": 6},
+            {"name": "sym._fini", "addr": 0x3000, "size": 1024, "blocks": 2},
+            {"name": "dbg.real_worker", "addr": 0x4000, "size": 64, "blocks": 4},
+        ]
+        selected = benchmark.choose_targets(functions, (), 2)
+
+        self.assertEqual([item["name"] for item in selected], ["dbg.real_worker"])
+
+    def test_choose_targets_keeps_explicit_import_requests(self):
+        functions = [
+            {"name": "sym.imp.free", "addr": 0x1000, "size": 8, "blocks": 1},
+        ]
+        selected = benchmark.choose_targets(functions, ("sym.imp.free",), 1)
+
+        self.assertEqual(selected[0]["name"], "sym.imp.free")
+        self.assertEqual(selected[0]["target_match"], "exact")
+
+    def test_choose_targets_returns_empty_when_only_unsampleable_code_exists(self):
+        functions = [
+            {"name": "sym.imp.free", "addr": 0x1000, "size": 4096, "blocks": 3},
+            {"name": "fcn.00000000", "addr": 0, "size": 8192, "blocks": 8},
+            {"name": "sym._fini", "addr": 0x3000, "size": 1024, "blocks": 2},
+        ]
+        selected = benchmark.choose_targets(functions, (), 4)
+
+        self.assertEqual(selected, [])
+
     def test_focused_coreutils_cases_pin_hot_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -331,6 +362,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         quality = benchmark.decompile_quality(
             "int f(int a) {\n"
             "  while (a) { break; }\n"
+            "  do { } while (a);\n"
             "  fcn.401000(arg1);\n"
             "  tmp:_2 = stack_8;\n"
             "}\n"
@@ -374,12 +406,102 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "comment_only_decompile",
                 "decompile_header_return_mismatch",
                 "decompile_header_signature_mismatch",
+                "empty_loop_body",
                 "fake_while_break_wrapper",
                 "missing_return_nonvoid",
                 "unresolved_fcn_or_temp_stack_leak",
             }.issubset(kinds)
         )
         self.assertLessEqual(benchmark.score_case(case_result), 34)
+
+    def test_gold_oracle_gates_source_expectations(self):
+        case = benchmark.BinaryCase(
+            name="vuln_test_x86",
+            path=Path("/tmp/vuln_test_x86"),
+            corpus="repo-fixtures",
+            analysis="aaa",
+            targets=("test_struct_array_index",),
+            max_functions=1,
+        )
+        target = {
+            "name": "sym.test_struct_array_index",
+            "requested": "test_struct_array_index",
+        }
+        gold = [
+            {
+                "id": "struct-array-index",
+                "corpus": "repo-fixtures",
+                "case": "vuln_test_x86",
+                "target": "test_struct_array_index",
+                "command": "decompile_sla",
+                "owner": "r2types",
+                "contains": ["DemoStruct*", "arr[idx].third"],
+                "not_contains": ["sla_struct_", "*(arr +"],
+            }
+        ]
+        entry = benchmark.command_summary(
+            "decompile_sla",
+            cmd_result(
+                "int32_t test_struct_array_index(struct sla_struct_bad* arr, int32_t idx)\n"
+                "{\n"
+                "    *(arr + idx * 56 + 8) = 1;\n"
+                "}\n"
+            ),
+            False,
+            case=case,
+            target=target,
+            gold_manifest=gold,
+        )
+        case_result = {
+            "discovery": {"returncode": 0, "function_count": 1},
+            "targets": [{"name": target["name"], "commands": {"decompile_sla": entry}}],
+        }
+
+        failures = benchmark.collect_failures(case_result)
+        kinds = [failure["kind"] for failure in failures]
+
+        self.assertEqual(entry["gold_oracle"]["status"], "failed")
+        self.assertIn("source_oracle_failure", kinds)
+        self.assertTrue(any(failure.get("owner") == "r2types" for failure in failures))
+        case_result["failures"] = failures
+        self.assertLess(benchmark.score_case(case_result), 100)
+
+    def test_gold_oracle_passes_expected_source_shape(self):
+        case = benchmark.BinaryCase(
+            name="vuln_test_x86",
+            path=Path("/tmp/vuln_test_x86"),
+            corpus="repo-fixtures",
+            analysis="aaa",
+            targets=("test_struct_array_index",),
+            max_functions=1,
+        )
+        target = {"name": "sym.test_struct_array_index"}
+        gold = [
+            {
+                "target": "dbg.test_struct_array_index",
+                "command": "decompile_sla",
+                "contains": ["DemoStruct*", "arr[idx].fourteenth + arr[idx].third"],
+                "not_contains": ["sla_struct_", "*(arr +"],
+            }
+        ]
+        entry = benchmark.command_summary(
+            "decompile_sla",
+            cmd_result(
+                "int32_t test_struct_array_index(DemoStruct* arr, int32_t idx, int32_t v)\n"
+                "{\n"
+                "    arr[idx].third = v;\n"
+                "    return arr[idx].fourteenth + arr[idx].third;\n"
+                "}\n"
+            ),
+            False,
+            case=case,
+            target=target,
+            gold_manifest=gold,
+        )
+
+        self.assertEqual(entry["gold_oracle"]["status"], "ok")
+        self.assertEqual(entry["gold_oracle"]["expectation_count"], 1)
+        self.assertEqual(entry["gold_oracle"]["failures"], [])
 
     def test_run_case_classifies_native_discovery_as_radare2_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -467,8 +589,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
         quality = benchmark.decompile_quality(
             "int f(int a) {\n"
             "  while (a) { break; }\n"
+            "  do { } while (a);\n"
             "  fcn.401000(arg1);\n"
             "  tmp:_2 = stack_8;\n"
+            "  compute_numeric_transform(accumulator);\n"
+            "  RCX = edx_1;\n"
             "}\n"
         )
         comment_only = benchmark.decompile_quality("/* summary: no statements recovered */\n")
@@ -477,7 +602,10 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(quality["header_param_count"], 1)
         self.assertTrue(quality["missing_return_nonvoid"])
         self.assertEqual(quality["fake_while_break_wrapper_count"], 1)
+        self.assertEqual(quality["empty_loop_body_count"], 1)
         self.assertEqual(quality["argn_leak_count"], 1)
+        self.assertEqual(quality["summary_pseudo_call_count"], 1)
+        self.assertGreaterEqual(quality["raw_register_artifact_count"], 1)
         self.assertEqual(quality["unresolved_fcn_count"], 1)
         self.assertGreaterEqual(quality["raw_temp_stack_leak_count"], 2)
         self.assertTrue(comment_only["comment_only"])
@@ -492,6 +620,19 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertTrue(quality["explicit_unresolved_summary_return"])
         self.assertFalse(quality["missing_return_nonvoid"])
+        self.assertEqual(quality["undefined_identifier_return_count"], 0)
+
+    def test_quality_metrics_count_undefined_summary_placeholder_return(self):
+        quality = benchmark.decompile_quality(
+            "uint64_t fnv_fold(uint8_t* buf, size_t n)\n"
+            "{\n"
+            "  /* worker summary: hash_fold: mem=buf len=n fold=xor/fnv1a_hash:64 */\n"
+            "  return fnv1a_hash;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["undefined_identifier_return_count"], 1)
+        self.assertGreaterEqual(quality["readability_smell_count"], 1)
 
     def test_quality_metrics_count_invalid_control_flow_and_pointer_literal_compare(self):
         quality = benchmark.decompile_quality(
@@ -518,6 +659,18 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(quality["classification"], "residual")
         self.assertIsNone(quality["fallback_marker"])
         self.assertGreater(quality["residual_markers"], 0)
+
+    def test_timeout_inside_identifier_is_not_residual(self):
+        quality = benchmark.decompile_quality(
+            "void dbg.settimeout(double duration, bool warn)\n"
+            "{\n"
+            "    /* semantic role: settimeout; source=NameHint */\n"
+            "    compute_numeric_transform(duration);\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["classification"], "structured")
+        self.assertEqual(quality["residual_markers"], 0)
 
     def test_missing_r2ghidra_message_is_decompiler_fallback(self):
         quality = benchmark.decompile_quality("You need to install the plugin with r2pm -ci r2ghidra\n")
@@ -917,6 +1070,10 @@ class ReversingBenchmarkTests(unittest.TestCase):
             {"pdg": 0, "sla": 1, "tie": 0},
         )
         self.assertEqual(
+            summary["quality"]["pdg_comparison"]["quality_then_perf"],
+            {"pdg": 1, "sla": 0, "tie": 0},
+        )
+        self.assertEqual(
             summary["quality"]["pdg_comparison"]["by_corpus"]["unit"]["quality"],
             {"pdg": 1, "sla": 0, "tie": 0},
         )
@@ -1047,6 +1204,29 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["worst_targets"][1]["generic_arg_count"], 6)
         self.assertEqual(summary["worst_targets"][2]["generic_type_count"], 3)
         self.assertEqual(summary["worst_targets"][0]["elapsed_s"], 2.0)
+        self.assertEqual(
+            summary["quality"]["owner_buckets"],
+            {"r2engine": 1, "r2sym": 1, "r2types": 12},
+        )
+        self.assertEqual(summary["worst_targets"][0]["owner_buckets"], {"r2engine": 1})
+        self.assertEqual(
+            summary["worst_targets"][1]["owner_buckets"],
+            {"r2sym": 1, "r2types": 7},
+        )
+        self.assertEqual(summary["next_work"]["status"], "owner_work")
+        self.assertEqual(
+            summary["next_work"]["blocking_owners"],
+            ["r2types", "r2engine", "r2sym"],
+        )
+        self.assertEqual(
+            summary["next_work"]["owner_work_items"][0]["action"],
+            benchmark.OWNER_ACTIONS["r2types"],
+        )
+        self.assertEqual(
+            [target["target"] for target in summary["next_work"]["owner_work_items"][0]["targets"]],
+            ["sym.residual_loop", "dbg.string_scan"],
+        )
+        self.assertEqual(summary["next_work"]["setup"]["status"], "ok")
 
     def test_aggregate_summarizes_manual_quality_gates(self):
         quality = benchmark.decompile_quality(
@@ -1138,6 +1318,10 @@ class ReversingBenchmarkTests(unittest.TestCase):
         comparison = summary["quality"]["pdg_comparison"]
         self.assertEqual(comparison["quality"], {"pdg": 0, "sla": 1, "tie": 0})
         self.assertEqual(comparison["perf"], {"pdg": 0, "sla": 1, "tie": 0})
+        self.assertEqual(
+            comparison["quality_then_perf"],
+            {"pdg": 0, "sla": 1, "tie": 0},
+        )
         self.assertEqual(comparison["by_corpus"]["coreutils"]["quality"]["sla"], 1)
         self.assertEqual(comparison["by_family"]["skip_whitespace_run"]["quality"]["sla"], 1)
         self.assertGreater(comparison["worst_quality_gaps"][0]["pdg_readability_smells"], 0)
@@ -1179,6 +1363,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(comparison["pdg_failed"], 1)
         self.assertEqual(comparison["quality"], {"pdg": 0, "sla": 0, "tie": 0})
         self.assertEqual(comparison["perf"], {"pdg": 0, "sla": 0, "tie": 0})
+        self.assertEqual(comparison["quality_then_perf"], {"pdg": 0, "sla": 0, "tie": 0})
         self.assertEqual(comparison["failed_targets"][0]["pdg_returncode"], -11)
 
     def test_batch_started_failure_is_retryable(self):
@@ -1481,6 +1666,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "generic_type_total": 12,
                     "radare2_candidate_count": 2,
                 },
+                "next_work": {"status": "owner_work", "blocking_owners": ["r2types"]},
                 "slowest_commands": [
                     {
                         "corpus": "unit",
@@ -1505,6 +1691,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "generic_type_total": 5,
                     "radare2_candidate_count": 0,
                 },
+                "next_work": {"status": "clean", "blocking_owners": []},
                 "slowest_commands": [
                     {
                         "corpus": "unit",
@@ -1520,7 +1707,67 @@ class ReversingBenchmarkTests(unittest.TestCase):
         delta = benchmark.compare_reports(before, after)
         self.assertEqual(delta["metrics"]["hard_failures"]["delta"], -2.0)
         self.assertEqual(delta["metrics"]["average_score"]["delta"], 25.0)
+        self.assertEqual(
+            delta["metrics"]["next_work_status"],
+            {"before": "owner_work", "after": "clean"},
+        )
+        self.assertEqual(delta["next_work"]["after"]["status"], "clean")
         self.assertEqual(delta["slowest_command_delta"][0]["delta_s"], -7.0)
+
+    def test_strict_quality_gate_checks_broad_quality_thresholds(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "max_hard_failures": 0,
+                "max_residual_decompile": 2,
+                "max_generic_args": 4,
+                "max_generic_types": 5,
+                "min_average_score": 99.0,
+                "max_setup_command_ratio": 1.5,
+                "require_pdg_comparison": True,
+                "max_pdg_quality_wins": 0,
+                "max_pdg_perf_wins": 0,
+                "max_pdg_quality_then_perf_wins": 0,
+            },
+        )()
+        report = {
+            "summary": {
+                "average_score": 98.5,
+                "failures_by_kind": {"command_return": 1},
+                "timing": {"setup_to_command_ratio": 2.0},
+                "quality": {
+                    "decompile": {"residual": 3},
+                    "generic_arg_total": 4,
+                    "generic_type_total": 8,
+                    "pdg_comparison": {
+                        "successful_common_targets": 0,
+                        "quality": {"pdg": 1},
+                        "perf": {"pdg": 2},
+                        "quality_then_perf": {"pdg": 3},
+                    },
+                },
+            }
+        }
+
+        gate = benchmark.strict_quality_gate(args, report)
+
+        self.assertEqual(gate["status"], "failed")
+        self.assertEqual(
+            {failure["metric"] for failure in gate["failures"]},
+            {
+                "average_score",
+                "generic_types",
+                "hard_failures",
+                "pdg_perf_wins",
+                "pdg_quality_wins",
+                "pdg_quality_then_perf_wins",
+                "pdg_successful_common_targets",
+                "residual_decompile",
+                "setup_command_ratio",
+            },
+        )
+        self.assertEqual(gate["checks"]["generic_args"]["value"], 4)
 
     def test_parallel_split_uses_case_and_command_workers(self):
         self.assertEqual(benchmark.parallel_split(1, 12), (1, 1))
@@ -1549,6 +1796,47 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.timeout, 120)
         self.assertEqual(args.batch_target_size, 0)
         self.assertEqual(args.commands, "decompile_sla,types,profile")
+
+    def test_closure_gate_defaults_to_strict_gold_thresholds(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "preset": "",
+                "focused_coreutils": False,
+                "max_functions": benchmark.DEFAULT_MAX_FUNCTIONS,
+                "timeout": benchmark.DEFAULT_TIMEOUT,
+                "max_binaries_per_corpus": benchmark.DEFAULT_MAX_BINARIES_PER_CORPUS,
+                "batch_target_size": 0,
+                "commands": "decompile_sla,decompile_pdg,types,profile",
+                "closure_gate": True,
+                "strict": False,
+                "max_hard_failures": None,
+                "max_residual_decompile": None,
+                "max_generic_args": None,
+                "max_generic_types": None,
+                "min_average_score": None,
+                "max_setup_command_ratio": None,
+                "require_pdg_comparison": False,
+                "max_pdg_quality_wins": None,
+                "max_pdg_perf_wins": None,
+                "max_pdg_quality_then_perf_wins": None,
+            },
+        )()
+
+        benchmark.apply_preset_defaults(args)
+
+        self.assertTrue(args.strict)
+        self.assertEqual(args.max_hard_failures, 0)
+        self.assertEqual(args.max_residual_decompile, 0)
+        self.assertEqual(args.max_generic_args, 0)
+        self.assertEqual(args.max_generic_types, 0)
+        self.assertEqual(args.min_average_score, 99.5)
+        self.assertEqual(args.max_setup_command_ratio, 2.0)
+        self.assertTrue(args.require_pdg_comparison)
+        self.assertEqual(args.max_pdg_quality_wins, 0)
+        self.assertIsNone(args.max_pdg_perf_wins)
+        self.assertEqual(args.max_pdg_quality_then_perf_wins, 0)
 
     def test_cache_probe_defaults_to_repeated_tier1_commands(self):
         args = type(

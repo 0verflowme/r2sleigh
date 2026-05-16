@@ -852,7 +852,7 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_context(
     let semantic_artifact = root_summary
         .and_then(|summary| {
             r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
-                &semantic_analysis.ssa_func,
+                &semantic_analysis.pattern_ssa_func,
                 symbolic_scope,
                 summary,
             )
@@ -860,7 +860,7 @@ pub(crate) fn build_function_analysis_artifact_from_analysis_context(
         .unwrap_or_else(|| {
             let mut semantic_artifact = r2sym::compile_semantic_artifact_default_with_scope(
                 &z3::Context::thread_local(),
-                &semantic_analysis.ssa_func,
+                &semantic_analysis.pattern_ssa_func,
                 symbolic_scope,
                 input.ctx.arch,
             );

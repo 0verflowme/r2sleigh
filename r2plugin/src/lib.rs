@@ -964,6 +964,17 @@ pub extern "C" fn r2il_string_free(s: *mut c_char) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn r2dec_highlight_c_ansi(source: *const c_char) -> *mut c_char {
+    if source.is_null() {
+        return ptr::null_mut();
+    }
+    let Ok(source) = (unsafe { CStr::from_ptr(source) }).to_str() else {
+        return ptr::null_mut();
+    };
+    CString::new(r2dec::highlight_c_ansi(source)).map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_has_native_worker_summary_family_ffi(name: *const c_char) -> bool {
     if name.is_null() {
         return false;
@@ -3684,7 +3695,8 @@ pub extern "C" fn r2sleigh_named_native_worker_type_json(
         compiled: &projection.semantic_artifact,
         function_facts: &projection.function_facts,
         symbolic_scope: None,
-        apply_artifact_signature_hint: !projection.name_owned_signature,
+        apply_artifact_signature_hint: !(projection.name_owned_signature
+            || projection.context_owned_signature),
         budget: TypeOutputBudget::new(global_max_links, max_type_decls, max_mutations),
     });
     serde_json::to_string(&payload)
@@ -8885,6 +8897,22 @@ mod tests {
             ty: ty.as_ref().map(ctype_to_type_like),
             reg: reg.to_string(),
         }
+    }
+
+    #[test]
+    fn r2dec_highlight_c_ansi_ffi_returns_owned_highlighted_text() {
+        let source = CString::new("size_t f(void)\n{\n    return 0;\n}\n").unwrap();
+        let out = r2dec_highlight_c_ansi(source.as_ptr());
+        assert!(!out.is_null());
+
+        let highlighted = unsafe { CStr::from_ptr(out) }
+            .to_str()
+            .expect("highlighted output should be utf-8")
+            .to_string();
+        r2il_string_free(out);
+
+        assert!(highlighted.contains("\x1b[96msize_t\x1b[0m"));
+        assert!(highlighted.contains("\x1b[95mreturn\x1b[0m"));
     }
 
     #[test]

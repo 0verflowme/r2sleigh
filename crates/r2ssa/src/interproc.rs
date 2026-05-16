@@ -2127,45 +2127,7 @@ fn normalize_seed_name(name: &str) -> Option<&'static str> {
         "puts" => Some("puts"),
         "printf" | "__printf_chk" => Some("printf"),
         "exit" | "_exit" => Some("exit"),
-        _ => {
-            if normalized.starts_with("memcpy") {
-                Some("memcpy")
-            } else if normalized.starts_with("memmove") {
-                Some("memmove")
-            } else if normalized.starts_with("copyin") {
-                Some("copyin")
-            } else if normalized.starts_with("copyout") {
-                Some("copyout")
-            } else if normalized == "malloc"
-                || normalized.ends_with("malloc")
-                || normalized.starts_with("kalloc")
-                || normalized.starts_with("zalloc")
-            {
-                Some("malloc")
-            } else if normalized == "free"
-                || normalized.ends_with("free")
-                || normalized.starts_with("kfree")
-            {
-                Some("free")
-            } else if normalized.contains("retain") {
-                Some("retain")
-            } else if normalized.contains("release") {
-                Some("release")
-            } else if (normalized.starts_with("lck_") && normalized.contains("unlock"))
-                || normalized.starts_with("os_unfair_lock_unlock")
-                || normalized.ends_with("_unlock")
-            {
-                Some("unlock")
-            } else if normalized.starts_with("lck_")
-                || normalized.starts_with("os_unfair_lock_lock")
-                || normalized.ends_with("_lock")
-                || normalized.contains("_lock_")
-            {
-                Some("lock")
-            } else {
-                None
-            }
-        }
+        _ => None,
     }
 }
 

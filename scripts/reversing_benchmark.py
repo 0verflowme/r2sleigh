@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, cast
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 DEFAULT_TMPDIR = "/tmp/r2sleigh-reversing-benchmark-tmp"
 DEFAULT_OUT = "/tmp/r2sleigh-reversing-benchmark.json"
 DEFAULT_MAX_BINARIES_PER_CORPUS = 8
@@ -53,13 +53,26 @@ DECOMPILER_FALLBACK_MARKERS = (
     "install the plugin with r2pm",
 )
 RESIDUAL_MARKERS = ("budget", "residual", "largecfg", "large cfg", "timeout")
+RESIDUAL_MARKER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:budget|residual|largecfg|large cfg|timeout)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 TEMP_ARTIFACT_RE = re.compile(
     r"\b(?:tmp[:_][A-Za-z0-9_:.]+|unique[:_][A-Za-z0-9_:.]+|unk_[A-Za-z0-9_]+|"
-    r"(?:SP|FP|LR|PC|X[0-9]+|R[0-9A-Z]+)_[0-9]+)\b"
+    r"(?:SP|FP|LR|PC|X[0-9]+|R[0-9A-Z]+)_[0-9]+|"
+    r"(?:e?(?:ax|bx|cx|dx|si|di|bp|sp)|r(?:[0-9]+|ax|bx|cx|dx|si|di|bp|sp))[bwdq]?_[0-9]+)\b"
+)
+BARE_REGISTER_ARTIFACT_RE = re.compile(
+    r"\b(?:RAX|RBX|RCX|RDX|RSI|RDI|RBP|RSP|RIP|"
+    r"EAX|EBX|ECX|EDX|ESI|EDI|EBP|ESP|X[0-9]+|W[0-9]+|R[0-9]+)\b"
 )
 GENERIC_NAME_RE = re.compile(r"^(?:arg|param|var)[._]?[0-9]+$", re.IGNORECASE)
 GENERIC_TYPE_RE = re.compile(
     r"(?:\b(?:unknown|undefined|unk|uint(?:32|64)_t|int(?:32|64)_t)\b|void\s*\*)",
+    re.IGNORECASE,
+)
+UNSAMPLED_CODE_NAME_RE = re.compile(
+    r"^(?:fcn|sub)\.[0-9a-f]+$",
     re.IGNORECASE,
 )
 ADDRESS_OF_SCALAR_SMELL_RE = re.compile(
@@ -85,7 +98,15 @@ POINTER_CAST_RE = re.compile(
 CONTROL_FLOW_NOISE_RE = re.compile(r"\b(?:goto\s+[A-Za-z_][A-Za-z0-9_]*|while\s*\(\s*(?:1|true)\s*\))", re.IGNORECASE)
 LOOP_OR_SWITCH_RE = re.compile(r"\b(?:for|while|switch)\s*\(", re.IGNORECASE)
 ORPHAN_BREAK_RE = re.compile(r"^\s*break;\s*(?://.*)?$", re.MULTILINE)
-CALL_READABILITY_NOISE_RE = re.compile(r"\b(?:call_[0-9a-f]+|sym\.imp\.|fcn\.[0-9a-f]+)\b", re.IGNORECASE)
+CALL_READABILITY_NOISE_RE = re.compile(
+    r"\b(?:call_[0-9a-f]+|sym\.imp\.|fcn\.[0-9a-f]+)\b", re.IGNORECASE
+)
+SUMMARY_PSEUDO_CALL_RE = re.compile(
+    r"\b(?:scan_[A-Za-z0-9_]*_summary|walk_[A-Za-z0-9_]*_summary|"
+    r"compute_[A-Za-z0-9_]*_transform|[A-Za-z0-9_]+_fold_summary|"
+    r"parse_[A-Za-z0-9_]*_summary)\s*\("
+)
+RETURN_IDENTIFIER_RE = re.compile(r"\breturn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;")
 UNRESOLVED_FCN_RE = re.compile(r"\bfcn\.[0-9a-f]+\b", re.IGNORECASE)
 ARGN_LEAK_RE = re.compile(r"\barg[._]?[0-9]+\b", re.IGNORECASE)
 RAW_TEMP_STACK_LEAK_RE = re.compile(
@@ -95,6 +116,11 @@ RAW_TEMP_STACK_LEAK_RE = re.compile(
 )
 FAKE_WHILE_BREAK_RE = re.compile(
     r"\bwhile\s*\([^)]*\)\s*\{\s*break;\s*\}",
+    re.IGNORECASE | re.DOTALL,
+)
+EMPTY_LOOP_BODY_RE = re.compile(
+    r"\bdo\s*\{\s*\}\s*while\s*\([^)]*\)\s*;|"
+    r"\b(?:while|for)\s*\([^)]*\)\s*\{\s*\}",
     re.IGNORECASE | re.DOTALL,
 )
 FUNCTION_HEADER_RE = re.compile(
@@ -132,9 +158,49 @@ QUALITY_GATE_FAILURES = {
     "comment_only_decompile",
     "decompile_header_return_mismatch",
     "decompile_header_signature_mismatch",
+    "empty_loop_body",
     "fake_while_break_wrapper",
     "missing_return_nonvoid",
+    "summary_pseudo_call",
+    "undefined_identifier_return",
     "unresolved_fcn_or_temp_stack_leak",
+}
+GOLD_ORACLE_FAILURE = "source_oracle_failure"
+FAILURE_OWNER = {
+    "argn_leak": "r2types",
+    "comment_only_decompile": "r2dec",
+    "command_return": "r2plugin",
+    "decompile_header_return_mismatch": "r2types",
+    "decompile_header_signature_mismatch": "r2types",
+    "decompiler_fallback": "r2dec",
+    "discovery_parse": "radare2",
+    "discovery_return": "radare2",
+    "empty_decompile": "r2dec",
+    "empty_loop_body": "r2dec",
+    "fake_while_break_wrapper": "r2dec",
+    "json_parse": "r2plugin",
+    "missing_return_nonvoid": "r2dec",
+    "source_oracle_failure": "unknown",
+    "summary_pseudo_call": "r2dec",
+    "undefined_identifier_return": "r2dec",
+    "missing_debug_target_alias": "radare2",
+    "missing_symbol_target_alias": "radare2",
+    "missing_target": "radare2",
+    "nondeterministic_output": "r2engine",
+    "radare2_candidate": "radare2",
+    "timeout": "r2engine",
+    "unresolved_fcn_or_temp_stack_leak": "r2ssa",
+    "zero_functions": "radare2",
+}
+OWNER_ACTIONS = {
+    "radare2": "extend typed radare2 collectors, discovery aliases, or native analysis metadata",
+    "r2ssa": "push missing CFG, def-use, stack, or callsite facts into prepared SSA facts",
+    "r2sym": "add structural semantic evidence, summaries, or explicit refusal policy",
+    "r2types": "project canonical semantic evidence into FunctionTypeFacts and writeback facts",
+    "r2engine": "fix route selection, cache reuse, budget, or determinism policy",
+    "r2dec": "render only canonical facts and improve structuring from summary-backed evidence",
+    "r2plugin": "fix command dispatch, FFI, or typed session plumbing without adding policy",
+    "unknown": "classify the failure into a canonical owner before implementing a fix",
 }
 CACHE_COUNTER_FIELDS = ("hits", "misses", "lookups", "insertions", "evictions")
 TARGET_ALIAS_PREFIXES = {"sym", "dbg"}
@@ -399,6 +465,14 @@ def parse_args() -> argparse.Namespace:
         help="optional JSON manifest with a top-level 'binaries' array",
     )
     parser.add_argument(
+        "--gold-manifest",
+        default="",
+        help=(
+            "optional source-gold oracle manifest; matching expectations are "
+            "checked against command output and reported separately from smell metrics"
+        ),
+    )
+    parser.add_argument(
         "--manifest-only",
         action="store_true",
         help="run only manifest/direct binary inputs; suppress repo fixtures and corpus auto-discovery",
@@ -518,6 +592,88 @@ def parse_args() -> argparse.Namespace:
         help="return non-zero when benchmark failures are detected",
     )
     parser.add_argument(
+        "--closure-gate",
+        action="store_true",
+        help=(
+            "apply the default gold-closure quality gate: strict mode, no hard failures, "
+            "no residuals/generic type debt, average score >= 99.5, and setup/command "
+            "ratio <= 2.0 unless thresholds are overridden"
+        ),
+    )
+    parser.add_argument(
+        "--max-hard-failures",
+        type=nonnegative_int,
+        default=None,
+        help="strict quality gate: maximum allowed hard benchmark failures",
+    )
+    parser.add_argument(
+        "--max-residual-decompile",
+        type=nonnegative_int,
+        default=None,
+        help="strict quality gate: maximum allowed residual decompile command count",
+    )
+    parser.add_argument(
+        "--max-generic-args",
+        type=nonnegative_int,
+        default=None,
+        help="strict quality gate: maximum allowed generic argument-name count",
+    )
+    parser.add_argument(
+        "--max-generic-types",
+        type=nonnegative_int,
+        default=None,
+        help="strict quality gate: maximum allowed generic type count",
+    )
+    parser.add_argument(
+        "--min-average-score",
+        type=float,
+        default=None,
+        help="strict quality gate: minimum allowed average benchmark score",
+    )
+    parser.add_argument(
+        "--max-setup-command-ratio",
+        type=float,
+        default=None,
+        help="strict performance gate: maximum allowed setup_s / command_s ratio",
+    )
+    parser.add_argument(
+        "--require-pdg-comparison",
+        action="store_true",
+        help="strict comparison gate: fail when no successful decompile_sla/decompile_pdg common targets exist",
+    )
+    parser.add_argument(
+        "--max-pdg-quality-wins",
+        type=nonnegative_int,
+        default=None,
+        help="strict comparison gate: maximum targets where pdg beats decompile_sla on quality",
+    )
+    parser.add_argument(
+        "--max-pdg-perf-wins",
+        type=nonnegative_int,
+        default=None,
+        help="strict comparison gate: maximum targets where pdg beats decompile_sla on elapsed time",
+    )
+    parser.add_argument(
+        "--max-pdg-quality-then-perf-wins",
+        type=nonnegative_int,
+        default=None,
+        help=(
+            "strict comparison gate: maximum targets where pdg wins a lexicographic "
+            "quality-then-elapsed comparison against decompile_sla"
+        ),
+    )
+    parser.add_argument(
+        "--max-gold-failures",
+        type=nonnegative_int,
+        default=None,
+        help="strict quality gate: maximum allowed source-gold oracle failures",
+    )
+    parser.add_argument(
+        "--require-gold",
+        action="store_true",
+        help="strict quality gate: fail when no source-gold expectations were exercised",
+    )
+    parser.add_argument(
         "--include-sensitive",
         action="store_true",
         help="include local paths and output previews in the report",
@@ -550,6 +706,32 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
         args.repeat = max(2, int(getattr(args, "repeat", 1) or 1))
         if not args.commands:
             args.commands = ",".join(TIER1_TARGET_COMMANDS)
+    if getattr(args, "closure_gate", False):
+        args.strict = True
+        if args.max_hard_failures is None:
+            args.max_hard_failures = 0
+        if args.max_residual_decompile is None:
+            args.max_residual_decompile = 0
+        if args.max_generic_args is None:
+            args.max_generic_args = 0
+        if args.max_generic_types is None:
+            args.max_generic_types = 0
+        if args.min_average_score is None:
+            args.min_average_score = 99.5
+        if args.max_setup_command_ratio is None:
+            args.max_setup_command_ratio = 2.0
+        if getattr(args, "max_gold_failures", None) is None:
+            args.max_gold_failures = 0
+        try:
+            command_names = set(parse_command_filter(args.commands))
+        except ValueError:
+            command_names = set()
+        if "decompile_pdg" in command_names:
+            args.require_pdg_comparison = True
+            if getattr(args, "max_pdg_quality_wins", None) is None:
+                args.max_pdg_quality_wins = 0
+            if getattr(args, "max_pdg_quality_then_perf_wins", None) is None:
+                args.max_pdg_quality_then_perf_wins = 0
 
 def is_executable(path: Path) -> bool:
     try:
@@ -891,8 +1073,7 @@ def decompiler_fallback_marker(text: str) -> str | None:
 
 
 def residual_marker_count(text: str) -> int:
-    lower = text.lower()
-    return sum(lower.count(marker) for marker in RESIDUAL_MARKERS)
+    return len(RESIDUAL_MARKER_RE.findall(text))
 
 
 def runtime_bucket(elapsed_s: float) -> str:
@@ -908,10 +1089,13 @@ def runtime_bucket(elapsed_s: float) -> str:
 def artifact_density(text: str) -> dict[str, Any]:
     lines = [line for line in text.splitlines() if line.strip()]
     matches = TEMP_ARTIFACT_RE.findall(text)
+    bare_register_matches = BARE_REGISTER_ARTIFACT_RE.findall(text)
+    artifact_count = len(matches) + len(bare_register_matches)
     line_count = max(1, len(lines))
     return {
-        "artifact_count": len(matches),
-        "per_line": round(len(matches) / line_count, 6),
+        "artifact_count": artifact_count,
+        "raw_register_artifact_count": len(bare_register_matches),
+        "per_line": round(artifact_count / line_count, 6),
     }
 
 
@@ -949,6 +1133,31 @@ def shadowed_param_count(text: str) -> int:
         if match and match.group("name") in params:
             shadowed.add(match.group("name"))
     return len(shadowed)
+
+
+def declared_identifier_names(text: str, body_text: str) -> set[str]:
+    names: set[str] = set()
+    header = _first_function_header(text)
+    for part in header.get("params") or []:
+        name = _param_name_from_decl(str(part))
+        if name:
+            names.add(name)
+    for line in body_text.splitlines():
+        match = LOCAL_DECL_RE.search(line)
+        if match:
+            names.add(match.group("name"))
+    return names
+
+
+def undefined_identifier_return_count(text: str, body_text: str) -> int:
+    declared = declared_identifier_names(text, body_text)
+    builtin_return_names = {"NULL", "EOF", "true", "false", "EXIT_SUCCESS", "EXIT_FAILURE"}
+    count = 0
+    for match in RETURN_IDENTIFIER_RE.finditer(body_text):
+        name = match.group("name")
+        if name not in declared and name not in builtin_return_names:
+            count += 1
+    return count
 
 
 def _source_body_text(text: str) -> str:
@@ -1045,6 +1254,7 @@ def pointer_scalar_compare_count(text: str, body_text: str) -> int:
 
 def source_smell_metrics(text: str) -> dict[str, int]:
     body_text = _source_body_text(text)
+    body_text_without_comments = LINE_COMMENT_RE.sub("", BLOCK_COMMENT_RE.sub("", body_text))
     address_of_scalar_count = len(ADDRESS_OF_SCALAR_SMELL_RE.findall(body_text))
     local_stack_placeholder_count = len(LOCAL_STACK_PLACEHOLDER_RE.findall(body_text))
     stack_address_leak_count = len(STACK_ADDRESS_LEAK_RE.findall(body_text))
@@ -1058,10 +1268,15 @@ def source_smell_metrics(text: str) -> dict[str, int]:
         else len(ORPHAN_BREAK_RE.findall(body_text))
     )
     call_readability_noise_count = len(CALL_READABILITY_NOISE_RE.findall(body_text))
+    summary_pseudo_call_count = len(SUMMARY_PSEUDO_CALL_RE.findall(body_text))
+    undefined_identifier_return_count_value = undefined_identifier_return_count(
+        text, body_text_without_comments
+    )
     unresolved_fcn_count = len(UNRESOLVED_FCN_RE.findall(body_text))
     argn_leak_count = len(ARGN_LEAK_RE.findall(body_text))
     raw_temp_stack_leak_count = len(RAW_TEMP_STACK_LEAK_RE.findall(body_text))
     fake_while_break_wrapper_count = len(FAKE_WHILE_BREAK_RE.findall(body_text))
+    empty_loop_body_count = len(EMPTY_LOOP_BODY_RE.findall(body_text_without_comments))
     synthetic_type_leak_count = len(SYNTHETIC_TYPE_LEAK_RE.findall(body_text))
     pointer_scalar_compare_count_value = pointer_scalar_compare_count(text, body_text)
     readability_smell_count = (
@@ -1071,9 +1286,12 @@ def source_smell_metrics(text: str) -> dict[str, int]:
         + control_flow_noise_count
         + orphan_break_count
         + call_readability_noise_count
+        + summary_pseudo_call_count
+        + undefined_identifier_return_count_value
         + argn_leak_count
         + raw_temp_stack_leak_count
         + fake_while_break_wrapper_count
+        + empty_loop_body_count
         + synthetic_type_leak_count
         + pointer_scalar_compare_count_value
     )
@@ -1087,10 +1305,13 @@ def source_smell_metrics(text: str) -> dict[str, int]:
         "control_flow_noise_count": control_flow_noise_count,
         "orphan_break_count": orphan_break_count,
         "call_readability_noise_count": call_readability_noise_count,
+        "summary_pseudo_call_count": summary_pseudo_call_count,
+        "undefined_identifier_return_count": undefined_identifier_return_count_value,
         "unresolved_fcn_count": unresolved_fcn_count,
         "argn_leak_count": argn_leak_count,
         "raw_temp_stack_leak_count": raw_temp_stack_leak_count,
         "fake_while_break_wrapper_count": fake_while_break_wrapper_count,
+        "empty_loop_body_count": empty_loop_body_count,
         "synthetic_type_leak_count": synthetic_type_leak_count,
         "pointer_scalar_compare_count": pointer_scalar_compare_count_value,
         "readability_smell_count": readability_smell_count,
@@ -1711,11 +1932,46 @@ def choose_targets(functions: list[dict[str, Any]], requested: tuple[str, ...], 
     if selected:
         return selected
 
-    top = sorted(functions, key=lambda f: (-int(f.get("size") or 0), -int(f.get("blocks") or 0), f["addr"], f["name"]))
+    sample_pool = [fcn for fcn in functions if is_sampleable_function(fcn)]
+    if not sample_pool:
+        return selected
+    top = sorted(sample_pool, key=lambda f: (-int(f.get("size") or 0), -int(f.get("blocks") or 0), f["addr"], f["name"]))
     for fcn in top[: max(0, limit)]:
         selected.append({**fcn, "requested": fcn["name"], "found": True, "target_match": "sampled"})
     selected.sort(key=lambda f: (not f.get("found", False), f.get("addr", 0), f.get("name", "")))
     return selected
+
+
+def is_sampleable_function(fcn: dict[str, Any]) -> bool:
+    """Return whether automatic corpus sampling should treat FCN as real code."""
+    name = str(fcn.get("name") or "")
+    norm = normalize_symbol(name)
+    try:
+        addr = int(fcn.get("addr") or 0)
+    except (TypeError, ValueError):
+        addr = 0
+    if addr <= 0:
+        return False
+    lowered = name.lower()
+    if lowered.startswith("sym.imp."):
+        return False
+    if UNSAMPLED_CODE_NAME_RE.match(norm):
+        return False
+    if norm in {
+        "fini",
+        "init",
+        "start",
+        "do_global_dtors_aux",
+        "call_weak_fn",
+        "deregister_tm_clones",
+        "entry.fini0",
+        "entry.init0",
+        "entry0",
+        "frame_dummy",
+        "register_tm_clones",
+    }:
+        return False
+    return True
 
 
 def cache_counter_metrics(payload: Any) -> dict[str, int] | None:
@@ -1878,7 +2134,15 @@ def command_fast_path_metrics(payload: Any, cache_metrics: dict[str, Any] | None
     return out or None
 
 
-def command_summary(name: str, result: CmdResult, include_sensitive: bool) -> dict[str, Any]:
+def command_summary(
+    name: str,
+    result: CmdResult,
+    include_sensitive: bool,
+    *,
+    case: BinaryCase | None = None,
+    target: dict[str, Any] | None = None,
+    gold_manifest: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "returncode": result.returncode,
         "timeout": result.returncode == 124,
@@ -1943,6 +2207,14 @@ def command_summary(name: str, result: CmdResult, include_sensitive: bool) -> di
             entry["fallback_marker"] = quality["fallback_marker"]
         entry["residual_markers"] = quality["residual_markers"]
         entry["empty"] = quality["empty"]
+    attach_gold_oracle(
+        entry,
+        case=case,
+        target=target,
+        command=name,
+        stdout=result.stdout,
+        gold_manifest=gold_manifest,
+    )
     return entry
 
 
@@ -1989,6 +2261,187 @@ def parse_command_filter(value: str) -> tuple[str, ...]:
     if not names:
         raise ValueError("at least one benchmark command must be selected")
     return tuple(names)
+
+
+def _symbol_match_keys(value: Any) -> set[str]:
+    if not isinstance(value, str) or not value.strip():
+        return set()
+    text = value.strip()
+    keys = {text}
+    normalized = normalize_symbol(text)
+    if normalized:
+        keys.add(normalized)
+        keys.add(f"sym.{normalized}")
+        keys.add(f"dbg.{normalized}")
+    return keys
+
+
+def load_gold_manifest(path: Path | str | None) -> list[dict[str, Any]]:
+    if path is None or not str(path).strip():
+        return []
+    manifest_path = Path(path)
+    payload = json.loads(manifest_path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError("gold manifest must be a JSON object")
+    raw_expectations = payload.get("expectations", payload.get("targets", []))
+    if not isinstance(raw_expectations, list):
+        raise ValueError("gold manifest expects a top-level expectations array")
+    expectations: list[dict[str, Any]] = []
+    for idx, raw in enumerate(raw_expectations):
+        if not isinstance(raw, dict):
+            raise ValueError(f"gold expectation {idx} must be an object")
+        target = raw.get("target")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError(f"gold expectation {idx} needs a target")
+        command = raw.get("command", "decompile_sla")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError(f"gold expectation {idx} needs a command")
+        expectation = dict(raw)
+        expectation["target"] = target.strip()
+        expectation["command"] = command.strip()
+        expectation.setdefault("id", f"gold-{idx}")
+        expectations.append(expectation)
+    expectations.sort(
+        key=lambda item: (
+            str(item.get("corpus") or ""),
+            str(item.get("case") or item.get("binary") or ""),
+            str(item.get("target") or ""),
+            str(item.get("command") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    return expectations
+
+
+def gold_manifest_hash(path: str) -> str | None:
+    if not path.strip():
+        return None
+    return file_sha256(Path(path))
+
+
+def _gold_field_matches(expected: Any, actual_values: set[str]) -> bool:
+    if expected is None:
+        return True
+    if isinstance(expected, str):
+        return bool(_symbol_match_keys(expected) & actual_values)
+    if isinstance(expected, list):
+        return any(_gold_field_matches(item, actual_values) for item in expected)
+    return False
+
+
+def gold_expectations_for_command(
+    gold_manifest: list[dict[str, Any]] | None,
+    case: BinaryCase | None,
+    target: dict[str, Any] | None,
+    command: str,
+) -> list[dict[str, Any]]:
+    if not gold_manifest or case is None or target is None:
+        return []
+    target_keys: set[str] = set()
+    for value in (target.get("name"), target.get("requested"), target.get("target_alias")):
+        if isinstance(value, dict):
+            target_keys.update(_symbol_match_keys(value.get("requested")))
+            target_keys.update(_symbol_match_keys(value.get("matched")))
+        else:
+            target_keys.update(_symbol_match_keys(value))
+    case_keys = _symbol_match_keys(case.name)
+    case_keys.update(_symbol_match_keys(case.path.name))
+    corpus_keys = {case.corpus}
+
+    matched: list[dict[str, Any]] = []
+    for expectation in gold_manifest:
+        if str(expectation.get("command", "decompile_sla")) != command:
+            continue
+        if not _gold_field_matches(expectation.get("target"), target_keys):
+            continue
+        if not _gold_field_matches(expectation.get("case", expectation.get("binary")), case_keys):
+            continue
+        if not _gold_field_matches(expectation.get("corpus"), corpus_keys):
+            continue
+        matched.append(expectation)
+    return matched
+
+
+def gold_oracle_failures_for_output(
+    *,
+    case: BinaryCase,
+    target_name: str,
+    command: str,
+    stdout: str,
+    expectations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for expectation in expectations:
+        expectation_id = str(expectation.get("id") or "")
+        owner = str(expectation.get("owner") or "unknown")
+        for check, patterns in (
+            ("contains", expectation.get("contains", [])),
+            ("regex", expectation.get("regex", [])),
+            ("not_contains", expectation.get("not_contains", [])),
+            ("not_regex", expectation.get("not_regex", [])),
+        ):
+            if isinstance(patterns, str):
+                pattern_list = [patterns]
+            elif isinstance(patterns, list):
+                pattern_list = [str(pattern) for pattern in patterns]
+            else:
+                pattern_list = []
+            for pattern in pattern_list:
+                matched = (
+                    re.search(pattern, stdout, re.MULTILINE) is not None
+                    if check.endswith("regex")
+                    else pattern in stdout
+                )
+                failed = matched if check.startswith("not_") else not matched
+                if failed:
+                    failures.append(
+                        {
+                            "kind": GOLD_ORACLE_FAILURE,
+                            "case": case.name,
+                            "corpus": case.corpus,
+                            "target": target_name,
+                            "command": command,
+                            "expectation": expectation_id,
+                            "check": check,
+                            "pattern": pattern,
+                            "owner": owner,
+                        }
+                    )
+    failures.sort(
+        key=lambda item: (
+            str(item.get("expectation") or ""),
+            str(item.get("check") or ""),
+            str(item.get("pattern") or ""),
+        )
+    )
+    return failures
+
+
+def attach_gold_oracle(
+    entry: dict[str, Any],
+    *,
+    case: BinaryCase | None,
+    target: dict[str, Any] | None,
+    command: str,
+    stdout: str,
+    gold_manifest: list[dict[str, Any]] | None,
+) -> None:
+    expectations = gold_expectations_for_command(gold_manifest, case, target, command)
+    if not expectations or case is None or target is None:
+        return
+    target_name = str(target.get("name") or target.get("requested") or "")
+    failures = gold_oracle_failures_for_output(
+        case=case,
+        target_name=target_name,
+        command=command,
+        stdout=stdout,
+        expectations=expectations,
+    )
+    entry["gold_oracle"] = {
+        "status": "ok" if not failures else "failed",
+        "expectation_count": len(expectations),
+        "failures": failures,
+    }
 
 
 def target_commands(command_names: tuple[str, ...] | None = None) -> dict[str, str]:
@@ -2364,6 +2817,7 @@ def collect_target_batched(
     task_tmpdir: Path | None,
     runner: Runner,
     commands: dict[str, str] | None = None,
+    gold_manifest: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not target.get("found", True):
         return dict(target)
@@ -2483,7 +2937,14 @@ def collect_target_batched(
     for name in commands:
         runs = [item[1] for item in grouped[name]]
         events = [item[2] for item in grouped[name]]
-        entry = command_summary(name, runs[0], include_sensitive)
+        entry = command_summary(
+            name,
+            runs[0],
+            include_sensitive,
+            case=case,
+            target=target,
+            gold_manifest=gold_manifest,
+        )
         entry["execution_mode"] = "batched"
         entry["batch_elapsed_s"] = round(batch_elapsed, 6)
         if events:
@@ -2620,6 +3081,7 @@ def collect_targets_batched_case(
     task_tmpdir: Path | None,
     runner: Runner,
     commands: dict[str, str] | None = None,
+    gold_manifest: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     commands = commands or target_commands()
     found_targets = [
@@ -2856,7 +3318,14 @@ def collect_targets_batched_case(
                     include_sensitive,
                 )
             else:
-                entry = command_summary(command_name, runs[0], include_sensitive)
+                entry = command_summary(
+                    command_name,
+                    runs[0],
+                    include_sensitive,
+                    case=case,
+                    target=target,
+                    gold_manifest=gold_manifest,
+                )
             entry["execution_mode"] = "batched"
             entry["batch_elapsed_s"] = round(batch_elapsed, 6)
             if events:
@@ -2892,6 +3361,7 @@ def collect_target_command_retries(
     runner: Runner,
     *,
     retry_origin: str,
+    gold_manifest: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if not target.get("found", True) or not command_names:
         return base_output, []
@@ -2962,7 +3432,14 @@ def collect_target_command_retries(
         if not runs:
             continue
         old_entry = out.get("commands", {}).get(name)
-        entry = command_summary(name, runs[0], include_sensitive)
+        entry = command_summary(
+            name,
+            runs[0],
+            include_sensitive,
+            case=case,
+            target=target,
+            gold_manifest=gold_manifest,
+        )
         entry["execution_mode"] = "isolated_retry"
         entry["attribution_mode"] = "command_retry"
         entry["retry_origin"] = retry_origin
@@ -3001,6 +3478,7 @@ def collect_targets_batched_adaptive(
     command_jobs: int,
     runner: Runner,
     commands: dict[str, str] | None = None,
+    gold_manifest: list[dict[str, Any]] | None = None,
     *,
     depth: int = 0,
     retry_origin: str | None = None,
@@ -3017,6 +3495,7 @@ def collect_targets_batched_adaptive(
         task_tmpdir,
         runner,
         commands,
+        gold_manifest,
     )
     mode = "batch" if depth == 0 else "batch_retry"
     for output in outputs:
@@ -3061,6 +3540,7 @@ def collect_targets_batched_adaptive(
             command_jobs,
             runner,
             retry_origin=retry_origin or origin,
+            gold_manifest=gold_manifest,
         )
         outputs[retry_idx] = retry_output
         events.extend(retry_events)
@@ -3079,6 +3559,7 @@ def collect_target(
     jobs: int,
     runner: Runner,
     commands: dict[str, str] | None = None,
+    gold_manifest: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not target.get("found", True):
         return dict(target)
@@ -3140,7 +3621,14 @@ def collect_target(
 
     for name in commands_to_run:
         runs = runs_by_command[name]
-        entry = command_summary(name, runs[0], include_sensitive)
+        entry = command_summary(
+            name,
+            runs[0],
+            include_sensitive,
+            case=case,
+            target=target,
+            gold_manifest=gold_manifest,
+        )
         events = events_by_command[name]
         if events:
             entry["event"] = events[0]
@@ -3212,6 +3700,21 @@ def quality_gate_failures_for_result(
         add(
             "fake_while_break_wrapper",
             count=int(quality.get("fake_while_break_wrapper_count") or 0),
+        )
+    if int(quality.get("empty_loop_body_count") or 0) > 0:
+        add(
+            "empty_loop_body",
+            count=int(quality.get("empty_loop_body_count") or 0),
+        )
+    if int(quality.get("summary_pseudo_call_count") or 0) > 0:
+        add(
+            "summary_pseudo_call",
+            count=int(quality.get("summary_pseudo_call_count") or 0),
+        )
+    if int(quality.get("undefined_identifier_return_count") or 0) > 0:
+        add(
+            "undefined_identifier_return",
+            count=int(quality.get("undefined_identifier_return_count") or 0),
         )
     if bool(quality.get("missing_return_nonvoid")) and not comment_only:
         add("missing_return_nonvoid", header_ret_type=quality.get("header_ret_type"))
@@ -3347,6 +3850,11 @@ def collect_failures(case_result: dict[str, Any]) -> list[dict[str, Any]]:
                 failures.append({"kind": "empty_decompile", "target": target_name, "command": command})
             if result.get("fallback_marker"):
                 failures.append({"kind": "decompiler_fallback", "target": target_name, "command": command})
+            gold_oracle = result.get("gold_oracle")
+            if isinstance(gold_oracle, dict):
+                for failure in gold_oracle.get("failures", []):
+                    if isinstance(failure, dict):
+                        failures.append(dict(failure))
             repeat = result.get("repeat")
             if isinstance(repeat, dict) and repeat.get("stable") is False:
                 failures.append({"kind": "nondeterministic_output", "target": target_name, "command": command})
@@ -3466,6 +3974,9 @@ def score_case(case_result: dict[str, Any]) -> int:
         "decompile_header_signature_mismatch": 8,
         "fake_while_break_wrapper": 10,
         "missing_return_nonvoid": 10,
+        "summary_pseudo_call": 8,
+        "undefined_identifier_return": 12,
+        GOLD_ORACLE_FAILURE: 15,
         "unresolved_fcn_or_temp_stack_leak": 8,
     }
     score = 100
@@ -3593,6 +4104,7 @@ def pdg_target_comparison(case: dict[str, Any], target: dict[str, Any]) -> dict[
 def _summarize_pdg_counts(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
     quality_counts = {"sla": 0, "pdg": 0, "tie": 0}
     perf_counts = {"sla": 0, "pdg": 0, "tie": 0}
+    quality_then_perf_counts = {"sla": 0, "pdg": 0, "tie": 0}
     artifact_counts = {"sla": 0, "pdg": 0, "tie": 0}
     comparable = [item for item in comparisons if item.get("comparable")]
     for item in comparable:
@@ -3611,6 +4123,17 @@ def _summarize_pdg_counts(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
             perf_counts["pdg"] += 1
         else:
             perf_counts["tie"] += 1
+
+        if quality_delta > 0:
+            quality_then_perf_counts["sla"] += 1
+        elif quality_delta < 0:
+            quality_then_perf_counts["pdg"] += 1
+        elif elapsed_delta < -0.001:
+            quality_then_perf_counts["sla"] += 1
+        elif elapsed_delta > 0.001:
+            quality_then_perf_counts["pdg"] += 1
+        else:
+            quality_then_perf_counts["tie"] += 1
 
         artifact_delta = int(item.get("artifact_delta") or 0)
         if artifact_delta < 0:
@@ -3632,6 +4155,7 @@ def _summarize_pdg_counts(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "quality": quality_counts,
         "perf": perf_counts,
+        "quality_then_perf": quality_then_perf_counts,
         "artifacts": artifact_counts,
         "sla_both_quality_and_perf_wins": sum(
             1
@@ -3712,6 +4236,137 @@ def summarize_pdg_comparisons(comparisons: list[dict[str, Any]]) -> dict[str, An
     return counts
 
 
+def _target_examples_for_owner(
+    owner: str, target_rollups: list[dict[str, Any]], limit: int = 5
+) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    for target in target_rollups:
+        owner_buckets = target.get("owner_buckets")
+        if not isinstance(owner_buckets, dict):
+            continue
+        count = int(owner_buckets.get(owner) or 0)
+        if count <= 0:
+            continue
+        examples.append(
+            {
+                "corpus": target.get("corpus"),
+                "case": target.get("case"),
+                "target": target.get("target"),
+                "family": target.get("family"),
+                "count": count,
+                "hard_failures": int(target.get("hard_failures") or 0),
+                "residual_commands": int(target.get("residual_commands") or 0),
+                "generic_arg_count": int(target.get("generic_arg_count") or 0),
+                "generic_type_count": int(target.get("generic_type_count") or 0),
+                "elapsed_s": _float_value(target.get("elapsed_s")),
+            }
+        )
+    examples.sort(
+        key=lambda item: (
+            -int(item.get("count") or 0),
+            -int(item.get("hard_failures") or 0),
+            -int(item.get("residual_commands") or 0),
+            -int(item.get("generic_arg_count") or 0),
+            -int(item.get("generic_type_count") or 0),
+            -_float_value(item.get("elapsed_s")),
+            str(item.get("corpus") or ""),
+            str(item.get("case") or ""),
+            str(item.get("target") or ""),
+        )
+    )
+    return examples[:limit]
+
+
+def _owner_work_items(
+    owner_buckets: dict[str, int], target_rollups: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    items = []
+    for owner, count in sorted(
+        owner_buckets.items(), key=lambda item: (-int(item[1]), str(item[0]))
+    ):
+        items.append(
+            {
+                "owner": owner,
+                "count": int(count),
+                "action": OWNER_ACTIONS.get(owner, OWNER_ACTIONS["unknown"]),
+                "targets": _target_examples_for_owner(owner, target_rollups),
+            }
+        )
+    return items
+
+
+def _pdg_next_work(pdg_summary: dict[str, Any]) -> dict[str, Any]:
+    common_targets = int(pdg_summary.get("common_targets") or 0)
+    successful_common_targets = int(pdg_summary.get("successful_common_targets") or 0)
+    quality = pdg_summary.get("quality")
+    perf = pdg_summary.get("perf")
+    quality_then_perf = pdg_summary.get("quality_then_perf")
+    pdg_quality_wins = (
+        int(quality.get("pdg") or 0) if isinstance(quality, dict) else 0
+    )
+    pdg_raw_perf_wins = int(perf.get("pdg") or 0) if isinstance(perf, dict) else 0
+    pdg_quality_then_perf_wins = (
+        int(quality_then_perf.get("pdg") or 0)
+        if isinstance(quality_then_perf, dict)
+        else 0
+    )
+    if common_targets == 0:
+        status = "not_run"
+    elif pdg_quality_wins or pdg_quality_then_perf_wins:
+        status = "quality_gap"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "common_targets": common_targets,
+        "successful_common_targets": successful_common_targets,
+        "pdg_quality_wins": pdg_quality_wins,
+        "pdg_raw_perf_wins": pdg_raw_perf_wins,
+        "pdg_quality_then_perf_wins": pdg_quality_then_perf_wins,
+    }
+
+
+def benchmark_next_work(
+    owner_buckets: dict[str, int],
+    target_rollups: list[dict[str, Any]],
+    slow_commands: list[dict[str, Any]],
+    timing: dict[str, Any],
+    pdg_summary: dict[str, Any],
+) -> dict[str, Any]:
+    owner_items = _owner_work_items(owner_buckets, target_rollups)
+    setup_ratio = timing.get("setup_to_command_ratio")
+    setup_ratio_value = (
+        round(_float_value(setup_ratio), 6) if setup_ratio is not None else None
+    )
+    setup_bottleneck = bool(setup_ratio_value is not None and setup_ratio_value > 2.0)
+    slow_setup = [
+        item
+        for item in slow_commands
+        if str(item.get("command") or "") in {"case_setup", "setup"}
+    ][:5]
+    pdg = _pdg_next_work(pdg_summary)
+    if owner_items:
+        status = "owner_work"
+    elif pdg["status"] == "quality_gap":
+        status = "pdg_quality_gap"
+    elif setup_bottleneck:
+        status = "setup_bottleneck"
+    else:
+        status = "clean"
+    return {
+        "status": status,
+        "blocking_owners": [item["owner"] for item in owner_items],
+        "owner_work_items": owner_items,
+        "setup": {
+            "status": "bottleneck" if setup_bottleneck else "ok",
+            "setup_to_command_ratio": setup_ratio_value,
+            "max_recommended_ratio": 2.0,
+            "slowest_setup_commands": slow_setup,
+        },
+        "pdg": pdg,
+    }
+
+
 def run_case(
     r2: str,
     case: BinaryCase,
@@ -3726,6 +4381,7 @@ def run_case(
     batch_target_size: int = 0,
     command_names: tuple[str, ...] | None = None,
     cached_case: dict[str, Any] | None = None,
+    gold_manifest: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     commands = target_commands(command_names)
@@ -3834,6 +4490,7 @@ def run_case(
                 command_jobs,
                 runner,
                 commands,
+                gold_manifest,
             )
             targets.extend(chunk_targets)
             for event in chunk_events:
@@ -3860,6 +4517,7 @@ def run_case(
             command_jobs,
             runner,
             commands,
+            gold_manifest,
         )
 
     case_out["targets"] = run_ordered_parallel(selected, target_jobs, collect_selected_target)
@@ -3879,14 +4537,25 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
     fallback_by_family: dict[str, int] = {}
     hard_failure_by_family: dict[str, int] = {}
     quality_gate_failures: dict[str, int] = {}
+    gold_oracle_totals = {
+        "expectations": 0,
+        "commands": 0,
+        "passed": 0,
+        "failed": 0,
+        "failures": 0,
+    }
+    owner_buckets: dict[str, int] = {}
     generic_arg_total = 0
     generic_type_total = 0
     decompile_metric_totals = {
         "argn_leak_total": 0,
         "comment_only_decompile_total": 0,
+        "empty_loop_body_total": 0,
         "fake_while_break_wrapper_total": 0,
         "missing_return_nonvoid_total": 0,
         "raw_temp_stack_leak_total": 0,
+        "summary_pseudo_call_total": 0,
+        "undefined_identifier_return_total": 0,
         "unresolved_fcn_total": 0,
     }
     radare2_candidates = 0
@@ -3916,6 +4585,8 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         for failure in case.get("failures", []):
             kind = str(failure.get("kind", "unknown"))
             failures_by_kind[kind] = failures_by_kind.get(kind, 0) + 1
+            owner = str(failure.get("owner") or owner_for_failure(kind, failure.get("command")))
+            owner_buckets[owner] = owner_buckets.get(owner, 0) + 1
             family = target_family(failure.get("target"))
             hard_failure_by_family[family] = hard_failure_by_family.get(family, 0) + 1
             if kind == "radare2_candidate":
@@ -3945,6 +4616,13 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             target_residual_count = 0
             target_generic_arg_count = 0
             target_generic_type_count = 0
+            target_owner_buckets: dict[str, int] = {}
+            for failure in target_failures:
+                owner = str(
+                    failure.get("owner")
+                    or owner_for_failure(failure.get("kind"), failure.get("command"))
+                )
+                target_owner_buckets[owner] = target_owner_buckets.get(owner, 0) + 1
             comparison = pdg_target_comparison(case, target)
             if comparison is not None:
                 pdg_comparisons.append(comparison)
@@ -3977,11 +4655,20 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                     decompile_metric_totals["fake_while_break_wrapper_total"] += int(
                         quality.get("fake_while_break_wrapper_count") or 0
                     )
+                    decompile_metric_totals["empty_loop_body_total"] += int(
+                        quality.get("empty_loop_body_count") or 0
+                    )
                     decompile_metric_totals["missing_return_nonvoid_total"] += (
                         1 if quality.get("missing_return_nonvoid") else 0
                     )
                     decompile_metric_totals["raw_temp_stack_leak_total"] += int(
                         quality.get("raw_temp_stack_leak_count") or 0
+                    )
+                    decompile_metric_totals["summary_pseudo_call_total"] += int(
+                        quality.get("summary_pseudo_call_count") or 0
+                    )
+                    decompile_metric_totals["undefined_identifier_return_total"] += int(
+                        quality.get("undefined_identifier_return_count") or 0
                     )
                     decompile_metric_totals["unresolved_fcn_total"] += int(
                         quality.get("unresolved_fcn_count") or 0
@@ -4000,6 +4687,10 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                             fallback_by_family[family] = fallback_by_family.get(family, 0) + 1
                         if classification == "residual":
                             target_residual_count += 1
+                            owner_buckets["r2sym"] = owner_buckets.get("r2sym", 0) + 1
+                            target_owner_buckets["r2sym"] = (
+                                target_owner_buckets.get("r2sym", 0) + 1
+                            )
                 type_metrics = result.get("type_metrics")
                 if isinstance(type_metrics, dict):
                     generic_arg_count = int(type_metrics.get("generic_arg_count") or 0)
@@ -4008,6 +4699,12 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                     generic_type_total += generic_type_count
                     target_generic_arg_count += generic_arg_count
                     target_generic_type_count += generic_type_count
+                    generic_total = generic_arg_count + generic_type_count
+                    if generic_total:
+                        owner_buckets["r2types"] = owner_buckets.get("r2types", 0) + generic_total
+                        target_owner_buckets["r2types"] = (
+                            target_owner_buckets.get("r2types", 0) + generic_total
+                        )
                 profile_metrics = result.get("profile_metrics")
                 cache_metrics = result.get("cache_metrics")
                 if isinstance(cache_metrics, dict):
@@ -4025,6 +4722,24 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                 fast_path_metrics = result.get("fast_path_metrics")
                 if isinstance(fast_path_metrics, dict):
                     add_fast_path_totals(fast_path_totals, fast_path_metrics)
+                gold_oracle = result.get("gold_oracle")
+                if isinstance(gold_oracle, dict):
+                    gold_oracle_totals["commands"] += 1
+                    gold_oracle_totals["expectations"] += int(
+                        gold_oracle.get("expectation_count") or 0
+                    )
+                    failure_count = len(
+                        [
+                            failure
+                            for failure in gold_oracle.get("failures", [])
+                            if isinstance(failure, dict)
+                        ]
+                    )
+                    gold_oracle_totals["failures"] += failure_count
+                    if failure_count:
+                        gold_oracle_totals["failed"] += 1
+                    else:
+                        gold_oracle_totals["passed"] += 1
                 slow_commands.append(
                     {
                         "case": case.get("name"),
@@ -4056,6 +4771,7 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                         "failure_kinds": sorted(
                             {str(failure.get("kind") or "unknown") for failure in target_failures}
                         ),
+                        "owner_buckets": dict(sorted(target_owner_buckets.items())),
                     }
                 )
     slow_commands.sort(
@@ -4091,6 +4807,8 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         if command_elapsed_s > 0
         else None,
     }
+    sorted_owner_buckets = dict(sorted(owner_buckets.items()))
+    pdg_summary = summarize_pdg_comparisons(pdg_comparisons)
     return {
         "case_count": len(cases),
         "target_count": total_targets,
@@ -4117,14 +4835,23 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
             },
             "fallback_by_family": dict(sorted(fallback_by_family.items())),
             "hard_failure_by_family": dict(sorted(hard_failure_by_family.items())),
+            "owner_buckets": sorted_owner_buckets,
             "runtime_buckets": dict(sorted(runtime_buckets.items())),
             "manual_gate_failures": dict(sorted(quality_gate_failures.items())),
+            "gold_oracle": dict(sorted(gold_oracle_totals.items())),
             **decompile_metric_totals,
             "generic_arg_total": generic_arg_total,
             "generic_type_total": generic_type_total,
             "radare2_candidate_count": radare2_candidates,
-            "pdg_comparison": summarize_pdg_comparisons(pdg_comparisons),
+            "pdg_comparison": pdg_summary,
         },
+        "next_work": benchmark_next_work(
+            sorted_owner_buckets,
+            target_rollups,
+            slow_commands,
+            timing,
+            pdg_summary,
+        ),
         "slowest_commands": slow_commands[:20],
         "worst_targets": target_rollups[:20],
     }
@@ -4175,11 +4902,165 @@ def _hard_failure_count(report: dict[str, Any]) -> int:
         return 0
     hard_kinds = {
         "command_return",
+        "decompiler_fallback",
+        "discovery_parse",
+        "discovery_return",
         "empty_decompile",
         "json_parse",
+        "missing_target",
+        "radare2_candidate",
+        "timeout",
+        "zero_functions",
+        GOLD_ORACLE_FAILURE,
         *QUALITY_GATE_FAILURES,
     }
     return sum(int(failures.get(kind) or 0) for kind in hard_kinds)
+
+
+def owner_for_failure(kind: Any, command: Any = None) -> str:
+    failure_kind = str(kind or "unknown")
+    owner = FAILURE_OWNER.get(failure_kind)
+    if owner:
+        return owner
+    command_name = str(command or "")
+    if command_name == "types":
+        return "r2types"
+    if command_name.startswith(DECOMPILE_COMMAND_PREFIX):
+        return "r2dec"
+    if command_name == "profile":
+        return "r2engine"
+    return "unknown"
+
+
+def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, Any]:
+    checks = {
+        "hard_failures": {
+            "value": _hard_failure_count(report),
+            "max": getattr(args, "max_hard_failures", None),
+        },
+        "residual_decompile": {
+            "value": int(_summary_metric(report, ("summary", "quality", "decompile", "residual"), 0) or 0),
+            "max": getattr(args, "max_residual_decompile", None),
+        },
+        "generic_args": {
+            "value": int(_summary_metric(report, ("summary", "quality", "generic_arg_total"), 0) or 0),
+            "max": getattr(args, "max_generic_args", None),
+        },
+        "generic_types": {
+            "value": int(_summary_metric(report, ("summary", "quality", "generic_type_total"), 0) or 0),
+            "max": getattr(args, "max_generic_types", None),
+        },
+        "average_score": {
+            "value": float(_summary_metric(report, ("summary", "average_score"), 0.0) or 0.0),
+            "min": getattr(args, "min_average_score", None),
+        },
+        "setup_command_ratio": {
+            "value": _summary_metric(report, ("summary", "timing", "setup_to_command_ratio"), None),
+            "max": getattr(args, "max_setup_command_ratio", None),
+        },
+        "pdg_quality_wins": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "pdg_comparison", "quality", "pdg"),
+                    0,
+                )
+                or 0
+            ),
+            "max": getattr(args, "max_pdg_quality_wins", None),
+        },
+        "pdg_perf_wins": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "pdg_comparison", "perf", "pdg"),
+                    0,
+                )
+                or 0
+            ),
+            "max": getattr(args, "max_pdg_perf_wins", None),
+        },
+        "pdg_quality_then_perf_wins": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    (
+                        "summary",
+                        "quality",
+                        "pdg_comparison",
+                        "quality_then_perf",
+                        "pdg",
+                    ),
+                    0,
+                )
+                or 0
+            ),
+            "max": getattr(args, "max_pdg_quality_then_perf_wins", None),
+        },
+        "pdg_successful_common_targets": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "pdg_comparison", "successful_common_targets"),
+                    0,
+                )
+                or 0
+            ),
+            "min": 1 if getattr(args, "require_pdg_comparison", False) else None,
+        },
+        "gold_failures": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "gold_oracle", "failures"),
+                    0,
+                )
+                or 0
+            ),
+            "max": getattr(args, "max_gold_failures", None),
+        },
+        "gold_expectations": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "gold_oracle", "expectations"),
+                    0,
+                )
+                or 0
+            ),
+            "min": 1 if getattr(args, "require_gold", False) else None,
+        },
+    }
+    failures: list[dict[str, Any]] = []
+    for metric, check in checks.items():
+        value = check["value"]
+        maximum = check.get("max")
+        minimum = check.get("min")
+        if value is None:
+            continue
+        if maximum is not None and value > maximum:
+            failures.append(
+                {
+                    "metric": metric,
+                    "value": value,
+                    "limit": maximum,
+                    "op": "<=",
+                }
+            )
+        if minimum is not None and value < minimum:
+            failures.append(
+                {
+                    "metric": metric,
+                    "value": value,
+                    "limit": minimum,
+                    "op": ">=",
+                }
+            )
+    return {
+        "status": "ok" if not failures else "failed",
+        "checks": checks,
+        "failures": failures,
+    }
 
 
 def _metric_delta(before: Any, after: Any) -> dict[str, Any]:
@@ -4239,10 +5120,18 @@ def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
 
     metrics = {
         "status": {"before": before.get("status"), "after": after.get("status")},
+        "next_work_status": {
+            "before": _summary_metric(before, ("summary", "next_work", "status"), None),
+            "after": _summary_metric(after, ("summary", "next_work", "status"), None),
+        },
         "elapsed_s": _metric_delta(before.get("elapsed_s"), after.get("elapsed_s")),
         "setup_s": _metric_delta(
             _summary_metric(before, ("summary", "timing", "setup_s")),
             _summary_metric(after, ("summary", "timing", "setup_s")),
+        ),
+        "setup_command_ratio": _metric_delta(
+            _summary_metric(before, ("summary", "timing", "setup_to_command_ratio")),
+            _summary_metric(after, ("summary", "timing", "setup_to_command_ratio")),
         ),
         "command_s": _metric_delta(
             _summary_metric(before, ("summary", "timing", "command_s")),
@@ -4297,6 +5186,16 @@ def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
             _summary_metric(before, ("summary", "quality", "pdg_comparison", "common_targets")),
             _summary_metric(after, ("summary", "quality", "pdg_comparison", "common_targets")),
         ),
+        "pdg_successful_common_targets": _metric_delta(
+            _summary_metric(
+                before,
+                ("summary", "quality", "pdg_comparison", "successful_common_targets"),
+            ),
+            _summary_metric(
+                after,
+                ("summary", "quality", "pdg_comparison", "successful_common_targets"),
+            ),
+        ),
         "sla_quality_wins_vs_pdg": _metric_delta(
             _summary_metric(before, ("summary", "quality", "pdg_comparison", "quality", "sla")),
             _summary_metric(after, ("summary", "quality", "pdg_comparison", "quality", "sla")),
@@ -4313,6 +5212,26 @@ def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
             _summary_metric(before, ("summary", "quality", "pdg_comparison", "perf", "pdg")),
             _summary_metric(after, ("summary", "quality", "pdg_comparison", "perf", "pdg")),
         ),
+        "sla_quality_then_perf_wins_vs_pdg": _metric_delta(
+            _summary_metric(
+                before,
+                ("summary", "quality", "pdg_comparison", "quality_then_perf", "sla"),
+            ),
+            _summary_metric(
+                after,
+                ("summary", "quality", "pdg_comparison", "quality_then_perf", "sla"),
+            ),
+        ),
+        "pdg_quality_then_perf_wins_vs_sla": _metric_delta(
+            _summary_metric(
+                before,
+                ("summary", "quality", "pdg_comparison", "quality_then_perf", "pdg"),
+            ),
+            _summary_metric(
+                after,
+                ("summary", "quality", "pdg_comparison", "quality_then_perf", "pdg"),
+            ),
+        ),
     }
     return {
         "schema": SCHEMA_VERSION,
@@ -4320,6 +5239,14 @@ def compare_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, 
         "failures_by_kind": {
             "before": _summary_metric(before, ("summary", "failures_by_kind"), {}),
             "after": _summary_metric(after, ("summary", "failures_by_kind"), {}),
+        },
+        "owner_buckets": {
+            "before": _summary_metric(before, ("summary", "quality", "owner_buckets"), {}),
+            "after": _summary_metric(after, ("summary", "quality", "owner_buckets"), {}),
+        },
+        "next_work": {
+            "before": _summary_metric(before, ("summary", "next_work"), {}),
+            "after": _summary_metric(after, ("summary", "next_work"), {}),
         },
         "slowest_command_delta": slow_delta[:20],
     }
@@ -4399,6 +5326,7 @@ def benchmark_execution_config(
         "analysis": args.analysis,
         "repeat": max(1, args.repeat),
         "cache_probe": bool(getattr(args, "cache_probe", False)),
+        "closure_gate": bool(getattr(args, "closure_gate", False)),
         "timeout": args.timeout,
         "execution_mode": execution_mode,
         "batch_target_size": args.batch_target_size,
@@ -4407,6 +5335,8 @@ def benchmark_execution_config(
         "per_case_workers": command_jobs,
         "include_sensitive": bool(args.include_sensitive),
         "manifest": args.manifest or "",
+        "gold_manifest": getattr(args, "gold_manifest", "") or "",
+        "gold_manifest_hash": gold_manifest_hash(getattr(args, "gold_manifest", "")),
         "manifest_only": bool(args.manifest_only),
         "override_manifest_max_functions": bool(
             getattr(args, "override_manifest_max_functions", False)
@@ -4417,6 +5347,24 @@ def benchmark_execution_config(
         "global_targets": list(args.target),
         "commands": list(parse_command_filter(args.commands)),
         "baseline_plugin_dirs": list(args.baseline_plugin_dir or []),
+        "strict_thresholds": {
+            "max_hard_failures": getattr(args, "max_hard_failures", None),
+            "max_residual_decompile": getattr(args, "max_residual_decompile", None),
+            "max_generic_args": getattr(args, "max_generic_args", None),
+            "max_generic_types": getattr(args, "max_generic_types", None),
+            "min_average_score": getattr(args, "min_average_score", None),
+            "max_setup_command_ratio": getattr(args, "max_setup_command_ratio", None),
+            "require_pdg_comparison": bool(getattr(args, "require_pdg_comparison", False)),
+            "max_pdg_quality_wins": getattr(args, "max_pdg_quality_wins", None),
+            "max_pdg_perf_wins": getattr(args, "max_pdg_perf_wins", None),
+            "max_pdg_quality_then_perf_wins": getattr(
+                args,
+                "max_pdg_quality_then_perf_wins",
+                None,
+            ),
+            "max_gold_failures": getattr(args, "max_gold_failures", None),
+            "require_gold": bool(getattr(args, "require_gold", False)),
+        },
     }
     config["run_config_hash"] = stable_json_hash(config)
     return config
@@ -4624,6 +5572,7 @@ def build_benchmark_report(
         },
         "inputs": {
             "manifest": args.manifest or None,
+            "gold_manifest": getattr(args, "gold_manifest", "") or None,
             "manifest_only": bool(args.manifest_only),
             "repo_fixtures": not args.no_repo_fixtures,
             "coreutils_dir": display_path(Path(args.coreutils_dir), args.include_sensitive) if args.coreutils_dir else None,
@@ -4724,6 +5673,11 @@ def main() -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    try:
+        gold_manifest = load_gold_manifest(args.gold_manifest)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: invalid gold manifest: {exc}", file=sys.stderr)
+        return 2
     cases = build_cases(args)
     tmpdir = Path(args.tmpdir) if args.tmpdir else None
     env = build_r2_env(args.r2, args.plugin_dir, args.baseline_plugin_dir or [], tmpdir)
@@ -4761,6 +5715,7 @@ def main() -> int:
             args.batch_target_size,
             command_names,
             cached_case,
+            gold_manifest,
         )
 
     def write_checkpoint(partial_results: list[dict[str, Any]], resumed_cases: int) -> None:
@@ -4802,13 +5757,15 @@ def main() -> int:
         benchmark_config=benchmark_config,
         command_names=command_names,
     )
+    strict_gate = strict_quality_gate(args, report)
+    report["strict_quality_gate"] = strict_gate
     write_report(out_path, report)
     print(
         "reversing benchmark "
         f"{report['status']}; cases={report['summary']['case_count']} "
         f"avg_score={report['summary']['average_score']} jobs={total_jobs} wrote {out_path}"
     )
-    if args.strict and report["status"] != "ok":
+    if args.strict and (report["status"] != "ok" or strict_gate["status"] != "ok"):
         return 1
     return 0
 

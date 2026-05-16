@@ -3264,10 +3264,56 @@ impl<'a> FoldingContext<'a> {
             CType::Pointer(inner) | CType::Array(inner, _) => {
                 self.field_name_from_type_hint(inner, offset)
             }
-            CType::Struct(name) => self.lookup_external_field_name(name, offset),
-            CType::Union(name) => self.lookup_external_field_name(name, offset),
+            CType::Struct(name) | CType::Union(name) => self
+                .lookup_external_field_name(name, offset)
+                .or_else(|| Self::fallback_aggregate_field_name(name, offset)),
+            CType::Typedef(name) => self.lookup_external_field_name(name, offset).or_else(|| {
+                self.typedef_name_looks_aggregate(name)
+                    .then(|| format!("f_{offset:x}"))
+            }),
             _ => None,
         }
+    }
+
+    fn fallback_aggregate_field_name(type_name: &str, offset: u64) -> Option<String> {
+        (!type_name.trim().is_empty()).then(|| format!("f_{offset:x}"))
+    }
+
+    fn typedef_name_looks_aggregate(&self, type_name: &str) -> bool {
+        let trimmed = type_name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "size_t"
+                | "ssize_t"
+                | "uintptr_t"
+                | "intptr_t"
+                | "ptrdiff_t"
+                | "pid_t"
+                | "uid_t"
+                | "gid_t"
+                | "off_t"
+                | "time_t"
+                | "mode_t"
+                | "dev_t"
+                | "ino_t"
+                | "nlink_t"
+                | "blksize_t"
+                | "blkcnt_t"
+                | "wchar_t"
+                | "wint_t"
+        ) {
+            return false;
+        }
+        lower.contains("struct")
+            || trimmed
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+            || self.inputs.external_type_db.typedefs.contains_key(&lower)
     }
 
     fn lookup_external_field_name(&self, type_name: &str, offset: u64) -> Option<String> {

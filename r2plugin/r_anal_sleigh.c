@@ -79,6 +79,7 @@ extern char *r2il_block_to_esil(const R2ILContext *ctx, const R2ILBlock *block);
 extern char *r2il_block_mnemonic(const R2ILContext *ctx, const unsigned char *bytes, size_t len, unsigned long long addr);
 extern char *r2il_block_op_json_named(const R2ILContext *ctx, const R2ILBlock *block, size_t index);
 extern void r2il_string_free(char *s);
+extern char *r2dec_highlight_c_ansi(const char *source);
 extern char *r2sleigh_decompile_render_cache_stats_json(void);
 extern void r2sleigh_decompile_render_cache_stats_reset(void);
 extern char *r2sleigh_engine_cache_stats_json(void);
@@ -371,8 +372,6 @@ extern const R2SleighSignatureFact *r2sleigh_session_result_signature_fact(const
 extern void r2sleigh_session_result_free(R2SleighSessionResult *result);
 extern char *r2sleigh_bounded_type_json_ffi(const R2ILContext *ctx, const char *fcn_name,
 	const char *reason, size_t global_max_links, size_t max_type_decls, size_t max_mutations);
-extern bool r2sleigh_has_native_worker_summary_family_ffi(const char *name);
-extern bool r2sleigh_direct_named_worker_decompile_ffi(const char *name);
 extern void r2sleigh_type_writeback_cache_clear(void);
 extern size_t r2sleigh_type_writeback_cache_len(void);
 extern int r2sleigh_type_writeback_cache_get(unsigned long long addr, unsigned long long *key,
@@ -420,10 +419,6 @@ extern char *r2dec_function_with_session_context(const R2SleighSessionInput *inp
 	const char *func_names_json, const char *strings_json, const char *symbols_json);
 extern char *r2dec_named_native_worker_summary(const R2ILContext *ctx, const R2ILBlock **blocks,
 	size_t num_blocks, unsigned long long fcn_addr, const char *func_name);
-extern char *r2sleigh_direct_named_worker_decompile_summary_ffi(const R2ILContext *ctx,
-	unsigned long long fcn_addr, const char *func_name);
-extern char *r2dec_named_native_worker_summary_direct(const R2ILContext *ctx,
-	unsigned long long fcn_addr, const char *func_name);
 extern char *r2sleigh_named_native_worker_type_json(const R2ILContext *ctx,
 	unsigned long long fcn_addr, const char *func_name, const void *function_context,
 	size_t global_max_links, size_t max_type_decls, size_t max_mutations);
@@ -1551,6 +1546,25 @@ static const char *skip_cmd_spaces(const char *s) {
 		s++;
 	}
 	return s;
+}
+
+static bool sleigh_console_color_enabled(RCore *core) {
+	return core && core->config && r_config_get_i (core->config, "scr.color") > 0;
+}
+
+static void sleigh_print_decompiler_text(RCore *core, RCons *cons, const char *text) {
+	if (!cons || !text) {
+		return;
+	}
+	if (sleigh_console_color_enabled (core)) {
+		char *highlighted = r2dec_highlight_c_ansi (text);
+		if (highlighted) {
+			r_cons_printf (cons, "%s\n", highlighted);
+			r2il_string_free (highlighted);
+			return;
+		}
+	}
+	r_cons_printf (cons, "%s\n", text);
 }
 
 static bool read_block_bytes_for_lifting(
@@ -8340,17 +8354,6 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			return strdup("");
 		}
-		char *direct_result = r2sleigh_direct_named_worker_decompile_summary_ffi (ctx, fcn->addr, fcn->name);
-		if (direct_result) {
-			if (direct_result[0]) {
-				if (cons) {
-					r_cons_printf (cons, "%s\n", direct_result);
-				}
-				r2il_string_free (direct_result);
-				return strdup("");
-			}
-			r2il_string_free (direct_result);
-		}
 		/* Lift all blocks */
 		BlockArray blocks;
 		ut64 profile_start_us = r_time_now_mono ();
@@ -8364,8 +8367,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			SymFunctionScope sym_scope;
 			SleighInterprocSeeds interproc_seeds;
 			bool have_sym_scope = false;
-			bool skip_helper_scope = should_skip_decompile_symbolic_scope (fcn)
-				|| r2sleigh_direct_named_worker_decompile_ffi (fcn->name);
+			bool skip_helper_scope = should_skip_decompile_symbolic_scope (fcn);
 			sleigh_interproc_seeds_init (&interproc_seeds);
 			if (!skip_helper_scope) {
 				have_sym_scope = build_type_interproc_scope (core, anal, ctx, fcn, &blocks,
@@ -8419,14 +8421,20 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			}
 			sleigh_interproc_seeds_free (&interproc_seeds);
 
-		if (cons) {
-			if (result && result[0]) {
-				r_cons_printf (cons, "%s\n", result);
-			} else {
-				const char *fname = (fcn && fcn->name) ? fcn->name : "unknown";
-				r_cons_printf (cons, "/* r2dec fallback: empty decompilation output for %s */\n", fname);
+			if (cons) {
+				if (result && result[0]) {
+					sleigh_print_decompiler_text (core, cons, result);
+				} else {
+					const char *fname = (fcn && fcn->name) ? fcn->name : "unknown";
+					char *fallback = r_str_newf ("/* r2dec fallback: empty decompilation output for %s */", fname);
+					if (fallback) {
+						sleigh_print_decompiler_text (core, cons, fallback);
+						free (fallback);
+					} else {
+						r_cons_printf (cons, "/* r2dec fallback: empty decompilation output for %s */\n", fname);
+					}
+				}
 			}
-		}
 
 		if (result) {
 			r2il_string_free (result);

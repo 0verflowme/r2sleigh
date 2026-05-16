@@ -28,8 +28,8 @@ pub use context::{
 };
 pub use convert::{CTypeLike, to_c_type_like};
 pub use external::{
-    ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb, ExternalUnion,
-    normalize_external_type_name,
+    ExternalAggregateKind, ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb,
+    ExternalTypedef, ExternalUnion, normalize_external_type_name,
 };
 pub use facts::{
     CalleeAllocationEffect, CalleeArgEffect, CalleeAtomicEffect, CalleeAtomicOp,

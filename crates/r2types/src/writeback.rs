@@ -256,6 +256,13 @@ fn signed_int_type(bits: u32) -> CTypeLike {
     }
 }
 
+fn unsigned_int_type(bits: u32) -> CTypeLike {
+    CTypeLike::Int {
+        bits,
+        signedness: Signedness::Unsigned,
+    }
+}
+
 fn c_int_type() -> CTypeLike {
     typedef_type("int")
 }
@@ -354,6 +361,24 @@ fn collect_projection_size_arg_hint(
     );
 }
 
+fn mark_projection_out_param(projection: &mut SemanticTypeProjection, index: usize) {
+    projection.out_param_indices.insert(index);
+    projection.refused_param_projections.remove(&index);
+}
+
+fn refuse_projection_out_param(
+    projection: &mut SemanticTypeProjection,
+    index: usize,
+    reason: impl Into<String>,
+) {
+    if !projection.out_param_indices.contains(&index) {
+        projection
+            .refused_param_projections
+            .entry(index)
+            .or_insert_with(|| reason.into());
+    }
+}
+
 fn collect_worker_scalar_arg_type_hints(
     summary: &r2sym::NativeWorkerSummary,
     projection: &mut SemanticTypeProjection,
@@ -417,9 +442,9 @@ fn collect_worker_summary_type_hints(
                 typedef_pointer_type("arguments"),
                 ptr_bits,
             );
-            projection
-                .out_param_indices
-                .extend(summary.out_param_indices());
+            for index in summary.out_param_indices() {
+                mark_projection_out_param(projection, index);
+            }
             return;
         }
         _ => {}
@@ -537,12 +562,32 @@ fn collect_worker_summary_type_hints(
                     .param_name_hints
                     .entry(index)
                     .or_insert_with(|| "result".to_string());
-                projection.out_param_indices.insert(index);
+                mark_projection_out_param(projection, index);
             }
         }
         _ => {}
     }
     collect_worker_scalar_arg_type_hints(summary, projection, ptr_bits);
+    if summary.dst.is_none()
+        && let Some(fold) = summary
+            .loop_summary
+            .as_ref()
+            .and_then(|loop_summary| loop_summary.fold.as_ref())
+    {
+        match summary.kind {
+            r2sym::NativeWorkerSummaryKind::HashFold => {
+                projection
+                    .return_type_hint
+                    .get_or_insert_with(|| unsigned_int_type(fold.bits));
+            }
+            r2sym::NativeWorkerSummaryKind::NumericTransform if summary.memory.is_some() => {
+                projection
+                    .return_type_hint
+                    .get_or_insert_with(|| size_type(ptr_bits));
+            }
+            _ => {}
+        }
+    }
     if summary.allocation.is_some()
         || matches!(summary.kind, r2sym::NativeWorkerSummaryKind::Allocation)
     {
@@ -552,21 +597,20 @@ fn collect_worker_summary_type_hints(
     }
     if summary.is_generic_memory_summary() {
         for index in summary.out_param_indices() {
-            projection
-                .refused_param_projections
-                .entry(index)
-                .or_insert_with(|| {
-                    format!(
-                        "generic memory summary at 0x{:x} is not specific enough for out-pointer projection",
-                        summary.anchor
-                    )
-                });
+            refuse_projection_out_param(
+                projection,
+                index,
+                format!(
+                    "generic memory summary at 0x{:x} is not specific enough for out-pointer projection",
+                    summary.anchor
+                ),
+            );
         }
         return;
     }
-    projection
-        .out_param_indices
-        .extend(summary.out_param_indices());
+    for index in summary.out_param_indices() {
+        mark_projection_out_param(projection, index);
+    }
     if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::FileTransfer) {
         if let Some(index) = summary_location_arg_index(summary.src.as_ref()) {
             merge_param_type_hint(
@@ -611,6 +655,9 @@ fn collect_worker_summary_type_hints(
         r2sym::NativeWorkerSummaryKind::FormatRender
         | r2sym::NativeWorkerSummaryKind::MetadataProbe => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::SortMerge => typedef_pointer_type("sortfile"),
+        r2sym::NativeWorkerSummaryKind::NumericTransform if summary.memory.is_some() => {
+            byte_pointer_type()
+        }
         r2sym::NativeWorkerSummaryKind::NumericTransform => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::HashFold
         | r2sym::NativeWorkerSummaryKind::TableWalk
@@ -631,11 +678,21 @@ fn collect_worker_summary_type_hints(
         | r2sym::NativeWorkerSummaryKind::Atomic
         | r2sym::NativeWorkerSummaryKind::Unknown => void_pointer_type(),
     };
+    let dst_pointer_hint = if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::Parser)
+        && summary
+            .parser
+            .as_ref()
+            .is_some_and(|parser| matches!(parser.kind, r2sym::NativeParserKind::Numeric))
+    {
+        void_pointer_type()
+    } else {
+        pointer_hint.clone()
+    };
     collect_worker_location_pointer_hint(
         &mut projection.param_type_hints,
         &mut projection.pointer_param_indices,
         summary.dst.as_ref(),
-        pointer_hint.clone(),
+        dst_pointer_hint,
         ptr_bits,
     );
     collect_worker_location_pointer_hint(
@@ -741,9 +798,9 @@ fn collect_region_summary_type_hints(
         return;
     }
     let pointer_hint = region_summary_pointer_hint(summary);
-    projection
-        .out_param_indices
-        .extend(summary.out_param_indices());
+    for index in summary.out_param_indices() {
+        mark_projection_out_param(projection, index);
+    }
     if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::Parser)
         && let Some(index) = summary
             .parser
@@ -819,6 +876,29 @@ fn normalized_semantic_function_name(name: &str) -> String {
     crate::role_registry::normalize_role_name(name)
 }
 
+fn semantic_summary_has_structural_evidence(summary: &FunctionSemanticSummary) -> bool {
+    summary.callsite_count > 0
+        || !summary.direct_callees.is_empty()
+        || summary.has_unknown_calls
+        || !summary.arg_effects.is_empty()
+        || !summary.memory_effects.is_empty()
+        || !summary.transfer_effects.is_empty()
+        || !summary.allocation_effects.is_empty()
+        || !summary.lifetime_effects.is_empty()
+        || !summary.sync_effects.is_empty()
+        || !summary.atomic_effects.is_empty()
+        || !matches!(summary.return_relation, SummaryReturnRelation::Unknown)
+        || summary.reads_global_memory
+        || summary.writes_global_memory
+        || summary.touches_unknown_memory
+}
+
+fn semantic_role_hints_are_evidence_backed(summary_view: &InterprocSummaryView) -> bool {
+    summary_view
+        .root_summary()
+        .is_some_and(semantic_summary_has_structural_evidence)
+}
+
 fn semantic_role_name_candidates(
     function_name: &str,
     summary_view: &InterprocSummaryView,
@@ -858,6 +938,15 @@ fn semantic_role_signature_hint(
     )
 }
 
+fn semantic_role_signature_hint_evidence_backed(
+    function_name: &str,
+    summary_view: &InterprocSummaryView,
+    current_param_count: usize,
+) -> Option<FunctionSignatureSpec> {
+    semantic_role_hints_are_evidence_backed(summary_view)
+        .then(|| semantic_role_signature_hint(function_name, summary_view, current_param_count))?
+}
+
 fn semantic_role_type_projection(
     function_name: &str,
     summary_view: &InterprocSummaryView,
@@ -876,15 +965,37 @@ fn semantic_role_type_projection(
     )
 }
 
+fn semantic_role_type_projection_evidence_backed(
+    function_name: &str,
+    summary_view: &InterprocSummaryView,
+    current_param_count: usize,
+) -> Option<crate::role_registry::RoleTypeProjection> {
+    semantic_role_hints_are_evidence_backed(summary_view)
+        .then(|| semantic_role_type_projection(function_name, summary_view, current_param_count))?
+}
+
 fn semantic_artifact_signature_hint(
+    function_name: Option<&str>,
     semantic_artifact: Option<&r2sym::SemanticArtifact>,
     current_param_count: usize,
 ) -> Option<FunctionSignatureSpec> {
     let native = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body)?;
     if let Some(role) = native.summary.role_identity.as_ref()
+        && !matches!(role.source, r2sym::NativeWorkerRoleSource::NameHint)
         && let Some(signature) = crate::role_registry::signature_hint_for_name_candidates(
             std::iter::once(role.role_name.as_str())
                 .chain(role.source_names.iter().map(String::as_str)),
+            current_param_count,
+        )
+    {
+        return Some(signature);
+    }
+    if !native.summary.has_primary_non_name_summary() {
+        return None;
+    }
+    if let Some(function_name) = function_name
+        && let Some(signature) = crate::role_registry::signature_hint_for_name_candidates(
+            std::iter::once(function_name),
             current_param_count,
         )
     {
@@ -1000,26 +1111,54 @@ fn semantic_role_typedef_is_authoritative(name: &str) -> bool {
     crate::role_registry::semantic_typedef_is_authoritative(name)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RoleOutParamPolicy<'a> {
+    EvidenceBacked(&'a FunctionSemanticSummary),
+    TypesOnly,
+}
+
 fn merge_role_type_projection(
     projection: &mut SemanticTypeProjection,
     role_projection: crate::role_registry::RoleTypeProjection,
     ptr_bits: u32,
+    out_param_policy: RoleOutParamPolicy<'_>,
 ) {
+    let crate::role_registry::RoleTypeProjection {
+        ret_type,
+        pointer_param_indices,
+        out_param_indices,
+        param_type_hints,
+        param_name_hints,
+    } = role_projection;
     if projection.return_type_hint.is_none() {
-        projection.return_type_hint = role_projection.ret_type;
+        projection.return_type_hint = ret_type;
     }
     projection
         .pointer_param_indices
-        .extend(role_projection.pointer_param_indices);
-    projection
-        .out_param_indices
-        .extend(role_projection.out_param_indices);
-    for (idx, name) in role_projection.param_name_hints {
+        .extend(pointer_param_indices);
+    for index in out_param_indices {
+        match out_param_policy {
+            RoleOutParamPolicy::EvidenceBacked(summary)
+                if summary_has_out_param_write_evidence(summary, index) =>
+            {
+                mark_projection_out_param(projection, index);
+            }
+            RoleOutParamPolicy::EvidenceBacked(_) => {
+                refuse_projection_out_param(
+                    projection,
+                    index,
+                    "role out-param hint lacks summary write or escape evidence",
+                );
+            }
+            RoleOutParamPolicy::TypesOnly => {}
+        }
+    }
+    for (idx, name) in param_name_hints {
         if !is_generic_arg_name(&name) {
             projection.param_name_hints.entry(idx).or_insert(name);
         }
     }
-    for (idx, ty) in role_projection.param_type_hints {
+    for (idx, ty) in param_type_hints {
         merge_param_type_hint(&mut projection.param_type_hints, idx, ty, ptr_bits);
     }
 }
@@ -1032,8 +1171,15 @@ impl SemanticTypeProjection {
     ) -> Self {
         let mut projection = Self::default();
         if let Some(summary) = summary_view.root_summary() {
-            if let Some(role_projection) = semantic_role_type_projection("", summary_view, 0) {
-                merge_role_type_projection(&mut projection, role_projection, ptr_bits);
+            if let Some(role_projection) =
+                semantic_role_type_projection_evidence_backed("", summary_view, 0)
+            {
+                merge_role_type_projection(
+                    &mut projection,
+                    role_projection,
+                    ptr_bits,
+                    RoleOutParamPolicy::EvidenceBacked(summary),
+                );
             }
             for idx in 0..=summary.arg_effects.keys().copied().max().unwrap_or(0) {
                 if summary_suggests_pointer_param(summary, idx) {
@@ -1042,13 +1188,13 @@ impl SemanticTypeProjection {
             }
             for (idx, effect) in &summary.arg_effects {
                 if effect.write || effect.escape {
-                    projection.out_param_indices.insert(*idx);
+                    mark_projection_out_param(&mut projection, *idx);
                 }
             }
             for effect in &summary.transfer_effects {
                 if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.dst.region {
                     projection.pointer_param_indices.insert(index);
-                    projection.out_param_indices.insert(index);
+                    mark_projection_out_param(&mut projection, index);
                 }
                 if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.src.region {
                     projection.pointer_param_indices.insert(index);
@@ -1063,6 +1209,7 @@ impl SemanticTypeProjection {
         }
         if let Some(native) = semantic_artifact.and_then(r2sym::SemanticArtifact::native_body) {
             if let Some(role) = native.summary.role_identity.as_ref()
+                && !matches!(role.source, r2sym::NativeWorkerRoleSource::NameHint)
                 && let Some(role_projection) =
                     crate::role_registry::type_projection_for_name_candidates(
                         std::iter::once(role.role_name.as_str())
@@ -1070,7 +1217,12 @@ impl SemanticTypeProjection {
                         0,
                     )
             {
-                merge_role_type_projection(&mut projection, role_projection, ptr_bits);
+                merge_role_type_projection(
+                    &mut projection,
+                    role_projection,
+                    ptr_bits,
+                    RoleOutParamPolicy::TypesOnly,
+                );
             }
             for summary in &native.summary.worker_summaries {
                 collect_worker_summary_type_hints(summary, &mut projection, ptr_bits);
@@ -1292,6 +1444,9 @@ fn summary_observed_param_count(summary: &FunctionSemanticSummary) -> usize {
 fn summary_role_type_projection(
     summary: &FunctionSemanticSummary,
 ) -> Option<crate::role_registry::RoleTypeProjection> {
+    if !semantic_summary_has_structural_evidence(summary) {
+        return None;
+    }
     let name = summary.name.as_deref()?;
     let current_param_count = summary
         .arg_count_hint
@@ -1906,7 +2061,7 @@ fn assumption_type_hint(
     let r2ssa::AssumptionValue::TypeHint { ty } = &assumption.value else {
         return None;
     };
-    parse_type_like_spec(ty, ptr_bits)
+    parse_signature_type_preserving_c_typedefs(ty, ptr_bits)
 }
 
 fn type_hint_conflicts(existing: &CTypeLike, hint: &CTypeLike, ptr_bits: u32) -> bool {
@@ -2249,7 +2404,7 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
         input.function_name,
     );
-    let role_projection = semantic_role_signature_hint(
+    let role_projection = semantic_role_signature_hint_evidence_backed(
         input.function_name,
         &summary_view,
         merged_signature
@@ -2260,7 +2415,7 @@ fn build_type_writeback_analysis_inner(
     .map(FunctionSignatureProjection::strong_summary)
     .or_else(|| {
         (input.inferred_signature.function_name != input.function_name).then(|| {
-            semantic_role_signature_hint(
+            semantic_role_signature_hint_evidence_backed(
                 &input.inferred_signature.function_name,
                 &summary_view,
                 merged_signature
@@ -2273,13 +2428,14 @@ fn build_type_writeback_analysis_inner(
     })
     .or_else(|| {
         semantic_artifact_signature_hint(
+            Some(input.function_name),
             semantic_inputs.as_ref().map(|semantic| semantic.artifact),
             merged_signature
                 .as_ref()
                 .map(|signature| signature.params.len())
                 .unwrap_or(input.inferred_signature.params.len()),
         )
-        .map(FunctionSignatureProjection::weak_summary_kind)
+        .map(FunctionSignatureProjection::strong_summary)
     });
     let role_hint_has_authoritative_empty_params =
         role_projection.as_ref().is_some_and(|projection| {
@@ -2345,11 +2501,13 @@ fn build_type_writeback_analysis_inner(
         &mut local_structs.slot_type_overrides,
         &local_structs.slot_field_profiles,
         &external_structs,
+        input.ptr_bits,
     );
     prefer_stronger_local_struct_overrides(
         &local_structs.struct_decls,
         &mut local_structs.slot_type_overrides,
         &local_structs.slot_field_profiles,
+        input.ptr_bits,
     );
     prune_conflicting_local_struct_overrides(
         &merged_signature,
@@ -2764,9 +2922,11 @@ pub fn build_semantic_type_fallback_plan(
         callconv_confidence: 0,
     };
     let empty_summary_view = InterprocSummaryView::new(None);
-    if let Some(role_hint) =
-        semantic_role_signature_hint(function_name, &empty_summary_view, signature.params.len())
-    {
+    if let Some(role_hint) = semantic_role_signature_hint_evidence_backed(
+        function_name,
+        &empty_summary_view,
+        signature.params.len(),
+    ) {
         apply_semantic_signature_hint_to_inferred(&mut signature, &role_hint, ptr_bits);
         signature.signature = format_signature(
             &signature.function_name,
@@ -2923,13 +3083,16 @@ pub fn apply_semantic_artifact_signature_hint_to_inferred(
     artifact: &r2sym::SemanticArtifact,
     ptr_bits: u32,
 ) -> bool {
-    let Some(hint) = semantic_artifact_signature_hint(Some(artifact), signature.params.len())
-    else {
+    let Some(hint) = semantic_artifact_signature_hint(
+        Some(&signature.function_name),
+        Some(artifact),
+        signature.params.len(),
+    ) else {
         return false;
     };
     let result = apply_signature_projection_to_inferred(
         signature,
-        FunctionSignatureProjection::weak_summary_kind(hint),
+        FunctionSignatureProjection::strong_summary(hint),
         ptr_bits,
     );
     if !result.was_applied() {
@@ -3824,6 +3987,15 @@ fn parse_signature_type_preserving_c_typedefs(ty: &str, ptr_bits: u32) -> Option
     {
         "int" => Some(c_int_type()),
         "unsigned int" => Some(c_uint_type()),
+        "short" | "short int" => Some(typedef_type("short")),
+        "unsigned short" | "unsigned short int" => Some(typedef_type("unsigned short")),
+        "long" | "long int" => Some(typedef_type("long")),
+        "unsigned long" | "unsigned long int" => Some(typedef_type("unsigned long")),
+        "size_t" => Some(typedef_type("size_t")),
+        "ssize_t" => Some(typedef_type("ssize_t")),
+        "ptrdiff_t" => Some(typedef_type("ptrdiff_t")),
+        "uintptr_t" => Some(typedef_type("uintptr_t")),
+        "intptr_t" => Some(typedef_type("intptr_t")),
         _ => parse_type_like_spec(ty, ptr_bits),
     }
 }
@@ -3898,9 +4070,10 @@ fn merge_local_signature_into_merged_signature(
                 if !is_generic_arg_name(&local_param.name) && is_generic_arg_name(&target.name) {
                     target.name = local_param.name.clone();
                 }
-                if local_signature_should_override_external(
+                if local_param_should_override_external(
                     local_param.ty.as_ref(),
                     target.ty.as_ref(),
+                    &target.name,
                 ) {
                     target.ty = local_param.ty;
                 } else if is_generic_signature_type(target.ty.as_ref()) {
@@ -3925,6 +4098,17 @@ fn local_signature_should_override_external(
         Some(external) if is_generic_signature_type(Some(external)) => true,
         Some(external) => local_scalar_override_should_apply(local, external),
     }
+}
+
+fn local_param_should_override_external(
+    local: Option<&CTypeLike>,
+    external: Option<&CTypeLike>,
+    external_name: &str,
+) -> bool {
+    if external.is_some() && !is_generic_arg_name(external_name) {
+        return false;
+    }
+    local_signature_should_override_external(local, external)
 }
 
 fn local_scalar_override_should_apply(local: &CTypeLike, external: &CTypeLike) -> bool {
@@ -3990,7 +4174,7 @@ fn merge_recovered_arg_types_into_signature(
         if param.name.is_empty() {
             param.name = format!("arg{}", slot + 1);
         }
-        if local_signature_should_override_external(Some(&local_ty), param.ty.as_ref())
+        if local_param_should_override_external(Some(&local_ty), param.ty.as_ref(), &param.name)
             || is_generic_signature_type(param.ty.as_ref())
         {
             param.ty = Some(local_ty);
@@ -4578,7 +4762,7 @@ fn signature_param_allows_local_struct_override(
         param.ty.as_ref(),
         Some(CTypeLike::Pointer(inner)) if matches!(inner.as_ref(), CTypeLike::Typedef(_))
     ) {
-        return true;
+        return false;
     }
 
     is_generic_arg_name(&param.name)
@@ -4665,7 +4849,7 @@ fn signature_param_blocks_generated_local_struct_override(
         CTypeLike::Pointer(inner) => match inner.as_ref() {
             CTypeLike::Unknown | CTypeLike::Void => false,
             CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) => true,
-            CTypeLike::Typedef(name) => semantic_role_typedef_is_authoritative(name),
+            CTypeLike::Typedef(_) => true,
             _ => true,
         },
         CTypeLike::Int { bits, .. } if *bits == ptr_bits && is_generic_arg_name(&param.name) => {
@@ -4736,7 +4920,10 @@ fn collect_external_struct_candidates_from_db(
         let Some(st) = db.structs.get(&key) else {
             continue;
         };
-        if is_opaque_placeholder_type_name(&st.name) || st.fields.is_empty() {
+        if is_opaque_placeholder_type_name(&st.name)
+            || st.fields.is_empty()
+            || db.is_aggregate_typedef(&st.name)
+        {
             continue;
         }
         let mut fields = Vec::new();
@@ -4827,10 +5014,17 @@ fn should_replace_struct_decl(
         && existing.name.eq_ignore_ascii_case(&candidate.name)
 }
 
-fn struct_fields_signature(fields: &[StructFieldCandidate]) -> Vec<(u64, String)> {
+fn canonical_field_type_key(ty: &str, ptr_bits: u32) -> String {
+    let normalized = normalize_external_type_name(ty);
+    parse_type_like_spec(&normalized, ptr_bits)
+        .map(|parsed| render_signature_type(&parsed, ptr_bits).to_ascii_lowercase())
+        .unwrap_or_else(|| normalized.to_ascii_lowercase())
+}
+
+fn struct_fields_signature(fields: &[StructFieldCandidate], ptr_bits: u32) -> Vec<(u64, String)> {
     let mut out: Vec<(u64, String)> = fields
         .iter()
-        .map(|f| (f.offset, f.field_type.to_ascii_lowercase()))
+        .map(|f| (f.offset, canonical_field_type_key(&f.field_type, ptr_bits)))
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     out
@@ -4846,6 +5040,7 @@ fn parse_struct_ptr_type_name(ty: &str) -> Option<String> {
 fn local_struct_profile_score(
     decl: &StructDeclCandidate,
     profile: &BTreeMap<u64, String>,
+    ptr_bits: u32,
 ) -> Option<(usize, usize, usize, i32)> {
     if decl.source != StructDeclSource::LocalInferred || profile.is_empty() {
         return None;
@@ -4854,7 +5049,12 @@ fn local_struct_profile_score(
     let field_map = decl
         .fields
         .iter()
-        .map(|field| (field.offset, field.field_type.to_ascii_lowercase()))
+        .map(|field| {
+            (
+                field.offset,
+                canonical_field_type_key(&field.field_type, ptr_bits),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
 
     let mut offset_matches = 0usize;
@@ -4864,7 +5064,7 @@ fn local_struct_profile_score(
             continue;
         };
         offset_matches += 1;
-        if field_ty == &ty.to_ascii_lowercase() {
+        if field_ty == &canonical_field_type_key(ty, ptr_bits) {
             typed_matches += 1;
         }
     }
@@ -4881,6 +5081,7 @@ fn prefer_stronger_local_struct_overrides(
     struct_decls: &[StructDeclCandidate],
     slot_type_overrides: &mut HashMap<usize, String>,
     slot_field_profiles: &HashMap<usize, BTreeMap<u64, String>>,
+    ptr_bits: u32,
 ) {
     for (slot, ty) in slot_type_overrides.iter_mut() {
         let Some(profile) = slot_field_profiles.get(slot) else {
@@ -4902,11 +5103,13 @@ fn prefer_stronger_local_struct_overrides(
             continue;
         }
 
-        let current_score = current_decl.and_then(|decl| local_struct_profile_score(decl, profile));
+        let current_score =
+            current_decl.and_then(|decl| local_struct_profile_score(decl, profile, ptr_bits));
         let best_local = struct_decls
             .iter()
             .filter_map(|decl| {
-                local_struct_profile_score(decl, profile).map(|score| (score, decl.name.clone()))
+                local_struct_profile_score(decl, profile, ptr_bits)
+                    .map(|score| (score, decl.name.clone()))
             })
             .max_by(|(left_score, left_name), (right_score, right_name)| {
                 left_score
@@ -4944,15 +5147,16 @@ fn align_local_structs_with_external(
     slot_type_overrides: &mut HashMap<usize, String>,
     slot_field_profiles: &HashMap<usize, BTreeMap<u64, String>>,
     external_structs: &[StructDeclCandidate],
+    ptr_bits: u32,
 ) {
     let mut local_to_external: HashMap<String, String> = HashMap::new();
     for local in struct_decls.iter_mut() {
         if local.source != StructDeclSource::LocalInferred {
             continue;
         }
-        let local_sig = struct_fields_signature(&local.fields);
+        let local_sig = struct_fields_signature(&local.fields, ptr_bits);
         for ext in external_structs {
-            let ext_sig = struct_fields_signature(&ext.fields);
+            let ext_sig = struct_fields_signature(&ext.fields, ptr_bits);
             if structurally_compatible(&local_sig, &ext_sig) {
                 local_to_external.insert(local.name.clone(), ext.name.clone());
                 local.confidence = local.confidence.max(92);
@@ -4969,10 +5173,10 @@ fn align_local_structs_with_external(
             continue;
         }
         let replacement = external_structs.iter().find_map(|ext| {
-            let ext_sig = struct_fields_signature(&ext.fields);
+            let ext_sig = struct_fields_signature(&ext.fields, ptr_bits);
             let local_sig: Vec<(u64, String)> = profile
                 .iter()
-                .map(|(off, ty)| (*off, ty.to_ascii_lowercase()))
+                .map(|(off, ty)| (*off, canonical_field_type_key(ty, ptr_bits)))
                 .collect();
             if structurally_compatible(&local_sig, &ext_sig) {
                 Some(ext.name.clone())
@@ -5427,22 +5631,29 @@ fn format_signature(
 fn build_struct_decl(
     struct_name: &str,
     fields: &[StructFieldCandidate],
-    _ptr_bits: u32,
+    ptr_bits: u32,
 ) -> Option<String> {
     if fields.is_empty() {
         return None;
     }
-    let body = fields
-        .iter()
-        .map(|field| {
-            format!(
-                "    {} {};",
-                normalize_external_type_name(&field.field_type),
-                field.name
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut sorted_fields = fields.iter().collect::<Vec<_>>();
+    sorted_fields.sort_by_key(|field| (field.offset, field.name.as_str()));
+
+    let mut cursor = 0u64;
+    let mut lines = Vec::new();
+    for field in sorted_fields {
+        if field.offset > cursor {
+            let gap = field.offset - cursor;
+            lines.push(format!("    uint8_t _pad_{cursor:x}[{gap}];"));
+            cursor = field.offset;
+        }
+
+        let field_type = normalize_external_type_name(&field.field_type);
+        lines.push(format!("    {} {};", field_type, field.name));
+        cursor = cursor.saturating_add(estimate_c_type_size_bytes(&field_type, ptr_bits));
+    }
+
+    let body = lines.join("\n");
     Some(format!("struct {struct_name} {{\n{body}\n}};"))
 }
 
@@ -5586,6 +5797,58 @@ fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn signature_type_parser_preserves_source_width_typedefs() {
+        assert_eq!(
+            parse_signature_type_preserving_c_typedefs("long", 64),
+            Some(typedef_type("long"))
+        );
+        assert_eq!(
+            parse_signature_type_preserving_c_typedefs("unsigned long int", 64),
+            Some(typedef_type("unsigned long"))
+        );
+        assert_eq!(
+            parse_signature_type_preserving_c_typedefs("short", 64),
+            Some(typedef_type("short"))
+        );
+        assert_eq!(
+            parse_signature_type_preserving_c_typedefs("size_t", 64),
+            Some(typedef_type("size_t"))
+        );
+        assert_eq!(
+            parse_signature_type_preserving_c_typedefs("ptrdiff_t", 64),
+            Some(typedef_type("ptrdiff_t"))
+        );
+    }
+
+    #[test]
+    fn local_struct_decl_preserves_sparse_offsets_with_padding() {
+        let decl = build_struct_decl(
+            "sla_struct_sparse",
+            &[
+                StructFieldCandidate {
+                    name: "f_8".to_string(),
+                    offset: 8,
+                    field_type: "int32_t".to_string(),
+                    confidence: 95,
+                },
+                StructFieldCandidate {
+                    name: "f_34".to_string(),
+                    offset: 0x34,
+                    field_type: "int32_t".to_string(),
+                    confidence: 95,
+                },
+            ],
+            64,
+        )
+        .expect("struct decl");
+
+        assert!(decl.contains("uint8_t _pad_0[8];"), "{decl}");
+        assert!(decl.contains("int32_t f_8;"), "{decl}");
+        assert!(decl.contains("uint8_t _pad_c[40];"), "{decl}");
+        assert!(decl.contains("int32_t f_34;"), "{decl}");
+    }
 
     fn test_native_summary(slice_class: r2sym::SliceClass) -> r2sym::NativeFunctionSummary {
         r2sym::NativeFunctionSummary {
@@ -6527,6 +6790,68 @@ mod tests {
     }
 
     #[test]
+    fn imported_size_t_type_hint_matches_preserved_source_typedef() {
+        let mut parsed_context = ParsedExternalContext {
+            assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
+                id: Some("rsi-size".to_string()),
+                subject: r2ssa::AssumptionSubject::Register {
+                    name: "rsi".to_string(),
+                },
+                value: r2ssa::AssumptionValue::TypeHint {
+                    ty: "size_t".to_string(),
+                },
+                scope: r2ssa::AssumptionScope::Function,
+                provenance: r2ssa::AssumptionProvenance::ImportedContext,
+            }]),
+            register_params: vec![crate::context::ExternalRegisterParamSpec {
+                name: "n".to_string(),
+                ty: Some(CTypeLike::Typedef("size_t".to_string())),
+                reg: "rsi".to_string(),
+            }],
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Typedef("size_t".to_string())),
+                params: vec![FunctionParamSpec {
+                    name: "n".to_string(),
+                    ty: Some(CTypeLike::Typedef("size_t".to_string())),
+                }],
+            }),
+            ..ParsedExternalContext::default()
+        };
+        let mut inferred_signature = InferredSignature {
+            function_name: "sym.mem_scan2".to_string(),
+            signature: "size_t sym.mem_scan2(size_t n)".to_string(),
+            ret_type: "size_t".to_string(),
+            params: vec![InferredSignatureParam {
+                name: "n".to_string(),
+                param_type: "size_t".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 96,
+            callconv_confidence: 92,
+        };
+
+        let usage = apply_type_hint_assumptions_to_context(
+            &mut parsed_context,
+            &mut inferred_signature,
+            64,
+            Some(&SemanticTypeProjection::default()),
+        );
+
+        assert_eq!(usage.applied.len(), 1);
+        assert!(usage.ignored.is_empty());
+        assert!(usage.conflicts.is_empty());
+        assert_eq!(
+            parsed_context.register_params[0]
+                .ty
+                .as_ref()
+                .map(|ty| render_signature_type(ty, 64))
+                .as_deref(),
+            Some("size_t")
+        );
+    }
+
+    #[test]
     fn corroborated_type_hint_assumptions_update_signature_and_usage() {
         let mut parsed_context = ParsedExternalContext {
             assumptions: r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
@@ -6910,6 +7235,103 @@ mod tests {
                 bits: 32,
                 signedness: Signedness::Signed,
             })
+        );
+    }
+
+    #[test]
+    fn exact_named_external_size_signature_blocks_local_byte_narrowing() {
+        let mut parsed_context = ParsedExternalContext::default();
+        parsed_context.current_signature = Some(FunctionSignatureSpec {
+            ret_type: Some(typedef_type("size_t")),
+            params: vec![
+                FunctionParamSpec {
+                    name: "buf".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                        bits: 8,
+                        signedness: Signedness::Unsigned,
+                    }))),
+                },
+                FunctionParamSpec {
+                    name: "n".to_string(),
+                    ty: Some(typedef_type("size_t")),
+                },
+                FunctionParamSpec {
+                    name: "a".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 8,
+                        signedness: Signedness::Unsigned,
+                    }),
+                },
+                FunctionParamSpec {
+                    name: "b".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 8,
+                        signedness: Signedness::Unsigned,
+                    }),
+                },
+            ],
+        });
+        parsed_context.merged_signature = parsed_context.current_signature.clone();
+
+        let vars = [RecoveredVariable {
+            name: "arg1".to_string(),
+            kind: "r".to_string(),
+            delta: 0,
+            var_type: "uint8_t".to_string(),
+            isarg: true,
+            reg: Some("rsi".to_string()),
+        }];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "dbg.mem_scan2",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "dbg.mem_scan2".to_string(),
+                signature: "uint8_t dbg.mem_scan2 (uint8_t* buf, uint8_t n, uint8_t a, uint8_t b)"
+                    .to_string(),
+                ret_type: "uint8_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "buf".to_string(),
+                        param_type: "uint8_t*".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "n".to_string(),
+                        param_type: "uint8_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "a".to_string(),
+                        param_type: "uint8_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "b".to_string(),
+                        param_type: "uint8_t".to_string(),
+                    },
+                ],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 90,
+                callconv_confidence: 90,
+            },
+            recovered_vars: &vars,
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.ret_type, "size_t");
+        assert_eq!(analysis.signature.params[1].name, "n");
+        assert_eq!(analysis.signature.params[1].param_type, "size_t");
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|sig| sig.params.get(1))
+                .and_then(|param| param.ty.clone()),
+            Some(typedef_type("size_t"))
         );
     }
 
@@ -7926,6 +8348,122 @@ mod tests {
     }
 
     #[test]
+    fn debug_typedef_alias_beats_generated_local_struct_override() {
+        let parsed_context = crate::parse_external_context_json(
+            r#"{
+                "signature":{
+                    "ret":"int32_t",
+                    "params":[{"name":"arr","type":"DemoStruct *"}]
+                },
+                "base_types":[
+                    {
+                        "kind":"struct",
+                        "name":"type_0x261",
+                        "members":[
+                            {"name":"third","type":"int","offset":8},
+                            {"name":"fourteenth","type":"int","offset":52}
+                        ]
+                    },
+                    {"kind":"typedef","name":"DemoStruct","type":"type_0x261"}
+                ]
+            }"#,
+            64,
+        );
+        let local_structs = LocalStructArtifacts {
+            struct_decls: vec![StructDeclCandidate {
+                name: "sla_struct_420703e08f70f00e".to_string(),
+                decl: "struct sla_struct_420703e08f70f00e { int32_t f_8; int32_t f_34; };"
+                    .to_string(),
+                confidence: 95,
+                source: StructDeclSource::LocalInferred,
+                fields: vec![
+                    StructFieldCandidate {
+                        name: "f_8".to_string(),
+                        offset: 8,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                    StructFieldCandidate {
+                        name: "f_34".to_string(),
+                        offset: 0x34,
+                        field_type: "int32_t".to_string(),
+                        confidence: 95,
+                    },
+                ],
+            }],
+            slot_type_overrides: HashMap::from([(
+                0usize,
+                "struct sla_struct_420703e08f70f00e *".to_string(),
+            )]),
+            slot_field_profiles: HashMap::from([(
+                0usize,
+                BTreeMap::from([
+                    (8u64, "int32_t".to_string()),
+                    (0x34u64, "int32_t".to_string()),
+                ]),
+            )]),
+        };
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym.test_struct_array_index",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym.test_struct_array_index".to_string(),
+                signature: "int32_t sym.test_struct_array_index (void * arr)".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![InferredSignatureParam {
+                    name: "arr".to_string(),
+                    param_type: "void *".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 90,
+                callconv_confidence: 90,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &[],
+            parsed_context,
+            local_structs,
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert_eq!(analysis.signature.params[0].param_type, "DemoStruct*");
+        assert_eq!(
+            analysis
+                .type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|signature| signature.params[0].ty.as_ref()),
+            Some(&CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
+                "DemoStruct".to_string()
+            ))))
+        );
+        let external = analysis
+            .type_facts
+            .external_type_db
+            .structs
+            .get("demostruct")
+            .expect("typedef-backed struct alias");
+        assert_eq!(
+            external.fields.get(&8).map(|field| field.name.as_str()),
+            Some("third")
+        );
+        assert_eq!(
+            external.fields.get(&0x34).map(|field| field.name.as_str()),
+            Some("fourteenth")
+        );
+        assert!(
+            !analysis
+                .type_facts
+                .slot_type_overrides
+                .values()
+                .any(|ty| ty.contains("sla_struct_")),
+            "source typedef layout should prevent selected synthetic struct overrides"
+        );
+    }
+
+    #[test]
     fn local_struct_override_replaces_weak_generic_ptr_sized_integer_param() {
         let mut parsed_context = ParsedExternalContext::default();
         parsed_context.current_signature = Some(FunctionSignatureSpec {
@@ -8163,11 +8701,74 @@ mod tests {
         let root = r2ssa::InterprocFunctionId(0x401000);
         let mut summary = r2ssa::FunctionSemanticSummary::unknown(root, Some(name.to_string()));
         summary.arg_count_hint = arg_count_hint;
+        summary.reads_global_memory = true;
         r2ssa::InterprocSummarySet {
             root: Some(root),
             summaries: BTreeMap::from([(root, summary)]),
             diagnostics: Default::default(),
         }
+    }
+
+    #[test]
+    fn semantic_role_out_param_projection_requires_write_evidence() {
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let mut summary =
+            r2ssa::FunctionSemanticSummary::unknown(root, Some("dbg.open_input_files".to_string()));
+        summary.arg_count_hint = Some(3);
+        summary.arg_effects.insert(
+            2,
+            r2ssa::SummaryArgEffect {
+                read: true,
+                ..r2ssa::SummaryArgEffect::default()
+            },
+        );
+        let summary_set = r2ssa::InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(root, summary.clone())]),
+            diagnostics: Default::default(),
+        };
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(Some(summary_set)),
+            None,
+            64,
+        );
+
+        assert_eq!(
+            projection
+                .param_type_hints
+                .get(&2)
+                .map(|ty| render_signature_type(ty, 64)),
+            Some("FILE***".to_string())
+        );
+        assert!(!projection.out_param_indices.contains(&2));
+        assert!(projection.refusal_warnings().iter().any(|warning| {
+            warning.contains("role out-param hint")
+                && warning.contains("summary write or escape evidence")
+        }));
+
+        summary.arg_effects.insert(
+            2,
+            r2ssa::SummaryArgEffect {
+                write: true,
+                ..r2ssa::SummaryArgEffect::default()
+            },
+        );
+        let summary_set = r2ssa::InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([(root, summary)]),
+            diagnostics: Default::default(),
+        };
+        let projection = SemanticTypeProjection::from_inputs(
+            &InterprocSummaryView::new(Some(summary_set)),
+            None,
+            64,
+        );
+
+        assert!(projection.out_param_indices.contains(&2));
+        assert!(!projection.refusal_warnings().iter().any(|warning| {
+            warning.contains("role out-param hint")
+                && warning.contains("summary write or escape evidence")
+        }));
     }
 
     #[test]
@@ -9900,6 +10501,13 @@ mod tests {
             Some("dbg.open_input_files".to_string()),
         );
         helper_summary.arg_count_hint = Some(3);
+        helper_summary.arg_effects.insert(
+            2,
+            r2ssa::SummaryArgEffect {
+                read: true,
+                ..r2ssa::SummaryArgEffect::default()
+            },
+        );
 
         let helper_fact = summary_to_callee_fact(&helper_summary);
 

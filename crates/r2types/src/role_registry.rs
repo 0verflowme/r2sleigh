@@ -598,6 +598,25 @@ pub fn signature_hint_for_role_name(
         ),
         "locale_charset" => sig(signed_byte_pointer_type(), Vec::new()),
         "current_timespec" => sig(CTypeLike::Struct("timespec".to_string()), Vec::new()),
+        "parse_datetime_body" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("result", struct_pointer_type("timespec")),
+                p("input", signed_byte_pointer_type()),
+                p("now", struct_pointer_type("timespec")),
+                p("flags", c_uint_type()),
+                p("tzdefault", typedef_type("timezone_t")),
+                p("tzstring", signed_byte_pointer_type()),
+            ],
+        ),
+        "posixtime" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("p", typedef_pointer_type("time_t")),
+                p("s", signed_byte_pointer_type()),
+                p("syntax_bits", c_uint_type()),
+            ],
+        ),
         "rpl_obstack_memory_used" => sig(
             typedef_type("size_t"),
             vec![p("h", struct_pointer_type("obstack"))],
@@ -807,11 +826,361 @@ pub fn signature_hint_for_role_name(
         | "sha256_process_bytes" => sig(
             CTypeLike::Void,
             vec![
-                p("buffer", void_pointer_type()),
+                p("buffer", memory_ptr_type()),
                 p("len", typedef_type("size_t")),
                 p("ctx", typedef_pointer_type("sha256_ctx")),
             ],
         ),
+        "sm3_process_block" | "sm3_process_bytes" => sig(
+            CTypeLike::Void,
+            vec![
+                p("buffer", memory_ptr_type()),
+                p("len", typedef_type("size_t")),
+                p("ctx", typedef_pointer_type("sm3_ctx")),
+            ],
+        ),
+        "blake2b_compress" => sig(
+            CTypeLike::Void,
+            vec![
+                p("state", typedef_pointer_type("blake2b_state")),
+                p("block", unsigned_byte_pointer_type()),
+            ],
+        ),
+        "base32_encode" | "base64_encode" => sig(
+            CTypeLike::Void,
+            vec![
+                p("in", signed_byte_pointer_type()),
+                p("inlen", typedef_type("idx_t")),
+                p("out", signed_byte_pointer_type()),
+                p("outlen", typedef_type("idx_t")),
+            ],
+        ),
+        "base32_decode_ctx" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("ctx", struct_pointer_type("base32_decode_context")),
+                p("in", signed_byte_pointer_type()),
+                p("inlen", typedef_type("idx_t")),
+                p("out", signed_byte_pointer_type()),
+                p("outlen", typedef_pointer_type("idx_t")),
+            ],
+        ),
+        "base64_decode_ctx" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("ctx", struct_pointer_type("base64_decode_context")),
+                p("in", signed_byte_pointer_type()),
+                p("inlen", typedef_type("idx_t")),
+                p("out", signed_byte_pointer_type()),
+                p("outlen", typedef_pointer_type("idx_t")),
+            ],
+        ),
+        "base58_encode_ctx_finalize" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("ctx", struct_pointer_type("base_encode_context")),
+                p("out", signed_byte_pointer_pointer_type()),
+                p("outlen", typedef_pointer_type("idx_t")),
+            ],
+        ),
+        "re_string_reconstruct" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![
+                p("pstr", typedef_pointer_type("re_string_t")),
+                p("idx", typedef_type("idx_t")),
+                p("eflags", c_int_type()),
+            ],
+        ),
+        "re_search_internal" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![
+                p("preg", typedef_pointer_type("regex_t")),
+                p("string", signed_byte_pointer_type()),
+                p("length", typedef_type("idx_t")),
+                p("start", typedef_type("idx_t")),
+                p("last_start", typedef_type("idx_t")),
+                p("stop", typedef_type("idx_t")),
+                p("nmatch", typedef_pointer_type("re_registers")),
+                p("pmatch", typedef_pointer_type("regmatch_t")),
+                p("eflags", c_int_type()),
+            ],
+        ),
+        "re_compile_internal" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![
+                p("preg", typedef_pointer_type("re_pattern_buffer")),
+                p("pattern", signed_byte_pointer_type()),
+                p("length", typedef_type("idx_t")),
+                p("syntax", typedef_type("reg_syntax_t")),
+            ],
+        ),
+        "parse_expression" => sig(
+            typedef_pointer_type("bin_tree_t"),
+            vec![
+                p("regexp", typedef_pointer_type("re_string_t")),
+                p("preg", typedef_pointer_type("regex_t")),
+                p("token", typedef_pointer_type("re_token_t")),
+                p("syntax", typedef_type("reg_syntax_t")),
+                p("nest", typedef_type("idx_t")),
+                p("err", typedef_pointer_type("reg_errcode_t")),
+            ],
+        ),
+        "build_trtable" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("dfa", typedef_pointer_type("re_dfa_t")),
+                p("state", typedef_pointer_type("re_dfastate_t")),
+            ],
+        ),
+        "update_cur_sifted_state" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![
+                p("mctx", typedef_pointer_type("re_match_context_t")),
+                p("dest_nodes", typedef_pointer_type("re_node_set")),
+                p("str_idx", typedef_type("idx_t")),
+                p("candidates", typedef_pointer_type("re_node_set")),
+            ],
+        ),
+        "transit_state_bkref" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![
+                p("mctx", typedef_pointer_type("re_match_context_t")),
+                p("nodes", typedef_pointer_type("re_node_set")),
+            ],
+        ),
+        "build_charclass" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![
+                p("trans", typedef_pointer_type("re_dfa_t")),
+                p("sbcset", typedef_pointer_type("bitset_word_t")),
+                p("mbcset", typedef_pointer_type("re_charset_t")),
+                p("char_class_alloc", typedef_pointer_type("idx_t")),
+                p("class_name", signed_byte_pointer_type()),
+                p("syntax", typedef_type("reg_syntax_t")),
+            ],
+        ),
+        "check_arrival" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![
+                p("mctx", typedef_pointer_type("re_match_context_t")),
+                p("path", typedef_pointer_type("state_array_t")),
+                p("top_node", typedef_type("idx_t")),
+                p("top_str", typedef_type("idx_t")),
+                p("last_node", typedef_type("idx_t")),
+                p("last_str", typedef_type("idx_t")),
+                p("type", c_int_type()),
+            ],
+        ),
+        "peek_token" => sig(
+            c_int_type(),
+            vec![
+                p("token", typedef_pointer_type("re_token_t")),
+                p("input", typedef_pointer_type("re_string_t")),
+                p("syntax", typedef_type("reg_syntax_t")),
+            ],
+        ),
+        "build_wcs_upper_buffer" => sig(
+            typedef_type("reg_errcode_t"),
+            vec![p("pstr", typedef_pointer_type("re_string_t"))],
+        ),
+        "yyparse" => sig(
+            c_int_type(),
+            vec![p("pc", typedef_pointer_type("parser_control"))],
+        ),
+        "install_file_in_file" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("from", signed_byte_pointer_type()),
+                p("to", signed_byte_pointer_type()),
+                p("to_dirfd", c_int_type()),
+                p("to_relname", signed_byte_pointer_type()),
+                p("x", typedef_pointer_type("cp_options")),
+            ],
+        ),
+        "chown_files" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("files", signed_byte_pointer_pointer_type()),
+                p("bit_flags", c_int_type()),
+                p("uid", typedef_type("uid_t")),
+                p("gid", typedef_type("gid_t")),
+                p("required_uid", typedef_type("uid_t")),
+                p("required_gid", typedef_type("gid_t")),
+                p("chopt", struct_pointer_type("Chown_option")),
+            ],
+        ),
+        "who" => sig(
+            CTypeLike::Void,
+            vec![
+                p("filename", signed_byte_pointer_type()),
+                p("options", c_int_type()),
+            ],
+        ),
+        "read_utmp" => sig(
+            c_int_type(),
+            vec![
+                p("file", signed_byte_pointer_type()),
+                p("n_entries", typedef_pointer_type("idx_t")),
+                p(
+                    "utmp_buf",
+                    CTypeLike::Pointer(Box::new(typedef_pointer_type("STRUCT_UTMP"))),
+                ),
+                p("options", c_int_type()),
+            ],
+        ),
+        "dopass" => sig(
+            c_int_type(),
+            vec![
+                p("fd", c_int_type()),
+                p("st", typedef_pointer_type("stat")),
+                p("qname", signed_byte_pointer_type()),
+                p("sizep", typedef_pointer_type("off_t")),
+                p("type", c_int_type()),
+                p("s", typedef_pointer_type("randread_source")),
+                p("k", c_ulong_type()),
+                p("n", c_ulong_type()),
+            ],
+        ),
+        "process_field" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("text", signed_byte_pointer_type()),
+                p("field", typedef_type("uintmax_t")),
+            ],
+        ),
+        "debug_print_current_time"
+        | "debug_print_current_time.part.0"
+        | "debug_print_relative_time"
+        | "debug_print_relative_time.part.0" => sig(
+            CTypeLike::Void,
+            vec![
+                p("item", signed_byte_pointer_type()),
+                p("pc", typedef_pointer_type("parser_control")),
+            ],
+        ),
+        "factor_using_pollard_rho" => sig(
+            CTypeLike::Void,
+            vec![
+                p("factors", struct_pointer_type("factors")),
+                p("n", typedef_type("mp_limb_t")),
+                p("a", typedef_type("mp_limb_t")),
+            ],
+        ),
+        "factor_using_pollard_rho2" => sig(
+            CTypeLike::Void,
+            vec![
+                p("factors", struct_pointer_type("factors")),
+                p("n1", typedef_type("mp_limb_t")),
+                p("n0", typedef_type("mp_limb_t")),
+                p("a", typedef_type("mp_limb_t")),
+            ],
+        ),
+        "factor_up" | "factor_up.part.0" | "factor_up.part.0.constprop.0" => sig(
+            CTypeLike::Void,
+            vec![
+                p("factors", struct_pointer_type("factors")),
+                p("t1", typedef_type("mp_limb_t")),
+                p("t0", typedef_type("mp_limb_t")),
+                p("prime_idx", typedef_type("idx_t")),
+            ],
+        ),
+        "mp_factor_using_pollard_rho" => sig(
+            CTypeLike::Void,
+            vec![
+                p("factors", struct_pointer_type("mp_factors")),
+                p("mp", typedef_pointer_type("mp_limb_t")),
+                p("n", typedef_type("mp_size_t")),
+                p("a", typedef_type("mp_limb_t")),
+            ],
+        ),
+        "seq_fast" => sig(
+            CTypeLike::Void,
+            vec![
+                p("a", signed_byte_pointer_type()),
+                p("b", signed_byte_pointer_type()),
+                p("step", typedef_type("uintmax_t")),
+            ],
+        ),
+        "tsort" => sig(CTypeLike::Void, vec![p("file", signed_byte_pointer_type())]),
+        "splice_cat" => sig(c_int_type(), Vec::new()),
+        "mgetgroups" => sig(
+            c_int_type(),
+            vec![
+                p("username", signed_byte_pointer_type()),
+                p("gid", typedef_type("gid_t")),
+                p(
+                    "groups",
+                    CTypeLike::Pointer(Box::new(typedef_pointer_type("gid_t"))),
+                ),
+            ],
+        ),
+        "parse_additional_groups" => sig(
+            c_int_type(),
+            vec![
+                p("groups", signed_byte_pointer_type()),
+                p(
+                    "pgids",
+                    CTypeLike::Pointer(Box::new(typedef_pointer_type("gid_t"))),
+                ),
+                p("pn_gids", typedef_pointer_type("idx_t")),
+                p("show_errors", CTypeLike::Bool),
+            ],
+        ),
+        "parse_tab_stops" => sig(
+            CTypeLike::Void,
+            vec![p("stops", signed_byte_pointer_type())],
+        ),
+        "finalize_tab_stops" | "list_signal_handling" => sig(CTypeLike::Void, Vec::new()),
+        "parse_block_signal_params" => sig(
+            CTypeLike::Void,
+            vec![
+                p("arg", signed_byte_pointer_type()),
+                p("block", CTypeLike::Bool),
+            ],
+        ),
+        "operand2sig" => sig(c_int_type(), vec![p("operand", signed_byte_pointer_type())]),
+        "str2sig" => sig(
+            c_int_type(),
+            vec![
+                p("signame", signed_byte_pointer_type()),
+                p("signum", CTypeLike::Pointer(Box::new(c_int_type()))),
+            ],
+        ),
+        "get_dev" => sig(
+            CTypeLike::Void,
+            vec![
+                p("device", signed_byte_pointer_type()),
+                p("mount_point", signed_byte_pointer_type()),
+                p("file", signed_byte_pointer_type()),
+                p("stat_file", signed_byte_pointer_type()),
+                p("fstype", signed_byte_pointer_type()),
+                p("me_dummy", CTypeLike::Bool),
+                p("me_remote", CTypeLike::Bool),
+                p("force_fsu", struct_pointer_type("fs_usage")),
+                p("process_all", CTypeLike::Bool),
+            ],
+        ),
+        "chdir_long" => sig(c_int_type(), vec![p("dir", signed_byte_pointer_type())]),
+        "append_quoted" => sig(CTypeLike::Void, vec![p("str", signed_byte_pointer_type())]),
+        "append_entry" => sig(
+            CTypeLike::Void,
+            vec![
+                p("prefix", signed_int_type(8)),
+                p("item", signed_byte_pointer_type()),
+                p("arg", signed_byte_pointer_type()),
+            ],
+        ),
+        "writeline" => {
+            let mut params = vec![
+                p("line", typedef_pointer_type("linebuffer")),
+                p("class", c_int_type()),
+            ];
+            if current_param_count > 2 {
+                params[1] = p("match", CTypeLike::Bool);
+                params.push(p("linecount", typedef_type("intmax_t")));
+            }
+            sig(CTypeLike::Void, params)
+        }
         name if is_fileinfo_sort_comparator_role(name) => sig(
             c_int_type(),
             vec![
@@ -936,6 +1305,440 @@ pub fn signature_hint_for_role_name(
                 p("err", signed_byte_pointer_type()),
                 p("err_exit", c_int_type()),
                 p("flags", c_int_type()),
+            ],
+        ),
+        "xnumtoimax" => sig(
+            typedef_type("intmax_t"),
+            vec![
+                p("n_str", signed_byte_pointer_type()),
+                p("base", c_int_type()),
+                p("min", typedef_type("intmax_t")),
+                p("max", typedef_type("intmax_t")),
+                p("suffixes", signed_byte_pointer_type()),
+                p("err", signed_byte_pointer_type()),
+                p("err_exit", c_int_type()),
+                p("flags", c_int_type()),
+            ],
+        ),
+        "xstrtol" => sig(
+            typedef_type("strtol_error"),
+            vec![
+                p("nptr", signed_byte_pointer_type()),
+                p("endptr", signed_byte_pointer_pointer_type()),
+                p("base", c_int_type()),
+                p("val", typedef_pointer_type("long")),
+                p("valid_suffixes", signed_byte_pointer_type()),
+            ],
+        ),
+        "xstrtoul" => sig(
+            typedef_type("strtol_error"),
+            vec![
+                p("nptr", signed_byte_pointer_type()),
+                p("endptr", signed_byte_pointer_pointer_type()),
+                p("base", c_int_type()),
+                p("val", typedef_pointer_type("unsigned long")),
+                p("valid_suffixes", signed_byte_pointer_type()),
+            ],
+        ),
+        "print_files" => sig(
+            CTypeLike::Void,
+            vec![
+                p("number_of_files", c_int_type()),
+                p("av", signed_byte_pointer_pointer_type()),
+            ],
+        ),
+        "squeeze_filter.constprop.0" => sig(
+            CTypeLike::Void,
+            vec![
+                p("buf", signed_byte_pointer_type()),
+                p("size", typedef_type("size_t")),
+            ],
+        ),
+        "squeeze_filter" => sig(
+            CTypeLike::Void,
+            vec![
+                p("buf", signed_byte_pointer_type()),
+                p("size", typedef_type("size_t")),
+                p("reader", CTypeLike::Function),
+            ],
+        ),
+        "bytes_split" => sig(
+            CTypeLike::Void,
+            vec![
+                p("n_bytes", typedef_type("intmax_t")),
+                p("rem_bytes", typedef_type("intmax_t")),
+                p("buf", signed_byte_pointer_type()),
+                p("bufsize", typedef_type("idx_t")),
+                p("initial_read", typedef_type("ssize_t")),
+                p("max_files", typedef_type("intmax_t")),
+            ],
+        ),
+        "ftoastr" => sig(
+            c_int_type(),
+            vec![
+                p("buf", signed_byte_pointer_type()),
+                p("bufsize", typedef_type("size_t")),
+                p("flags", c_int_type()),
+                p("width", c_int_type()),
+                p("x", typedef_type("float")),
+            ],
+        ),
+        "dtoastr" => sig(
+            c_int_type(),
+            vec![
+                p("buf", signed_byte_pointer_type()),
+                p("bufsize", typedef_type("size_t")),
+                p("flags", c_int_type()),
+                p("width", c_int_type()),
+                p("x", typedef_type("double")),
+            ],
+        ),
+        "ldtoastr" => sig(
+            c_int_type(),
+            vec![
+                p("buf", signed_byte_pointer_type()),
+                p("bufsize", typedef_type("size_t")),
+                p("flags", c_int_type()),
+                p("width", c_int_type()),
+                p("x", typedef_type("long double")),
+            ],
+        ),
+        "eval6" => sig(
+            typedef_pointer_type("VALUE"),
+            vec![p("evaluate", CTypeLike::Bool)],
+        ),
+        "settimeout" => sig(
+            CTypeLike::Void,
+            vec![
+                p("duration", typedef_type("double")),
+                p("warn", CTypeLike::Bool),
+            ],
+        ),
+        "sha1_stream" | "md5_stream" | "__md5_stream" => sig(
+            c_int_type(),
+            vec![
+                p("stream", typedef_pointer_type("FILE")),
+                p("resblock", unsigned_byte_pointer_type()),
+            ],
+        ),
+        "sha512_read_ctx" | "sha384_read_ctx" => sig(
+            unsigned_byte_pointer_type(),
+            vec![
+                p("ctx", struct_pointer_type("sha512_ctx")),
+                p("resbuf", unsigned_byte_pointer_type()),
+            ],
+        ),
+        "output_file" => sig(
+            CTypeLike::Void,
+            vec![
+                p("file", signed_byte_pointer_type()),
+                p("binary_file", c_int_type()),
+                p("digest", unsigned_byte_pointer_type()),
+                p("raw", CTypeLike::Bool),
+                p("tagged", CTypeLike::Bool),
+                p(
+                    "delim",
+                    CTypeLike::Int {
+                        bits: 8,
+                        signedness: Signedness::Unsigned,
+                    },
+                ),
+                p("args", CTypeLike::Bool),
+                p("length", typedef_type("intmax_t")),
+            ],
+        ),
+        "add_utmp" => sig(
+            CTypeLike::Struct("utmp_alloc".to_string()),
+            vec![
+                p("a", CTypeLike::Struct("utmp_alloc".to_string())),
+                p("options", c_int_type()),
+                p("user", signed_byte_pointer_type()),
+                p("user_len", typedef_type("idx_t")),
+                p("id", signed_byte_pointer_type()),
+                p("id_len", typedef_type("idx_t")),
+                p("line", signed_byte_pointer_type()),
+                p("line_len", typedef_type("idx_t")),
+                p("host", signed_byte_pointer_type()),
+                p("host_len", typedef_type("idx_t")),
+                p("pid", typedef_type("pid_t")),
+                p("type", typedef_type("short")),
+                p("ts", CTypeLike::Struct("timespec".to_string())),
+                p("session", typedef_type("utmp_session")),
+                p("termination", c_int_type()),
+                p("exit", c_int_type()),
+            ],
+        ),
+        "iopoll_internal" => sig(
+            c_int_type(),
+            vec![
+                p("fdin", c_int_type()),
+                p("fdout", c_int_type()),
+                p("block", CTypeLike::Bool),
+                p("broken_output", CTypeLike::Bool),
+            ],
+        ),
+        "make_dir_parents" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("dir", signed_byte_pointer_type()),
+                p("wd", struct_pointer_type("savewd")),
+                p("make_ancestor", typedef_type("mkdir_ancestor_fn")),
+                p("options", memory_ptr_type()),
+                p("mode", typedef_type("mode_t")),
+                p("announce", typedef_type("mkdir_announce_fn")),
+                p("mode_bits", typedef_type("mode_t")),
+                p("owner", typedef_type("uid_t")),
+                p("group", typedef_type("gid_t")),
+                p("preserve_existing", CTypeLike::Bool),
+            ],
+        ),
+        "savewd_chdir" => sig(
+            c_int_type(),
+            vec![
+                p("wd", struct_pointer_type("savewd")),
+                p("dir", signed_byte_pointer_type()),
+                p("options", c_int_type()),
+                p("open_result", CTypeLike::Pointer(Box::new(c_int_type()))),
+            ],
+        ),
+        "fmt_paragraph" | "next_file_name" | "stdbuf" => sig(CTypeLike::Void, Vec::new()),
+        "get_line" if current_param_count >= 3 => sig(
+            CTypeLike::Bool,
+            vec![
+                p("stream", typedef_pointer_type("FILE")),
+                p(
+                    "linep",
+                    CTypeLike::Pointer(Box::new(struct_pointer_type("line"))),
+                ),
+                p("which", c_int_type()),
+            ],
+        ),
+        "get_line" => sig(
+            c_int_type(),
+            vec![
+                p("stream", typedef_pointer_type("FILE")),
+                p("c", c_int_type()),
+            ],
+        ),
+        "fremote" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("fd", c_int_type()),
+                p("file", struct_pointer_type("File_spec")),
+            ],
+        ),
+        "tail_bytes" | "tail_lines" => sig(
+            typedef_type("off_t"),
+            vec![
+                p("prettyname", signed_byte_pointer_type()),
+                p("fd", c_int_type()),
+                p("st", struct_pointer_type("stat")),
+                p("count", typedef_type("count_t")),
+            ],
+        ),
+        "head_lines" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("filename", signed_byte_pointer_type()),
+                p("fd", c_int_type()),
+                p("lines_to_write", typedef_type("uintmax_t")),
+            ],
+        ),
+        "elide_tail_lines_seekable" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("pretty_filename", signed_byte_pointer_type()),
+                p("fd", c_int_type()),
+                p("n_lines", typedef_type("uintmax_t")),
+                p("start_pos", typedef_type("off_t")),
+                p("size", typedef_type("off_t")),
+            ],
+        ),
+        "recheck" => sig(
+            CTypeLike::Void,
+            vec![
+                p("file", struct_pointer_type("File_spec")),
+                p("blocking", CTypeLike::Bool),
+            ],
+        ),
+        "do_link" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("source", signed_byte_pointer_type()),
+                p("destdir_fd", c_int_type()),
+                p("dest_base", signed_byte_pointer_type()),
+                p("dest", signed_byte_pointer_type()),
+                p("link_errno", c_int_type()),
+            ],
+        ),
+        "create" => sig(c_int_type(), vec![p("name", signed_byte_pointer_type())]),
+        "fread_file" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("stream", typedef_pointer_type("FILE")),
+                p("flags", c_int_type()),
+                p("length", typedef_pointer_type("size_t")),
+            ],
+        ),
+        "do_wipefd" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("fd", c_int_type()),
+                p("qname", signed_byte_pointer_type()),
+                p("source", struct_pointer_type("randint_source")),
+                p("flags", struct_pointer_type("Options")),
+            ],
+        ),
+        "print_entry" => sig(
+            CTypeLike::Void,
+            vec![p("utmp_ent", typedef_pointer_type("struct_utmp"))],
+        ),
+        "print_stuff" => sig(
+            CTypeLike::Void,
+            vec![p("pw_name", signed_byte_pointer_type())],
+        ),
+        "print_stat" | "print_statfs" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("pformat", signed_byte_pointer_type()),
+                p("prefix_len", typedef_type("size_t")),
+                p("mod", signed_int_type(8)),
+                p("m", signed_int_type(8)),
+                p("fd", c_int_type()),
+                p("filename", signed_byte_pointer_type()),
+                p("data", typedef_pointer_type("stat_print_data")),
+            ],
+        ),
+        "print_it" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("format", signed_byte_pointer_type()),
+                p("fd", c_int_type()),
+                p("filename", signed_byte_pointer_type()),
+                p("print_func", typedef_type("stat_print_fn")),
+                p("data", typedef_type("stat_print_data_ref")),
+            ],
+        ),
+        "apply_settings" => sig(
+            CTypeLike::Void,
+            vec![
+                p("checking", CTypeLike::Bool),
+                p("device_name", signed_byte_pointer_type()),
+                p("settings", signed_byte_pointer_pointer_type()),
+                p("n_settings", c_int_type()),
+                p("mode", struct_pointer_type("termios")),
+                p(
+                    "require_set_attr",
+                    CTypeLike::Pointer(Box::new(CTypeLike::Bool)),
+                ),
+            ],
+        ),
+        "apply_mode" => sig(
+            CTypeLike::Void,
+            vec![
+                p("stream", typedef_pointer_type("FILE")),
+                p("stream_name", signed_byte_pointer_type()),
+                p("envvar", signed_byte_pointer_type()),
+            ],
+        ),
+        "baud_to_value" => sig(c_ulong_type(), vec![p("speed", typedef_type("speed_t"))]),
+        "add_field_list" => sig(CTypeLike::Void, vec![p("str", signed_byte_pointer_type())]),
+        "users" => sig(
+            CTypeLike::Void,
+            vec![
+                p("filename", signed_byte_pointer_type()),
+                p("options", c_int_type()),
+            ],
+        ),
+        "cleanup" => {
+            let params = if current_param_count == 0 {
+                Vec::new()
+            } else {
+                vec![p("sig", c_int_type())]
+            };
+            sig(CTypeLike::Void, params)
+        }
+        "prog_fprintf" => sig(
+            CTypeLike::Void,
+            extend_params_to_count(
+                vec![
+                    p("fp", typedef_pointer_type("FILE")),
+                    p("fmt", signed_byte_pointer_type()),
+                ],
+                current_param_count,
+                "value",
+                typedef_type("uintptr_t"),
+            ),
+        ),
+        "write_block" => sig(
+            CTypeLike::Void,
+            vec![
+                p("current_offset", typedef_type("intmax_t")),
+                p("n_bytes", typedef_type("idx_t")),
+                p("prev_block", signed_byte_pointer_type()),
+                p("curr_block", signed_byte_pointer_type()),
+            ],
+        ),
+        "get_next" => sig(
+            c_int_type(),
+            vec![
+                p("spec", struct_pointer_type("Spec_list")),
+                p(
+                    "class",
+                    CTypeLike::Pointer(Box::new(CTypeLike::Enum("Upper_Lower_class".to_string()))),
+                ),
+            ],
+        ),
+        "get_spec_stats" => sig(
+            CTypeLike::Void,
+            vec![p("spec", struct_pointer_type("Spec_list"))],
+        ),
+        "process_line" => sig(
+            c_int_type(),
+            vec![
+                p("line", signed_byte_pointer_type()),
+                p("newline", CTypeLike::Bool),
+            ],
+        ),
+        "ignorable_failure" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("error_number", c_int_type()),
+                p("dir", signed_byte_pointer_type()),
+            ],
+        ),
+        "tee_files" => sig(
+            CTypeLike::Bool,
+            vec![
+                p("nfiles", c_int_type()),
+                p("files", signed_byte_pointer_pointer_type()),
+                p("pipe_check", CTypeLike::Bool),
+            ],
+        ),
+        "errno_iterate" => sig(
+            CTypeLike::Void,
+            vec![
+                p("callback", CTypeLike::Function),
+                p("data", memory_ptr_type()),
+            ],
+        ),
+        "careadlinkat" => sig(
+            signed_byte_pointer_type(),
+            vec![
+                p("fd", c_int_type()),
+                p("filename", signed_byte_pointer_type()),
+                p("buffer", signed_byte_pointer_type()),
+                p("buffer_size", typedef_type("size_t")),
+                p("alloc", struct_pointer_type("allocator")),
+                p("preadlinkat", CTypeLike::Function),
+            ],
+        ),
+        "crc32_update_no_xor_pclmul" => sig(
+            typedef_type("crc32_t"),
+            vec![
+                p("crc", typedef_type("crc32_t")),
+                p("buf", memory_ptr_type()),
+                p("len", typedef_type("size_t")),
             ],
         ),
         "synchronize_output" => sig(c_int_type(), Vec::new()),
@@ -2605,11 +3408,45 @@ pub fn signature_hint_for_role_name(
                 p("bytes_bound", typedef_type("size_t")),
             ],
         ),
+        "randperm_new" => sig(
+            typedef_pointer_type("size_t"),
+            vec![
+                p("r", struct_pointer_type("randint_source")),
+                p("h", typedef_type("size_t")),
+                p("n", typedef_type("size_t")),
+            ],
+        ),
         "wc_lines_avx2" | "wc_lines_avx512" => sig(
             typedef_type("wc_lines"),
             vec![
                 p("buf", signed_byte_pointer_type()),
                 p("len", typedef_type("size_t")),
+            ],
+        ),
+        "readtoken" => sig(
+            typedef_type("size_t"),
+            vec![
+                p("stream", typedef_pointer_type("FILE")),
+                p("delim", signed_byte_pointer_type()),
+                p("n_delim", typedef_type("size_t")),
+                p("tokenbuffer", typedef_pointer_type("token_buffer")),
+            ],
+        ),
+        "readtokens" => sig(
+            typedef_type("size_t"),
+            vec![
+                p("stream", typedef_pointer_type("FILE")),
+                p("projected_n_tokens", typedef_type("size_t")),
+                p("delim", signed_byte_pointer_type()),
+                p("n_delim", typedef_type("size_t")),
+                p(
+                    "tokens_out",
+                    CTypeLike::Pointer(Box::new(signed_byte_pointer_pointer_type())),
+                ),
+                p(
+                    "token_lengths",
+                    CTypeLike::Pointer(Box::new(typedef_pointer_type("size_t"))),
+                ),
             ],
         ),
         "readtokens0" => sig(
@@ -2867,26 +3704,37 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "argmatch_value"
             | "arguments"
             | "backup_type"
+            | "base32_decode_context"
+            | "base64_decode_context"
+            | "base_encode_context"
+            | "bin_tree_t"
+            | "bitset_word_t"
+            | "blake2b_state"
             | "calendar_date"
             | "char32_t"
             | "count_t"
             | "copy_debug"
             | "cp_options"
+            | "crc32_t"
             | "cycle_check_state"
             | "dir_attr"
             | "dir_list"
             | "dir"
+            | "double"
             | "errno_t"
             | "fadvice_t"
             | "fcntl_arg"
             | "file"
             | "fileinfo"
             | "filetype"
+            | "float"
             | "fsword"
+            | "fs_usage"
             | "fstatus"
             | "fts"
             | "ftsent"
             | "fts_compar_fn"
+            | "gid_t"
             | "hash_table"
             | "idx_t"
             | "int"
@@ -2896,6 +3744,7 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "line"
             | "linebuffer"
             | "long"
+            | "long double"
             | "mcel_t"
             | "mbbuf_t"
             | "mbstate_t"
@@ -2905,16 +3754,35 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "merge_node"
             | "merge_node_queue"
             | "mode_t"
+            | "mp_limb_t"
+            | "mp_size_t"
+            | "mkdir_ancestor_fn"
+            | "mkdir_announce_fn"
             | "nproc_query"
             | "obstack"
             | "off_t"
             | "option"
+            | "parser_control"
             | "pid_t"
             | "ptrdiff_t"
             | "printf_directive"
             | "printf_status_t"
+            | "re_dfa_t"
+            | "re_dfastate_t"
+            | "re_match_context_t"
+            | "re_node_set"
+            | "re_pattern_buffer"
+            | "re_registers"
+            | "re_charset_t"
+            | "re_string_t"
+            | "re_token_t"
+            | "reg_errcode_t"
+            | "regex_t"
+            | "regmatch_t"
+            | "reg_syntax_t"
             | "quoting_options"
             | "quoting_style"
+            | "randint_source"
             | "randread_source"
             | "retval_t"
             | "rm_status"
@@ -2922,24 +3790,41 @@ pub fn semantic_typedef_is_authoritative(name: &str) -> bool {
             | "savedir_option"
             | "sbyte_count_t"
             | "selabel_handle"
+            | "sha256_ctx"
+            | "sha512_ctx"
+            | "short"
             | "size_t"
+            | "sm3_ctx"
             | "sortfile"
+            | "speed_t"
+            | "state_array_t"
             | "stat"
+            | "stat_print_data_ref"
+            | "stat_print_data"
+            | "stat_print_fn"
             | "strtol_error"
+            | "struct_utmp"
+            | "ssize_t"
             | "tempname_args"
             | "tempname_tryfunc"
+            | "time_t"
             | "timespec"
             | "tm"
             | "timezone_t"
+            | "token_buffer"
             | "tokens"
             | "uid_t"
+            | "utmp_alloc"
+            | "utmp_session"
             | "unicode_callback_context"
             | "unicode_failure_callback"
             | "unicode_success_callback"
             | "unsigned int"
             | "unsigned long"
+            | "unsigned short"
             | "uintmax_t"
             | "uintptr_t"
+            | "value"
             | "va_list"
             | "wchar_t"
             | "wc_lines"
@@ -3161,6 +4046,7 @@ mod tests {
             "error_at_line",
             "hash_free",
             "randread_new",
+            "randperm_new",
             "num_processors",
             "physmem_claimable",
             "fdutimensat",
@@ -3210,6 +4096,21 @@ mod tests {
             "alloc_ibuf",
             "alloc_obuf",
             "sha256_process_block",
+            "sm3_process_block",
+            "parse_datetime_body",
+            "posixtime",
+            "readtoken",
+            "readtokens",
+            "re_search_internal",
+            "re_compile_internal",
+            "parse_expression",
+            "build_trtable",
+            "update_cur_sifted_state",
+            "transit_state_bkref",
+            "build_charclass",
+            "check_arrival",
+            "peek_token",
+            "build_wcs_upper_buffer",
             "xstrcoll_df_version",
             "rev_strcmp_df_mtime",
         ] {
@@ -3236,13 +4137,261 @@ mod tests {
     }
 
     #[test]
+    fn registry_projects_coreutils_tail_quality_roles() {
+        let print_files =
+            signature_hint_for_role_name("print_files", 0).expect("expected print_files signature");
+        assert_eq!(print_files.ret_type, Some(CTypeLike::Void));
+        assert_eq!(print_files.params[0].ty, Some(c_int_type()));
+        assert_eq!(
+            print_files.params[1].ty,
+            Some(signed_byte_pointer_pointer_type())
+        );
+
+        let squeeze = signature_hint_for_role_name("squeeze_filter.constprop.0", 0)
+            .expect("expected squeeze_filter constprop signature");
+        assert_eq!(squeeze.ret_type, Some(CTypeLike::Void));
+        assert_eq!(squeeze.params.len(), 2);
+        assert_eq!(squeeze.params[1].ty, Some(typedef_type("size_t")));
+
+        let xnum =
+            signature_hint_for_role_name("xnumtoimax", 0).expect("expected xnumtoimax signature");
+        assert_eq!(xnum.ret_type, Some(typedef_type("intmax_t")));
+        assert_eq!(xnum.params[1].ty, Some(c_int_type()));
+
+        let dtoa = signature_hint_for_role_name("ldtoastr", 0).expect("expected ldtoastr");
+        assert_eq!(dtoa.ret_type, Some(c_int_type()));
+        assert_eq!(dtoa.params[4].ty, Some(typedef_type("long double")));
+
+        let digest_stream =
+            signature_hint_for_role_name("sha384_read_ctx", 0).expect("expected sha384");
+        assert_eq!(digest_stream.ret_type, Some(unsigned_byte_pointer_type()));
+        assert_eq!(
+            digest_stream.params[0].ty,
+            Some(struct_pointer_type("sha512_ctx"))
+        );
+
+        let output = signature_hint_for_role_name("output_file", 0).expect("expected output_file");
+        assert_eq!(output.ret_type, Some(CTypeLike::Void));
+        assert_eq!(output.params[2].ty, Some(unsigned_byte_pointer_type()));
+        assert_eq!(output.params[7].ty, Some(typedef_type("intmax_t")));
+
+        let join_get_line =
+            signature_hint_for_role_name("get_line", 3).expect("expected join get_line");
+        assert_eq!(join_get_line.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(
+            join_get_line.params[1].ty,
+            Some(CTypeLike::Pointer(Box::new(struct_pointer_type("line"))))
+        );
+
+        let baud = signature_hint_for_role_name("baud_to_value", 0).expect("expected baud");
+        assert_eq!(baud.ret_type, Some(c_ulong_type()));
+        assert_eq!(baud.params[0].ty, Some(typedef_type("speed_t")));
+
+        let mkdir =
+            signature_hint_for_role_name("make_dir_parents", 0).expect("expected mkdir parents");
+        assert_eq!(mkdir.params[2].ty, Some(typedef_type("mkdir_ancestor_fn")));
+        assert_eq!(mkdir.params[5].ty, Some(typedef_type("mkdir_announce_fn")));
+
+        let add_utmp = signature_hint_for_role_name("add_utmp", 0).expect("expected add_utmp");
+        assert_eq!(add_utmp.params[13].ty, Some(typedef_type("utmp_session")));
+
+        let print_it = signature_hint_for_role_name("print_it", 0).expect("expected print_it");
+        assert_eq!(print_it.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(print_it.params[3].ty, Some(typedef_type("stat_print_fn")));
+        assert_eq!(
+            print_it.params[4].ty,
+            Some(typedef_type("stat_print_data_ref"))
+        );
+    }
+
+    #[test]
     fn registry_covers_coreutils_mf100_gap_signatures() {
         let sha = signature_hint_for_name_candidates(["sym.sha256_process_block"], 0)
             .expect("sha256 signature");
         assert_eq!(sha.ret_type, Some(CTypeLike::Void));
         assert_eq!(sha.params[0].name, "buffer");
+        assert_eq!(sha.params[0].ty, Some(memory_ptr_type()));
         assert_eq!(sha.params[1].ty, Some(typedef_type("size_t")));
         assert_eq!(sha.params[2].ty, Some(typedef_pointer_type("sha256_ctx")));
+
+        let sm3 = signature_hint_for_name_candidates(["sym.sm3_process_block"], 0)
+            .expect("sm3 signature");
+        assert_eq!(sm3.ret_type, Some(CTypeLike::Void));
+        assert_eq!(sm3.params[0].ty, Some(memory_ptr_type()));
+        assert_eq!(sm3.params[1].ty, Some(typedef_type("size_t")));
+        assert_eq!(sm3.params[2].ty, Some(typedef_pointer_type("sm3_ctx")));
+
+        let datetime = signature_hint_for_name_candidates(["dbg.parse_datetime_body"], 0)
+            .expect("parse_datetime_body signature");
+        assert_eq!(datetime.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(datetime.params[0].ty, Some(struct_pointer_type("timespec")));
+        assert_eq!(datetime.params[3].ty, Some(c_uint_type()));
+        assert_eq!(datetime.params[4].ty, Some(typedef_type("timezone_t")));
+
+        let posixtime =
+            signature_hint_for_name_candidates(["dbg.posixtime"], 0).expect("posixtime signature");
+        assert_eq!(posixtime.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(posixtime.params[0].ty, Some(typedef_pointer_type("time_t")));
+        assert_eq!(posixtime.params[2].ty, Some(c_uint_type()));
+
+        let randperm = signature_hint_for_name_candidates(["dbg.randperm_new"], 0)
+            .expect("randperm_new signature");
+        assert_eq!(randperm.ret_type, Some(typedef_pointer_type("size_t")));
+        assert_eq!(
+            randperm.params[0].ty,
+            Some(struct_pointer_type("randint_source"))
+        );
+        assert_eq!(randperm.params[1].ty, Some(typedef_type("size_t")));
+
+        let readtoken =
+            signature_hint_for_name_candidates(["dbg.readtoken"], 0).expect("readtoken signature");
+        assert_eq!(readtoken.ret_type, Some(typedef_type("size_t")));
+        assert_eq!(readtoken.params[0].ty, Some(typedef_pointer_type("FILE")));
+        assert_eq!(
+            readtoken.params[3].ty,
+            Some(typedef_pointer_type("token_buffer"))
+        );
+
+        let readtokens = signature_hint_for_name_candidates(["dbg.readtokens"], 0)
+            .expect("readtokens signature");
+        assert_eq!(readtokens.ret_type, Some(typedef_type("size_t")));
+        assert_eq!(readtokens.params[1].ty, Some(typedef_type("size_t")));
+        assert_eq!(
+            readtokens.params[4].ty,
+            Some(CTypeLike::Pointer(Box::new(
+                signed_byte_pointer_pointer_type()
+            )))
+        );
+
+        let blake = signature_hint_for_name_candidates(["sym.blake2b_compress"], 0)
+            .expect("blake2b signature");
+        assert_eq!(blake.ret_type, Some(CTypeLike::Void));
+        assert_eq!(
+            blake.params[0].ty,
+            Some(typedef_pointer_type("blake2b_state"))
+        );
+        assert_eq!(blake.params[1].ty, Some(unsigned_byte_pointer_type()));
+
+        let reconstruct = signature_hint_for_name_candidates(["dbg.re_string_reconstruct"], 0)
+            .expect("regex reconstruct signature");
+        assert_eq!(reconstruct.ret_type, Some(typedef_type("reg_errcode_t")));
+        assert_eq!(
+            reconstruct.params[0].ty,
+            Some(typedef_pointer_type("re_string_t"))
+        );
+
+        let search = signature_hint_for_name_candidates(["dbg.re_search_internal"], 0)
+            .expect("regex search signature");
+        assert_eq!(search.ret_type, Some(typedef_type("reg_errcode_t")));
+        assert_eq!(search.params[0].ty, Some(typedef_pointer_type("regex_t")));
+        assert_eq!(search.params[2].ty, Some(typedef_type("idx_t")));
+        assert_eq!(search.params.len(), 9);
+
+        let compile = signature_hint_for_name_candidates(["dbg.re_compile_internal"], 0)
+            .expect("regex compile signature");
+        assert_eq!(compile.ret_type, Some(typedef_type("reg_errcode_t")));
+        assert_eq!(compile.params[3].ty, Some(typedef_type("reg_syntax_t")));
+
+        let expr = signature_hint_for_name_candidates(["dbg.parse_expression"], 0)
+            .expect("regex expression parser signature");
+        assert_eq!(expr.ret_type, Some(typedef_pointer_type("bin_tree_t")));
+        assert_eq!(expr.params[1].ty, Some(typedef_pointer_type("regex_t")));
+
+        let trtable = signature_hint_for_name_candidates(["dbg.build_trtable"], 0)
+            .expect("regex transition table signature");
+        assert_eq!(trtable.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(
+            trtable.params[1].ty,
+            Some(typedef_pointer_type("re_dfastate_t"))
+        );
+
+        let charclass = signature_hint_for_name_candidates(["dbg.build_charclass"], 0)
+            .expect("regex charclass signature");
+        assert_eq!(charclass.params.len(), 6);
+        assert_eq!(
+            charclass.params[2].ty,
+            Some(typedef_pointer_type("re_charset_t"))
+        );
+
+        let sift = signature_hint_for_name_candidates(["dbg.update_cur_sifted_state"], 0)
+            .expect("regex sift signature");
+        assert_eq!(sift.ret_type, Some(typedef_type("reg_errcode_t")));
+        assert_eq!(
+            sift.params[0].ty,
+            Some(typedef_pointer_type("re_match_context_t"))
+        );
+        assert_eq!(sift.params[2].ty, Some(typedef_type("idx_t")));
+
+        let arrival = signature_hint_for_name_candidates(["dbg.check_arrival"], 0)
+            .expect("regex arrival signature");
+        assert_eq!(
+            arrival.params[1].ty,
+            Some(typedef_pointer_type("state_array_t"))
+        );
+        assert_eq!(arrival.params[2].ty, Some(typedef_type("idx_t")));
+        assert_eq!(arrival.params.len(), 7);
+
+        let parser =
+            signature_hint_for_name_candidates(["dbg.yyparse"], 0).expect("yyparse signature");
+        assert_eq!(parser.ret_type, Some(c_int_type()));
+        assert_eq!(
+            parser.params[0].ty,
+            Some(typedef_pointer_type("parser_control"))
+        );
+
+        let install = signature_hint_for_name_candidates(["dbg.install_file_in_file"], 0)
+            .expect("install_file_in_file signature");
+        assert_eq!(install.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(
+            install.params[4].ty,
+            Some(typedef_pointer_type("cp_options"))
+        );
+
+        let chown =
+            signature_hint_for_name_candidates(["dbg.chown_files"], 0).expect("chown_files");
+        assert_eq!(chown.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(chown.params[3].ty, Some(typedef_type("gid_t")));
+
+        let read_utmp =
+            signature_hint_for_name_candidates(["dbg.read_utmp"], 0).expect("read_utmp");
+        assert_eq!(read_utmp.ret_type, Some(c_int_type()));
+        assert_eq!(read_utmp.params[1].ty, Some(typedef_pointer_type("idx_t")));
+
+        let dopass = signature_hint_for_name_candidates(["dbg.dopass"], 0).expect("dopass");
+        assert_eq!(dopass.ret_type, Some(c_int_type()));
+        assert_eq!(dopass.params[3].ty, Some(typedef_pointer_type("off_t")));
+
+        let factor = signature_hint_for_name_candidates(["sym.factor_up.part.0.constprop.0"], 0)
+            .expect("factor_up signature");
+        assert_eq!(factor.ret_type, Some(CTypeLike::Void));
+        assert_eq!(factor.params[1].ty, Some(typedef_type("mp_limb_t")));
+
+        let seq = signature_hint_for_name_candidates(["dbg.seq_fast"], 0).expect("seq_fast");
+        assert_eq!(seq.ret_type, Some(CTypeLike::Void));
+        assert_eq!(seq.params[2].ty, Some(typedef_type("uintmax_t")));
+
+        let base32 =
+            signature_hint_for_name_candidates(["dbg.base32_encode"], 0).expect("base32_encode");
+        assert_eq!(base32.ret_type, Some(CTypeLike::Void));
+        assert_eq!(base32.params[1].ty, Some(typedef_type("idx_t")));
+
+        let base64 = signature_hint_for_name_candidates(["dbg.base64_decode_ctx"], 0)
+            .expect("base64_decode_ctx");
+        assert_eq!(base64.ret_type, Some(CTypeLike::Bool));
+        assert_eq!(base64.params[4].ty, Some(typedef_pointer_type("idx_t")));
+
+        let signals =
+            signature_hint_for_name_candidates(["dbg.str2sig"], 0).expect("str2sig signature");
+        assert_eq!(signals.ret_type, Some(c_int_type()));
+        assert_eq!(
+            signals.params[1].ty,
+            Some(CTypeLike::Pointer(Box::new(c_int_type())))
+        );
+
+        let lines =
+            signature_hint_for_name_candidates(["dbg.writeline"], 3).expect("writeline signature");
+        assert_eq!(lines.ret_type, Some(CTypeLike::Void));
+        assert_eq!(lines.params[2].ty, Some(typedef_type("intmax_t")));
 
         let prefix = signature_hint_for_name_candidates(["dbg.file_prefixlen"], 0)
             .expect("file_prefixlen signature");
@@ -4016,17 +5165,41 @@ mod tests {
     fn registry_owns_authoritative_typedef_policy() {
         assert!(semantic_typedef_is_authoritative("allocation_ptr"));
         assert!(semantic_typedef_is_authoritative("argmatch_value"));
+        assert!(semantic_typedef_is_authoritative("bin_tree_t"));
+        assert!(semantic_typedef_is_authoritative("bitset_word_t"));
         assert!(semantic_typedef_is_authoritative("calendar_date"));
+        assert!(semantic_typedef_is_authoritative("blake2b_state"));
         assert!(semantic_typedef_is_authoritative("cycle_check_state"));
         assert!(semantic_typedef_is_authoritative("DIR"));
         assert!(semantic_typedef_is_authoritative("FTS"));
         assert!(semantic_typedef_is_authoritative("_Bool"));
         assert!(semantic_typedef_is_authoritative("fcntl_arg"));
+        assert!(semantic_typedef_is_authoritative("gid_t"));
         assert!(semantic_typedef_is_authoritative("long"));
         assert!(semantic_typedef_is_authoritative("memory_ptr"));
         assert!(semantic_typedef_is_authoritative("mode_t"));
+        assert!(semantic_typedef_is_authoritative("mkdir_ancestor_fn"));
+        assert!(semantic_typedef_is_authoritative("mkdir_announce_fn"));
         assert!(semantic_typedef_is_authoritative("md5_ctx"));
+        assert!(semantic_typedef_is_authoritative("mp_limb_t"));
+        assert!(semantic_typedef_is_authoritative("parser_control"));
         assert!(semantic_typedef_is_authoritative("ptrdiff_t"));
+        assert!(semantic_typedef_is_authoritative("re_dfa_t"));
+        assert!(semantic_typedef_is_authoritative("re_dfastate_t"));
+        assert!(semantic_typedef_is_authoritative("re_match_context_t"));
+        assert!(semantic_typedef_is_authoritative("re_node_set"));
+        assert!(semantic_typedef_is_authoritative("re_pattern_buffer"));
+        assert!(semantic_typedef_is_authoritative("re_registers"));
+        assert!(semantic_typedef_is_authoritative("re_charset_t"));
+        assert!(semantic_typedef_is_authoritative("reg_errcode_t"));
+        assert!(semantic_typedef_is_authoritative("regex_t"));
+        assert!(semantic_typedef_is_authoritative("regmatch_t"));
+        assert!(semantic_typedef_is_authoritative("re_string_t"));
+        assert!(semantic_typedef_is_authoritative("re_token_t"));
+        assert!(semantic_typedef_is_authoritative("reg_syntax_t"));
+        assert!(semantic_typedef_is_authoritative("state_array_t"));
+        assert!(semantic_typedef_is_authoritative("stat_print_data_ref"));
+        assert!(semantic_typedef_is_authoritative("stat_print_fn"));
         assert!(semantic_typedef_is_authoritative("wchar_t"));
         assert!(semantic_typedef_is_authoritative("wint_transform"));
         assert!(semantic_typedef_is_authoritative("quoting_options"));
@@ -4037,14 +5210,21 @@ mod tests {
         assert!(semantic_typedef_is_authoritative("mcel_t"));
         assert!(semantic_typedef_is_authoritative("nproc_query"));
         assert!(semantic_typedef_is_authoritative("randread_source"));
+        assert!(semantic_typedef_is_authoritative("sha256_ctx"));
+        assert!(semantic_typedef_is_authoritative("sha512_ctx"));
+        assert!(semantic_typedef_is_authoritative("sm3_ctx"));
+        assert!(semantic_typedef_is_authoritative("speed_t"));
         assert!(semantic_typedef_is_authoritative("timezone_t"));
         assert!(semantic_typedef_is_authoritative("uid_t"));
+        assert!(semantic_typedef_is_authoritative("utmp_alloc"));
+        assert!(semantic_typedef_is_authoritative("utmp_session"));
         assert!(semantic_typedef_is_authoritative(
             "unicode_success_callback"
         ));
         assert!(semantic_typedef_is_authoritative("wc_lines"));
         assert!(semantic_typedef_is_authoritative("unsigned int"));
         assert!(semantic_typedef_is_authoritative("unsigned long"));
+        assert!(semantic_typedef_is_authoritative("unsigned short"));
         assert!(semantic_typedef_is_authoritative("xtime_t"));
         assert!(semantic_typedef_is_authoritative("tempname_args"));
         assert!(semantic_typedef_is_authoritative("tempname_tryfunc"));

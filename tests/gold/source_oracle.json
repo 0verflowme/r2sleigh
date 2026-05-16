@@ -1,0 +1,297 @@
+{
+  "schema": 1,
+  "expectations": [
+    {
+      "id": "repo-vuln-struct-array-index",
+      "corpus": ["repo-fixtures", "manual"],
+      "case": "vuln_test_x86",
+      "target": "test_struct_array_index",
+      "command": "decompile_sla",
+      "owner": "r2types",
+      "contains": [
+        "arr[idx].third",
+        "arr[idx].fourteenth + arr[idx].third"
+      ],
+      "regex": [
+        "DemoStruct\\s*\\*\\s*arr"
+      ],
+      "not_contains": [
+        "sla_struct_",
+        "*(arr +",
+        "[idx].f_8",
+        "[idx].f_34"
+      ]
+    },
+    {
+      "id": "manual-mem-scan2-types-preserve-source-size",
+      "corpus": "manual",
+      "case": "r2sleigh_manual_limits_O2",
+      "target": "mem_scan2",
+      "command": "types",
+      "owner": "r2types",
+      "contains": [
+        "\"ret_type\":\"size_t\"",
+        "\"name\":\"n\",\"type\":\"size_t\""
+      ],
+      "not_contains": [
+        "\"ret_type\":\"uint8_t\"",
+        "\"name\":\"n\",\"type\":\"uint8_t\""
+      ]
+    },
+    {
+      "id": "manual-mem-scan2-decompile-no-empty-loop",
+      "corpus": "manual",
+      "case": "r2sleigh_manual_limits_O2",
+      "target": "mem_scan2",
+      "command": "decompile_sla",
+      "owner": "r2dec",
+      "contains": [
+        "size_t mem_scan2(uint8_t* buf, size_t n, uint8_t a, uint8_t b)",
+        "r2dec summary: semantic worker",
+        "size_t count = 0;",
+        "for (size_t i = 0; i < n; i++)",
+        "unsigned char c = buf[i];",
+        "if (c == a || c == b)",
+        "return count;"
+      ],
+      "not_contains": [
+        "r2dec residual: unproven loop effects",
+        "uint8_t mem_scan2",
+        "do {\n    } while",
+        "return r8d_1;",
+        "count_matching_bytes_summary",
+        "summary-backed count loop",
+        "match_count"
+      ]
+    },
+    {
+      "id": "manual-fnv-fold-decompile-no-constant-return",
+      "corpus": "manual",
+      "case": "r2sleigh_manual_limits_O2",
+      "target": "fnv_fold",
+      "command": "decompile_sla",
+      "owner": "r2dec",
+      "contains": [
+        "uint64_t fnv_fold(uint8_t* buf, size_t n)",
+        "r2dec summary: semantic worker",
+        "for (size_t i = 0; i < n; i++)",
+        "hash ^= c;",
+        "return hash;"
+      ],
+      "not_contains": [
+        "r2dec residual: unproven loop effects",
+        "return 0x14650fb0739d0383;",
+        "return fnv1a_hash;",
+        "fold_summary",
+        "summary return unresolved"
+      ]
+    },
+    {
+      "id": "manual-out-param-parse-summary-backed",
+      "corpus": "manual",
+      "case": "r2sleigh_manual_limits_O2",
+      "target": "out_param_parse",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "int32_t out_param_parse(int8_t* s, Result* out)",
+        "r2dec summary: semantic worker islands",
+        "worker summary: parser: dst=out mem=s",
+        "worker summary: memory_write: mem=out"
+      ],
+      "not_contains": [
+        "r2dec residual: unproven loop effects",
+        "do {\n    } while"
+      ]
+    },
+    {
+      "id": "manual-table-walk-summary-backed",
+      "corpus": "manual",
+      "case": "r2sleigh_manual_limits_O2",
+      "target": "table_walk",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "int32_t table_walk(Item* head, int8_t* needle)",
+        "r2dec summary: semantic worker islands",
+        "worker summary: table_walk: mem=head",
+        "worker summary: string_scan: mem=needle"
+      ],
+      "not_contains": [
+        "r2dec residual: unproven loop effects",
+        "return table_match_score;"
+      ]
+    },
+    {
+      "id": "manual-struct-nested-array-source-shape",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "struct_nested_array",
+      "command": "decompile_sla",
+      "owner": "r2types",
+      "contains": [
+        "Item* items",
+        "items[idx].scores[2]",
+        "items[idx].flags",
+        "items[idx].id",
+        "items[idx].len"
+      ],
+      "not_contains": [
+        "f_",
+        "t6a80",
+        "edx_",
+        "it = items + it",
+        "RCX"
+      ]
+    },
+    {
+      "id": "manual-sparse-switch-source-cases",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "sparse_switch",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "return a - b;",
+        "return a + b;",
+        "return a * 3 + b;",
+        "return (a ^ b) + 42;",
+        "return b == 0 ? -1 : a / b;",
+        "return op + a - b;"
+      ],
+      "not_contains": [
+        "RCX",
+        "compute_numeric_transform",
+        "summary return: Unknown",
+        "return accumulator;",
+        "t49900",
+        "t49a00"
+      ]
+    },
+    {
+      "id": "manual-fnv-fold-source-loop",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "fnv_fold",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "for (size_t i = 0; i < n; i++)",
+        "unsigned char c = buf[i];",
+        "c = (unsigned char)(c + 32);",
+        "hash ^= c;",
+        "hash *= 1099511628211",
+        "return hash;"
+      ],
+      "not_contains": [
+        "return fnv1a_hash;",
+        "fold_summary",
+        "summary return unresolved"
+      ]
+    },
+    {
+      "id": "manual-out-param-parse-source-fields",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "out_param_parse",
+      "command": "decompile_sla",
+      "owner": "r2types",
+      "contains": [
+        "out->code",
+        "out->hash",
+        "out->count",
+        "out->hit",
+        "return i > 0 && s[i] == 0;"
+      ],
+      "not_contains": [
+        "summary return unresolved",
+        "parse_base10_numeric_summary",
+        "compute_numeric_transform"
+      ]
+    },
+    {
+      "id": "manual-table-walk-source-loop",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "table_walk",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "for (Item* it = head; it != NULL; it = it->next)",
+        "it->name",
+        "it->len",
+        "it->id + seen",
+        "return -seen;"
+      ],
+      "not_contains": [
+        "summary return unresolved",
+        "walk_table_summary",
+        "return table_match_score;"
+      ]
+    },
+    {
+      "id": "manual-state-machine-no-pseudo-source",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "state_machine",
+      "command": "decompile_sla",
+      "owner": "r2dec",
+      "contains": [
+        "int32_t state_machine",
+        "summary return unresolved"
+      ],
+      "not_contains": [
+        "scan_string_summary",
+        "compute_numeric_transform",
+        "return accumulator;"
+      ]
+    },
+    {
+      "id": "manual-state-machine-source-control",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "state_machine",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "for (size_t i = 0; s[i] != 0; i++)",
+        "switch (state)",
+        "case 0:",
+        "state = 1;",
+        "score += 3;",
+        "return -100 - (int32_t)i;",
+        "return score + state;"
+      ],
+      "not_contains": [
+        "summary return unresolved",
+        "summary island",
+        "numeric_transform",
+        "string_scan"
+      ]
+    },
+    {
+      "id": "manual-mem-scan2-source-loop",
+      "corpus": "manual",
+      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "target": "mem_scan2",
+      "command": "decompile_sla",
+      "owner": "r2dec",
+      "contains": [
+        "size_t mem_scan2(uint8_t* buf, size_t n, uint8_t a, uint8_t b)",
+        "size_t count = 0;",
+        "for (size_t i = 0; i < n; i++)",
+        "unsigned char c = buf[i];",
+        "if (c == a || c == b)",
+        "count++;",
+        "return count;"
+      ],
+      "not_contains": [
+        "summary-backed count loop",
+        "summary_i <",
+        "size_t summary_i",
+        "match_count",
+        "summary return unresolved"
+      ]
+    }
+  ]
+}

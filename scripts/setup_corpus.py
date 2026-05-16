@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_ROOT = Path("/tmp/r2sleigh-corpora")
 DEFAULT_MANIFEST = "manifest.json"
 GNU_COREUTILS_INDEX = "https://ftp.gnu.org/gnu/coreutils/"
@@ -253,6 +253,31 @@ def skip_entry(corpus: str, reason: str) -> dict[str, str]:
     return {"corpus": corpus, "reason": reason}
 
 
+def corpus_availability(
+    tiers: list[str], binaries: list[dict[str, Any]], skips: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    out = []
+    for tier in tiers:
+        tier_binaries = [
+            item for item in binaries if str(item.get("corpus") or "") == tier
+        ]
+        tier_skips = sorted(
+            str(item.get("reason") or "")
+            for item in skips
+            if str(item.get("corpus") or "") == tier
+        )
+        status = "available" if tier_binaries else "skipped" if tier_skips else "planned"
+        out.append(
+            {
+                "corpus": tier,
+                "status": status,
+                "binary_count": len(tier_binaries),
+                "skip_reasons": tier_skips,
+            }
+        )
+    return out
+
+
 def build_coreutils(
     root: Path,
     version: str,
@@ -423,6 +448,7 @@ def manifest_payload(
         "schema": SCHEMA_VERSION,
         "root": str(root) if include_sensitive else redacted_path(root),
         "tiers": tiers,
+        "availability": corpus_availability(tiers, binaries_sorted, skips_sorted),
         "binaries": binaries_sorted,
         "skips": skips_sorted,
         "steps": steps,

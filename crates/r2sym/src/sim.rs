@@ -1932,67 +1932,7 @@ fn normalize_core_summary_name(name: &str) -> Option<&'static str> {
         "usleep" => Some("usleep"),
         "nanosleep" => Some("nanosleep"),
         "exit" | "_exit" => Some("exit"),
-        _ => {
-            if normalized.starts_with("strlen") {
-                Some("strlen")
-            } else if normalized.starts_with("strcmp") {
-                Some("strcmp")
-            } else if normalized.starts_with("memcmp") {
-                Some("memcmp")
-            } else if normalized.starts_with("memcpy") {
-                Some("memcpy")
-            } else if normalized.starts_with("copyin") {
-                Some("copyin")
-            } else if normalized.starts_with("copyout") {
-                Some("copyout")
-            } else if normalized.starts_with("memset") {
-                Some("memset")
-            } else if normalized.starts_with("printf") || normalized == "__printf_chk" {
-                Some("printf")
-            } else if normalized.starts_with("read") {
-                Some("read")
-            } else if normalized.starts_with("isatty") {
-                Some("isatty")
-            } else if normalized == "sleep" || normalized.ends_with("sleep") {
-                Some("sleep")
-            } else if normalized.starts_with("usleep") {
-                Some("usleep")
-            } else if normalized.starts_with("nanosleep") {
-                Some("nanosleep")
-            } else if normalized.starts_with("puts") {
-                Some("puts")
-            } else if normalized == "malloc"
-                || normalized.ends_with("malloc")
-                || normalized.starts_with("kalloc")
-                || normalized.starts_with("zalloc")
-            {
-                Some("malloc")
-            } else if normalized == "free"
-                || normalized.ends_with("free")
-                || normalized.starts_with("kfree")
-            {
-                Some("free")
-            } else if normalized.contains("retain") {
-                Some("retain")
-            } else if normalized.contains("release") {
-                Some("release")
-            } else if (normalized.starts_with("lck_") && normalized.contains("unlock"))
-                || normalized.starts_with("os_unfair_lock_unlock")
-                || normalized.ends_with("_unlock")
-            {
-                Some("unlock")
-            } else if normalized.starts_with("lck_")
-                || normalized.starts_with("os_unfair_lock_lock")
-                || normalized.ends_with("_lock")
-                || normalized.contains("_lock_")
-            {
-                Some("lock")
-            } else if normalized.starts_with("exit") {
-                Some("exit")
-            } else {
-                None
-            }
-        }
+        _ => None,
     }
 }
 
@@ -2917,9 +2857,9 @@ mod tests {
         let cases = [
             ("sym._copyin", Some("copyin")),
             ("sym._copyout", Some("copyout")),
-            ("sym._IOMalloc", Some("malloc")),
-            ("sym._kalloc_type_impl", Some("malloc")),
-            ("sym._IOFree", Some("free")),
+            ("sym._IOMalloc", None),
+            ("sym._kalloc_type_impl", None),
+            ("sym._IOFree", None),
             ("sym._os_ref_retain", Some("retain")),
             ("sym._os_ref_release", Some("release")),
             ("sym._lck_mtx_lock", Some("lock")),

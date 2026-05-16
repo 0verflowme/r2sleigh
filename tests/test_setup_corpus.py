@@ -55,6 +55,17 @@ class SetupCorpusTests(unittest.TestCase):
         self.assertEqual(first["tiers"], ["coreutils"])
         self.assertEqual(len(first["binaries"]), len(setup_corpus.GNU_COREUTILS_PRIORITY))
         self.assertEqual(first["skips"], [])
+        self.assertEqual(
+            first["availability"],
+            [
+                {
+                    "corpus": "coreutils",
+                    "status": "available",
+                    "binary_count": len(setup_corpus.GNU_COREUTILS_PRIORITY),
+                    "skip_reasons": [],
+                }
+            ],
+        )
 
     def test_secondary_tier_skips_without_large_downloads(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,9 +92,34 @@ class SetupCorpusTests(unittest.TestCase):
             binary.chmod(0o755)
 
             binaries, skips = setup_corpus.current_manifest(root, ["coreutils", "juliet"], False)
+            payload = setup_corpus.manifest_payload(
+                root,
+                ["coreutils", "juliet"],
+                binaries,
+                skips,
+                [],
+                False,
+            )
 
         self.assertEqual([item["name"] for item in binaries], ["ls"])
         self.assertEqual(skips, [{"corpus": "juliet", "reason": "no local binaries found"}])
+        self.assertEqual(
+            payload["availability"],
+            [
+                {
+                    "corpus": "coreutils",
+                    "status": "available",
+                    "binary_count": 1,
+                    "skip_reasons": [],
+                },
+                {
+                    "corpus": "juliet",
+                    "status": "skipped",
+                    "binary_count": 0,
+                    "skip_reasons": ["no local binaries found"],
+                },
+            ],
+        )
 
     def test_clean_refuses_non_default_root_without_force(self):
         with tempfile.TemporaryDirectory() as tmp:

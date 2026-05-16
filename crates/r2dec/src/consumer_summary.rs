@@ -136,6 +136,12 @@ pub(crate) fn render_for_route(
                 native.summary.worker_summaries.len()
             )));
             for summary in native.summary.worker_summaries.iter().take(6) {
+                let predicated_count_stmts =
+                    crate::predicated_count_loop_stmts(summary, function_facts);
+                if let Some(stmts) = predicated_count_stmts {
+                    body.extend(stmts);
+                    continue;
+                }
                 if let Some(stmt) = crate::native_worker_summary_structured_stmt(summary) {
                     body.push(stmt);
                 }
@@ -268,6 +274,11 @@ fn semantic_worker_summary_function(
                 },
             })
             .collect();
+    }
+    for (idx, param) in params.iter_mut().enumerate() {
+        if crate::is_generic_arg_name(&param.name) || param.name.trim().is_empty() {
+            param.name = format!("summary_input{}", idx + 1);
+        }
     }
 
     CFunction {

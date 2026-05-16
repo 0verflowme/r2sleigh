@@ -5109,7 +5109,7 @@ mod tests {
             [
                 (
                     "arg1".to_string(),
-                    CType::ptr(CType::Struct("demo_layout".to_string())),
+                    CType::ptr(CType::Typedef("DemoLayout".to_string())),
                 ),
                 ("arg2".to_string(), CType::Int(32)),
             ]
@@ -5118,9 +5118,9 @@ mod tests {
         );
         ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
             structs: [(
-                "demo_layout".to_string(),
+                "demolayout".to_string(),
                 ExternalStruct {
-                    name: "demo_layout".to_string(),
+                    name: "DemoLayout".to_string(),
                     fields: [
                         (
                             8,
@@ -5169,6 +5169,49 @@ mod tests {
         assert!(
             rendered_text.contains("third") && rendered_text.contains("arg1"),
             "expected layout-backed field render rooted at arg1, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_typedef_aggregate_without_layout_renders_observed_field_placeholders() {
+        let base = make_var("X0", 0, 8);
+        let addr = make_var("tmp:6400", 3, 8);
+
+        let mut ctx = make_aarch64_ctx();
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+            [("x0".to_string(), "obj".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        ctx.set_type_hints(
+            [(
+                "obj".to_string(),
+                CType::ptr(CType::Typedef("DemoStruct".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        ctx.state.analysis_ctx.use_info.semantic_values.insert(
+            addr.display_name(),
+            crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
+                base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(base)),
+                index: None,
+                scale_bytes: 0,
+                offset_bytes: 0x30,
+            }),
+        );
+
+        let mut visited = HashSet::new();
+        let rendered = ctx
+            .render_memory_access_by_name(&addr.display_name(), 4, 0, &mut visited)
+            .expect("typedef-backed aggregate access should render");
+
+        assert_eq!(
+            rendered,
+            CExpr::PtrMember {
+                base: Box::new(CExpr::Var("obj".to_string())),
+                member: "f_30".to_string()
+            }
         );
     }
 

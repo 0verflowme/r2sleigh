@@ -960,31 +960,7 @@ fn normalize_signature_registry_name(name: &str) -> Option<&'static str> {
         "puts" => Some("puts"),
         "printf" | "__printf_chk" => Some("printf"),
         "exit" | "_exit" => Some("exit"),
-        _ => {
-            if normalized.starts_with("strlen") {
-                Some("strlen")
-            } else if normalized.starts_with("strcmp") {
-                Some("strcmp")
-            } else if normalized.starts_with("memcmp") {
-                Some("memcmp")
-            } else if normalized.starts_with("memcpy") {
-                Some("memcpy")
-            } else if normalized.starts_with("memset") {
-                Some("memset")
-            } else if normalized.starts_with("printf") || normalized == "__printf_chk" {
-                Some("printf")
-            } else if normalized.starts_with("puts") {
-                Some("puts")
-            } else if normalized == "malloc" || normalized.ends_with("malloc") {
-                Some("malloc")
-            } else if normalized == "free" || normalized.ends_with("free") {
-                Some("free")
-            } else if normalized.starts_with("exit") {
-                Some("exit")
-            } else {
-                None
-            }
-        }
+        _ => None,
     }
 }
 

@@ -503,6 +503,14 @@ There are two different block types in `r2ssa`:
 | `../radare2/libr/include/r_anal.h` | changing typed collector APIs used by the plugin |
 | `tests/r2r/db/extras/` | adding or updating regression snapshots |
 
+## Benchmark Triage
+
+Use `scripts/reversing_benchmark.py --closure-gate` when a corpus run is meant
+to prove closure rather than just gather signal. The report includes owner
+buckets for `../radare2`, `r2ssa`, `r2sym`, `r2types`, `r2engine`, `r2dec`, and
+plugin glue; treat those buckets as triage hints, then verify the canonical
+owner before editing.
+
 ## Gotchas
 
 1. x86/x86-64 lifting still expects 16 bytes minimum.

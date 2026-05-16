@@ -424,6 +424,7 @@ impl FunctionTypeFacts {
             && self.external_type_db.structs.is_empty()
             && self.external_type_db.unions.is_empty()
             && self.external_type_db.enums.is_empty()
+            && self.external_type_db.typedefs.is_empty()
             && self.external_type_db.diagnostics.is_empty()
             && self.slot_type_overrides.is_empty()
             && self.slot_field_profiles.is_empty()
@@ -597,6 +598,11 @@ pub fn signature_hint_can_replace_existing(
         (CTypeLike::Pointer(inner), CTypeLike::Pointer(new_inner)) => {
             matches!(inner.as_ref(), CTypeLike::Void | CTypeLike::Unknown)
                 && !matches!(new_inner.as_ref(), CTypeLike::Void | CTypeLike::Unknown)
+                || signature_hint_can_replace_existing(
+                    inner.as_ref(),
+                    Some(new_inner.as_ref()),
+                    ptr_bits,
+                )
                 || (matches!(
                     (inner.as_ref(), new_inner.as_ref()),
                     (
@@ -1460,6 +1466,39 @@ mod tests {
                 bits: 8,
                 signedness: Signedness::Signed,
             }))
+        );
+    }
+
+    #[test]
+    fn strong_summary_projection_upgrades_nested_storage_pointers_to_typedefs() {
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(test_typedef("size_t")),
+                params: vec![test_param(
+                    "token_lengths",
+                    test_ptr(test_ptr(CTypeLike::Int {
+                        bits: 64,
+                        signedness: Signedness::Unsigned,
+                    })),
+                )],
+            }),
+            ..FunctionTypeFacts::default()
+        };
+        let projection = FunctionSignatureProjection::strong_summary(FunctionSignatureSpec {
+            ret_type: Some(test_typedef("size_t")),
+            params: vec![test_param(
+                "token_lengths",
+                test_ptr(test_ptr(test_typedef("size_t"))),
+            )],
+        });
+
+        let result = facts.apply_signature_projection("dbg.readtokens", projection, 64);
+        let signature = facts.merged_signature.expect("signature");
+
+        assert!(result.was_applied());
+        assert_eq!(
+            signature.params[0].ty,
+            Some(test_ptr(test_ptr(test_typedef("size_t"))))
         );
     }
 

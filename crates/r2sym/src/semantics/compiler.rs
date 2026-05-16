@@ -164,7 +164,13 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
         super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, summary);
     let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
     let named_worker_family = has_named_worker_family(&worker_summaries);
-    if worker_summaries.len() < SUMMARY_DENSE_WORKER_ISLAND_MIN && !named_worker_family {
+    let direct_named_worker = summary.name.as_deref().is_some_and(|name| {
+        super::native_worker::native_worker_summary_route_policy_for_name(func.entry, name)
+            .should_use_direct_summary()
+    });
+    if worker_summaries.len() < SUMMARY_DENSE_WORKER_ISLAND_MIN
+        && !(named_worker_family && direct_named_worker)
+    {
         return None;
     }
 
@@ -172,7 +178,7 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
     if cfg.loop_count == 0
         && cfg.back_edge_count == 0
         && cfg.block_count <= 64
-        && !named_worker_family
+        && !(named_worker_family && direct_named_worker)
     {
         return None;
     }
@@ -304,9 +310,15 @@ pub fn compile_native_worker_summary_artifact(
         .sum::<usize>();
     let cheap_native_worker_classification =
         !skipped_large_cfg || (cfg_summary.block_count <= 64 && op_count <= 256);
-    if !has_primary_interproc_summary && cheap_native_worker_classification {
-        worker_summaries
-            .extend(super::native_worker::classify_function_worker_summaries_unbounded(func));
+    if cheap_native_worker_classification {
+        if has_primary_interproc_summary {
+            worker_summaries.extend(
+                super::native_worker::classify_function_worker_enrichment_summaries_unbounded(func),
+            );
+        } else {
+            worker_summaries
+                .extend(super::native_worker::classify_function_worker_summaries_unbounded(func));
+        }
     }
     let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
     let named_worker_family = has_named_worker_family(&worker_summaries);

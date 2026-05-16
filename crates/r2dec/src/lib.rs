@@ -38,6 +38,7 @@ pub(crate) mod consumer_structured;
 pub(crate) mod consumer_summary;
 pub(crate) mod consumer_vm;
 pub mod fold;
+pub mod highlight;
 pub(crate) mod normalize;
 pub(crate) mod planner;
 pub(crate) mod post_rename;
@@ -49,6 +50,7 @@ pub mod variable;
 pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
 pub use codegen::{CodeGenConfig, CodeGenerator, generate};
 pub use fold::lower_ssa_ops_to_stmts;
+pub use highlight::highlight_c_ansi;
 pub use planner::SemanticRoutePlan;
 pub use region::{Region, RegionAnalyzer};
 pub use structure::ControlFlowStructurer;
@@ -483,6 +485,25 @@ fn native_worker_fold_operation_label(operation: r2sym::NativeWorkerFoldOperatio
     }
 }
 
+fn native_worker_predicate_label(predicate: &r2sym::NativeWorkerPredicate) -> String {
+    match predicate {
+        r2sym::NativeWorkerPredicate::ByteEqArg { arg } => format!("byte == arg{arg}"),
+        r2sym::NativeWorkerPredicate::ByteEqConst { value } => {
+            format!("byte == 0x{value:02x}")
+        }
+        r2sym::NativeWorkerPredicate::AnyOf(predicates) => predicates
+            .iter()
+            .map(native_worker_predicate_label)
+            .collect::<Vec<_>>()
+            .join(" || "),
+        r2sym::NativeWorkerPredicate::AllOf(predicates) => predicates
+            .iter()
+            .map(native_worker_predicate_label)
+            .collect::<Vec<_>>()
+            .join(" && "),
+    }
+}
+
 fn native_parser_summary_label(parser: &r2sym::NativeParserSummary) -> String {
     match parser.kind {
         r2sym::NativeParserKind::Numeric => parser
@@ -521,6 +542,12 @@ fn native_worker_loop_detail(loop_summary: &r2sym::NativeWorkerLoopSummary) -> S
             summary_accumulator_label(&fold.accumulator),
             fold.bits
         ));
+        if let Some(predicate) = fold.predicate.as_ref() {
+            parts.push(format!(
+                "predicate={}",
+                native_worker_predicate_label(predicate)
+            ));
+        }
     }
     parts.join(" ")
 }
@@ -601,6 +628,38 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             Some(format!("merge sorted records from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::NumericTransform => {
+            if let Some(fold) = summary
+                .loop_summary
+                .as_ref()
+                .and_then(|loop_summary| loop_summary.fold.as_ref())
+            {
+                let accumulator = summary_accumulator_label(&fold.accumulator);
+                let memory = summary
+                    .memory
+                    .as_ref()
+                    .map(summary_memory_location_label)
+                    .unwrap_or_else(|| "summary_input".to_string());
+                let length = summary_worker_length(summary)
+                    .map(summary_transfer_length_label)
+                    .unwrap_or_else(|| "unknown length".to_string());
+                if let Some(predicate) = fold.predicate.as_ref() {
+                    return Some(format!(
+                        "{} count over {} where {} into {} ({})",
+                        native_worker_fold_operation_label(fold.operation),
+                        memory,
+                        native_worker_predicate_label(predicate),
+                        accumulator,
+                        length
+                    ));
+                }
+                return Some(format!(
+                    "{} fold over {} into {} ({})",
+                    native_worker_fold_operation_label(fold.operation),
+                    memory,
+                    accumulator,
+                    length
+                ));
+            }
             let dst = summary
                 .dst
                 .as_ref()
@@ -701,6 +760,116 @@ fn summary_location_expr(location: &r2ssa::SummaryMemoryLocation) -> CExpr {
     CExpr::var(summary_memory_location_ident(location))
 }
 
+fn predicated_count_loop_stmts(
+    summary: &r2sym::NativeWorkerSummary,
+    function_facts: &FunctionFacts,
+) -> Option<Vec<CStmt>> {
+    if summary.kind != r2sym::NativeWorkerSummaryKind::NumericTransform || summary.dst.is_some() {
+        return None;
+    }
+    let fold = summary
+        .loop_summary
+        .as_ref()
+        .and_then(|loop_summary| loop_summary.fold.as_ref())?;
+    if fold.operation != r2sym::NativeWorkerFoldOperation::Add {
+        return None;
+    }
+    let predicate = fold.predicate.as_ref()?;
+    let memory = summary.memory.as_ref().map(summary_location_expr)?;
+    let length = summary_transfer_length_expr(summary_worker_length(summary))?;
+    let accumulator = "count".to_string();
+    let index = "i".to_string();
+    let byte_name = "c".to_string();
+    let byte = CExpr::var(byte_name.clone());
+    let cond = native_worker_predicate_expr(&byte, predicate)?;
+    let accumulator_ty = function_facts
+        .types
+        .merged_signature
+        .as_ref()
+        .and_then(|signature| signature.ret_type.as_ref())
+        .map(type_like_to_ctype)
+        .filter(|ty| !matches!(ty, CType::Void | CType::Unknown))
+        .unwrap_or_else(|| {
+            if fold.bits <= 32 {
+                CType::u32()
+            } else {
+                CType::u64()
+            }
+        });
+    Some(vec![
+        CStmt::Decl {
+            ty: accumulator_ty,
+            name: accumulator.clone(),
+            init: Some(CExpr::int(0)),
+        },
+        CStmt::For {
+            init: Some(Box::new(CStmt::Decl {
+                ty: CType::Typedef("size_t".to_string()),
+                name: index.clone(),
+                init: Some(CExpr::int(0)),
+            })),
+            cond: Some(CExpr::binary(
+                BinaryOp::Lt,
+                CExpr::var(index.clone()),
+                length,
+            )),
+            update: Some(CExpr::unary(UnaryOp::PostInc, CExpr::var(index.clone()))),
+            body: Box::new(CStmt::Block(vec![
+                CStmt::Decl {
+                    ty: CType::Typedef("unsigned char".to_string()),
+                    name: byte_name,
+                    init: Some(CExpr::subscript(memory, CExpr::var(index.clone()))),
+                },
+                CStmt::If {
+                    cond,
+                    then_body: Box::new(CStmt::Block(vec![CStmt::Expr(CExpr::unary(
+                        UnaryOp::PostInc,
+                        CExpr::var(accumulator.clone()),
+                    ))])),
+                    else_body: None,
+                },
+            ])),
+        },
+        CStmt::Return(Some(CExpr::var(accumulator))),
+    ])
+}
+
+fn native_worker_predicate_expr(
+    byte: &CExpr,
+    predicate: &r2sym::NativeWorkerPredicate,
+) -> Option<CExpr> {
+    match predicate {
+        r2sym::NativeWorkerPredicate::ByteEqArg { arg } => Some(CExpr::binary(
+            BinaryOp::Eq,
+            byte.clone(),
+            CExpr::var(format!("arg{arg}")),
+        )),
+        r2sym::NativeWorkerPredicate::ByteEqConst { value } => Some(CExpr::binary(
+            BinaryOp::Eq,
+            byte.clone(),
+            CExpr::uint(u64::from(*value)),
+        )),
+        r2sym::NativeWorkerPredicate::AnyOf(predicates) => {
+            combine_native_worker_predicates(byte, predicates, BinaryOp::Or)
+        }
+        r2sym::NativeWorkerPredicate::AllOf(predicates) => {
+            combine_native_worker_predicates(byte, predicates, BinaryOp::And)
+        }
+    }
+}
+
+fn combine_native_worker_predicates(
+    byte: &CExpr,
+    predicates: &[r2sym::NativeWorkerPredicate],
+    op: BinaryOp,
+) -> Option<CExpr> {
+    let mut iter = predicates
+        .iter()
+        .filter_map(|predicate| native_worker_predicate_expr(byte, predicate));
+    let first = iter.next()?;
+    Some(iter.fold(first, |left, right| CExpr::binary(op, left, right)))
+}
+
 fn summary_worker_length(
     summary: &r2sym::NativeWorkerSummary,
 ) -> Option<r2ssa::SummaryTransferLength> {
@@ -711,22 +880,6 @@ fn summary_worker_length(
                 .map(r2ssa::SummaryTransferLength::Arg)
         })
     })
-}
-
-fn native_region_summary_length(
-    summary: &r2sym::NativeRegionSummary,
-) -> Option<r2ssa::SummaryTransferLength> {
-    summary
-        .memory_accesses
-        .iter()
-        .find_map(|access| access.len)
-        .or_else(|| {
-            summary.loop_summary.as_ref().and_then(|loop_summary| {
-                loop_summary
-                    .length_arg
-                    .map(r2ssa::SummaryTransferLength::Arg)
-            })
-        })
 }
 
 fn semantic_evidence_allows_structured_rendering(evidence: &r2sym::SemanticEvidence) -> bool {
@@ -865,36 +1018,8 @@ fn native_worker_summary_structured_stmt(summary: &r2sym::NativeWorkerSummary) -
                 vec![CExpr::var(memory)],
             )))
         }
-        r2sym::NativeWorkerSummaryKind::NumericTransform => {
-            let dst = summary
-                .dst
-                .as_ref()
-                .map(summary_location_expr)
-                .unwrap_or_else(|| CExpr::var("result"));
-            Some(CStmt::Expr(CExpr::call(
-                CExpr::var("compute_numeric_transform"),
-                vec![dst],
-            )))
-        }
-        r2sym::NativeWorkerSummaryKind::HashFold => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_ident)?;
-            let fold = summary.loop_summary.as_ref()?.fold.as_ref()?;
-            let accumulator = summary_accumulator_label(&fold.accumulator);
-            Some(CStmt::Expr(CExpr::assign(
-                CExpr::var(accumulator.clone()),
-                CExpr::call(
-                    CExpr::var(format!(
-                        "{}_fold_summary",
-                        native_worker_fold_operation_label(fold.operation)
-                    )),
-                    vec![
-                        CExpr::var(accumulator),
-                        CExpr::var(memory),
-                        summary_transfer_length_expr(summary_worker_length(summary))?,
-                    ],
-                ),
-            )))
-        }
+        r2sym::NativeWorkerSummaryKind::NumericTransform
+        | r2sym::NativeWorkerSummaryKind::HashFold => None,
         r2sym::NativeWorkerSummaryKind::Parser => {
             let parser = summary
                 .parser
@@ -977,19 +1102,6 @@ fn native_worker_summary_structured_stmt(summary: &r2sym::NativeWorkerSummary) -
     }
 }
 
-fn native_region_summary_memory_ident(
-    summary: &r2sym::NativeRegionSummary,
-    fallback: &str,
-) -> String {
-    summary
-        .memory_accesses
-        .iter()
-        .filter_map(|access| access.location.as_ref())
-        .next()
-        .map(summary_memory_location_ident)
-        .unwrap_or_else(|| fallback.to_string())
-}
-
 fn native_region_summary_memory_expr(
     summary: &r2sym::NativeRegionSummary,
     fallback: &str,
@@ -1043,21 +1155,7 @@ fn native_region_summary_structured_stmt(summary: &r2sym::NativeRegionSummary) -
                 vec![src, dst, summary_transfer_length_expr(len)?],
             )))
         }
-        r2sym::NativeWorkerSummaryKind::StringScan => {
-            let memory = native_region_summary_memory_ident(summary, "string");
-            Some(CStmt::Expr(CExpr::call(
-                CExpr::var("scan_string_summary"),
-                vec![
-                    CExpr::var(memory),
-                    native_worker_terminator_expr(
-                        summary
-                            .loop_summary
-                            .as_ref()
-                            .and_then(|loop_summary| loop_summary.terminator),
-                    ),
-                ],
-            )))
-        }
+        r2sym::NativeWorkerSummaryKind::StringScan => None,
         r2sym::NativeWorkerSummaryKind::PathWalk => {
             let memory = native_region_summary_memory_expr(summary, "path");
             Some(CStmt::Expr(CExpr::call(
@@ -1074,8 +1172,7 @@ fn native_region_summary_structured_stmt(summary: &r2sym::NativeRegionSummary) -
         }
         r2sym::NativeWorkerSummaryKind::RecordStream
         | r2sym::NativeWorkerSummaryKind::FieldSelection
-        | r2sym::NativeWorkerSummaryKind::SortMerge
-        | r2sym::NativeWorkerSummaryKind::NumericTransform => {
+        | r2sym::NativeWorkerSummaryKind::SortMerge => {
             let memory = native_region_summary_memory_expr(
                 summary,
                 native_worker_summary_kind_label(summary.kind),
@@ -1084,11 +1181,11 @@ fn native_region_summary_structured_stmt(summary: &r2sym::NativeRegionSummary) -
                 r2sym::NativeWorkerSummaryKind::RecordStream => "read_records_summary",
                 r2sym::NativeWorkerSummaryKind::FieldSelection => "select_fields_summary",
                 r2sym::NativeWorkerSummaryKind::SortMerge => "merge_sorted_records_summary",
-                r2sym::NativeWorkerSummaryKind::NumericTransform => "compute_numeric_transform",
                 _ => unreachable!(),
             };
             Some(CStmt::Expr(CExpr::call(CExpr::var(callee), vec![memory])))
         }
+        r2sym::NativeWorkerSummaryKind::NumericTransform => None,
         r2sym::NativeWorkerSummaryKind::OutputStream
         | r2sym::NativeWorkerSummaryKind::FormatRender
         | r2sym::NativeWorkerSummaryKind::MetadataProbe => {
@@ -1107,41 +1204,7 @@ fn native_region_summary_structured_stmt(summary: &r2sym::NativeRegionSummary) -
             };
             Some(CStmt::Expr(CExpr::call(CExpr::var(callee), vec![memory])))
         }
-        r2sym::NativeWorkerSummaryKind::HashFold => {
-            let reduction = summary.reductions.first()?;
-            let source = reduction
-                .source
-                .as_ref()
-                .map(summary_memory_location_ident)
-                .unwrap_or_else(|| "fold_source".to_string());
-            let accumulator = summary_accumulator_label(&reduction.accumulator);
-            Some(CStmt::Expr(CExpr::assign(
-                CExpr::var(accumulator.clone()),
-                CExpr::call(
-                    CExpr::var(format!(
-                        "{}_fold_summary",
-                        native_worker_fold_operation_label(reduction.operation)
-                    )),
-                    vec![
-                        CExpr::var(accumulator),
-                        CExpr::var(source),
-                        summary_transfer_length_expr(native_region_summary_length(summary))?,
-                    ],
-                ),
-            )))
-        }
-        r2sym::NativeWorkerSummaryKind::Parser => {
-            let parser = summary
-                .parser
-                .as_ref()
-                .map(native_parser_summary_label)
-                .unwrap_or_else(|| "token".to_string());
-            let memory = native_region_summary_memory_expr(summary, "parser_stream");
-            Some(CStmt::Expr(CExpr::call(
-                CExpr::var(format!("parse_{}_summary", sanitize_worker_ident(&parser))),
-                vec![memory],
-            )))
-        }
+        r2sym::NativeWorkerSummaryKind::HashFold | r2sym::NativeWorkerSummaryKind::Parser => None,
         r2sym::NativeWorkerSummaryKind::DiagnosticWrapper => {
             let fmt = summary
                 .memory_accesses
@@ -1617,6 +1680,101 @@ fn append_semantic_summary_return_to_function_if_needed(
     }
 }
 
+fn looped_standard_output_residual_reason(
+    func: &CFunction,
+    cfg_summary: &r2ssa::CFGRiskSummary,
+) -> Option<String> {
+    if cfg_summary.loop_count == 0 && cfg_summary.back_edge_count == 0 {
+        return None;
+    }
+    if func.body.iter().any(stmt_has_empty_loop_body) {
+        return Some("unproven loop effects: empty loop body rendered".to_string());
+    }
+    if !func.body.iter().any(stmt_contains_loop_construct) {
+        return Some(
+            "unproven loop effects: looped CFG rendered without loop structure".to_string(),
+        );
+    }
+    None
+}
+
+fn residual_function_for_unproven_loop(mut func: CFunction, reason: String) -> CFunction {
+    func.locals.clear();
+    func.body = vec![CStmt::comment(format!(
+        "r2dec residual: {}; structured C suppressed until canonical loop facts prove the effects",
+        sanitize_comment_text(&reason)
+    ))];
+    if !matches!(func.ret_type, CType::Void | CType::Unknown) {
+        func.body.push(CStmt::comment(
+            "summary return unresolved; value intentionally not reconstructed".to_string(),
+        ));
+    }
+    func
+}
+
+fn stmt_contains_loop_construct(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::While { .. } | CStmt::DoWhile { .. } | CStmt::For { .. } => true,
+        CStmt::Block(stmts) => stmts.iter().any(stmt_contains_loop_construct),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            stmt_contains_loop_construct(then_body)
+                || else_body
+                    .as_deref()
+                    .is_some_and(stmt_contains_loop_construct)
+        }
+        CStmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|case| case.body.iter().any(stmt_contains_loop_construct))
+                || default
+                    .as_ref()
+                    .is_some_and(|body| body.iter().any(stmt_contains_loop_construct))
+        }
+        _ => false,
+    }
+}
+
+fn stmt_has_empty_loop_body(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            !stmt_has_loop_body_content(body) || stmt_has_empty_loop_body(body)
+        }
+        CStmt::For { body, .. } => {
+            !stmt_has_loop_body_content(body) || stmt_has_empty_loop_body(body)
+        }
+        CStmt::Block(stmts) => stmts.iter().any(stmt_has_empty_loop_body),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            stmt_has_empty_loop_body(then_body)
+                || else_body.as_deref().is_some_and(stmt_has_empty_loop_body)
+        }
+        CStmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|case| case.body.iter().any(stmt_has_empty_loop_body))
+                || default
+                    .as_ref()
+                    .is_some_and(|body| body.iter().any(stmt_has_empty_loop_body))
+        }
+        _ => false,
+    }
+}
+
+fn stmt_has_loop_body_content(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::Empty | CStmt::Comment(_) => false,
+        CStmt::Block(stmts) => stmts.iter().any(stmt_has_loop_body_content),
+        _ => true,
+    }
+}
+
 fn summary_non_void_return_type(
     function_facts: &FunctionFacts,
     _semantic_artifact: &r2sym::SemanticArtifact,
@@ -1702,20 +1860,39 @@ fn summary_return_arg_name(function_facts: &FunctionFacts, index: usize) -> Stri
 }
 
 fn rewrite_summary_arg_labels(output: String, type_facts: &FunctionTypeFacts) -> String {
-    let Some(signature) = type_facts.merged_signature.as_ref() else {
-        return output;
-    };
     let mut replacements: Vec<Option<String>> = Vec::new();
-    for (idx, param) in signature.params.iter().enumerate() {
-        let name = param.name.trim();
-        if name.is_empty() || is_generic_arg_name(name) {
-            continue;
+    let extra_index_base;
+    if let Some(signature) = type_facts.merged_signature.as_ref() {
+        extra_index_base = 0usize;
+        for (idx, param) in signature.params.iter().enumerate() {
+            let name = param.name.trim();
+            if name.is_empty() || is_generic_arg_name(name) {
+                continue;
+            }
+            if replacements.len() <= idx {
+                replacements.resize(idx + 1, None);
+            }
+            replacements[idx] = Some(name.to_string());
         }
-        if replacements.len() <= idx {
-            replacements.resize(idx + 1, None);
-        }
-        replacements[idx] = Some(name.to_string());
+    } else if !type_facts.register_params.is_empty() {
+        extra_index_base = 1usize;
+        replacements = type_facts
+            .register_params
+            .iter()
+            .enumerate()
+            .map(|(idx, param)| {
+                let name = param.name.trim();
+                if name.is_empty() || is_generic_arg_name(name) {
+                    Some(format!("summary_input{}", idx + 1))
+                } else {
+                    Some(name.to_string())
+                }
+            })
+            .collect();
+    } else {
+        return output;
     }
+
     let bytes = output.as_bytes();
     let mut rewritten = String::with_capacity(output.len());
     let mut copied = 0usize;
@@ -1737,9 +1914,7 @@ fn rewrite_summary_arg_labels(output: String, type_facts: &FunctionTypeFacts) ->
                     .get(index)
                     .and_then(Option::as_ref)
                     .cloned()
-                    .or_else(|| {
-                        (index >= signature.params.len()).then(|| format!("summary_input{index}"))
-                    });
+                    .or_else(|| Some(format!("summary_input{}", index + extra_index_base)));
                 if let Some(name) = replacement {
                     rewritten.push_str(&output[copied..cursor]);
                     rewritten.push_str(&name);
@@ -3205,6 +3380,12 @@ impl Decompiler {
         rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
         prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
         prune_unused_pure_locals(&mut c_function);
+        if matches!(semantic_route, planner::SemanticRoutePlan::Standard)
+            && let Some(reason) =
+                looped_standard_output_residual_reason(&c_function, &func.cfg_risk_summary())
+        {
+            c_function = residual_function_for_unproven_loop(c_function, reason);
+        }
 
         c_function
     }
@@ -4334,6 +4515,69 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn loop_cfg_summary() -> r2ssa::CFGRiskSummary {
+        r2ssa::CFGRiskSummary {
+            block_count: 4,
+            loop_count: 1,
+            back_edge_count: 1,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        }
+    }
+
+    #[test]
+    fn looped_standard_output_refuses_loop_cfg_without_rendered_loop_structure() {
+        let func = CFunction::new("loop_fold", CType::u64()).with_body(vec![CStmt::Return(Some(
+            CExpr::UIntLit(0x14650fb0739d0383),
+        ))]);
+
+        let reason = looped_standard_output_residual_reason(&func, &loop_cfg_summary())
+            .expect("looped CFG without a loop construct must refuse structured output");
+        assert!(reason.contains("without loop structure"), "{reason}");
+
+        let residual = residual_function_for_unproven_loop(func, reason);
+        assert!(residual.locals.is_empty());
+        assert!(residual.body.iter().any(|stmt| matches!(
+            stmt,
+            CStmt::Comment(text) if text.contains("r2dec residual")
+        )));
+        assert!(residual.body.iter().any(|stmt| matches!(
+            stmt,
+            CStmt::Comment(text) if text.contains("summary return unresolved")
+        )));
+    }
+
+    #[test]
+    fn looped_standard_output_refuses_empty_loop_body() {
+        let func =
+            CFunction::new("mem_scan2", CType::Typedef("size_t".to_string())).with_body(vec![
+                CStmt::DoWhile {
+                    body: Box::new(CStmt::block(vec![CStmt::comment("dropped loop effects")])),
+                    cond: CExpr::var("cond"),
+                },
+            ]);
+
+        let reason = looped_standard_output_residual_reason(&func, &loop_cfg_summary())
+            .expect("empty/comment-only loop body must refuse structured output");
+        assert!(reason.contains("empty loop body"), "{reason}");
+    }
+
+    #[test]
+    fn looped_standard_output_accepts_nonempty_rendered_loop() {
+        let func = CFunction::new("count", CType::u64()).with_body(vec![CStmt::while_loop(
+            CExpr::var("cond"),
+            CStmt::block(vec![CStmt::expr(CExpr::assign(
+                CExpr::var("acc"),
+                CExpr::binary(BinaryOp::Add, CExpr::var("acc"), CExpr::uint(1)),
+            ))]),
+        )]);
+
+        assert_eq!(
+            looped_standard_output_residual_reason(&func, &loop_cfg_summary()),
+            None
+        );
     }
 
     fn arg_memory_term(
@@ -7255,6 +7499,76 @@ mod tests {
     }
 
     #[test]
+    fn semantic_worker_summary_sanitizes_generic_header_register_params() {
+        let mut semantic_artifact =
+            large_cfg_worker_artifact(r2sym::RefinementStage::Compiled, Vec::new(), Vec::new());
+        semantic_artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
+        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401020,
+                kind: r2sym::NativeWorkerSummaryKind::TableWalk,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        let function_facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                register_params: vec![
+                    ExternalRegisterParamSpec {
+                        name: "arg1".to_string(),
+                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        reg: "rdi".to_string(),
+                    },
+                    ExternalRegisterParamSpec {
+                        name: "arg2".to_string(),
+                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        reg: "rsi".to_string(),
+                    },
+                ],
+                ..FunctionTypeFacts::default()
+            },
+            Some(semantic_artifact),
+        );
+        let output = render_semantic_worker_summary(
+            "fcn.00004129",
+            &function_facts,
+            &SemanticRoutePlan::SummaryIslands {
+                reason: "named native-worker summary projection".to_string(),
+            },
+            DecompilerConfig::default(),
+        )
+        .expect("worker summary should render");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(
+            header.contains("summary_input1") && header.contains("summary_input2"),
+            "expected summary header to avoid generic arg labels, got:\n{output}"
+        );
+        assert!(
+            !header.contains(" arg1") && !header.contains(" arg2"),
+            "summary-only headers must not leak generic arg labels, got:\n{output}"
+        );
+    }
+
+    #[test]
     fn semantic_worker_summary_renders_file_and_fts_worker_families() {
         let mut semantic_artifact =
             large_cfg_worker_artifact(r2sym::RefinementStage::Compiled, Vec::new(), Vec::new());
@@ -7656,7 +7970,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_worker_summary_renders_length_bounded_hash_fold() {
+    fn semantic_worker_summary_reports_length_bounded_hash_fold_without_fake_code() {
         let mut semantic_artifact = large_cfg_worker_artifact(
             r2sym::RefinementStage::Residual,
             vec![r2sym::ResidualReason::LargeCfg],
@@ -7701,6 +8015,7 @@ mod tests {
                         accumulator: "md5_state".to_string(),
                         bits: 32,
                         operation: r2sym::NativeWorkerFoldOperation::RotateMix,
+                        predicate: None,
                     }),
                 }),
                 evidence: r2sym::SemanticEvidence::likely(
@@ -7719,14 +8034,104 @@ mod tests {
         )
         .expect("hash summary should render");
 
-        assert!(
-            output.contains("md5_state = rotate_mix_fold_summary(md5_state, arg0, arg1);"),
-            "expected bounded fold summary call, got:\n{output}"
-        );
+        assert!(!output.contains("rotate_mix_fold_summary"));
+        assert!(!output.contains("return md5_state;"));
         assert!(!output.contains("_fold_active"));
         assert!(output.contains("worker loop: rotate_mix fold over arg0[0..0;w=1] into md5_state"));
         assert!(output.contains("len=arg1"));
         assert!(output.contains("fold=rotate_mix/md5_state:32"));
+    }
+
+    #[test]
+    fn semantic_worker_summary_renders_predicated_byte_count_return() {
+        let mut semantic_artifact = large_cfg_worker_artifact(
+            r2sym::RefinementStage::Residual,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401050,
+                kind: r2sym::NativeWorkerSummaryKind::NumericTransform,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: Some(r2ssa::SummaryMemoryRange {
+                        offset_lo: 0,
+                        offset_hi: 0,
+                        width: Some(1),
+                    }),
+                }),
+                len: Some(r2ssa::SummaryTransferLength::Arg(1)),
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: Some(r2sym::NativeWorkerLoopSummary {
+                    header: 0x401050,
+                    exit_target: Some(0x401090),
+                    iterations: None,
+                    length_arg: Some(1),
+                    stride: Some(1),
+                    terminator: Some(r2sym::NativeWorkerTerminator::LengthBound),
+                    fold: Some(r2sym::NativeWorkerFold {
+                        accumulator: "match_count".to_string(),
+                        bits: 64,
+                        operation: r2sym::NativeWorkerFoldOperation::Add,
+                        predicate: Some(r2sym::NativeWorkerPredicate::AnyOf(vec![
+                            r2sym::NativeWorkerPredicate::ByteEqArg { arg: 2 },
+                            r2sym::NativeWorkerPredicate::ByteEqArg { arg: 3 },
+                        ])),
+                    }),
+                }),
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        let function_facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(signature_spec(
+                    Some(CType::Typedef("size_t".to_string())),
+                    vec![
+                        ("buf", Some(CType::Pointer(Box::new(CType::UInt(8))))),
+                        ("n", Some(CType::Typedef("size_t".to_string()))),
+                        ("a", Some(CType::UInt(8))),
+                        ("b", Some(CType::UInt(8))),
+                    ],
+                )),
+                ..FunctionTypeFacts::default()
+            },
+            Some(semantic_artifact),
+        );
+        let output = render_semantic_worker_summary(
+            "mem_scan2",
+            &function_facts,
+            &SemanticRoutePlan::SummaryIslands {
+                reason: "named native-worker summary projection".to_string(),
+            },
+            DecompilerConfig::default(),
+        )
+        .expect("predicated byte-count summary should render");
+
+        assert!(output.contains("size_t count = 0;"));
+        assert!(output.contains("for (size_t i = 0; i < n; i++)"));
+        assert!(output.contains("unsigned char c = buf[i];"));
+        assert!(output.contains("if (c == a || c == b)"));
+        assert!(output.contains("count++;"));
+        assert!(output.contains("return count;"));
+        assert!(!output.contains("summary-backed count loop"));
+        assert!(!output.contains("size_t summary_i"));
+        assert!(!output.contains("summary_i <"));
+        assert!(!output.contains("match_count"));
+        assert!(!output.contains("count_matching_bytes_summary"));
+        assert!(!output.contains("add_fold_summary"));
     }
 
     #[test]
@@ -8055,19 +8460,15 @@ mod tests {
         .expect("summary island output");
 
         assert!(output.contains("native summary islands: 2"));
-        assert!(
-            output.contains("scan_string_summary(arg0, 0);"),
-            "expected source-like region scan summary call, got:\n{output}"
-        );
-        assert!(
-            output.contains("accumulator = add_fold_summary(accumulator, arg0, 8U);"),
-            "expected raw temporary accumulator to be rendered as a semantic placeholder, got:\n{output}"
-        );
+        assert!(!output.contains("scan_string_summary("));
+        assert!(!output.contains("fold_summary("));
+        assert!(!output.contains("return accumulator;"));
         assert!(!output.contains("_scan_active"));
         assert!(!output.contains("tmp:"));
         assert!(!output.contains("while ("));
         assert!(!output.contains("for ("));
         assert!(output.contains("summary island: scan arg0 until zero byte"));
+        assert!(output.contains("summary island: add fold over arg0 into accumulator"));
         assert!(output.contains("island summary: string_scan"));
     }
 
@@ -8182,7 +8583,7 @@ mod tests {
         .expect("summary-only primary region should render without a large-cfg skip bit");
 
         assert!(output.contains("native summary islands: 1"));
-        assert!(output.contains("parse_token_summary(arg1);"));
+        assert!(!output.contains("parse_token_summary("));
         assert!(!output.contains("_parse_active"));
         assert!(output.contains("summary island: parse token stream from arg1[0..0;w=1]"));
         assert!(output.contains("island summary: parser"));
