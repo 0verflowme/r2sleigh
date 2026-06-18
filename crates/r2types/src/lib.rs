@@ -22,14 +22,15 @@ pub use callee::{
 };
 pub use constraint::{Constraint, ConstraintSource, MemoryCapability};
 pub use context::{
-    ExternalBaseTypeJson, ExternalBaseTypeKind, ExternalBaseTypeMemberJson, ExternalContextJson,
-    ExternalContextMetadataJson, ExternalEnumVariantJson, ExternalRegisterParamSpec,
-    ExternalSignatureJson, ExternalSignatureParamJson, ExternalStackBase, ExternalStackSlotRole,
-    ExternalStackSlotSpec, ExternalStackVarSpec, ExternalVarJson, ExternalVarKind,
-    KnownSignatureJson, ParsedExternalContext, StackSlotKey, apply_main_signature_override,
+    ExternalAssumptionPayloadParseError, ExternalBaseTypeJson, ExternalBaseTypeKind,
+    ExternalBaseTypeMemberJson, ExternalContextJson, ExternalContextMetadataJson,
+    ExternalEnumVariantJson, ExternalRegisterParamSpec, ExternalSignatureJson,
+    ExternalSignatureParamJson, ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec,
+    ExternalStackVarSpec, ExternalVarJson, ExternalVarKind, KnownSignatureJson,
+    ParsedExternalContext, StackSlotKey, apply_main_signature_override,
     canonical_main_signature_spec, function_type_facts_from_parsed_context, is_c_main_function,
     is_generic_arg_name, merge_signature_with_register_params, normalize_function_basename,
-    parse_external_context, parse_external_context_json,
+    parse_external_assumption_payload_json, parse_external_context, parse_external_context_json,
 };
 pub use convert::{CTypeLike, to_c_type_like};
 pub use external::{

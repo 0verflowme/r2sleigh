@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -233,6 +234,27 @@ pub struct ExternalContextJson {
     pub assumptions: Vec<r2ssa::AnalysisAssumption>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAssumptionPayloadParseError {
+    InvalidAssumptionArray,
+}
+
+impl ExternalAssumptionPayloadParseError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::InvalidAssumptionArray => "assumptions json is invalid",
+        }
+    }
+}
+
+impl fmt::Display for ExternalAssumptionPayloadParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ExternalAssumptionPayloadParseError {}
+
 pub fn normalize_function_basename(name: &str) -> String {
     let mut lower = name.trim().to_ascii_lowercase();
     for prefix in ["sym.imp.", "sym.", "dbg.", "fcn.", "imp."] {
@@ -430,6 +452,24 @@ pub fn parse_external_context_json(json_str: &str, ptr_bits: u32) -> ParsedExter
     };
 
     parse_external_context(raw, ptr_bits)
+}
+
+pub fn parse_external_assumption_payload_json(
+    json_str: &str,
+    ptr_bits: u32,
+) -> Result<r2ssa::AssumptionSet, ExternalAssumptionPayloadParseError> {
+    let trimmed = json_str.trim();
+    if trimmed.is_empty() {
+        return Ok(r2ssa::AssumptionSet::default());
+    }
+
+    if trimmed.starts_with('[') {
+        let assumptions = serde_json::from_str::<Vec<r2ssa::AnalysisAssumption>>(trimmed)
+            .map_err(|_| ExternalAssumptionPayloadParseError::InvalidAssumptionArray)?;
+        return Ok(r2ssa::AssumptionSet::new(assumptions));
+    }
+
+    Ok(parse_external_context_json(trimmed, ptr_bits).assumptions)
 }
 
 pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> ParsedExternalContext {
@@ -1633,6 +1673,52 @@ mod tests {
             render_signature_type(helper.params[0].ty.as_ref().unwrap(), 64),
             "int8_t*"
         );
+    }
+
+    #[test]
+    fn parse_external_assumption_payload_reads_external_context_payload() {
+        let assumptions = parse_external_assumption_payload_json(
+            r#"{"assumptions":[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]}"#,
+            64,
+        )
+        .expect("assumptions");
+
+        assert_eq!(assumptions.items.len(), 1);
+        assert_eq!(
+            assumptions.items[0].subject,
+            r2ssa::AssumptionSubject::Register {
+                name: "rdi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_external_assumption_payload_reads_direct_assumption_array() {
+        let assumptions = parse_external_assumption_payload_json(
+            r#"[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]"#,
+            64,
+        )
+        .expect("assumptions");
+
+        assert_eq!(assumptions.items.len(), 1);
+        assert_eq!(
+            assumptions.items[0].value,
+            r2ssa::AssumptionValue::Constant { value: 4660 }
+        );
+    }
+
+    #[test]
+    fn parse_external_assumption_payload_rejects_invalid_direct_array() {
+        let err =
+            parse_external_assumption_payload_json(r#"[{"subject":"not an assumption"}]"#, 64)
+                .expect_err("invalid direct assumption arrays should fail");
+
+        assert_eq!(
+            err,
+            ExternalAssumptionPayloadParseError::InvalidAssumptionArray
+        );
+        assert_eq!(err.message(), "assumptions json is invalid");
+        assert_eq!(err.to_string(), "assumptions json is invalid");
     }
 
     #[test]

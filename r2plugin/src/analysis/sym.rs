@@ -1898,14 +1898,8 @@ fn parse_scope_assumptions(
     let text = unsafe { CStr::from_ptr(external_context_json) }
         .to_str()
         .map_err(|_| "external context is not valid utf-8")?;
-    let trimmed = text.trim();
-    if trimmed.starts_with('[') {
-        let assumptions = serde_json::from_str::<Vec<r2ssa::AnalysisAssumption>>(trimmed)
-            .map_err(|_| "assumptions json is invalid")?;
-        return Ok(r2ssa::AssumptionSet::new(assumptions));
-    }
     let ptr_bits = arch.map(effective_ptr_bits).unwrap_or(64);
-    Ok(r2types::parse_external_context_json(text, ptr_bits).assumptions)
+    r2types::parse_external_assumption_payload_json(text, ptr_bits).map_err(|err| err.message())
 }
 
 fn scope_with_external_assumptions(
@@ -3292,23 +3286,20 @@ mod tests {
     use std::ffi::CString;
 
     #[test]
-    fn parse_scope_assumptions_reads_external_context_payload() {
+    fn parse_scope_assumptions_forwards_payload_to_typed_parser() {
         let json = CString::new(
             r#"{"assumptions":[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]}"#,
         )
         .expect("json");
         let assumptions = parse_scope_assumptions(json.as_ptr(), None).expect("assumptions");
-        assert_eq!(assumptions.items.len(), 1);
-    }
 
-    #[test]
-    fn parse_scope_assumptions_reads_direct_assumption_array() {
-        let json = CString::new(
-            r#"[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]"#,
-        )
-        .expect("json");
-        let assumptions = parse_scope_assumptions(json.as_ptr(), None).expect("assumptions");
         assert_eq!(assumptions.items.len(), 1);
+        assert_eq!(
+            assumptions.items[0].subject,
+            r2ssa::AssumptionSubject::Register {
+                name: "rdi".to_string()
+            }
+        );
     }
 
     #[test]

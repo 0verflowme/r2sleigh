@@ -4353,9 +4353,9 @@ unsafe fn typed_function_context_to_parsed(
     };
 
     if let Some(assumptions) = optional_cstr(context.assumptions_json)
-        && let Ok(parsed) = serde_json::from_str::<Vec<r2ssa::AnalysisAssumption>>(&assumptions)
+        && let Ok(parsed) = r2types::parse_external_assumption_payload_json(&assumptions, ptr_bits)
     {
-        raw.assumptions = parsed;
+        raw.assumptions = parsed.items;
     } else if let Some(fallback) = fallback.as_ref() {
         raw.assumptions = fallback.assumptions.clone();
     }
@@ -11336,6 +11336,27 @@ mod integration_tests {
             num_base_types: 0,
             assumptions_json: ptr::null(),
         }
+    }
+
+    #[test]
+    fn typed_function_context_reads_assumption_payload_with_typed_parser() {
+        let external_context = CString::new("{}").expect("external context");
+        let assumptions = CString::new(
+            r#"{"assumptions":[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]}"#,
+        )
+        .expect("assumptions");
+        let mut context = test_function_context(&external_context);
+        context.assumptions_json = assumptions.as_ptr();
+
+        let parsed = unsafe { typed_function_context_to_parsed(&context, "{}", 64) };
+
+        assert_eq!(parsed.assumptions.items.len(), 1);
+        assert_eq!(
+            parsed.assumptions.items[0].subject,
+            r2ssa::AssumptionSubject::Register {
+                name: "rdi".to_string()
+            }
+        );
     }
 
     fn test_session_input(
