@@ -7443,8 +7443,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn visible_names_share_stack_slot(&self, lhs: &str, rhs: &str) -> bool {
-        self.public_stack_alias_offset(lhs).is_some()
-            && self.public_stack_alias_offset(lhs) == self.public_stack_alias_offset(rhs)
+        self.stack_offset_for_visible_storage_name(lhs).is_some()
+            && self.stack_offset_for_visible_storage_name(lhs)
+                == self.stack_offset_for_visible_storage_name(rhs)
     }
 
     fn should_suppress_shadow_call_result_assignment(&self, dst: &SSAVar) -> bool {
@@ -10893,7 +10894,6 @@ impl<'a> FoldingContext<'a> {
             }
             CExpr::Var(name) if matches!(mode, PublicExprSanitizeMode::CallArg) => self
                 .canonical_stack_owner_display_name(&name)
-                .or_else(|| self.public_stack_call_arg_display_name(&name))
                 .map(CExpr::Var)
                 .unwrap_or(CExpr::Var(name)),
             CExpr::Deref(inner) => CExpr::Deref(Box::new(self.sanitize_public_expr(*inner, mode))),
@@ -10979,16 +10979,6 @@ impl<'a> FoldingContext<'a> {
         format!("value_{suffix}")
     }
 
-    fn public_stack_call_arg_display_name(&self, name: &str) -> Option<String> {
-        if !Self::is_low_quality_imported_call_arg_name(name)
-            && !is_generic_stack_placeholder_alias(name)
-        {
-            return None;
-        }
-        let offset = self.public_stack_alias_offset(name)?;
-        Some(Self::public_stack_slot_display_name(offset))
-    }
-
     fn canonical_stack_owner_display_name(&self, name: &str) -> Option<String> {
         if !name.eq_ignore_ascii_case("slot") {
             return None;
@@ -10998,48 +10988,6 @@ impl<'a> FoldingContext<'a> {
             .get(&offset)
             .filter(|candidate| !candidate.eq_ignore_ascii_case(name))
             .cloned()
-    }
-
-    fn public_stack_alias_offset(&self, name: &str) -> Option<i64> {
-        self.stack_offset_for_visible_storage_name(name)
-            .or_else(|| Self::parse_public_stack_alias_offset(name))
-    }
-
-    fn parse_public_stack_alias_offset(name: &str) -> Option<i64> {
-        let lower = name.trim_start_matches('&').to_ascii_lowercase();
-        if lower == "saved_fp" || lower == "stack" || lower == "slot" {
-            return Some(0);
-        }
-        if let Some(rest) = lower.strip_prefix("slot_p") {
-            return i64::from_str_radix(rest, 16).ok();
-        }
-        if let Some(rest) = lower.strip_prefix("slot_") {
-            return i64::from_str_radix(rest, 16).ok().map(|offset| -offset);
-        }
-        if let Some(rest) = lower.strip_prefix("stack_") {
-            return i64::from_str_radix(rest, 16).ok();
-        }
-        if let Some(rest) = lower
-            .strip_prefix("local_")
-            .or_else(|| lower.strip_prefix("arg_"))
-        {
-            return i64::from_str_radix(rest, 16).ok().map(|offset| -offset);
-        }
-        if let Some(rest) = lower.strip_prefix("var_") {
-            let trimmed = rest.strip_suffix('h').unwrap_or(rest);
-            if !trimmed.is_empty() && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-                return i64::from_str_radix(trimmed, 16).ok().map(|offset| -offset);
-            }
-        }
-        None
-    }
-
-    fn public_stack_slot_display_name(offset: i64) -> String {
-        match offset.cmp(&0) {
-            std::cmp::Ordering::Less => format!("slot_{:x}", offset.unsigned_abs()),
-            std::cmp::Ordering::Equal => "frame_base".to_string(),
-            std::cmp::Ordering::Greater => format!("slot_p{:x}", offset as u64),
-        }
     }
 
     fn normalize_final_call_expr(&self, expr: CExpr) -> CExpr {

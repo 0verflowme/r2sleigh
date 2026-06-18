@@ -398,6 +398,19 @@ mod tests {
     }
 
     #[test]
+    fn visible_stack_slot_sharing_requires_known_matching_offsets() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.state.analysis_ctx.stack_info.stack_vars = HashMap::from([
+            (-8, "buf".to_string()),
+            (-16, "len".to_string()),
+        ]);
+
+        assert!(ctx.visible_names_share_stack_slot("buf", "local_8"));
+        assert!(!ctx.visible_names_share_stack_slot("buf", "len"));
+        assert!(!ctx.visible_names_share_stack_slot("not_stack_a", "not_stack_b"));
+    }
+
+    #[test]
     fn scalar_stack_read_modify_write_drops_addr_of_aliases() {
         let mut ctx = make_x86_64_ctx();
         ctx.set_external_stack_vars(HashMap::from([
@@ -1072,6 +1085,56 @@ mod tests {
         assert!(
             expr_contains_var(&args[0], "arg2"),
             "imported call arg should keep canonical stack alias root, got: {:?}",
+            args[0]
+        );
+    }
+
+    #[test]
+    fn test_imported_call_arg_does_not_promote_uncertified_stack_placeholder_to_slot() {
+        let mut ctx = FoldingContext::new(64);
+        let mut names = HashMap::new();
+        names.insert(0x401040, "sym.imp.atoi".to_string());
+        ctx.set_function_names(names);
+        let mut sigs = HashMap::new();
+        sigs.insert(
+            "sym.imp.atoi".to_string(),
+            FunctionType {
+                return_type: CType::Int(32),
+                params: vec![CType::ptr(CType::Int(8))],
+                variadic: false,
+            },
+        );
+        ctx.set_known_function_signatures(sigs);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_args
+            .insert((0x1000, 0), vec![call_arg(CExpr::Var("stack_20".to_string()))]);
+
+        let stmt = ctx
+            .op_to_stmt_with_args(
+                &SSAOp::Call {
+                    target: make_var("const:401040", 0, 8),
+                },
+                0x1000,
+                0,
+            )
+            .expect("call should emit statement");
+
+        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
+            panic!("expected call expression");
+        };
+        assert_eq!(args.len(), 1);
+        assert!(
+            expr_contains_var(&args[0], "stack_20"),
+            "uncertified placeholder should remain visibly uncertified, got: {:?}",
+            args[0]
+        );
+        assert!(
+            !expr_contains_var(&args[0], "slot_p20")
+                && !expr_contains_var(&args[0], "slot_20")
+                && !expr_contains_var(&args[0], "frame_base"),
+            "uncertified stack placeholder must not become a canonical slot, got: {:?}",
             args[0]
         );
     }
@@ -18909,7 +18972,7 @@ mod tests {
     }
 
     #[test]
-    fn final_public_call_arg_sanitizer_hides_raw_stack_slots() {
+    fn final_public_call_arg_sanitizer_does_not_certify_raw_stack_placeholders() {
         let ctx = make_x86_64_ctx();
         let normalized = ctx.normalize_final_stmt_calls(CStmt::Expr(CExpr::call(
             CExpr::Var("sym.rpl_mbrtoc32".to_string()),
@@ -18934,12 +18997,12 @@ mod tests {
             }
         });
         assert!(
-            names.iter().any(|name| name == "slot_8"),
-            "expected sanitized stack slot name, got {args:?}"
+            names.iter().all(|name| name != "slot_8"),
+            "uncertified stack placeholder must not become a canonical slot: {args:?}"
         );
         assert!(
-            names.iter().all(|name| name != "var_8h"),
-            "raw stack slot leaked in call arg: {args:?}"
+            names.iter().any(|name| name == "var_8h"),
+            "uncertified stack placeholder should remain visibly uncertified: {args:?}"
         );
     }
 
