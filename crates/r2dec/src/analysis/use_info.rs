@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 use r2ssa::{SSAFunction, SSAOp, SSAVar, SSAVarNameKind, ValueId};
+use r2types::CalleeIdentity;
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
@@ -6014,8 +6015,7 @@ fn call_target_is_imported(op: &SSAOp, env: &PassEnv<'_>) -> bool {
     let Some(name) = call_target_name(op, env) else {
         return false;
     };
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("sym.imp.") || lower.starts_with("imp.")
+    CalleeIdentity::from_name(name).is_imported_name_hint()
 }
 
 fn call_target_name<'a>(op: &SSAOp, env: &'a PassEnv<'_>) -> Option<&'a String> {
@@ -8568,6 +8568,27 @@ mod tests {
             size: 4,
             phis: Vec::new(),
             ops,
+        }
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_typed_callee_identity() {
+        let op = SSAOp::Call {
+            target: mk("ram:401000", 0, 8),
+        };
+
+        for name in ["sym.imp.printf", "imp.printf"] {
+            let mut fixture = TestEnvFixture::default();
+            fixture.function_names.insert(0x401000, name.to_string());
+            let env = fixture.env();
+            assert!(call_target_is_imported(&op, &env), "{name}");
+        }
+
+        for name in ["sym.helper", "fcn.401000", "plain_helper"] {
+            let mut fixture = TestEnvFixture::default();
+            fixture.function_names.insert(0x401000, name.to_string());
+            let env = fixture.env();
+            assert!(!call_target_is_imported(&op, &env), "{name}");
         }
     }
 

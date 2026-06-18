@@ -33,8 +33,9 @@ use r2types::StackSlotKey;
 #[cfg(test)]
 use r2types::TypeOracle;
 use r2types::{
-    CTypeLike, CalleeFact, ExternalField, ExternalStackBase, ExternalStackSlotRole, ExternalStruct,
-    ExternalUnion, TypeArena, normalize_external_type_name, parse_type_like_spec,
+    CTypeLike, CalleeFact, CalleeIdentity, ExternalField, ExternalStackBase, ExternalStackSlotRole,
+    ExternalStruct, ExternalUnion, TypeArena, normalize_callee_name, normalize_external_type_name,
+    parse_type_like_spec,
 };
 
 use crate::address::parse_address_from_var_name;
@@ -6638,23 +6639,22 @@ impl<'a> FoldingContext<'a> {
         let Some(callee) = call_arg_callee_name(func) else {
             return false;
         };
-        let lower = callee.to_ascii_lowercase();
-        if lower.starts_with("sym.imp.")
-            || lower.starts_with("imp.")
-            || lower.starts_with("ram:")
-            || lower.starts_with("const:")
-        {
+        let identity = CalleeIdentity::from_name(callee);
+        if identity.is_raw_storage_target() {
             return false;
         }
+        let signature_key = self
+            .call_target_identity(func.as_ref())
+            .unwrap_or_else(|| identity.normalized_name().to_string());
         if self
             .inputs
             .known_function_signatures
-            .contains_key(&normalize_callee_name(callee))
+            .contains_key(&signature_key)
         {
             return false;
         }
 
-        lower.starts_with("fcn.") || lower.starts_with("sym.")
+        identity.is_internal_name_hint()
     }
 
     fn fallback_owned_call_result_return_name_for_source(
@@ -9996,11 +9996,11 @@ impl<'a> FoldingContext<'a> {
         let Some(name) = call_arg_callee_name(callee) else {
             return false;
         };
+        let identity = CalleeIdentity::from_name(name);
         self.inputs
             .known_function_signatures
-            .contains_key(&normalize_callee_name(name))
-            || name.contains("sym.imp.")
-            || name.starts_with("imp.")
+            .contains_key(identity.normalized_name())
+            || identity.is_imported_name_hint()
     }
 
     fn call_arg_contains_stack_placeholder(&self, expr: &CExpr, depth: u32) -> bool {
@@ -12758,45 +12758,6 @@ fn normalize_stack_definition_overrides(stack_info: &mut analysis::StackInfo) {
     for (key, expr) in replacements {
         stack_info.definition_overrides.insert(key, expr);
     }
-}
-
-fn normalize_callee_name(name: &str) -> String {
-    let raw = name.trim();
-    if let Some(addr) = parse_address_from_var_name(raw) {
-        return format!("addr:{addr:x}");
-    }
-    if let Some(rest) = raw
-        .trim_start_matches(|ch: char| ch.is_whitespace())
-        .to_ascii_lowercase()
-        .strip_prefix("sub_")
-        .and_then(|suffix| suffix.split('_').next())
-        .and_then(|suffix| u64::from_str_radix(suffix, 16).ok())
-    {
-        return format!("addr:{rest:x}");
-    }
-
-    let mut normalized = name.trim().to_ascii_lowercase();
-
-    for prefix in ["sym.imp.", "sym.", "imp.", "dbg.", "fcn."] {
-        while let Some(rest) = normalized.strip_prefix(prefix) {
-            normalized = rest.to_string();
-        }
-    }
-    while let Some(rest) = normalized.strip_suffix("@plt") {
-        normalized = rest.to_string();
-    }
-    while let Some(rest) = normalized.strip_suffix(".plt") {
-        normalized = rest.to_string();
-    }
-    if let Some((base, suffix)) = normalized.rsplit_once('_')
-        && !base.is_empty()
-        && !suffix.is_empty()
-        && suffix.chars().all(|ch| ch.is_ascii_digit())
-    {
-        normalized = base.to_string();
-    }
-
-    normalized
 }
 
 fn call_expr_cache_key(expr: &CExpr) -> String {

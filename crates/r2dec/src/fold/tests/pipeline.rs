@@ -9189,6 +9189,91 @@ mod tests {
     }
 
     #[test]
+    fn typed_callee_identity_controls_return_register_owner_policy() {
+        let cases = [
+            ("ram:401000_0", false),
+            ("const:401000", false),
+            ("sym.imp.helper", false),
+            ("imp.helper", false),
+            ("fcn.1000", true),
+            ("sym.helper", true),
+        ];
+
+        for (idx, (callee, expected)) in cases.into_iter().enumerate() {
+            let mut ctx = make_aarch64_ctx();
+            let source_call = (0x1000 + idx as u64, 0);
+            ctx.state
+                .analysis_ctx
+                .use_info
+                .call_result_exprs
+                .insert(source_call, CExpr::call(CExpr::Var(callee.to_string()), vec![]));
+
+            assert_eq!(
+                ctx.source_call_allows_return_register_owner(source_call),
+                expected,
+                "{callee}",
+            );
+        }
+
+        let mut ctx = make_aarch64_ctx();
+        let source_call = (0x2000, 0);
+        ctx.set_known_function_signatures(HashMap::from([(
+            "sym.helper".to_string(),
+            FunctionType {
+                return_type: CType::u64(),
+                params: Vec::new(),
+                variadic: false,
+            },
+        )]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(
+                source_call,
+                CExpr::call(CExpr::Var("sym.helper".to_string()), vec![]),
+            );
+
+        assert!(
+            !ctx.source_call_allows_return_register_owner(source_call),
+            "known-signature callees already have typed return facts and must not fall back to return-register ownership",
+        );
+    }
+
+    #[test]
+    fn typed_callee_identity_controls_imported_call_policy() {
+        let mut ctx = make_aarch64_ctx();
+        assert!(ctx.is_imported_call_target(&CExpr::Var(
+            "sym.imp.printf".to_string()
+        )));
+        assert!(ctx.is_imported_call_target(&CExpr::Var(
+            "imp.printf".to_string()
+        )));
+        assert!(!ctx.is_imported_call_target(&CExpr::Var(
+            "sym.helper".to_string()
+        )));
+        assert!(!ctx.is_imported_call_target(&CExpr::Var(
+            "fcn.401000".to_string()
+        )));
+
+        ctx.set_known_function_signatures(HashMap::from([(
+            "plain_helper".to_string(),
+            FunctionType {
+                return_type: CType::u64(),
+                params: Vec::new(),
+                variadic: false,
+            },
+        )]));
+
+        assert!(ctx.is_imported_call_target(&CExpr::Var(
+            "plain_helper".to_string()
+        )));
+        assert!(!ctx.is_imported_call_target(&CExpr::Var(
+            "other_helper".to_string()
+        )));
+    }
+
+    #[test]
     fn identical_helper_replay_across_callsites_is_ambiguous() {
         let mut ctx = make_aarch64_ctx();
         let first_call = (0x1000, 0);

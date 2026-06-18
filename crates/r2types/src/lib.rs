@@ -1,3 +1,4 @@
+pub mod callee;
 pub mod constraint;
 pub mod context;
 pub mod convert;
@@ -15,6 +16,10 @@ pub mod signature_infer;
 pub mod solver;
 pub mod writeback;
 
+pub use callee::{
+    CalleeClass, CalleeIdentity, CalleeIdentityEvidence, CalleeIdentityKey, CallsiteKey,
+    normalize_callee_name,
+};
 pub use constraint::{Constraint, ConstraintSource, MemoryCapability};
 pub use context::{
     ExternalBaseTypeJson, ExternalBaseTypeKind, ExternalBaseTypeMemberJson, ExternalContextJson,
