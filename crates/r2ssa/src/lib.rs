@@ -74,4 +74,4 @@ pub use semantic::{
     SwitchPredicateFact,
 };
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
-pub use var::SSAVar;
+pub use var::{SSAVar, SSAVarNameKind};

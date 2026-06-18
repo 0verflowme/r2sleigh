@@ -2,6 +2,70 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical classification for SSA variable names.
+///
+/// Raw SSA names still carry prefixes because they originate at the IL/lift
+/// seam. Consumers should ask this type for the meaning of those names instead
+/// of re-parsing prefix strings in downstream crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SSAVarNameKind {
+    RegisterAlias,
+    Temporary,
+    Constant,
+    Memory,
+    AddressSpace,
+    Ordinary,
+}
+
+impl SSAVarNameKind {
+    pub fn classify(name: &str) -> Self {
+        if name.strip_prefix("reg:").is_some() {
+            Self::RegisterAlias
+        } else if name.strip_prefix("tmp:").is_some() {
+            Self::Temporary
+        } else if name.strip_prefix("const:").is_some() {
+            Self::Constant
+        } else if name.strip_prefix("ram:").is_some() {
+            Self::Memory
+        } else if name.strip_prefix("space").is_some() {
+            Self::AddressSpace
+        } else {
+            Self::Ordinary
+        }
+    }
+
+    pub fn is_prefixed_display_name(self) -> bool {
+        matches!(
+            self,
+            Self::RegisterAlias
+                | Self::Temporary
+                | Self::Constant
+                | Self::Memory
+                | Self::AddressSpace
+        )
+    }
+
+    pub fn is_constant(self) -> bool {
+        matches!(self, Self::Constant)
+    }
+
+    pub fn is_temporary(self) -> bool {
+        matches!(self, Self::Temporary)
+    }
+
+    pub fn is_memory(self) -> bool {
+        matches!(self, Self::Memory)
+    }
+
+    pub fn strip_constant_prefix(name: &str) -> Option<&str> {
+        name.strip_prefix("const:")
+    }
+
+    pub fn strip_temporary_prefix(name: &str) -> Option<&str> {
+        name.strip_prefix("tmp:")
+    }
+}
+
 /// An SSA variable: a named location with a version number.
 ///
 /// In SSA form, each assignment creates a new version of the variable.
@@ -68,6 +132,10 @@ impl SSAVar {
         format!("{}_{}", self.name.to_uppercase(), self.version)
     }
 
+    pub fn name_kind(&self) -> SSAVarNameKind {
+        SSAVarNameKind::classify(&self.name)
+    }
+
     /// Check if this is a constant (name starts with "const:").
     pub fn is_const(&self) -> bool {
         self.name.starts_with("const:")
@@ -76,6 +144,11 @@ impl SSAVar {
     /// Check if this is a temporary (name starts with "tmp:").
     pub fn is_temp(&self) -> bool {
         self.name.starts_with("tmp:")
+    }
+
+    /// Check if this is a memory-backed SSA name (name starts with "ram:").
+    pub fn is_memory(&self) -> bool {
+        self.name_kind().is_memory()
     }
 
     /// Check if this is a register (not const or temp).
@@ -119,6 +192,23 @@ mod tests {
     }
 
     #[test]
+    fn test_name_kind_classification() {
+        let cases = [
+            ("reg:10", SSAVarNameKind::RegisterAlias),
+            ("tmp:0x1000", SSAVarNameKind::Temporary),
+            ("const:0x42", SSAVarNameKind::Constant),
+            ("ram:0x401000", SSAVarNameKind::Memory),
+            ("space1:0x20", SSAVarNameKind::AddressSpace),
+            ("rax", SSAVarNameKind::Ordinary),
+        ];
+
+        for (name, expected) in cases {
+            assert_eq!(SSAVarNameKind::classify(name), expected);
+            assert_eq!(SSAVar::new(name, 0, 8).name_kind(), expected);
+        }
+    }
+
+    #[test]
     fn test_next_version() {
         let v0 = SSAVar::initial("RSP", 8);
         let v1 = v0.next_version().expect("version 0 has a successor");
@@ -151,6 +241,9 @@ mod tests {
 
         assert!(cst.is_const());
         assert!(!cst.is_register());
+
+        let mem = SSAVar::new("ram:0x1000", 0, 8);
+        assert!(mem.is_memory());
     }
 }
 

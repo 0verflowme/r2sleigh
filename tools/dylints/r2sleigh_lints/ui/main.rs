@@ -9,4 +9,5 @@ fn ordinary(name: &str) -> bool {
 fn main() {
     let _ = classify("tmp:0x1000");
     let _ = ordinary("test_case");
+    let _ = "afcfj";
 }
