@@ -17,8 +17,8 @@ pub mod solver;
 pub mod writeback;
 
 pub use callee::{
-    CalleeClass, CalleeIdentity, CalleeIdentityEvidence, CalleeIdentityKey, CallsiteKey,
-    normalize_callee_name,
+    CalleeClass, CalleeIdentity, CalleeIdentityContext, CalleeIdentityEvidence, CalleeIdentityKey,
+    CallsiteKey, normalize_callee_name,
 };
 pub use constraint::{Constraint, ConstraintSource, MemoryCapability};
 pub use context::{

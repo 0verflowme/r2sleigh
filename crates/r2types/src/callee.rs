@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use r2ssa::SSAVarNameKind;
 
-use crate::{FunctionType, SignatureCertificateSource};
+use crate::{CalleeFact, FunctionType, SignatureCertificateSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CallsiteKey {
@@ -34,9 +34,18 @@ pub enum CalleeIdentityEvidence {
     RawConstantName,
     ImportedNameHint,
     InternalNameHint,
+    CalleeFactName,
     KnownSignature,
     FunctionName,
     SymbolName,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CalleeIdentityContext<'a> {
+    pub function_names: &'a HashMap<u64, String>,
+    pub symbols: &'a HashMap<u64, String>,
+    pub callee_facts: &'a BTreeMap<u64, CalleeFact>,
+    pub known_function_signatures: &'a HashMap<String, FunctionType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +101,80 @@ impl CalleeIdentity {
         }
     }
 
+    pub fn from_direct_target(addr: u64, ctx: &CalleeIdentityContext<'_>) -> Self {
+        let mut evidence = BTreeSet::from([CalleeIdentityEvidence::DirectTarget]);
+        let fact_name = ctx
+            .callee_facts
+            .get(&addr)
+            .and_then(|fact| fact.name.as_deref())
+            .filter(|name| !name.trim().is_empty());
+        let function_name = ctx
+            .function_names
+            .get(&addr)
+            .map(String::as_str)
+            .filter(|name| !name.trim().is_empty());
+        let symbol_name = ctx
+            .symbols
+            .get(&addr)
+            .map(String::as_str)
+            .filter(|name| !name.trim().is_empty());
+
+        let (name, name_evidence) = if let Some(name) = fact_name {
+            (name, CalleeIdentityEvidence::CalleeFactName)
+        } else if let Some(name) = function_name {
+            (name, CalleeIdentityEvidence::FunctionName)
+        } else if let Some(name) = symbol_name {
+            (name, CalleeIdentityEvidence::SymbolName)
+        } else {
+            ("", CalleeIdentityEvidence::DirectTarget)
+        };
+
+        let mut identity = if name.is_empty() {
+            let display_name = format!("sub_{addr:x}");
+            let mut aliases = BTreeSet::from([format!("addr:{addr:x}"), display_name.clone()]);
+            aliases.insert(format!("0x{addr:x}"));
+            CalleeIdentity {
+                target_addr: Some(addr),
+                raw_name: Some(display_name.clone()),
+                display_name: Some(display_name),
+                normalized_name: Some(format!("addr:{addr:x}")),
+                aliases,
+                class: CalleeClass::RawAddress,
+                is_recursive: false,
+                signature: None,
+                signature_source: None,
+                evidence,
+            }
+        } else {
+            evidence.insert(name_evidence);
+            let mut identity = Self::from_name(name);
+            identity.target_addr = Some(addr);
+            identity.evidence.extend(evidence);
+            identity
+        };
+
+        identity.insert_direct_target_aliases(addr);
+        if let Some(name) = fact_name {
+            identity.insert_name_alias(name);
+        }
+        if let Some(name) = function_name {
+            identity.insert_name_alias(name);
+        }
+        if let Some(name) = symbol_name {
+            identity.insert_name_alias(name);
+            if identity.class == CalleeClass::Unknown {
+                identity.class = CalleeClass::ExternalSymbol;
+            }
+        }
+        identity.attach_known_signature(ctx.known_function_signatures);
+        identity
+    }
+
+    pub fn with_known_signature(mut self, signatures: &HashMap<String, FunctionType>) -> Self {
+        self.attach_known_signature(signatures);
+        self
+    }
+
     pub fn raw_name(&self) -> &str {
         self.raw_name.as_deref().unwrap_or("")
     }
@@ -126,6 +209,76 @@ impl CalleeIdentity {
             && self
                 .evidence
                 .contains(&CalleeIdentityEvidence::InternalNameHint)
+    }
+
+    pub fn has_known_signature(&self) -> bool {
+        self.signature.is_some()
+            && self
+                .evidence
+                .contains(&CalleeIdentityEvidence::KnownSignature)
+    }
+
+    pub fn primary_key(&self) -> String {
+        self.normalized_name
+            .clone()
+            .or_else(|| self.display_name.clone())
+            .or_else(|| self.raw_name.clone())
+            .or_else(|| self.target_addr.map(|addr| format!("addr:{addr:x}")))
+            .unwrap_or_default()
+    }
+
+    pub fn matches_identity(&self, other: &Self) -> bool {
+        let left = self.primary_key();
+        let right = other.primary_key();
+        (!left.is_empty() && left == right)
+            || self
+                .aliases
+                .iter()
+                .any(|alias| other.aliases.contains(alias))
+    }
+
+    fn insert_direct_target_aliases(&mut self, addr: u64) {
+        self.aliases.insert(format!("addr:{addr:x}"));
+        self.aliases.insert(format!("sub_{addr:x}"));
+        self.aliases.insert(format!("0x{addr:x}"));
+    }
+
+    fn insert_name_alias(&mut self, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.aliases.insert(trimmed.to_string());
+        let normalized = normalize_callee_name(trimmed);
+        if !normalized.is_empty() {
+            self.aliases.insert(normalized);
+        }
+    }
+
+    fn attach_known_signature(&mut self, signatures: &HashMap<String, FunctionType>) {
+        let mut candidates = self.aliases.iter().cloned().collect::<Vec<_>>();
+        if let Some(name) = &self.raw_name {
+            candidates.push(name.clone());
+        }
+        if let Some(name) = &self.display_name {
+            candidates.push(name.clone());
+        }
+        if let Some(name) = &self.normalized_name {
+            candidates.push(name.clone());
+        }
+
+        for candidate in candidates {
+            let normalized = normalize_callee_name(&candidate);
+            if let Some(signature) = signatures
+                .get(&candidate)
+                .or_else(|| signatures.get(&normalized))
+            {
+                self.signature = Some(signature.clone());
+                self.signature_source = Some(SignatureCertificateSource::ExternalContext);
+                self.evidence.insert(CalleeIdentityEvidence::KnownSignature);
+                return;
+            }
+        }
     }
 }
 
@@ -218,6 +371,69 @@ fn parse_address_payload(payload: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn empty_identity_context<'a>(
+        function_names: &'a HashMap<u64, String>,
+        symbols: &'a HashMap<u64, String>,
+        callee_facts: &'a BTreeMap<u64, CalleeFact>,
+        known_signatures: &'a HashMap<String, FunctionType>,
+    ) -> CalleeIdentityContext<'a> {
+        CalleeIdentityContext {
+            function_names,
+            symbols,
+            callee_facts,
+            known_function_signatures: known_signatures,
+        }
+    }
+
+    fn callee_fact(addr: u64, name: &str) -> CalleeFact {
+        CalleeFact {
+            function_id: addr,
+            name: Some(name.to_string()),
+            direct_callees: Vec::new(),
+            callsite_count: 0,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: Vec::new(),
+            transfer_effects: Vec::new(),
+            allocation_effects: Vec::new(),
+            lifetime_effects: Vec::new(),
+            sync_effects: Vec::new(),
+            atomic_effects: Vec::new(),
+            param_type_hints: BTreeMap::new(),
+            return_type_hint: None,
+            return_relation: crate::CalleeReturnRelation::Unknown,
+            reads_global_memory: false,
+            writes_global_memory: false,
+            touches_unknown_memory: false,
+        }
+    }
+
+    fn test_signature() -> FunctionType {
+        FunctionType {
+            return_type: crate::CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            },
+            params: Vec::new(),
+            variadic: true,
+        }
+    }
+
+    fn minimal_identity_with_key(key: Option<&str>) -> CalleeIdentity {
+        CalleeIdentity {
+            target_addr: None,
+            raw_name: None,
+            display_name: None,
+            normalized_name: key.map(str::to_string),
+            aliases: BTreeSet::new(),
+            class: CalleeClass::Unknown,
+            is_recursive: false,
+            signature: None,
+            signature_source: None,
+            evidence: BTreeSet::new(),
+        }
+    }
+
     #[test]
     fn callee_identity_classifies_raw_storage_imports_and_internal_names() {
         let cases = [
@@ -261,6 +477,139 @@ mod tests {
         assert_eq!(normalize_callee_name("sym.imp.printf@plt"), "printf");
         assert_eq!(normalize_callee_name("sym.imp.printf.plt"), "printf");
         assert_eq!(normalize_callee_name("sym.helper_2"), "helper");
+    }
+
+    #[test]
+    fn direct_target_identity_uses_callee_fact_before_function_and_symbol_names() {
+        let function_names = HashMap::from([(0x401000, "sym.function_name".to_string())]);
+        let symbols = HashMap::from([(0x401000, "sym.symbol_name".to_string())]);
+        let callee_facts = BTreeMap::from([(0x401000, callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x401000, &ctx);
+
+        assert_eq!(identity.target_addr, Some(0x401000));
+        assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
+        assert_eq!(identity.normalized_name(), "printf");
+        assert_eq!(identity.class(), CalleeClass::Imported);
+        assert!(
+            identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::DirectTarget)
+        );
+        assert!(
+            identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::CalleeFactName)
+        );
+        assert!(identity.aliases.contains("addr:401000"));
+        assert!(identity.aliases.contains("sym.function_name"));
+        assert!(identity.aliases.contains("sym.symbol_name"));
+    }
+
+    #[test]
+    fn direct_target_identity_attaches_known_signature_by_normalized_alias() {
+        let function_names = HashMap::from([(0x401030, "sym.imp.printf@plt".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::from([("printf".to_string(), test_signature())]);
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x401030, &ctx);
+
+        assert!(identity.has_known_signature());
+        assert_eq!(
+            identity.signature_source,
+            Some(SignatureCertificateSource::ExternalContext)
+        );
+        assert!(
+            identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::KnownSignature)
+        );
+        assert_eq!(identity.primary_key(), "printf");
+        assert!(identity.matches_identity(&CalleeIdentity::from_name("printf")));
+    }
+
+    #[test]
+    fn known_signature_predicate_requires_signature_and_evidence() {
+        let mut signature_without_evidence = CalleeIdentity::from_name("printf");
+        signature_without_evidence.signature = Some(test_signature());
+        assert!(!signature_without_evidence.has_known_signature());
+
+        let mut evidence_without_signature = CalleeIdentity::from_name("printf");
+        evidence_without_signature
+            .evidence
+            .insert(CalleeIdentityEvidence::KnownSignature);
+        assert!(!evidence_without_signature.has_known_signature());
+
+        let mut complete = CalleeIdentity::from_name("printf");
+        complete.signature = Some(test_signature());
+        complete
+            .evidence
+            .insert(CalleeIdentityEvidence::KnownSignature);
+        assert!(complete.has_known_signature());
+    }
+
+    #[test]
+    fn direct_target_identity_does_not_insert_empty_normalized_aliases() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(0x401040, callee_fact(0x401040, "sym.imp."))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x401040, &ctx);
+
+        assert!(!identity.aliases.contains(""));
+    }
+
+    #[test]
+    fn callee_identity_matching_separates_exact_alias_and_negative_cases() {
+        let exact_left = minimal_identity_with_key(Some("printf"));
+        let exact_right = minimal_identity_with_key(Some("printf"));
+        assert!(exact_left.matches_identity(&exact_right));
+
+        let mut alias_left = minimal_identity_with_key(Some("fact_helper"));
+        alias_left.aliases.insert("sym.function_name".to_string());
+        let mut alias_right = minimal_identity_with_key(Some("function_name"));
+        alias_right.aliases.insert("sym.function_name".to_string());
+        assert!(alias_left.matches_identity(&alias_right));
+
+        let unrelated_left = CalleeIdentity::from_name("sym.imp.printf");
+        let unrelated_right = CalleeIdentity::from_name("sym.imp.puts");
+        assert!(!unrelated_left.matches_identity(&unrelated_right));
+
+        let empty_left = minimal_identity_with_key(None);
+        let empty_right = minimal_identity_with_key(None);
+        assert!(!empty_left.matches_identity(&empty_right));
+    }
+
+    #[test]
+    fn direct_target_identity_without_names_remains_address_keyed() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x401050, &ctx);
+
+        assert_eq!(identity.target_addr, Some(0x401050));
+        assert_eq!(identity.primary_key(), "addr:401050");
+        assert_eq!(identity.display_name.as_deref(), Some("sub_401050"));
+        assert!(
+            identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::DirectTarget)
+        );
+        assert!(identity.aliases.contains("addr:401050"));
+        assert!(identity.aliases.contains("sub_401050"));
     }
 
     #[test]
@@ -327,6 +676,21 @@ mod kani_proofs {
         }
     }
 
+    fn proof_identity(key: Option<&str>) -> CalleeIdentity {
+        CalleeIdentity {
+            target_addr: None,
+            raw_name: None,
+            display_name: None,
+            normalized_name: key.map(str::to_string),
+            aliases: BTreeSet::new(),
+            class: CalleeClass::Unknown,
+            is_recursive: false,
+            signature: None,
+            signature_source: None,
+            evidence: BTreeSet::new(),
+        }
+    }
+
     #[kani::proof]
     fn callee_name_classification_precedence_is_total() {
         let storage_kind = pick_name_kind(kani::any());
@@ -357,5 +721,18 @@ mod kani_proofs {
                 assert_eq!(evidence, None);
             }
         }
+    }
+
+    #[kani::proof]
+    fn identity_matching_requires_nonempty_equal_key_or_alias_overlap() {
+        let left = proof_identity(Some("printf"));
+        let same = proof_identity(Some("printf"));
+        let different = proof_identity(Some("puts"));
+        let empty_left = proof_identity(None);
+        let empty_right = proof_identity(None);
+
+        assert!(left.matches_identity(&same));
+        assert!(!left.matches_identity(&different));
+        assert!(!empty_left.matches_identity(&empty_right));
     }
 }
