@@ -7505,7 +7505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_call_arg_hides_raw_opaque_tmp_names() {
+    fn opaque_public_call_arg_sanitizer_hides_raw_tmp_names() {
         let ctx = make_aarch64_ctx();
         let callee = CExpr::Var("fcn.1000".to_string());
 
@@ -7513,6 +7513,16 @@ mod tests {
             ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("tmp:2a000".to_string()));
 
         assert_eq!(normalized, CExpr::Var("value_2a000".to_string()));
+
+        let normalized =
+            ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("TMP:2A000".to_string()));
+
+        assert_eq!(normalized, CExpr::Var("value_2a000".to_string()));
+
+        let normalized =
+            ctx.normalize_call_arg_expr_for_callee(&callee, CExpr::Var("visible_arg".to_string()));
+
+        assert_eq!(normalized, CExpr::Var("visible_arg".to_string()));
     }
 
     #[test]

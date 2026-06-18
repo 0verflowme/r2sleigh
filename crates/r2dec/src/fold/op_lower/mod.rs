@@ -10960,16 +10960,12 @@ impl<'a> FoldingContext<'a> {
 
     fn is_opaque_public_call_arg_name(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
-        lower.starts_with("tmp:") || lower.starts_with("unique:") || lower.starts_with("tmp_")
+        SSAVarNameKind::classify(&lower).is_temporary()
     }
 
     fn opaque_public_call_arg_display_name(name: &str) -> String {
         let lower = name.to_ascii_lowercase();
-        let raw = lower
-            .strip_prefix("tmp:")
-            .or_else(|| lower.strip_prefix("unique:"))
-            .or_else(|| lower.strip_prefix("tmp_"))
-            .unwrap_or(lower.as_str());
+        let raw = SSAVarNameKind::strip_temporary_prefix(&lower).unwrap_or(lower.as_str());
         let mut suffix = raw
             .chars()
             .map(|ch| {
