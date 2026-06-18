@@ -62,16 +62,16 @@ pub use interproc::{
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};
 pub use semantic::{
-    BlockAssumption, CallMemoryEffect, CallSiteFact, CallSiteFacts, CallSiteId,
-    CallsiteCertificate, CompareKind, CompareProvenance, GlobalObjectKey, IfRegionCertificate,
-    LoopCertificate, LoopId, MemoryAccessCertificate, MemoryDefFact, MemoryLocation, MemoryPhiFact,
-    MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
-    PredicateFact, PredicateFacts, PredicateId, PreparedAssumptionBinding,
-    PreparedAssumptionBindingKind, PreparedFunctionCertificates, PreparedFunctionFacts,
-    PreparedProofFailure, ProofNodeId, ReturnValueCertificate, StackSlotCertificate,
-    StructuredAccessId, StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind,
-    StructuredMemoryAccessFact, StructuredRecursiveCallFact, SwitchCertificate,
-    SwitchPredicateFact,
+    BlockAssumption, CallArgumentCertificate, CallArgumentLocation, CallMemoryEffect,
+    CallResultCertificate, CallSiteFact, CallSiteFacts, CallSiteId, CallsiteCertificate,
+    CompareKind, CompareProvenance, GlobalObjectKey, IfRegionCertificate, LoopCertificate, LoopId,
+    MemoryAccessCertificate, MemoryDefFact, MemoryLocation, MemoryPhiFact, MemorySSAFacts,
+    MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel, PredicateFact,
+    PredicateFacts, PredicateId, PreparedAssumptionBinding, PreparedAssumptionBindingKind,
+    PreparedFunctionCertificates, PreparedFunctionFacts, PreparedProofFailure, ProofNodeId,
+    ReturnCarrier, ReturnValueCertificate, StackSlotCertificate, StructuredAccessId,
+    StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
+    StructuredRecursiveCallFact, SwitchCertificate, SwitchPredicateFact, ValueOwner,
 };
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
 pub use var::{SSAVar, SSAVarNameKind};

@@ -343,6 +343,7 @@ pub struct CallsiteCertificate {
     pub fallthrough: Option<u64>,
     pub argument_values: Vec<ValueId>,
     pub stack_argument_values: Vec<StackCallArgumentCertificate>,
+    pub argument_certificates: Vec<CallArgumentCertificate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,12 +354,58 @@ pub struct StackCallArgumentCertificate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallArgumentCertificate {
+    pub index: usize,
+    pub value: ValueId,
+    pub location: CallArgumentLocation,
+    pub source_inst: Option<InstId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallArgumentLocation {
+    Register {
+        name: String,
+    },
+    Stack {
+        object: ObjectId,
+        offset: i64,
+        memory_access: StructuredAccessId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallResultCertificate {
+    pub value: ValueId,
+    pub carrier: ReturnCarrier,
+    pub owner: Option<ValueOwner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnCarrier {
+    Register {
+        name: String,
+    },
+    StackSlot {
+        object: ObjectId,
+        offset: i64,
+        memory_access: Option<StructuredAccessId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueOwner {
+    Value(ValueId),
+    StackSlot { object: ObjectId, offset: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnValueCertificate {
     pub at: InstId,
     pub block_addr: u64,
     pub op_index: usize,
     pub value: ValueId,
     pub width: u32,
+    pub carrier: Option<ReturnCarrier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1234,6 +1281,10 @@ fn collect_prepared_function_certificates(
         .iter()
         .map(|(id, fact)| {
             let (block_addr, op_index) = graph.op_site_for_inst(fact.at).unwrap_or_default();
+            let stack_argument_values =
+                collect_stack_call_argument_values(function, graph, objects, structured, fact);
+            let argument_certificates =
+                collect_stack_call_argument_certificates(&stack_argument_values, structured);
             callsites_by_inst.insert(fact.at, *id);
             (
                 *id,
@@ -1246,9 +1297,8 @@ fn collect_prepared_function_certificates(
                     direct_target: fact.direct_target,
                     fallthrough: fact.fallthrough,
                     argument_values: collect_call_argument_values(function, graph, fact),
-                    stack_argument_values: collect_stack_call_argument_values(
-                        function, graph, objects, structured, fact,
-                    ),
+                    stack_argument_values,
+                    argument_certificates,
                 },
             )
         })
@@ -1649,7 +1699,17 @@ fn push_return_value_certificate(
         op_index: op_idx,
         value,
         width: value_var.size,
+        carrier: return_carrier_for_value(value_var),
     });
+}
+
+fn return_carrier_for_value(value: &SSAVar) -> Option<ReturnCarrier> {
+    if is_return_value_register(value) {
+        return Some(ReturnCarrier::Register {
+            name: value.name.clone(),
+        });
+    }
+    None
 }
 
 fn is_return_value_register(value: &SSAVar) -> bool {
@@ -2357,6 +2417,29 @@ fn collect_stack_call_argument_values(
     }
 
     by_offset.into_values().collect()
+}
+
+fn collect_stack_call_argument_certificates(
+    stack_argument_values: &[StackCallArgumentCertificate],
+    structured: &StructuredDataflowFacts,
+) -> Vec<CallArgumentCertificate> {
+    stack_argument_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stack_arg)| {
+            let access = structured.memory_accesses.get(&stack_arg.memory_access)?;
+            Some(CallArgumentCertificate {
+                index,
+                value: stack_arg.value,
+                location: CallArgumentLocation::Stack {
+                    object: access.object,
+                    offset: stack_arg.stack_offset,
+                    memory_access: stack_arg.memory_access,
+                },
+                source_inst: Some(stack_arg.memory_access.inst),
+            })
+        })
+        .collect()
 }
 
 fn stack_pointer_object_offset(objects: &ObjectModel, object: ObjectId) -> Option<i64> {

@@ -2655,6 +2655,7 @@ impl SSABlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::{CallArgumentLocation, ReturnCarrier};
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
@@ -3061,6 +3062,19 @@ mod tests {
             return_write_blocks, 2,
             "both branch-arm return-register writes should carry ReturnValueCertificate proof"
         );
+        for cert in prepared
+            .certificates()
+            .returns
+            .iter()
+            .filter(|cert| cert.block_addr == 0x1004 || cert.block_addr == 0x1010)
+        {
+            assert_eq!(
+                cert.carrier,
+                Some(ReturnCarrier::Register {
+                    name: "rax".to_string()
+                })
+            );
+        }
     }
 
     #[test]
@@ -3597,6 +3611,29 @@ mod tests {
             .expect("stack argument value");
         assert!(value.is_const());
         assert_eq!(value.name, "const:7");
+
+        assert_eq!(call.argument_certificates.len(), 1);
+        let typed_arg = &call.argument_certificates[0];
+        assert_eq!(typed_arg.index, 0);
+        assert_eq!(typed_arg.value, stack_arg.value);
+        assert_eq!(typed_arg.source_inst, Some(stack_arg.memory_access.inst));
+        let memory = prepared
+            .memory_certificate_for_op_site(0x1740, 1, true)
+            .expect("stack argument write certificate");
+        match &typed_arg.location {
+            CallArgumentLocation::Stack {
+                object,
+                offset,
+                memory_access,
+            } => {
+                assert_eq!(*object, memory.object);
+                assert_eq!(*offset, 0x20);
+                assert_eq!(*memory_access, stack_arg.memory_access);
+            }
+            CallArgumentLocation::Register { name } => {
+                panic!("stack argument should not be certified as register {name}");
+            }
+        }
     }
 
     #[test]
