@@ -218,6 +218,27 @@ impl CalleeIdentity {
                 .contains(&CalleeIdentityEvidence::KnownSignature)
     }
 
+    pub fn known_signature(&self) -> Option<&FunctionType> {
+        self.has_known_signature()
+            .then_some(self.signature.as_ref())
+            .flatten()
+    }
+
+    pub fn non_variadic_known_arity(&self) -> Option<usize> {
+        self.known_signature()
+            .and_then(|signature| (!signature.variadic).then_some(signature.params.len()))
+    }
+
+    pub fn matches_normalized_name(&self, normalized: &str) -> bool {
+        let normalized = normalized.trim();
+        !normalized.is_empty()
+            && (self.normalized_name.as_deref() == Some(normalized)
+                || self
+                    .aliases
+                    .iter()
+                    .any(|alias| normalize_callee_name(alias) == normalized))
+    }
+
     pub fn primary_key(&self) -> String {
         self.normalized_name
             .clone()
@@ -419,6 +440,20 @@ mod tests {
         }
     }
 
+    fn non_variadic_signature(param_count: usize) -> FunctionType {
+        FunctionType {
+            return_type: crate::CTypeLike::Void,
+            params: vec![
+                crate::CTypeLike::Int {
+                    bits: 32,
+                    signedness: crate::Signedness::Signed,
+                };
+                param_count
+            ],
+            variadic: false,
+        }
+    }
+
     fn minimal_identity_with_key(key: Option<&str>) -> CalleeIdentity {
         CalleeIdentity {
             target_addr: None,
@@ -539,12 +574,15 @@ mod tests {
         let mut signature_without_evidence = CalleeIdentity::from_name("printf");
         signature_without_evidence.signature = Some(test_signature());
         assert!(!signature_without_evidence.has_known_signature());
+        assert!(signature_without_evidence.known_signature().is_none());
+        assert_eq!(signature_without_evidence.non_variadic_known_arity(), None);
 
         let mut evidence_without_signature = CalleeIdentity::from_name("printf");
         evidence_without_signature
             .evidence
             .insert(CalleeIdentityEvidence::KnownSignature);
         assert!(!evidence_without_signature.has_known_signature());
+        assert!(evidence_without_signature.known_signature().is_none());
 
         let mut complete = CalleeIdentity::from_name("printf");
         complete.signature = Some(test_signature());
@@ -552,6 +590,15 @@ mod tests {
             .evidence
             .insert(CalleeIdentityEvidence::KnownSignature);
         assert!(complete.has_known_signature());
+        assert!(complete.known_signature().is_some());
+        assert_eq!(complete.non_variadic_known_arity(), None);
+
+        let mut non_variadic = CalleeIdentity::from_name("strcmp");
+        non_variadic.signature = Some(non_variadic_signature(2));
+        non_variadic
+            .evidence
+            .insert(CalleeIdentityEvidence::KnownSignature);
+        assert_eq!(non_variadic.non_variadic_known_arity(), Some(2));
     }
 
     #[test]
@@ -587,6 +634,23 @@ mod tests {
         let empty_left = minimal_identity_with_key(None);
         let empty_right = minimal_identity_with_key(None);
         assert!(!empty_left.matches_identity(&empty_right));
+    }
+
+    #[test]
+    fn normalized_name_matching_uses_canonical_aliases_only() {
+        let identity = CalleeIdentity::from_name("sym.imp.printf@plt");
+
+        assert!(identity.matches_normalized_name("printf"));
+        assert!(!identity.matches_normalized_name(""));
+        assert!(!identity.matches_normalized_name("puts"));
+
+        let normalized_only = minimal_identity_with_key(Some("strcmp"));
+        assert!(normalized_only.matches_normalized_name("strcmp"));
+
+        let mut alias_only = minimal_identity_with_key(Some("fact_helper"));
+        alias_only.aliases.insert("sym.imp.memcpy@plt".to_string());
+        assert!(alias_only.matches_normalized_name("memcpy"));
+        assert!(!alias_only.matches_normalized_name("fact_helper_and_memcpy"));
     }
 
     #[test]

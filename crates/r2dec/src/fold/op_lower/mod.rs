@@ -8009,27 +8009,9 @@ impl<'a> FoldingContext<'a> {
     fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
         match expr {
             CExpr::Var(name) => self.lookup_type_hint(name).cloned(),
-            CExpr::Call { func, .. } => {
-                let callee = match func.as_ref() {
-                    CExpr::Var(name) => Some(name.as_str()),
-                    CExpr::Deref(inner) | CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
-                        match inner.as_ref() {
-                            CExpr::Var(name) => Some(name.as_str()),
-                            _ => None,
-                        }
-                    }
-                    CExpr::Cast { expr: inner, .. } => match inner.as_ref() {
-                        CExpr::Var(name) => Some(name.as_str()),
-                        _ => None,
-                    },
-                    _ => None,
-                }?;
-                let normalized = normalize_callee_name(callee);
-                self.inputs
-                    .known_function_signatures
-                    .get(&normalized)
-                    .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type))
-            }
+            CExpr::Call { func, .. } => self
+                .known_signature_for_callee_expr(func)
+                .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
             CExpr::Cast { ty, .. } => Some(ty.clone()),
             CExpr::Paren(inner) => self.expr_type_hint(inner),
             _ => None,
@@ -9997,9 +9979,7 @@ impl<'a> FoldingContext<'a> {
 
     fn is_imported_call_target(&self, callee: &CExpr) -> bool {
         self.callee_identity_for_expr(callee)
-            .is_some_and(|identity| {
-                identity.has_known_signature() || identity.is_imported_name_hint()
-            })
+            .is_some_and(|identity| identity.is_imported_name_hint())
     }
 
     fn call_arg_contains_stack_placeholder(&self, expr: &CExpr, depth: u32) -> bool {

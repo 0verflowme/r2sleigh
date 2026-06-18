@@ -66,7 +66,7 @@ use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts, FunctionSignatureSpec,
     FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding,
-    VisibleBindingKind,
+    VisibleBindingKind, normalize_callee_name,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -77,23 +77,6 @@ fn is_generic_arg_name(name: &str) -> bool {
         .strip_prefix("arg")
         .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
         .unwrap_or(false)
-}
-
-fn normalize_callee_name(name: &str) -> String {
-    let mut out = name.trim().to_ascii_lowercase();
-    for prefix in ["sym.imp.", "sym.", "fcn."] {
-        if let Some(rest) = out.strip_prefix(prefix) {
-            out = rest.to_string();
-            break;
-        }
-    }
-    if let Some((base, ver)) = out.rsplit_once('_')
-        && !base.is_empty()
-        && ver.chars().all(|c| c.is_ascii_digit())
-    {
-        return base.to_string();
-    }
-    out
 }
 
 fn should_skip_runtime_type_inference(

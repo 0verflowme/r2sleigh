@@ -4462,6 +4462,112 @@ mod tests {
     }
 
     #[test]
+    fn typed_callee_identity_signature_controls_direct_address_arity_and_return_type() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_function_names(HashMap::from([(
+            0x401050,
+            "sym.imp.memcpy@plt".to_string(),
+        )]));
+        ctx.set_known_function_signatures(HashMap::from([(
+            "memcpy".to_string(),
+            FunctionType {
+                return_type: CType::ptr(CType::Void),
+                params: vec![CType::void_ptr(), CType::void_ptr(), CType::UInt(64)],
+                variadic: false,
+            },
+        )]));
+
+        let callee = CExpr::Var("const:401050".to_string());
+        assert_eq!(ctx.non_variadic_call_arity(&callee), Some(3));
+        assert!(
+            ctx.known_signature_for_callee_expr(&callee).is_some(),
+            "direct address aliases should attach the r2types-owned known signature"
+        );
+        assert_eq!(
+            ctx.expr_type_hint(&CExpr::call(callee, vec![])),
+            Some(CType::ptr(CType::Void))
+        );
+    }
+
+    #[test]
+    fn known_signature_does_not_make_internal_call_imported() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_known_function_signatures(HashMap::from([(
+            "sym.helper".to_string(),
+            FunctionType {
+                return_type: CType::Int(32),
+                params: vec![CType::Int(32)],
+                variadic: false,
+            },
+        )]));
+
+        let callee = CExpr::Var("sym.helper".to_string());
+        assert_eq!(ctx.non_variadic_call_arity(&callee), Some(1));
+        assert!(
+            ctx.known_signature_for_callee_expr(&callee).is_some(),
+            "known signature remains available as type/arity evidence"
+        );
+        assert!(
+            !ctx.is_imported_call_target(&callee),
+            "type evidence must not be reclassified as import evidence"
+        );
+    }
+
+    #[test]
+    fn typed_callee_identity_signature_controls_void_call_detection() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_function_names(HashMap::from([
+            (0x401080, "sym.imp.free".to_string()),
+            (0x401090, "sym.helper".to_string()),
+        ]));
+        ctx.set_known_function_signatures(HashMap::from([
+            (
+                "free".to_string(),
+                FunctionType {
+                    return_type: CType::Void,
+                    params: vec![CType::void_ptr()],
+                    variadic: false,
+                },
+            ),
+            (
+                "sym.helper".to_string(),
+                FunctionType {
+                    return_type: CType::Int(32),
+                    params: Vec::new(),
+                    variadic: false,
+                },
+            ),
+        ]));
+
+        assert!(ctx.call_expr_returns_void(&CExpr::call(
+            CExpr::Var("const:401080".to_string()),
+            vec![CExpr::Var("ptr".to_string())],
+        )));
+        assert!(!ctx.call_expr_returns_void(&CExpr::call(
+            CExpr::Var("const:401090".to_string()),
+            vec![],
+        )));
+    }
+
+    #[test]
+    fn expr_type_hint_preserves_cast_and_paren_contracts() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_type_hints(HashMap::from([("value".to_string(), CType::UInt(64))]));
+
+        assert_eq!(
+            ctx.expr_type_hint(&CExpr::cast(
+                CType::Int(16),
+                CExpr::Var("value".to_string())
+            )),
+            Some(CType::Int(16))
+        );
+        assert_eq!(
+            ctx.expr_type_hint(&CExpr::Paren(Box::new(CExpr::Var("value".to_string())))),
+            Some(CType::UInt(64))
+        );
+    }
+
+    #[test]
     fn test_is_cpu_flag() {
         assert!(is_cpu_flag("cf"));
         assert!(is_cpu_flag("zf"));
@@ -9367,7 +9473,7 @@ mod tests {
             },
         )]));
 
-        assert!(ctx.is_imported_call_target(&CExpr::Var(
+        assert!(!ctx.is_imported_call_target(&CExpr::Var(
             "plain_helper".to_string()
         )));
         assert!(!ctx.is_imported_call_target(&CExpr::Var(

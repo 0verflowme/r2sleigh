@@ -1,5 +1,4 @@
 use super::*;
-use r2types::FunctionType;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct CertifiedCallArgs {
@@ -245,9 +244,21 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(super) fn lookup_known_signature(&self, callee_name: &str) -> Option<&FunctionType> {
-        let normalized = normalize_callee_name(callee_name);
-        self.inputs.known_function_signatures.get(&normalized)
+    pub(super) fn known_signature_for_callee_name(
+        &self,
+        callee_name: &str,
+    ) -> Option<r2types::FunctionType> {
+        self.callee_identity_for_name(callee_name)
+            .known_signature()
+            .cloned()
+    }
+
+    pub(super) fn known_signature_for_callee_expr(
+        &self,
+        callee: &CExpr,
+    ) -> Option<r2types::FunctionType> {
+        self.callee_identity_for_expr(callee)
+            .and_then(|identity| identity.known_signature().cloned())
     }
 
     pub(super) fn extract_callee_name(expr: &CExpr) -> Option<&str> {
@@ -262,27 +273,27 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn non_variadic_call_arity(&self, callee: &CExpr) -> Option<usize> {
-        let name = Self::extract_callee_name(callee)?;
+        let identity = self.callee_identity_for_expr(callee)?;
+        let cache_key = identity.primary_key();
         if let Some(cached) = self
             .non_variadic_call_arity_cache
             .borrow()
-            .get(name)
+            .get(&cache_key)
             .copied()
         {
             return cached;
         }
 
-        let known_arity = self
-            .lookup_known_signature(name)
-            .and_then(|sig| (!sig.variadic).then_some(sig.params.len()));
-        let summary_arity = self
-            .summary_helper_view_for_name(name)
+        let known_arity = identity.non_variadic_known_arity();
+        let summary_arity = identity
+            .aliases
+            .iter()
+            .find_map(|alias| self.summary_helper_view_for_name(alias))
             .and_then(|summary| summary.arg_count_hint);
 
-        let normalized = normalize_callee_name(name);
         let mut arena = TypeArena::default();
         let mut registry_arity = None;
-        for candidate in [name, normalized.as_str()] {
+        for candidate in identity.aliases.iter().map(String::as_str) {
             if let Some(resolved) =
                 self.signature_registry
                     .resolve(candidate, &mut arena, self.inputs.arch.ptr_size)
@@ -298,7 +309,7 @@ impl<'a> FoldingContext<'a> {
             .min();
         self.non_variadic_call_arity_cache
             .borrow_mut()
-            .insert(name.to_string(), result);
+            .insert(cache_key, result);
         result
     }
 
@@ -828,8 +839,8 @@ impl<'a> FoldingContext<'a> {
         callee: &CExpr,
         rendered_args: &[CExpr],
     ) -> Option<usize> {
-        let callee_name = Self::extract_callee_name(callee)?;
-        if normalize_callee_name(callee_name) != "printf" {
+        let identity = self.callee_identity_for_expr(callee)?;
+        if !identity.matches_normalized_name("printf") {
             return None;
         }
         let format_string = self.resolved_printf_format_string(rendered_args.first()?)?;

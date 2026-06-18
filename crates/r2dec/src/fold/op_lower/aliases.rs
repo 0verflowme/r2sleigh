@@ -449,14 +449,14 @@ impl<'a> FoldingContext<'a> {
         pure
     }
 
-    fn call_expr_returns_void(&self, expr: &CExpr) -> bool {
+    pub(super) fn call_expr_returns_void(&self, expr: &CExpr) -> bool {
         let CExpr::Call { func, .. } = expr else {
             return false;
         };
         let Some(name) = Self::extract_callee_name(func) else {
             return false;
         };
-        self.lookup_known_signature(name)
+        self.known_signature_for_callee_name(name)
             .is_some_and(|sig| matches!(sig.return_type, r2types::CTypeLike::Void))
     }
 
