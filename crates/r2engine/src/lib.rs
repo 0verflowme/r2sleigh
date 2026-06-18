@@ -3178,7 +3178,7 @@ pub fn native_worker_type_projection_for_identity(
     skipped_large_cfg: bool,
 ) -> Option<NativeWorkerTypeProjection> {
     let summary_name = identity.summary_probe_name();
-    let summary = native_worker_summary_seed(identity.function_addr, summary_name)?;
+    let summary = native_worker_summary_seed(identity.function_addr, &summary_name)?;
     let semantic_artifact =
         r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)?;
     if !semantic_artifact
@@ -4635,6 +4635,76 @@ mod tests {
     }
 
     #[test]
+    fn decompile_probe_decision_uses_strict_block_count_guard_boundary() {
+        let exactly_limit = (0..200)
+            .map(|idx| R2ILBlock::new(0x7000 + idx, 1))
+            .collect::<Vec<_>>();
+        let over_limit = (0..201)
+            .map(|idx| R2ILBlock::new(0x8000 + idx, 1))
+            .collect::<Vec<_>>();
+
+        let at_limit = decompile_probe_decision(&exactly_limit, 0x7000, "dbg.helper", "dbg.helper");
+        let over_limit = decompile_probe_decision(&over_limit, 0x8000, "dbg.helper", "dbg.helper");
+
+        assert!(!at_limit.summary_probe_skipped_large_cfg);
+        assert!(!at_limit.block_guarded);
+        assert!(over_limit.summary_probe_skipped_large_cfg);
+        assert!(over_limit.block_guarded);
+    }
+
+    #[test]
+    fn decompile_probe_decision_uses_strict_op_count_guard_boundary() {
+        let mut exactly_limit = R2ILBlock::new(0x9000, 1);
+        let mut over_limit = R2ILBlock::new(0xa000, 1);
+        for idx in 0..512 {
+            exactly_limit.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(0x300 + idx, 8),
+                src: r2il::Varnode::constant(idx, 8),
+            });
+            over_limit.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(0x600 + idx, 8),
+                src: r2il::Varnode::constant(idx, 8),
+            });
+        }
+        over_limit.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::unique(0x900, 8),
+            src: r2il::Varnode::constant(0x900, 8),
+        });
+
+        let at_limit =
+            decompile_probe_decision(&[exactly_limit], 0x9000, "dbg.helper", "dbg.helper");
+        let over_limit =
+            decompile_probe_decision(&[over_limit], 0xa000, "dbg.helper", "dbg.helper");
+
+        assert!(!at_limit.summary_probe_skipped_large_cfg);
+        assert!(!at_limit.block_guarded);
+        assert!(over_limit.summary_probe_skipped_large_cfg);
+        assert!(over_limit.block_guarded);
+    }
+
+    #[test]
+    fn decompile_probe_decision_probes_small_switch_cfg() {
+        let mut switch_block = R2ILBlock::new(0xb000, 4);
+        switch_block.switch_info = Some(r2il::SwitchInfo {
+            switch_addr: 0xb000,
+            min_val: 0,
+            max_val: 0,
+            default_target: None,
+            cases: vec![r2il::SwitchCase {
+                value: 0,
+                target: 0xb010,
+            }],
+        });
+        let blocks = vec![switch_block, R2ILBlock::new(0xb010, 1)];
+
+        let decision = decompile_probe_decision(&blocks, 0xb000, "dbg.helper", "dbg.helper");
+
+        assert!(!decision.summary_probe_skipped_large_cfg);
+        assert!(!decision.block_guarded);
+        assert!(decision.summary_probe_needed);
+    }
+
+    #[test]
     fn function_identity_keeps_ordered_aliases_for_summary_and_type_routes() {
         let identity = EngineFunctionIdentity::with_aliases(
             0x7000,
@@ -4659,6 +4729,19 @@ mod tests {
             !identity.has_summary_family(),
             "name aliases alone must not create summary-family applicability"
         );
+    }
+
+    #[test]
+    fn function_identity_reports_evidence_backed_summary_family() {
+        let identity = EngineFunctionIdentity::with_aliases(
+            0x401000,
+            "sym.imp.memcpy",
+            "sym.imp.memcpy",
+            ["fcn.00401000", "memcpy"],
+        );
+
+        assert!(identity.has_summary_family());
+        assert_eq!(identity.summary_probe_name(), "sym.imp.memcpy");
     }
 
     #[test]

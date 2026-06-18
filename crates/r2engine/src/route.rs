@@ -77,34 +77,22 @@ impl EngineFunctionIdentity {
         }
     }
 
-    pub fn summary_probe_name(&self) -> &str {
-        self.aliases
-            .iter()
-            .find(|alias| {
-                direct_named_worker_summary_applicability_for_name(self.function_addr, alias)
-                    .is_some()
-                    || (has_summary_applicability(self.function_addr, alias)
-                        && !r2sym::is_anonymous_semantic_route_name(alias))
-            })
-            .or_else(|| {
-                self.aliases
-                    .iter()
-                    .find(|alias| has_summary_applicability(self.function_addr, alias))
-            })
-            .map(String::as_str)
-            .unwrap_or_else(|| self.primary_name())
+    pub fn name_route_facts(&self) -> r2sym::NativeWorkerNameRouteFacts {
+        r2sym::NativeWorkerNameRouteFacts::for_candidates(
+            self.function_addr,
+            &self.display_name,
+            &self.canonical_name,
+            self.name_candidates(),
+            self.primary_name(),
+        )
+    }
+
+    pub fn summary_probe_name(&self) -> String {
+        self.name_route_facts().summary_probe_name
     }
 
     pub fn has_summary_family(&self) -> bool {
-        self.name_candidates()
-            .any(|name| has_summary_applicability(self.function_addr, name))
-    }
-
-    pub fn has_program_orchestrator_family(&self) -> bool {
-        self.name_candidates().any(|name| {
-            r2sym::has_program_orchestrator_summary_family(name)
-                && has_summary_applicability(self.function_addr, name)
-        })
+        self.name_route_facts().summary_family
     }
 }
 
@@ -327,9 +315,6 @@ pub struct DecompileProbeDecision {
     pub cfg_guard_reason: Option<String>,
     pub display_summary_family: bool,
     pub canonical_summary_family: bool,
-    pub display_program_orchestrator_family: bool,
-    pub canonical_program_orchestrator_family: bool,
-    pub program_orchestrator_guarded: bool,
     pub named_worker_guarded: bool,
     pub summary_probe_name: String,
     pub summary_probe_needed: bool,
@@ -413,79 +398,6 @@ fn raw_const_addr_for_preprobe(varnode: &r2il::Varnode) -> Option<u64> {
     matches!(varnode.space, r2il::SpaceId::Const | r2il::SpaceId::Ram).then_some(varnode.offset)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EngineNameRouteFacts {
-    display_summary_family: bool,
-    canonical_summary_family: bool,
-    display_program_orchestrator_family: bool,
-    canonical_program_orchestrator_family: bool,
-    summary_family: bool,
-    program_orchestrator_family: bool,
-    prefer_full_named_worker: bool,
-    direct_named_worker_guarded: bool,
-    summary_probe_name: String,
-}
-
-fn engine_name_route_facts(identity: &EngineFunctionIdentity) -> EngineNameRouteFacts {
-    let mut display_summary_family = false;
-    let mut canonical_summary_family = false;
-    let mut display_program_orchestrator_family = false;
-    let mut canonical_program_orchestrator_family = false;
-    let mut summary_family = false;
-    let mut program_orchestrator_family = false;
-    let mut prefer_full_named_worker = false;
-    let mut direct_named_worker_guarded = false;
-    let mut first_preferred_summary_name: Option<String> = None;
-    let mut first_supported_summary_name: Option<String> = None;
-
-    for name in identity.name_candidates() {
-        let policy =
-            r2sym::native_worker_summary_route_policy_for_name(identity.function_addr, name);
-        let summary_route_backed = policy.has_route_certificate();
-        let program_orchestrator = r2sym::has_program_orchestrator_summary_family(name);
-
-        if name == identity.display_name {
-            display_summary_family |= summary_route_backed;
-            display_program_orchestrator_family |= program_orchestrator && summary_route_backed;
-        }
-        if name == identity.canonical_name {
-            canonical_summary_family |= summary_route_backed;
-            canonical_program_orchestrator_family |= program_orchestrator && summary_route_backed;
-        }
-
-        summary_family |= summary_route_backed;
-        program_orchestrator_family |= program_orchestrator && summary_route_backed;
-        prefer_full_named_worker |= policy.should_prefer_full();
-        direct_named_worker_guarded |= policy.should_use_direct_summary();
-
-        if summary_route_backed {
-            first_supported_summary_name.get_or_insert_with(|| name.to_string());
-            if first_preferred_summary_name.is_none()
-                && (policy.should_use_direct_summary()
-                    || !r2sym::is_anonymous_semantic_route_name(name))
-            {
-                first_preferred_summary_name = Some(name.to_string());
-            }
-        }
-    }
-
-    let summary_probe_name = first_preferred_summary_name
-        .or(first_supported_summary_name)
-        .unwrap_or_else(|| identity.primary_name().to_string());
-
-    EngineNameRouteFacts {
-        display_summary_family,
-        canonical_summary_family,
-        display_program_orchestrator_family,
-        canonical_program_orchestrator_family,
-        summary_family,
-        program_orchestrator_family,
-        prefer_full_named_worker,
-        direct_named_worker_guarded,
-        summary_probe_name,
-    }
-}
-
 pub fn decompile_probe_decision(
     blocks: &[R2ILBlock],
     function_addr: u64,
@@ -500,7 +412,7 @@ pub fn decompile_probe_decision_for_identity(
     blocks: &[R2ILBlock],
     identity: &EngineFunctionIdentity,
 ) -> DecompileProbeDecision {
-    let name_facts = engine_name_route_facts(identity);
+    let name_facts = identity.name_route_facts();
     let cfg_guard_reason = cfg_guard_reason(blocks);
     let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
     let raw_cfg = raw_cfg_risk_summary_for_preprobe(blocks);
@@ -509,39 +421,24 @@ pub fn decompile_probe_decision_for_identity(
         && (raw_cfg.loop_count > 0
             || raw_cfg.back_edge_count > 0
             || raw_cfg.switch_block_count > 0);
-    let program_orchestrator_guarded = name_facts.program_orchestrator_family
-        && should_guard_program_orchestrator_decompile(blocks.len(), op_count);
-    let skipped_large_cfg_guarded = !name_facts.prefer_full_named_worker
-        && (cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512);
-    let named_worker_guarded = name_facts.summary_family
-        && (name_facts.direct_named_worker_guarded
-            || skipped_large_cfg_guarded
-            || program_orchestrator_guarded)
-        && (!name_facts.program_orchestrator_family || program_orchestrator_guarded);
+    let skipped_large_cfg_guarded =
+        cfg_guard_reason.is_some() || blocks.len() > 200 || op_count > 512;
+    let named_worker_guarded = name_facts.summary_family && skipped_large_cfg_guarded;
     let block_guarded = named_worker_guarded || skipped_large_cfg_guarded;
-    let summary_probe_needed = block_guarded
-        || cfg_guard_reason.is_some()
-        || name_facts.prefer_full_named_worker
-        || small_structural_worker_probe;
+    let summary_probe_needed =
+        block_guarded || cfg_guard_reason.is_some() || small_structural_worker_probe;
 
     DecompileProbeDecision {
         op_count,
         cfg_guard_reason,
         display_summary_family: name_facts.display_summary_family,
         canonical_summary_family: name_facts.canonical_summary_family,
-        display_program_orchestrator_family: name_facts.display_program_orchestrator_family,
-        canonical_program_orchestrator_family: name_facts.canonical_program_orchestrator_family,
-        program_orchestrator_guarded,
         named_worker_guarded,
         summary_probe_name: name_facts.summary_probe_name,
         summary_probe_needed,
         summary_probe_skipped_large_cfg: skipped_large_cfg_guarded,
         block_guarded,
     }
-}
-
-fn has_summary_applicability(function_addr: u64, name: &str) -> bool {
-    r2sym::native_worker_summary_route_policy_for_name(function_addr, name).has_route_certificate()
 }
 
 pub fn should_use_direct_named_native_worker_decompile(function_name: &str) -> bool {
