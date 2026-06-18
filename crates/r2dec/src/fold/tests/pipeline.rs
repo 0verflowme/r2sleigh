@@ -4393,6 +4393,88 @@ mod tests {
     }
 
     #[test]
+    fn typed_ssa_var_storage_filters_exclude_const_and_memory_sources() {
+        let ctx = FoldingContext::new(64);
+        let block = make_block(vec![
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("ram:401000", 0, 8),
+                val: make_var("const:1", 0, 4),
+            },
+            SSAOp::Store {
+                space: "ram".to_string(),
+                addr: make_var("ptr", 1, 8),
+                val: make_var("value", 1, 4),
+            },
+        ]);
+
+        let names = ctx.emitted_var_names(&[block]);
+        assert!(names.contains("ptr_1"), "{names:?}");
+        assert!(names.contains("value_1"), "{names:?}");
+        assert!(
+            names.iter().all(|name| {
+                !name.starts_with("const:") && !name.eq_ignore_ascii_case("ram:401000")
+            }),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn typed_ssa_var_storage_filters_dead_storage_classification() {
+        let ctx = FoldingContext::new(64);
+
+        assert!(ctx.is_dead(&make_var("tmp:dead", 1, 8)));
+        assert!(ctx.is_dead(&make_var("const:1", 0, 8)));
+        assert!(ctx.is_dead(&make_var("reg:10", 1, 8)));
+        assert!(!ctx.is_dead(&make_var("ram:401000", 0, 8)));
+        assert!(!ctx.is_dead(&make_var("sym.helper", 0, 8)));
+        assert!(!ctx.is_dead(&make_var("ordinary", 1, 8)));
+    }
+
+    #[test]
+    fn typed_ssa_var_storage_filters_resolve_memory_without_stealing_constant_path() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_function_names(HashMap::from([(0x401000, "target".to_string())]));
+
+        assert_eq!(
+            ctx.get_expr(&make_var("ram:401000", 0, 8)),
+            CExpr::Var("target".to_string())
+        );
+        assert_eq!(
+            ctx.get_expr(&make_var("const:402000", 0, 8)),
+            CExpr::IntLit(0x402000)
+        );
+    }
+
+    #[test]
+    fn typed_ssa_var_storage_filters_memory_copy_lowers_to_assignment() {
+        let ctx = FoldingContext::new(64);
+        let stmt = ctx
+            .op_to_stmt(&SSAOp::Copy {
+                dst: make_var("ram:401000", 1, 8),
+                src: make_var("value", 2, 8),
+            })
+            .expect("memory-destination copy should emit an assignment");
+
+        let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = stmt
+        else {
+            panic!("expected assignment expression");
+        };
+        assert!(
+            matches!(left.as_ref(), CExpr::Var(name) if name == "ram:401000_1"),
+            "{left:?}"
+        );
+        assert!(
+            matches!(right.as_ref(), CExpr::Var(name) if name == "value_2"),
+            "{right:?}"
+        );
+    }
+
+    #[test]
     fn test_dead_flag_elimination() {
         let rax_0 = make_var("RAX", 0, 8);
         let rax_1 = make_var("RAX", 1, 8);

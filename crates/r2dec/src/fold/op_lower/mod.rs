@@ -26,7 +26,7 @@ use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{
     CallSiteFact, CallSiteFacts, DecompilePrepFacts, MemoryDefFact, MemoryLocation, MemoryUseFact,
     ObjectKind, ObjectModel, PredicateFacts, PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar,
-    SsaArtifact, ValueId,
+    SSAVarNameKind, SsaArtifact, ValueId,
 };
 #[cfg(test)]
 use r2types::StackSlotKey;
@@ -1145,7 +1145,7 @@ impl<'a> FoldingContext<'a> {
                 // Also collect variable names used in the right-hand side
                 // (These appear as Var references in the output)
                 for src in op.sources() {
-                    if src.is_const() || src.name.starts_with("ram:") {
+                    if src.is_const() || src.is_memory() {
                         continue;
                     }
                     let _ = op_idx; // suppress unused warning
@@ -2531,9 +2531,9 @@ impl<'a> FoldingContext<'a> {
         }
 
         // Temporaries and reg: prefixed vars are always dead if unused
-        if var.name.starts_with("tmp:")
-            || var.name.starts_with("const:")
-            || var.name.starts_with("reg:")
+        if var.is_temp()
+            || var.is_const()
+            || matches!(var.name_kind(), SSAVarNameKind::RegisterAlias)
         {
             return true;
         }
@@ -2581,7 +2581,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         // Resolve ram:address references to known names
-        if var.name.starts_with("ram:")
+        if var.is_memory()
             && let Some(addr) = extract_call_address(&var.name)
         {
             if let Some(name) = self.lookup_function(addr) {
@@ -11878,7 +11878,7 @@ impl<'a> FoldingContext<'a> {
                     return None;
                 }
                 let lhs = self.assignment_lhs_expr(dst);
-                let rhs_base = if dst.name.starts_with("ram:") {
+                let rhs_base = if dst.is_memory() {
                     let raw = self.lookup_definition_raw(&src.display_name());
                     let direct = self.direct_definition_expr(&src.display_name());
                     let preferred = if raw
