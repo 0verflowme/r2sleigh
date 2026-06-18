@@ -193,6 +193,39 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
     key.to_string()
 }
 
+pub(crate) fn ssa_name_kind(name: &str) -> SSAVarNameKind {
+    let lower = name.to_ascii_lowercase();
+    SSAVarNameKind::classify(&lower)
+}
+
+pub(crate) fn is_temporary_name(name: &str) -> bool {
+    ssa_name_kind(name).is_temporary()
+}
+
+pub(crate) fn is_temporary_or_constant_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Constant
+    )
+}
+
+pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Constant | SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
+    )
+}
+
+pub(crate) fn is_low_signal_ssa_storage_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary
+            | SSAVarNameKind::Constant
+            | SSAVarNameKind::Memory
+            | SSAVarNameKind::AddressSpace
+    )
+}
+
 pub(crate) fn ssa_render_base_name(var: &SSAVar) -> String {
     match var.name_kind() {
         SSAVarNameKind::RegisterAlias => {
@@ -674,5 +707,28 @@ mod tests {
             "t11f80"
         );
         assert_eq!(ssa_render_base_name(&SSAVar::new("RAX", 1, 8)), "rax");
+    }
+
+    #[test]
+    fn ssa_name_kind_helpers_classify_prefixed_storage_names() {
+        for name in ["tmp:1", "TMP:1"] {
+            assert!(is_temporary_name(name));
+            assert!(is_temporary_or_constant_name(name));
+            assert!(!is_constant_or_memory_name(name));
+            assert!(is_low_signal_ssa_storage_name(name));
+        }
+        for name in ["const:1", "CONST:1"] {
+            assert!(!is_temporary_name(name));
+            assert!(is_temporary_or_constant_name(name));
+            assert!(is_constant_or_memory_name(name));
+            assert!(is_low_signal_ssa_storage_name(name));
+        }
+        for name in ["ram:401000", "RAM:401000", "space1:20"] {
+            assert!(!is_temporary_or_constant_name(name));
+            assert!(is_constant_or_memory_name(name));
+            assert!(is_low_signal_ssa_storage_name(name));
+        }
+        assert!(!is_constant_or_memory_name("rax"));
+        assert!(!is_low_signal_ssa_storage_name("rax"));
     }
 }

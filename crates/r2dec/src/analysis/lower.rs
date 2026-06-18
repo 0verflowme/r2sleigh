@@ -4,7 +4,10 @@ use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{SSAOp, SSAVar};
 use r2types::TypeOracle;
 
-use super::utils::{format_traced_name, parse_const_value, ssa_render_base_name};
+use super::utils::{
+    format_traced_name, is_constant_or_memory_name, is_low_signal_ssa_storage_name,
+    is_temporary_name, is_temporary_or_constant_name, parse_const_value, ssa_render_base_name,
+};
 use super::{
     BaseRef, NormalizedAddr, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
     ValueProvenance, ValueRef,
@@ -620,7 +623,7 @@ impl<'a> LowerCtx<'a> {
             .map(|(name, _)| name.clone())
             .min_by_key(|name| {
                 let generic = name.starts_with("local_") || name.starts_with("stack_");
-                let synthetic = name.starts_with("tmp:") || name.contains(':');
+                let synthetic = is_temporary_name(name) || name.contains(':');
                 (generic, synthetic, name.clone())
             })
     }
@@ -673,7 +676,7 @@ impl<'a> LowerCtx<'a> {
             return false;
         }
 
-        if var_name.starts_with("tmp:") || var_name.starts_with("const:") {
+        if is_temporary_or_constant_name(var_name) {
             return true;
         }
 
@@ -1083,9 +1086,7 @@ impl<'a> LowerCtx<'a> {
             }
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
-                let semantic_visible_name = !lower.starts_with("tmp:")
-                    && !lower.starts_with("const:")
-                    && !lower.starts_with("ram:")
+                let semantic_visible_name = !is_low_signal_ssa_storage_name(name)
                     && !lower.starts_with("local_")
                     && !lower.starts_with('t')
                     && !lower.starts_with('v');
@@ -1126,8 +1127,7 @@ impl<'a> LowerCtx<'a> {
                     let lower = name.to_ascii_lowercase();
                     let stack_placeholder =
                         lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
-                    !name.starts_with("const:")
-                        && !name.starts_with("ram:")
+                    !is_constant_or_memory_name(name)
                         && (!stack_placeholder
                             && (!self.stack_slot_name_map().contains_key(name)
                                 || lower.starts_with("local_")
@@ -1207,9 +1207,7 @@ impl<'a> LowerCtx<'a> {
         match expr {
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
-                let semantic_visible_name = !lower.starts_with("tmp:")
-                    && !lower.starts_with("const:")
-                    && !lower.starts_with("ram:")
+                let semantic_visible_name = !is_low_signal_ssa_storage_name(name)
                     && !lower.starts_with("local_")
                     && !lower.starts_with('t')
                     && !lower.starts_with('v');
@@ -1278,7 +1276,7 @@ impl<'a> LowerCtx<'a> {
         match expr {
             CExpr::Var(name) => {
                 let lower = name.to_ascii_lowercase();
-                !lower.starts_with("tmp:")
+                !is_temporary_name(name)
                     && !lower.starts_with('r')
                     && !lower.starts_with('e')
                     && !matches!(lower.as_str(), "stack" | "saved_fp")
@@ -1382,10 +1380,8 @@ fn is_low_signal_lowering_name(name: &str) -> bool {
             })
             .is_some_and(|tail| tail.is_empty() || tail.chars().all(|ch| ch.is_ascii_digit()))
     };
-    lower.starts_with("tmp:")
+    is_low_signal_ssa_storage_name(name)
         || lower.starts_with("tmp")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
         || is_temp_family('t')
         || is_temp_family('v')
 }
