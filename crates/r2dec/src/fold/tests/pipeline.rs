@@ -5175,6 +5175,19 @@ mod tests {
     }
 
     #[test]
+    fn semantic_index_storage_filter_uses_typed_ssa_name_kind_without_lowering() {
+        let ctx = FoldingContext::new(64);
+
+        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("const:4_0".to_string())));
+        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("ram:401000_0".to_string())));
+        assert!(ctx.is_semantic_index_expr(&CExpr::Var("CONST:4_0".to_string())));
+        assert!(ctx.is_semantic_index_expr(&CExpr::Var("idx_1".to_string())));
+        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("stack".to_string())));
+        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("saved_fp".to_string())));
+        assert!(!ctx.is_semantic_index_expr(&CExpr::Var("stack_8".to_string())));
+    }
+
+    #[test]
     fn test_member_access_uses_subscript_base_when_base_has_generic_ptr_arith_definition() {
         let idx = make_var("arg2", 0, 4);
         let base = make_var("tmp:9400", 1, 8);

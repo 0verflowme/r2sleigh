@@ -5975,10 +5975,11 @@ impl<'a> FoldingContext<'a> {
                 .map(|inner| self.is_semantic_index_expr(&inner))
                 .unwrap_or_else(|| {
                     let lower = name.to_ascii_lowercase();
+                    let name_kind = SSAVarNameKind::classify(name);
                     let stack_placeholder =
                         lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
-                    !name.starts_with("const:")
-                        && !name.starts_with("ram:")
+                    !name_kind.is_constant()
+                        && !name_kind.is_memory()
                         && (!stack_placeholder
                             && (self.stack_slot_provenance_for_name(name).is_none()
                                 || lower.starts_with("local_")
