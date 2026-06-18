@@ -4393,6 +4393,17 @@ mod tests {
     }
 
     #[test]
+    fn generated_carrier_name_uses_colon_rule_for_raw_storage_names() {
+        assert!(is_generated_carrier_name("tmp:raw_1"));
+        assert!(is_generated_carrier_name("unique:raw_1"));
+        assert!(is_generated_carrier_name("space1:20"));
+        assert!(is_generated_carrier_name("value_3"));
+        assert!(is_generated_carrier_name("t19"));
+        assert!(!is_generated_carrier_name("tmp_loop"));
+        assert!(!is_generated_carrier_name("rax_1"));
+    }
+
+    #[test]
     fn typed_ssa_var_storage_filters_exclude_const_and_memory_sources() {
         let ctx = FoldingContext::new(64);
         let block = make_block(vec![

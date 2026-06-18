@@ -343,8 +343,6 @@ fn expr_is_side_effect_free_for_carrier_gate(expr: &CExpr) -> bool {
 fn is_generated_carrier_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.starts_with("value_")
-        || lower.starts_with("tmp:")
-        || lower.starts_with("unique:")
         || lower.contains(':')
         || (lower.starts_with('t') && lower[1..].chars().all(|ch| ch.is_ascii_digit()))
 }
