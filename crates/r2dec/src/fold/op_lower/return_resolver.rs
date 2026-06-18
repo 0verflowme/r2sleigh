@@ -1,5 +1,5 @@
 use super::*;
-use crate::analysis::utils::ssa_render_base_name;
+use crate::analysis::utils::{is_temporary_or_constant_name, ssa_render_base_name};
 
 impl<'a> FoldingContext<'a> {
     fn typed_integer_literal_expr_in_context(
@@ -733,15 +733,12 @@ impl<'a> FoldingContext<'a> {
             .find_ssa_name_for_rendered_alias(var_name)
             .filter(|ssa_name| ssa_name != var_name);
         let semantic_name = ssa_name.as_deref().unwrap_or(var_name);
-        let lower = var_name.to_lowercase();
-        let semantic_lower = semantic_name.to_lowercase();
-        if lower.starts_with("const:")
-            || lower.starts_with("tmp:")
-            || semantic_lower.starts_with("const:")
-            || semantic_lower.starts_with("tmp:")
-        {
+        if is_temporary_or_constant_name(var_name) || is_temporary_or_constant_name(semantic_name) {
             return true;
         }
+
+        let lower = var_name.to_lowercase();
+        let semantic_lower = semantic_name.to_lowercase();
         if self.inputs.arch.is_return_register_name(&lower) {
             return true;
         }

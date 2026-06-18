@@ -18236,6 +18236,102 @@ mod tests {
     }
 
     #[test]
+    fn return_inline_ssa_storage_carriers_inline_raw_tmp_and_const() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            "tmp:ret_1".to_string(),
+            CExpr::binary(
+                BinaryOp::BitXor,
+                CExpr::Var("value".to_string()),
+                CExpr::IntLit(1),
+            ),
+        );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert("const:1_0".to_string(), CExpr::IntLit(1));
+
+        assert_eq!(
+            ctx.resolve_return_candidate(&CExpr::Var("tmp:ret_1".to_string())),
+            CExpr::binary(
+                BinaryOp::BitXor,
+                CExpr::Var("value".to_string()),
+                CExpr::IntLit(1)
+            )
+        );
+        assert_eq!(
+            ctx.resolve_return_candidate(&CExpr::Var("const:1_0".to_string())),
+            CExpr::IntLit(1)
+        );
+    }
+
+    #[test]
+    fn return_inline_ssa_storage_carriers_require_raw_or_mapped_alias() {
+        let mut unmapped = make_x86_64_ctx();
+        unmapped
+            .state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert("tmp:3e480_1".to_string(), CExpr::IntLit(7));
+
+        assert_eq!(
+            unmapped.expand_return_expr(
+                &CExpr::Var("value_3e480".to_string()),
+                0,
+                &mut HashSet::new()
+            ),
+            CExpr::Var("value_3e480".to_string())
+        );
+        assert_eq!(
+            unmapped.expand_return_expr(
+                &CExpr::Var("t42_1".to_string()),
+                0,
+                &mut HashSet::new()
+            ),
+            CExpr::Var("t42_1".to_string())
+        );
+        unmapped
+            .state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert("ordinary_alias".to_string(), CExpr::IntLit(9));
+        assert_eq!(
+            unmapped.expand_return_expr(
+                &CExpr::Var("ordinary_alias".to_string()),
+                0,
+                &mut HashSet::new()
+            ),
+            CExpr::Var("ordinary_alias".to_string())
+        );
+
+        let mut mapped = make_x86_64_ctx();
+        mapped
+            .state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert("tmp:3e480_1".to_string(), CExpr::IntLit(7));
+        mapped
+            .state
+            .analysis_ctx
+            .use_info
+            .var_aliases
+            .insert("tmp:3e480_1".to_string(), "value_3e480".to_string());
+
+        assert_eq!(
+            mapped.expand_return_expr(
+                &CExpr::Var("value_3e480".to_string()),
+                0,
+                &mut HashSet::new()
+            ),
+            CExpr::IntLit(7)
+        );
+    }
+
+    #[test]
     fn prepared_imported_arg_rewrite_canonicalizes_stack_home_aliases() {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
