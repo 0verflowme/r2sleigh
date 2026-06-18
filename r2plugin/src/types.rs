@@ -26,6 +26,7 @@ pub(crate) type FunctionAnalysis = r2engine::EngineAnalysis;
 pub(crate) type FunctionAnalysisArtifact = r2engine::EngineAnalysisArtifact;
 
 type FunctionAnalysisCacheKey = r2engine::AnalysisCacheKey;
+#[cfg(test)]
 type FunctionArtifactCacheKey = r2engine::ArtifactCacheKey;
 
 fn hash_debug_payload<T: std::fmt::Debug>(value: &T) -> u64 {
@@ -65,13 +66,15 @@ fn function_analysis_cache_key_parts(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn function_artifact_cache_key_parts_hashed(
     function_name: &str,
     function_addr: u64,
     arch: Option<&ArchSpec>,
     blocks: &[R2ILBlock],
     semantic_metadata_enabled: bool,
-    external_context_hash: u64,
+    typed_context_hash: u64,
+    assumptions_hash: u64,
     interproc_scope_hash: u64,
     interproc_max_iterations: usize,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
@@ -81,9 +84,9 @@ fn function_artifact_cache_key_parts_hashed(
         hash_string_payload(function_name),
         hash_optional_arch(arch),
         hash_blocks(blocks),
-        external_context_hash,
-        hash_value(&("semantic-metadata-enabled", semantic_metadata_enabled)),
-        hash_string_payload("function-analysis-artifact-v1"),
+        typed_context_hash,
+        assumptions_hash,
+        r2engine::function_analysis_depth_hash(semantic_metadata_enabled),
     );
     let interproc_budget_hash = hash_value(&(
         "interproc-scope-budget-v1",
@@ -110,13 +113,16 @@ fn function_artifact_cache_key_parts(
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<FunctionArtifactCacheKey> {
     let ptr_bits = arch.map(effective_ptr_bits).unwrap_or(64);
+    let parsed = r2types::parse_external_context_json(external_context_json, ptr_bits);
+    let external_context_fallback_hash = hash_string_payload(external_context_json);
     function_artifact_cache_key_parts_hashed(
         function_name,
         0,
         arch,
         blocks,
         semantic_metadata_enabled,
-        session_context_identity_hash(external_context_json, ptr_bits),
+        session_context_identity_hash_from_parsed(&parsed, external_context_fallback_hash),
+        r2engine::assumptions_identity_hash(&parsed.assumptions),
         interproc_scope_hash,
         interproc_max_iterations,
         symbolic_scope,
@@ -129,6 +135,7 @@ fn session_context_identity_hash(external_context_json: &str, ptr_bits: u32) -> 
     session_context_identity_hash_from_parsed(&parsed, hash_string_payload(external_context_json))
 }
 
+#[cfg(test)]
 fn session_context_identity_hash_from_parsed(
     parsed: &r2types::ParsedExternalContext,
     fallback_hash: u64,
@@ -338,27 +345,6 @@ pub(crate) fn build_function_input<'a>(
     })
 }
 
-fn function_artifact_cache_key_with_parsed_context_and_interproc_hash(
-    input: &FunctionInput<'_>,
-    parsed_context: &r2types::ParsedExternalContext,
-    external_context_fallback_hash: u64,
-    interproc_scope_hash: u64,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionArtifactCacheKey> {
-    function_artifact_cache_key_parts_hashed(
-        &input.function_name,
-        input.function_addr,
-        input.ctx.arch,
-        input.blocks.as_slice(),
-        input.ctx.semantic_metadata_enabled,
-        session_context_identity_hash_from_parsed(parsed_context, external_context_fallback_hash),
-        interproc_scope_hash,
-        interproc_max_iterations,
-        symbolic_scope,
-    )
-}
-
 pub(crate) fn function_analysis_artifact_cache_identity_hash_with_parsed_context_and_scope_facts(
     input: &FunctionInput<'_>,
     parsed_context: &r2types::ParsedExternalContext,
@@ -367,15 +353,24 @@ pub(crate) fn function_analysis_artifact_cache_identity_hash_with_parsed_context
     interproc_max_iterations: usize,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<u64> {
-    function_artifact_cache_key_with_parsed_context_and_interproc_hash(
+    let reg_type_hints = if input.ctx.semantic_metadata_enabled {
+        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let request = engine_analyze_request_with_scope_facts(
         input,
         parsed_context,
         external_context_fallback_hash,
-        scope_facts.identity_hash(),
+        scope_facts,
         interproc_max_iterations,
         symbolic_scope,
-    )
-    .map(|key| hash_value(&key))
+        reg_type_hints,
+        None,
+        r2engine::EngineSemanticMode::Full,
+        true,
+    );
+    Some(hash_value(&r2engine::function_artifact_cache_key(&request)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3493,6 +3488,7 @@ mod tests {
             &blocks,
             true,
             session_context_identity_hash("{}", 64),
+            0,
             interproc_hash,
             1,
             None,
@@ -3505,6 +3501,7 @@ mod tests {
             &blocks,
             true,
             session_context_identity_hash("{}", 64),
+            0,
             interproc_hash,
             1,
             None,

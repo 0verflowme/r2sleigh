@@ -51,7 +51,7 @@ pub use stable_hash::{
     stable_blocks_hash, stable_fnv1a_bytes, stable_fnv1a_debug_hash, stable_fnv1a_hash,
 };
 
-pub const ENGINE_SCHEMA_VERSION: u32 = 1;
+pub const ENGINE_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_ENGINE_CACHE_LIMIT: usize = 256;
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
@@ -2172,11 +2172,8 @@ pub fn function_artifact_cache_key(request: &EngineAnalyzeRequest) -> ArtifactCa
             &request.parsed_context,
             request.external_context_fallback_hash,
         ),
-        stable_fnv1a_hash(&(
-            "semantic-metadata-enabled",
-            request.semantic_metadata_enabled,
-        )),
-        stable_fnv1a_hash("function-analysis-artifact-v1"),
+        assumptions_identity_hash(&request.parsed_context.assumptions),
+        function_analysis_depth_hash(request.semantic_metadata_enabled),
     );
     ArtifactCacheKey::from_hashes(
         analysis,
@@ -2193,6 +2190,22 @@ pub fn function_artifact_cache_key(request: &EngineAnalyzeRequest) -> ArtifactCa
         )),
         r2sym::stable_scope_hash(request.symbolic_scope.as_ref()),
     )
+}
+
+pub fn assumptions_identity_hash(assumptions: &r2ssa::AssumptionSet) -> u64 {
+    if assumptions.is_empty() {
+        return 0;
+    }
+    let mut item_hashes = assumptions
+        .iter()
+        .map(stable_fnv1a_debug_hash)
+        .collect::<Vec<_>>();
+    item_hashes.sort_unstable();
+    stable_fnv1a_hash(&("r2ssa-assumptions-v1", item_hashes))
+}
+
+pub fn function_analysis_depth_hash(semantic_metadata_enabled: bool) -> u64 {
+    stable_fnv1a_hash(&("function-analysis-artifact-v2", semantic_metadata_enabled))
 }
 
 pub fn session_context_identity_hash_from_parsed(
@@ -3701,6 +3714,18 @@ mod tests {
         }
     }
 
+    fn cache_register_assumption(id: &str, name: &str, value: u64) -> r2ssa::AnalysisAssumption {
+        r2ssa::AnalysisAssumption {
+            id: Some(id.to_string()),
+            subject: r2ssa::AssumptionSubject::Register {
+                name: name.to_string(),
+            },
+            value: r2ssa::AssumptionValue::Constant { value },
+            scope: r2ssa::AssumptionScope::Query,
+            provenance: r2ssa::AssumptionProvenance::User,
+        }
+    }
+
     #[test]
     fn opaque_typedef_signature_is_not_a_concrete_layout_hint() {
         let mut parsed = r2types::ParsedExternalContext {
@@ -4291,6 +4316,79 @@ mod tests {
 
         assert_ne!(first, changed_assumption);
         assert_ne!(first, changed_context);
+    }
+
+    #[test]
+    fn function_artifact_cache_key_hashes_parsed_assumptions_separately() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let parsed_context = r2types::ParsedExternalContext {
+            context_schema_version: Some(1),
+            context_dirty_epoch: Some(7),
+            type_dirty_epoch: Some(3),
+            context_hash: Some(42),
+            ..r2types::ParsedExternalContext::default()
+        };
+        let base_request = EngineAnalyzeRequest {
+            function_name: "sym.main".to_string(),
+            function_addr: 0x401000,
+            blocks,
+            arch: None,
+            ptr_bits: 64,
+            semantic_metadata_enabled: false,
+            reg_type_hints: HashMap::new(),
+            parsed_context,
+            external_context_fallback_hash: 0xfeed,
+            scope_facts: InterprocScopeFacts::empty(),
+            interproc_max_iterations: 1,
+            symbolic_scope: None,
+            precomputed_semantic_artifact: None,
+            semantic_mode: EngineSemanticMode::Full,
+            include_interproc_summary_set: true,
+        };
+        let base = function_artifact_cache_key(&base_request);
+
+        let mut changed_assumption_request = base_request.clone();
+        changed_assumption_request.parsed_context.assumptions =
+            r2ssa::AssumptionSet::new(vec![cache_register_assumption("rdi-one", "rdi", 1)]);
+        let changed_assumption = function_artifact_cache_key(&changed_assumption_request);
+
+        assert_eq!(
+            base.analysis.typed_context_hash,
+            changed_assumption.analysis.typed_context_hash
+        );
+        assert_ne!(
+            base.analysis.assumptions_hash,
+            changed_assumption.analysis.assumptions_hash
+        );
+        assert_ne!(base, changed_assumption);
+
+        let mut reordered_first = base_request.clone();
+        reordered_first.parsed_context.assumptions = r2ssa::AssumptionSet::new(vec![
+            cache_register_assumption("rdi-one", "rdi", 1),
+            cache_register_assumption("rsi-two", "rsi", 2),
+        ]);
+        let mut reordered_second = base_request.clone();
+        reordered_second.parsed_context.assumptions = r2ssa::AssumptionSet::new(vec![
+            cache_register_assumption("rsi-two", "rsi", 2),
+            cache_register_assumption("rdi-one", "rdi", 1),
+        ]);
+        assert_eq!(
+            function_artifact_cache_key(&reordered_first),
+            function_artifact_cache_key(&reordered_second),
+            "assumption identity should be deterministic and order-insensitive"
+        );
+
+        let mut changed_config_request = base_request;
+        changed_config_request.semantic_metadata_enabled = true;
+        let changed_config = function_artifact_cache_key(&changed_config_request);
+        assert_eq!(
+            base.analysis.assumptions_hash,
+            changed_config.analysis.assumptions_hash
+        );
+        assert_ne!(
+            base.analysis.analysis_depth_hash,
+            changed_config.analysis.analysis_depth_hash
+        );
     }
 
     #[test]
