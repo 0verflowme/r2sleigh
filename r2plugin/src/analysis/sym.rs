@@ -1720,10 +1720,14 @@ fn is_flag_like_symbol(name: &str) -> bool {
 
 fn is_public_solution_symbol(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    if lower.starts_with("tmp:")
-        || lower.starts_with("tmp")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
+    let kind = r2ssa::SSAVarNameKind::classify(&lower);
+    if matches!(
+        kind,
+        r2ssa::SSAVarNameKind::Temporary
+            | r2ssa::SSAVarNameKind::Constant
+            | r2ssa::SSAVarNameKind::Memory
+            | r2ssa::SSAVarNameKind::AddressSpace
+    ) || lower.starts_with("tmp")
         || lower.starts_with("unique:")
     {
         return false;
@@ -3364,7 +3368,14 @@ mod tests {
     #[test]
     fn public_solution_filter_hides_temps_and_flags_but_keeps_abi_inputs() {
         for hidden in [
-            "tmp:1234", "TMPZR", "TMPNG", "CY", "OV", "const:4", "ram:1000",
+            "tmp:1234",
+            "TMPZR",
+            "TMPNG",
+            "CY",
+            "OV",
+            "const:4",
+            "ram:1000",
+            "space1:20",
         ] {
             assert!(
                 !is_public_solution_symbol(hidden),

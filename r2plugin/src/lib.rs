@@ -8845,10 +8845,14 @@ fn is_filtered_cpu_flag_name_lower(name: &str) -> bool {
 
 fn is_real_reg(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    !lower.starts_with("tmp:")
-        && !lower.starts_with("const:")
-        && !lower.starts_with("ram:")
-        && !is_filtered_cpu_flag_name_lower(&lower)
+    let kind = r2ssa::SSAVarNameKind::classify(&lower);
+    !matches!(
+        kind,
+        r2ssa::SSAVarNameKind::Temporary
+            | r2ssa::SSAVarNameKind::Constant
+            | r2ssa::SSAVarNameKind::Memory
+            | r2ssa::SSAVarNameKind::AddressSpace
+    ) && !is_filtered_cpu_flag_name_lower(&lower)
 }
 
 /// Annotation entry for analyze_fcn writeback.
@@ -9157,7 +9161,7 @@ mod tests {
             );
         }
 
-        for synthetic in ["tmp:10", "const:4", "ram:1000", "TMP:5"] {
+        for synthetic in ["tmp:10", "const:4", "ram:1000", "space1:20", "TMP:5"] {
             assert!(
                 !is_real_reg(synthetic),
                 "{synthetic} should be excluded as non-register data"
