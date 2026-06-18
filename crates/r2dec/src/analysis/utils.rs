@@ -209,6 +209,20 @@ pub(crate) fn is_temporary_or_constant_name(name: &str) -> bool {
     )
 }
 
+pub(crate) fn is_temporary_or_memory_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Memory
+    )
+}
+
+pub(crate) fn is_temporary_constant_or_memory_name(name: &str) -> bool {
+    matches!(
+        ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Constant | SSAVarNameKind::Memory
+    )
+}
+
 pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
     matches!(
         ssa_name_kind(name),
@@ -714,20 +728,34 @@ mod tests {
         for name in ["tmp:1", "TMP:1"] {
             assert!(is_temporary_name(name));
             assert!(is_temporary_or_constant_name(name));
+            assert!(is_temporary_or_memory_name(name));
+            assert!(is_temporary_constant_or_memory_name(name));
             assert!(!is_constant_or_memory_name(name));
             assert!(is_low_signal_ssa_storage_name(name));
         }
         for name in ["const:1", "CONST:1"] {
             assert!(!is_temporary_name(name));
             assert!(is_temporary_or_constant_name(name));
+            assert!(!is_temporary_or_memory_name(name));
+            assert!(is_temporary_constant_or_memory_name(name));
             assert!(is_constant_or_memory_name(name));
             assert!(is_low_signal_ssa_storage_name(name));
         }
-        for name in ["ram:401000", "RAM:401000", "space1:20"] {
+        for name in ["ram:401000", "RAM:401000"] {
             assert!(!is_temporary_or_constant_name(name));
+            assert!(is_temporary_or_memory_name(name));
+            assert!(is_temporary_constant_or_memory_name(name));
             assert!(is_constant_or_memory_name(name));
             assert!(is_low_signal_ssa_storage_name(name));
         }
+        assert!(!is_temporary_or_constant_name("space1:20"));
+        assert!(!is_temporary_or_memory_name("space1:20"));
+        assert!(!is_temporary_constant_or_memory_name("space1:20"));
+        assert!(is_constant_or_memory_name("space1:20"));
+        assert!(is_low_signal_ssa_storage_name("space1:20"));
+
+        assert!(!is_temporary_or_memory_name("rax"));
+        assert!(!is_temporary_constant_or_memory_name("rax"));
         assert!(!is_constant_or_memory_name("rax"));
         assert!(!is_low_signal_ssa_storage_name("rax"));
     }

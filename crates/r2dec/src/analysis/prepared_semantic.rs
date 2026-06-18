@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::function::DefLocation;
 use r2ssa::{
-    CompareKind, InterprocSummarySet, MemoryLocation, ObjectKind, SSAOp, SSAVar, SsaArtifact,
-    ValueId,
+    CompareKind, InterprocSummarySet, MemoryLocation, ObjectKind, SSAOp, SSAVar, SSAVarNameKind,
+    SsaArtifact, ValueId,
 };
 use r2types::{
     CalleeFact, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
@@ -17,7 +17,8 @@ use super::{
     StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
 };
 use crate::analysis::utils::{
-    compare_const_to_expr, compare_const_to_expr_with_width, is_cpu_flag, parse_const_value,
+    compare_const_to_expr, compare_const_to_expr_with_width, is_cpu_flag,
+    is_temporary_constant_or_memory_name, is_temporary_or_memory_name, parse_const_value,
 };
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::fold::SSABlock;
@@ -516,9 +517,8 @@ fn prepared_render_definition_is_safe(expr: &CExpr, env: &PassEnv<'_>) -> bool {
             || base == ret
             || arg_regs.contains(base)
             || caller_saved.contains(base)
-            || lower.starts_with("tmp:")
+            || is_temporary_or_memory_name(name)
             || lower.starts_with("unique:")
-            || lower.starts_with("ram:")
         {
             safe = false;
         }
@@ -528,13 +528,13 @@ fn prepared_render_definition_is_safe(expr: &CExpr, env: &PassEnv<'_>) -> bool {
 
 fn is_self_render_definition(dst: &SSAVar, expr: &CExpr) -> bool {
     let dst_display = dst.display_name();
-    let dst_rendered = if dst.name.starts_with("tmp:") {
+    let dst_rendered = if let Some(tmp_name) = SSAVarNameKind::strip_temporary_prefix(&dst.name) {
         let suffix = if dst.version > 0 {
             format!("_{}", dst.version)
         } else {
             String::new()
         };
-        format!("t{}{}", dst.name.trim_start_matches("tmp:"), suffix)
+        format!("t{}{}", tmp_name, suffix)
     } else if dst.version > 0 {
         format!("{}_{}", dst.name.to_ascii_lowercase(), dst.version)
     } else {
@@ -2597,11 +2597,7 @@ fn prepared_fallback_visible_expr(var: &SSAVar) -> Option<CExpr> {
     }
 
     let lower = var.name.to_ascii_lowercase();
-    if lower.starts_with("tmp:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("unique:")
-    {
+    if is_temporary_constant_or_memory_name(&var.name) || lower.starts_with("unique:") {
         return None;
     }
 
@@ -3629,9 +3625,18 @@ fn param_alias_for_name(name: &str, env: &PassEnv<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use r2il::{R2ILBlock, R2ILOp, Varnode};
 
     fn test_var(name: &str, version: u32, size: u32) -> SSAVar {
         SSAVar::new(name, version, size)
+    }
+
+    fn test_prepared_artifact() -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        SsaArtifact::from_blocks(&[block], None).expect("prepared SSA artifact")
     }
 
     #[test]
@@ -3738,6 +3743,212 @@ mod tests {
                 CExpr::Var("b".to_string())
             )
         );
+    }
+
+    #[test]
+    fn prepared_view_build_preserves_param_alias_contract() {
+        let prepared = test_prepared_artifact();
+        let summaries = InterprocSummarySet::default();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::from([
+            ("rdi".to_string(), "argc".to_string()),
+            ("rsi".to_string(), "argv".to_string()),
+        ]);
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            interproc_summary_set: Some(&summaries),
+            abi_arg_regs: &abi_arg_regs,
+            ret_reg_name: "rax",
+            function_names: &function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        assert_eq!(view.param_alias_by_reg, param_register_aliases);
+        assert_eq!(view.param_rank_by_alias.get("argc"), Some(&0));
+        assert_eq!(view.param_rank_by_alias.get("argv"), Some(&1));
+    }
+
+    #[test]
+    fn prepared_runtime_facts_preserve_env_type_hints() {
+        let prepared = test_prepared_artifact();
+        let view = PreparedSemanticView::default();
+        let blocks: Vec<SSABlock> = Vec::new();
+        let function_names = HashMap::new();
+        let strings = HashMap::new();
+        let symbols = HashMap::new();
+        let arg_regs = Vec::new();
+        let param_register_aliases = HashMap::new();
+        let caller_saved_regs = HashSet::new();
+        let type_hints = HashMap::from([("result".to_string(), crate::ast::CType::u64())]);
+        let env = PassEnv {
+            ptr_size: 8,
+            sp_name: "rsp",
+            fp_name: "rbp",
+            ret_reg_name: "rax",
+            function_names: &function_names,
+            strings: &strings,
+            symbols: &symbols,
+            arg_regs: &arg_regs,
+            param_register_aliases: &param_register_aliases,
+            caller_saved_regs: &caller_saved_regs,
+            type_hints: &type_hints,
+            type_oracle: None,
+        };
+
+        let facts = build_prepared_runtime_facts(&blocks, &env, &prepared, &view);
+
+        assert_eq!(facts.use_info.type_hints, type_hints);
+    }
+
+    #[test]
+    fn prepared_definition_safety_uses_typed_storage_classification() {
+        let function_names = HashMap::new();
+        let strings = HashMap::new();
+        let symbols = HashMap::new();
+        let arg_regs = vec!["RDI".to_string()];
+        let param_register_aliases = HashMap::new();
+        let caller_saved_regs = HashSet::from(["RCX".to_string()]);
+        let type_hints: HashMap<String, crate::ast::CType> = HashMap::new();
+        let env = PassEnv {
+            ptr_size: 8,
+            sp_name: "RSP",
+            fp_name: "RBP",
+            ret_reg_name: "RAX",
+            function_names: &function_names,
+            strings: &strings,
+            symbols: &symbols,
+            arg_regs: &arg_regs,
+            param_register_aliases: &param_register_aliases,
+            caller_saved_regs: &caller_saved_regs,
+            type_hints: &type_hints,
+            type_oracle: None,
+        };
+
+        assert!(!prepared_render_definition_is_safe(
+            &CExpr::Var("tmp:1".to_string()),
+            &env
+        ));
+        assert!(!prepared_render_definition_is_safe(
+            &CExpr::Var("ram:401000".to_string()),
+            &env
+        ));
+        assert!(!prepared_render_definition_is_safe(
+            &CExpr::Var("unique:1".to_string()),
+            &env
+        ));
+        assert!(!prepared_render_definition_is_safe(
+            &CExpr::Var("RDI".to_string()),
+            &env
+        ));
+        assert!(!prepared_render_definition_is_safe(
+            &CExpr::Var("RBP".to_string()),
+            &env
+        ));
+        assert!(!prepared_render_definition_is_safe(
+            &CExpr::Var("RAX".to_string()),
+            &env
+        ));
+        assert!(!prepared_render_definition_is_safe(
+            &CExpr::Var("RCX".to_string()),
+            &env
+        ));
+        assert!(prepared_render_definition_is_safe(
+            &CExpr::Var("const:1".to_string()),
+            &env
+        ));
+        assert!(prepared_render_definition_is_safe(
+            &CExpr::Var("space1:20".to_string()),
+            &env
+        ));
+        assert!(prepared_render_definition_is_safe(
+            &CExpr::Var("value".to_string()),
+            &env
+        ));
+    }
+
+    #[test]
+    fn prepared_fallback_visible_expr_rejects_only_unrenderable_storage_names() {
+        assert_eq!(
+            prepared_fallback_visible_expr(&SSAVar::constant(1, 8)),
+            None
+        );
+        assert_eq!(
+            prepared_fallback_visible_expr(&test_var("tmp:1", 0, 8)),
+            None
+        );
+        assert_eq!(
+            prepared_fallback_visible_expr(&test_var("ram:401000", 0, 8)),
+            None
+        );
+        assert_eq!(
+            prepared_fallback_visible_expr(&test_var("unique:1", 0, 8)),
+            None
+        );
+        assert_eq!(
+            prepared_fallback_visible_expr(&test_var("space1:20", 0, 8)),
+            Some(CExpr::Var("space1:20".to_string()))
+        );
+        assert_eq!(
+            prepared_fallback_visible_expr(&test_var("rax", 0, 8)),
+            Some(CExpr::Var("rax".to_string()))
+        );
+    }
+
+    #[test]
+    fn self_render_definition_uses_typed_temporary_render_name() {
+        let dst = test_var("tmp:11f80", 2, 8);
+        assert!(is_self_render_definition(
+            &dst,
+            &CExpr::Var("t11f80_2".to_string())
+        ));
+        assert!(is_self_render_definition(
+            &dst,
+            &CExpr::Var(dst.display_name())
+        ));
+        assert!(!is_self_render_definition(
+            &dst,
+            &CExpr::Var("t11f80_3".to_string())
+        ));
+
+        let version_zero_temp = test_var("tmp:11f80", 0, 8);
+        assert!(is_self_render_definition(
+            &version_zero_temp,
+            &CExpr::Var("t11f80".to_string())
+        ));
+        assert!(!is_self_render_definition(
+            &version_zero_temp,
+            &CExpr::Var("t11f80_0".to_string())
+        ));
+
+        let versioned_reg = test_var("rax", 2, 8);
+        assert!(is_self_render_definition(
+            &versioned_reg,
+            &CExpr::Var("rax_2".to_string())
+        ));
+        assert!(!is_self_render_definition(
+            &versioned_reg,
+            &CExpr::Var("rax".to_string())
+        ));
+
+        let version_zero_reg = test_var("rbx", 0, 8);
+        assert!(is_self_render_definition(
+            &version_zero_reg,
+            &CExpr::Var("rbx".to_string())
+        ));
+        assert!(!is_self_render_definition(
+            &version_zero_reg,
+            &CExpr::Var("rbx_0".to_string())
+        ));
     }
 
     #[test]
