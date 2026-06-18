@@ -588,6 +588,8 @@ pub struct EngineSymbolicSummaryResponse<'ctx> {
     pub summary: r2sym::SymbolicFunctionSummary<'ctx>,
     pub compiled: Option<r2sym::SemanticArtifact>,
     pub query_policy: r2sym::QueryExecutionPolicy,
+    pub assumption_usage: r2ssa::AssumptionUsageReport,
+    pub assumption_conditioned: bool,
 }
 
 pub struct EngineSymbolicPathsRequest<'ctx, 'a> {
@@ -599,6 +601,8 @@ pub struct EngineSymbolicPathsResponse<'ctx> {
     pub explorer: r2sym::PathExplorer<'ctx>,
     pub solution_limit: usize,
     pub query_policy: r2sym::QueryExecutionPolicy,
+    pub assumption_usage: r2ssa::AssumptionUsageReport,
+    pub assumption_conditioned: bool,
 }
 
 pub struct EngineTargetExploreRequest<'ctx, 'a> {
@@ -638,6 +642,16 @@ pub struct EngineRunSpecResponse<'ctx> {
     pub stats: r2sym::path::ExploreStats,
     pub solver_stats: r2sym::SolverStats,
     pub query_policy: r2sym::QueryExecutionPolicy,
+    pub assumption_usage: r2ssa::AssumptionUsageReport,
+    pub assumption_conditioned: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineConditionedSymbolicScope {
+    pub scope: r2sym::PreparedFunctionScope,
+    pub prepared: r2ssa::SsaArtifact,
+    pub assumption_usage: r2ssa::AssumptionUsageReport,
+    pub assumption_conditioned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1534,6 +1548,8 @@ impl EngineSession {
         request: EngineSymbolicSummaryRequest<'ctx, '_>,
     ) -> EngineSymbolicSummaryResponse<'ctx> {
         let context = request.context;
+        let (assumption_usage, assumption_conditioned) =
+            prepared_assumption_conditioning(context.prepared);
         let mut query_config = symbolic_query_config_for_context(&context);
         let compiled = request.compile_semantics.then(|| {
             r2sym::compile_semantic_artifact_with_scope(
@@ -1559,6 +1575,8 @@ impl EngineSession {
                 summary: empty_symbolic_summary(),
                 compiled,
                 query_policy,
+                assumption_usage,
+                assumption_conditioned,
             };
         }
 
@@ -1576,6 +1594,8 @@ impl EngineSession {
             summary,
             compiled,
             query_policy,
+            assumption_usage,
+            assumption_conditioned,
         }
     }
 
@@ -1584,6 +1604,8 @@ impl EngineSession {
         request: EngineSymbolicPathsRequest<'ctx, '_>,
     ) -> EngineSymbolicPathsResponse<'ctx> {
         let context = request.context;
+        let (assumption_usage, assumption_conditioned) =
+            prepared_assumption_conditioning(context.prepared);
         let mut query_config = symbolic_query_config_for_context(&context);
         let initial_state = symbolic_initial_state(&context);
         let query_policy = symbolic_query_policy_for_state(
@@ -1601,6 +1623,8 @@ impl EngineSession {
             explorer,
             solution_limit,
             query_policy,
+            assumption_usage,
+            assumption_conditioned,
         }
     }
 
@@ -1731,6 +1755,8 @@ impl EngineSession {
         request: EngineRunSpecRequest<'ctx, '_>,
     ) -> Result<EngineRunSpecResponse<'ctx>, String> {
         let context = request.context;
+        let (assumption_usage, assumption_conditioned) =
+            prepared_assumption_conditioning(context.prepared);
         let mut query_config = symbolic_query_config_for_context(&context);
         let start_pc = request.spec.start_pc(context.seed.entry_addr())?;
         let mut initial_state = symbolic_initial_state_at(&context, start_pc);
@@ -1755,6 +1781,8 @@ impl EngineSession {
             stats,
             solver_stats,
             query_policy,
+            assumption_usage,
+            assumption_conditioned,
         })
     }
 }
@@ -1819,6 +1847,40 @@ pub fn symbolic_query_policy_for_state(
 
 pub fn prepared_assumption_conflicted(prepared: &r2ssa::SsaArtifact) -> bool {
     !prepared.facts().assumption_usage.conflicts.is_empty()
+}
+
+pub fn prepared_assumption_conditioning(
+    prepared: &r2ssa::SsaArtifact,
+) -> (r2ssa::AssumptionUsageReport, bool) {
+    let usage = prepared.facts().assumption_usage.clone();
+    let conditioned = !usage.applied.is_empty() || !usage.conflicts.is_empty();
+    (usage, conditioned)
+}
+
+pub fn condition_symbolic_scope_with_assumptions(
+    scope: &r2sym::PreparedFunctionScope,
+    assumptions: &r2ssa::AssumptionSet,
+) -> Result<EngineConditionedSymbolicScope, &'static str> {
+    let root = scope.root().ok_or("failed to build root SSA function")?;
+    let prepared = if assumptions.is_empty() {
+        root.prepared.clone()
+    } else {
+        root.prepared.with_assumptions(assumptions)
+    };
+    let scope = if assumptions.is_empty() {
+        scope.clone()
+    } else {
+        scope
+            .with_prepared_root(&prepared)
+            .ok_or("failed to build symbolic scope")?
+    };
+    let (assumption_usage, assumption_conditioned) = prepared_assumption_conditioning(&prepared);
+    Ok(EngineConditionedSymbolicScope {
+        scope,
+        prepared,
+        assumption_usage,
+        assumption_conditioned,
+    })
 }
 
 fn symbolic_query_config_for_context(
@@ -3570,6 +3632,73 @@ mod tests {
 
     fn vm_const(value: u64, size: u32) -> r2il::Varnode {
         r2il::Varnode::constant(value, size)
+    }
+
+    fn symbolic_register_branch_blocks(addr: u64) -> Vec<R2ILBlock> {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(r2il::R2ILOp::IntEqual {
+            dst: vm_reg(0x80, 1),
+            a: vm_reg(0x38, 8),
+            b: vm_const(1, 8),
+        });
+        block.push(r2il::R2ILOp::CBranch {
+            target: vm_const(addr + 0x10, 8),
+            cond: vm_reg(0x80, 1),
+        });
+
+        let mut fallthrough = R2ILBlock::new(addr + 4, 1);
+        fallthrough.push(r2il::R2ILOp::Return {
+            target: vm_const(0, 8),
+        });
+
+        let mut target = R2ILBlock::new(addr + 0x10, 1);
+        target.push(r2il::R2ILOp::Return {
+            target: vm_const(1, 8),
+        });
+
+        vec![block, fallthrough, target]
+    }
+
+    fn symbolic_register_assumption(prepared: &r2ssa::SsaArtifact) -> r2ssa::AnalysisAssumption {
+        let reg_name = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.version == 0 && value.var.is_register() && value.var.size == 8)
+            .expect("version-zero input register")
+            .var
+            .name
+            .clone();
+        r2ssa::AnalysisAssumption {
+            id: Some("force-input-register".to_string()),
+            subject: r2ssa::AssumptionSubject::Register { name: reg_name },
+            value: r2ssa::AssumptionValue::Constant { value: 1 },
+            scope: r2ssa::AssumptionScope::Query,
+            provenance: r2ssa::AssumptionProvenance::User,
+        }
+    }
+
+    fn conflicting_predicate_assumption(
+        prepared: &r2ssa::SsaArtifact,
+    ) -> r2ssa::AnalysisAssumption {
+        let (predicate, fact) = prepared
+            .facts()
+            .predicates
+            .predicates
+            .iter()
+            .next()
+            .expect("predicate fact");
+        r2ssa::AnalysisAssumption {
+            id: Some("conflicting-branch".to_string()),
+            subject: r2ssa::AssumptionSubject::Predicate {
+                predicate: *predicate,
+                block_addr: fact.block_addr + 0x1000,
+                predecessor: None,
+            },
+            value: r2ssa::AssumptionValue::Branch { truth: true },
+            scope: r2ssa::AssumptionScope::Query,
+            provenance: r2ssa::AssumptionProvenance::User,
+        }
     }
 
     #[test]
@@ -5592,6 +5721,132 @@ mod tests {
             response.solution_limit,
             path_listing_solution_limit(response.summary.paths.len(), &prepared)
         );
+    }
+
+    #[test]
+    fn engine_conditions_symbolic_scope_with_root_assumptions() {
+        let blocks = symbolic_register_branch_blocks(0x501000);
+        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let scope = r2sym::PreparedFunctionScope::new(
+            0x501000,
+            vec![r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x501000),
+                name: Some("sym.branch".to_string()),
+                prepared: prepared.clone(),
+            }],
+        )
+        .expect("scope");
+        let assumption = symbolic_register_assumption(&prepared);
+        let assumptions = r2ssa::AssumptionSet::new(vec![assumption.clone()]);
+
+        let conditioned = condition_symbolic_scope_with_assumptions(&scope, &assumptions)
+            .expect("conditioned scope");
+
+        assert!(conditioned.assumption_conditioned);
+        assert_eq!(
+            conditioned.assumption_usage.applied,
+            vec![assumption.clone()]
+        );
+        assert!(conditioned.assumption_usage.ignored.is_empty());
+        assert!(conditioned.assumption_usage.conflicts.is_empty());
+        assert_eq!(
+            conditioned.prepared.facts().assumption_usage.applied,
+            vec![assumption.clone()]
+        );
+        assert!(prepared.facts().assumption_usage.applied.is_empty());
+        assert!(
+            scope
+                .root()
+                .expect("scope root")
+                .prepared
+                .facts()
+                .assumption_usage
+                .applied
+                .is_empty()
+        );
+        assert_eq!(
+            conditioned
+                .scope
+                .root()
+                .expect("conditioned scope root")
+                .prepared
+                .facts()
+                .assumption_usage
+                .applied,
+            vec![assumption]
+        );
+    }
+
+    #[test]
+    fn engine_reports_conflicting_assumptions_as_conditioning() {
+        let blocks = symbolic_register_branch_blocks(0x501800);
+        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let scope = r2sym::PreparedFunctionScope::new(
+            0x501800,
+            vec![r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x501800),
+                name: Some("sym.branch".to_string()),
+                prepared: prepared.clone(),
+            }],
+        )
+        .expect("scope");
+        let assumption = conflicting_predicate_assumption(&prepared);
+        let assumptions = r2ssa::AssumptionSet::new(vec![assumption.clone()]);
+
+        let conditioned = condition_symbolic_scope_with_assumptions(&scope, &assumptions)
+            .expect("conditioned scope");
+
+        assert!(conditioned.assumption_conditioned);
+        assert!(conditioned.assumption_usage.applied.is_empty());
+        assert!(conditioned.assumption_usage.ignored.is_empty());
+        assert_eq!(conditioned.assumption_usage.conflicts.len(), 1);
+        assert_eq!(
+            conditioned.assumption_usage.conflicts[0].assumption,
+            assumption
+        );
+    }
+
+    #[test]
+    fn symbolic_summary_reports_prepared_assumption_usage() {
+        let blocks = symbolic_register_branch_blocks(0x502000);
+        let prepared = r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared");
+        let scope = r2sym::PreparedFunctionScope::new(
+            0x502000,
+            vec![r2sym::ScopedPreparedFunction {
+                id: r2ssa::InterprocFunctionId(0x502000),
+                name: Some("sym.branch".to_string()),
+                prepared: prepared.clone(),
+            }],
+        )
+        .expect("scope");
+        let assumption = symbolic_register_assumption(&prepared);
+        let assumptions = r2ssa::AssumptionSet::new(vec![assumption.clone()]);
+        let conditioned = condition_symbolic_scope_with_assumptions(&scope, &assumptions)
+            .expect("conditioned scope");
+        let z3_ctx = z3::Context::thread_local();
+        let symbols = HashMap::new();
+        let session = EngineSession::new(4);
+
+        let response = session.symbolic_summary(EngineSymbolicSummaryRequest {
+            context: EngineSymbolicContextRequest {
+                z3_ctx: &z3_ctx,
+                prepared: &conditioned.prepared,
+                scope: Some(&conditioned.scope),
+                arch: None,
+                symbol_map: &symbols,
+                merge_states: false,
+                config_profile: EngineSymbolicConfigProfile::PathListing,
+                seed: EngineSymbolicStateSeed::Scope {
+                    entry_addr: 0x502000,
+                },
+            },
+            compile_semantics: false,
+        });
+
+        assert!(response.assumption_conditioned);
+        assert_eq!(response.assumption_usage.applied, vec![assumption]);
+        assert!(response.assumption_usage.ignored.is_empty());
+        assert!(response.assumption_usage.conflicts.is_empty());
     }
 
     #[test]

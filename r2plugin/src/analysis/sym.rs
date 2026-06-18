@@ -1880,14 +1880,6 @@ fn engine_symbolic_context<'ctx, 'a>(
     }
 }
 
-fn prepared_assumption_conditioning(
-    prepared: &r2ssa::SsaArtifact,
-) -> (r2ssa::AssumptionUsageReport, bool) {
-    let usage = prepared.facts().assumption_usage.clone();
-    let conditioned = !usage.applied.is_empty() || !usage.conflicts.is_empty();
-    (usage, conditioned)
-}
-
 fn parse_scope_assumptions(
     external_context_json: *const c_char,
     arch: Option<&ArchSpec>,
@@ -1908,15 +1900,8 @@ fn scope_with_external_assumptions(
     external_context_json: *const c_char,
 ) -> Result<r2sym::PreparedFunctionScope, &'static str> {
     let assumptions = parse_scope_assumptions(external_context_json, arch)?;
-    let prepared = scope_root_prepared(scope).ok_or("failed to build root SSA function")?;
-    let prepared = if assumptions.is_empty() {
-        prepared.clone()
-    } else {
-        prepared.with_assumptions(&assumptions)
-    };
-    scope
-        .with_prepared_root(&prepared)
-        .ok_or("failed to build symbolic scope")
+    r2engine::condition_symbolic_scope_with_assumptions(scope, &assumptions)
+        .map(|conditioned| conditioned.scope)
 }
 
 unsafe fn ffi_slice<'a, T>(ptr: *const T, len: usize) -> Result<&'a [T], &'static str> {
@@ -2066,8 +2051,8 @@ pub extern "C" fn r2sym_function(
         &response.summary.stats,
         &response.summary.solver_stats,
         response.summary.feasible_paths,
-        r2ssa::AssumptionUsageReport::default(),
-        false,
+        response.assumption_usage,
+        response.assumption_conditioned,
         false,
         response.compiled.as_ref(),
     );
@@ -2443,15 +2428,18 @@ pub extern "C" fn r2sym_run_spec_json(
             response.result,
             response.stats,
             response.solver_stats,
+            response.assumption_usage,
+            response.assumption_conditioned,
             found_paths,
         ))
     }));
 
-    let (result, stats, solver_stats, found_paths) = match run_result {
-        Ok(Ok(value)) => value,
-        Ok(Err(err)) => return sym_error_json(&err),
-        Err(err) => return sym_panic_json("symbolic execution failed", err),
-    };
+    let (result, stats, solver_stats, assumption_usage, assumption_conditioned, found_paths) =
+        match run_result {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => return sym_error_json(&err),
+            Err(err) => return sym_panic_json("symbolic execution failed", err),
+        };
 
     let output = SymRunResult {
         entry: format!("0x{:x}", entry_addr),
@@ -2460,8 +2448,8 @@ pub extern "C" fn r2sym_run_spec_json(
             &stats,
             &solver_stats,
             found_paths.len(),
-            r2ssa::AssumptionUsageReport::default(),
-            false,
+            assumption_usage,
+            assumption_conditioned,
             false,
             None,
         ),
@@ -2506,7 +2494,6 @@ pub extern "C" fn r2sym_function_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return ptr::null_mut();
     };
-    let (assumption_usage, assumption_conditioned) = prepared_assumption_conditioning(prepared);
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
@@ -2536,8 +2523,8 @@ pub extern "C" fn r2sym_function_scope(
         &response.summary.stats,
         &response.summary.solver_stats,
         response.summary.feasible_paths,
-        assumption_usage,
-        assumption_conditioned,
+        response.assumption_usage,
+        response.assumption_conditioned,
         false,
         response.compiled.as_ref(),
     );
@@ -2960,7 +2947,6 @@ pub extern "C" fn r2sym_run_spec_json_scope(
     let Some(prepared) = scope_root_prepared(&scope) else {
         return sym_error_json("failed to build root SSA function");
     };
-    let (assumption_usage, assumption_conditioned) = prepared_assumption_conditioning(prepared);
     let symbol_map = symbol_map_snapshot();
     let z3_ctx = Context::thread_local();
 
@@ -2989,15 +2975,18 @@ pub extern "C" fn r2sym_run_spec_json_scope(
             response.result,
             response.stats,
             response.solver_stats,
+            response.assumption_usage,
+            response.assumption_conditioned,
             found_paths,
         ))
     }));
 
-    let (result, stats, solver_stats, found_paths) = match run_result {
-        Ok(Ok(value)) => value,
-        Ok(Err(err)) => return sym_error_json(&err),
-        Err(err) => return sym_panic_json("symbolic execution failed", err),
-    };
+    let (result, stats, solver_stats, assumption_usage, assumption_conditioned, found_paths) =
+        match run_result {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => return sym_error_json(&err),
+            Err(err) => return sym_panic_json("symbolic execution failed", err),
+        };
 
     let output = SymRunResult {
         entry: format!("0x{:x}", entry_addr),
