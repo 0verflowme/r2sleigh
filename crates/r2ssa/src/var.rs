@@ -25,7 +25,7 @@ impl SSAVarNameKind {
     pub fn classify(name: &str) -> Self {
         if name.strip_prefix("reg:").is_some() {
             Self::RegisterAlias
-        } else if name.strip_prefix("tmp:").is_some() {
+        } else if name.strip_prefix("tmp:").is_some() || name.strip_prefix("unique:").is_some() {
             Self::Temporary
         } else if name.strip_prefix("const:").is_some() {
             Self::Constant
@@ -83,6 +83,7 @@ impl SSAVarNameKind {
 
     pub fn strip_temporary_prefix(name: &str) -> Option<&str> {
         name.strip_prefix("tmp:")
+            .or_else(|| name.strip_prefix("unique:"))
     }
 }
 
@@ -211,6 +212,7 @@ mod tests {
         let cases = [
             ("reg:10", SSAVarNameKind::RegisterAlias),
             ("tmp:0x1000", SSAVarNameKind::Temporary),
+            ("unique:0x1000", SSAVarNameKind::Temporary),
             ("const:0x42", SSAVarNameKind::Constant),
             ("ram:0x401000", SSAVarNameKind::Memory),
             ("space1:0x20", SSAVarNameKind::AddressSpace),
@@ -291,6 +293,10 @@ mod tests {
             SSAVarNameKind::strip_temporary_prefix("tmp:0x1000"),
             Some("0x1000")
         );
+        assert_eq!(
+            SSAVarNameKind::strip_temporary_prefix("unique:0x1000"),
+            Some("0x1000")
+        );
         assert_eq!(SSAVarNameKind::strip_temporary_prefix("const:0x1000"), None);
     }
 
@@ -316,6 +322,7 @@ mod tests {
     fn test_var_classification() {
         let reg = SSAVar::new("RAX", 0, 8);
         let tmp = SSAVar::new("tmp:0x1000", 0, 4);
+        let unique = SSAVar::new("unique:0x1000", 0, 4);
         let cst = SSAVar::new("const:0x42", 0, 4);
 
         assert!(reg.is_register());
@@ -327,6 +334,11 @@ mod tests {
         assert!(!tmp.is_const());
         assert!(!tmp.is_register());
         assert!(!tmp.is_memory());
+
+        assert!(unique.is_temp());
+        assert!(!unique.is_const());
+        assert!(!unique.is_register());
+        assert!(!unique.is_memory());
 
         assert!(cst.is_const());
         assert!(!cst.is_temp());

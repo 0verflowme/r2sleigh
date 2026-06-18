@@ -518,7 +518,6 @@ fn prepared_render_definition_is_safe(expr: &CExpr, env: &PassEnv<'_>) -> bool {
             || arg_regs.contains(base)
             || caller_saved.contains(base)
             || is_temporary_or_memory_name(name)
-            || lower.starts_with("unique:")
         {
             safe = false;
         }
@@ -2596,8 +2595,7 @@ fn prepared_fallback_visible_expr(var: &SSAVar) -> Option<CExpr> {
         return None;
     }
 
-    let lower = var.name.to_ascii_lowercase();
-    if is_temporary_constant_or_memory_name(&var.name) || lower.starts_with("unique:") {
+    if is_temporary_constant_or_memory_name(&var.name) {
         return None;
     }
 

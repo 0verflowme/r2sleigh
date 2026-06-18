@@ -2130,9 +2130,9 @@ fn parse_const_name(name: &str) -> Option<u64> {
 fn normalize_seed_name(name: &str) -> Option<&'static str> {
     let normalized_owned = name.trim().to_ascii_lowercase();
     let mut normalized = normalized_owned.as_str();
-    let has_external_marker = normalized.starts_with("sym.imp.")
-        || normalized.starts_with("imp.")
-        || normalized.starts_with("reloc.")
+    let has_external_marker = ["sym.imp.", "imp.", "reloc."]
+        .iter()
+        .any(|prefix| normalized.strip_prefix(prefix).is_some())
         || normalized.ends_with("@plt")
         || normalized.ends_with(".plt");
     if !has_external_marker {

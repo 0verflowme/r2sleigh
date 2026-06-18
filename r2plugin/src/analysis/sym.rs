@@ -1727,9 +1727,7 @@ fn is_public_solution_symbol(name: &str) -> bool {
             | r2ssa::SSAVarNameKind::Constant
             | r2ssa::SSAVarNameKind::Memory
             | r2ssa::SSAVarNameKind::AddressSpace
-    ) || lower.starts_with("tmp")
-        || lower.starts_with("unique:")
-    {
+    ) {
         return false;
     }
     let base = lower.split('_').next().unwrap_or(lower.as_str());
@@ -3371,6 +3369,7 @@ mod tests {
             "tmp:1234",
             "TMPZR",
             "TMPNG",
+            "unique:1234",
             "CY",
             "OV",
             "const:4",

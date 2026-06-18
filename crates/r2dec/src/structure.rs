@@ -3320,7 +3320,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         });
         lower.starts_with("value_")
             || crate::analysis::utils::is_temporary_name(name)
-            || lower.starts_with("unique:")
             || lower.contains(':')
             || (lower.starts_with('t') && lower[1..].chars().all(|ch| ch.is_ascii_digit()))
             || versioned_register

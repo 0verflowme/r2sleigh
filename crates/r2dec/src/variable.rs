@@ -713,9 +713,7 @@ impl VariableRecovery {
 
     /// Generate a variable name.
     fn gen_var_name(&mut self, var: &SSAVar) -> String {
-        let base = if var.name.contains("reg:") {
-            "v"
-        } else if var.name.contains("tmp:") || var.name.contains("unique:") {
+        let base = if var.name_kind().is_temporary() {
             "t"
         } else {
             "v"
@@ -910,6 +908,12 @@ mod tests {
         let name2 = vr.gen_var_name(&var2);
 
         assert_ne!(name1, name2);
+
+        let temp_name = vr.gen_var_name(&SSAVar::new("tmp:11f80", 1, 64));
+        let unique_name = vr.gen_var_name(&SSAVar::new("unique:11f80", 1, 64));
+
+        assert!(temp_name.starts_with('t'));
+        assert!(unique_name.starts_with('t'));
     }
 
     #[test]

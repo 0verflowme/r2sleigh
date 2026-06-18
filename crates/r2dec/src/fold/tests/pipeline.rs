@@ -3687,8 +3687,13 @@ mod tests {
 
         let byte_var = make_var("tmp:11e00", 1, 1);
         let byte_expr = ctx.get_expr(&byte_var);
+        let byte_expr_is_temporary = matches!(
+            byte_expr,
+            CExpr::Var(ref name)
+                if r2ssa::SSAVarNameKind::classify(&name.to_ascii_lowercase()).is_temporary()
+        );
         assert!(
-            !matches!(byte_expr, CExpr::Var(ref name) if name.starts_with("tmp:")),
+            !byte_expr_is_temporary,
             "byte load in the true arm should not regress to a transient temp before return tracking, got {byte_expr:?}",
         );
 
@@ -4490,7 +4495,8 @@ mod tests {
         assert!(names.contains("value_1"), "{names:?}");
         assert!(
             names.iter().all(|name| {
-                !name.starts_with("const:") && !name.eq_ignore_ascii_case("ram:401000")
+                !r2ssa::SSAVarNameKind::classify(&name.to_ascii_lowercase()).is_constant()
+                    && !name.eq_ignore_ascii_case("ram:401000")
             }),
             "{names:?}"
         );

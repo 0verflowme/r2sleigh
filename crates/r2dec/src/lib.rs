@@ -396,9 +396,7 @@ fn sanitize_comment_text(text: &str) -> String {
 }
 
 fn summary_accumulator_label(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
     if crate::analysis::utils::is_temporary_constant_or_memory_name(name)
-        || lower.starts_with("unique:")
         || is_ssa_versioned_register_label(name)
     {
         "accumulator".to_string()
@@ -2962,7 +2960,6 @@ fn is_uncertified_render_var_name(name: &str) -> bool {
     let stripped = name.trim_start_matches('&');
     let lower = stripped.to_ascii_lowercase();
     crate::analysis::utils::is_temporary_name(stripped)
-        || lower.starts_with("unique:")
         || lower.starts_with("tmp_")
         || lower.starts_with("unique_")
         || lower.starts_with("stack_")

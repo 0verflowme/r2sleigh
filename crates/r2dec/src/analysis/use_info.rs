@@ -10343,7 +10343,7 @@ mod tests {
                     name != "stack" && name != "saved_fp" && !name.starts_with("local_")
                 }
                 Some(SemanticValue::Scalar(ScalarValue::Root(value_ref))) => {
-                    !value_ref.var.name.starts_with("tmp:")
+                    !value_ref.var.name_kind().is_temporary()
                         && !value_ref.var.name.eq_ignore_ascii_case("stack")
                         && !value_ref.var.name.eq_ignore_ascii_case("saved_fp")
                 }

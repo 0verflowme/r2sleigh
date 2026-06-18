@@ -3043,7 +3043,6 @@ impl<'a> FoldingContext<'a> {
                     }
                 }
                 SSAVarNameKind::Temporary => "t".to_string(),
-                _ if dst.name.starts_with("unique:") => "t".to_string(),
                 _ => dst.name.to_ascii_lowercase().replace([':', '.'], "_"),
             };
 
@@ -6281,9 +6280,7 @@ impl<'a> FoldingContext<'a> {
 
     fn meaningful_tmp_call_owner_name(alias: &str) -> Option<String> {
         let lower = alias.to_ascii_lowercase();
-        let raw = lower
-            .strip_prefix("tmp:")
-            .or_else(|| lower.strip_prefix("unique:"))?;
+        let raw = SSAVarNameKind::strip_temporary_prefix(&lower)?;
         let stem = raw
             .rsplit_once('_')
             .filter(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))

@@ -2185,7 +2185,7 @@ mod tests {
             .graph()
             .values
             .iter()
-            .find(|value| value.var.name.starts_with("tmp:"))
+            .find(|value| value.var.name_kind().is_temporary())
             .map(|value| value.var.clone())
             .expect("stack-root value");
         assert_eq!(

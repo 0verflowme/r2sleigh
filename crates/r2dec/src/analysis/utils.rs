@@ -693,6 +693,10 @@ mod tests {
             "t11f80_19"
         );
         assert_eq!(format_traced_name("tmp:foo_2", &HashMap::new()), "tfoo_2");
+        assert_eq!(
+            format_traced_name("unique:11f80_19", &HashMap::new()),
+            "t11f80_19"
+        );
     }
 
     #[test]
@@ -720,12 +724,16 @@ mod tests {
             ssa_render_base_name(&SSAVar::new("tmp:11f80", 2, 8)),
             "t11f80"
         );
+        assert_eq!(
+            ssa_render_base_name(&SSAVar::new("unique:11f80", 2, 8)),
+            "t11f80"
+        );
         assert_eq!(ssa_render_base_name(&SSAVar::new("RAX", 1, 8)), "rax");
     }
 
     #[test]
     fn ssa_name_kind_helpers_classify_prefixed_storage_names() {
-        for name in ["tmp:1", "TMP:1"] {
+        for name in ["tmp:1", "TMP:1", "unique:1", "UNIQUE:1"] {
             assert!(is_temporary_name(name));
             assert!(is_temporary_or_constant_name(name));
             assert!(is_temporary_or_memory_name(name));
