@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use r2ssa::SSAVar;
+use r2ssa::{SSAVar, SSAVarNameKind};
 
 use crate::ast::{BinaryOp, CExpr};
 
@@ -161,7 +161,11 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
         return alias.clone();
     }
 
-    if !key.starts_with("tmp:") && !key.starts_with("const:") && !key.starts_with("ram:") {
+    let kind = SSAVarNameKind::classify(key);
+    if !matches!(
+        kind,
+        SSAVarNameKind::Temporary | SSAVarNameKind::Constant | SSAVarNameKind::Memory
+    ) {
         if let Some((base, version)) = key.rsplit_once('_') {
             if version == "0" {
                 return base.to_lowercase();
@@ -171,8 +175,10 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
         return key.to_lowercase();
     }
 
-    if key.starts_with("tmp:")
-        && let Some((base, version_str)) = key.trim_start_matches("tmp:").rsplit_once('_')
+    if kind.is_temporary()
+        && let Some((base, version_str)) = SSAVarNameKind::strip_temporary_prefix(key)
+            .unwrap_or(key)
+            .rsplit_once('_')
     {
         if let Ok(ver) = version_str.parse::<u32>() {
             return if ver > 0 {
@@ -612,10 +618,28 @@ mod tests {
 
     #[test]
     fn format_traced_name_keeps_temp_base_identity() {
+        assert_eq!(format_traced_name("tmp:11f80_0", &HashMap::new()), "t0");
         assert_eq!(
             format_traced_name("tmp:11f80_19", &HashMap::new()),
             "t11f80_19"
         );
         assert_eq!(format_traced_name("tmp:foo_2", &HashMap::new()), "tfoo_2");
+    }
+
+    #[test]
+    fn format_traced_name_uses_typed_name_kinds_for_visibility() {
+        assert_eq!(format_traced_name("RAX_0", &HashMap::new()), "rax");
+        assert_eq!(format_traced_name("RAX_2", &HashMap::new()), "rax_2");
+        assert_eq!(
+            format_traced_name("const:2a_0", &HashMap::new()),
+            "const:2a_0"
+        );
+        assert_eq!(
+            format_traced_name("ram:401000_0", &HashMap::new()),
+            "ram:401000_0"
+        );
+
+        let aliases = HashMap::from([(String::from("tmp:11f80_19"), String::from("idx"))]);
+        assert_eq!(format_traced_name("tmp:11f80_19", &aliases), "idx");
     }
 }
