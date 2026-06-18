@@ -1,4 +1,5 @@
 use super::*;
+use crate::analysis::utils::ssa_render_base_name;
 
 impl<'a> FoldingContext<'a> {
     fn typed_integer_literal_expr_in_context(
@@ -1318,18 +1319,7 @@ impl<'a> FoldingContext<'a> {
             return alias;
         }
 
-        let base = if var.name.starts_with("reg:") {
-            let reg = var.name.trim_start_matches("reg:");
-            if is_hex_name(reg) {
-                format!("r{}", reg)
-            } else {
-                reg.to_string()
-            }
-        } else if var.name.starts_with("tmp:") {
-            format!("t{}", var.name.trim_start_matches("tmp:"))
-        } else {
-            var.name.to_lowercase()
-        };
+        let base = ssa_render_base_name(var);
 
         if var.version > 0 {
             format!("{}_{}", base, var.version)

@@ -193,6 +193,24 @@ pub(crate) fn format_traced_name(key: &str, var_aliases: &HashMap<String, String
     key.to_string()
 }
 
+pub(crate) fn ssa_render_base_name(var: &SSAVar) -> String {
+    match var.name_kind() {
+        SSAVarNameKind::RegisterAlias => {
+            let reg = var.name.strip_prefix("reg:").unwrap_or(&var.name);
+            if is_hex_name(reg) {
+                format!("r{}", reg)
+            } else {
+                reg.to_string()
+            }
+        }
+        SSAVarNameKind::Temporary => {
+            let tmp = SSAVarNameKind::strip_temporary_prefix(&var.name).unwrap_or(&var.name);
+            format!("t{}", tmp)
+        }
+        _ => var.name.to_lowercase(),
+    }
+}
+
 pub(crate) fn trace_ssa_var_to_source(
     var: &SSAVar,
     copy_sources: &HashMap<String, String>,
@@ -526,6 +544,10 @@ pub(crate) fn arg_alias_for_store_source(
         .or_else(|| arg_alias_for_register_name(&traced))
 }
 
+fn is_hex_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +663,16 @@ mod tests {
 
         let aliases = HashMap::from([(String::from("tmp:11f80_19"), String::from("idx"))]);
         assert_eq!(format_traced_name("tmp:11f80_19", &aliases), "idx");
+    }
+
+    #[test]
+    fn ssa_render_base_name_uses_typed_name_kinds() {
+        assert_eq!(ssa_render_base_name(&SSAVar::new("reg:10", 0, 8)), "r10");
+        assert_eq!(ssa_render_base_name(&SSAVar::new("reg:zf", 0, 1)), "zf");
+        assert_eq!(
+            ssa_render_base_name(&SSAVar::new("tmp:11f80", 2, 8)),
+            "t11f80"
+        );
+        assert_eq!(ssa_render_base_name(&SSAVar::new("RAX", 1, 8)), "rax");
     }
 }

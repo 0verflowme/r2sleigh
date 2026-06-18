@@ -4,7 +4,7 @@ use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{SSAOp, SSAVar};
 use r2types::TypeOracle;
 
-use super::utils::{format_traced_name, parse_const_value};
+use super::utils::{format_traced_name, parse_const_value, ssa_render_base_name};
 use super::{
     BaseRef, NormalizedAddr, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
     ValueProvenance, ValueRef,
@@ -158,18 +158,7 @@ impl<'a> LowerCtx<'a> {
             return alias;
         }
 
-        let base = if var.name.starts_with("reg:") {
-            let reg = var.name.trim_start_matches("reg:");
-            if is_hex_name(reg) {
-                format!("r{}", reg)
-            } else {
-                reg.to_string()
-            }
-        } else if var.name.starts_with("tmp:") {
-            format!("t{}", var.name.trim_start_matches("tmp:"))
-        } else {
-            var.name.to_lowercase()
-        };
+        let base = ssa_render_base_name(var);
 
         if var.version > 0 {
             format!("{}_{}", base, var.version)
@@ -1378,10 +1367,6 @@ fn uint_type_from_size(size: u32) -> CType {
         8 => CType::UInt(64),
         _ => CType::UInt(size.saturating_mul(8)),
     }
-}
-
-fn is_hex_name(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn is_low_signal_lowering_name(name: &str) -> bool {
