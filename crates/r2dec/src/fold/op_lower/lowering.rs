@@ -46,19 +46,35 @@ impl<'a> FoldingContext<'a> {
                                 .get(&(frame.block_addr, frame.op_idx))
                                 .cloned()
                                 .unwrap_or_default();
-                            let mut args = self
-                                .prepared_call_args_for_site(
-                                    frame.block_addr,
-                                    frame.op_idx,
-                                    &func_expr,
-                                )
-                                .unwrap_or_else(|| {
-                                    self.render_call_args_for_callee(&func_expr, raw_args)
-                                });
+                            let Some(mut certified_args) = self.certified_call_args_for_site(
+                                frame.block_addr,
+                                frame.op_idx,
+                                &func_expr,
+                                raw_args,
+                            ) else {
+                                return LoweredOp::Comment(format!(
+                                    "r2sleigh residual: uncertified callsite arguments at 0x{:x}:{}",
+                                    frame.block_addr, frame.op_idx
+                                ));
+                            };
+                            let mut args = certified_args.args;
                             if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
                                 args.truncate(max_arity);
+                                certified_args.values.truncate(max_arity);
                             }
                             let call = CExpr::call(func_expr, args);
+                            if let Some(target_value) = self
+                                .certified_callsite_for_op(frame.block_addr, frame.op_idx)
+                                .map(|cert| cert.target)
+                            {
+                                self.record_effect_render_proof_for_values(
+                                    EffectRenderProofKind::Call,
+                                    frame.block_addr,
+                                    frame.op_idx,
+                                    Some(target_value),
+                                    certified_args.values,
+                                );
+                            }
                             if let Some(owner) = self.materializable_call_result_expr_for_call_expr(
                                 (frame.block_addr, frame.op_idx),
                                 &call,
@@ -85,19 +101,35 @@ impl<'a> FoldingContext<'a> {
                                 .get(&(frame.block_addr, frame.op_idx))
                                 .cloned()
                                 .unwrap_or_default();
-                            let mut args = self
-                                .prepared_call_args_for_site(
-                                    frame.block_addr,
-                                    frame.op_idx,
-                                    &func_expr,
-                                )
-                                .unwrap_or_else(|| {
-                                    self.render_call_args_for_callee(&func_expr, raw_args)
-                                });
+                            let Some(mut certified_args) = self.certified_call_args_for_site(
+                                frame.block_addr,
+                                frame.op_idx,
+                                &func_expr,
+                                raw_args,
+                            ) else {
+                                return LoweredOp::Comment(format!(
+                                    "r2sleigh residual: uncertified indirect-call arguments at 0x{:x}:{}",
+                                    frame.block_addr, frame.op_idx
+                                ));
+                            };
+                            let mut args = certified_args.args;
                             if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
                                 args.truncate(max_arity);
+                                certified_args.values.truncate(max_arity);
                             }
                             let call = CExpr::call(func_expr, args);
+                            if let Some(target_value) = self
+                                .certified_callsite_for_op(frame.block_addr, frame.op_idx)
+                                .map(|cert| cert.target)
+                            {
+                                self.record_effect_render_proof_for_values(
+                                    EffectRenderProofKind::Call,
+                                    frame.block_addr,
+                                    frame.op_idx,
+                                    Some(target_value),
+                                    certified_args.values,
+                                );
+                            }
                             if let Some(owner) = self.materializable_call_result_expr_for_call_expr(
                                 (frame.block_addr, frame.op_idx),
                                 &call,
@@ -145,6 +177,116 @@ impl<'a> FoldingContext<'a> {
         op_idx: usize,
     ) -> Option<CStmt> {
         let mut frame = LowerFrame::for_stmt(block_addr, op_idx, true);
-        self.lowered_to_stmt(self.lower_op(op, &mut frame))
+        let stmt = self.lowered_to_stmt(self.lower_op(op, &mut frame))?;
+        if self.requires_certified_rendering()
+            && self
+                .record_certified_call_render_proofs_for_stmt(&stmt)
+                .is_none()
+        {
+            return Some(self.certified_residual_comment(format!(
+                "uncertified rendered call at 0x{:x}:{}",
+                block_addr, op_idx
+            )));
+        }
+        if self.requires_certified_rendering() && stmt_is_side_effect_free_generated_carrier(&stmt)
+        {
+            return None;
+        }
+        if self.requires_certified_rendering()
+            && stmt_is_side_effect_free_versioned_register_carrier(&stmt)
+        {
+            return Some(stmt);
+        }
+        if self.requires_certified_rendering() && stmt_requires_expression_render_proof(&stmt) {
+            let materialized_phi_copy = self.is_certified_materialized_phi_carrier(op, &stmt);
+            let value = match op {
+                SSAOp::Store { val, .. } => self.prepared_value_id_for_var(val),
+                _ => op.dst().and_then(|dst| self.prepared_value_id_for_var(dst)),
+            };
+            match value {
+                Some(value)
+                    if self
+                        .certified_render_context()
+                        .is_some_and(|proof| proof.expression_is_renderable(value)) =>
+                {
+                    if materialized_phi_copy {
+                        self.record_effect_render_proof_for_materialized_phi_copy(
+                            block_addr,
+                            op_idx,
+                            Some(value),
+                        );
+                    } else {
+                        self.record_effect_render_proof_for_value(
+                            EffectRenderProofKind::Expression,
+                            block_addr,
+                            op_idx,
+                            Some(value),
+                        );
+                    }
+                }
+                Some(value) => {
+                    return Some(self.certified_residual_comment(format!(
+                        "uncertified expression value {:?} at 0x{:x}:{}",
+                        value, block_addr, op_idx
+                    )));
+                }
+                None => {
+                    return Some(self.certified_residual_comment(format!(
+                        "missing expression value proof at 0x{:x}:{}",
+                        block_addr, op_idx
+                    )));
+                }
+            }
+        }
+        if stmt_contains_memory_like_access(&stmt) {
+            match op {
+                SSAOp::Load { .. } => {
+                    if let Some((address, value)) = self
+                        .certified_memory_access_for_current_op(false)
+                        .map(|cert| (cert.address, cert.value))
+                    {
+                        self.record_effect_render_proof_for_memory(
+                            EffectRenderProofKind::MemoryRead,
+                            block_addr,
+                            op_idx,
+                            address,
+                            value,
+                        );
+                    }
+                }
+                SSAOp::Store { .. } => {
+                    if let Some((address, value)) = self
+                        .certified_memory_access_for_current_op(true)
+                        .map(|cert| (cert.address, cert.value))
+                    {
+                        self.record_effect_render_proof_for_memory(
+                            EffectRenderProofKind::MemoryWrite,
+                            block_addr,
+                            op_idx,
+                            address,
+                            value,
+                        );
+                    }
+                }
+                _ => {
+                    if self.requires_certified_rendering()
+                        && let Some(value) =
+                            op.dst().and_then(|dst| self.prepared_value_id_for_var(dst))
+                        && let Some((block_addr, op_index, address, value)) = self
+                            .certified_memory_read_for_value_dependency(value)
+                            .map(|cert| (cert.block_addr, cert.op_index, cert.address, cert.value))
+                    {
+                        self.record_effect_render_proof_for_memory(
+                            EffectRenderProofKind::MemoryRead,
+                            block_addr,
+                            op_index,
+                            address,
+                            value,
+                        );
+                    }
+                }
+            }
+        }
+        Some(stmt)
     }
 }

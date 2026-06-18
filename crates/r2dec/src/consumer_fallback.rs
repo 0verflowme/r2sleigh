@@ -147,16 +147,11 @@ pub(crate) fn semantic_fallback_comment(
         if let Some(return_relation) = rollup.root_return_relation.as_ref() {
             reason.push_str(&format!("; summary_return={return_relation:?}"));
         }
-        if !rollup.out_param_indices.is_empty() {
+        let certified_out_params =
+            crate::consumer_summary::certified_out_param_labels(&function_facts.types);
+        if !certified_out_params.is_empty() {
             reason.push_str("; out_params=[");
-            reason.push_str(
-                &rollup
-                    .out_param_indices
-                    .iter()
-                    .map(|idx| idx.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
+            reason.push_str(&certified_out_params.join(", "));
             reason.push(']');
         }
     }

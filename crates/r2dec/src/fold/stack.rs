@@ -410,6 +410,37 @@ impl<'a> FoldingContext<'a> {
         None
     }
 
+    pub(super) fn param_home_alias_for_stack_offset(&self, offset: i64) -> Option<String> {
+        if let Some(alias_name) = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_alias_for_offset(offset))
+            .filter(|alias| matches!(alias.binding_kind, Some(VisibleBindingKind::HiddenHome)))
+            .and_then(|alias| alias.arg_alias.as_deref())
+            .map(str::trim)
+            .filter(|alias| self.is_valid_param_home_alias(alias))
+        {
+            return Some(alias_name.to_string());
+        }
+
+        if let Some(binding) = self.visible_stack_binding_for_offset(offset)
+            && matches!(binding.kind, VisibleBindingKind::HiddenHome)
+            && let Some(alias) = self.visible_param_home_alias_for_binding(binding)
+            && self.is_valid_param_home_alias(&alias)
+        {
+            return Some(alias);
+        }
+
+        self.inputs
+            .stack_slots
+            .iter()
+            .find(|(slot_key, slot)| {
+                matches!(slot.role, ExternalStackSlotRole::ParamHome)
+                    && Self::stack_slot_matches_offset(slot_key, offset)
+            })
+            .and_then(|(_, slot)| self.visible_param_home_alias_for_slot(slot))
+            .filter(|alias| self.is_valid_param_home_alias(alias))
+    }
+
     fn visible_param_home_alias_for_binding(&self, binding: &VisibleBinding) -> Option<String> {
         if !matches!(binding.kind, VisibleBindingKind::HiddenHome) {
             return None;
@@ -464,6 +495,14 @@ impl<'a> FoldingContext<'a> {
         slot.source_reg
             .as_deref()
             .and_then(|reg| self.arg_alias_for_register_name(reg))
+    }
+
+    fn is_valid_param_home_alias(&self, alias: &str) -> bool {
+        let alias = alias.trim();
+        !alias.is_empty()
+            && !super::op_lower::is_generic_stack_placeholder_alias(alias)
+            && !self.is_transient_visible_name(alias)
+            && !self.is_low_signal_visible_name(alias)
     }
 
     pub(super) fn canonicalize_stack_name(&self, name: &str) -> Option<String> {

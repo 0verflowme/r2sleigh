@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use r2ssa::{
     SummaryAllocationEffect, SummaryAtomicEffect, SummaryLifetimeEffect, SummaryMemoryLocation,
-    SummarySyncEffect, SummaryTransferLength,
+    SummaryMemoryRegion, SummarySyncEffect, SummaryTransferLength,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -282,7 +282,7 @@ impl SemanticRegion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum NativeWorkerSummaryKind {
     ProgramOrchestrator,
     MemoryTransfer,
@@ -453,6 +453,11 @@ pub enum NativeWorkerPredicate {
     AllOf(Vec<NativeWorkerPredicate>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeWorkerByteTransform {
+    AsciiLowercase,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NativeWorkerFold {
     pub accumulator: String,
@@ -460,6 +465,33 @@ pub struct NativeWorkerFold {
     pub operation: NativeWorkerFoldOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicate: Option<NativeWorkerPredicate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_transform: Option<NativeWorkerByteTransform>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeTableWalkSummary {
+    pub table_arg: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needle_arg: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_accumulator: Option<String>,
+    #[serde(default)]
+    pub match_returns_field_plus_count: bool,
+    #[serde(default)]
+    pub exhausted_returns_negative_count: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -467,6 +499,17 @@ pub enum NativeParserKind {
     Numeric,
     Token,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NativeParserReturnPredicateKind {
+    NonzeroCursorAndZeroTerminator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NativeParserReturnPredicate {
+    pub kind: NativeParserReturnPredicateKind,
+    pub cursor_arg: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -482,6 +525,8 @@ pub struct NativeParserSummary {
     pub digit_max: Option<u8>,
     #[serde(default)]
     pub accepts_sign: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_predicate: Option<NativeParserReturnPredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -499,6 +544,8 @@ pub struct NativeWorkerLoopSummary {
     pub terminator: Option<NativeWorkerTerminator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fold: Option<NativeWorkerFold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_walk: Option<NativeTableWalkSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,6 +577,15 @@ pub struct NativeWorkerSummary {
 }
 
 impl NativeWorkerSummary {
+    pub fn summary_role_certificate_id(&self) -> u64 {
+        stable_summary_role_id(
+            0x20,
+            self.anchor,
+            self.kind,
+            stable_worker_summary_content_id(self),
+        )
+    }
+
     pub fn specificity(&self) -> NativeSummarySpecificity {
         if self.kind == NativeWorkerSummaryKind::NumericTransform {
             return NativeSummarySpecificity::NumericTransform;
@@ -629,6 +685,9 @@ impl NativeWorkerSummary {
             NativeWorkerSummaryKind::NumericTransform => {
                 collect_location_arg_indices(self.dst.as_ref(), &mut indices);
             }
+            NativeWorkerSummaryKind::Parser => {
+                collect_location_arg_indices(self.dst.as_ref(), &mut indices);
+            }
             NativeWorkerSummaryKind::MemoryWrite | NativeWorkerSummaryKind::Atomic => {
                 collect_location_arg_indices(self.memory.as_ref(), &mut indices);
                 collect_location_arg_indices(
@@ -639,6 +698,323 @@ impl NativeWorkerSummary {
             _ => {}
         }
         indices
+    }
+}
+
+fn stable_summary_role_id(
+    tag: u64,
+    anchor: u64,
+    kind: NativeWorkerSummaryKind,
+    detail: u64,
+) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    mix_stable_u64(&mut hash, tag);
+    mix_stable_u64(&mut hash, anchor);
+    mix_stable_u64(&mut hash, kind as u64);
+    mix_stable_u64(&mut hash, detail);
+    hash
+}
+
+fn stable_worker_summary_content_id(summary: &NativeWorkerSummary) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    mix_optional_location(&mut hash, 1, summary.dst.as_ref());
+    mix_optional_location(&mut hash, 2, summary.src.as_ref());
+    mix_optional_location(&mut hash, 3, summary.memory.as_ref());
+    mix_optional_transfer_length(&mut hash, 4, summary.len);
+    mix_optional_allocation(&mut hash, 5, summary.allocation.as_ref());
+    mix_optional_lifetime(&mut hash, 6, summary.lifetime.as_ref());
+    mix_optional_sync(&mut hash, 7, summary.sync.as_ref());
+    mix_optional_atomic(&mut hash, 8, summary.atomic.as_ref());
+    mix_optional_parser(&mut hash, 9, summary.parser.as_ref());
+    mix_optional_worker_loop(&mut hash, 10, summary.loop_summary.as_ref());
+    hash
+}
+
+fn mix_stable_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn mix_stable_text(hash: &mut u64, text: &str) {
+    mix_stable_u64(hash, text.len() as u64);
+    for byte in text.bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn mix_optional_u64(hash: &mut u64, tag: u64, value: Option<u64>) {
+    mix_stable_u64(hash, tag);
+    match value {
+        Some(value) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, value);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_location(hash: &mut u64, tag: u64, location: Option<&SummaryMemoryLocation>) {
+    mix_stable_u64(hash, tag);
+    match location {
+        Some(location) => {
+            mix_stable_u64(hash, 1);
+            mix_location(hash, location);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_location(hash: &mut u64, location: &SummaryMemoryLocation) {
+    match location.region {
+        SummaryMemoryRegion::Arg { index } => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, index as u64);
+        }
+        SummaryMemoryRegion::Global { address } => {
+            mix_stable_u64(hash, 2);
+            mix_stable_u64(hash, address);
+        }
+        SummaryMemoryRegion::HeapReturn => mix_stable_u64(hash, 3),
+        SummaryMemoryRegion::Unknown => mix_stable_u64(hash, 4),
+    }
+    match location.range {
+        Some(range) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, range.offset_lo as u64);
+            mix_stable_u64(hash, range.offset_hi as u64);
+            mix_optional_u64(hash, 1, range.width.map(u64::from));
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_transfer_length(hash: &mut u64, tag: u64, len: Option<SummaryTransferLength>) {
+    mix_stable_u64(hash, tag);
+    match len {
+        Some(len) => {
+            mix_stable_u64(hash, 1);
+            mix_transfer_length(hash, len);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_transfer_length(hash: &mut u64, len: SummaryTransferLength) {
+    match len {
+        SummaryTransferLength::Arg(index) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, index as u64);
+        }
+        SummaryTransferLength::Const(value) => {
+            mix_stable_u64(hash, 2);
+            mix_stable_u64(hash, value);
+        }
+        SummaryTransferLength::Unknown => mix_stable_u64(hash, 3),
+    }
+}
+
+fn mix_optional_allocation(hash: &mut u64, tag: u64, allocation: Option<&SummaryAllocationEffect>) {
+    mix_stable_u64(hash, tag);
+    match allocation {
+        Some(allocation) => {
+            mix_stable_u64(hash, 1);
+            mix_optional_u64(hash, 1, allocation.size_arg.map(|index| index as u64));
+            mix_stable_u64(hash, u64::from(allocation.zeroed));
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_lifetime(hash: &mut u64, tag: u64, lifetime: Option<&SummaryLifetimeEffect>) {
+    mix_stable_u64(hash, tag);
+    match lifetime {
+        Some(lifetime) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, lifetime.arg as u64);
+            mix_stable_u64(hash, lifetime.op as u64);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_sync(hash: &mut u64, tag: u64, sync: Option<&SummarySyncEffect>) {
+    mix_stable_u64(hash, tag);
+    match sync {
+        Some(sync) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, sync.arg as u64);
+            mix_stable_u64(hash, sync.op as u64);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_atomic(hash: &mut u64, tag: u64, atomic: Option<&SummaryAtomicEffect>) {
+    mix_stable_u64(hash, tag);
+    match atomic {
+        Some(atomic) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, atomic.op as u64);
+            mix_location(hash, &atomic.location);
+            mix_stable_u64(hash, atomic.ordering as u64);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_parser(hash: &mut u64, tag: u64, parser: Option<&NativeParserSummary>) {
+    mix_stable_u64(hash, tag);
+    match parser {
+        Some(parser) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, parser.kind as u64);
+            mix_optional_u64(hash, 1, parser.cursor_arg.map(|index| index as u64));
+            mix_optional_u64(hash, 2, parser.base.map(u64::from));
+            mix_optional_u64(hash, 3, parser.digit_min.map(u64::from));
+            mix_optional_u64(hash, 4, parser.digit_max.map(u64::from));
+            mix_stable_u64(hash, u64::from(parser.accepts_sign));
+            match parser.return_predicate {
+                Some(predicate) => {
+                    mix_stable_u64(hash, 1);
+                    mix_stable_u64(hash, predicate.kind as u64);
+                    mix_stable_u64(hash, predicate.cursor_arg as u64);
+                }
+                None => mix_stable_u64(hash, 0),
+            }
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_worker_loop(
+    hash: &mut u64,
+    tag: u64,
+    loop_summary: Option<&NativeWorkerLoopSummary>,
+) {
+    mix_stable_u64(hash, tag);
+    match loop_summary {
+        Some(loop_summary) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, loop_summary.header);
+            mix_optional_u64(hash, 1, loop_summary.exit_target);
+            mix_optional_u64(hash, 2, loop_summary.iterations);
+            mix_optional_u64(hash, 3, loop_summary.length_arg.map(|index| index as u64));
+            mix_optional_u64(hash, 4, loop_summary.stride);
+            mix_optional_terminator(hash, 5, loop_summary.terminator);
+            mix_optional_fold(hash, 6, loop_summary.fold.as_ref());
+            mix_optional_table_walk(hash, 7, loop_summary.table_walk.as_ref());
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_table_walk(hash: &mut u64, tag: u64, table: Option<&NativeTableWalkSummary>) {
+    mix_stable_u64(hash, tag);
+    match table {
+        Some(table) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, table.table_arg as u64);
+            mix_optional_u64(hash, 1, table.needle_arg.map(|value| value as u64));
+            mix_optional_u64(hash, 2, table.id_offset);
+            mix_optional_u64(hash, 3, table.len_offset);
+            mix_optional_u64(hash, 4, table.name_offset);
+            mix_optional_u64(hash, 5, table.next_offset);
+            if let Some(accumulator) = table.count_accumulator.as_ref() {
+                mix_stable_u64(hash, 1);
+                mix_stable_text(hash, accumulator);
+            } else {
+                mix_stable_u64(hash, 0);
+            }
+            mix_stable_u64(hash, u64::from(table.match_returns_field_plus_count));
+            mix_stable_u64(hash, u64::from(table.exhausted_returns_negative_count));
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_terminator(hash: &mut u64, tag: u64, terminator: Option<NativeWorkerTerminator>) {
+    mix_stable_u64(hash, tag);
+    match terminator {
+        Some(terminator) => {
+            mix_stable_u64(hash, 1);
+            mix_terminator(hash, terminator);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_terminator(hash: &mut u64, terminator: NativeWorkerTerminator) {
+    match terminator {
+        NativeWorkerTerminator::None => mix_stable_u64(hash, 1),
+        NativeWorkerTerminator::ZeroByte => mix_stable_u64(hash, 2),
+        NativeWorkerTerminator::ByteEquals(value) => {
+            mix_stable_u64(hash, 3);
+            mix_stable_u64(hash, u64::from(value));
+        }
+        NativeWorkerTerminator::LengthBound => mix_stable_u64(hash, 4),
+        NativeWorkerTerminator::Unknown => mix_stable_u64(hash, 5),
+    }
+}
+
+fn mix_optional_fold(hash: &mut u64, tag: u64, fold: Option<&NativeWorkerFold>) {
+    mix_stable_u64(hash, tag);
+    match fold {
+        Some(fold) => {
+            mix_stable_u64(hash, 1);
+            mix_stable_text(hash, &fold.accumulator);
+            mix_stable_u64(hash, u64::from(fold.bits));
+            mix_stable_u64(hash, fold.operation as u64);
+            mix_optional_predicate(hash, 1, fold.predicate.as_ref());
+            mix_optional_u64(hash, 2, fold.init);
+            mix_optional_u64(hash, 3, fold.multiplier);
+            mix_optional_u64(
+                hash,
+                4,
+                fold.byte_transform.map(|transform| transform as u64),
+            );
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_optional_predicate(hash: &mut u64, tag: u64, predicate: Option<&NativeWorkerPredicate>) {
+    mix_stable_u64(hash, tag);
+    match predicate {
+        Some(predicate) => {
+            mix_stable_u64(hash, 1);
+            mix_predicate(hash, predicate);
+        }
+        None => mix_stable_u64(hash, 0),
+    }
+}
+
+fn mix_predicate(hash: &mut u64, predicate: &NativeWorkerPredicate) {
+    match predicate {
+        NativeWorkerPredicate::ByteEqArg { arg } => {
+            mix_stable_u64(hash, 1);
+            mix_stable_u64(hash, *arg as u64);
+        }
+        NativeWorkerPredicate::ByteEqConst { value } => {
+            mix_stable_u64(hash, 2);
+            mix_stable_u64(hash, u64::from(*value));
+        }
+        NativeWorkerPredicate::AnyOf(predicates) => {
+            mix_stable_u64(hash, 3);
+            mix_stable_u64(hash, predicates.len() as u64);
+            for predicate in predicates {
+                mix_predicate(hash, predicate);
+            }
+        }
+        NativeWorkerPredicate::AllOf(predicates) => {
+            mix_stable_u64(hash, 4);
+            mix_stable_u64(hash, predicates.len() as u64);
+            for predicate in predicates {
+                mix_predicate(hash, predicate);
+            }
+        }
     }
 }
 
@@ -678,6 +1054,12 @@ pub struct NativeReductionSummary {
     pub operation: NativeWorkerFoldOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SummaryMemoryLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_transform: Option<NativeWorkerByteTransform>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -726,6 +1108,10 @@ pub struct NativeRegionSummary {
 }
 
 impl NativeRegionSummary {
+    pub fn summary_role_certificate_id(&self) -> u64 {
+        stable_summary_role_id(0x30, self.anchor, self.kind, self.stable_id)
+    }
+
     pub fn specificity(&self) -> NativeSummarySpecificity {
         if self.parser.is_some() {
             return NativeSummarySpecificity::Parser;
@@ -1332,13 +1718,14 @@ mod tests {
 
     use super::{
         ControlFact, Judged, MemoryFact, NativeArtifactBody, NativeFunctionSummary,
-        NativeSummarySpecificity, NativeWorkerSummary, NativeWorkerSummaryKind,
-        NativeWorkerTerminator, RegionKey, SemanticRegion, TargetFact,
+        NativeParserKind, NativeParserSummary, NativeSummarySpecificity, NativeWorkerSummary,
+        NativeWorkerSummaryKind, NativeWorkerTerminator, RegionKey, SemanticRegion, TargetFact,
     };
     use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
         BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
-        BackwardMemoryRegion, SemanticEvidence, SliceClass, SymbolicReachabilityStatus,
+        BackwardMemoryRegion, SemanticEvidence, SemanticEvidenceReason, SliceClass,
+        SymbolicReachabilityStatus,
     };
 
     fn compiled_summary(tag: u64) -> BackwardConditionSummary {
@@ -1409,6 +1796,57 @@ mod tests {
     }
 
     #[test]
+    fn worker_summary_certificate_id_includes_summary_content() {
+        let mut left = worker_summary(NativeWorkerSummaryKind::NumericTransform);
+        left.memory = Some(r2ssa::SummaryMemoryLocation {
+            region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+            range: Some(r2ssa::SummaryMemoryRange {
+                offset_lo: 0,
+                offset_hi: 0,
+                width: Some(1),
+            }),
+        });
+        left.len = Some(r2ssa::SummaryTransferLength::Arg(1));
+        left.loop_summary = Some(super::NativeWorkerLoopSummary {
+            header: 0x401000,
+            exit_target: Some(0x401040),
+            iterations: None,
+            length_arg: Some(1),
+            stride: Some(1),
+            terminator: Some(NativeWorkerTerminator::LengthBound),
+            fold: Some(super::NativeWorkerFold {
+                accumulator: "count".to_string(),
+                bits: 64,
+                operation: super::NativeWorkerFoldOperation::Add,
+                predicate: Some(super::NativeWorkerPredicate::ByteEqArg { arg: 2 }),
+                init: None,
+                multiplier: None,
+                byte_transform: None,
+            }),
+            table_walk: None,
+        });
+
+        let mut right = left.clone();
+        right
+            .loop_summary
+            .as_mut()
+            .unwrap()
+            .fold
+            .as_mut()
+            .unwrap()
+            .predicate = Some(super::NativeWorkerPredicate::ByteEqArg { arg: 3 });
+
+        assert_eq!(
+            left.summary_role_certificate_id(),
+            left.clone().summary_role_certificate_id()
+        );
+        assert_ne!(
+            left.summary_role_certificate_id(),
+            right.summary_role_certificate_id()
+        );
+    }
+
+    #[test]
     fn generic_memory_worker_summary_is_not_primary_renderable() {
         let summary = worker_summary(NativeWorkerSummaryKind::MemoryRead);
 
@@ -1431,6 +1869,7 @@ mod tests {
             stride: Some(1),
             terminator: Some(NativeWorkerTerminator::ZeroByte),
             fold: None,
+            table_walk: None,
         });
 
         assert_eq!(summary.specificity(), NativeSummarySpecificity::StringScan);
@@ -1534,5 +1973,40 @@ mod tests {
         assert!(body.target_source_conflict(0x401100, false));
         assert!(!body.has_target_guidance(0x401100, false));
         assert!(!body.supports_guarded_structuring());
+    }
+
+    #[test]
+    fn parser_destination_is_an_output_parameter() {
+        let summary = NativeWorkerSummary {
+            anchor: 0x401000,
+            kind: NativeWorkerSummaryKind::Parser,
+            dst: Some(r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                range: None,
+            }),
+            src: None,
+            memory: Some(r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                range: None,
+            }),
+            len: None,
+            allocation: None,
+            lifetime: None,
+            sync: None,
+            atomic: None,
+            parser: Some(NativeParserSummary {
+                kind: NativeParserKind::Numeric,
+                cursor_arg: Some(0),
+                base: Some(10),
+                digit_min: Some(b'0'),
+                digit_max: Some(b'9'),
+                accepts_sign: true,
+                return_predicate: None,
+            }),
+            loop_summary: None,
+            evidence: SemanticEvidence::likely(SemanticEvidenceReason::SummaryBudget),
+        };
+
+        assert_eq!(summary.out_param_indices(), BTreeSet::from([1]));
     }
 }

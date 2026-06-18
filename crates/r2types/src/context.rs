@@ -8,7 +8,8 @@ use crate::external::{
     normalize_external_type_name,
 };
 use crate::facts::{
-    FunctionParamSpec, FunctionSignatureSpec, FunctionType, FunctionTypeFacts, parse_type_like_spec,
+    FunctionParamSpec, FunctionSignatureSpec, FunctionType, FunctionTypeFacts,
+    SignatureCertificate, SignatureCertificateSource, parse_type_like_spec,
 };
 use crate::signature_infer::render_signature_type;
 
@@ -395,8 +396,15 @@ pub fn function_type_facts_from_parsed_context(
         .clone()
         .or_else(|| parsed_context.current_signature.clone());
     apply_main_signature_override(function_name, &mut merged_signature);
+    let signature_certificate = merged_signature.as_ref().and_then(|signature| {
+        SignatureCertificate::from_signature(
+            signature,
+            [SignatureCertificateSource::ExternalContext],
+        )
+    });
     FunctionTypeFacts {
         merged_signature,
+        signature_certificate,
         known_function_signatures: parsed_context.known_function_signatures.clone(),
         register_params: parsed_context.register_params.clone(),
         stack_slots: parsed_context.stack_slots.clone(),
@@ -1597,6 +1605,15 @@ mod tests {
         );
 
         let facts = function_type_facts_from_parsed_context("dbg.main", &parsed);
+        let certificate = facts
+            .signature_certificate
+            .as_ref()
+            .expect("external main signature should carry a certificate");
+        assert_eq!(
+            certificate.sources,
+            vec![SignatureCertificateSource::ExternalContext]
+        );
+        assert!(certificate.authorizes_signature_writeback());
         let signature = facts.merged_signature.expect("main signature");
         assert_eq!(signature.ret_type, Some(CTypeLike::Typedef("int".into())));
         assert_eq!(signature.params[0].name, "argc");
@@ -1646,6 +1663,14 @@ mod tests {
 
         let facts =
             function_type_facts_from_parsed_context("dbg.canonicalize_filename_mode", &parsed);
+        let certificate = facts
+            .signature_certificate
+            .as_ref()
+            .expect("current external signature should seed a certificate");
+        assert_eq!(
+            certificate.sources,
+            vec![SignatureCertificateSource::ExternalContext]
+        );
         let signature = facts
             .merged_signature
             .expect("current signature should seed function facts");

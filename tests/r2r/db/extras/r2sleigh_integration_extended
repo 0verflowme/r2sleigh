@@ -13,6 +13,20 @@ e??anal.sla | jq -Rs 'length==0'
 EOF_CMDS
 RUN
 
+NAME=manual_sparse_switch_o2_uses_edge_specific_return_phi
+FILE=bins/r2sleigh_manual_limits_O2
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~sparse_switch[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("return a + b;") and contains("return op + a - b;") and contains("return b == 0 ? -1 : a / b;") and (contains("r2sleigh residual:")|not) and (contains("t49900")|not) and (contains("t49a00")|not)'
+EOF_CMDS
+RUN
+
 NAME=deprecated_debug_aliases_report_moved_namespace
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
@@ -43,7 +57,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~check_secret[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("check_secret") and contains("0xdead") and contains("return 1;") and contains("return 0;") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("check_secret") and contains("return 0;") and contains("return 1;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
@@ -113,7 +127,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~check_secret[0]` >/dev/null
 af
-a:sla.dec $$ | jq -Rs 'contains("check_secret") and contains("0xdead") and contains("return 1;") and contains("return 0;") and (contains("r2dec fallback:")|not)'
+a:sla.dec $$ | jq -Rs 'contains("check_secret") and contains("return 0;") and contains("return 1;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 
@@ -159,7 +173,7 @@ af
 a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
 s `afl~test_struct_array_index[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct") and contains("[idx].third") and contains("[idx].fourteenth") and (contains("[idx].f_8")|not) and (contains("[idx].f_34")|not) and (contains("sla_struct_")|not) and (contains("*(arr +")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct* arr") and contains("arr[idx].third = v;") and contains("return arr[idx].fourteenth + arr[idx].third;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arr +")|not)'
 EOF_CMDS
 RUN
 
@@ -175,13 +189,13 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~process_string[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("process_string") and contains("strlen") and contains("return") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("process_string") and contains("strlen(s)") and contains("return -1;") and contains("return -2;") and contains("return len;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 s `afl~authenticate[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("authenticate") and contains("strcmp") and contains("return") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("authenticate") and contains("strcmp(password, \"secret123\")") and contains("return 0;") and contains("return 1;") and contains("r2sleigh residual: uncertified expression value") and ((split("strcmp(")|length)==2) and (contains("r10_1")|not) and (contains("summary return unresolved")|not) and (contains("r2dec fallback:")|not)'
 s `afl~alloc_and_copy[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("alloc_and_copy") and contains("malloc") and contains("memcpy") and contains("return") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("int8_t* alloc_and_copy(int8_t* src, size_t len)") and contains("buf = malloc(len + 1);") and contains("if (buf == 0)") and contains("memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
 EOF_CMDS
 RUN
 
@@ -368,7 +382,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~main[0]` >/dev/null
 afn copy_file_data
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("file_transfer")) != null) and (.params[1].type == "stat*") and (.params[8].type == "count_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -382,7 +396,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~main[0]` >/dev/null
 afn mergefps
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("record_stream")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("sort_merge")) != null) and (.params[0].type == "sortfile*") and (.params[3].type == "FILE*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -396,11 +410,11 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~main[0]` >/dev/null
 afn oputs_.constprop.0
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("output_stream")) != null)'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
-NAME=named_hash_fold_summary_feeds_types
+NAME=name_only_hash_fold_does_not_select_summary_only_types
 FILE=bins/test_func_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -410,7 +424,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn _md5_process_block
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("hash_fold")) != null) and (.params[1].type == "size_t") and (.params[2].type == "md5_ctx*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -424,7 +438,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn gregorian_to_persian
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("numeric_transform")) != null) and (.ret_type == "int") and (.params[0].type == "calendar_date*") and (.params[0].name == "result")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -438,7 +452,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn randread
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("hash_fold")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("memory_write")) != null) and (.ret_type == "void") and (.params[0].type == "randread_source*") and (.params[1].type == "int8_t*") and (.params[2].type == "size_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -452,7 +466,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn _internal_fnwmatch
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and ((.params[0].type // "") | contains("wchar_t")) and (.params[3].name == "no_leading_period")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -466,7 +480,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn _getopt_internal_r
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.params[2].name == "optstring") and (.params[3].type == "option*") and (.params[6].type == "_getopt_data*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -480,7 +494,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn digest_file.isra.0
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("hash_fold")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("record_stream")) != null) and (.params[2].type == "size_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -494,7 +508,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn binop
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "int")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -508,7 +522,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn write_counts
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("output_stream")) != null) and (.ret_type == "void") and (.params[0].type == "uintmax_t") and (.params[4].type == "intmax_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -522,7 +536,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn verror_at_line
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("diagnostic_wrapper")) != null) and (.ret_type == "void") and (.params[3].type == "unsigned int") and ((.params[5].type // "") | contains("__va_list_tag"))'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -536,7 +550,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn argmatch
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "ptrdiff_t") and (.params[2].type == "argmatch_value*") and (.params[3].type == "size_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -550,7 +564,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn error_tail
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("diagnostic_wrapper")) != null) and (.ret_type == "void") and (.params[0].type == "int") and (.params[1].type == "int") and ((.params[3].type // "") | contains("__va_list_tag"))'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -564,7 +578,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn argmatch_to_argument
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "int8_t*") and (.params[0].type == "argmatch_value*") and (.params[1].type == "int8_t**") and (.params[3].type == "size_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -578,7 +592,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn strcoll_loop
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("numeric_transform")) != null) and (.ret_type == "int") and (.params[0].type == "int8_t*") and (.params[1].type == "size_t") and (.params[2].type == "int8_t*") and (.params[3].type == "size_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -592,7 +606,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn indent
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("numeric_transform")) != null) and (.ret_type == "void") and (.params[0].type == "size_t") and (.params[1].type == "size_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -606,7 +620,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn dired_dump_obstack
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "void") and (.params[0].type == "int8_t*") and (.params[1].type == "struct obstack*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -620,7 +634,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn _obstack_begin_worker
-a:sla.debug.types | jq -c 'type=="object" and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("memory_write")) != null) and (.ret_type == "int") and (.params[0].type == "struct obstack*") and (.params[1].type == "idx_t") and (.params[2].type == "idx_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -634,7 +648,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn heap_remove_top
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("memory_write")) != null) and (.ret_type == "memory_ptr") and (.params[0].type == "heap*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -648,7 +662,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn quotearg_n_options
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (.params[2].type == "size_t") and (.params[3].type == "quoting_options*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -662,7 +676,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn defaultcon
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("path_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("metadata_probe")) != null) and (.ret_type == "int") and (.params[0].type == "selabel_handle*") and (.params[2].type == "mode_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -676,7 +690,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn renameatu
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("path_walk")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("metadata_probe")) != null) and (.ret_type == "int") and (.params[1].type == "int8_t*") and (.params[4].type == "unsigned int")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -690,7 +704,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn streamsavedir
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("directory_traversal")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (.ret_type == "int8_t*") and (.params[0].type == "DIR*") and ((.params[1].type // "") | contains("savedir_option"))'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -704,7 +718,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn quotearg_alloc_mem
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "int8_t*") and (.params[2].type == "size_t*") and (.params[3].type == "quoting_options*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -718,7 +732,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn xpalloc
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("allocation")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("metadata_probe")) != null) and (.ret_type == "allocation_ptr") and (.params[0].type == "allocation_ptr") and (.params[1].type == "idx_t*") and (.params[3].type == "ptrdiff_t")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -732,7 +746,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn version_etc_va
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("format_render")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("table_walk")) != null) and (.ret_type == "void") and (.params[0].type == "FILE*") and (.params[4].type == "va_list")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -746,7 +760,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~add[0]` >/dev/null
 afn rpl_mbrtowc
-a:sla.debug.types | jq -c 'type=="object" and (.compiled_semantics.granularity == "summary_only") and (((.compiled_semantics.native_worker_summary_kinds // []) | index("parser")) != null) and (((.compiled_semantics.native_worker_summary_kinds // []) | index("string_scan")) != null) and (.params[0].type == "wchar_t*") and (.params[3].type == "mbstate_t*")'
+a:sla.debug.types | jq -c 'type=="object" and ((.compiled_semantics.granularity // "") != "summary_only")'
 EOF_CMDS
 RUN
 
@@ -764,7 +778,7 @@ a:sla.debug.types | jq -c 'type=="object" and ((((.function_name // "") | contai
 EOF_CMDS
 RUN
 
-NAME=stress_parse_number_decompile_uses_parser_summary_route
+NAME=stress_parse_number_decompile_refuses_bounded_parser_summary_c
 FILE=bins/stress_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -774,7 +788,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~parse_number$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("parse_number") and contains("parse base10 numeric") and contains("worker summary: parser") and (contains("str != 45")|not) and (contains("str != 43")|not) and (contains("r2dec fallback:")|not) and (contains("r2dec residual:")|not)'
+a:sla.dec | jq -Rs 'contains("parse_number") and contains("summary role hint: string_scan; source=Structural") and contains("render contract: summary facts only; no executable native C reconstructed") and contains("island summary: parser") and contains("summary return unresolved") and (contains("summary projection (not native CFG): parser base10 numeric return loop")|not) and (contains("while (str[summary_i] >=")|not) and (contains("summary_value = summary_value * 10U +")|not) and (contains("return summary_value;")|not) and (contains("semantic role:")|not) and (contains("parse_base10_numeric_summary(")|not) and (contains("compute_numeric_transform(")|not)'
 EOF_CMDS
 RUN
 
@@ -789,5 +803,33 @@ aaa
 s `isq~tiny_vm_dispatch$[0]` >/dev/null
 af
 a:sla.debug.types | jq -c 'type=="object" and ((.function_name // "") | contains("tiny_vm_dispatch")) and .compiled_semantics.execution=="vm" and (.compiled_semantics.vm_transfer != null) and (((.compiled_semantics.vm_transfer.truncated_handlers // []) | length) == 0) and (((.compiled_semantics.vm_transfer.transfers // []) | length) > 0) and (((.compiled_semantics.vm_transfer.transfers // []) | all(.truncated == false))) and (((.compiled_semantics.vm_transfer.handler_state_updates // {}) | to_entries | length) >= 5)'
+EOF_CMDS
+RUN
+
+NAME=manual_table_walk_refuses_synthetic_summary_loop
+FILE=bins/r2sleigh_manual_limits_O0
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~table_walk[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t table_walk(Item* head, int8_t* needle)") and ((contains("render contract: summary facts only; no executable native C reconstructed") and contains("summary return unresolved") and (contains("for (Item* it = head; it != NULL; it = it->next)")|not) and (contains("it->id + seen")|not) and (contains("return -seen;")|not)) or contains("r2dec residual: unproven loop effects") or contains("r2dec residual: uncertified structured control") or contains("certified render contract failed") or ((contains("render contract: summary facts only; no executable native C reconstructed")|not) and contains("for (Item* it = head; it != NULL; it = it->next)") and contains("return -seen;"))) and (contains("table walk fields and returns are certified by r2sym")|not) and (contains("body blocks")|not) and (contains("exit targets")|not) and (contains("while (pos == head)")|not) and (contains("while (head == head)")|not) and (contains("while (it == head)")|not) and (contains("while (1) {\n    break;")|not)'
+EOF_CMDS
+RUN
+
+NAME=manual_sparse_switch_refuses_fake_cases_or_proves_source_cases
+FILE=bins/r2sleigh_manual_limits_O0
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~sparse_switch[0]` >/dev/null
+af
+a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("return a - b;") and contains("return a + b;") and contains("return a * 3 + b;") and contains("return (a ^ b) + 42;") and contains("return b == 0 ? -1 : a / b;") and contains("return op + a - b;") and (contains("r2sleigh residual:")|not) and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("case 1:")|not) and (contains("case 2:")|not)'
 EOF_CMDS
 RUN

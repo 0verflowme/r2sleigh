@@ -618,10 +618,7 @@ impl<'ctx> SymExecutor<'ctx> {
             // ==================== Boolean Operations ====================
             BoolNot { dst, src } => {
                 let val = self.read_var(state, src);
-                let result = match val.as_concrete() {
-                    Some(v) => SymValue::concrete(if v == 0 { 1 } else { 0 }, 1),
-                    None => val.not(self.ctx),
-                };
+                let result = val.bool_not(self.ctx);
                 self.write_var(state, dst, result);
                 Ok(vec![])
             }
@@ -1052,10 +1049,10 @@ impl<'ctx> SymExecutor<'ctx> {
             }
         } else {
             let key = var.display_name();
-            if let Some(value) = state.registers().get(&key).cloned() {
+            if let Some(value) = resolve_alias_register_value(state, &key, self.ctx) {
                 return value;
             }
-            if let Some(value) = resolve_alias_register_value(state, &key, self.ctx) {
+            if let Some(value) = state.registers().get(&key).cloned() {
                 return value;
             }
             SymValue::unknown(var.size * 8)
@@ -1113,10 +1110,8 @@ impl<'ctx> SymExecutor<'ctx> {
             });
         }
         let key = var.display_name();
-        state
-            .value_provenance(&key)
-            .cloned()
-            .or_else(|| resolve_alias_value_provenance(state, &key))
+        resolve_alias_value_provenance(state, &key)
+            .or_else(|| state.value_provenance(&key).cloned())
     }
 
     /// Execute a block of SSA operations.

@@ -370,7 +370,7 @@ fn is_fileinfo_sort_comparator_role(name: &str) -> bool {
         || name.starts_with("rev_strcmp_df_")
 }
 
-pub fn signature_hint_for_name_candidates<'a>(
+pub(crate) fn signature_hint_for_name_candidates<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     current_param_count: usize,
 ) -> Option<FunctionSignatureSpec> {
@@ -384,11 +384,36 @@ pub fn signature_hint_for_name_candidates<'a>(
     None
 }
 
-pub fn type_projection_for_name_candidates<'a>(
+#[cfg(test)]
+pub(crate) fn type_projection_for_name_candidates<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     current_param_count: usize,
 ) -> Option<RoleTypeProjection> {
     signature_hint_for_name_candidates(candidates, current_param_count)
+        .map(|signature| type_projection_for_signature(&signature))
+}
+
+pub fn signature_hint_for_role_identity(
+    role: &r2sym::NativeWorkerRoleIdentity,
+    current_param_count: usize,
+) -> Option<FunctionSignatureSpec> {
+    if matches!(role.source, r2sym::NativeWorkerRoleSource::NameHint)
+        || !role.evidence.allows_narrowing()
+    {
+        return None;
+    }
+    signature_hint_for_name_candidates(
+        std::iter::once(role.role_name.as_str())
+            .chain(role.source_names.iter().map(String::as_str)),
+        current_param_count,
+    )
+}
+
+pub fn type_projection_for_role_identity(
+    role: &r2sym::NativeWorkerRoleIdentity,
+    current_param_count: usize,
+) -> Option<RoleTypeProjection> {
+    signature_hint_for_role_identity(role, current_param_count)
         .map(|signature| type_projection_for_signature(&signature))
 }
 
@@ -492,7 +517,7 @@ pub fn signature_hint_for_summary_kinds(
     None
 }
 
-pub fn signature_hint_for_role_name(
+pub(crate) fn signature_hint_for_role_name(
     role_name: &str,
     current_param_count: usize,
 ) -> Option<FunctionSignatureSpec> {
@@ -515,14 +540,6 @@ pub fn signature_hint_for_role_name(
         "usage" => sig(CTypeLike::Void, vec![p("status", c_int_type())]),
         "printf_fetchargs" => format_argument_fetch_signature(),
         "oprintf_" | "oprintf_.constprop.0" => format_output_signature(current_param_count),
-        "_md5_process_block" | "md5_process_block" | "md5_process_bytes" => sig(
-            CTypeLike::Void,
-            vec![
-                p("buffer", void_pointer_type()),
-                p("len", typedef_type("size_t")),
-                p("ctx", typedef_pointer_type("md5_ctx")),
-            ],
-        ),
         "_internal_fnwmatch" | "internal_fnwmatch" => sig(
             c_int_type(),
             vec![
@@ -819,32 +836,6 @@ pub fn signature_hint_for_role_name(
         "hwcap_allowed" => sig(
             CTypeLike::Bool,
             vec![p("glibc_hwcap", signed_byte_pointer_type())],
-        ),
-        "sha224_process_block"
-        | "sha224_process_bytes"
-        | "sha256_process_block"
-        | "sha256_process_bytes" => sig(
-            CTypeLike::Void,
-            vec![
-                p("buffer", memory_ptr_type()),
-                p("len", typedef_type("size_t")),
-                p("ctx", typedef_pointer_type("sha256_ctx")),
-            ],
-        ),
-        "sm3_process_block" | "sm3_process_bytes" => sig(
-            CTypeLike::Void,
-            vec![
-                p("buffer", memory_ptr_type()),
-                p("len", typedef_type("size_t")),
-                p("ctx", typedef_pointer_type("sm3_ctx")),
-            ],
-        ),
-        "blake2b_compress" => sig(
-            CTypeLike::Void,
-            vec![
-                p("state", typedef_pointer_type("blake2b_state")),
-                p("block", unsigned_byte_pointer_type()),
-            ],
         ),
         "base32_encode" | "base64_encode" => sig(
             CTypeLike::Void,
@@ -1412,20 +1403,6 @@ pub fn signature_hint_for_role_name(
             vec![
                 p("duration", typedef_type("double")),
                 p("warn", CTypeLike::Bool),
-            ],
-        ),
-        "sha1_stream" | "md5_stream" | "__md5_stream" => sig(
-            c_int_type(),
-            vec![
-                p("stream", typedef_pointer_type("FILE")),
-                p("resblock", unsigned_byte_pointer_type()),
-            ],
-        ),
-        "sha512_read_ctx" | "sha384_read_ctx" => sig(
-            unsigned_byte_pointer_type(),
-            vec![
-                p("ctx", struct_pointer_type("sha512_ctx")),
-                p("resbuf", unsigned_byte_pointer_type()),
             ],
         ),
         "output_file" => sig(
@@ -3847,6 +3824,33 @@ mod tests {
     }
 
     #[test]
+    fn role_identity_signature_requires_non_name_evidence() {
+        let name_hint = r2sym::NativeWorkerRoleIdentity {
+            role_name: r2sym::NativeWorkerSummaryKind::FormatArgumentFetch
+                .canonical_role_name()
+                .to_string(),
+            source: r2sym::NativeWorkerRoleSource::NameHint,
+            confidence: r2sym::SemanticConfidence::Heuristic,
+            source_names: vec!["sym.printf_fetchargs".to_string()],
+            summary_kinds: BTreeSet::from([r2sym::NativeWorkerSummaryKind::FormatArgumentFetch]),
+            evidence: r2sym::SemanticEvidence::heuristic(r2sym::SemanticEvidenceReason::NameHint),
+        };
+        assert!(signature_hint_for_role_identity(&name_hint, 0).is_none());
+        assert!(type_projection_for_role_identity(&name_hint, 0).is_none());
+
+        let structural = r2sym::NativeWorkerRoleIdentity {
+            source: r2sym::NativeWorkerRoleSource::Structural,
+            confidence: r2sym::SemanticConfidence::Likely,
+            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
+            ..name_hint
+        };
+        let signature = signature_hint_for_role_identity(&structural, 0)
+            .expect("structural role identity should project signature");
+        assert_eq!(signature.ret_type, Some(typedef_type("printf_status_t")));
+        assert!(type_projection_for_role_identity(&structural, 0).is_some());
+    }
+
+    #[test]
     fn registry_covers_current_coreutils_worker_roles() {
         for name in [
             "copy_file_data",
@@ -3863,7 +3867,6 @@ mod tests {
             "cut_fields_bytesearch",
             "fdfile_has_aclinfo",
             "__strftime_internal.isra.0",
-            "_md5_process_block",
             "_internal_fnwmatch",
             "_getopt_internal_r",
             "getopt_long",
@@ -4095,8 +4098,6 @@ mod tests {
             "rpl_obstack_memory_used",
             "alloc_ibuf",
             "alloc_obuf",
-            "sha256_process_block",
-            "sm3_process_block",
             "parse_datetime_body",
             "posixtime",
             "readtoken",
@@ -4162,14 +4163,6 @@ mod tests {
         assert_eq!(dtoa.ret_type, Some(c_int_type()));
         assert_eq!(dtoa.params[4].ty, Some(typedef_type("long double")));
 
-        let digest_stream =
-            signature_hint_for_role_name("sha384_read_ctx", 0).expect("expected sha384");
-        assert_eq!(digest_stream.ret_type, Some(unsigned_byte_pointer_type()));
-        assert_eq!(
-            digest_stream.params[0].ty,
-            Some(struct_pointer_type("sha512_ctx"))
-        );
-
         let output = signature_hint_for_role_name("output_file", 0).expect("expected output_file");
         assert_eq!(output.ret_type, Some(CTypeLike::Void));
         assert_eq!(output.params[2].ty, Some(unsigned_byte_pointer_type()));
@@ -4206,20 +4199,17 @@ mod tests {
 
     #[test]
     fn registry_covers_coreutils_mf100_gap_signatures() {
-        let sha = signature_hint_for_name_candidates(["sym.sha256_process_block"], 0)
-            .expect("sha256 signature");
-        assert_eq!(sha.ret_type, Some(CTypeLike::Void));
-        assert_eq!(sha.params[0].name, "buffer");
-        assert_eq!(sha.params[0].ty, Some(memory_ptr_type()));
-        assert_eq!(sha.params[1].ty, Some(typedef_type("size_t")));
-        assert_eq!(sha.params[2].ty, Some(typedef_pointer_type("sha256_ctx")));
-
-        let sm3 = signature_hint_for_name_candidates(["sym.sm3_process_block"], 0)
-            .expect("sm3 signature");
-        assert_eq!(sm3.ret_type, Some(CTypeLike::Void));
-        assert_eq!(sm3.params[0].ty, Some(memory_ptr_type()));
-        assert_eq!(sm3.params[1].ty, Some(typedef_type("size_t")));
-        assert_eq!(sm3.params[2].ty, Some(typedef_pointer_type("sm3_ctx")));
+        for name in [
+            "sym.sha256_process_block",
+            "sym.sm3_process_block",
+            "sym.blake2b_compress",
+            "dbg.sha384_read_ctx",
+        ] {
+            assert!(
+                signature_hint_for_name_candidates([name], 0).is_none(),
+                "hash/crypto names alone must not create authoritative signatures for {name}"
+            );
+        }
 
         let datetime = signature_hint_for_name_candidates(["dbg.parse_datetime_body"], 0)
             .expect("parse_datetime_body signature");
@@ -4262,15 +4252,6 @@ mod tests {
                 signed_byte_pointer_pointer_type()
             )))
         );
-
-        let blake = signature_hint_for_name_candidates(["sym.blake2b_compress"], 0)
-            .expect("blake2b signature");
-        assert_eq!(blake.ret_type, Some(CTypeLike::Void));
-        assert_eq!(
-            blake.params[0].ty,
-            Some(typedef_pointer_type("blake2b_state"))
-        );
-        assert_eq!(blake.params[1].ty, Some(unsigned_byte_pointer_type()));
 
         let reconstruct = signature_hint_for_name_candidates(["dbg.re_string_reconstruct"], 0)
             .expect("regex reconstruct signature");
@@ -4562,14 +4543,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_projects_hash_pattern_and_getopt_roles() {
-        let md5 =
-            signature_hint_for_role_name("_md5_process_block", 0).expect("expected md5 signature");
-        assert_eq!(md5.ret_type, Some(CTypeLike::Void));
-        assert_eq!(md5.params[0].name, "buffer");
-        assert_eq!(md5.params[1].ty, Some(typedef_type("size_t")));
-        assert_eq!(md5.params[2].ty, Some(typedef_pointer_type("md5_ctx")));
-
+    fn registry_projects_getopt_roles_without_name_only_hash_signatures() {
+        assert!(
+            signature_hint_for_role_name("_md5_process_block", 0).is_none(),
+            "hash names alone must not create authoritative signatures"
+        );
         let fnwmatch = signature_hint_for_role_name("_internal_fnwmatch", 0)
             .expect("expected fnwmatch signature");
         assert_eq!(fnwmatch.params[0].name, "pattern");

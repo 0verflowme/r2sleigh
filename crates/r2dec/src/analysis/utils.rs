@@ -73,11 +73,7 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     {
         dec.parse().ok()
     } else if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        if val_str.chars().any(|c| c.is_ascii_alphabetic()) || val_str.len() > 4 {
-            u64::from_str_radix(val_str, 16).ok()
-        } else {
-            val_str.parse().ok()
-        }
+        u64::from_str_radix(val_str, 16).ok()
     } else {
         val_str.parse().ok()
     }
@@ -85,22 +81,13 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
 
 pub(crate) fn parse_compare_const_value_with_width(
     var: &SSAVar,
-    compare_width: u32,
+    _compare_width: u32,
 ) -> Option<u64> {
     let raw = var.name.strip_prefix("const:")?;
     let raw = raw.split('_').next().unwrap_or(raw);
 
     if let Some(dec) = raw.strip_prefix("0d").or_else(|| raw.strip_prefix("0D")) {
         return dec.parse().ok();
-    }
-
-    if compare_width >= 8
-        && raw.len() > 1
-        && raw.chars().all(|c| c.is_ascii_hexdigit())
-        && !raw.starts_with("0x")
-        && !raw.starts_with("0X")
-    {
-        return u64::from_str_radix(raw, 16).ok();
     }
 
     parse_const_value(&var.name)
@@ -539,27 +526,27 @@ mod tests {
     use r2ssa::SSAVar;
 
     #[test]
-    fn parse_const_value_keeps_existing_general_behavior() {
-        assert_eq!(parse_const_value("const:100"), Some(100));
+    fn parse_const_value_uses_ssa_hex_payload_by_default() {
+        assert_eq!(parse_const_value("const:100"), Some(0x100));
         assert_eq!(parse_const_value("const:0x100"), Some(0x100));
         assert_eq!(parse_const_value("const:0d100"), Some(100));
     }
 
     #[test]
-    fn parse_compare_const_value_keeps_lifted_wide_hex_immediates_and_narrow_decimal_tests() {
+    fn parse_compare_const_value_keeps_lifted_hex_immediates_and_explicit_decimal_tests() {
         let wide = SSAVar::new("const:64", 0, 8);
         let narrow = SSAVar::new("const:64", 0, 4);
         let explicit_decimal = SSAVar::new("const:0d64", 0, 8);
 
         assert_eq!(parse_compare_const_value(&wide), Some(0x64));
-        assert_eq!(parse_compare_const_value(&narrow), Some(64));
+        assert_eq!(parse_compare_const_value(&narrow), Some(0x64));
         assert_eq!(parse_compare_const_value(&explicit_decimal), Some(64));
     }
 
     #[test]
     fn parse_compare_const_value_with_width_prefers_hex_for_wide_comparisons() {
         let narrow = SSAVar::new("const:64", 0, 4);
-        let decimal = SSAVar::new("const:100", 0, 4);
+        let decimal = SSAVar::new("const:0d100", 0, 4);
 
         assert_eq!(parse_compare_const_value_with_width(&narrow, 8), Some(0x64));
         assert_eq!(parse_compare_const_value_with_width(&decimal, 4), Some(100));

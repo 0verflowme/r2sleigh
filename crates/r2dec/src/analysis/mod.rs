@@ -186,7 +186,6 @@ impl CallArgBinding {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn with_source_value_id(mut self, value_id: ValueId) -> Self {
         self.source_value_id = Some(value_id);
         self
@@ -414,6 +413,10 @@ impl StackSlotProvenance {
         self.value_kind == StackSlotValueKind::Scalar
     }
 
+    pub(crate) fn is_address_like(self) -> bool {
+        self.value_kind == StackSlotValueKind::AddressLike
+    }
+
     pub(crate) fn is_scalar_predicate_carrier(self) -> bool {
         self.predicate_carrier && self.is_scalar()
     }
@@ -467,7 +470,9 @@ impl UseInfo {
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) {
         let display = var.display_name();
         self.value_ids_by_name.insert(display.clone(), value_id);
-        self.value_ids_by_name.insert(var.name.clone(), value_id);
+        if var.version == 0 {
+            self.value_ids_by_name.insert(var.name.clone(), value_id);
+        }
         self.vars_by_value_id
             .entry(value_id)
             .or_insert_with(|| var.clone());
@@ -628,10 +633,20 @@ impl UseInfo {
     }
 
     pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
-        self.value_ids_by_name
-            .get(&var.display_name())
-            .copied()
-            .or_else(|| self.value_ids_by_name.get(&var.name).copied())
+        self.exact_value_id_for_var(var).or_else(|| {
+            (var.version == 0)
+                .then(|| self.value_ids_by_name.get(&var.name).copied())
+                .flatten()
+        })
+    }
+
+    pub(crate) fn exact_value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
+        let display = var.display_name();
+        let value_id = self.value_ids_by_name.get(&display).copied()?;
+        self.vars_by_value_id
+            .get(&value_id)
+            .filter(|stored| stored.display_name() == display)
+            .map(|_| value_id)
     }
 
     pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {

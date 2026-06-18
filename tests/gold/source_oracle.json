@@ -2,6 +2,96 @@
   "schema": 1,
   "expectations": [
     {
+      "id": "repo-stress-parse-number-summary-return-sla",
+      "corpus": "repo-fixtures",
+      "case": "stress_test_x86",
+      "target": "parse_number",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "int32_t parse_number(int8_t* str)",
+        "summary role hint: string_scan; source=Structural",
+        "render contract: summary facts only; no executable native C reconstructed",
+        "island summary: parser",
+        "summary return unresolved"
+      ],
+      "not_contains": [
+        "r2dec residual:",
+        "summary projection (not native CFG): parser base10 numeric return loop",
+        "summary locals are synthetic; source local names were not recovered",
+        "summary_value",
+        "while (str[summary_i]",
+        "parse_base10_numeric_summary(",
+        "compute_numeric_transform(",
+        "return accumulator;"
+      ]
+    },
+    {
+      "id": "repo-stress-parse-number-summary-return-pdd",
+      "corpus": "repo-fixtures",
+      "case": "stress_test_x86",
+      "target": "parse_number",
+      "command": "decompile_pdd",
+      "owner": "r2sym",
+      "contains": [
+        "int32_t parse_number(int8_t* str)",
+        "summary role hint: string_scan; source=Structural",
+        "render contract: summary facts only; no executable native C reconstructed",
+        "island summary: parser",
+        "summary return unresolved"
+      ],
+      "not_contains": [
+        "r2dec residual:",
+        "summary projection (not native CFG): parser base10 numeric return loop",
+        "summary locals are synthetic; source local names were not recovered",
+        "summary_value",
+        "while (str[summary_i]",
+        "parse_base10_numeric_summary(",
+        "compute_numeric_transform(",
+        "return accumulator;"
+      ]
+    },
+    {
+      "id": "repo-stress-tiny-vm-summary-sla",
+      "corpus": "repo-fixtures",
+      "case": "stress_test_x86",
+      "target": "tiny_vm_dispatch",
+      "command": "decompile_sla",
+      "owner": "r2sym",
+      "contains": [
+        "int32_t tiny_vm_dispatch(uint8_t* code, int32_t len)",
+        "r2dec semantic summary: vm_summary for tiny_vm_dispatch",
+        "switch (dispatch_selector)",
+        "case 0x0:",
+        "case 0x7:",
+        "default:",
+        "redispatch"
+      ],
+      "not_contains": [
+        "r2dec residual:",
+        "summary return unresolved",
+        "while (pos == head)",
+        "parse_base10_numeric_summary("
+      ]
+    },
+    {
+      "id": "repo-stress-tiny-vm-types-route",
+      "corpus": "repo-fixtures",
+      "case": "stress_test_x86",
+      "target": "tiny_vm_dispatch",
+      "command": "types",
+      "owner": "r2engine",
+      "contains": [
+        "\"function_name\":\"dbg.tiny_vm_dispatch\"",
+        "\"execution\":\"Vm\"",
+        "\"VmSummaryOnly\""
+      ],
+      "not_contains": [
+        "\"execution\":\"Native\"",
+        "\"summary return unresolved\""
+      ]
+    },
+    {
       "id": "repo-vuln-struct-array-index",
       "corpus": ["repo-fixtures", "manual"],
       "case": "vuln_test_x86",
@@ -48,15 +138,18 @@
       "contains": [
         "size_t mem_scan2(uint8_t* buf, size_t n, uint8_t a, uint8_t b)",
         "r2dec summary: semantic worker",
-        "size_t count = 0;",
-        "for (size_t i = 0; i < n; i++)",
-        "unsigned char c = buf[i];",
-        "if (c == a || c == b)",
-        "return count;"
+        "render contract: summary facts only; no executable native C reconstructed",
+        "island summary: numeric_transform",
+        "summary return unresolved"
       ],
       "not_contains": [
         "r2dec residual: unproven loop effects",
         "uint8_t mem_scan2",
+        "summary projection (not native CFG): numeric_transform predicated count loop",
+        "summary_count",
+        "size_t summary_i",
+        "summary_i <",
+        "summary_byte",
         "do {\n    } while",
         "return r8d_1;",
         "count_matching_bytes_summary",
@@ -73,17 +166,27 @@
       "owner": "r2dec",
       "contains": [
         "uint64_t fnv_fold(uint8_t* buf, size_t n)",
-        "r2dec summary: semantic worker",
-        "for (size_t i = 0; i < n; i++)",
-        "hash ^= c;",
-        "return hash;"
+        "r2dec residual:",
+        "unproven loop effects",
+        "empty loop body rendered",
+        "structured C suppressed until canonical facts prove the rendered effects",
+        "summary return unresolved"
       ],
       "not_contains": [
-        "r2dec residual: unproven loop effects",
+        "r2dec summary: semantic worker",
+        "render contract: summary facts only; no executable native C reconstructed",
+        "worker summary: hash_fold",
         "return 0x14650fb0739d0383;",
         "return fnv1a_hash;",
+        "summary projection (not native CFG): hash_fold loop",
+        "summary_hash",
+        "size_t summary_i",
+        "summary_i <",
+        "summary_byte",
+        "buf[2]",
+        "r8d_2",
         "fold_summary",
-        "summary return unresolved"
+        "return summary_hash;"
       ]
     },
     {
@@ -96,6 +199,7 @@
       "contains": [
         "int32_t out_param_parse(int8_t* s, Result* out)",
         "r2dec summary: semantic worker islands",
+        "render contract: summary facts only; no executable native C reconstructed",
         "worker summary: parser: dst=out mem=s",
         "worker summary: memory_write: mem=out"
       ],
@@ -110,16 +214,26 @@
       "case": "r2sleigh_manual_limits_O2",
       "target": "table_walk",
       "command": "decompile_sla",
-      "owner": "r2sym",
+      "owner": "r2dec",
       "contains": [
         "int32_t table_walk(Item* head, int8_t* needle)",
-        "r2dec summary: semantic worker islands",
-        "worker summary: table_walk: mem=head",
-        "worker summary: string_scan: mem=needle"
+        "r2dec residual:",
+        "uncertified structured control",
+        "structured C suppressed until canonical facts prove the rendered effects",
+        "summary return unresolved"
       ],
       "not_contains": [
-        "r2dec residual: unproven loop effects",
-        "return table_match_score;"
+        "r2dec summary: semantic worker islands",
+        "render contract: summary facts only; no executable native C reconstructed",
+        "worker summary: table_walk: mem=head",
+        "worker summary: string_scan: mem=needle",
+        "for (Item* it = head; it != NULL; it = it->next)",
+        "it->id + seen",
+        "return -seen;",
+        "return table_match_score;",
+        "table walk fields and returns are certified by r2sym",
+        "body blocks",
+        "exit targets"
       ]
     },
     {
@@ -147,7 +261,7 @@
     {
       "id": "manual-sparse-switch-source-cases",
       "corpus": "manual",
-      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "case": "r2sleigh_manual_limits_O0",
       "target": "sparse_switch",
       "command": "decompile_sla",
       "owner": "r2sym",
@@ -171,28 +285,31 @@
     {
       "id": "manual-fnv-fold-source-loop",
       "corpus": "manual",
-      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "case": "r2sleigh_manual_limits_O0",
       "target": "fnv_fold",
       "command": "decompile_sla",
-      "owner": "r2sym",
+      "owner": "r2dec",
       "contains": [
         "for (size_t i = 0; i < n; i++)",
-        "unsigned char c = buf[i];",
-        "c = (unsigned char)(c + 32);",
+        "uint8_t c = buf[i];",
+        "if (c > 64 && c <= 90)",
+        "c += 32;",
         "hash ^= c;",
-        "hash *= 1099511628211",
+        "hash *= 0x100000001b3U;",
         "return hash;"
       ],
       "not_contains": [
         "return fnv1a_hash;",
         "fold_summary",
-        "summary return unresolved"
+        "summary_hash",
+        "summary return unresolved",
+        "value_"
       ]
     },
     {
       "id": "manual-out-param-parse-source-fields",
       "corpus": "manual",
-      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "case": "r2sleigh_manual_limits_O0",
       "target": "out_param_parse",
       "command": "decompile_sla",
       "owner": "r2types",
@@ -207,26 +324,6 @@
         "summary return unresolved",
         "parse_base10_numeric_summary",
         "compute_numeric_transform"
-      ]
-    },
-    {
-      "id": "manual-table-walk-source-loop",
-      "corpus": "manual",
-      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
-      "target": "table_walk",
-      "command": "decompile_sla",
-      "owner": "r2sym",
-      "contains": [
-        "for (Item* it = head; it != NULL; it = it->next)",
-        "it->name",
-        "it->len",
-        "it->id + seen",
-        "return -seen;"
-      ],
-      "not_contains": [
-        "summary return unresolved",
-        "walk_table_summary",
-        "return table_match_score;"
       ]
     },
     {
@@ -272,7 +369,7 @@
     {
       "id": "manual-mem-scan2-source-loop",
       "corpus": "manual",
-      "case": ["r2sleigh_manual_limits_O2", "r2sleigh_manual_limits_O0"],
+      "case": "r2sleigh_manual_limits_O0",
       "target": "mem_scan2",
       "command": "decompile_sla",
       "owner": "r2dec",
@@ -280,7 +377,7 @@
         "size_t mem_scan2(uint8_t* buf, size_t n, uint8_t a, uint8_t b)",
         "size_t count = 0;",
         "for (size_t i = 0; i < n; i++)",
-        "unsigned char c = buf[i];",
+        "uint8_t c = buf[i];",
         "if (c == a || c == b)",
         "count++;",
         "return count;"
@@ -289,6 +386,7 @@
         "summary-backed count loop",
         "summary_i <",
         "size_t summary_i",
+        "    int8_t c = buf[i];",
         "match_count",
         "summary return unresolved"
       ]

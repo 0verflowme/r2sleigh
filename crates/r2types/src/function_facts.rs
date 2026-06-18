@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::facts::{FunctionSignatureProjection, FunctionTypeFacts, SignatureProjectionResult};
+use crate::facts::{
+    FunctionSignatureProjection, FunctionTypeFacts, OutParamCertificateEvidence,
+    OutParamCertificateSource, SignatureProjectionResult,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisPlans {
@@ -44,8 +47,8 @@ pub struct SummaryEffectRollup {
     pub root_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_return_relation: Option<r2ssa::SummaryReturnRelation>,
-    #[serde(default)]
-    pub out_param_indices: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out_param_facts: Vec<SummaryOutParamFact>,
     #[serde(default)]
     pub pointer_param_indices: Vec<usize>,
     #[serde(default)]
@@ -71,8 +74,8 @@ pub struct SummaryHelperView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arg_count_hint: Option<usize>,
     pub return_relation: r2ssa::SummaryReturnRelation,
-    #[serde(default)]
-    pub out_param_indices: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out_param_facts: Vec<SummaryOutParamFact>,
     #[serde(default)]
     pub pointer_param_indices: Vec<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -87,6 +90,13 @@ pub struct SummaryHelperView {
     pub atomic_effects: Vec<r2ssa::SummaryAtomicEffect>,
     pub has_unknown_calls: bool,
     pub touches_unknown_memory: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SummaryOutParamFact {
+    pub param_index: usize,
+    pub evidence: OutParamCertificateEvidence,
+    pub source: OutParamCertificateSource,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,11 +167,13 @@ impl InterprocSummaryView {
         })
     }
 
-    pub fn out_param_indices(&self) -> &[usize] {
-        self.rollup
-            .as_ref()
-            .map(|rollup| rollup.out_param_indices.as_slice())
-            .unwrap_or(&[])
+    pub fn out_param_indices(&self) -> Vec<usize> {
+        out_param_indices_from_facts(
+            self.rollup
+                .as_ref()
+                .map(|rollup| rollup.out_param_facts.as_slice())
+                .unwrap_or(&[]),
+        )
     }
 
     pub fn pointer_param_indices(&self) -> &[usize] {
@@ -176,6 +188,7 @@ impl InterprocSummaryView {
 pub struct FunctionFacts {
     pub types: FunctionTypeFacts,
     pub semantics: Option<r2sym::SemanticArtifact>,
+    pub proof: r2sym::ProofCoverage,
     pub assumptions: r2ssa::AssumptionSet,
     pub plans: AnalysisPlans,
     pub summary_view: InterprocSummaryView,
@@ -186,9 +199,15 @@ pub struct FunctionFacts {
 impl FunctionFacts {
     pub fn new(types: FunctionTypeFacts, semantics: Option<r2sym::SemanticArtifact>) -> Self {
         let plans = AnalysisPlans::from_semantics(semantics.as_ref());
+        let proof = semantics
+            .as_ref()
+            .map(r2sym::SemanticArtifact::semantic_claim_summary)
+            .map(|claims| r2sym::ProofCoverage::from_semantic_claims(&claims))
+            .unwrap_or_default();
         Self {
             types,
             semantics,
+            proof,
             assumptions: r2ssa::AssumptionSet::default(),
             plans,
             summary_view: InterprocSummaryView::default(),
@@ -225,9 +244,23 @@ impl FunctionFacts {
         self
     }
 
+    pub fn with_proof_coverage(mut self, proof: r2sym::ProofCoverage) -> Self {
+        self.proof = proof;
+        self
+    }
+
+    pub fn merge_proof_coverage(&mut self, proof: r2sym::ProofCoverage) {
+        self.proof = std::mem::take(&mut self.proof).merge(proof);
+    }
+
     pub fn set_semantics(&mut self, semantics: Option<r2sym::SemanticArtifact>) {
         self.semantics = semantics;
         self.refresh_plans();
+        if let Some(semantics) = self.semantics.as_ref() {
+            self.merge_proof_coverage(r2sym::ProofCoverage::from_semantic_claims(
+                &semantics.semantic_claim_summary(),
+            ));
+        }
     }
 
     pub fn refresh_plans(&mut self) {
@@ -332,17 +365,9 @@ impl FunctionFacts {
 fn summary_rollup(set: Option<&r2ssa::InterprocSummarySet>) -> Option<SummaryEffectRollup> {
     let set = set?;
     let root_summary = set.root.and_then(|root| set.summaries.get(&root));
-    let mut out_param_indices = root_summary
-        .map(|summary| {
-            summary
-                .arg_effects
-                .iter()
-                .filter_map(|(idx, effect)| (effect.write || effect.escape).then_some(*idx))
-                .collect::<Vec<_>>()
-        })
+    let out_param_facts = root_summary
+        .map(summary_out_param_facts)
         .unwrap_or_default();
-    out_param_indices.sort_unstable();
-    out_param_indices.dedup();
 
     let mut pointer_param_indices = root_summary
         .map(|summary| {
@@ -368,7 +393,7 @@ fn summary_rollup(set: Option<&r2ssa::InterprocSummarySet>) -> Option<SummaryEff
     Some(SummaryEffectRollup {
         root_name: root_summary.and_then(|summary| summary.name.clone()),
         root_return_relation: root_summary.map(|summary| summary.return_relation.clone()),
-        out_param_indices,
+        out_param_facts,
         pointer_param_indices,
         transfer_count: root_summary.map_or(0, |summary| summary.transfer_effects.len()),
         allocation_count: root_summary.map_or(0, |summary| summary.allocation_effects.len()),
@@ -393,13 +418,7 @@ fn helper_views(set: Option<&r2ssa::InterprocSummarySet>) -> Vec<SummaryHelperVi
         .iter()
         .filter(|(id, _)| Some(**id) != set.root)
         .map(|(id, summary)| {
-            let mut out_param_indices = summary
-                .arg_effects
-                .iter()
-                .filter_map(|(idx, effect)| (effect.write || effect.escape).then_some(*idx))
-                .collect::<Vec<_>>();
-            out_param_indices.sort_unstable();
-            out_param_indices.dedup();
+            let out_param_facts = summary_out_param_facts(summary);
 
             let mut pointer_param_indices = summary
                 .arg_effects
@@ -422,7 +441,7 @@ fn helper_views(set: Option<&r2ssa::InterprocSummarySet>) -> Vec<SummaryHelperVi
                 name: summary.name.clone(),
                 arg_count_hint: summary.arg_count_hint,
                 return_relation: summary.return_relation.clone(),
-                out_param_indices,
+                out_param_facts,
                 pointer_param_indices,
                 transfer_effects: summary.transfer_effects.clone(),
                 allocation_effects: summary.allocation_effects.clone(),
@@ -442,6 +461,68 @@ fn helper_views(set: Option<&r2ssa::InterprocSummarySet>) -> Vec<SummaryHelperVi
     helpers
 }
 
+fn summary_out_param_facts(summary: &r2ssa::FunctionSemanticSummary) -> Vec<SummaryOutParamFact> {
+    let mut facts = summary
+        .arg_effects
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, effect))| effect.write)
+        .map(|(effect_index, (idx, _))| SummaryOutParamFact {
+            param_index: *idx,
+            evidence: OutParamCertificateEvidence::InterprocArgWrite,
+            source: OutParamCertificateSource::InterprocSummaryEffect {
+                function_id: summary.id.0,
+                evidence: OutParamCertificateEvidence::InterprocArgWrite,
+                param_index: *idx,
+                effect_index,
+            },
+        })
+        .collect::<Vec<_>>();
+    for (effect_index, effect) in summary.memory_effects.iter().enumerate() {
+        if effect.kind == r2ssa::SummaryMemoryEffectKind::Write
+            && let r2ssa::SummaryMemoryRegion::Arg { index } = effect.location.region
+        {
+            facts.push(SummaryOutParamFact {
+                param_index: index,
+                evidence: OutParamCertificateEvidence::InterprocMemoryWrite,
+                source: OutParamCertificateSource::InterprocSummaryEffect {
+                    function_id: summary.id.0,
+                    evidence: OutParamCertificateEvidence::InterprocMemoryWrite,
+                    param_index: index,
+                    effect_index,
+                },
+            });
+        }
+    }
+    for (effect_index, effect) in summary.transfer_effects.iter().enumerate() {
+        if let r2ssa::SummaryMemoryRegion::Arg { index } = effect.dst.region {
+            facts.push(SummaryOutParamFact {
+                param_index: index,
+                evidence: OutParamCertificateEvidence::InterprocTransferDst,
+                source: OutParamCertificateSource::InterprocSummaryEffect {
+                    function_id: summary.id.0,
+                    evidence: OutParamCertificateEvidence::InterprocTransferDst,
+                    param_index: index,
+                    effect_index,
+                },
+            });
+        }
+    }
+    facts.sort();
+    facts.dedup();
+    facts
+}
+
+fn out_param_indices_from_facts(facts: &[SummaryOutParamFact]) -> Vec<usize> {
+    let mut indices = facts
+        .iter()
+        .map(|fact| fact.param_index)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 fn push_structured_summary_pointer_indices(
     summary: &r2ssa::FunctionSemanticSummary,
     indices: &mut Vec<usize>,
@@ -459,5 +540,120 @@ fn push_structured_summary_pointer_indices(
     }
     for effect in &summary.sync_effects {
         indices.push(effect.arg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn summary_with_effects(id: r2ssa::InterprocFunctionId) -> r2ssa::FunctionSemanticSummary {
+        let mut summary = r2ssa::FunctionSemanticSummary::unknown(id, Some("sym.effect".into()));
+        summary.arg_effects.insert(
+            0,
+            r2ssa::SummaryArgEffect {
+                escape: true,
+                ..r2ssa::SummaryArgEffect::default()
+            },
+        );
+        summary.arg_effects.insert(
+            1,
+            r2ssa::SummaryArgEffect {
+                write: true,
+                ..r2ssa::SummaryArgEffect::default()
+            },
+        );
+        summary.memory_effects.push(r2ssa::SummaryMemoryEffect {
+            kind: r2ssa::SummaryMemoryEffectKind::Write,
+            location: r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 2 },
+                range: None,
+            },
+        });
+        summary.memory_effects.push(r2ssa::SummaryMemoryEffect {
+            kind: r2ssa::SummaryMemoryEffectKind::Escape,
+            location: r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 5 },
+                range: None,
+            },
+        });
+        summary.transfer_effects.push(r2ssa::SummaryTransferEffect {
+            dst: r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 3 },
+                range: None,
+            },
+            src: r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 4 },
+                range: None,
+            },
+            len: r2ssa::SummaryTransferLength::Unknown,
+        });
+        summary
+    }
+
+    #[test]
+    fn summary_rollup_out_params_require_writeback_evidence() {
+        let root = r2ssa::InterprocFunctionId(0x401000);
+        let helper = r2ssa::InterprocFunctionId(0x402000);
+        let set = r2ssa::InterprocSummarySet {
+            root: Some(root),
+            summaries: BTreeMap::from([
+                (root, summary_with_effects(root)),
+                (helper, summary_with_effects(helper)),
+            ]),
+            diagnostics: Default::default(),
+        };
+
+        let view = InterprocSummaryView::new(Some(set));
+
+        assert_eq!(view.out_param_indices(), vec![1, 2, 3]);
+        assert_eq!(
+            view.rollup
+                .as_ref()
+                .expect("rollup")
+                .out_param_facts
+                .iter()
+                .map(|fact| (&fact.evidence, &fact.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    &OutParamCertificateEvidence::InterprocArgWrite,
+                    &OutParamCertificateSource::InterprocSummaryEffect {
+                        function_id: root.0,
+                        evidence: OutParamCertificateEvidence::InterprocArgWrite,
+                        param_index: 1,
+                        effect_index: 1,
+                    },
+                ),
+                (
+                    &OutParamCertificateEvidence::InterprocMemoryWrite,
+                    &OutParamCertificateSource::InterprocSummaryEffect {
+                        function_id: root.0,
+                        evidence: OutParamCertificateEvidence::InterprocMemoryWrite,
+                        param_index: 2,
+                        effect_index: 0,
+                    },
+                ),
+                (
+                    &OutParamCertificateEvidence::InterprocTransferDst,
+                    &OutParamCertificateSource::InterprocSummaryEffect {
+                        function_id: root.0,
+                        evidence: OutParamCertificateEvidence::InterprocTransferDst,
+                        param_index: 3,
+                        effect_index: 0,
+                    },
+                ),
+            ]
+        );
+        assert_eq!(view.pointer_param_indices(), &[0, 1, 2, 3, 4, 5]);
+        let helper_view = view
+            .helper_view_for_name("sym.effect")
+            .expect("helper view");
+        assert_eq!(
+            out_param_indices_from_facts(&helper_view.out_param_facts),
+            vec![1, 2, 3]
+        );
+        assert_eq!(helper_view.pointer_param_indices, vec![0, 1, 2, 3, 4, 5]);
     }
 }

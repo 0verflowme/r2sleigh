@@ -262,17 +262,24 @@ impl CallConv {
     }
 
     pub(crate) fn write_return<'ctx>(&self, state: &mut SymState<'ctx>, value: SymValue<'ctx>) {
-        let key = register_aliases(self.ret_register)
-            .into_iter()
-            .find_map(|alias| find_register_key(state, alias))
-            .unwrap_or_else(|| format!("{}_0", self.ret_register));
-        let key_bits = state
-            .registers()
-            .get(&key)
-            .map(|existing| existing.bits())
-            .unwrap_or(self.ret_bits);
-        let adjusted = adjust_bits(state.context(), value, key_bits);
-        state.set_register(&key, adjusted);
+        let mut keys = BTreeSet::new();
+        for alias in register_aliases(self.ret_register) {
+            if let Some(key) = find_register_key(state, alias) {
+                keys.insert(key);
+            }
+        }
+        if keys.is_empty() {
+            keys.insert(format!("{}_0", self.ret_register));
+        }
+        for key in keys {
+            let key_bits = state
+                .registers()
+                .get(&key)
+                .map(|existing| existing.bits())
+                .unwrap_or(self.ret_bits);
+            let adjusted = adjust_bits(state.context(), value.clone(), key_bits);
+            state.set_register(&key, adjusted);
+        }
     }
 
     pub(crate) fn arg_register_name(&self, index: usize) -> Option<&'static str> {
@@ -1033,11 +1040,11 @@ fn build_interproc_summary_set(
             prepared: &function.prepared,
         });
         if let Some(name) = symbol_map.get(&function.id.0)
-            && let Some(summary) = FunctionSemanticSummary::seed_for_name(function.id, name)
+            && let Some(summary) = crate::function_semantic_summary_seed_for_name(function.id, name)
         {
             seeds.insert(function.id, summary);
         } else if let Some(name) = function.name.as_deref()
-            && let Some(summary) = FunctionSemanticSummary::seed_for_name(function.id, name)
+            && let Some(summary) = crate::function_semantic_summary_seed_for_name(function.id, name)
         {
             seeds.insert(function.id, summary);
         }

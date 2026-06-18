@@ -48,7 +48,7 @@ fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) ->
 
 #[cfg(test)]
 fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> bool {
-    let Some(signature) = function_facts.types.merged_signature.as_ref() else {
+    let Some(signature) = function_facts.types.render_authorized_signature() else {
         return false;
     };
     let Some(native) = function_facts

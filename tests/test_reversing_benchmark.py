@@ -48,6 +48,26 @@ def batched_stdout(entries):
 
 
 class ReversingBenchmarkTests(unittest.TestCase):
+    def test_checked_in_source_oracle_does_not_bless_synthetic_summary_c(self):
+        oracle_path = ROOT / "tests" / "gold" / "source_oracle.json"
+        oracle = json.loads(oracle_path.read_text())
+        synthetic_markers = (
+            "summary locals are synthetic",
+            "summary_value",
+            "summary_count",
+            "summary_hash",
+            "summary_i",
+            "summary_byte",
+            "return summary_",
+        )
+        offenders = []
+        for expectation in oracle.get("expectations", []):
+            for needle in expectation.get("contains", []):
+                if any(marker in needle for marker in synthetic_markers):
+                    offenders.append((expectation.get("id"), needle))
+
+        self.assertEqual([], offenders)
+
     def test_parse_json_payload_skips_non_json_prefix(self):
         output = "INFO: ignored {not json}\n[{\"ok\": true}]\nWARN: trailing text\n"
         self.assertEqual(benchmark.parse_json_payload(output), [{"ok": True}])
@@ -407,6 +427,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                 "decompile_header_return_mismatch",
                 "decompile_header_signature_mismatch",
                 "empty_loop_body",
+                "fake_stack_slot",
                 "fake_while_break_wrapper",
                 "missing_return_nonvoid",
                 "unresolved_fcn_or_temp_stack_leak",
@@ -480,6 +501,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
             {
                 "target": "dbg.test_struct_array_index",
                 "command": "decompile_sla",
+                "owner": "r2types",
                 "contains": ["DemoStruct*", "arr[idx].fourteenth + arr[idx].third"],
                 "not_contains": ["sla_struct_", "*(arr +"],
             }
@@ -502,6 +524,45 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(entry["gold_oracle"]["status"], "ok")
         self.assertEqual(entry["gold_oracle"]["expectation_count"], 1)
         self.assertEqual(entry["gold_oracle"]["failures"], [])
+
+    def test_load_gold_manifest_requires_canonical_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gold.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "expectations": [
+                            {
+                                "target": "dbg.worker",
+                                "command": "decompile_sla",
+                                "contains": ["return 1;"],
+                            }
+                        ]
+                    }
+                )
+            )
+
+            with self.assertRaisesRegex(ValueError, "canonical owner"):
+                benchmark.load_gold_manifest(path)
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "expectations": [
+                            {
+                                "target": "dbg.worker",
+                                "command": "decompile_sla",
+                                "owner": "r2dec",
+                                "contains": ["return 1;"],
+                            }
+                        ]
+                    }
+                )
+            )
+
+            expectations = benchmark.load_gold_manifest(path)
+
+        self.assertEqual(expectations[0]["owner"], "r2dec")
 
     def test_run_case_classifies_native_discovery_as_radare2_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -559,11 +620,26 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(quality["local_stack_placeholder_count"], 1)
         self.assertEqual(quality["stack_address_leak_count"], 1)
         self.assertEqual(quality["raw_temp_stack_leak_count"], 2)
+        self.assertEqual(quality["fake_stack_slot_count"], 1)
         self.assertEqual(quality["shadowed_param_count"], 1)
-        self.assertEqual(quality["readability_smell_count"], 3)
+        self.assertEqual(quality["readability_smell_count"], 4)
         self.assertEqual(quality["source_smell_count"], 3)
         self.assertEqual(type_metrics["generic_arg_count"], 1)
         self.assertEqual(type_metrics["generic_type_count"], 2)
+
+    def test_quality_metrics_do_not_count_source_grade_fixed_width_types_as_generic(self):
+        type_metrics = benchmark.generic_type_metrics(
+            {
+                "ret_type": "int32_t",
+                "params": [
+                    {"name": "hash", "type": "uint64_t"},
+                    {"name": "buf", "type": "uint8_t *"},
+                ],
+            }
+        )
+
+        self.assertEqual(type_metrics["generic_arg_count"], 0)
+        self.assertEqual(type_metrics["generic_type_count"], 0)
 
     def test_quality_metrics_count_readability_noise(self):
         quality = benchmark.decompile_quality(
@@ -580,10 +656,11 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(quality["pointer_cast_count"], 2)
         self.assertEqual(quality["stack_address_leak_count"], 1)
         self.assertEqual(quality["raw_temp_stack_leak_count"], 1)
+        self.assertEqual(quality["fake_stack_slot_count"], 1)
         self.assertEqual(quality["control_flow_noise_count"], 1)
         self.assertEqual(quality["call_readability_noise_count"], 1)
         self.assertEqual(quality["synthetic_type_leak_count"], 1)
-        self.assertEqual(quality["readability_smell_count"], 10)
+        self.assertEqual(quality["readability_smell_count"], 11)
 
     def test_quality_metrics_count_manual_failure_patterns(self):
         quality = benchmark.decompile_quality(
@@ -608,8 +685,32 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertGreaterEqual(quality["raw_register_artifact_count"], 1)
         self.assertEqual(quality["unresolved_fcn_count"], 1)
         self.assertGreaterEqual(quality["raw_temp_stack_leak_count"], 2)
+        self.assertEqual(quality["fake_stack_slot_count"], 1)
         self.assertTrue(comment_only["comment_only"])
         self.assertFalse(comment_only["missing_return_nonvoid"])
+
+    def test_quality_metrics_count_broader_fake_semantics_patterns(self):
+        quality = benchmark.decompile_quality(
+            "unknown_t bad(undefined1 arg1) {\n"
+            "  switch (arg1) { case fake_case: break; }\n"
+            "  helper(fake_arg, tmp:_1);\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["fake_switch_case_count"], 1)
+        self.assertEqual(quality["fake_call_arg_count"], 1)
+        self.assertGreaterEqual(quality["fake_signature_count"], 1)
+
+    def test_quality_metrics_count_proof_coverage_gap_comments(self):
+        quality = benchmark.decompile_quality(
+            "int f(void) {\n"
+            "  /* r2dec residual: certified render contract failed: rendered 1 call expression(s) with only 0 CallsiteCertificate(s) */\n"
+            "  /* engine render permission residual: missing expression proof */\n"
+            "}\n"
+        )
+
+        self.assertGreaterEqual(quality["proof_coverage_gap_count"], 2)
+        self.assertGreaterEqual(quality["readability_smell_count"], 2)
 
     def test_quality_metrics_do_not_treat_explicit_summary_return_refusal_as_fake_missing_return(self):
         quality = benchmark.decompile_quality(
@@ -633,6 +734,152 @@ class ReversingBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(quality["undefined_identifier_return_count"], 1)
         self.assertGreaterEqual(quality["readability_smell_count"], 1)
+
+    def test_quality_metrics_accept_compact_pointer_local_return(self):
+        quality = benchmark.decompile_quality(
+            "int8_t* alloc_and_copy(int8_t* src, size_t len)\n"
+            "{\n"
+            "  int8_t* buf;\n"
+            "  buf = malloc(len + 1);\n"
+            "  return buf;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["undefined_identifier_return_count"], 0)
+
+    def test_quality_metrics_count_unmarked_source_like_summary_locals(self):
+        quality = benchmark.decompile_quality(
+            "uint64_t fnv_fold(uint8_t* buf, size_t n)\n"
+            "{\n"
+            "  /* semantic role: numeric_transform; source=Structural; confidence=Likely */\n"
+            "  /* summary projection: hash_fold loop */\n"
+            "  uint64_t hash = 0;\n"
+            "  for (size_t i = 0; i < n; i++) {\n"
+            "    unsigned char c = buf[i];\n"
+            "    hash ^= c;\n"
+            "  }\n"
+            "  return hash;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["source_like_summary_local_count"], 3)
+        self.assertEqual(quality["summary_synthetic_local_count"], 3)
+        self.assertEqual(quality["unmarked_summary_synthetic_local_count"], 3)
+        self.assertEqual(quality["misleading_summary_role_count"], 1)
+        self.assertEqual(quality["name_hint_structured_route_count"], 0)
+        self.assertEqual(quality["missing_semantic_claims_count"], 1)
+        self.assertEqual(quality["missing_summary_render_contract_count"], 1)
+        self.assertEqual(quality["claimless_summary_projection_count"], 0)
+
+    def test_quality_metrics_count_marked_synthetic_summary_locals(self):
+        quality = benchmark.decompile_quality(
+            "uint64_t fnv_fold(uint8_t* buf, size_t n)\n"
+            "{\n"
+            "  /* summary role: hash_fold; source=SummaryEvidence; confidence=Likely */\n"
+            "  /* render contract: summary projection only; native CFG/control not reconstructed */\n"
+            "  /* semantic claims: renderable=1, control=0, memory=0, value=1, summary_roles=1, type_args=2, out_args=0, name_hint=0, residual=0 */\n"
+            "  /* summary projection (not native CFG): hash_fold loop */\n"
+            "  /* summary locals are synthetic; source local names were not recovered */\n"
+            "  uint64_t summary_hash = 0;\n"
+            "  for (size_t summary_i = 0; summary_i < n; summary_i++) {\n"
+            "    unsigned char summary_byte = buf[summary_i];\n"
+            "    summary_hash ^= summary_byte;\n"
+            "  }\n"
+            "  return summary_hash;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["source_like_summary_local_count"], 3)
+        self.assertEqual(quality["summary_synthetic_local_count"], 3)
+        self.assertEqual(quality["unmarked_summary_synthetic_local_count"], 0)
+        self.assertEqual(quality["misleading_summary_role_count"], 0)
+        self.assertEqual(quality["name_hint_structured_route_count"], 0)
+        self.assertEqual(quality["missing_semantic_claims_count"], 0)
+        self.assertEqual(quality["missing_summary_render_contract_count"], 0)
+        self.assertEqual(quality["claimless_summary_projection_count"], 0)
+        self.assertEqual(quality["missing_summary_role_certificate_count"], 0)
+        self.assertEqual(quality["classification"], "structured")
+        self.assertGreaterEqual(quality["readability_smell_count"], 3)
+        self.assertEqual(quality["residual_markers"], 0)
+
+    def test_quality_metrics_ignore_zero_residual_semantic_claim(self):
+        quality = benchmark.decompile_quality(
+            "int f(void)\n"
+            "{\n"
+            "  /* semantic claims: renderable=1, control=0, memory=0, value=1, summary_roles=1, type_args=0, out_args=0, name_hint=0, residual=0 */\n"
+            "  return 0;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["classification"], "structured")
+        self.assertEqual(quality["residual_markers"], 0)
+
+    def test_quality_metrics_count_positive_residual_semantic_claim(self):
+        quality = benchmark.decompile_quality(
+            "int f(void)\n"
+            "{\n"
+            "  /* semantic claims: renderable=1, control=0, memory=0, value=1, summary_roles=1, type_args=0, out_args=0, name_hint=0, residual=2 */\n"
+            "  return 0;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["classification"], "residual")
+        self.assertEqual(quality["residual_markers"], 1)
+
+    def test_quality_metrics_count_claimless_summary_projection(self):
+        quality = benchmark.decompile_quality(
+            "uint64_t fnv_fold(uint8_t* buf, size_t n)\n"
+            "{\n"
+            "  /* summary role: hash_fold; source=SummaryEvidence; confidence=Likely */\n"
+            "  /* render contract: summary projection only; native CFG/control not reconstructed */\n"
+            "  /* semantic claims: renderable=0, control=0, memory=0, value=0, summary_roles=0, type_args=0, out_args=0, name_hint=0, residual=0 */\n"
+            "  /* summary projection (not native CFG): hash_fold loop */\n"
+            "  /* summary locals are synthetic; source local names were not recovered */\n"
+            "  uint64_t summary_hash = 0;\n"
+            "  return summary_hash;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["missing_semantic_claims_count"], 0)
+        self.assertEqual(quality["missing_summary_render_contract_count"], 0)
+        self.assertEqual(quality["claimless_summary_projection_count"], 1)
+        self.assertEqual(quality["missing_summary_role_certificate_count"], 1)
+
+    def test_quality_metrics_count_name_hint_structured_route(self):
+        quality = benchmark.decompile_quality(
+            "int f(int x)\n"
+            "{\n"
+            "  /* summary role hint: parser; source=NameHint; confidence=Heuristic */\n"
+            "  for (size_t i = 0; i < 4; i++) {\n"
+            "    x++;\n"
+            "  }\n"
+            "  return x;\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["name_hint_structured_route_count"], 1)
+
+    def test_quality_metrics_count_all_summary_pseudo_calls(self):
+        quality = benchmark.decompile_quality(
+            "void f(void)\n"
+            "{\n"
+            "  scan_string_summary(arg0, 0);\n"
+            "  walk_table_summary(arg1, unknown_terminator);\n"
+            "  parse_base10_numeric_summary(arg2);\n"
+            "  copy_file_data_summary(src_fd, dest_fd, len);\n"
+            "  malloc_summary(size);\n"
+            "  free_summary(ptr);\n"
+            "  diagnose_summary(fmt);\n"
+            "  fetch_printf_arguments(ap, out);\n"
+            "  render_formatted_output(fmt);\n"
+            "  probe_file_metadata(path);\n"
+            "  run_program_orchestrator(argc, argv, envp);\n"
+            "  compute_numeric_transform(accumulator);\n"
+            "}\n"
+        )
+
+        self.assertEqual(quality["summary_pseudo_call_count"], 12)
+        self.assertGreaterEqual(quality["readability_smell_count"], 12)
 
     def test_quality_metrics_count_invalid_control_flow_and_pointer_literal_compare(self):
         quality = benchmark.decompile_quality(
@@ -1244,6 +1491,7 @@ class ReversingBenchmarkTests(unittest.TestCase):
                     "score": 50,
                     "failures": [
                         {"kind": "argn_leak", "target": "sym.f"},
+                        {"kind": "fake_stack_slot", "target": "sym.f"},
                         {"kind": "missing_return_nonvoid", "target": "sym.f"},
                         {"kind": "unresolved_fcn_or_temp_stack_leak", "target": "sym.f"},
                     ],
@@ -1267,11 +1515,14 @@ class ReversingBenchmarkTests(unittest.TestCase):
             summary["quality"]["manual_gate_failures"],
             {
                 "argn_leak": 1,
+                "fake_stack_slot": 1,
                 "missing_return_nonvoid": 1,
                 "unresolved_fcn_or_temp_stack_leak": 1,
             },
         )
         self.assertEqual(summary["quality"]["argn_leak_total"], 1)
+        self.assertEqual(summary["quality"]["fake_call_arg_total"], 1)
+        self.assertEqual(summary["quality"]["fake_stack_slot_total"], 1)
         self.assertEqual(summary["quality"]["fake_while_break_wrapper_total"], 1)
         self.assertEqual(summary["quality"]["missing_return_nonvoid_total"], 1)
         self.assertEqual(summary["quality"]["unresolved_fcn_total"], 1)
@@ -1769,6 +2020,85 @@ class ReversingBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(gate["checks"]["generic_args"]["value"], 4)
 
+    def test_closure_gate_fails_incomplete_and_fake_semantics_even_with_high_score(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "closure_gate": True,
+                "max_hard_failures": 0,
+                "max_residual_decompile": 0,
+                "max_generic_args": 0,
+                "max_generic_types": 0,
+                "min_average_score": 99.5,
+                "max_setup_command_ratio": None,
+                "require_pdg_comparison": False,
+                "max_pdg_quality_wins": None,
+                "max_pdg_perf_wins": None,
+                "max_pdg_quality_then_perf_wins": None,
+                "max_gold_failures": 0,
+                "require_gold": False,
+            },
+        )()
+        report = {
+            "status": "incomplete",
+            "summary": {
+                "average_score": 100.0,
+                "failures_by_kind": {},
+                "quality": {
+                    "decompile": {},
+                    "empty_loop_body_total": 1,
+                    "fake_stack_slot_total": 1,
+                    "fake_while_break_wrapper_total": 0,
+                    "missing_summary_role_certificate_total": 1,
+                    "missing_summary_render_contract_total": 1,
+                    "proof_coverage_gap_total": 1,
+                    "summary_pseudo_call_total": 0,
+                    "raw_temp_stack_leak_total": 1,
+                    "undefined_identifier_return_total": 1,
+                    "generic_arg_total": 0,
+                    "generic_type_total": 0,
+                    "gold_oracle": {"failures": 0, "expectations": 0},
+                    "pdg_comparison": {},
+                },
+            },
+        }
+
+        gate = benchmark.strict_quality_gate(args, report)
+
+        self.assertEqual(gate["status"], "failed")
+        self.assertIn(
+            "report_complete", {failure["metric"] for failure in gate["failures"]}
+        )
+        self.assertIn(
+            "fake_semantics", {failure["metric"] for failure in gate["failures"]}
+        )
+        self.assertIn(
+            "fake_stack_slots", {failure["metric"] for failure in gate["failures"]}
+        )
+        self.assertIn(
+            "summary_role_certificate_gap",
+            {failure["metric"] for failure in gate["failures"]},
+        )
+        self.assertIn(
+            "summary_render_contract_gap",
+            {failure["metric"] for failure in gate["failures"]},
+        )
+        self.assertIn(
+            "proof_coverage_gap", {failure["metric"] for failure in gate["failures"]}
+        )
+        self.assertIn(
+            "raw_temp_stack_leak", {failure["metric"] for failure in gate["failures"]}
+        )
+        self.assertIn(
+            "undefined_identifier_return",
+            {failure["metric"] for failure in gate["failures"]},
+        )
+        self.assertIn(
+            "gold_expectations",
+            {failure["metric"] for failure in gate["failures"]},
+        )
+
     def test_parallel_split_uses_case_and_command_workers(self):
         self.assertEqual(benchmark.parallel_split(1, 12), (1, 1))
         self.assertEqual(benchmark.parallel_split(64, 1), (1, 64))
@@ -1833,6 +2163,8 @@ class ReversingBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.max_generic_types, 0)
         self.assertEqual(args.min_average_score, 99.5)
         self.assertEqual(args.max_setup_command_ratio, 2.0)
+        self.assertEqual(args.max_gold_failures, 0)
+        self.assertTrue(args.require_gold)
         self.assertTrue(args.require_pdg_comparison)
         self.assertEqual(args.max_pdg_quality_wins, 0)
         self.assertIsNone(args.max_pdg_perf_wins)

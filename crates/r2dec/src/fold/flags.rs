@@ -2555,11 +2555,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn normalize_sub_cmp_constant(&self, value: CExpr) -> CExpr {
-        match value {
-            CExpr::IntLit(v) if v >= 0x100 => CExpr::Var(format!("0x{:x}", v as u64)),
-            CExpr::UIntLit(v) if v >= 0x100 => CExpr::Var(format!("0x{:x}", v)),
-            other => other,
-        }
+        value
     }
 
     pub(super) fn const_expr_for_comparison(&self, expr: &CExpr) -> Option<CExpr> {

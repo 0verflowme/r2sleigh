@@ -412,7 +412,8 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
 
     fn eval_ssa_var(&mut self, var: &r2ssa::SSAVar) -> Result<SymValue<'ctx>, EvalUnsupported> {
         if let Some(value_id) = self.func.graph().value_id_for_var(var) {
-            self.eval_value_id(value_id)
+            let value = self.eval_value_id(value_id)?;
+            Ok(adjust_bits(self.state.context(), value, var.size * 8))
         } else {
             Ok(read_input_var(self.state, var))
         }
@@ -510,7 +511,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                     value.get_taint(),
                 ))
             }
-            BoolNot { src, .. } => Ok(self.eval_ssa_var(src)?.not(ctx)),
+            BoolNot { src, .. } => Ok(self.eval_ssa_var(src)?.bool_not(ctx)),
             BoolAnd { a, b, .. } => Ok(self.eval_ssa_var(a)?.and(ctx, &self.eval_ssa_var(b)?)),
             BoolOr { a, b, .. } => Ok(self.eval_ssa_var(a)?.or(ctx, &self.eval_ssa_var(b)?)),
             BoolXor { a, b, .. } => Ok(self.eval_ssa_var(a)?.xor(ctx, &self.eval_ssa_var(b)?)),
@@ -835,7 +836,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         &mut self,
         addr: &r2ssa::SSAVar,
     ) -> Option<Vec<NormalizedMemoryLocation>> {
-        if let Some(arg_index) = ssa_var_arg_index(addr) {
+        if let Some(arg_index) = ssa_formal_arg_index(addr) {
             return Some(vec![NormalizedMemoryLocation {
                 region: BackwardMemoryRegion::Argument { index: arg_index },
                 offset: 0,
@@ -1467,7 +1468,7 @@ fn build_call_transform_contexts<'ctx>(
         if seq_index > 0 {
             let predecessor = sequence[seq_index - 1];
             for phi in &block.phis {
-                if let Some(arg_index) = ssa_var_arg_index(&phi.dst)
+                if let Some(arg_index) = ssa_call_arg_slot_index(&phi.dst)
                     && let Some((_, source)) =
                         phi.sources.iter().find(|(pred, _)| *pred == predecessor)
                     && let Some(value_id) = func.graph().value_id_for_var(source)
@@ -1524,7 +1525,7 @@ fn build_call_transform_contexts<'ctx>(
             }
 
             if let Some(dst) = op.dst()
-                && let Some(arg_index) = ssa_var_arg_index(dst)
+                && let Some(arg_index) = ssa_call_arg_slot_index(dst)
                 && let Some(value_id) = func.graph().value_id_for_var(dst)
             {
                 arg_state.insert(arg_index, value_id);
@@ -2005,7 +2006,17 @@ fn is_specific_memory_location(location: &NormalizedMemoryLocation) -> bool {
     )
 }
 
-fn ssa_var_arg_index(var: &r2ssa::SSAVar) -> Option<usize> {
+fn ssa_formal_arg_index(var: &r2ssa::SSAVar) -> Option<usize> {
+    (var.version == 0)
+        .then(|| ssa_register_arg_index(var))
+        .flatten()
+}
+
+fn ssa_call_arg_slot_index(var: &r2ssa::SSAVar) -> Option<usize> {
+    ssa_register_arg_index(var)
+}
+
+fn ssa_register_arg_index(var: &r2ssa::SSAVar) -> Option<usize> {
     let display = var.display_name();
     if let Some((prefix, _)) = split_version(&display)
         && let Some(index) = callconv_arg_index(prefix)
@@ -2263,6 +2274,36 @@ mod tests {
             (1usize, BTreeSet::from([0i64])),
         ]);
         assert!(select_best_translated_arg(translated).is_none());
+    }
+
+    #[test]
+    fn ssa_formal_arg_index_requires_entry_version() {
+        assert_eq!(
+            ssa_formal_arg_index(&r2ssa::SSAVar::new("RDI", 0, 8)),
+            Some(0)
+        );
+        assert_eq!(
+            ssa_formal_arg_index(&r2ssa::SSAVar::new("EDX", 0, 4)),
+            Some(2)
+        );
+        assert_eq!(ssa_formal_arg_index(&r2ssa::SSAVar::new("RDI", 1, 8)), None);
+        assert_eq!(ssa_formal_arg_index(&r2ssa::SSAVar::new("EDX", 3, 4)), None);
+    }
+
+    #[test]
+    fn ssa_call_arg_slot_index_tracks_written_abi_registers() {
+        assert_eq!(
+            ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RDI", 1, 8)),
+            Some(0)
+        );
+        assert_eq!(
+            ssa_call_arg_slot_index(&r2ssa::SSAVar::new("EDX", 3, 4)),
+            Some(2)
+        );
+        assert_eq!(
+            ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RAX", 1, 8)),
+            None
+        );
     }
 
     #[test]

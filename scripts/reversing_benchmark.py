@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, cast
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_TMPDIR = "/tmp/r2sleigh-reversing-benchmark-tmp"
 DEFAULT_OUT = "/tmp/r2sleigh-reversing-benchmark.json"
 DEFAULT_MAX_BINARIES_PER_CORPUS = 8
@@ -68,7 +68,7 @@ BARE_REGISTER_ARTIFACT_RE = re.compile(
 )
 GENERIC_NAME_RE = re.compile(r"^(?:arg|param|var)[._]?[0-9]+$", re.IGNORECASE)
 GENERIC_TYPE_RE = re.compile(
-    r"(?:\b(?:unknown|undefined|unk|uint(?:32|64)_t|int(?:32|64)_t)\b|void\s*\*)",
+    r"(?:\b(?:unknown|undefined|unk)\b|void\s*\*)",
     re.IGNORECASE,
 )
 UNSAMPLED_CODE_NAME_RE = re.compile(
@@ -102,9 +102,37 @@ CALL_READABILITY_NOISE_RE = re.compile(
     r"\b(?:call_[0-9a-f]+|sym\.imp\.|fcn\.[0-9a-f]+)\b", re.IGNORECASE
 )
 SUMMARY_PSEUDO_CALL_RE = re.compile(
-    r"\b(?:scan_[A-Za-z0-9_]*_summary|walk_[A-Za-z0-9_]*_summary|"
-    r"compute_[A-Za-z0-9_]*_transform|[A-Za-z0-9_]+_fold_summary|"
-    r"parse_[A-Za-z0-9_]*_summary)\s*\("
+    r"\b(?:[A-Za-z_][A-Za-z0-9_]*_summary|"
+    r"compute_[A-Za-z0-9_]*_transform|"
+    r"run_program_orchestrator|write_output_stream|render_formatted_output|"
+    r"probe_file_metadata|fetch_printf_arguments)\s*\("
+)
+SUMMARY_PROJECTION_RE = re.compile(
+    r"summary projection(?:\s*\(not native CFG\))?:\s*(?P<kind>[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+SUMMARY_RENDER_CONTRACT_MARKERS = (
+    "render contract: summary facts only; no executable native C reconstructed",
+    "render contract: summary projection only; native CFG/control not reconstructed",
+)
+SEMANTIC_CLAIMS_RE = re.compile(
+    r"semantic claims:\s*renderable=(?P<renderable>\d+).*?name_hint=(?P<name_hint>\d+).*?residual=(?P<residual>\d+)",
+    re.IGNORECASE,
+)
+SEMANTIC_CLAIMS_LINE_RE = re.compile(r"semantic claims:\s*(?P<body>[^\n*]*)", re.IGNORECASE)
+SEMANTIC_CLAIM_FIELD_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\d+)")
+SUMMARY_SYNTHETIC_LOCAL_MARKER = "summary locals are synthetic; source local names were not recovered"
+SOURCE_LIKE_SUMMARY_LOCAL_RE = re.compile(
+    r"^\s*(?:for\s*\(\s*)?"
+    r"(?:u?int(?:8|16|32|64)_t|size_t|ssize_t|unsigned\s+char|char|int|long)\s+"
+    r"(?P<name>(?:summary_)?(?:hash|count|i|c|byte|value|sign)|hash|count|i|c)"
+    r"\s*(?:=|;|,|\[)",
+    re.IGNORECASE | re.MULTILINE,
+)
+SUMMARY_ROLE_RE = re.compile(
+    r"(?:semantic role|summary role(?: hint)?):\s*(?P<role>[A-Za-z_][A-Za-z0-9_]*);"
+    r"\s*source=(?P<source>[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
 )
 RETURN_IDENTIFIER_RE = re.compile(r"\breturn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;")
 UNRESOLVED_FCN_RE = re.compile(r"\bfcn\.[0-9a-f]+\b", re.IGNORECASE)
@@ -114,9 +142,30 @@ RAW_TEMP_STACK_LEAK_RE = re.compile(
     r"stack_[0-9a-f]+|var_[0-9a-f]+h?|local_[0-9a-f]+)\b",
     re.IGNORECASE,
 )
+FAKE_STACK_SLOT_RE = re.compile(
+    r"\b(?:stack_[0-9a-f]+|var_[0-9a-f]+h?|local_[0-9a-f]+)\b",
+    re.IGNORECASE,
+)
 FAKE_WHILE_BREAK_RE = re.compile(
     r"\bwhile\s*\([^)]*\)\s*\{\s*break;\s*\}",
     re.IGNORECASE | re.DOTALL,
+)
+FAKE_SWITCH_CASE_RE = re.compile(
+    r"\bcase\s+(?:fake_[A-Za-z0-9_]*|unknown_[A-Za-z0-9_]*|"
+    r"tmp[:_][A-Za-z0-9_:.]*|unique[:_][A-Za-z0-9_:.]*|"
+    r"arg[._]?[0-9]+|local_[0-9a-f]+)\s*:",
+    re.IGNORECASE,
+)
+FAKE_CALL_ARG_RE = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^;{}]*\b"
+    r"(?:fake_arg|arg[._]?[0-9]+|tmp[:_][A-Za-z0-9_:.]+|unique[:_][A-Za-z0-9_:.]+)"
+    r"\b[^;{}]*\)\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
+FAKE_SIGNATURE_RE = re.compile(
+    r"^\s*(?:unknown_t|undefined(?:[0-9]+)?)\s+[A-Za-z_][A-Za-z0-9_.]*\s*\(|"
+    r"\((?=[^)]*\b(?:unknown_t|undefined(?:[0-9]+)?)\s+arg[._]?[0-9]+\b)[^)]*\)",
+    re.IGNORECASE | re.MULTILINE,
 )
 EMPTY_LOOP_BODY_RE = re.compile(
     r"\bdo\s*\{\s*\}\s*while\s*\([^)]*\)\s*;|"
@@ -133,12 +182,19 @@ SYNTHETIC_TYPE_LEAK_RE = re.compile(
     r"\b(?:sla_struct_[A-Za-z0-9_]+|struct\s+local_[A-Za-z0-9_]+|undefined(?:[0-9]+)?|unk(?:nown)?_t)\b",
     re.IGNORECASE,
 )
+PROOF_COVERAGE_GAP_RE = re.compile(
+    r"\b(?:certified render contract failed|uncertified structured control|"
+    r"missing prepared SSA certificates|engine render permission (?:residual|refusal)|"
+    r"lacks [^\n;{}]*certificate|without [^\n;{}]*(?:certificate|proof)|"
+    r"missing [^\n;{}]*proof)\b",
+    re.IGNORECASE,
+)
 BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 LINE_COMMENT_RE = re.compile(r"//.*?$", re.MULTILINE)
 HEADER_PARAM_RE = re.compile(r"^[^{;]*\((?P<params>[^()]*)\)")
 LOCAL_DECL_RE = re.compile(
-    r"^\s*(?:const\s+)?(?:u?int(?:8|16|32|64)_t|char|short|int|long|bool|size_t|ssize_t|void)\s+"
-    r"\*?\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:[=;,\[])"
+    r"^\s*(?:const\s+)?(?:u?int(?:8|16|32|64)_t|char|short|int|long|bool|size_t|ssize_t|void)"
+    r"(?:(?:\s+)|(?:\s*\*+\s*))(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:[=;,\[])"
 )
 TARGET_COMMAND_DEFS: dict[str, str] = {
     "decompile_sla": "a:sla.dec",
@@ -159,10 +215,22 @@ QUALITY_GATE_FAILURES = {
     "decompile_header_return_mismatch",
     "decompile_header_signature_mismatch",
     "empty_loop_body",
+    "fake_call_arg",
+    "fake_stack_slot",
+    "fake_signature",
+    "fake_switch_case",
     "fake_while_break_wrapper",
     "missing_return_nonvoid",
     "summary_pseudo_call",
+    "unmarked_summary_synthetic_local",
     "undefined_identifier_return",
+    "name_hint_structured_route",
+    "misleading_summary_role",
+    "missing_semantic_claims",
+    "missing_summary_role_certificate",
+    "missing_summary_render_contract",
+    "claimless_summary_projection",
+    "proof_coverage_gap",
     "unresolved_fcn_or_temp_stack_leak",
 }
 GOLD_ORACLE_FAILURE = "source_oracle_failure"
@@ -177,11 +245,23 @@ FAILURE_OWNER = {
     "discovery_return": "radare2",
     "empty_decompile": "r2dec",
     "empty_loop_body": "r2dec",
+    "fake_call_arg": "r2ssa",
+    "fake_stack_slot": "r2ssa",
+    "fake_signature": "r2types",
+    "fake_switch_case": "r2ssa",
     "fake_while_break_wrapper": "r2dec",
     "json_parse": "r2plugin",
     "missing_return_nonvoid": "r2dec",
+    "misleading_summary_role": "r2dec",
+    "missing_semantic_claims": "r2engine",
+    "missing_summary_role_certificate": "r2sym",
+    "missing_summary_render_contract": "r2dec",
+    "claimless_summary_projection": "r2sym",
+    "proof_coverage_gap": "r2engine",
+    "name_hint_structured_route": "r2sym",
     "source_oracle_failure": "unknown",
     "summary_pseudo_call": "r2dec",
+    "unmarked_summary_synthetic_local": "r2dec",
     "undefined_identifier_return": "r2dec",
     "missing_debug_target_alias": "radare2",
     "missing_symbol_target_alias": "radare2",
@@ -202,6 +282,7 @@ OWNER_ACTIONS = {
     "r2plugin": "fix command dispatch, FFI, or typed session plumbing without adding policy",
     "unknown": "classify the failure into a canonical owner before implementing a fix",
 }
+CANONICAL_GOLD_OWNERS = frozenset(owner for owner in OWNER_ACTIONS if owner != "unknown")
 CACHE_COUNTER_FIELDS = ("hits", "misses", "lookups", "insertions", "evictions")
 TARGET_ALIAS_PREFIXES = {"sym", "dbg"}
 CACHE_METRIC_KEYS = (
@@ -596,8 +677,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "apply the default gold-closure quality gate: strict mode, no hard failures, "
-            "no residuals/generic type debt, average score >= 99.5, and setup/command "
-            "ratio <= 2.0 unless thresholds are overridden"
+            "no residuals/generic type debt, source-gold expectations exercised, average "
+            "score >= 99.5, and setup/command ratio <= 2.0 unless thresholds are overridden"
         ),
     )
     parser.add_argument(
@@ -722,6 +803,8 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
             args.max_setup_command_ratio = 2.0
         if getattr(args, "max_gold_failures", None) is None:
             args.max_gold_failures = 0
+        if not getattr(args, "require_gold", False):
+            args.require_gold = True
         try:
             command_names = set(parse_command_filter(args.commands))
         except ValueError:
@@ -1073,7 +1156,13 @@ def decompiler_fallback_marker(text: str) -> str | None:
 
 
 def residual_marker_count(text: str) -> int:
-    return len(RESIDUAL_MARKER_RE.findall(text))
+    count = 0
+    for match in RESIDUAL_MARKER_RE.finditer(text):
+        token = match.group(0).lower()
+        if token == "residual" and re.match(r"\s*=\s*0\b", text[match.end() : match.end() + 8]):
+            continue
+        count += 1
+    return count
 
 
 def runtime_bucket(elapsed_s: float) -> str:
@@ -1252,6 +1341,78 @@ def pointer_scalar_compare_count(text: str, body_text: str) -> int:
     return count
 
 
+def semantic_claim_counts(body_text: str) -> dict[str, int] | None:
+    claim_match = SEMANTIC_CLAIMS_LINE_RE.search(body_text)
+    if not claim_match:
+        return None
+    return {
+        match.group("key").lower(): int(match.group("value"))
+        for match in SEMANTIC_CLAIM_FIELD_RE.finditer(claim_match.group("body"))
+    }
+
+
+def summary_honesty_metrics(body_text: str, body_text_without_comments: str) -> dict[str, int]:
+    has_summary_projection = bool(SUMMARY_PROJECTION_RE.search(body_text))
+    has_summary_route = (
+        has_summary_projection or "semantic route:" in body_text or "r2dec summary:" in body_text
+    )
+    has_synthetic_marker = SUMMARY_SYNTHETIC_LOCAL_MARKER in body_text
+    source_like_summary_local_count = (
+        len(SOURCE_LIKE_SUMMARY_LOCAL_RE.findall(body_text_without_comments))
+        if has_summary_projection
+        else 0
+    )
+    summary_synthetic_local_count = source_like_summary_local_count
+    unmarked_summary_synthetic_local_count = (
+        source_like_summary_local_count if source_like_summary_local_count and not has_synthetic_marker else 0
+    )
+
+    roles = [match.group("role").lower() for match in SUMMARY_ROLE_RE.finditer(body_text)]
+    projections = [match.group("kind").lower() for match in SUMMARY_PROJECTION_RE.finditer(body_text)]
+    misleading_summary_role_count = 0
+    if roles and projections:
+        primary_role = roles[0]
+        misleading_summary_role_count = sum(
+            1 for projection in projections if projection != primary_role
+        )
+
+    name_hint_structured_route_count = 0
+    if any(match.group("source").lower() == "namehint" for match in SUMMARY_ROLE_RE.finditer(body_text)):
+        if re.search(r"\b(?:for|while|do)\s*\(|\breturn\s+", body_text_without_comments):
+            name_hint_structured_route_count = 1
+
+    claims = semantic_claim_counts(body_text)
+    missing_semantic_claims_count = 1 if has_summary_route and claims is None else 0
+    missing_summary_render_contract_count = (
+        1
+        if has_summary_projection
+        and not any(marker in body_text for marker in SUMMARY_RENDER_CONTRACT_MARKERS)
+        else 0
+    )
+    claimless_summary_projection_count = 0
+    missing_summary_role_certificate_count = 0
+    if has_summary_projection and claims is not None:
+        renderable = int(claims.get("renderable") or 0)
+        name_hint = int(claims.get("name_hint") or 0)
+        summary_roles = int(claims.get("summary_roles") or 0)
+        if renderable == 0 or name_hint > 0:
+            claimless_summary_projection_count = 1
+        if summary_roles == 0:
+            missing_summary_role_certificate_count = 1
+
+    return {
+        "source_like_summary_local_count": source_like_summary_local_count,
+        "summary_synthetic_local_count": summary_synthetic_local_count,
+        "unmarked_summary_synthetic_local_count": unmarked_summary_synthetic_local_count,
+        "misleading_summary_role_count": misleading_summary_role_count,
+        "name_hint_structured_route_count": name_hint_structured_route_count,
+        "missing_semantic_claims_count": missing_semantic_claims_count,
+        "missing_summary_render_contract_count": missing_summary_render_contract_count,
+        "claimless_summary_projection_count": claimless_summary_projection_count,
+        "missing_summary_role_certificate_count": missing_summary_role_certificate_count,
+    }
+
+
 def source_smell_metrics(text: str) -> dict[str, int]:
     body_text = _source_body_text(text)
     body_text_without_comments = LINE_COMMENT_RE.sub("", BLOCK_COMMENT_RE.sub("", body_text))
@@ -1275,10 +1436,16 @@ def source_smell_metrics(text: str) -> dict[str, int]:
     unresolved_fcn_count = len(UNRESOLVED_FCN_RE.findall(body_text))
     argn_leak_count = len(ARGN_LEAK_RE.findall(body_text))
     raw_temp_stack_leak_count = len(RAW_TEMP_STACK_LEAK_RE.findall(body_text))
+    fake_stack_slot_count = len(FAKE_STACK_SLOT_RE.findall(body_text))
     fake_while_break_wrapper_count = len(FAKE_WHILE_BREAK_RE.findall(body_text))
+    fake_switch_case_count = len(FAKE_SWITCH_CASE_RE.findall(body_text))
+    fake_call_arg_count = len(FAKE_CALL_ARG_RE.findall(body_text))
+    fake_signature_count = len(FAKE_SIGNATURE_RE.findall(text))
     empty_loop_body_count = len(EMPTY_LOOP_BODY_RE.findall(body_text_without_comments))
     synthetic_type_leak_count = len(SYNTHETIC_TYPE_LEAK_RE.findall(body_text))
+    proof_coverage_gap_count = len(PROOF_COVERAGE_GAP_RE.findall(body_text))
     pointer_scalar_compare_count_value = pointer_scalar_compare_count(text, body_text)
+    summary_honesty = summary_honesty_metrics(body_text, body_text_without_comments)
     readability_smell_count = (
         stack_address_leak_count
         + cast_expr_count
@@ -1290,10 +1457,19 @@ def source_smell_metrics(text: str) -> dict[str, int]:
         + undefined_identifier_return_count_value
         + argn_leak_count
         + raw_temp_stack_leak_count
+        + fake_stack_slot_count
         + fake_while_break_wrapper_count
         + empty_loop_body_count
         + synthetic_type_leak_count
+        + proof_coverage_gap_count
         + pointer_scalar_compare_count_value
+        + summary_honesty["summary_synthetic_local_count"]
+        + summary_honesty["misleading_summary_role_count"]
+        + summary_honesty["name_hint_structured_route_count"]
+        + summary_honesty["missing_semantic_claims_count"]
+        + summary_honesty["missing_summary_render_contract_count"]
+        + summary_honesty["claimless_summary_projection_count"]
+        + summary_honesty["missing_summary_role_certificate_count"]
     )
     return {
         "address_of_scalar_count": address_of_scalar_count,
@@ -1310,10 +1486,16 @@ def source_smell_metrics(text: str) -> dict[str, int]:
         "unresolved_fcn_count": unresolved_fcn_count,
         "argn_leak_count": argn_leak_count,
         "raw_temp_stack_leak_count": raw_temp_stack_leak_count,
+        "fake_stack_slot_count": fake_stack_slot_count,
         "fake_while_break_wrapper_count": fake_while_break_wrapper_count,
+        "fake_switch_case_count": fake_switch_case_count,
+        "fake_call_arg_count": fake_call_arg_count,
+        "fake_signature_count": fake_signature_count,
         "empty_loop_body_count": empty_loop_body_count,
         "synthetic_type_leak_count": synthetic_type_leak_count,
+        "proof_coverage_gap_count": proof_coverage_gap_count,
         "pointer_scalar_compare_count": pointer_scalar_compare_count_value,
+        **summary_honesty,
         "readability_smell_count": readability_smell_count,
         "source_smell_count": address_of_scalar_count
         + local_stack_placeholder_count
@@ -2296,9 +2478,18 @@ def load_gold_manifest(path: Path | str | None) -> list[dict[str, Any]]:
         command = raw.get("command", "decompile_sla")
         if not isinstance(command, str) or not command.strip():
             raise ValueError(f"gold expectation {idx} needs a command")
+        owner = raw.get("owner")
+        if not isinstance(owner, str) or not owner.strip():
+            raise ValueError(f"gold expectation {idx} needs a canonical owner")
+        owner = owner.strip()
+        if owner not in CANONICAL_GOLD_OWNERS:
+            raise ValueError(
+                f"gold expectation {idx} owner must be one of {sorted(CANONICAL_GOLD_OWNERS)}"
+            )
         expectation = dict(raw)
         expectation["target"] = target.strip()
         expectation["command"] = command.strip()
+        expectation["owner"] = owner
         expectation.setdefault("id", f"gold-{idx}")
         expectations.append(expectation)
     expectations.sort(
@@ -3701,6 +3892,26 @@ def quality_gate_failures_for_result(
             "fake_while_break_wrapper",
             count=int(quality.get("fake_while_break_wrapper_count") or 0),
         )
+    if int(quality.get("fake_switch_case_count") or 0) > 0:
+        add(
+            "fake_switch_case",
+            count=int(quality.get("fake_switch_case_count") or 0),
+        )
+    if int(quality.get("fake_call_arg_count") or 0) > 0:
+        add(
+            "fake_call_arg",
+            count=int(quality.get("fake_call_arg_count") or 0),
+        )
+    if int(quality.get("fake_stack_slot_count") or 0) > 0:
+        add(
+            "fake_stack_slot",
+            count=int(quality.get("fake_stack_slot_count") or 0),
+        )
+    if int(quality.get("fake_signature_count") or 0) > 0:
+        add(
+            "fake_signature",
+            count=int(quality.get("fake_signature_count") or 0),
+        )
     if int(quality.get("empty_loop_body_count") or 0) > 0:
         add(
             "empty_loop_body",
@@ -3710,6 +3921,51 @@ def quality_gate_failures_for_result(
         add(
             "summary_pseudo_call",
             count=int(quality.get("summary_pseudo_call_count") or 0),
+        )
+    if int(quality.get("summary_synthetic_local_count") or 0) > 0:
+        add(
+            "summary_synthetic_local",
+            count=int(quality.get("summary_synthetic_local_count") or 0),
+        )
+    if int(quality.get("unmarked_summary_synthetic_local_count") or 0) > 0:
+        add(
+            "unmarked_summary_synthetic_local",
+            count=int(quality.get("unmarked_summary_synthetic_local_count") or 0),
+        )
+    if int(quality.get("misleading_summary_role_count") or 0) > 0:
+        add(
+            "misleading_summary_role",
+            count=int(quality.get("misleading_summary_role_count") or 0),
+        )
+    if int(quality.get("name_hint_structured_route_count") or 0) > 0:
+        add(
+            "name_hint_structured_route",
+            count=int(quality.get("name_hint_structured_route_count") or 0),
+        )
+    if int(quality.get("missing_semantic_claims_count") or 0) > 0:
+        add(
+            "missing_semantic_claims",
+            count=int(quality.get("missing_semantic_claims_count") or 0),
+        )
+    if int(quality.get("missing_summary_render_contract_count") or 0) > 0:
+        add(
+            "missing_summary_render_contract",
+            count=int(quality.get("missing_summary_render_contract_count") or 0),
+        )
+    if int(quality.get("claimless_summary_projection_count") or 0) > 0:
+        add(
+            "claimless_summary_projection",
+            count=int(quality.get("claimless_summary_projection_count") or 0),
+        )
+    if int(quality.get("missing_summary_role_certificate_count") or 0) > 0:
+        add(
+            "missing_summary_role_certificate",
+            count=int(quality.get("missing_summary_role_certificate_count") or 0),
+        )
+    if int(quality.get("proof_coverage_gap_count") or 0) > 0:
+        add(
+            "proof_coverage_gap",
+            count=int(quality.get("proof_coverage_gap_count") or 0),
         )
     if int(quality.get("undefined_identifier_return_count") or 0) > 0:
         add(
@@ -3972,9 +4228,21 @@ def score_case(case_result: dict[str, Any]) -> int:
         "comment_only_decompile": 12,
         "decompile_header_return_mismatch": 12,
         "decompile_header_signature_mismatch": 8,
+        "fake_call_arg": 10,
+        "fake_stack_slot": 10,
+        "fake_signature": 10,
+        "fake_switch_case": 10,
         "fake_while_break_wrapper": 10,
         "missing_return_nonvoid": 10,
+        "misleading_summary_role": 8,
+        "missing_semantic_claims": 8,
+        "missing_summary_role_certificate": 10,
+        "missing_summary_render_contract": 10,
+        "claimless_summary_projection": 10,
+        "name_hint_structured_route": 10,
+        "proof_coverage_gap": 10,
         "summary_pseudo_call": 8,
+        "unmarked_summary_synthetic_local": 8,
         "undefined_identifier_return": 12,
         GOLD_ORACLE_FAILURE: 15,
         "unresolved_fcn_or_temp_stack_leak": 8,
@@ -4551,8 +4819,15 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "argn_leak_total": 0,
         "comment_only_decompile_total": 0,
         "empty_loop_body_total": 0,
+        "fake_call_arg_total": 0,
+        "fake_stack_slot_total": 0,
+        "fake_signature_total": 0,
+        "fake_switch_case_total": 0,
         "fake_while_break_wrapper_total": 0,
+        "missing_summary_role_certificate_total": 0,
+        "missing_summary_render_contract_total": 0,
         "missing_return_nonvoid_total": 0,
+        "proof_coverage_gap_total": 0,
         "raw_temp_stack_leak_total": 0,
         "summary_pseudo_call_total": 0,
         "undefined_identifier_return_total": 0,
@@ -4655,11 +4930,32 @@ def aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
                     decompile_metric_totals["fake_while_break_wrapper_total"] += int(
                         quality.get("fake_while_break_wrapper_count") or 0
                     )
+                    decompile_metric_totals["fake_switch_case_total"] += int(
+                        quality.get("fake_switch_case_count") or 0
+                    )
+                    decompile_metric_totals["fake_call_arg_total"] += int(
+                        quality.get("fake_call_arg_count") or 0
+                    )
+                    decompile_metric_totals["fake_stack_slot_total"] += int(
+                        quality.get("fake_stack_slot_count") or 0
+                    )
+                    decompile_metric_totals["fake_signature_total"] += int(
+                        quality.get("fake_signature_count") or 0
+                    )
                     decompile_metric_totals["empty_loop_body_total"] += int(
                         quality.get("empty_loop_body_count") or 0
                     )
                     decompile_metric_totals["missing_return_nonvoid_total"] += (
                         1 if quality.get("missing_return_nonvoid") else 0
+                    )
+                    decompile_metric_totals["missing_summary_role_certificate_total"] += int(
+                        quality.get("missing_summary_role_certificate_count") or 0
+                    )
+                    decompile_metric_totals["missing_summary_render_contract_total"] += int(
+                        quality.get("missing_summary_render_contract_count") or 0
+                    )
+                    decompile_metric_totals["proof_coverage_gap_total"] += int(
+                        quality.get("proof_coverage_gap_count") or 0
                     )
                     decompile_metric_totals["raw_temp_stack_leak_total"] += int(
                         quality.get("raw_temp_stack_leak_count") or 0
@@ -4933,7 +5229,25 @@ def owner_for_failure(kind: Any, command: Any = None) -> str:
 
 
 def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dict[str, Any]:
+    fake_semantics_total = sum(
+        int(_summary_metric(report, ("summary", "quality", metric), 0) or 0)
+        for metric in (
+            "empty_loop_body_total",
+            "fake_call_arg_total",
+            "fake_stack_slot_total",
+            "fake_signature_total",
+            "fake_switch_case_total",
+            "fake_while_break_wrapper_total",
+            "missing_summary_role_certificate_total",
+            "missing_summary_render_contract_total",
+            "summary_pseudo_call_total",
+        )
+    )
     checks = {
+        "report_complete": {
+            "value": 1 if report.get("status") != "incomplete" else 0,
+            "min": 1 if getattr(args, "closure_gate", False) else None,
+        },
         "hard_failures": {
             "value": _hard_failure_count(report),
             "max": getattr(args, "max_hard_failures", None),
@@ -4949,6 +5263,64 @@ def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dic
         "generic_types": {
             "value": int(_summary_metric(report, ("summary", "quality", "generic_type_total"), 0) or 0),
             "max": getattr(args, "max_generic_types", None),
+        },
+        "fake_semantics": {
+            "value": fake_semantics_total,
+            "max": 0 if getattr(args, "closure_gate", False) else None,
+        },
+        "fake_stack_slots": {
+            "value": int(
+                _summary_metric(report, ("summary", "quality", "fake_stack_slot_total"), 0)
+                or 0
+            ),
+            "max": 0 if getattr(args, "closure_gate", False) else None,
+        },
+        "summary_role_certificate_gap": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "missing_summary_role_certificate_total"),
+                    0,
+                )
+                or 0
+            ),
+            "max": 0 if getattr(args, "closure_gate", False) else None,
+        },
+        "summary_render_contract_gap": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "missing_summary_render_contract_total"),
+                    0,
+                )
+                or 0
+            ),
+            "max": 0 if getattr(args, "closure_gate", False) else None,
+        },
+        "proof_coverage_gap": {
+            "value": int(
+                _summary_metric(report, ("summary", "quality", "proof_coverage_gap_total"), 0)
+                or 0
+            ),
+            "max": 0 if getattr(args, "closure_gate", False) else None,
+        },
+        "undefined_identifier_return": {
+            "value": int(
+                _summary_metric(
+                    report,
+                    ("summary", "quality", "undefined_identifier_return_total"),
+                    0,
+                )
+                or 0
+            ),
+            "max": 0 if getattr(args, "closure_gate", False) else None,
+        },
+        "raw_temp_stack_leak": {
+            "value": int(
+                _summary_metric(report, ("summary", "quality", "raw_temp_stack_leak_total"), 0)
+                or 0
+            ),
+            "max": 0 if getattr(args, "closure_gate", False) else None,
         },
         "average_score": {
             "value": float(_summary_metric(report, ("summary", "average_score"), 0.0) or 0.0),
@@ -5028,7 +5400,9 @@ def strict_quality_gate(args: argparse.Namespace, report: dict[str, Any]) -> dic
                 )
                 or 0
             ),
-            "min": 1 if getattr(args, "require_gold", False) else None,
+            "min": 1
+            if getattr(args, "require_gold", False) or getattr(args, "closure_gate", False)
+            else None,
         },
     }
     failures: list[dict[str, Any]] = []

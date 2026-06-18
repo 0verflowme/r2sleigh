@@ -89,10 +89,22 @@ impl RenameContext {
         self.sizes.get(name).copied().unwrap_or(8)
     }
 
+    fn has_size(&self, name: &str) -> bool {
+        self.sizes.contains_key(name)
+    }
+
     /// Create an SSAVar for reading a variable.
     pub fn read_var(&self, name: &str) -> SSAVar {
         let version = self.current_version(name);
         let size = self.get_size(name);
+        SSAVar::new(name, version, size)
+    }
+
+    /// Create an SSAVar for reading a variable, using the IL varnode width if
+    /// the name has not been defined in this function.
+    pub fn read_var_with_size(&self, name: &str, fallback_size: u32) -> SSAVar {
+        let version = self.current_version(name);
+        let size = self.sizes.get(name).copied().unwrap_or(fallback_size);
         SSAVar::new(name, version, size)
     }
 
@@ -378,6 +390,9 @@ fn append_call_boundary_defs(
             actual_names.insert(reg.name.clone());
         }
         for actual_name in actual_names {
+            if !ctx.has_size(&actual_name) {
+                ctx.init_var(&actual_name, reg.size);
+            }
             let dst = ctx.write_var(&actual_name);
             defined_vars.push(actual_name);
             block_ops.push(SSAOp::CallDefine { dst });
@@ -1274,7 +1289,7 @@ fn read_varnode(
         }
         _ => {
             let name = varnode_to_name(vn, reg_names);
-            ctx.read_var(&name)
+            ctx.read_var_with_size(&name, vn.size)
         }
     }
 }
@@ -1283,7 +1298,7 @@ fn read_varnode(
 mod tests {
     use super::*;
     use crate::cfg::CFG;
-    use crate::phi::collect_defs_from_cfg;
+    use crate::phi::{collect_defs_from_cfg, collect_defs_from_cfg_with_names};
     use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
@@ -1440,5 +1455,75 @@ mod tests {
         } else {
             panic!("Expected Phi op, got {:?}", merge_ops[0]);
         }
+    }
+
+    #[test]
+    fn call_boundary_preserves_register_map_alias_width_for_read_only_alias() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(0x80, 1),
+                    a: make_reg(0, 4),
+                    b: make_const(0, 4),
+                },
+                R2ILOp::Return {
+                    target: make_const(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let cfg = CFG::from_blocks(&blocks).unwrap();
+        let domtree = DomTree::compute(&cfg);
+        let mut reg_names = RegisterNameMap::new();
+        reg_names.insert((0, 8), "RAX".to_string());
+        reg_names.insert((0, 4), "EAX".to_string());
+        let (defs, var_sizes) = collect_defs_from_cfg_with_names(&cfg, Some(&reg_names));
+        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs, &var_sizes);
+        let boundary = CallBoundaryConfig {
+            defined_regs: vec![
+                CallBoundaryDef {
+                    name: "rax".to_string(),
+                    size: 8,
+                },
+                CallBoundaryDef {
+                    name: "eax".to_string(),
+                    size: 4,
+                },
+            ],
+        };
+        let result = rename_function_with_names_and_call_boundaries(
+            &cfg,
+            &domtree,
+            &phi_placement,
+            &var_sizes,
+            Some(&reg_names),
+            Some(&boundary),
+        );
+
+        let call_defines: Vec<&SSAVar> = result
+            .get_block(0x1000)
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::CallDefine { dst } => Some(dst),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            call_defines
+                .iter()
+                .any(|dst| dst.name == "RAX" && dst.size == 8)
+        );
+        assert!(
+            call_defines
+                .iter()
+                .any(|dst| dst.name == "EAX" && dst.size == 4)
+        );
     }
 }

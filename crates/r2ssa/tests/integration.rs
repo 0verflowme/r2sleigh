@@ -120,15 +120,48 @@ mod tests {
     #[test]
     fn test_ssa_multiple_writes() {
         let disasm = create_x86_64_disasm();
-        // inc rax (48 ff c0)
         let bytes = pad_hex("48ffc0");
 
         let block = disasm.lift(&bytes, 0x1000).expect("Failed to lift");
         let ssa_block = to_ssa(&block, &disasm);
 
-        // Each inc should produce a new version
-        // The exact behavior depends on P-code semantics
-        assert!(!ssa_block.is_empty());
+        fn is_rax_family(name: &str) -> bool {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "rax" | "eax" | "ax" | "al" | "ah"
+            )
+        }
+
+        let rax_source_versions: Vec<u32> = ssa_block
+            .ops
+            .iter()
+            .flat_map(|op| op.sources())
+            .filter(|var| is_rax_family(&var.name))
+            .map(|var| var.version)
+            .collect();
+        let rax_dest_versions: Vec<u32> = ssa_block
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter(|var| is_rax_family(&var.name))
+            .map(|var| var.version)
+            .collect();
+
+        assert!(
+            rax_source_versions.contains(&0),
+            "inc rax must read the incoming RAX-family value, got ops={:?}",
+            ssa_block.ops
+        );
+        assert!(
+            rax_dest_versions.iter().any(|version| *version > 0),
+            "inc rax must define a fresh RAX-family version, got ops={:?}",
+            ssa_block.ops
+        );
+        assert!(
+            rax_dest_versions.windows(2).all(|pair| pair[0] < pair[1]),
+            "RAX-family definitions must be monotonic, got versions={rax_dest_versions:?}, ops={:?}",
+            ssa_block.ops
+        );
     }
 
     #[test]

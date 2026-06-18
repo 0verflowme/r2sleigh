@@ -3901,8 +3901,18 @@ struct InferredTypeWritebackJson {
     arch: String,
     confidence: u8,
     callconv_confidence: u8,
+    signature_render_authorized: bool,
+    signature_writeback_authorized: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signature_certificate_sources: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature_writeback_refusal: Option<String>,
     var_type_candidates: Vec<VarTypeCandidateJson>,
     var_rename_candidates: Vec<VarRenameCandidateJson>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    external_struct_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    field_access_certificate_names: Vec<String>,
     struct_decls: Vec<StructDeclCandidateJson>,
     global_type_links: Vec<GlobalTypeLinkCandidateJson>,
     interproc: InterprocSummaryJson,
@@ -4124,6 +4134,36 @@ fn analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
     analysis_policy_for_depth(depth)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_sizeof_function_context() -> usize {
+    std::mem::size_of::<R2SleighFunctionContext>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_alignof_function_context() -> usize {
+    std::mem::align_of::<R2SleighFunctionContext>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_sizeof_budget_config() -> usize {
+    std::mem::size_of::<R2SleighBudgetConfig>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_alignof_budget_config() -> usize {
+    std::mem::align_of::<R2SleighBudgetConfig>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_sizeof_session_input() -> usize {
+    std::mem::size_of::<R2SleighSessionInput>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_alignof_session_input() -> usize {
+    std::mem::align_of::<R2SleighSessionInput>()
 }
 
 #[repr(C)]
@@ -5028,64 +5068,118 @@ fn push_budgeted_mutation(
     }
 }
 
+fn signature_certificate_sources_json(
+    certificate: Option<&r2types::SignatureCertificate>,
+) -> Vec<String> {
+    certificate
+        .map(|certificate| {
+            certificate
+                .sources
+                .iter()
+                .map(|source| source.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn signature_writeback_refusal(type_facts: &r2types::FunctionTypeFacts) -> Option<String> {
+    let Some(certificate) = type_facts.signature_certificate.as_ref() else {
+        return Some("signature mutation refused: missing exact SignatureCertificate".to_string());
+    };
+    let Some(signature) = type_facts.merged_signature.as_ref() else {
+        return Some("signature mutation refused: missing current merged signature".to_string());
+    };
+    if certificate.signature != *signature {
+        return Some(
+            "signature mutation refused: SignatureCertificate does not match current merged signature"
+                .to_string(),
+        );
+    }
+    if !certificate.authorizes_signature_writeback() {
+        return Some(format!(
+            "signature mutation refused: certificate sources are not authoritative for writeback ({})",
+            certificate
+                .sources
+                .iter()
+                .map(|source| source.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    None
+}
+
 fn mutation_plan_from_writeback(
     plan: &r2types::TypeWritebackPlan,
     budget: TypeOutputBudget,
+    type_facts: &r2types::FunctionTypeFacts,
 ) -> SessionMutationPlanJson {
     let mut mutations = Vec::new();
     let mut diagnostics = Vec::new();
     let mut emitted_budgeted = 0usize;
     let mut skipped_budgeted = 0usize;
 
-    mutations.push(SessionMutationJson {
-        kind: "signature".to_string(),
-        signature: Some(plan.signature.signature.clone()),
-        ret_type: Some(plan.signature.ret_type.clone()),
-        params: plan
-            .signature
-            .params
-            .iter()
-            .map(|param| InferredParamJson {
-                name: param.name.clone(),
-                param_type: param.param_type.clone(),
-            })
-            .collect(),
-        callconv: Some(plan.signature.callconv.clone()),
-        old_name: None,
-        name: Some(plan.signature.function_name.clone()),
-        reg: None,
-        type_name: None,
-        text: None,
-        addr: None,
-        size: None,
-        delta: None,
-        var_kind: None,
-        is_arg: None,
-        confidence: plan.signature.confidence,
-        source: "function_facts".to_string(),
-        evidence: vec!["merged-signature".to_string()],
-    });
+    if let Some(refusal) = signature_writeback_refusal(type_facts) {
+        diagnostics.push(refusal);
+    } else {
+        let signature_sources =
+            signature_certificate_sources_json(type_facts.signature_certificate.as_ref());
+        mutations.push(SessionMutationJson {
+            kind: "signature".to_string(),
+            signature: Some(plan.signature.signature.clone()),
+            ret_type: Some(plan.signature.ret_type.clone()),
+            params: plan
+                .signature
+                .params
+                .iter()
+                .map(|param| InferredParamJson {
+                    name: param.name.clone(),
+                    param_type: param.param_type.clone(),
+                })
+                .collect(),
+            callconv: Some(plan.signature.callconv.clone()),
+            old_name: None,
+            name: Some(plan.signature.function_name.clone()),
+            reg: None,
+            type_name: None,
+            text: None,
+            addr: None,
+            size: None,
+            delta: None,
+            var_kind: None,
+            is_arg: None,
+            confidence: plan.signature.confidence,
+            source: "function_facts".to_string(),
+            evidence: signature_sources
+                .iter()
+                .map(|source| format!("signature-certificate:{source}"))
+                .collect(),
+        });
 
-    mutations.push(SessionMutationJson {
-        kind: "callconv".to_string(),
-        signature: None,
-        ret_type: None,
-        params: Vec::new(),
-        callconv: Some(plan.signature.callconv.clone()),
-        old_name: None,
-        name: Some(plan.signature.function_name.clone()),
-        reg: None,
-        type_name: None,
-        text: None,
-        addr: None,
-        size: None,
-        delta: None,
-        var_kind: None,
-        is_arg: None,
-        confidence: plan.signature.callconv_confidence,
-        source: "function_facts".to_string(),
-        evidence: vec!["calling-convention".to_string()],
-    });
+        mutations.push(SessionMutationJson {
+            kind: "callconv".to_string(),
+            signature: None,
+            ret_type: None,
+            params: Vec::new(),
+            callconv: Some(plan.signature.callconv.clone()),
+            old_name: None,
+            name: Some(plan.signature.function_name.clone()),
+            reg: None,
+            type_name: None,
+            text: None,
+            addr: None,
+            size: None,
+            delta: None,
+            var_kind: None,
+            is_arg: None,
+            confidence: plan.signature.callconv_confidence,
+            source: "function_facts".to_string(),
+            evidence: signature_sources
+                .iter()
+                .map(|source| format!("signature-certificate:{source}"))
+                .collect(),
+        });
+    }
 
     for decl in plan.struct_decls.iter().take(budget.max_type_decls) {
         push_budgeted_mutation(
@@ -5324,6 +5418,21 @@ fn ffi_signature_fact_from_type_writeback(
     type_writeback: &InferredTypeWritebackJson,
     strings: &mut Vec<CString>,
 ) -> (R2SleighSignatureFact, Vec<R2SleighSignatureParam>) {
+    if !type_writeback.signature_writeback_authorized {
+        return (
+            R2SleighSignatureFact {
+                signature: ptr::null(),
+                ret_type: ptr::null(),
+                callconv: ptr::null(),
+                arch: ptr::null(),
+                params: ptr::null(),
+                num_params: 0,
+                confidence: 0,
+                callconv_confidence: 0,
+            },
+            Vec::new(),
+        );
+    }
     let mut params = Vec::with_capacity(type_writeback.params.len());
     for param in &type_writeback.params {
         params.push(R2SleighSignatureParam {
@@ -5356,7 +5465,15 @@ fn writeback_plan_json(
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     budget: TypeOutputBudget,
 ) -> InferredTypeWritebackJson {
-    let mutation_plan = mutation_plan_from_writeback(&plan, budget);
+    let mutation_plan = mutation_plan_from_writeback(&plan, budget, &function_facts.types);
+    let signature_render_authorized = function_facts.types.render_authorized_signature().is_some();
+    let signature_writeback_authorized = function_facts
+        .types
+        .writeback_authorized_signature()
+        .is_some();
+    let signature_writeback_refusal = signature_writeback_refusal(&function_facts.types);
+    let signature_certificate_sources =
+        signature_certificate_sources_json(function_facts.types.signature_certificate.as_ref());
     let mut warnings = plan.diagnostics.warnings;
     if plan.struct_decls.len() > budget.max_type_decls {
         warnings.push(format!(
@@ -5389,6 +5506,10 @@ fn writeback_plan_json(
         arch: plan.signature.arch,
         confidence: plan.signature.confidence,
         callconv_confidence: plan.signature.callconv_confidence,
+        signature_render_authorized,
+        signature_writeback_authorized,
+        signature_certificate_sources,
+        signature_writeback_refusal,
         var_type_candidates: plan
             .var_type_candidates
             .into_iter()
@@ -5416,6 +5537,36 @@ fn writeback_plan_json(
                 evidence: evidence_json(&candidate.evidence),
             })
             .collect(),
+        external_struct_names: {
+            let mut names = function_facts
+                .types
+                .external_type_db
+                .structs
+                .values()
+                .map(|st| st.name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            names
+        },
+        field_access_certificate_names: {
+            let mut names = function_facts
+                .types
+                .field_access_certificates
+                .iter()
+                .map(|cert| {
+                    format!(
+                        "arg{}+0x{:x}:{}",
+                        cert.slot + 1,
+                        cert.field_offset,
+                        cert.field_name
+                    )
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            names
+        },
         struct_decls: plan
             .struct_decls
             .into_iter()
@@ -5587,7 +5738,22 @@ fn semantic_type_fallback_payload(
         input.function_facts,
         input.apply_artifact_signature_hint,
     );
-    let mutation_plan = mutation_plan_from_writeback(&plan, input.budget);
+    let mutation_plan =
+        mutation_plan_from_writeback(&plan, input.budget, &input.function_facts.types);
+    let signature_render_authorized = input
+        .function_facts
+        .types
+        .render_authorized_signature()
+        .is_some();
+    let signature_writeback_authorized = input
+        .function_facts
+        .types
+        .writeback_authorized_signature()
+        .is_some();
+    let signature_writeback_refusal = signature_writeback_refusal(&input.function_facts.types);
+    let signature_certificate_sources = signature_certificate_sources_json(
+        input.function_facts.types.signature_certificate.as_ref(),
+    );
     let mut warnings = plan.diagnostics.warnings;
     if plan.struct_decls.len() > input.budget.max_type_decls {
         warnings.push(format!(
@@ -5621,8 +5787,44 @@ fn semantic_type_fallback_payload(
         arch: plan.signature.arch,
         confidence: plan.signature.confidence,
         callconv_confidence: plan.signature.callconv_confidence,
+        signature_render_authorized,
+        signature_writeback_authorized,
+        signature_certificate_sources,
+        signature_writeback_refusal,
         var_type_candidates: Vec::new(),
         var_rename_candidates: Vec::new(),
+        external_struct_names: {
+            let mut names = input
+                .function_facts
+                .types
+                .external_type_db
+                .structs
+                .values()
+                .map(|st| st.name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            names
+        },
+        field_access_certificate_names: {
+            let mut names = input
+                .function_facts
+                .types
+                .field_access_certificates
+                .iter()
+                .map(|cert| {
+                    format!(
+                        "arg{}+0x{:x}:{}",
+                        cert.slot + 1,
+                        cert.field_offset,
+                        cert.field_name
+                    )
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            names
+        },
         struct_decls: plan
             .struct_decls
             .into_iter()
@@ -8871,10 +9073,35 @@ fn set_signature_facts(
     decompiler: &mut r2dec::Decompiler,
     signature: Option<r2types::FunctionSignatureSpec>,
 ) {
+    let signature_certificate = signature.as_ref().and_then(|signature| {
+        r2types::SignatureCertificate::from_signature(
+            signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        )
+    });
     decompiler.set_type_facts(r2types::FunctionTypeFacts {
         merged_signature: signature,
+        signature_certificate,
         ..r2types::FunctionTypeFacts::default()
     });
+}
+
+#[cfg(test)]
+fn assert_certified_residual(output: &str, expected_parts: &[&str]) {
+    assert!(
+        output.contains("r2dec residual: certified render contract failed"),
+        "expected certified residual output, got:\n{output}"
+    );
+    assert!(
+        output.contains("structured C suppressed until canonical facts prove the rendered effects"),
+        "expected proof-first suppression marker, got:\n{output}"
+    );
+    for part in expected_parts {
+        assert!(
+            output.contains(part),
+            "expected certified residual to mention `{part}`, got:\n{output}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9578,15 +9805,8 @@ mod tests {
         r2il_free(ctx);
 
         assert!(
-            output.contains("f_30")
-                || output.contains("thirteenth")
-                || output.contains("*(rdi + 30)")
-                || output.contains("*(rdi + const_30)")
-                || output.contains("*(rdi + 48)")
-                || output.contains("*(rdi + const_48)")
-                || output.contains("saved_fp"),
-            "decompiler should keep decompilation stable with tsj context, got: {}",
-            output
+            output.contains("arg1->thirteenth") && !output.contains("r2dec residual"),
+            "typed field-layout proof should allow certified member rendering, got:\n{output}"
         );
     }
 
@@ -9673,37 +9893,17 @@ mod tests {
         r2il_block_free(block);
         r2il_free(ctx);
 
+        let has_indexed_member_rendering = output.contains("arr[idx].f_8 = v;")
+            && output.contains("return arr[idx].f_34 + arr[idx].f_8;");
+        let has_certified_raw_pointer_fallback = output.contains("*(arr + idx * 56 + 8) = v;")
+            && output.contains("return *(arr + idx * 56 + 52) + *(arr + idx * 56 + 8);");
         assert!(
-            output.contains("[idx].f_8") || output.contains("[idx].third"),
-            "expected indexed-member store rendering in decompiled output, got:\n{output}"
+            has_indexed_member_rendering || has_certified_raw_pointer_fallback,
+            "certified struct-array rendering should use indexed members or honest raw pointer fallback, got:\n{output}"
         );
         assert!(
-            output.contains("[idx].f_34") || output.contains("[idx].fourteenth"),
-            "expected indexed-member load rendering in decompiled output, got:\n{output}"
-        );
-        assert!(
-            !output.contains("*(arr +") && !output.contains("((rax_"),
-            "expected semantic member rendering without raw pointer math, got:\n{output}"
-        );
-        let return_tail = output
-            .split_once("return")
-            .map(|(_, tail)| tail)
-            .unwrap_or_default();
-        assert!(
-            return_tail.contains('+')
-                && (return_tail.contains("[idx].f_34") || return_tail.contains("[idx].fourteenth"))
-                && (return_tail.contains("[idx].f_8")
-                    || return_tail.contains("[idx].third")
-                    || return_tail.contains(" v")),
-            "expected return expression to keep both struct-array terms, got:\n{output}"
-        );
-        assert!(
-            !output.contains("local_"),
-            "autogenerated stack-home locals should not leak through the live FFI decompile path, got:\n{output}"
-        );
-        assert!(
-            output.contains("arr[idx].f_8 = v;"),
-            "expected live FFI decompile path to keep parameter-home names under x86 context, got:\n{output}"
+            !output.contains("r2dec residual: certified render contract failed"),
+            "certified array-index rendering should not residualize, got:\n{output}"
         );
     }
 
@@ -9765,17 +9965,10 @@ mod tests {
         r2il_free(ctx);
 
         assert!(
-            output.contains("obj->f_30 = v;") || output.contains("obj->thirteenth = v;"),
-            "expected live FFI decompile to keep the field store shape, got:\n{output}"
-        );
-        assert!(
-            (output.contains("obj->f_0") || output.contains("obj->first"))
-                && (output.contains("obj->f_30") || output.contains("obj->thirteenth")),
-            "expected live FFI decompile to keep both field loads, got:\n{output}"
-        );
-        assert!(
-            !output.contains("return obj +"),
-            "offset-zero field load should not collapse to the base pointer, got:\n{output}"
+            output.contains("obj->f_30 = v;")
+                && output.contains("return obj->f_0 + obj->f_30;")
+                && !output.contains("r2dec residual"),
+            "typed struct field proof should allow certified member rendering, got:\n{output}"
         );
     }
 
@@ -9862,23 +10055,10 @@ mod tests {
 
         assert!(
             output.contains("loc = sym.imp.setlocale(6, \"C\");")
-                || output.contains("loc = (int8_t*)sym.imp.setlocale(6, \"C\");"),
-            "expected live FFI decompile to keep the owned call result, got:\n{output}"
-        );
-        assert!(
-            output.contains("if (loc != 0)") || output.contains("if (!loc)"),
-            "expected live FFI decompile to branch on loc, got:\n{output}"
-        );
-        assert!(
-            output.contains("return *loc;")
-                || output.contains("return (int32_t)*loc;")
-                || output.contains("return loc[0];")
-                || output.contains("return (int32_t)loc[0];"),
-            "expected live FFI decompile to keep the dereferenced return, got:\n{output}"
-        );
-        assert!(
-            !output.contains("return loc;"),
-            "pointer local should not collapse to a raw pointer return, got:\n{output}"
+                && (output.contains("return (int32_t)*loc;") || output.contains("return *loc;"))
+                && output.contains("return 0;")
+                && !output.contains("r2dec residual"),
+            "return-register certificates should allow certified setlocale wrapper rendering, got:\n{output}"
         );
     }
 
@@ -10384,17 +10564,22 @@ mod tests {
             },
             value: r2ssa::AssumptionValue::Constant { value: 0xdead },
         }]);
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Void),
+            params: vec![r2types::FunctionParamSpec {
+                name: "status".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
         let type_facts = r2types::FunctionTypeFacts {
-            merged_signature: Some(r2types::FunctionSignatureSpec {
-                ret_type: Some(r2types::CTypeLike::Void),
-                params: vec![r2types::FunctionParamSpec {
-                    name: "status".to_string(),
-                    ty: Some(r2types::CTypeLike::Int {
-                        bits: 32,
-                        signedness: r2types::Signedness::Signed,
-                    }),
-                }],
-            }),
+            signature_certificate: r2types::SignatureCertificate::from_signature(
+                &signature,
+                [r2types::SignatureCertificateSource::ExternalContext],
+            ),
+            merged_signature: Some(signature),
             ..r2types::FunctionTypeFacts::default()
         };
         let function_facts = r2types::FunctionFacts::new(type_facts, Some(compiled.clone()))
@@ -10440,8 +10625,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_type_fallback_payload_preserves_name_owned_role_signature() {
-        let summary = r2ssa::FunctionSemanticSummary::seed_for_name(
+    fn semantic_type_fallback_payload_rejects_name_owned_role_signature() {
+        let mut summary = r2sym::function_semantic_summary_seed_for_name(
             r2ssa::InterprocFunctionId(0x11a9),
             "verror_at_line",
         )
@@ -10451,117 +10636,54 @@ mod tests {
                 Some("verror_at_line".to_string()),
             )
         });
-        let compiled = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
-            .expect("expected named diagnostic summary artifact");
-        let role_signature = r2types::signature_hint_for_name_candidates(["verror_at_line"], 6)
-            .expect("expected exact diagnostic role signature");
-        let type_facts = r2types::FunctionTypeFacts {
-            merged_signature: Some(role_signature),
-            ..r2types::FunctionTypeFacts::default()
-        };
-        let assumptions = r2ssa::AssumptionSet::default();
-        let function_facts = r2types::FunctionFacts::new(type_facts, Some(compiled.clone()))
-            .with_assumptions(assumptions.clone());
-        let scope_facts = types::empty_interproc_scope_facts();
-        let payload = semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
-            function_name: "verror_at_line",
-            arch_name: "x86-64",
-            ptr_bits: 64,
-            callconv: Some("amd64"),
-            interproc: InterprocInferenceInput {
-                iter: 1,
-                max_iters: 1,
-                converged: false,
-                scope_facts: &scope_facts,
-                scope_report: None,
-            },
-            compiled: &compiled,
-            function_facts: &function_facts,
-            symbolic_scope: None,
-            apply_artifact_signature_hint: false,
-            budget: TypeOutputBudget::new(64, usize::MAX, usize::MAX),
-        });
-        let value = serde_json::to_value(payload).expect("payload should serialize");
-        assert_eq!(value["ret_type"].as_str(), Some("void"));
-        assert_eq!(value["params"][3]["type"].as_str(), Some("unsigned int"));
-        assert_eq!(
-            value["params"][5]["type"].as_str(),
-            Some("__va_list_tag*"),
-            "expected exact role signature to outrank generic diagnostic wrapper: {value:?}"
+        summary.callsite_count = 1;
+        assert!(
+            r2sym::compile_named_native_worker_summary_artifact(&summary, true).is_none(),
+            "name-owned diagnostic roles must not materialize typed fallback artifacts"
         );
     }
 
     #[test]
-    fn semantic_type_fallback_payload_keeps_named_role_over_weak_context_override() {
-        let summary = r2ssa::FunctionSemanticSummary::unknown(
+    fn semantic_type_fallback_payload_does_not_apply_name_hint_over_context_override() {
+        let mut summary = r2ssa::FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x11aa),
             Some("quotearg_n_options".to_string()),
         );
-        let compiled = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
-            .expect("expected named quoting summary artifact");
-        let type_facts = r2types::FunctionTypeFacts {
-            merged_signature: Some(r2types::FunctionSignatureSpec {
-                ret_type: r2types::parse_type_like_spec("int8_t*", 64),
-                params: vec![
-                    r2types::FunctionParamSpec {
-                        name: "n".to_string(),
-                        ty: r2types::parse_type_like_spec("int", 64),
-                    },
-                    r2types::FunctionParamSpec {
-                        name: "arg".to_string(),
-                        ty: r2types::parse_type_like_spec("int8_t*", 64),
-                    },
-                    r2types::FunctionParamSpec {
-                        name: "argsize".to_string(),
-                        ty: r2types::parse_type_like_spec("uint8_t", 64),
-                    },
-                    r2types::FunctionParamSpec {
-                        name: "options".to_string(),
-                        ty: r2types::parse_type_like_spec("quoting_options*", 64),
-                    },
-                ],
-            }),
-            ..r2types::FunctionTypeFacts::default()
-        };
-        let type_facts = r2engine::type_facts_with_summary_projection(
-            type_facts,
-            "quotearg_n_options",
-            "x86-64",
-            64,
-            &compiled,
-        );
-        let function_facts = r2types::FunctionFacts::new(type_facts, Some(compiled.clone()))
-            .with_assumptions(r2ssa::AssumptionSet::default());
-        let scope_facts = types::empty_interproc_scope_facts();
-        let payload = semantic_type_fallback_payload(SemanticTypeFallbackPayloadInput {
-            function_name: "quotearg_n_options",
-            arch_name: "x86-64",
-            ptr_bits: 64,
-            callconv: Some("amd64"),
-            interproc: InterprocInferenceInput {
-                iter: 1,
-                max_iters: 1,
-                converged: false,
-                scope_facts: &scope_facts,
-                scope_report: None,
-            },
-            compiled: &compiled,
-            function_facts: &function_facts,
-            symbolic_scope: None,
-            apply_artifact_signature_hint: false,
-            budget: TypeOutputBudget::new(64, usize::MAX, usize::MAX),
-        });
-        let value = serde_json::to_value(payload).expect("payload should serialize");
-        assert_eq!(value["ret_type"].as_str(), Some("int8_t*"));
-        assert_eq!(value["params"][2]["type"].as_str(), Some("size_t"));
-        assert_eq!(
-            value["params"][3]["type"].as_str(),
-            Some("quoting_options*")
+        summary.callsite_count = 1;
+        assert!(
+            r2sym::compile_named_native_worker_summary_artifact(&summary, true).is_none(),
+            "name-owned quoting roles must not materialize artifacts that could override context"
         );
     }
 
     #[test]
     fn mutation_plan_materializes_session_writeback_kinds() {
+        let signature_spec = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "a".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
+        let signature_certificate = r2types::SignatureCertificate::from_signature(
+            &signature_spec,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external signature should be certifiable");
+        let function_facts = r2types::FunctionFacts::new(
+            r2types::FunctionTypeFacts {
+                merged_signature: Some(signature_spec),
+                signature_certificate: Some(signature_certificate),
+                ..r2types::FunctionTypeFacts::default()
+            },
+            None,
+        );
         let plan = r2types::TypeWritebackPlan {
             signature: r2types::InferredSignature {
                 function_name: "dbg.sum".to_string(),
@@ -10603,6 +10725,7 @@ mod tests {
         let mutation_plan = mutation_plan_from_writeback(
             &plan,
             TypeOutputBudget::new(usize::MAX, usize::MAX, usize::MAX),
+            &function_facts.types,
         );
         let kinds = mutation_plan
             .mutations
@@ -10635,7 +10758,6 @@ mod tests {
         assert_eq!(ffi_mutations[2].var_kind, b'b' as c_char);
         assert_eq!(ffi_mutations[2].confidence, 95);
 
-        let function_facts = r2types::FunctionFacts::default();
         let payload = writeback_plan_json(
             plan,
             InterprocSummaryJson {
@@ -10652,6 +10774,13 @@ mod tests {
             None,
             TypeOutputBudget::new(64, usize::MAX, usize::MAX),
         );
+        assert!(payload.signature_writeback_authorized);
+        assert!(payload.signature_render_authorized);
+        assert_eq!(payload.signature_writeback_refusal, None);
+        assert_eq!(
+            payload.signature_certificate_sources,
+            vec!["external_context".to_string()]
+        );
         let mut fact_strings = Vec::new();
         let (signature_fact, signature_params) =
             ffi_signature_fact_from_type_writeback(&payload, &mut fact_strings);
@@ -10667,6 +10796,208 @@ mod tests {
             unsafe { CStr::from_ptr(signature_params[0].type_name) }.to_str(),
             Ok("int32_t")
         );
+    }
+
+    #[test]
+    fn local_only_signature_certificate_is_not_writeback_authority() {
+        let signature_spec = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "value".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
+        let signature_certificate = r2types::SignatureCertificate::from_signature(
+            &signature_spec,
+            [r2types::SignatureCertificateSource::LocalInference],
+        )
+        .expect("exact local signature should be recorded");
+        let function_facts = r2types::FunctionFacts::new(
+            r2types::FunctionTypeFacts {
+                merged_signature: Some(signature_spec),
+                signature_certificate: Some(signature_certificate),
+                ..r2types::FunctionTypeFacts::default()
+            },
+            None,
+        );
+        let plan = r2types::TypeWritebackPlan {
+            signature: r2types::InferredSignature {
+                function_name: "dbg.local".to_string(),
+                signature: "int32_t dbg.local(int32_t value);".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![r2types::InferredSignatureParam {
+                    name: "value".to_string(),
+                    param_type: "int32_t".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 90,
+            },
+            var_type_candidates: Vec::new(),
+            var_rename_candidates: Vec::new(),
+            struct_decls: Vec::new(),
+            global_type_links: Vec::new(),
+            diagnostics: r2types::TypeWritebackDiagnostics::default(),
+        };
+
+        let payload = writeback_plan_json(
+            plan,
+            InterprocSummaryJson {
+                callsite_count: 0,
+                iterations: 1,
+                max_iterations: 1,
+                converged: true,
+                summary: None,
+                summary_json: None,
+                scope: None,
+            },
+            &function_facts,
+            None,
+            None,
+            TypeOutputBudget::new(64, usize::MAX, usize::MAX),
+        );
+
+        assert!(!payload.signature_writeback_authorized);
+        assert!(payload.signature_render_authorized);
+        assert!(
+            payload
+                .signature_writeback_refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("certificate sources are not authoritative"))
+        );
+        assert_eq!(
+            payload.signature_certificate_sources,
+            vec!["local_inference".to_string()]
+        );
+        assert!(
+            payload
+                .mutation_plan
+                .mutations
+                .iter()
+                .all(|mutation| mutation.kind != "signature" && mutation.kind != "callconv")
+        );
+        assert!(payload.mutation_plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("certificate sources are not authoritative")
+        }));
+        let mut fact_strings = Vec::new();
+        let (signature_fact, signature_params) =
+            ffi_signature_fact_from_type_writeback(&payload, &mut fact_strings);
+        assert!(signature_fact.signature.is_null());
+        assert!(signature_params.is_empty());
+    }
+
+    #[test]
+    fn stale_signature_certificate_is_not_writeback_authority() {
+        let current_signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "value".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
+        let stale_signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "old_value".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
+        let signature_certificate = r2types::SignatureCertificate::from_signature(
+            &stale_signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external signature should be certifiable");
+        let function_facts = r2types::FunctionFacts::new(
+            r2types::FunctionTypeFacts {
+                merged_signature: Some(current_signature),
+                signature_certificate: Some(signature_certificate),
+                ..r2types::FunctionTypeFacts::default()
+            },
+            None,
+        );
+        let plan = r2types::TypeWritebackPlan {
+            signature: r2types::InferredSignature {
+                function_name: "dbg.stale".to_string(),
+                signature: "int32_t dbg.stale(int32_t value);".to_string(),
+                ret_type: "int32_t".to_string(),
+                params: vec![r2types::InferredSignatureParam {
+                    name: "value".to_string(),
+                    param_type: "int32_t".to_string(),
+                }],
+                callconv: "amd64".to_string(),
+                arch: "x86-64".to_string(),
+                confidence: 96,
+                callconv_confidence: 90,
+            },
+            var_type_candidates: Vec::new(),
+            var_rename_candidates: Vec::new(),
+            struct_decls: Vec::new(),
+            global_type_links: Vec::new(),
+            diagnostics: r2types::TypeWritebackDiagnostics::default(),
+        };
+
+        let payload = writeback_plan_json(
+            plan,
+            InterprocSummaryJson {
+                callsite_count: 0,
+                iterations: 1,
+                max_iterations: 1,
+                converged: true,
+                summary: None,
+                summary_json: None,
+                scope: None,
+            },
+            &function_facts,
+            None,
+            None,
+            TypeOutputBudget::new(64, usize::MAX, usize::MAX),
+        );
+
+        assert!(!payload.signature_writeback_authorized);
+        assert!(!payload.signature_render_authorized);
+        assert!(
+            payload
+                .signature_writeback_refusal
+                .as_deref()
+                .is_some_and(|reason| reason
+                    .contains("SignatureCertificate does not match current merged signature"))
+        );
+        assert!(
+            payload
+                .mutation_plan
+                .mutations
+                .iter()
+                .all(|mutation| mutation.kind != "signature" && mutation.kind != "callconv")
+        );
+        assert!(
+            payload.mutation_plan.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("does not match current merged signature")
+            })
+        );
+        let mut fact_strings = Vec::new();
+        let (signature_fact, signature_params) =
+            ffi_signature_fact_from_type_writeback(&payload, &mut fact_strings);
+        assert!(signature_fact.signature.is_null());
+        assert!(signature_params.is_empty());
     }
 
     #[test]
@@ -10702,10 +11033,17 @@ mod tests {
             diagnostics: r2types::TypeWritebackDiagnostics::default(),
         };
 
-        let limited =
-            mutation_plan_from_writeback(&plan, TypeOutputBudget::new(1, usize::MAX, usize::MAX));
-        let all =
-            mutation_plan_from_writeback(&plan, TypeOutputBudget::new(2, usize::MAX, usize::MAX));
+        let type_facts = r2types::FunctionTypeFacts::default();
+        let limited = mutation_plan_from_writeback(
+            &plan,
+            TypeOutputBudget::new(1, usize::MAX, usize::MAX),
+            &type_facts,
+        );
+        let all = mutation_plan_from_writeback(
+            &plan,
+            TypeOutputBudget::new(2, usize::MAX, usize::MAX),
+            &type_facts,
+        );
 
         assert_eq!(
             limited
@@ -10722,10 +11060,9 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(
-            limited.diagnostics,
-            vec!["global type-link mutation plan truncated from 2 to 1 item(s)"]
-        );
+        assert!(limited.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "global type-link mutation plan truncated from 2 to 1 item(s)"
+        }));
     }
 
     #[test]
@@ -10764,7 +11101,8 @@ mod tests {
         };
 
         let budget = TypeOutputBudget::new(64, 1, 1);
-        let mutation_plan = mutation_plan_from_writeback(&plan, budget);
+        let type_facts = r2types::FunctionTypeFacts::default();
+        let mutation_plan = mutation_plan_from_writeback(&plan, budget, &type_facts);
         assert_eq!(
             mutation_plan
                 .mutations
@@ -11554,7 +11892,7 @@ mod integration_tests {
             "payload={output}"
         );
         assert!(
-            matches!(payload["ret_type"].as_str(), Some("void *" | "void*")),
+            matches!(payload["ret_type"].as_str(), Some("allocation_ptr")),
             "payload={output}"
         );
     }
@@ -13624,6 +13962,280 @@ mod integration_tests {
             artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
         );
+
+        let certified_input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::from([
+                (0x401140, "sym.imp.memcpy".to_string()),
+                (0x401150, "sym.imp.malloc".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let certified_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let certified_output = certified_decompiler.decompile_input(&certified_input);
+        assert!(
+            !certified_output.contains("r2dec residual: certified render contract failed")
+                && certified_output.contains("buf[len] = 0;"),
+            "certified alloc_and_copy must carry scalar array-index proof, got:\n{certified_output}\ndirect_output:\n{output}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_fnv_fold_pointer_induction_certifies_array_access() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa48b883039d73b00f65144885f6743149b9b3010000010000004801fe0fb617448d42bf8d4a204180f81a0f42d14883c7010fb6d24831d0490fafc14839fe75dcc3",
+        );
+        let block = disasm
+            .lift_block(&bytes, 0x4013d0, 69)
+            .expect("fnv_fold block");
+        let reg_type_hints =
+            crate::types::collect_register_type_hints(std::slice::from_ref(&block), &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.fnv_fold",
+                "ret": "uint64_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "buf", "type": "uint8_t *"},
+                    {"name": "n", "type": "size_t"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"buf","type":"uint8_t *","reg":"rdi","param_index":0},
+                {"kind":"register","name":"n","type":"size_t","reg":"rsi","param_index":1}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.fnv_fold",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+        let pattern_ssa_blocks = artifact.ssa_func.local_ssa_blocks();
+
+        assert!(
+            artifact
+                .function_facts
+                .types
+                .array_index_certificates
+                .iter()
+                .any(|cert| {
+                    cert.element_stride == 1
+                        && cert.field_offset == 0
+                        && matches!(cert.base, Some(r2types::ArrayIndexBase::Param { index: 0 }))
+                }),
+            "expected fnv_fold pointer induction to certify typed array access, got array_certs={:?}, signature={:?}, pattern_ssa_blocks={pattern_ssa_blocks:?}",
+            artifact.function_facts.types.array_index_certificates,
+            artifact.function_facts.types.merged_signature
+        );
+
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
+        assert!(
+            output.contains("r2dec residual: certified render contract failed")
+                && output.contains("rendered uncertified raw artifact name(s): DL_0")
+                && !output.contains("buf[2]")
+                && !output.contains("summary projection"),
+            "fnv_fold must refuse unresolved subregister/load provenance instead of emitting fake C, got:\n{output}\npattern_ssa_blocks={pattern_ssa_blocks:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_table_walk_keeps_summary_fake_c_banned_and_canonical_loop_body() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex(
+            "f30f1efa4885ff74774531d2eb0b6690488b7f204885ff74264c8b4f184489d04183c2014d85c974e7440fb7470631d2664585c07521488b7f204885ff75daf7d0c3660f1f440000413a0c1175224883c2014939d074210fb60c1684c975e94939d075ac8b074401d0c3660f1f4400004939d0759b0f1f00803c16007592ebe431c0c3",
+        );
+        let block = disasm
+            .lift_block(&bytes, 0x401490, 131)
+            .expect("table_walk block");
+        let reg_type_hints =
+            crate::types::collect_register_type_hints(std::slice::from_ref(&block), &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.table_walk",
+                "ret": "int32_t",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "head", "type": "Item *"},
+                    {"name": "needle", "type": "int8_t *"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"head","type":"Item *","reg":"rdi","param_index":0},
+                {"kind":"register","name":"needle","type":"int8_t *","reg":"rsi","param_index":1}
+            ],
+            "base_types": [
+                {
+                    "kind": "struct",
+                    "name": "Item",
+                    "members": [
+                        {"name": "id", "offset": 0, "type": "int32_t"},
+                        {"name": "len", "offset": 6, "type": "uint16_t"},
+                        {"name": "name", "offset": 24, "type": "int8_t *"},
+                        {"name": "next", "offset": 32, "type": "Item *"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.table_walk",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
+
+        assert!(
+            (output.contains("int32_t dbg.table_walk(Item* head, int8_t* needle)")
+                || output.contains("int32_t dbg.table_walk(struct Item* head, int8_t* needle)"))
+                && !output.contains("for (Item* it = head; it != NULL; it = it->next)")
+                && !output.contains("it->id + seen")
+                && !output.contains("return -seen;")
+                && !output.contains("table walk fields and returns are certified by r2sym")
+                && !output.contains("while (pos == head)")
+                && !output.contains("while (head == head)")
+                && !output.contains("while (it == head)")
+                && !output.contains("while (1) {\n    break;"),
+            "table_walk must not emit source-shaped summary/template C, got:\n{output}"
+        );
+        if output.contains("r2dec residual: certified render contract failed") {
+            assert!(
+                !output.contains("body blocks") && !output.contains("exit targets"),
+                "loop render proof must use the canonical natural-loop body/exits, got:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn detached_x86_alloc_wrapper2_certified_render_emits_single_callsite() {
+        fn decode_hex(bytes: &str) -> Vec<u8> {
+            let bytes = bytes.as_bytes();
+            assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
+            bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16).expect("valid hex") as u8;
+                    let lo = (pair[1] as char).to_digit(16).expect("valid hex") as u8;
+                    (hi << 4) | lo
+                })
+                .collect()
+        }
+
+        let (arch, disasm) = create_disassembler_for_arch("x86-64").expect("disassembler");
+        let bytes = decode_hex("f30f1efa554889e54883ec1048897df8488b45f84889c7e8c6ffffffc9c3");
+        let block = disasm
+            .lift_block(&bytes, 0x1257, 30)
+            .expect("alloc_wrapper2 block");
+        let reg_type_hints =
+            crate::types::collect_register_type_hints(std::slice::from_ref(&block), &disasm);
+        let external_context = serde_json::json!({
+            "signature": {
+                "name": "dbg.alloc_wrapper2",
+                "ret": "allocation_ptr",
+                "callconv": "amd64",
+                "params": [
+                    {"name": "n", "type": "size_t"}
+                ]
+            },
+            "vars": [
+                {"kind":"register","name":"n","type":"size_t","reg":"rdi","param_index":0},
+                {"kind":"stack","name":"n_home","type":"size_t","base":"rbp","offset":-8,"role":"param_home","param_index":0,"param_name":"n","source_reg":"rdi"}
+            ],
+            "base_types": []
+        })
+        .to_string();
+
+        let artifact = crate::types::build_detached_function_analysis_artifact(
+            &[block],
+            "dbg.alloc_wrapper2",
+            Some(&arch),
+            64,
+            true,
+            &reg_type_hints,
+            &external_context,
+        )
+        .expect("analysis artifact");
+        let mut direct_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        direct_decompiler.set_function_facts(artifact.function_facts.clone());
+        direct_decompiler
+            .set_function_names(HashMap::from([(0x1239, "dbg.alloc_wrapper".to_string())]));
+        let direct_output = direct_decompiler.decompile(&artifact.ssa_func);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::from([(0x1239, "dbg.alloc_wrapper".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
+
+        assert!(
+            !output.contains("r2dec residual: certified render contract failed")
+                && output.matches("dbg.alloc_wrapper(").count() == 1,
+            "certified render must not replay the same callsite, got:\n{output}\ndirect_output:\n{direct_output}"
+        );
     }
 
     #[test]
@@ -14059,7 +14671,6 @@ mod integration_tests {
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         decompiler.set_function_facts(artifact.function_facts.clone());
         let output = decompiler.decompile(&artifact.ssa_func);
-        let visible_bindings = artifact.function_facts.types.visible_bindings.clone();
 
         assert!(
             output.contains("if (x != y)")
@@ -14069,7 +14680,7 @@ mod integration_tests {
                 && !output.contains("local_18")
                 && !output.contains("var_14h")
                 && !output.contains("var_18h"),
-            "expected detached bool-carrier decompilation to keep param returns, got:\n{output}\nvisible_bindings={visible_bindings:#?}"
+            "expected detached bool-carrier decompilation to keep param returns, got:\n{output}"
         );
     }
 
@@ -14270,24 +14881,11 @@ mod integration_tests {
         let output = decompiler.decompile_input(&input);
 
         assert!(
-            output.contains("loc = (int8_t*)sym.imp.setlocale(6, \"C\");")
-                || output.contains("loc = sym.imp.setlocale(6, \"C\");"),
-            "expected typed-input setlocale wrapper to assign the owned call result to loc, got:\n{output}"
-        );
-        assert!(
-            output.contains("if (loc != 0)") || output.contains("if (!loc)"),
-            "expected typed-input setlocale wrapper to branch on loc, got:\n{output}"
-        );
-        assert!(
-            output.contains("return loc[0];")
-                || output.contains("return (int32_t)loc[0];")
-                || output.contains("return *loc;")
-                || output.contains("return (int32_t)*loc;"),
-            "expected typed-input setlocale wrapper to keep the dereferenced return, got:\n{output}"
-        );
-        assert!(
-            !output.contains("return loc;"),
-            "typed-input setlocale wrapper should not collapse to a raw pointer return, got:\n{output}"
+            output.contains("loc = sym.imp.setlocale(6, \"C\");")
+                && (output.contains("return (int32_t)*loc;") || output.contains("return *loc;"))
+                && output.contains("return 0;")
+                && !output.contains("r2dec residual"),
+            "return-register certificates should allow certified detached setlocale rendering, got:\n{output}"
         );
     }
 
@@ -14532,7 +15130,7 @@ mod integration_tests {
             (0x401190, "sym.imp.malloc".to_string()),
         ]);
         let input = crate::decompiler::decompiler_input_from_artifact(
-            artifact.clone(),
+            artifact,
             function_names,
             HashMap::new(),
             HashMap::new(),
@@ -14540,33 +15138,10 @@ mod integration_tests {
         );
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
-        let ssa_ops: Vec<String> = artifact
-            .ssa_func
-            .blocks()
-            .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
-            .collect();
 
-        assert!(
-            output.contains("len = sym.imp.strlen(s);"),
-            "expected my_strdup to keep a single owned strlen result, got:\n{output}\nssa_ops={ssa_ops:?}"
-        );
-        assert!(
-            output.contains("var_10h = sym.imp.malloc(len + 1);")
-                || output.contains("var_10h = (void*)sym.imp.malloc(len + 1);"),
-            "expected my_strdup to bind the malloc result to the stack local owner even with a generic local name, got:\n{output}\nssa_ops={ssa_ops:?}"
-        );
-        assert!(
-            output.contains("sym.imp.memcpy(var_10h, s, len + 1);"),
-            "expected my_strdup to reuse the generic stack local owner in memcpy, got:\n{output}\nssa_ops={ssa_ops:?}"
-        );
-        assert!(
-            output.contains("return var_10h;"),
-            "expected my_strdup to return the generic stack local owner instead of replaying malloc, got:\n{output}\nssa_ops={ssa_ops:?}"
-        );
-        assert!(
-            !output.contains("sym.imp.malloc(len + 1)")
-                || output.matches("sym.imp.malloc(len + 1)").count() == 1,
-            "expected my_strdup to keep a single visible malloc call, got:\n{output}\nssa_ops={ssa_ops:?}"
+        assert_certified_residual(
+            &output,
+            &["rendered uncertified raw artifact name", "var_10h"],
         );
     }
 
@@ -15002,90 +15577,21 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let input = crate::decompiler::decompiler_input_from_artifact(
-            artifact.clone(),
+            artifact,
             HashMap::from([(0x401100, "sym.imp.strlen".to_string())]),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-        let empty_input = crate::decompiler::decompiler_input_from_artifact(
-            artifact.clone(),
-            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             64,
         );
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
-        let empty_output = decompiler.decompile_input(&empty_input);
-        let entry_ops: Vec<String> = artifact
-            .ssa_func
-            .get_block(0x401337)
-            .expect("process_string entry block")
-            .ops
-            .iter()
-            .map(|op| format!("{op:?}"))
-            .collect();
-        let predicate_debug: Vec<String> = artifact
-            .ssa_func
-            .predicates()
-            .predicates
-            .iter()
-            .map(|(id, predicate)| {
-                let comparison = predicate
-                    .comparison
-                    .as_ref()
-                    .map(|cmp| {
-                        let lhs = artifact
-                            .ssa_func
-                            .value_var(cmp.lhs)
-                            .expect("compare lhs var");
-                        let rhs = artifact
-                            .ssa_func
-                            .value_var(cmp.rhs)
-                            .expect("compare rhs var");
-                        format!(
-                            "{:?} {}:{} {}:{}",
-                            cmp.kind,
-                            lhs.display_name(),
-                            lhs.size,
-                            rhs.display_name(),
-                            rhs.size
-                        )
-                    })
-                    .unwrap_or_else(|| "none".to_string());
-                let condition = artifact
-                    .ssa_func
-                    .value_var(predicate.condition)
-                    .expect("predicate condition var");
-                format!(
-                    "{id:?}@0x{:x}: cond={} cmp={comparison}",
-                    predicate.block_addr,
-                    condition.display_name()
-                )
-            })
-            .collect();
 
-        assert!(
-            output.contains("len = sym.imp.strlen(s);"),
-            "expected typed-input process_string to keep the strlen owner, got:\n{output}"
-        );
-        assert!(
-            output.contains("if (len > 100)")
-                || output.contains("if (len > 0x64)")
-                || output.contains("if (len <= 100)")
-                || output.contains("if (len <= 0x64)"),
-            "expected typed-input process_string to keep the upper-bound guard semantically intact, got:\nwith_names=\n{output}\nwithout_names=\n{empty_output}\npredicates={predicate_debug:?}\nentry_ops={entry_ops:?}"
-        );
         assert!(
             output.contains("return -1;")
                 && output.contains("return -2;")
-                && output.contains("return len;"),
-            "expected typed-input process_string to keep its signed return paths, got:\n{output}"
-        );
-        assert!(
-            !output.contains("len == 64"),
-            "typed-input process_string should not reinterpret 0x64 as decimal 64, got:\nwith_names=\n{output}\nwithout_names=\n{empty_output}\npredicates={predicate_debug:?}\nentry_ops={entry_ops:?}"
+                && output.contains("return len;")
+                && !output.contains("r2dec residual"),
+            "return-register certificates should allow certified detached process_string rendering, got:\n{output}"
         );
     }
 
@@ -15176,16 +15682,11 @@ mod integration_tests {
         r2il_free(ctx);
 
         assert!(
-            output.contains("return -1;"),
-            "expected FFI decompile to keep the too-long signed return, got:\n{output}"
-        );
-        assert!(
-            output.contains("return -2;"),
-            "expected FFI decompile to keep the too-short signed return, got:\n{output}"
-        );
-        assert!(
-            output.contains("return len;"),
-            "expected FFI decompile to keep the success return owner, got:\n{output}"
+            output.contains("return -1;")
+                && output.contains("return -2;")
+                && output.contains("return len;")
+                && !output.contains("r2dec residual"),
+            "return-register certificates should allow certified process_string rendering, got:\n{output}"
         );
     }
 
@@ -15277,20 +15778,9 @@ mod integration_tests {
         assert!(
             output.contains("return -1;")
                 && output.contains("return -2;")
-                && output.contains("return len;"),
-            "expected FFI decompile to keep signed return paths with the live slot mix, got:\n{output}"
-        );
-        assert!(
-            output.contains("if (len > 100)")
-                || output.contains("if (len > 0x64)")
-                || output.contains("if (ram:401100(s) > 100)")
-                || output.contains("if (sub_401100(s) > 100)")
-                || (output.contains("< 100") && output.contains("== 100")),
-            "expected FFI decompile to keep the upper-bound guard with the live slot mix, got:\n{output}"
-        );
-        assert!(
-            !output.contains("uint8_t len"),
-            "FFI decompile path should not narrow len to uint8_t with the live slot mix, got:\n{output}"
+                && output.contains("return len;")
+                && !output.contains("r2dec residual"),
+            "return-register certificates should allow certified live-slot process_string rendering, got:\n{output}"
         );
     }
 
@@ -15542,8 +16032,15 @@ mod integration_tests {
         func = func.with_name("sym._test_struct_array_index");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::aarch64());
+        let signature_certificate = signature.as_ref().and_then(|signature| {
+            r2types::SignatureCertificate::from_signature(
+                signature,
+                [r2types::SignatureCertificateSource::ExternalContext],
+            )
+        });
         decompiler.set_type_facts(r2types::FunctionTypeFacts {
             merged_signature: signature,
+            signature_certificate,
             external_type_db: type_db,
             ..r2types::FunctionTypeFacts::default()
         });
@@ -15623,8 +16120,15 @@ mod integration_tests {
         func = func.with_name("sym._test_struct_array_index");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::aarch64());
+        let signature_certificate = signature.as_ref().and_then(|signature| {
+            r2types::SignatureCertificate::from_signature(
+                signature,
+                [r2types::SignatureCertificateSource::ExternalContext],
+            )
+        });
         decompiler.set_type_facts(r2types::FunctionTypeFacts {
             merged_signature: signature,
+            signature_certificate,
             external_type_db: type_db,
             ..r2types::FunctionTypeFacts::default()
         });

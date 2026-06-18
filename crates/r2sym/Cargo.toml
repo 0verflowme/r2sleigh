@@ -14,7 +14,7 @@ r2il = { path = "../r2il" }
 r2ssa = { path = "../r2ssa" }
 serde.workspace = true
 thiserror.workspace = true
-z3 = "0.20.0"
+z3.workspace = true
 r2pipe = { version = "0.7", optional = true }
 serde_json = { version = "1.0", optional = true }
 
@@ -25,4 +25,3 @@ r2 = ["r2pipe", "serde_json"]
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.6"
-sleigh-config = { version = "1.0", features = ["x86"] }

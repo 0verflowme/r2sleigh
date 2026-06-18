@@ -32,14 +32,16 @@ pub use external::{
     ExternalTypedef, ExternalUnion, normalize_external_type_name,
 };
 pub use facts::{
-    CalleeAllocationEffect, CalleeArgEffect, CalleeAtomicEffect, CalleeAtomicOp,
-    CalleeAtomicOrdering, CalleeFact, CalleeLifetimeEffect, CalleeLifetimeOp, CalleeMemoryEffect,
-    CalleeMemoryEffectKind, CalleeMemoryLocation, CalleeMemoryRange, CalleeMemoryRegion,
-    CalleeReturnRelation, CalleeSyncEffect, CalleeSyncOp, CalleeTransferEffect,
-    CalleeTransferLength, FunctionParamSpec, FunctionSignatureProjection, FunctionSignatureSpec,
-    FunctionType, FunctionTypeFactInputs, FunctionTypeFacts, FunctionTypeFactsBuilder,
-    InterprocFactDiagnostics, LocalFieldAccessFact, ResolvedFieldLayout,
-    SIGNATURE_PROJECTION_STRONG_CONFIDENCE, SIGNATURE_PROJECTION_WEAK_CONFIDENCE,
+    ArrayIndexBase, ArrayIndexCertificate, CalleeAllocationEffect, CalleeArgEffect,
+    CalleeAtomicEffect, CalleeAtomicOp, CalleeAtomicOrdering, CalleeFact, CalleeLifetimeEffect,
+    CalleeLifetimeOp, CalleeMemoryEffect, CalleeMemoryEffectKind, CalleeMemoryLocation,
+    CalleeMemoryRange, CalleeMemoryRegion, CalleeReturnRelation, CalleeSyncEffect, CalleeSyncOp,
+    CalleeTransferEffect, CalleeTransferLength, FieldAccessCertificate, FunctionParamSpec,
+    FunctionSignatureProjection, FunctionSignatureSpec, FunctionType, FunctionTypeFactInputs,
+    FunctionTypeFacts, FunctionTypeFactsBuilder, InterprocFactDiagnostics, LocalFieldAccessFact,
+    OutParamCertificate, OutParamCertificateEvidence, OutParamCertificateSource,
+    ResolvedFieldLayout, SIGNATURE_PROJECTION_STRONG_CONFIDENCE,
+    SIGNATURE_PROJECTION_WEAK_CONFIDENCE, SignatureCertificate, SignatureCertificateSource,
     SignatureProjectionRejection, SignatureProjectionResult, SignatureProjectionSource,
     VisibleBinding, VisibleBindingKind, is_generic_signature_type, parse_type_like_spec,
     signature_hint_can_replace_existing, signature_param_count_is_authoritative,
@@ -49,7 +51,7 @@ pub use facts::{
 };
 pub use function_facts::{
     AnalysisPlans, DecompileCapabilityView, FunctionFacts, InterprocSummaryView,
-    SummaryEffectRollup, SummaryHelperView,
+    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
@@ -62,8 +64,8 @@ pub use prepare::{
 };
 pub use r2ssa::AssumptionUsageReport;
 pub use role_registry::{
-    normalize_role_name, semantic_typedef_is_authoritative, signature_hint_for_name_candidates,
-    signature_hint_for_role_name, signature_hint_for_summary_kinds,
+    normalize_role_name, semantic_typedef_is_authoritative, signature_hint_for_role_identity,
+    signature_hint_for_summary_kinds, type_projection_for_role_identity,
 };
 pub use signature::{ResolvedSignature, SignatureRegistry};
 pub use signature_infer::{
@@ -83,8 +85,11 @@ pub use writeback::{
     TypeWritebackAnalysis, TypeWritebackAnalysisInput, TypeWritebackDiagnostics, TypeWritebackPlan,
     TypeWritebackSemanticInputs, VarRenameCandidate, VarTypeCandidate, WritebackEvidence,
     WritebackSource, apply_semantic_artifact_signature_hint_to_inferred,
+    augment_function_type_facts_with_summary_evidence,
     augment_local_struct_artifacts_with_semantics, build_semantic_type_fallback_plan,
     build_type_writeback_analysis, build_type_writeback_analysis_with_semantics,
-    infer_local_struct_artifacts_from_ssa, inferred_signature_to_function_type_facts,
-    semantic_artifact_prefers_bounded_type_plan,
+    field_access_certificates_from_struct_artifacts, infer_local_struct_artifacts_from_ssa,
+    inferred_signature_to_function_type_facts, local_field_accesses_from_struct_artifacts,
+    semantic_artifact_prefers_bounded_type_plan, signature_hint_for_semantic_artifact,
+    signature_projection_for_semantic_artifact,
 };

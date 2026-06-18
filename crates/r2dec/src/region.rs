@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use r2ssa::{CFGEdge, SSAFunction, SSAOp, SSAVar};
+use r2ssa::{BlockTerminator, CFGEdge, SSAFunction, SSAOp, SSAVar, domtree::DomTree};
 
 /// A control flow region.
 #[derive(Debug, Clone)]
@@ -132,6 +132,8 @@ impl Region {
 /// Region analyzer for identifying structured control flow.
 pub struct RegionAnalyzer<'a> {
     func: &'a SSAFunction,
+    /// Dominator tree computed from the current CFG snapshot.
+    dominators: DomTree,
     /// Back edges in the CFG (target -> sources).
     back_edges: HashMap<u64, Vec<u64>>,
     /// Natural loops (header -> body blocks).
@@ -194,8 +196,10 @@ impl<'a> RegionAnalyzer<'a> {
     /// Create a new region analyzer.
     pub fn new(func: &'a SSAFunction) -> Self {
         let num_blocks = func.num_blocks();
+        let dominators = DomTree::compute(func.cfg());
         let mut analyzer = Self {
             func,
+            dominators,
             back_edges: HashMap::new(),
             loops: HashMap::new(),
             post_dominators: HashMap::new(),
@@ -272,35 +276,20 @@ impl<'a> RegionAnalyzer<'a> {
         self.post_dominators = postdoms;
     }
 
-    /// Find back edges using DFS.
+    /// Find back edges by the canonical dominance invariant.
     fn find_back_edges(&mut self) {
-        let mut visited = HashSet::new();
-        let mut in_stack = HashSet::new();
-        self.dfs_back_edges(self.func.entry, &mut visited, &mut in_stack);
-    }
-
-    fn dfs_back_edges(
-        &mut self,
-        block: u64,
-        visited: &mut HashSet<u64>,
-        in_stack: &mut HashSet<u64>,
-    ) {
-        if visited.contains(&block) {
-            return;
-        }
-        visited.insert(block);
-        in_stack.insert(block);
-
-        for succ in self.func.successors(block) {
-            if in_stack.contains(&succ) {
-                // Back edge found: block -> succ
-                self.back_edges.entry(succ).or_default().push(block);
-            } else {
-                self.dfs_back_edges(succ, visited, in_stack);
+        self.back_edges.clear();
+        for &block in self.func.block_addrs() {
+            for succ in self.func.successors(block) {
+                if self.dominators.dominates(succ, block) {
+                    self.back_edges.entry(succ).or_default().push(block);
+                }
             }
         }
-
-        in_stack.remove(&block);
+        for sources in self.back_edges.values_mut() {
+            sources.sort_unstable();
+            sources.dedup();
+        }
     }
 
     /// Find natural loops from back edges.
@@ -368,11 +357,17 @@ impl<'a> RegionAnalyzer<'a> {
     fn collect_loop_body(&self, source: u64, header: u64, body: &mut HashSet<u64>) {
         let mut worklist = vec![source];
         while let Some(block) = worklist.pop() {
+            if block != header && !self.dominators.dominates(header, block) {
+                continue;
+            }
             if !body.insert(block) {
                 continue;
             }
             for pred in self.func.predecessors(block) {
-                if pred != header && !body.contains(&pred) {
+                if pred != header
+                    && !body.contains(&pred)
+                    && self.dominators.dominates(header, pred)
+                {
                     worklist.push(pred);
                 }
             }
@@ -732,12 +727,35 @@ impl<'a> RegionAnalyzer<'a> {
                 };
             }
 
-            // Do-while or infinite loop
+            // Do-while or infinite loop.  When the loop continuation test lives
+            // in a unique latch, anchor the condition there; the header may be
+            // a one-way body block in optimized CFGs.
+            let cond_block = self
+                .unique_loop_latch_condition_block(header, body)
+                .unwrap_or(header);
             let body_region = self.analyze_loop_body(header, body);
             Region::DoWhileLoop {
                 body: Box::new(body_region),
-                cond_block: header,
+                cond_block,
             }
+        }
+    }
+
+    fn unique_loop_latch_condition_block(&self, header: u64, body: &HashSet<u64>) -> Option<u64> {
+        let mut candidates = body
+            .iter()
+            .copied()
+            .filter(|block| {
+                let succs = self.func.successors(*block);
+                succs.contains(&header) && succs.iter().any(|succ| !body.contains(succ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.len() == 1 {
+            Some(candidates[0])
+        } else {
+            None
         }
     }
 
@@ -1516,7 +1534,7 @@ impl<'a> RegionAnalyzer<'a> {
     /// Build the final region tree from a post-collapse acyclic WorkingGraph
     /// using an iterative reverse-topological-order pass (no recursion).
     fn analyze_post_collapse_iterative(
-        &self,
+        &mut self,
         entry: usize,
         graph: &WorkingGraph,
         topo: &[usize],
@@ -1697,22 +1715,18 @@ impl<'a> RegionAnalyzer<'a> {
                         continue;
                     }
 
-                    for (idx, succ) in succs.iter().enumerate() {
-                        if Some(*succ) == merge {
-                            continue;
-                        }
-                        let case_region = region_map.remove(succ).unwrap_or_else(|| {
-                            graph.node_region(*succ).unwrap_or(Region::Block(
-                                graph.node_entry(*succ).unwrap_or(self.func.entry),
-                            ))
-                        });
-                        cases.push((Some(idx as u64), Box::new(case_region)));
+                    if self.analysis_reason.is_none() {
+                        self.analysis_reason = Some(format!(
+                            "switch-like block 0x{switch_block:x} has multiple successors but no canonical case values"
+                        ));
                     }
-                    Region::Switch {
-                        switch_block,
-                        cases,
-                        default: None,
-                        merge_block: merge.and_then(|id| graph.node_entry(id)),
+                    let mut blocks = graph.node_blocks(node);
+                    blocks.extend(succs.iter().flat_map(|id| graph.node_blocks(*id)));
+                    blocks.sort_unstable();
+                    blocks.dedup();
+                    Region::Irreducible {
+                        entry: graph.node_entry(node).unwrap_or(self.func.entry),
+                        blocks,
                     }
                 }
             };
@@ -2071,6 +2085,14 @@ impl WorkingGraph {
             return Err(());
         }
 
+        let absorbed_terminal_exit_nodes =
+            self.terminal_return_exit_nodes(analyzer, &internal_nodes);
+        let absorbed_terminal_exit_blocks = absorbed_terminal_exit_nodes
+            .iter()
+            .flat_map(|node_id| self.node_blocks(*node_id))
+            .collect::<HashSet<_>>();
+        internal_nodes.extend(absorbed_terminal_exit_nodes);
+
         let mut external_preds = HashSet::new();
         let mut external_succs = HashSet::new();
 
@@ -2091,6 +2113,31 @@ impl WorkingGraph {
             }
         }
 
+        let mut incoming_edge_labels = Vec::new();
+        for pred in &external_preds {
+            let labels = internal_nodes
+                .iter()
+                .filter_map(|internal| self.edge_labels.get(&(*pred, *internal)).copied())
+                .collect::<Vec<_>>();
+            if let Some(first) = labels.first().copied()
+                && labels.iter().all(|label| *label == first)
+            {
+                incoming_edge_labels.push((*pred, first));
+            }
+        }
+        let mut outgoing_edge_labels = Vec::new();
+        for succ in &external_succs {
+            let labels = internal_nodes
+                .iter()
+                .filter_map(|internal| self.edge_labels.get(&(*internal, *succ)).copied())
+                .collect::<Vec<_>>();
+            if let Some(first) = labels.first().copied()
+                && labels.iter().all(|label| *label == first)
+            {
+                outgoing_edge_labels.push((*succ, first));
+            }
+        }
+
         // Classify edges leaving the loop body.
         //
         // - Continue: back-edge to this loop's header (from non-header block)
@@ -2107,6 +2154,16 @@ impl WorkingGraph {
                 }
                 // Internal edge
                 if body.contains(&succ) {
+                    continue;
+                }
+                if absorbed_terminal_exit_blocks.contains(&succ) {
+                    if analyzer
+                        .loop_exits
+                        .get(block)
+                        .is_some_and(|existing| *existing == succ)
+                    {
+                        analyzer.loop_exits.remove(block);
+                    }
                     continue;
                 }
                 // Already recorded as exit with same target — skip
@@ -2136,7 +2193,12 @@ impl WorkingGraph {
             }
         }
 
-        let loop_region = self.make_loop_region(analyzer, loop_info, &internal_nodes);
+        let loop_region = self.make_loop_region(
+            analyzer,
+            loop_info,
+            &internal_nodes,
+            &absorbed_terminal_exit_blocks,
+        );
         let mut collapsed_blocks = BTreeSet::new();
         for node_id in &internal_nodes {
             if let Some(node) = self.nodes.get(node_id) {
@@ -2144,8 +2206,15 @@ impl WorkingGraph {
             }
         }
 
-        let new_id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        let next_available = self
+            .nodes
+            .keys()
+            .copied()
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0);
+        let new_id = self.next_id.max(next_available);
+        self.next_id = new_id.saturating_add(1);
         self.nodes.insert(
             new_id,
             WorkingNode {
@@ -2172,11 +2241,11 @@ impl WorkingGraph {
 
         self.edge_labels
             .retain(|(from, to), _| !internal_nodes.contains(from) && !internal_nodes.contains(to));
-        for pred in &external_preds {
-            self.edge_labels.remove(&(*pred, new_id));
+        for (pred, label) in incoming_edge_labels {
+            self.edge_labels.insert((pred, new_id), label);
         }
-        for succ in &external_succs {
-            self.edge_labels.remove(&(new_id, *succ));
+        for (succ, label) in outgoing_edge_labels {
+            self.edge_labels.insert((new_id, succ), label);
         }
 
         for node_id in &internal_nodes {
@@ -2220,20 +2289,95 @@ impl WorkingGraph {
         false
     }
 
-    fn make_loop_region(
+    fn terminal_return_exit_nodes(
         &self,
         analyzer: &RegionAnalyzer<'_>,
+        internal_nodes: &HashSet<usize>,
+    ) -> HashSet<usize> {
+        let mut out = HashSet::new();
+        for node in internal_nodes {
+            for succ in self.sorted_succs(*node) {
+                if internal_nodes.contains(&succ) || out.contains(&succ) {
+                    continue;
+                }
+                if let Some(chain) = self.terminal_return_exit_chain(analyzer, succ, internal_nodes)
+                {
+                    out.extend(chain);
+                }
+            }
+        }
+        out
+    }
+
+    fn terminal_return_exit_chain(
+        &self,
+        analyzer: &RegionAnalyzer<'_>,
+        start: usize,
+        internal_nodes: &HashSet<usize>,
+    ) -> Option<HashSet<usize>> {
+        let mut chain = HashSet::new();
+        let mut current = start;
+
+        loop {
+            if internal_nodes.contains(&current) || !self.nodes.contains_key(&current) {
+                return None;
+            }
+            if !self.preds.get(&current).is_some_and(|preds| {
+                preds
+                    .iter()
+                    .all(|pred| internal_nodes.contains(pred) || chain.contains(pred))
+            }) {
+                return None;
+            }
+            if !chain.insert(current) {
+                return None;
+            }
+            if self.node_is_terminal_return(analyzer, current) {
+                return Some(chain);
+            }
+
+            let succs = self.sorted_succs(current);
+            if succs.len() != 1 {
+                return None;
+            }
+            current = succs[0];
+        }
+    }
+
+    fn node_is_terminal_return(&self, analyzer: &RegionAnalyzer<'_>, node: usize) -> bool {
+        let Some(node_data) = self.nodes.get(&node) else {
+            return false;
+        };
+        if !self.sorted_succs(node).is_empty() || node_data.blocks.len() != 1 {
+            return false;
+        }
+        let Some(block) = node_data.blocks.iter().next().copied() else {
+            return false;
+        };
+        analyzer
+            .func
+            .cfg()
+            .get_block(block)
+            .is_some_and(|cfg_block| matches!(cfg_block.terminator, BlockTerminator::Return))
+    }
+
+    fn make_loop_region(
+        &self,
+        analyzer: &mut RegionAnalyzer<'_>,
         loop_info: &LoopInfo,
         internal_nodes: &HashSet<usize>,
+        absorbed_terminal_exit_blocks: &HashSet<u64>,
     ) -> Region {
         let header = loop_info.header;
         let body = &loop_info.body;
+        let mut region_body = body.clone();
+        region_body.extend(absorbed_terminal_exit_blocks.iter().copied());
         let succs = analyzer.func.successors(header);
         let is_while = succs.len() == 2 && succs.iter().any(|s| !body.contains(s));
 
         if is_while {
             let body_entry = succs.iter().find(|s| body.contains(s)).copied();
-            let mut body_blocks = body.clone();
+            let mut body_blocks = region_body.clone();
             body_blocks.remove(&header);
             let loop_body =
                 self.make_loop_body_region(analyzer, internal_nodes, &body_blocks, body_entry);
@@ -2244,7 +2388,7 @@ impl WorkingGraph {
         }
 
         if let Some((guard_block, body_entry)) = analyzer.find_precheck_guard(header, body) {
-            let mut body_blocks = body.clone();
+            let mut body_blocks = region_body.clone();
             body_blocks.remove(&guard_block);
             if header != guard_block && analyzer.func.successors(header).len() == 1 {
                 body_blocks.remove(&header);
@@ -2261,16 +2405,20 @@ impl WorkingGraph {
             };
         }
 
-        let loop_body = self.make_loop_body_region(analyzer, internal_nodes, body, Some(header));
+        let cond_block = analyzer
+            .unique_loop_latch_condition_block(header, body)
+            .unwrap_or(header);
+        let loop_body =
+            self.make_loop_body_region(analyzer, internal_nodes, &region_body, Some(header));
         Region::DoWhileLoop {
             body: Box::new(loop_body),
-            cond_block: header,
+            cond_block,
         }
     }
 
     fn make_loop_body_region(
         &self,
-        analyzer: &RegionAnalyzer<'_>,
+        analyzer: &mut RegionAnalyzer<'_>,
         internal_nodes: &HashSet<usize>,
         body_blocks: &HashSet<u64>,
         start_block: Option<u64>,
@@ -2407,6 +2555,8 @@ impl WorkingGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fold::FoldingContext;
+    use crate::structure::ControlFlowStructurer;
     use r2il::{R2ILBlock, R2ILOp, Varnode};
     use r2ssa::{BlockTerminator, SSAFunction};
 
@@ -2530,7 +2680,7 @@ mod tests {
     #[test]
     fn iterative_composition_uses_working_graph_edge_polarity() {
         let func = build_diamond_cfg_with_reversed_address_order();
-        let analyzer = RegionAnalyzer::new(&func);
+        let mut analyzer = RegionAnalyzer::new(&func);
         let graph = WorkingGraph::from_function(&func);
 
         let entry_node = graph
@@ -2581,6 +2731,465 @@ mod tests {
             else_region.as_ref().map(|r| r.entry()),
             Some(0x1004),
             "else branch should be false-target"
+        );
+    }
+
+    fn build_latch_condition_loop_cfg() -> SSAFunction {
+        let mut header = R2ILBlock::new(0x1010, 4);
+        header.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1020, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x1020, 4);
+        latch.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x200, 1),
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x1030, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let mut func =
+            SSAFunction::from_blocks_raw_no_arch(&[header, latch, exit]).expect("ssa function");
+        func.cfg_mut()
+            .set_terminator(0x1010, BlockTerminator::Branch { target: 0x1020 });
+        func.cfg_mut().set_terminator(
+            0x1020,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1010,
+                false_target: 0x1030,
+            },
+        );
+        func.refresh_after_cfg_mutation();
+        func
+    }
+
+    fn build_guarded_latch_condition_loop_cfg() -> SSAFunction {
+        let mut entry = R2ILBlock::new(0x1000, 0x10);
+        entry.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x200, 1),
+            target: Varnode::constant(0x1040, 8),
+        });
+
+        let mut preheader = R2ILBlock::new(0x1010, 0x10);
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1020, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x1020, 0x10);
+        header.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1030, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x1030, 0x10);
+        latch.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x206, 1),
+            target: Varnode::constant(0x1020, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x1040, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let mut func =
+            SSAFunction::from_blocks_raw_no_arch(&[entry, preheader, header, latch, exit])
+                .expect("ssa function");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1040,
+                false_target: 0x1010,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1010, BlockTerminator::Branch { target: 0x1020 });
+        func.cfg_mut()
+            .set_terminator(0x1020, BlockTerminator::Branch { target: 0x1030 });
+        func.cfg_mut().set_terminator(
+            0x1030,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1020,
+                false_target: 0x1040,
+            },
+        );
+        func.refresh_after_cfg_mutation();
+        func
+    }
+
+    fn build_table_walk_like_cfg() -> SSAFunction {
+        let addrs = [
+            0x401490, 0x401499, 0x40149e, 0x4014a0, 0x4014a9, 0x4014b9, 0x4014c6, 0x4014cf,
+            0x4014d2, 0x4014d8, 0x4014de, 0x4014e7, 0x4014ef, 0x4014f4, 0x4014fa, 0x401500,
+            0x401505, 0x401508, 0x40150e, 0x401510,
+        ];
+        let blocks = addrs
+            .into_iter()
+            .map(|addr| {
+                let mut block = R2ILBlock::new(addr, 4);
+                block.push(R2ILOp::Nop);
+                block
+            })
+            .collect::<Vec<_>>();
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+
+        func.cfg_mut().set_terminator(
+            0x401490,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x401510,
+                false_target: 0x401499,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x401499, BlockTerminator::Branch { target: 0x4014a9 });
+        func.cfg_mut()
+            .set_terminator(0x40149e, BlockTerminator::Branch { target: 0x4014a0 });
+        func.cfg_mut().set_terminator(
+            0x4014a0,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014cf,
+                false_target: 0x4014a9,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x4014a9,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014a0,
+                false_target: 0x4014b9,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x4014b9,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014e7,
+                false_target: 0x4014c6,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x4014c6,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014a9,
+                false_target: 0x4014cf,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x4014cf, BlockTerminator::Return);
+        func.cfg_mut()
+            .set_terminator(0x4014d2, BlockTerminator::Branch { target: 0x4014d8 });
+        func.cfg_mut().set_terminator(
+            0x4014d8,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x401500,
+                false_target: 0x4014de,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x4014de,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x401508,
+                false_target: 0x4014e7,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x4014e7,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014d8,
+                false_target: 0x4014ef,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x4014ef,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014a0,
+                false_target: 0x4014f4,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x4014f4, BlockTerminator::Return);
+        func.cfg_mut()
+            .set_terminator(0x4014fa, BlockTerminator::Branch { target: 0x401500 });
+        func.cfg_mut().set_terminator(
+            0x401500,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014a0,
+                false_target: 0x401505,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x401505, BlockTerminator::Branch { target: 0x401508 });
+        func.cfg_mut().set_terminator(
+            0x401508,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x4014a0,
+                false_target: 0x40150e,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x40150e, BlockTerminator::Branch { target: 0x4014f4 });
+        func.cfg_mut()
+            .set_terminator(0x401510, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+        func
+    }
+
+    fn region_contains_dowhile_cond(region: &Region, expected: u64) -> bool {
+        match region {
+            Region::DoWhileLoop { body, cond_block } => {
+                *cond_block == expected || region_contains_dowhile_cond(body, expected)
+            }
+            Region::WhileLoop { body, .. } => region_contains_dowhile_cond(body, expected),
+            Region::Sequence(regions) => regions
+                .iter()
+                .any(|region| region_contains_dowhile_cond(region, expected)),
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                region_contains_dowhile_cond(then_region, expected)
+                    || else_region
+                        .as_deref()
+                        .is_some_and(|region| region_contains_dowhile_cond(region, expected))
+            }
+            Region::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|(_, region)| region_contains_dowhile_cond(region, expected))
+                    || default
+                        .as_deref()
+                        .is_some_and(|region| region_contains_dowhile_cond(region, expected))
+            }
+            Region::Block(_) | Region::Irreducible { .. } => false,
+        }
+    }
+
+    fn region_contains_loop_entry(region: &Region, expected: u64) -> bool {
+        match region {
+            Region::DoWhileLoop { body, .. } => {
+                body.entry() == expected || region_contains_loop_entry(body, expected)
+            }
+            Region::WhileLoop { header, body } => {
+                *header == expected || region_contains_loop_entry(body, expected)
+            }
+            Region::Sequence(regions) => regions
+                .iter()
+                .any(|region| region_contains_loop_entry(region, expected)),
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                region_contains_loop_entry(then_region, expected)
+                    || else_region
+                        .as_deref()
+                        .is_some_and(|region| region_contains_loop_entry(region, expected))
+            }
+            Region::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|(_, region)| region_contains_loop_entry(region, expected))
+                    || default
+                        .as_deref()
+                        .is_some_and(|region| region_contains_loop_entry(region, expected))
+            }
+            Region::Block(_) | Region::Irreducible { .. } => false,
+        }
+    }
+
+    fn region_contains_irreducible_entry(region: &Region, expected: u64) -> bool {
+        match region {
+            Region::Irreducible { entry, .. } => *entry == expected,
+            Region::WhileLoop { body, .. } | Region::DoWhileLoop { body, .. } => {
+                region_contains_irreducible_entry(body, expected)
+            }
+            Region::Sequence(regions) => regions
+                .iter()
+                .any(|region| region_contains_irreducible_entry(region, expected)),
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                region_contains_irreducible_entry(then_region, expected)
+                    || else_region
+                        .as_deref()
+                        .is_some_and(|region| region_contains_irreducible_entry(region, expected))
+            }
+            Region::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|(_, region)| region_contains_irreducible_entry(region, expected))
+                    || default
+                        .as_deref()
+                        .is_some_and(|region| region_contains_irreducible_entry(region, expected))
+            }
+            Region::Block(_) => false,
+        }
+    }
+
+    #[test]
+    fn iterative_loop_region_uses_unique_latch_condition_block() {
+        let func = build_latch_condition_loop_cfg();
+        let mut analyzer = RegionAnalyzer::new(&func);
+
+        let region = analyzer.analyze();
+        let Region::DoWhileLoop { cond_block, .. } = region else {
+            panic!("expected latch-conditioned loop, got {region:?}");
+        };
+
+        assert_eq!(cond_block, 0x1020);
+    }
+
+    #[test]
+    fn iterative_guarded_loop_preserves_latch_condition_region() {
+        let func = build_guarded_latch_condition_loop_cfg();
+        assert_eq!(func.successors(0x1000), vec![0x1040, 0x1010]);
+        assert_eq!(func.successors(0x1010), vec![0x1020]);
+        assert_eq!(func.successors(0x1020), vec![0x1030]);
+        assert_eq!(func.successors(0x1030), vec![0x1020, 0x1040]);
+        let mut analyzer = RegionAnalyzer::new(&func);
+
+        let region = analyzer.analyze();
+        assert!(
+            matches!(
+                region,
+                Region::IfThenElse { .. } | Region::Sequence(_) | Region::DoWhileLoop { .. }
+            ),
+            "region should stay structured enough to inspect, got {region:?}"
+        );
+        assert!(
+            region.blocks().contains(&0x1030),
+            "latch block must stay in the structured region, got {region:?}; loops={:?}",
+            analyzer.loops
+        );
+        assert!(
+            region_contains_dowhile_cond(&region, 0x1030),
+            "loop condition should be anchored at latch 0x1030, got {region:?}"
+        );
+    }
+
+    #[test]
+    fn table_walk_like_cfg_recovers_dominator_backed_loop_regions() {
+        let func = build_table_walk_like_cfg();
+        let mut analyzer = RegionAnalyzer::new(&func);
+
+        let outer = analyzer
+            .get_loop_body(0x4014a9)
+            .expect("outer table loop should be recognized from dominance");
+        assert!(outer.contains(&0x4014a0));
+        assert!(outer.contains(&0x4014c6));
+
+        let inner = analyzer
+            .get_loop_body(0x4014e7)
+            .expect("inner string loop should be recognized from dominance");
+        assert!(inner.contains(&0x4014d8));
+        assert!(inner.contains(&0x4014de));
+
+        let mut recursive_analyzer = RegionAnalyzer::new(&func);
+        let direct = recursive_analyzer.analyze_region_recursive(0x4014a9);
+        assert!(
+            matches!(
+                direct,
+                Region::WhileLoop { .. } | Region::DoWhileLoop { .. }
+            ),
+            "direct loop analysis should recover the table loop, got {direct:?}"
+        );
+
+        let region = analyzer.analyze();
+        assert!(
+            !region_contains_irreducible_entry(&region, 0x4014a9),
+            "table-walk loop header must not degrade to an irreducible island: {region:?}; loops={:?}; reason={:?}",
+            analyzer.loops,
+            analyzer.analysis_reason()
+        );
+        assert!(
+            region_contains_loop_entry(&region, 0x4014a9),
+            "outer table-walk natural loop must survive in the region tree: {region:?}"
+        );
+        assert!(
+            region_contains_loop_entry(&region, 0x4014e7),
+            "inner string-match natural loop must survive in the region tree: {region:?}"
+        );
+
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let _ = structurer.structure();
+        let proof_anchors = structurer
+            .control_render_proofs()
+            .iter()
+            .map(|proof| proof.anchor)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            proof_anchors.contains(&0x4014a9),
+            "outer natural loop needs a render proof, got {proof_anchors:x?}"
+        );
+        assert!(
+            proof_anchors.contains(&0x4014e7),
+            "inner natural loop needs a render proof, got {proof_anchors:x?}"
+        );
+    }
+
+    #[test]
+    fn iterative_composition_refuses_unknown_multiway_cases_instead_of_numbering_them() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Nop);
+        entry.set_switch_info(r2il::SwitchInfo {
+            switch_addr: 0x1000,
+            min_val: 10,
+            max_val: 30,
+            default_target: None,
+            cases: vec![
+                r2il::SwitchCase {
+                    value: 10,
+                    target: 0x1010,
+                },
+                r2il::SwitchCase {
+                    value: 20,
+                    target: 0x1020,
+                },
+                r2il::SwitchCase {
+                    value: 30,
+                    target: 0x1030,
+                },
+            ],
+        });
+        let mut case0 = R2ILBlock::new(0x1010, 4);
+        case0.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+        let mut case1 = R2ILBlock::new(0x1020, 4);
+        case1.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+        let mut case2 = R2ILBlock::new(0x1030, 4);
+        case2.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[entry, case0, case1, case2])
+            .expect("ssa function");
+        let graph = WorkingGraph::from_function(&func);
+        func.cfg_mut().set_terminator(0x1000, BlockTerminator::None);
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let entry_node = graph.node_for_block(0x1000).expect("entry node");
+        assert_eq!(graph.sorted_succs(entry_node).len(), 3);
+        let topo = graph.topological_order().expect("manual graph is acyclic");
+
+        let region = analyzer.analyze_post_collapse_iterative(entry_node, &graph, &topo);
+
+        let Region::Irreducible { entry, blocks } = region else {
+            panic!("unknown multiway control must residualize instead of rendering a fake switch");
+        };
+        assert_eq!(entry, 0x1000);
+        assert_eq!(blocks, vec![0x1000, 0x1010, 0x1020, 0x1030]);
+        assert!(
+            analyzer
+                .analysis_reason()
+                .is_some_and(|reason| reason.contains("no canonical case values")),
+            "unknown multiway residual should keep an explicit analysis reason"
         );
     }
 

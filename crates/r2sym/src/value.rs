@@ -978,6 +978,25 @@ impl<'ctx> SymValue<'ctx> {
         }
     }
 
+    /// Logical boolean NOT: returns 1 when this value is zero, otherwise 0.
+    pub fn bool_not(&self, ctx: &'ctx Context) -> Self {
+        let taint = self.get_taint();
+        match self.as_concrete() {
+            Some(value) => Self::Concrete {
+                value: if value == 0 { 1 } else { 0 },
+                bits: 1,
+                taint,
+            },
+            None => {
+                let bv = self.to_bv(ctx);
+                let zero_check = bv.eq(BV::from_u64(0, Self::normalize_bv_bits(self.bits())));
+                let one = BV::from_u64(1, 1);
+                let zero = BV::from_u64(0, 1);
+                Self::symbolic_tainted(zero_check.ite(&one, &zero), 1, taint)
+            }
+        }
+    }
+
     // ==================== Shift Operations ====================
 
     /// Logical left shift.
@@ -1245,6 +1264,7 @@ impl<'ctx> fmt::Display for SymValue<'ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use z3::{SatResult, Solver};
 
     #[test]
     fn test_concrete_ops() {
@@ -1375,6 +1395,25 @@ mod tests {
         assert_eq!(sym.ule(&ctx, &sym).as_concrete(), Some(1));
         assert_eq!(sym.slt(&ctx, &sym).as_concrete(), Some(0));
         assert_eq!(sym.sle(&ctx, &sym).as_concrete(), Some(1));
+    }
+
+    #[test]
+    fn bool_not_is_logical_for_symbolic_byte_flags() {
+        let ctx = Context::thread_local();
+
+        let flag = SymValue::new_symbolic(&ctx, "flag", 8);
+        let negated = flag.bool_not(&ctx);
+
+        assert_eq!(negated.bits(), 1);
+
+        let flag_bv = flag.to_bv(&ctx);
+        let negated_bv = negated.to_bv(&ctx);
+        for (input, expected) in [(0, 1), (1, 0), (0xff, 0)] {
+            let solver = Solver::new();
+            solver.assert(flag_bv.eq(BV::from_u64(input, 8)));
+            solver.assert(negated_bv.eq(BV::from_u64(expected, 1)).not());
+            assert_eq!(solver.check(), SatResult::Unsat);
+        }
     }
 
     #[test]

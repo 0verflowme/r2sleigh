@@ -1,30 +1,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use r2ssa::{
-    FunctionSemanticSummary, InterprocFunctionId, SSAOp, SSAVar, SsaArtifact,
-    SummaryAllocationEffect, SummaryAtomicEffect, SummaryLifetimeEffect, SummaryLifetimeOp,
-    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange,
-    SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect, SummaryTransferEffect,
-    SummaryTransferLength,
+    FunctionSemanticSummary, InterprocFunctionId, SSAOp, SSAVar, SsaArtifact, StackAddressRoot,
+    SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryLifetimeEffect,
+    SummaryLifetimeOp, SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation,
+    SummaryMemoryRange, SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect,
+    SummarySyncOp, SummaryTransferEffect, SummaryTransferLength,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::semantics::{
     NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary, NativeParserKind,
-    NativeParserSummary, NativeReductionSummary, NativeRegionSummary, NativeWorkerFold,
-    NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerPredicate,
+    NativeParserReturnPredicate, NativeParserReturnPredicateKind, NativeParserSummary,
+    NativeReductionSummary, NativeRegionSummary, NativeTableWalkSummary, NativeWorkerByteTransform,
+    NativeWorkerFold, NativeWorkerFoldOperation, NativeWorkerLoopSummary, NativeWorkerPredicate,
     NativeWorkerRoleIdentity, NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryKind,
-    NativeWorkerTerminator, ResidualReason, SemanticEvidence, SemanticEvidenceAmbiguity,
-    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+    NativeWorkerTerminator, ResidualReason, SemanticClaimSource, SemanticEvidence,
+    SemanticEvidenceAmbiguity, SemanticEvidenceCoverage, SemanticEvidenceProvenance,
+    SemanticEvidenceReason, SummaryRouteCertificate, SummaryRouteCertificateKind,
 };
 
 mod hash;
 
 use self::hash::{
-    hash_context_read_worker_summaries, hash_fold_family_worker_summaries, hash_fold_summary,
-    hash_fold_summary_for_island, hash_statistics_worker_summaries,
-    hash_table_family_worker_summaries, hash_table_worker_summaries, is_hash_context_read_name,
-    is_hash_fold_family_name, is_hash_table_family_name, named_hash_fold_worker_summary,
+    hash_fold_summary, hash_fold_summary_for_island, hash_statistics_worker_summaries,
+    hash_table_family_worker_summaries, hash_table_worker_summaries, is_hash_table_family_name,
 };
 
 pub(super) const NATIVE_WORKER_SUMMARY_MAX: usize = 32;
@@ -94,6 +94,8 @@ pub enum NativeWorkerSummaryApplicabilitySource {
 pub struct NativeWorkerSummaryApplicability {
     pub normalized_name: Option<String>,
     pub worker_kinds: BTreeSet<NativeWorkerSummaryKind>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub route_evidence_kinds: BTreeSet<NativeWorkerSummaryKind>,
     pub sources: BTreeSet<NativeWorkerSummaryApplicabilitySource>,
     pub evidence: SemanticEvidence,
 }
@@ -103,6 +105,7 @@ impl NativeWorkerSummaryApplicability {
         Self {
             normalized_name,
             worker_kinds: BTreeSet::new(),
+            route_evidence_kinds: BTreeSet::new(),
             sources: BTreeSet::new(),
             evidence: SemanticEvidence::residual(SemanticEvidenceReason::ResidualSearchRequired),
         }
@@ -143,16 +146,31 @@ pub struct NativeWorkerSummaryRoutePolicy {
     pub kind: NativeWorkerSummaryRouteKind,
     pub applicability: NativeWorkerSummaryApplicability,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<SummaryRouteCertificate>,
 }
 
 impl NativeWorkerSummaryRoutePolicy {
     pub fn should_use_direct_summary(&self) -> bool {
         self.kind == NativeWorkerSummaryRouteKind::DirectSummary
-            && self.applicability.is_supported()
+            && self.has_certificate_for_kind(NativeWorkerSummaryRouteKind::DirectSummary)
     }
 
     pub fn should_prefer_full(&self) -> bool {
         self.kind == NativeWorkerSummaryRouteKind::PreferFull
+            && self.has_certificate_for_kind(NativeWorkerSummaryRouteKind::PreferFull)
+    }
+
+    pub fn has_route_certificate(&self) -> bool {
+        self.has_certificate_for_kind(self.kind)
+    }
+
+    fn has_certificate_for_kind(&self, kind: NativeWorkerSummaryRouteKind) -> bool {
+        self.certificate.as_ref().is_some_and(|certificate| {
+            certificate.route_kind == summary_route_certificate_kind(kind)
+                && !matches!(certificate.source, SemanticClaimSource::NameHint)
+                && certificate.evidence.is_usable()
+        })
     }
 }
 
@@ -207,6 +225,18 @@ struct LoadedSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct BytePredicateValue {
+    source: LoadedSource,
+    predicate: NativeWorkerPredicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZeroComparisonValue {
+    value: SSAVar,
+    branch_when_zero: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RegisterAliasSpec {
     family: String,
     offset_bits: u32,
@@ -231,10 +261,14 @@ impl<T> DataflowValue<T> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WorkerDataflowState {
     roots: BTreeMap<SSAVar, DataflowValue<SummaryMemoryRegion>>,
+    locations: BTreeMap<SSAVar, DataflowValue<SummaryMemoryLocation>>,
     load_sources: BTreeMap<SSAVar, DataflowValue<LoadedSource>>,
     load_source_aliases: LoadSourceAliasIndex,
     load_source_alias_members: BTreeMap<String, BTreeSet<SSAVar>>,
     control_sources: BTreeMap<SSAVar, DataflowValue<BTreeSet<usize>>>,
+    byte_predicates: BTreeMap<SSAVar, DataflowValue<BytePredicateValue>>,
+    zero_comparisons: BTreeMap<SSAVar, DataflowValue<ZeroComparisonValue>>,
+    stack_values: BTreeMap<StackAddressRoot, DataflowValue<SummaryMemoryRegion>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -264,6 +298,13 @@ struct GlobalLoadObservation {
     source: LoadedSource,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryWriteObservation {
+    anchor: u64,
+    location: SummaryMemoryLocation,
+    width: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OptionStringReadObservation {
     anchor: u64,
@@ -288,6 +329,29 @@ struct NumericTransformObservation {
     operation: NativeWorkerFoldOperation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BytePredicateObservation {
+    anchor: u64,
+    source: LoadedSource,
+    predicate: NativeWorkerPredicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZeroGuardObservation {
+    anchor: u64,
+    target: Option<u64>,
+    value: SSAVar,
+    branch_when_zero: bool,
+    source: Option<LoadedSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReturnObservation {
+    anchor: u64,
+    field_plus_count: Option<(LoadedSource, String)>,
+    negative_count_return: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ParserLoopEvidence {
     anchor: u64,
@@ -301,10 +365,14 @@ struct BlockWorkerObservations {
     scans: Vec<ScanObservation>,
     folds: Vec<FoldObservation>,
     global_loads: Vec<GlobalLoadObservation>,
+    memory_writes: Vec<MemoryWriteObservation>,
     option_string_reads: Vec<OptionStringReadObservation>,
     option_string_writes: Vec<OptionStringWriteObservation>,
     option_string_branch_controls: BTreeSet<usize>,
     numeric_transforms: Vec<NumericTransformObservation>,
+    byte_predicates: Vec<BytePredicateObservation>,
+    zero_guards: Vec<ZeroGuardObservation>,
+    returns: Vec<ReturnObservation>,
     parser_comparisons: BTreeMap<usize, ParserLoopEvidence>,
 }
 
@@ -315,7 +383,10 @@ struct LoopEffectSummary {
     scans: Vec<ScanObservation>,
     folds: Vec<FoldObservation>,
     global_loads: Vec<GlobalLoadObservation>,
+    memory_writes: Vec<MemoryWriteObservation>,
     numeric_transforms: Vec<NumericTransformObservation>,
+    byte_predicates: Vec<BytePredicateObservation>,
+    zero_guards: Vec<ZeroGuardObservation>,
     parser_comparisons: BTreeMap<usize, ParserLoopEvidence>,
 }
 
@@ -409,6 +480,11 @@ fn applicability_from_worker_summaries(
         .iter()
         .map(|worker| worker.kind)
         .collect::<BTreeSet<_>>();
+    let route_evidence_kinds = worker_summaries
+        .iter()
+        .filter(|worker| worker.is_primary_non_name_summary())
+        .map(|worker| worker.kind)
+        .collect::<BTreeSet<_>>();
     let sources = applicability_sources_from_summary(summary, worker_summaries);
     let evidence = worker_summaries
         .iter()
@@ -418,6 +494,7 @@ fn applicability_from_worker_summaries(
     NativeWorkerSummaryApplicability {
         normalized_name,
         worker_kinds,
+        route_evidence_kinds,
         sources,
         evidence,
     }
@@ -432,6 +509,197 @@ pub fn native_worker_summary_applicability_for_summary(
     applicability_from_worker_summaries(summary, &worker_summaries)
 }
 
+pub fn function_semantic_summary_seed_for_name(
+    id: InterprocFunctionId,
+    name: &str,
+) -> Option<FunctionSemanticSummary> {
+    let normalized = normalize_semantic_summary_seed_name(name)?;
+    let mut arg_effects = BTreeMap::new();
+    let mut effect = |idx: usize, read: bool, write: bool, escape: bool, free: bool| {
+        arg_effects.insert(
+            idx,
+            SummaryArgEffect {
+                read,
+                write,
+                escape,
+                free,
+            },
+        );
+    };
+    let mut memory_effects = Vec::new();
+    let mut transfer_effects = Vec::new();
+    let mut allocation_effects = Vec::new();
+    let mut lifetime_effects = Vec::new();
+    let mut sync_effects = Vec::new();
+    let atomic_effects = Vec::new();
+
+    let return_relation = match normalized {
+        "malloc" => {
+            effect(0, true, false, false, false);
+            allocation_effects.push(SummaryAllocationEffect {
+                size_arg: Some(0),
+                zeroed: false,
+            });
+            SummaryReturnRelation::HeapAlloc
+        }
+        "calloc" => {
+            effect(0, true, false, false, false);
+            effect(1, true, false, false, false);
+            allocation_effects.push(SummaryAllocationEffect {
+                size_arg: Some(1),
+                zeroed: true,
+            });
+            SummaryReturnRelation::HeapAlloc
+        }
+        "free" => {
+            effect(0, false, false, true, true);
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Free,
+                location: arg_location(0),
+            });
+            lifetime_effects.push(SummaryLifetimeEffect {
+                arg: 0,
+                op: SummaryLifetimeOp::Free,
+            });
+            SummaryReturnRelation::Void
+        }
+        "memcpy" | "memmove" => {
+            effect(0, false, true, true, false);
+            effect(1, true, false, false, false);
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Write,
+                location: arg_location(0),
+            });
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: arg_location(1),
+            });
+            transfer_effects.push(SummaryTransferEffect {
+                dst: arg_location(0),
+                src: arg_location(1),
+                len: SummaryTransferLength::Arg(2),
+            });
+            SummaryReturnRelation::Arg(0)
+        }
+        "copyin" | "copyout" => {
+            effect(0, true, false, false, false);
+            effect(1, false, true, true, false);
+            effect(2, true, false, false, false);
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: arg_location(0),
+            });
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Write,
+                location: arg_location(1),
+            });
+            transfer_effects.push(SummaryTransferEffect {
+                dst: arg_location(1),
+                src: arg_location(0),
+                len: SummaryTransferLength::Arg(2),
+            });
+            SummaryReturnRelation::Unknown
+        }
+        "memset" => {
+            effect(0, false, true, true, false);
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Write,
+                location: arg_location(0),
+            });
+            SummaryReturnRelation::Arg(0)
+        }
+        "strlen" => {
+            effect(0, true, false, false, false);
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: arg_location(0),
+            });
+            SummaryReturnRelation::Unknown
+        }
+        "strcmp" | "memcmp" => {
+            effect(0, true, false, false, false);
+            effect(1, true, false, false, false);
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: arg_location(0),
+            });
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: arg_location(1),
+            });
+            SummaryReturnRelation::Unknown
+        }
+        "puts" | "printf" => {
+            effect(0, true, false, false, false);
+            memory_effects.push(SummaryMemoryEffect {
+                kind: SummaryMemoryEffectKind::Read,
+                location: arg_location(0),
+            });
+            SummaryReturnRelation::Unknown
+        }
+        "retain" => {
+            effect(0, true, false, true, false);
+            lifetime_effects.push(SummaryLifetimeEffect {
+                arg: 0,
+                op: SummaryLifetimeOp::Retain,
+            });
+            SummaryReturnRelation::Arg(0)
+        }
+        "release" => {
+            effect(0, false, false, true, false);
+            lifetime_effects.push(SummaryLifetimeEffect {
+                arg: 0,
+                op: SummaryLifetimeOp::Release,
+            });
+            SummaryReturnRelation::Void
+        }
+        "lock" => {
+            effect(0, false, false, true, false);
+            sync_effects.push(SummarySyncEffect {
+                arg: 0,
+                op: SummarySyncOp::Lock,
+            });
+            SummaryReturnRelation::Void
+        }
+        "unlock" => {
+            effect(0, false, false, true, false);
+            sync_effects.push(SummarySyncEffect {
+                arg: 0,
+                op: SummarySyncOp::Unlock,
+            });
+            SummaryReturnRelation::Void
+        }
+        "exit" => SummaryReturnRelation::Void,
+        _ => return None,
+    };
+
+    Some(FunctionSemanticSummary {
+        id,
+        name: Some(normalized.to_string()),
+        arg_count_hint: Some(match normalized {
+            "malloc" | "free" | "strlen" | "puts" | "printf" | "exit" | "retain" | "release"
+            | "lock" | "unlock" => 1,
+            "calloc" | "strcmp" | "memcmp" => 2,
+            "memcpy" | "memmove" | "copyin" | "copyout" | "memset" => 3,
+            _ => 0,
+        }),
+        direct_callees: BTreeSet::new(),
+        callsite_count: 0,
+        has_unknown_calls: false,
+        arg_effects,
+        memory_effects,
+        transfer_effects,
+        allocation_effects,
+        lifetime_effects,
+        sync_effects,
+        atomic_effects,
+        return_relation,
+        reads_global_memory: false,
+        writes_global_memory: false,
+        touches_unknown_memory: false,
+    })
+}
+
 pub fn native_worker_summary_applicability_for_name(
     function_addr: u64,
     name: &str,
@@ -440,7 +708,7 @@ pub fn native_worker_summary_applicability_for_name(
         return NativeWorkerSummaryApplicability::unsupported(None);
     };
     let summary =
-        FunctionSemanticSummary::seed_for_name(InterprocFunctionId(function_addr), &normalized)
+        function_semantic_summary_seed_for_name(InterprocFunctionId(function_addr), &normalized)
             .unwrap_or_else(|| {
                 FunctionSemanticSummary::unknown(
                     InterprocFunctionId(function_addr),
@@ -454,40 +722,295 @@ pub fn native_worker_summary_route_policy_for_name(
     function_addr: u64,
     name: &str,
 ) -> NativeWorkerSummaryRoutePolicy {
-    let mut applicability = native_worker_summary_applicability_for_name(function_addr, name);
+    let applicability = native_worker_summary_applicability_for_name(function_addr, name);
     let requested_name = normalize_native_worker_role_name(name);
-    let route_name = requested_name
+    let route_name = requested_name.or_else(|| applicability.normalized_name.clone());
+    native_worker_summary_route_policy_from_applicability(
+        function_addr,
+        route_name.as_deref(),
+        applicability,
+    )
+}
+
+pub fn native_worker_summary_route_policy_for_summary(
+    anchor: u64,
+    summary: &FunctionSemanticSummary,
+) -> NativeWorkerSummaryRoutePolicy {
+    let applicability = native_worker_summary_applicability_for_summary(anchor, summary);
+    let route_name = summary
+        .name
         .as_deref()
-        .or(applicability.normalized_name.as_deref());
+        .and_then(normalize_native_worker_role_name)
+        .or_else(|| applicability.normalized_name.clone());
+    native_worker_summary_route_policy_from_applicability(
+        anchor,
+        route_name.as_deref(),
+        applicability,
+    )
+}
+
+fn native_worker_summary_route_policy_from_applicability(
+    anchor: u64,
+    route_name: Option<&str>,
+    mut applicability: NativeWorkerSummaryApplicability,
+) -> NativeWorkerSummaryRoutePolicy {
+    if !applicability.has_route_evidence() {
+        return NativeWorkerSummaryRoutePolicy {
+            kind: NativeWorkerSummaryRouteKind::Standard,
+            applicability,
+            reason: None,
+            certificate: None,
+        };
+    }
 
     if let Some(entry) = route_name.and_then(native_worker_summary_route_registry_entry) {
         match entry.kind {
-            NativeWorkerSummaryRouteKind::PreferFull => {
+            NativeWorkerSummaryRouteKind::PreferFull
+                if route_name_has_compatible_evidence(route_name, entry.kind, &applicability) =>
+            {
+                let certificate = summary_route_certificate(
+                    anchor,
+                    entry.kind,
+                    route_name,
+                    &applicability,
+                    entry.reason,
+                );
                 return NativeWorkerSummaryRoutePolicy {
                     kind: entry.kind,
                     applicability,
                     reason: Some(entry.reason.to_string()),
-                };
-            }
-            NativeWorkerSummaryRouteKind::DirectSummary if applicability.has_route_evidence() => {
-                applicability
-                    .sources
-                    .insert(NativeWorkerSummaryApplicabilitySource::TrustedSymbol);
-                return NativeWorkerSummaryRoutePolicy {
-                    kind: entry.kind,
-                    applicability,
-                    reason: Some(entry.reason.to_string()),
+                    certificate: Some(certificate),
                 };
             }
             NativeWorkerSummaryRouteKind::DirectSummary
+                if route_name_has_compatible_evidence(route_name, entry.kind, &applicability) =>
+            {
+                applicability
+                    .sources
+                    .insert(NativeWorkerSummaryApplicabilitySource::TrustedSymbol);
+                let certificate = summary_route_certificate(
+                    anchor,
+                    entry.kind,
+                    route_name,
+                    &applicability,
+                    entry.reason,
+                );
+                return NativeWorkerSummaryRoutePolicy {
+                    kind: entry.kind,
+                    applicability,
+                    reason: Some(entry.reason.to_string()),
+                    certificate: Some(certificate),
+                };
+            }
+            NativeWorkerSummaryRouteKind::PreferFull
+            | NativeWorkerSummaryRouteKind::DirectSummary
             | NativeWorkerSummaryRouteKind::Standard => {}
         }
     }
 
+    if route_name.is_some_and(route_name_requires_compatible_route_evidence)
+        && !route_name_has_compatible_evidence(
+            route_name,
+            NativeWorkerSummaryRouteKind::Standard,
+            &applicability,
+        )
+    {
+        return NativeWorkerSummaryRoutePolicy {
+            kind: NativeWorkerSummaryRouteKind::Standard,
+            applicability,
+            reason: None,
+            certificate: None,
+        };
+    }
+
+    let certificate = summary_route_certificate(
+        anchor,
+        NativeWorkerSummaryRouteKind::Standard,
+        route_name,
+        &applicability,
+        "standard summary route with non-name evidence",
+    );
     NativeWorkerSummaryRoutePolicy {
         kind: NativeWorkerSummaryRouteKind::Standard,
         applicability,
         reason: None,
+        certificate: Some(certificate),
+    }
+}
+
+fn route_name_requires_compatible_route_evidence(name: &str) -> bool {
+    has_native_worker_summary_family(name)
+        || native_worker_summary_route_registry_entry(name).is_some()
+}
+
+fn route_name_has_compatible_evidence(
+    route_name: Option<&str>,
+    route_kind: NativeWorkerSummaryRouteKind,
+    applicability: &NativeWorkerSummaryApplicability,
+) -> bool {
+    let Some(route_name) = route_name else {
+        return !applicability.route_evidence_kinds.is_empty();
+    };
+    if !route_name_requires_compatible_route_evidence(route_name) {
+        return true;
+    }
+    applicability
+        .route_evidence_kinds
+        .iter()
+        .any(|kind| route_name_allows_worker_kind(route_name, route_kind, *kind))
+}
+
+fn route_name_allows_worker_kind(
+    route_name: &str,
+    route_kind: NativeWorkerSummaryRouteKind,
+    worker_kind: NativeWorkerSummaryKind,
+) -> bool {
+    if should_prefer_full_native_worker_summary(route_name) {
+        return matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::DiagnosticWrapper
+                | NativeWorkerSummaryKind::ProgramOrchestrator
+                | NativeWorkerSummaryKind::FormatArgumentFetch
+        );
+    }
+    if is_direct_allocation_wrapper(route_name) || is_xalloc_family_name(route_name) {
+        return matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::Allocation
+                | NativeWorkerSummaryKind::MemoryTransfer
+                | NativeWorkerSummaryKind::StringScan
+                | NativeWorkerSummaryKind::MetadataProbe
+                | NativeWorkerSummaryKind::DiagnosticWrapper
+        );
+    }
+    if is_direct_version_worker(route_name) || is_version_etc_family_name(route_name) {
+        return matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::FormatRender
+                | NativeWorkerSummaryKind::TableWalk
+                | NativeWorkerSummaryKind::OutputStream
+        );
+    }
+    if is_direct_hash_table_worker(route_name) || is_hash_table_family_name(route_name) {
+        return matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::TableWalk
+                | NativeWorkerSummaryKind::MetadataProbe
+                | NativeWorkerSummaryKind::MemoryTransfer
+        );
+    }
+    if is_direct_path_or_fts_worker(route_name)
+        || is_path_family_name(route_name)
+        || is_directory_family_name(route_name)
+    {
+        return matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::PathWalk
+                | NativeWorkerSummaryKind::DirectoryTraversal
+                | NativeWorkerSummaryKind::SortMerge
+                | NativeWorkerSummaryKind::MetadataProbe
+                | NativeWorkerSummaryKind::TableWalk
+        );
+    }
+    if is_direct_regex_worker(route_name) || is_parser_family_name(route_name) {
+        return matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::Parser
+                | NativeWorkerSummaryKind::StringScan
+                | NativeWorkerSummaryKind::TableWalk
+        );
+    }
+    if is_direct_fileinfo_sort_comparator(route_name) {
+        return matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::MetadataProbe
+                | NativeWorkerSummaryKind::SortMerge
+                | NativeWorkerSummaryKind::StringScan
+        );
+    }
+    match route_name {
+        "argmatch" | "argmatch_exact" | "argmatch_valid" | "argmatch_to_argument" => matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::TableWalk
+                | NativeWorkerSummaryKind::StringScan
+                | NativeWorkerSummaryKind::Parser
+        ),
+        "__xargmatch_internal"
+        | "argmatch_invalid"
+        | "error_tail"
+        | "verror"
+        | "verror_at_line"
+        | "print_errno_message"
+        | "usage" => matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::DiagnosticWrapper
+                | NativeWorkerSummaryKind::OutputStream
+                | NativeWorkerSummaryKind::FormatRender
+        ),
+        "umaxtostr" | "imaxtostr" | "parse_field_count" | "posix2_version" | "next_prime" => {
+            matches!(
+                worker_kind,
+                NativeWorkerSummaryKind::NumericTransform | NativeWorkerSummaryKind::Parser
+            )
+        }
+        _ if matches!(route_kind, NativeWorkerSummaryRouteKind::Standard) => !matches!(
+            worker_kind,
+            NativeWorkerSummaryKind::MemoryRead
+                | NativeWorkerSummaryKind::MemoryWrite
+                | NativeWorkerSummaryKind::MemoryEscape
+                | NativeWorkerSummaryKind::Unknown
+        ),
+        _ => false,
+    }
+}
+
+fn summary_route_certificate(
+    anchor: u64,
+    kind: NativeWorkerSummaryRouteKind,
+    route_name: Option<&str>,
+    applicability: &NativeWorkerSummaryApplicability,
+    reason: &str,
+) -> SummaryRouteCertificate {
+    SummaryRouteCertificate::new(
+        anchor,
+        summary_route_certificate_kind(kind),
+        summary_route_claim_source(applicability),
+        route_name
+            .map(str::to_string)
+            .or_else(|| applicability.normalized_name.clone()),
+        applicability.route_evidence_kinds.clone(),
+        applicability.evidence.clone(),
+        reason,
+    )
+}
+
+fn summary_route_certificate_kind(
+    kind: NativeWorkerSummaryRouteKind,
+) -> SummaryRouteCertificateKind {
+    match kind {
+        NativeWorkerSummaryRouteKind::Standard => SummaryRouteCertificateKind::Standard,
+        NativeWorkerSummaryRouteKind::DirectSummary => SummaryRouteCertificateKind::DirectSummary,
+        NativeWorkerSummaryRouteKind::PreferFull => SummaryRouteCertificateKind::PreferFull,
+    }
+}
+
+fn summary_route_claim_source(
+    applicability: &NativeWorkerSummaryApplicability,
+) -> SemanticClaimSource {
+    if applicability.is_name_hint_only() {
+        SemanticClaimSource::NameHint
+    } else if applicability
+        .sources
+        .contains(&NativeWorkerSummaryApplicabilitySource::TypedContext)
+    {
+        SemanticClaimSource::TypedContext
+    } else if applicability
+        .sources
+        .contains(&NativeWorkerSummaryApplicabilitySource::Callsite)
+    {
+        SemanticClaimSource::InterprocSummary
+    } else {
+        SemanticClaimSource::Summary
     }
 }
 
@@ -512,13 +1035,11 @@ fn native_worker_summary_route_registry_entry(
 fn is_direct_native_worker_summary_role(name: &str) -> bool {
     if is_direct_fileinfo_sort_comparator(name)
         || is_direct_allocation_wrapper(name)
-        || is_direct_hash_fold_worker(name)
         || is_direct_hash_table_worker(name)
         || is_direct_hot_coreutils_worker(name)
         || is_direct_regex_worker(name)
         || is_direct_version_worker(name)
         || is_direct_path_or_fts_worker(name)
-        || is_direct_bounded_loop_worker(name)
     {
         return true;
     }
@@ -640,32 +1161,10 @@ fn is_direct_hash_table_worker(name: &str) -> bool {
     )
 }
 
-fn is_direct_hash_fold_worker(name: &str) -> bool {
-    matches!(
-        name,
-        "blake2b_compress"
-            | "sha224_process_block"
-            | "sha224_process_bytes"
-            | "sha256_process_block"
-            | "sha256_process_bytes"
-            | "sha384_read_ctx"
-            | "sha512_process_block"
-            | "sha512_process_bytes"
-            | "sha512_read_ctx"
-            | "sm3_process_block"
-            | "sm3_process_bytes"
-    )
-}
-
-fn is_direct_bounded_loop_worker(name: &str) -> bool {
-    matches!(name, "mem_scan2" | "out_param_parse" | "table_walk")
-}
-
 fn is_direct_hot_coreutils_worker(name: &str) -> bool {
     matches!(
         name,
-        "blake2b_compress"
-            | "chown_files"
+        "chown_files"
             | "dopass"
             | "factor_up"
             | "install_file_in_file"
@@ -752,31 +1251,44 @@ pub(super) fn role_identity_from_worker_summaries(
         .iter()
         .map(|summary| summary.kind)
         .collect::<BTreeSet<_>>();
-    let primary_kind = worker_summaries
+    let primary_summary = worker_summaries
         .iter()
-        .find(|summary| summary.is_primary_render_summary())
-        .or_else(|| worker_summaries.first())
-        .map(|summary| summary.kind)?;
+        .filter(|summary| summary.is_primary_non_name_summary())
+        .min_by_key(|summary| native_worker_summary_sort_key(summary))
+        .or_else(|| {
+            worker_summaries
+                .iter()
+                .filter(|summary| summary.is_primary_render_summary())
+                .min_by_key(|summary| native_worker_summary_sort_key(summary))
+        })
+        .or_else(|| {
+            worker_summaries
+                .iter()
+                .min_by_key(|summary| native_worker_summary_sort_key(summary))
+        })?;
+    let primary_kind = primary_summary.kind;
     let structural_name = primary_kind.canonical_role_name();
     let source_name = summary_name.and_then(normalize_native_worker_role_name);
-    let role_name = source_name
-        .as_deref()
-        .unwrap_or(structural_name)
-        .to_string();
-    let source = if source_name.is_some()
-        && worker_summaries.iter().any(|summary| {
-            summary
-                .evidence
-                .reasons
-                .iter()
-                .any(|reason| matches!(reason, SemanticEvidenceReason::NameHint))
-        }) {
+    let has_name_hint_summary = worker_summaries.iter().any(|summary| {
+        summary
+            .evidence
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason, SemanticEvidenceReason::NameHint))
+    });
+    let source = if source_name.is_some() && has_name_hint_summary {
         NativeWorkerRoleSource::NameHint
     } else if source_name.is_some() {
         NativeWorkerRoleSource::SummarySeed
     } else {
         NativeWorkerRoleSource::Structural
     };
+    let role_name = if matches!(source, NativeWorkerRoleSource::NameHint) {
+        structural_name
+    } else {
+        source_name.as_deref().unwrap_or(structural_name)
+    }
+    .to_string();
     let evidence = worker_summaries
         .iter()
         .map(|summary| summary.evidence.clone())
@@ -845,8 +1357,57 @@ pub(super) fn bounded_worker_summaries(
 ) -> Vec<NativeWorkerSummary> {
     summaries.sort_by_key(native_worker_summary_sort_key);
     summaries.dedup();
-    summaries.truncate(NATIVE_WORKER_SUMMARY_MAX);
-    summaries
+    if summaries.len() <= NATIVE_WORKER_SUMMARY_MAX {
+        return summaries;
+    }
+
+    let mut selected = Vec::with_capacity(NATIVE_WORKER_SUMMARY_MAX);
+    let mut selected_indices = BTreeSet::new();
+    let mut coverage_keys = BTreeSet::new();
+
+    for (idx, summary) in summaries.iter().enumerate() {
+        if coverage_keys.insert(native_worker_summary_coverage_key(summary)) {
+            selected.push(summary.clone());
+            selected_indices.insert(idx);
+            if selected.len() == NATIVE_WORKER_SUMMARY_MAX {
+                selected.sort_by_key(native_worker_summary_sort_key);
+                return selected;
+            }
+        }
+    }
+
+    for (idx, summary) in summaries.iter().enumerate() {
+        if selected_indices.insert(idx) {
+            selected.push(summary.clone());
+            if selected.len() == NATIVE_WORKER_SUMMARY_MAX {
+                break;
+            }
+        }
+    }
+
+    selected.sort_by_key(native_worker_summary_sort_key);
+    selected
+}
+
+fn native_worker_summary_coverage_key(
+    summary: &NativeWorkerSummary,
+) -> (
+    u64,
+    NativeWorkerSummaryKind,
+    Option<SummaryMemoryLocation>,
+    Option<NativeParserKind>,
+    Option<u64>,
+) {
+    (
+        summary.anchor,
+        summary.kind,
+        summary.memory,
+        summary.parser.as_ref().map(|parser| parser.kind),
+        summary
+            .loop_summary
+            .as_ref()
+            .map(|loop_summary| loop_summary.header),
+    )
 }
 
 fn native_region_summary_sort_key(summary: &NativeRegionSummary) -> NativeRegionSummarySortKey {
@@ -1174,6 +1735,63 @@ fn normalize_semantic_summary_name(name: &str) -> Option<String> {
     normalize_native_worker_role_name(name)
 }
 
+fn normalize_semantic_summary_seed_name(name: &str) -> Option<&'static str> {
+    let normalized_owned = name.trim().to_ascii_lowercase();
+    let mut normalized = normalized_owned.as_str();
+    let has_external_marker = normalized.starts_with("sym.imp.")
+        || normalized.starts_with("imp.")
+        || normalized.starts_with("reloc.")
+        || normalized.ends_with("@plt")
+        || normalized.ends_with(".plt");
+    if !has_external_marker {
+        return None;
+    }
+    for prefix in ["sym.imp.", "sym.", "imp.", "reloc.", "dbg."] {
+        while let Some(rest) = normalized.strip_prefix(prefix) {
+            normalized = rest;
+        }
+    }
+    while let Some(rest) = normalized.strip_suffix("@plt") {
+        normalized = rest;
+    }
+    while let Some(rest) = normalized.strip_suffix(".plt") {
+        normalized = rest;
+    }
+    if let Some((base, _)) = normalized.split_once('@') {
+        normalized = base;
+    }
+    if let Some(rest) = normalized.strip_prefix("__isoc99_") {
+        normalized = rest;
+    }
+    if let Some(rest) = normalized.strip_prefix("__gi_") {
+        normalized = rest;
+    }
+    while let Some(rest) = normalized.strip_prefix('_') {
+        normalized = rest;
+    }
+    match normalized {
+        "strlen" | "__strlen_chk" => Some("strlen"),
+        "strcmp" => Some("strcmp"),
+        "memcmp" => Some("memcmp"),
+        "memcpy" | "__memcpy_chk" => Some("memcpy"),
+        "memmove" | "__memmove_chk" => Some("memmove"),
+        "copyin" => Some("copyin"),
+        "copyout" => Some("copyout"),
+        "memset" => Some("memset"),
+        "malloc" | "__libc_malloc" | "__gi___libc_malloc" => Some("malloc"),
+        "calloc" | "__libc_calloc" => Some("calloc"),
+        "free" => Some("free"),
+        "os_ref_retain" | "osobject_retain" => Some("retain"),
+        "os_ref_release" | "osobject_release" => Some("release"),
+        "lck_mtx_lock" | "lck_rw_lock_shared" | "lck_rw_lock_exclusive" => Some("lock"),
+        "lck_mtx_unlock" | "lck_rw_unlock_shared" | "lck_rw_unlock_exclusive" => Some("unlock"),
+        "puts" => Some("puts"),
+        "printf" | "__printf_chk" => Some("printf"),
+        "exit" | "_exit" => Some("exit"),
+        _ => None,
+    }
+}
+
 fn strip_known_compiler_suffixes(name: &str) -> &str {
     let mut current = name;
     while let Some(stripped) = strip_one_compiler_suffix(current) {
@@ -1212,7 +1830,6 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
         || is_version_etc_family_name(&name)
         || is_xalloc_family_name(&name)
         || is_hash_table_family_name(&name)
-        || is_hash_fold_family_name(&name)
         || is_parser_family_name(&name)
         || is_path_family_name(&name)
         || is_directory_family_name(&name)
@@ -1228,9 +1845,6 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "diagnose"
             | "usage"
             | "keycompare"
-            | "_md5_process_block"
-            | "md5_process_block"
-            | "md5_process_bytes"
             | "_internal_fnwmatch"
             | "internal_fnwmatch"
             | "fnmatch"
@@ -1479,9 +2093,6 @@ pub fn has_native_worker_summary_family(name: &str) -> bool {
             | "mergefps"
             | "sortlines"
             | "pipe_child"
-            | "mem_scan2"
-            | "out_param_parse"
-            | "table_walk"
             | "merge"
             | "mergefiles"
             | "cwd_advance_fd"
@@ -1865,6 +2476,7 @@ fn linebuffer_delimiter_summary(anchor: u64) -> NativeWorkerSummary {
             digit_min: None,
             digit_max: None,
             accepts_sign: false,
+            return_predicate: None,
         }),
         loop_summary: None,
         evidence: bounded_evidence(),
@@ -1901,6 +2513,7 @@ fn string_scan_worker_summary(
             stride: Some(1),
             terminator: Some(terminator),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -1933,6 +2546,7 @@ fn token_parser_worker_summary(
             digit_min: None,
             digit_max: None,
             accepts_sign: false,
+            return_predicate: None,
         }),
         loop_summary: Some(NativeWorkerLoopSummary {
             header: anchor,
@@ -1942,6 +2556,7 @@ fn token_parser_worker_summary(
             stride: Some(1),
             terminator: Some(NativeWorkerTerminator::LengthBound),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -1966,6 +2581,7 @@ fn global_token_parser_worker_summary(anchor: u64) -> NativeWorkerSummary {
             digit_min: None,
             digit_max: None,
             accepts_sign: false,
+            return_predicate: None,
         }),
         loop_summary: Some(NativeWorkerLoopSummary {
             header: anchor,
@@ -1975,6 +2591,7 @@ fn global_token_parser_worker_summary(anchor: u64) -> NativeWorkerSummary {
             stride: Some(1),
             terminator: Some(NativeWorkerTerminator::Unknown),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2007,6 +2624,7 @@ fn numeric_parser_worker_summary_with_dst(
             digit_min: Some(b'0'),
             digit_max: Some(b'9'),
             accepts_sign: true,
+            return_predicate: None,
         }),
         loop_summary: Some(NativeWorkerLoopSummary {
             header: anchor,
@@ -2016,6 +2634,7 @@ fn numeric_parser_worker_summary_with_dst(
             stride: Some(1),
             terminator: Some(NativeWorkerTerminator::Unknown),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2040,6 +2659,7 @@ fn argv_option_parser_worker_summary(anchor: u64, argv_arg: usize) -> NativeWork
             digit_min: None,
             digit_max: None,
             accepts_sign: false,
+            return_predicate: None,
         }),
         loop_summary: None,
         evidence: bounded_evidence(),
@@ -2076,6 +2696,7 @@ fn file_transfer_worker_summary(
                     .unwrap_or(NativeWorkerTerminator::Unknown),
             ),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2118,6 +2739,7 @@ fn path_walk_worker_summary(anchor: u64, path_arg: usize) -> NativeWorkerSummary
             stride: Some(1),
             terminator: Some(NativeWorkerTerminator::ZeroByte),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2148,6 +2770,7 @@ fn directory_traversal_worker_summary(
             stride: None,
             terminator: Some(NativeWorkerTerminator::Unknown),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2178,6 +2801,7 @@ fn record_stream_worker_summary(
             stride: None,
             terminator: Some(NativeWorkerTerminator::ByteEquals(b'\n')),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2208,6 +2832,7 @@ fn field_selection_worker_summary(
             stride: Some(1),
             terminator: Some(NativeWorkerTerminator::Unknown),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2251,6 +2876,7 @@ fn output_stream_worker_summary_with_len(
                     .unwrap_or(NativeWorkerTerminator::ZeroByte),
             ),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2281,6 +2907,7 @@ fn format_render_worker_summary(
             stride: None,
             terminator: Some(NativeWorkerTerminator::Unknown),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2336,6 +2963,7 @@ fn sort_merge_worker_summary(
             stride: None,
             terminator: Some(NativeWorkerTerminator::Unknown),
             fold: None,
+            table_walk: None,
         }),
         evidence: bounded_evidence(),
     }
@@ -2381,31 +3009,11 @@ fn digest_stream_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     vec![
         path_walk_worker_summary(anchor, 0),
         record_stream_worker_summary(anchor, 0, None),
-        named_hash_fold_worker_summary(
-            anchor,
-            0,
-            Some(1),
-            None,
-            "digest_state",
-            32,
-            NativeWorkerFoldOperation::RotateMix,
-        ),
     ]
 }
 
 fn shaxxx_stream_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
-    vec![
-        record_stream_worker_summary(anchor, 0, Some(1)),
-        named_hash_fold_worker_summary(
-            anchor,
-            1,
-            Some(1),
-            None,
-            "digest_state",
-            32,
-            NativeWorkerFoldOperation::RotateMix,
-        ),
-    ]
+    vec![record_stream_worker_summary(anchor, 0, Some(1))]
 }
 
 fn expression_evaluator_worker_summaries(
@@ -2470,51 +3078,6 @@ fn memchr2_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
             NativeWorkerTerminator::LengthBound,
         ),
         token_parser_worker_summary(anchor, 0, None, Some(3)),
-    ]
-}
-
-fn mem_scan2_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
-    vec![
-        string_scan_worker_summary(
-            anchor,
-            0,
-            None,
-            Some(1),
-            NativeWorkerTerminator::LengthBound,
-        ),
-        numeric_scan_count_worker_summary(
-            anchor,
-            0,
-            1,
-            "match_count",
-            Some(NativeWorkerPredicate::AnyOf(vec![
-                NativeWorkerPredicate::ByteEqArg { arg: 2 },
-                NativeWorkerPredicate::ByteEqArg { arg: 3 },
-            ])),
-        ),
-    ]
-}
-
-fn out_param_parse_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
-    vec![
-        numeric_parser_worker_summary_with_dst(anchor, 0, Some(1)),
-        named_hash_fold_worker_summary(
-            anchor,
-            0,
-            Some(1),
-            None,
-            "fnv1a_hash",
-            64,
-            NativeWorkerFoldOperation::Xor,
-        ),
-        memory_write_worker_summary(anchor, 1, None),
-    ]
-}
-
-fn linked_table_walk_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
-    vec![
-        table_walk_worker_summary(anchor, 0),
-        string_scan_worker_summary(anchor, 1, None, None, NativeWorkerTerminator::ZeroByte),
     ]
 }
 
@@ -2781,15 +3344,6 @@ fn randread_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
     vec![
         table_walk_worker_summary(anchor, 0),
         memory_write_worker_summary(anchor, 1, Some(2)),
-        named_hash_fold_worker_summary(
-            anchor,
-            0,
-            Some(0),
-            Some(2),
-            "randread_state",
-            64,
-            NativeWorkerFoldOperation::RotateMix,
-        ),
     ]
 }
 
@@ -2882,46 +3436,13 @@ fn numeric_transform_worker_summary(
                 bits: 64,
                 operation: NativeWorkerFoldOperation::Add,
                 predicate: None,
+                init: None,
+                multiplier: None,
+                byte_transform: None,
             }),
+            table_walk: None,
         },
     )
-}
-
-fn numeric_scan_count_worker_summary(
-    anchor: u64,
-    memory_arg: usize,
-    length_arg: usize,
-    accumulator: &str,
-    predicate: Option<NativeWorkerPredicate>,
-) -> NativeWorkerSummary {
-    NativeWorkerSummary {
-        anchor,
-        kind: NativeWorkerSummaryKind::NumericTransform,
-        dst: None,
-        src: None,
-        memory: Some(arg_byte_location(memory_arg)),
-        len: Some(SummaryTransferLength::Arg(length_arg)),
-        allocation: None,
-        lifetime: None,
-        sync: None,
-        atomic: None,
-        parser: None,
-        loop_summary: Some(NativeWorkerLoopSummary {
-            header: anchor,
-            exit_target: None,
-            iterations: None,
-            length_arg: Some(length_arg),
-            stride: Some(1),
-            terminator: Some(NativeWorkerTerminator::LengthBound),
-            fold: Some(NativeWorkerFold {
-                accumulator: accumulator.to_string(),
-                bits: 64,
-                operation: NativeWorkerFoldOperation::Add,
-                predicate,
-            }),
-        }),
-        evidence: bounded_evidence(),
-    }
 }
 
 fn numeric_transform_worker_summary_with_loop(
@@ -2951,6 +3472,9 @@ fn numeric_transform_worker_summary_with_loop(
                 bits,
                 operation,
                 predicate: None,
+                init: None,
+                multiplier: None,
+                byte_transform: None,
             }),
             ..loop_summary
         }),
@@ -3014,18 +3538,7 @@ fn filename_output_worker_summaries(anchor: u64, filename_arg: usize) -> Vec<Nat
 }
 
 fn vector_line_count_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
-    vec![
-        record_stream_worker_summary(anchor, 0, None),
-        named_hash_fold_worker_summary(
-            anchor,
-            0,
-            None,
-            Some(1),
-            "line_count",
-            64,
-            NativeWorkerFoldOperation::Add,
-        ),
-    ]
+    vec![record_stream_worker_summary(anchor, 0, None)]
 }
 
 fn parser_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeWorkerSummary> {
@@ -3208,18 +3721,7 @@ fn record_memory_family_worker_summaries(anchor: u64, name: &str) -> Vec<NativeW
 }
 
 fn isaac_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
-    vec![
-        table_walk_worker_summary(anchor, 0),
-        named_hash_fold_worker_summary(
-            anchor,
-            0,
-            Some(0),
-            None,
-            "isaac_state",
-            64,
-            NativeWorkerFoldOperation::RotateMix,
-        ),
-    ]
+    vec![table_walk_worker_summary(anchor, 0)]
 }
 
 fn counter_output_worker_summaries(anchor: u64) -> Vec<NativeWorkerSummary> {
@@ -3930,6 +4432,9 @@ fn semantic_family_worker_summaries(
     anchor: u64,
     summary: &FunctionSemanticSummary,
 ) -> Vec<NativeWorkerSummary> {
+    if !summary_has_semantic_role_evidence(summary) {
+        return Vec::new();
+    }
     let Some(name) = semantic_summary_name(summary) else {
         return Vec::new();
     };
@@ -3953,17 +4458,6 @@ fn semantic_family_worker_summaries(
         "diagnose" => vec![diagnostic_wrapper_summary(anchor)],
         "usage" => vec![usage_wrapper_summary(anchor)],
         "keycompare" => vec![table_compare_summary(anchor)],
-        "_md5_process_block" | "md5_process_block" | "md5_process_bytes" => {
-            vec![named_hash_fold_worker_summary(
-                anchor,
-                0,
-                Some(2),
-                Some(1),
-                "md5_state",
-                32,
-                NativeWorkerFoldOperation::RotateMix,
-            )]
-        }
         "_internal_fnwmatch" | "internal_fnwmatch" | "fnmatch" | "rpl_fnmatch" => {
             fnmatch_worker_summaries(anchor)
         }
@@ -4130,7 +4624,6 @@ fn semantic_family_worker_summaries(
             format_render_worker_summary(anchor, 0, None),
             table_walk_worker_summary(anchor, 1),
         ],
-        "blake2b_compress" => hash_fold_family_worker_summaries(anchor, &name),
         "re_string_reconstruct" => vec![
             token_parser_worker_summary(anchor, 0, Some(0), None),
             memory_write_worker_summary(anchor, 0, None),
@@ -4336,9 +4829,6 @@ fn semantic_family_worker_summaries(
         ],
         "cut_file" => byte_stream_selection_worker_summaries(anchor, 0),
         "cut_bytes" => byte_stream_selection_worker_summaries(anchor, 0),
-        "mem_scan2" => mem_scan2_worker_summaries(anchor),
-        "out_param_parse" => out_param_parse_worker_summaries(anchor),
-        "table_walk" => linked_table_walk_worker_summaries(anchor),
         "memchr2" => memchr2_worker_summaries(anchor),
         "begfield" | "limfield" => vec![
             field_selection_worker_summary(anchor, 0, None),
@@ -4588,9 +5078,7 @@ fn semantic_family_worker_summaries(
             memory_read_worker_summary(anchor, 0, None),
             memory_write_worker_summary(anchor, 0, None),
         ],
-        name if is_hash_context_read_name(name) => hash_context_read_worker_summaries(anchor, name),
         name if is_hash_table_family_name(name) => hash_table_family_worker_summaries(anchor, name),
-        name if is_hash_fold_family_name(name) => hash_fold_family_worker_summaries(anchor, name),
         name if is_parser_family_name(name) => parser_family_worker_summaries(anchor, name),
         name if is_path_family_name(name) => path_family_worker_summaries(anchor, name),
         name if is_directory_family_name(name) => directory_family_worker_summaries(anchor, name),
@@ -4603,6 +5091,17 @@ fn semantic_family_worker_summaries(
         _ => Vec::new(),
     };
     mark_name_hint_summaries(summaries)
+}
+
+fn summary_has_semantic_role_evidence(summary: &FunctionSemanticSummary) -> bool {
+    summary.return_relation != SummaryReturnRelation::Unknown
+        || !summary.arg_effects.is_empty()
+        || !summary.transfer_effects.is_empty()
+        || !summary.memory_effects.is_empty()
+        || !summary.allocation_effects.is_empty()
+        || !summary.lifetime_effects.is_empty()
+        || !summary.sync_effects.is_empty()
+        || !summary.atomic_effects.is_empty()
 }
 
 fn structural_worker_summaries_from_interproc_summary(
@@ -4863,6 +5362,36 @@ fn const_value(var: &SSAVar) -> Option<u64> {
     parse_hexish_u64(value)
 }
 
+fn resolved_const_value(func: &SsaArtifact, var: &SSAVar) -> Option<u64> {
+    fn resolve(func: &SsaArtifact, var: &SSAVar, depth: usize) -> Option<u64> {
+        if let Some(value) = const_value(var) {
+            return Some(value);
+        }
+        if depth == 0 {
+            return None;
+        }
+        let (block_addr, r2ssa::function::DefLocation::Op(op_idx)) =
+            func.function().find_def(var)?
+        else {
+            return None;
+        };
+        let block = func.function().get_block(block_addr)?;
+        let op = block.ops.get(op_idx)?;
+        let src = match op {
+            SSAOp::Copy { src, .. }
+            | SSAOp::IntZExt { src, .. }
+            | SSAOp::IntSExt { src, .. }
+            | SSAOp::Subpiece { src, .. }
+            | SSAOp::Cast { src, .. }
+            | SSAOp::Trunc { src, .. } => src,
+            _ => return None,
+        };
+        resolve(func, src, depth - 1)
+    }
+
+    resolve(func, var, 4)
+}
+
 fn ram_address(var: &SSAVar) -> Option<u64> {
     var.name.strip_prefix("ram:").and_then(parse_hexish_u64)
 }
@@ -4961,23 +5490,36 @@ fn x86_alias_tuple(var: &SSAVar) -> Option<(String, u32, u32, u32)> {
 fn abi_pointer_arg_index(var: &SSAVar) -> Option<usize> {
     let name = register_base_name(var).to_ascii_lowercase();
     match name.as_str() {
-        "x0" | "w0" | "rdi" | "edi" | "di" | "a0" => Some(0),
-        "x1" | "w1" | "rsi" | "esi" | "si" | "a1" => Some(1),
-        "x2" | "w2" | "rdx" | "edx" | "dx" | "a2" => Some(2),
-        "x3" | "w3" | "rcx" | "ecx" | "cx" | "a3" => Some(3),
-        "x4" | "w4" | "r8" | "r8d" | "a4" => Some(4),
-        "x5" | "w5" | "r9" | "r9d" | "a5" => Some(5),
+        "x0" | "w0" | "rdi" | "edi" | "di" | "dil" | "a0" => Some(0),
+        "x1" | "w1" | "rsi" | "esi" | "si" | "sil" | "a1" => Some(1),
+        "x2" | "w2" | "rdx" | "edx" | "dx" | "dl" | "a2" => Some(2),
+        "x3" | "w3" | "rcx" | "ecx" | "cx" | "cl" | "a3" => Some(3),
+        "x4" | "w4" | "r8" | "r8d" | "r8w" | "r8b" | "a4" => Some(4),
+        "x5" | "w5" | "r9" | "r9d" | "r9w" | "r9b" | "a5" => Some(5),
         "x6" | "w6" | "a6" => Some(6),
         "x7" | "w7" | "a7" => Some(7),
         _ => None,
     }
 }
 
+fn abi_input_arg_index(var: &SSAVar) -> Option<usize> {
+    (var.version == 0)
+        .then(|| abi_pointer_arg_index(var))
+        .flatten()
+}
+
+fn is_return_value_var(var: &SSAVar) -> bool {
+    matches!(
+        register_base_name(var).to_ascii_uppercase().as_str(),
+        "AL" | "AX" | "EAX" | "RAX" | "W0" | "X0" | "A0"
+    )
+}
+
 fn rooted_region(
     var: &SSAVar,
     roots: &BTreeMap<SSAVar, SummaryMemoryRegion>,
 ) -> Option<SummaryMemoryRegion> {
-    abi_pointer_arg_index(var)
+    abi_input_arg_index(var)
         .map(|index| SummaryMemoryRegion::Arg { index })
         .or_else(|| ram_address(var).map(|address| SummaryMemoryRegion::Global { address }))
         .or_else(|| roots.get(var).copied())
@@ -5001,6 +5543,45 @@ fn location_from_region(region: SummaryMemoryRegion, width: u32) -> SummaryMemor
             width: Some(width),
         }),
     }
+}
+
+fn pointer_location_from_region(region: SummaryMemoryRegion) -> SummaryMemoryLocation {
+    SummaryMemoryLocation {
+        region,
+        range: None,
+    }
+}
+
+fn location_with_access_width(
+    mut location: SummaryMemoryLocation,
+    width: u32,
+) -> SummaryMemoryLocation {
+    let range = location.range.unwrap_or(SummaryMemoryRange {
+        offset_lo: 0,
+        offset_hi: 0,
+        width: None,
+    });
+    location.range = Some(SummaryMemoryRange {
+        width: Some(width),
+        ..range
+    });
+    location
+}
+
+fn offset_location(location: SummaryMemoryLocation, delta: i64) -> Option<SummaryMemoryLocation> {
+    let range = location.range.unwrap_or(SummaryMemoryRange {
+        offset_lo: 0,
+        offset_hi: 0,
+        width: None,
+    });
+    Some(SummaryMemoryLocation {
+        region: location.region,
+        range: Some(SummaryMemoryRange {
+            offset_lo: range.offset_lo.checked_add(delta)?,
+            offset_hi: range.offset_hi.checked_add(delta)?,
+            width: range.width,
+        }),
+    })
 }
 
 fn copy_root_if_known(
@@ -5054,6 +5635,16 @@ fn loaded_source(
     if let Some(source) = load_sources.get(var).copied() {
         return Some(source);
     }
+    if let Some((candidate, source)) = load_sources
+        .iter()
+        .filter(|(candidate, _)| same_ssa_identity(candidate, var) && candidate.size >= var.size)
+        .max_by_key(|(candidate, _)| candidate.size)
+    {
+        return Some(loaded_source_with_value_width(
+            *source,
+            candidate.size.min(var.size),
+        ));
+    }
     let requested = x86_register_alias_spec(register_base_name(var))?;
     load_sources
         .iter()
@@ -5067,6 +5658,14 @@ fn loaded_source(
         })
         .max_by_key(|(version, width_bits, _)| (*version, *width_bits))
         .map(|(_, _, source)| source)
+}
+
+fn same_ssa_identity(left: &SSAVar, right: &SSAVar) -> bool {
+    left.name == right.name && left.version == right.version
+}
+
+fn loaded_source_with_value_width(source: LoadedSource, size: u32) -> LoadedSource {
+    LoadedSource { size, ..source }
 }
 
 fn exact_dataflow_value<T: Copy>(value: Option<&DataflowValue<T>>) -> Option<T> {
@@ -5114,12 +5713,24 @@ fn join_dataflow_map<K: Clone + Ord, T: Clone + Eq>(
 
 fn join_worker_state(left: &mut WorkerDataflowState, right: &WorkerDataflowState) -> bool {
     let roots_changed = join_dataflow_map(&mut left.roots, &right.roots);
+    let locations_changed = join_dataflow_map(&mut left.locations, &right.locations);
     let loads_changed = join_dataflow_map(&mut left.load_sources, &right.load_sources);
     let controls_changed = join_dataflow_map(&mut left.control_sources, &right.control_sources);
+    let byte_predicates_changed =
+        join_dataflow_map(&mut left.byte_predicates, &right.byte_predicates);
+    let zero_comparisons_changed =
+        join_dataflow_map(&mut left.zero_comparisons, &right.zero_comparisons);
+    let stack_values_changed = join_dataflow_map(&mut left.stack_values, &right.stack_values);
     if loads_changed {
         rebuild_load_source_alias_index(left);
     }
-    roots_changed || loads_changed || controls_changed
+    roots_changed
+        || locations_changed
+        || loads_changed
+        || controls_changed
+        || byte_predicates_changed
+        || zero_comparisons_changed
+        || stack_values_changed
 }
 
 fn insert_exact_dataflow_value<K: Clone + Ord, T: Clone + Eq>(
@@ -5214,6 +5825,22 @@ fn insert_unknown_control_source_value(state: &mut WorkerDataflowState, key: &SS
     insert_dataflow_value(&mut state.control_sources, key, DataflowValue::Unknown);
 }
 
+fn insert_exact_byte_predicate_value(
+    state: &mut WorkerDataflowState,
+    key: &SSAVar,
+    value: BytePredicateValue,
+) {
+    insert_exact_dataflow_value(&mut state.byte_predicates, key, value);
+}
+
+fn insert_exact_zero_comparison_value(
+    state: &mut WorkerDataflowState,
+    key: &SSAVar,
+    value: ZeroComparisonValue,
+) {
+    insert_exact_dataflow_value(&mut state.zero_comparisons, key, value);
+}
+
 fn rebuild_load_source_alias_index(state: &mut WorkerDataflowState) {
     state.load_source_aliases.clear();
     state.load_source_alias_members.clear();
@@ -5238,15 +5865,42 @@ fn dataflow_rooted_region(
     var: &SSAVar,
     state: &WorkerDataflowState,
 ) -> Option<SummaryMemoryRegion> {
-    abi_pointer_arg_index(var)
+    abi_input_arg_index(var)
         .map(|index| SummaryMemoryRegion::Arg { index })
         .or_else(|| ram_address(var).map(|address| SummaryMemoryRegion::Global { address }))
         .or_else(|| exact_dataflow_value(state.roots.get(var)))
 }
 
+fn dataflow_memory_location(
+    var: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<SummaryMemoryLocation> {
+    exact_dataflow_value(state.locations.get(var))
+        .or_else(|| dataflow_rooted_region(var, state).map(pointer_location_from_region))
+}
+
+fn dataflow_stack_root(
+    stack_address_roots: Option<&BTreeMap<SSAVar, StackAddressRoot>>,
+    addr: &SSAVar,
+) -> Option<StackAddressRoot> {
+    stack_address_roots?.get(addr).copied()
+}
+
 fn dataflow_loaded_source(var: &SSAVar, state: &WorkerDataflowState) -> Option<LoadedSource> {
     if let Some(source) = exact_dataflow_value(state.load_sources.get(var)) {
         return Some(source);
+    }
+    if let Some((candidate, source)) = state
+        .load_sources
+        .iter()
+        .filter(|(candidate, _)| same_ssa_identity(candidate, var) && candidate.size >= var.size)
+        .filter_map(|(candidate, source)| source.exact().map(|source| (candidate, *source)))
+        .max_by_key(|(candidate, _)| candidate.size)
+    {
+        return Some(loaded_source_with_value_width(
+            source,
+            candidate.size.min(var.size),
+        ));
     }
     let requested = x86_register_alias_spec(register_base_name(var))?;
     state
@@ -5264,6 +5918,20 @@ fn dataflow_loaded_source(var: &SSAVar, state: &WorkerDataflowState) -> Option<L
         })
         .max_by_key(|(version, width_bits, _)| (*version, *width_bits))
         .map(|(_, _, source)| source)
+}
+
+fn dataflow_byte_predicate(
+    var: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<BytePredicateValue> {
+    state.byte_predicates.get(var)?.exact().cloned()
+}
+
+fn dataflow_zero_comparison(
+    var: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<ZeroComparisonValue> {
+    state.zero_comparisons.get(var)?.exact().cloned()
 }
 
 fn source_control_args(source: LoadedSource) -> Option<BTreeSet<usize>> {
@@ -5298,8 +5966,15 @@ fn merge_control_args(
 }
 
 fn dataflow_kill_load_source_aliases(dst: &SSAVar, state: &mut WorkerDataflowState) {
+    state.byte_predicates.remove(dst);
+    state.zero_comparisons.remove(dst);
     let Some(dst_spec) = x86_register_alias_spec(register_base_name(dst)) else {
-        state.load_sources.remove(dst);
+        state
+            .load_sources
+            .retain(|candidate, _| !same_ssa_identity(candidate, dst));
+        state
+            .locations
+            .retain(|candidate, _| !same_ssa_identity(candidate, dst));
         insert_unknown_load_source_value(state, dst);
         insert_unknown_control_source_value(state, dst);
         return;
@@ -5310,6 +5985,7 @@ fn dataflow_kill_load_source_aliases(dst: &SSAVar, state: &mut WorkerDataflowSta
         }
     }
     state.load_source_aliases.remove(&dst_spec.family);
+    state.locations.remove(dst);
     insert_unknown_load_source_value(state, dst);
     insert_unknown_control_source_value(state, dst);
 }
@@ -5320,15 +5996,29 @@ fn dataflow_copy_root_if_known(dst: &SSAVar, src: &SSAVar, state: &mut WorkerDat
     }
 }
 
+fn dataflow_copy_location_if_known(dst: &SSAVar, src: &SSAVar, state: &mut WorkerDataflowState) {
+    if let Some(location) = dataflow_memory_location(src, state) {
+        insert_exact_dataflow_value(&mut state.locations, dst, location);
+    }
+}
+
 fn dataflow_copy_load_source_if_known(dst: &SSAVar, src: &SSAVar, state: &mut WorkerDataflowState) {
     let source = dataflow_loaded_source(src, state);
     let control_args = dataflow_control_args_from_operand(src, state);
+    let byte_predicate = dataflow_byte_predicate(src, state);
+    let zero_comparison = dataflow_zero_comparison(src, state);
     dataflow_kill_load_source_aliases(dst, state);
     if let Some(source) = source {
         insert_exact_load_source_value(state, dst, source);
     }
     if let Some(control_args) = control_args {
         insert_exact_control_source_value(state, dst, control_args);
+    }
+    if let Some(byte_predicate) = byte_predicate {
+        insert_exact_byte_predicate_value(state, dst, byte_predicate);
+    }
+    if let Some(zero_comparison) = zero_comparison {
+        insert_exact_zero_comparison_value(state, dst, zero_comparison);
     }
 }
 
@@ -5363,6 +6053,21 @@ fn dataflow_copy_phi_root_if_unambiguous<'a>(
         && source_roots.all(|root| root == first)
     {
         insert_exact_dataflow_value(&mut state.roots, dst, first);
+    }
+}
+
+fn dataflow_copy_phi_location_if_unambiguous<'a>(
+    dst: &SSAVar,
+    sources: impl IntoIterator<Item = &'a SSAVar>,
+    state: &mut WorkerDataflowState,
+) {
+    let mut source_locations = sources
+        .into_iter()
+        .filter_map(|src| dataflow_memory_location(src, state));
+    if let Some(first) = source_locations.next()
+        && source_locations.all(|location| location == first)
+    {
+        insert_exact_dataflow_value(&mut state.locations, dst, first);
     }
 }
 
@@ -5415,6 +6120,24 @@ fn const_i64(var: &SSAVar) -> Option<i64> {
     const_value(var).and_then(|value| i64::try_from(value).ok())
 }
 
+fn const_signed_i64(var: &SSAVar) -> Option<i64> {
+    let value = const_value(var)?;
+    let bits = var.size.checked_mul(8)?;
+    if bits == 0 || bits > 64 {
+        return None;
+    }
+    if bits == 64 {
+        return Some(value as i64);
+    }
+    let sign_bit = 1u64.checked_shl(bits - 1)?;
+    if value & sign_bit == 0 {
+        i64::try_from(value).ok()
+    } else {
+        let modulus = 1i128.checked_shl(bits)?;
+        i64::try_from(i128::from(value) - modulus).ok()
+    }
+}
+
 fn dataflow_copy_additive_load_source(
     dst: &SSAVar,
     a: &SSAVar,
@@ -5424,7 +6147,7 @@ fn dataflow_copy_additive_load_source(
 ) {
     let a_source = dataflow_loaded_source(a, state);
     let b_source = dataflow_loaded_source(b, state);
-    match (a_source, const_i64(b), b_source, const_i64(a)) {
+    match (a_source, const_signed_i64(b), b_source, const_signed_i64(a)) {
         (Some(source), Some(delta), None, _) => {
             let delta = if subtract_rhs { -delta } else { delta };
             dataflow_insert_transformed_load_source(dst, source, delta, state);
@@ -5433,6 +6156,34 @@ fn dataflow_copy_additive_load_source(
             dataflow_insert_transformed_load_source(dst, source, delta, state);
         }
         _ => dataflow_kill_load_source_aliases(dst, state),
+    }
+}
+
+fn dataflow_copy_additive_location(
+    dst: &SSAVar,
+    a: &SSAVar,
+    b: &SSAVar,
+    subtract_rhs: bool,
+    state: &mut WorkerDataflowState,
+) {
+    let a_location = dataflow_memory_location(a, state);
+    let b_location = dataflow_memory_location(b, state);
+    let location = match (
+        a_location,
+        const_signed_i64(b),
+        b_location,
+        const_signed_i64(a),
+    ) {
+        (Some(location), Some(delta), None, _) => {
+            let delta = if subtract_rhs { -delta } else { delta };
+            offset_location(location, delta)
+        }
+        (None, _, Some(location), Some(delta)) if !subtract_rhs => offset_location(location, delta),
+        _ => None,
+    };
+    state.locations.remove(dst);
+    if let Some(location) = location {
+        insert_exact_dataflow_value(&mut state.locations, dst, location);
     }
 }
 
@@ -5663,6 +6414,7 @@ fn loop_summary(
         stride: Some(1),
         terminator: Some(terminator),
         fold,
+        table_walk: None,
     }
 }
 
@@ -5680,6 +6432,7 @@ fn loop_summary_from_island(
         stride: Some(1),
         terminator: Some(terminator),
         fold,
+        table_walk: None,
     }
 }
 
@@ -5890,6 +6643,9 @@ fn reductions_from_worker(worker: &NativeWorkerSummary) -> Vec<NativeReductionSu
             bits: fold.bits,
             operation: fold.operation,
             source: worker.memory.or(worker.src),
+            init: fold.init,
+            multiplier: fold.multiplier,
+            byte_transform: fold.byte_transform,
         })
         .into_iter()
         .collect()
@@ -5954,6 +6710,22 @@ fn source_arg(source: LoadedSource) -> Option<usize> {
     }
 }
 
+fn fold_observation_has_accumulator_identity(fold: &FoldObservation) -> bool {
+    !fold.accumulator.starts_with("const:")
+}
+
+fn loaded_source_access_width(source: LoadedSource) -> u32 {
+    source
+        .location
+        .range
+        .and_then(|range| range.width)
+        .unwrap_or(source.size)
+}
+
+fn fold_observation_has_hash_stream_source(fold: &FoldObservation) -> bool {
+    fold_observation_has_accumulator_identity(fold) && loaded_source_access_width(fold.source) == 1
+}
+
 fn dataflow_loaded_compare<'a>(
     a: &'a SSAVar,
     b: &'a SSAVar,
@@ -5986,12 +6758,90 @@ fn dataflow_loaded_binary_source(
 }
 
 fn dataflow_arg_index(var: &SSAVar, state: &WorkerDataflowState) -> Option<usize> {
-    abi_pointer_arg_index(var).or_else(|| match dataflow_rooted_region(var, state)? {
+    abi_input_arg_index(var).or_else(|| match dataflow_rooted_region(var, state)? {
         SummaryMemoryRegion::Arg { index } => Some(index),
         SummaryMemoryRegion::Global { .. }
         | SummaryMemoryRegion::HeapReturn
         | SummaryMemoryRegion::Unknown => None,
     })
+}
+
+fn dataflow_tracked_arg_index(var: &SSAVar, state: &WorkerDataflowState) -> Option<usize> {
+    match exact_dataflow_value(state.roots.get(var))? {
+        SummaryMemoryRegion::Arg { index } => Some(index),
+        SummaryMemoryRegion::Global { .. }
+        | SummaryMemoryRegion::HeapReturn
+        | SummaryMemoryRegion::Unknown => None,
+    }
+}
+
+fn byte_eq_predicate_for_operand(
+    source: LoadedSource,
+    other: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<NativeWorkerPredicate> {
+    if let Some(arg) = dataflow_arg_index(other, state)
+        && source.value_delta == 0
+    {
+        return Some(NativeWorkerPredicate::ByteEqArg { arg });
+    }
+    let raw = const_i64(other)?;
+    let value = raw.checked_sub(source.value_delta)?;
+    (0..=i64::from(u8::MAX))
+        .contains(&value)
+        .then_some(NativeWorkerPredicate::ByteEqConst { value: value as u8 })
+}
+
+fn byte_predicate_from_loaded_compare(
+    a: &SSAVar,
+    b: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<BytePredicateValue> {
+    dataflow_loaded_source(a, state)
+        .and_then(|source| {
+            byte_eq_predicate_for_operand(source, b, state)
+                .map(|predicate| BytePredicateValue { source, predicate })
+        })
+        .or_else(|| {
+            dataflow_loaded_source(b, state).and_then(|source| {
+                byte_eq_predicate_for_operand(source, a, state)
+                    .map(|predicate| BytePredicateValue { source, predicate })
+            })
+        })
+}
+
+fn byte_predicate_from_zero_compare(
+    a: &SSAVar,
+    b: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<BytePredicateValue> {
+    if const_value(b) == Some(0) {
+        return dataflow_byte_predicate(a, state);
+    }
+    if const_value(a) == Some(0) {
+        return dataflow_byte_predicate(b, state);
+    }
+    None
+}
+
+fn zero_comparison_value(
+    a: &SSAVar,
+    b: &SSAVar,
+    branch_when_zero: bool,
+) -> Option<ZeroComparisonValue> {
+    if const_value(b) == Some(0) {
+        return Some(ZeroComparisonValue {
+            value: a.clone(),
+            branch_when_zero,
+        });
+    }
+    if const_value(a) == Some(0) {
+        return Some(ZeroComparisonValue {
+            value: b.clone(),
+            branch_when_zero,
+        });
+    }
+    None
 }
 
 fn numeric_transform_binary_observation(
@@ -6012,11 +6862,38 @@ fn numeric_transform_binary_observation(
     }
     Some(NumericTransformObservation {
         anchor,
-        dst_arg: dataflow_arg_index(dst, state),
+        dst_arg: dataflow_tracked_arg_index(dst, state),
         length_arg,
         accumulator: dst.display_name(),
         bits: dst.size.saturating_mul(8),
         operation,
+    })
+}
+
+fn numeric_increment_observation(
+    anchor: u64,
+    dst: &SSAVar,
+    a: &SSAVar,
+    b: &SSAVar,
+    state: &WorkerDataflowState,
+) -> Option<NumericTransformObservation> {
+    let non_const_operand = match (const_value(a).is_some(), const_value(b).is_some()) {
+        (true, false) => b,
+        (false, true) => a,
+        _ => return None,
+    };
+    if dataflow_loaded_source(non_const_operand, state).is_some()
+        || dataflow_tracked_arg_index(non_const_operand, state).is_some()
+    {
+        return None;
+    }
+    Some(NumericTransformObservation {
+        anchor,
+        dst_arg: dataflow_tracked_arg_index(dst, state),
+        length_arg: None,
+        accumulator: dst.display_name(),
+        bits: dst.size.saturating_mul(8),
+        operation: NativeWorkerFoldOperation::Add,
     })
 }
 
@@ -6032,7 +6909,7 @@ fn numeric_transform_unary_observation(
     let length_arg = dataflow_arg_index(src, state)?;
     Some(NumericTransformObservation {
         anchor,
-        dst_arg: dataflow_arg_index(dst, state),
+        dst_arg: dataflow_tracked_arg_index(dst, state),
         length_arg: Some(length_arg),
         accumulator: dst.display_name(),
         bits: dst.size.saturating_mul(8),
@@ -6083,6 +6960,12 @@ fn byte_range_from_upper_bound(
 ) -> Option<ParserByteRange> {
     if source.value_delta == -i64::from(b'0') && inclusive_upper == 9 {
         return Some(ParserByteRange { lo: b'0', hi: b'9' });
+    }
+    if source.value_delta == -i64::from(b'0') && (0..9).contains(&inclusive_upper) {
+        return Some(ParserByteRange {
+            lo: b'0',
+            hi: b'0'.checked_add(u8::try_from(inclusive_upper).ok()?)?,
+        });
     }
     let hi = inclusive_upper.saturating_sub(source.value_delta);
     if !(0..=255).contains(&hi) {
@@ -6146,8 +7029,15 @@ fn scan_worker_kind(
     source: LoadedSource,
     terminator: NativeWorkerTerminator,
 ) -> NativeWorkerSummaryKind {
+    let arg_pointer_null_scan = matches!(source.location.region, SummaryMemoryRegion::Arg { .. })
+        && source.size >= 4
+        && matches!(
+            terminator,
+            NativeWorkerTerminator::ZeroByte | NativeWorkerTerminator::ByteEquals(0)
+        );
     match (source.location.region, terminator) {
         (SummaryMemoryRegion::Global { .. }, _) => NativeWorkerSummaryKind::TableWalk,
+        _ if arg_pointer_null_scan => NativeWorkerSummaryKind::TableWalk,
         (_, NativeWorkerTerminator::ByteEquals(b'/' | b'\\' | b':' | b'.')) => {
             NativeWorkerSummaryKind::PathWalk
         }
@@ -6230,12 +7120,14 @@ fn parser_summary(
     func: &SsaArtifact,
     anchor: u64,
     arg: usize,
+    dst_arg: Option<usize>,
     parser: NativeParserSummary,
+    value_fold: Option<NativeWorkerFold>,
 ) -> NativeWorkerSummary {
     NativeWorkerSummary {
         anchor,
         kind: NativeWorkerSummaryKind::Parser,
-        dst: None,
+        dst: dst_arg.map(arg_location),
         src: None,
         memory: Some(SummaryMemoryLocation {
             region: SummaryMemoryRegion::Arg { index: arg },
@@ -6255,7 +7147,7 @@ fn parser_summary(
             func,
             anchor,
             NativeWorkerTerminator::Unknown,
-            None,
+            value_fold,
         )),
         evidence: bounded_evidence(),
     }
@@ -6264,12 +7156,14 @@ fn parser_summary(
 fn parser_summary_for_island(
     island: &LoopIsland,
     arg: usize,
+    dst_arg: Option<usize>,
     parser: NativeParserSummary,
+    value_fold: Option<NativeWorkerFold>,
 ) -> NativeWorkerSummary {
     NativeWorkerSummary {
         anchor: island.header,
         kind: NativeWorkerSummaryKind::Parser,
-        dst: None,
+        dst: dst_arg.map(arg_location),
         src: None,
         memory: Some(SummaryMemoryLocation {
             region: SummaryMemoryRegion::Arg { index: arg },
@@ -6288,7 +7182,7 @@ fn parser_summary_for_island(
         loop_summary: Some(loop_summary_from_island(
             island,
             NativeWorkerTerminator::Unknown,
-            None,
+            value_fold,
             None,
         )),
         evidence: bounded_evidence(),
@@ -6342,14 +7236,206 @@ fn numeric_transform_summary(
             stride: None,
             terminator: Some(terminator),
             fold: None,
+            table_walk: None,
         },
     )
+}
+
+fn infer_length_arg_for_memory_arg(func: &SsaArtifact, memory_arg: usize) -> Option<usize> {
+    let mut candidates = BTreeSet::<usize>::new();
+    for block in func.function().blocks() {
+        for op in &block.ops {
+            let operands = match op {
+                SSAOp::IntAdd { a, b, .. }
+                | SSAOp::PtrAdd {
+                    base: a, index: b, ..
+                }
+                | SSAOp::IntSub { a, b, .. }
+                | SSAOp::PtrSub {
+                    base: a, index: b, ..
+                } => Some((a, b)),
+                _ => None,
+            };
+            let Some((a, b)) = operands else {
+                continue;
+            };
+            match (abi_input_arg_index(a), abi_input_arg_index(b)) {
+                (Some(left), Some(right)) if left == memory_arg && right != memory_arg => {
+                    candidates.insert(right);
+                }
+                (Some(left), Some(right)) if right == memory_arg && left != memory_arg => {
+                    candidates.insert(left);
+                }
+                _ => {}
+            }
+        }
+    }
+    (candidates.len() == 1).then(|| *candidates.iter().next().expect("single length arg"))
+}
+
+fn combined_worker_predicate(
+    predicates: BTreeSet<NativeWorkerPredicate>,
+) -> Option<NativeWorkerPredicate> {
+    let mut predicates: Vec<_> = predicates.into_iter().collect();
+    match predicates.len() {
+        0 => None,
+        1 => predicates.pop(),
+        _ => Some(NativeWorkerPredicate::AnyOf(predicates)),
+    }
+}
+
+fn predicated_numeric_transform_summary_for_island(
+    island: &LoopIsland,
+    transform: &NumericTransformObservation,
+    source: LoadedSource,
+    length_arg: usize,
+    predicate: NativeWorkerPredicate,
+) -> NativeWorkerSummary {
+    let fold = NativeWorkerFold {
+        accumulator: transform.accumulator.clone(),
+        bits: transform.bits,
+        operation: transform.operation,
+        predicate: Some(predicate),
+        init: None,
+        multiplier: None,
+        byte_transform: None,
+    };
+    NativeWorkerSummary {
+        anchor: island.header,
+        kind: NativeWorkerSummaryKind::NumericTransform,
+        dst: transform.dst_arg.map(arg_location),
+        src: None,
+        memory: Some(source.location),
+        len: Some(SummaryTransferLength::Arg(length_arg)),
+        allocation: None,
+        lifetime: None,
+        sync: None,
+        atomic: None,
+        parser: None,
+        loop_summary: Some(loop_summary_from_island(
+            island,
+            NativeWorkerTerminator::LengthBound,
+            Some(fold),
+            Some(length_arg),
+        )),
+        evidence: bounded_evidence(),
+    }
+}
+
+fn infer_loop_accumulator_init(
+    func: &SsaArtifact,
+    island: &LoopIsland,
+    accumulator: &str,
+) -> Option<u64> {
+    for block_addr in &island.body {
+        let Some(block) = func.function().get_block(*block_addr) else {
+            continue;
+        };
+        for phi in &block.phis {
+            if phi.dst.display_name() != accumulator {
+                continue;
+            }
+            let mut constants = BTreeSet::new();
+            for (pred, src) in &phi.sources {
+                if !island.body.contains(pred)
+                    && let Some(value) = resolved_const_value(func, src)
+                {
+                    constants.insert(value);
+                }
+            }
+            if constants.len() == 1 {
+                return constants.into_iter().next();
+            }
+        }
+    }
+    None
+}
+
+fn signed_resolved_const_value(func: &SsaArtifact, var: &SSAVar) -> Option<i64> {
+    resolved_const_value(func, var).map(|value| value as i64)
+}
+
+fn infer_loop_multiplier(func: &SsaArtifact, island: &LoopIsland) -> Option<u64> {
+    let mut constants = BTreeSet::new();
+    for block_addr in &island.body {
+        let Some(block) = func.function().get_block(*block_addr) else {
+            continue;
+        };
+        for op in &block.ops {
+            if let SSAOp::IntMult { a, b, .. } = op {
+                if let Some(value) = resolved_const_value(func, a).filter(|value| *value > 0xff) {
+                    constants.insert(value);
+                }
+                if let Some(value) = resolved_const_value(func, b).filter(|value| *value > 0xff) {
+                    constants.insert(value);
+                }
+            }
+        }
+    }
+    (constants.len() == 1).then(|| *constants.iter().next().expect("single multiplier"))
+}
+
+fn loop_has_ascii_lowercase_transform(func: &SsaArtifact, island: &LoopIsland) -> bool {
+    let mut has_upper_base = false;
+    let mut has_upper_bound = false;
+    let mut has_lower_delta = false;
+    for block_addr in &island.body {
+        let Some(block) = func.function().get_block(*block_addr) else {
+            continue;
+        };
+        for op in &block.ops {
+            match op {
+                SSAOp::IntAdd { a, b, .. } => {
+                    let constants = [
+                        signed_resolved_const_value(func, a),
+                        signed_resolved_const_value(func, b),
+                    ];
+                    has_upper_base |= constants.contains(&Some(-65));
+                    has_lower_delta |= constants.contains(&Some(32));
+                }
+                SSAOp::IntLess { a, b, .. } | SSAOp::IntSLess { a, b, .. } => {
+                    let constants = [resolved_const_value(func, a), resolved_const_value(func, b)];
+                    has_upper_bound |= constants.contains(&Some(26));
+                }
+                _ => {}
+            }
+        }
+    }
+    has_upper_base && has_upper_bound && has_lower_delta
+}
+
+fn enrich_hash_fold_summary_for_island(
+    func: &SsaArtifact,
+    island: &LoopIsland,
+    source: LoadedSource,
+    summary: &mut NativeWorkerSummary,
+) {
+    let length_arg = source_arg(source).and_then(|arg| infer_length_arg_for_memory_arg(func, arg));
+    if let Some(length_arg) = length_arg {
+        summary.len = Some(SummaryTransferLength::Arg(length_arg));
+    }
+    let Some(loop_summary) = summary.loop_summary.as_mut() else {
+        return;
+    };
+    if let Some(length_arg) = length_arg {
+        loop_summary.length_arg = Some(length_arg);
+        loop_summary.terminator = Some(NativeWorkerTerminator::LengthBound);
+    }
+    let Some(fold) = loop_summary.fold.as_mut() else {
+        return;
+    };
+    fold.init = infer_loop_accumulator_init(func, island, &fold.accumulator);
+    fold.multiplier = infer_loop_multiplier(func, island);
+    if loop_has_ascii_lowercase_transform(func, island) {
+        fold.byte_transform = Some(NativeWorkerByteTransform::AsciiLowercase);
+    }
 }
 
 fn transfer_worker_block(
     block: &r2ssa::function::SSABlock,
     input: &WorkerDataflowState,
     mut observations: Option<&mut BlockWorkerObservations>,
+    stack_address_roots: Option<&BTreeMap<SSAVar, StackAddressRoot>>,
 ) -> WorkerDataflowState {
     let mut state = input.clone();
     for phi in &block.phis {
@@ -6363,6 +7449,11 @@ fn transfer_worker_block(
             phi.sources.iter().map(|(_, src)| src),
             &mut state,
         );
+        dataflow_copy_phi_location_if_unambiguous(
+            &phi.dst,
+            phi.sources.iter().map(|(_, src)| src),
+            &mut state,
+        );
     }
 
     for op in &block.ops {
@@ -6370,6 +7461,7 @@ fn transfer_worker_block(
             SSAOp::Phi { dst, sources } => {
                 dataflow_copy_phi_root_if_unambiguous(dst, sources, &mut state);
                 dataflow_copy_phi_load_source_if_unambiguous(dst, sources, &mut state);
+                dataflow_copy_phi_location_if_unambiguous(dst, sources, &mut state);
             }
             SSAOp::Copy { dst, src }
             | SSAOp::IntZExt { dst, src }
@@ -6379,6 +7471,7 @@ fn transfer_worker_block(
             | SSAOp::Trunc { dst, src } => {
                 dataflow_copy_root_if_known(dst, src, &mut state);
                 dataflow_copy_load_source_if_known(dst, src, &mut state);
+                dataflow_copy_location_if_known(dst, src, &mut state);
             }
             SSAOp::IntAdd { dst, a, b }
             | SSAOp::PtrAdd {
@@ -6398,7 +7491,26 @@ fn transfer_worker_block(
                         operation: NativeWorkerFoldOperation::Add,
                     });
                 }
+                if matches!(op, SSAOp::IntAdd { .. })
+                    && is_return_value_var(dst)
+                    && let Some(observations) = observations.as_deref_mut()
+                    && let Some((source, accumulator)) = dataflow_loaded_binary_source(a, b, &state)
+                {
+                    observations.returns.push(ReturnObservation {
+                        anchor: block.addr,
+                        field_plus_count: Some((source, accumulator)),
+                        negative_count_return: false,
+                    });
+                }
+                if matches!(op, SSAOp::IntAdd { .. })
+                    && let Some(observations) = observations.as_deref_mut()
+                    && let Some(observation) =
+                        numeric_increment_observation(block.addr, dst, a, b, &state)
+                {
+                    observations.numeric_transforms.push(observation);
+                }
                 dataflow_copy_additive_load_source(dst, a, b, false, &mut state);
+                dataflow_copy_additive_location(dst, a, b, false, &mut state);
             }
             SSAOp::IntSub { dst, a, b }
             | SSAOp::PtrSub {
@@ -6408,7 +7520,12 @@ fn transfer_worker_block(
                 ..
             } => {
                 dataflow_copy_binary_root_if_unambiguous(dst, a, b, &mut state);
+                let byte_predicate = byte_predicate_from_loaded_compare(a, b, &state);
                 dataflow_copy_additive_load_source(dst, a, b, true, &mut state);
+                dataflow_copy_additive_location(dst, a, b, true, &mut state);
+                if let Some(byte_predicate) = byte_predicate {
+                    insert_exact_byte_predicate_value(&mut state, dst, byte_predicate);
+                }
             }
             SSAOp::IntMult { dst, a, b }
             | SSAOp::IntDiv { dst, a, b }
@@ -6482,8 +7599,23 @@ fn transfer_worker_block(
                 }
                 dataflow_kill_load_source_aliases(dst, &mut state);
             }
+            SSAOp::IntNot { dst, src } | SSAOp::IntNegate { dst, src } => {
+                if is_return_value_var(dst)
+                    && const_value(src).is_none()
+                    && let Some(observations) = observations.as_deref_mut()
+                {
+                    observations.returns.push(ReturnObservation {
+                        anchor: block.addr,
+                        field_plus_count: None,
+                        negative_count_return: true,
+                    });
+                }
+                dataflow_kill_load_source_aliases(dst, &mut state);
+            }
             SSAOp::IntEqual { dst, a, b } | SSAOp::IntNotEqual { dst, a, b } => {
                 let control_args = dataflow_compare_control_args(a, b, &state);
+                let branch_when_zero = matches!(op, SSAOp::IntEqual { .. });
+                let zero_comparison = zero_comparison_value(a, b, branch_when_zero);
                 if let Some(observations) = observations.as_deref_mut()
                     && let Some((source, other)) = dataflow_loaded_compare(a, b, &state)
                 {
@@ -6497,7 +7629,9 @@ fn transfer_worker_block(
                         })
                         .unwrap_or(NativeWorkerTerminator::Unknown);
                     if let Some(arg) = source_arg(source)
-                        && let Some(value) = const_value(other).filter(|value| *value <= 0xff)
+                        && let Some(raw_value) = const_i64(other)
+                        && let Some(value) = raw_value.checked_sub(source.value_delta)
+                        && (0..=i64::from(u8::MAX)).contains(&value)
                     {
                         merge_parser_byte_value(observations, arg, block.addr, value as u8);
                     }
@@ -6507,9 +7641,23 @@ fn transfer_worker_block(
                         terminator,
                     });
                 }
+                if let Some(observations) = observations.as_deref_mut() {
+                    let byte_predicate = byte_predicate_from_zero_compare(a, b, &state)
+                        .or_else(|| byte_predicate_from_loaded_compare(a, b, &state));
+                    if let Some(byte_predicate) = byte_predicate {
+                        observations.byte_predicates.push(BytePredicateObservation {
+                            anchor: block.addr,
+                            source: byte_predicate.source,
+                            predicate: byte_predicate.predicate,
+                        });
+                    }
+                }
                 dataflow_kill_load_source_aliases(dst, &mut state);
                 if let Some(control_args) = control_args {
                     insert_exact_control_source_value(&mut state, dst, control_args);
+                }
+                if let Some(zero_comparison) = zero_comparison {
+                    insert_exact_zero_comparison_value(&mut state, dst, zero_comparison);
                 }
             }
             SSAOp::IntLess { dst, a, b } | SSAOp::IntSLess { dst, a, b } => {
@@ -6572,9 +7720,16 @@ fn transfer_worker_block(
             }
             SSAOp::BoolNot { dst, src } => {
                 let control_args = dataflow_control_args_from_operand(src, &state);
+                let zero_comparison = dataflow_zero_comparison(src, &state).map(|mut value| {
+                    value.branch_when_zero = !value.branch_when_zero;
+                    value
+                });
                 dataflow_kill_load_source_aliases(dst, &mut state);
                 if let Some(control_args) = control_args {
                     insert_exact_control_source_value(&mut state, dst, control_args);
+                }
+                if let Some(zero_comparison) = zero_comparison {
+                    insert_exact_zero_comparison_value(&mut state, dst, zero_comparison);
                 }
             }
             SSAOp::BoolAnd { dst, a, b }
@@ -6593,15 +7748,21 @@ fn transfer_worker_block(
             | SSAOp::LoadLinked { dst, addr, .. }
             | SSAOp::LoadGuarded { dst, addr, .. } => {
                 dataflow_kill_load_source_aliases(dst, &mut state);
-                if let Some(region) = dataflow_rooted_region(addr, &state) {
+                if let Some(stack_root) = dataflow_stack_root(stack_address_roots, addr)
+                    && let Some(root) = exact_dataflow_value(state.stack_values.get(&stack_root))
+                {
+                    insert_exact_dataflow_value(&mut state.roots, dst, root);
+                }
+                if let Some(location) = dataflow_memory_location(addr, &state) {
+                    let location = location_with_access_width(location, dst.size);
                     let source = LoadedSource {
-                        location: location_from_region(region, dst.size),
+                        location,
                         size: dst.size,
                         block_addr: block.addr,
                         value_delta: 0,
                     };
                     if let Some(observations) = observations.as_deref_mut()
-                        && matches!(region, SummaryMemoryRegion::Global { .. })
+                        && matches!(location.region, SummaryMemoryRegion::Global { .. })
                     {
                         observations.global_loads.push(GlobalLoadObservation {
                             anchor: block.addr,
@@ -6609,7 +7770,7 @@ fn transfer_worker_block(
                         });
                     }
                     if let Some(observations) = observations.as_deref_mut()
-                        && let SummaryMemoryRegion::Arg { index } = region
+                        && let SummaryMemoryRegion::Arg { index } = location.region
                     {
                         observations
                             .option_string_reads
@@ -6622,6 +7783,26 @@ fn transfer_worker_block(
                 }
             }
             SSAOp::Store { addr, val, .. } => {
+                if let Some(stack_root) = dataflow_stack_root(stack_address_roots, addr) {
+                    if let Some(root) = dataflow_rooted_region(val, &state) {
+                        insert_exact_dataflow_value(&mut state.stack_values, &stack_root, root);
+                    } else {
+                        insert_dataflow_value(
+                            &mut state.stack_values,
+                            &stack_root,
+                            DataflowValue::Unknown,
+                        );
+                    }
+                }
+                if let Some(observations) = observations.as_deref_mut()
+                    && let Some(location) = dataflow_memory_location(addr, &state)
+                {
+                    observations.memory_writes.push(MemoryWriteObservation {
+                        anchor: block.addr,
+                        location: location_with_access_width(location, val.size),
+                        width: val.size,
+                    });
+                }
                 if let Some(observations) = observations.as_deref_mut()
                     && let Some(SummaryMemoryRegion::Arg { index }) =
                         dataflow_rooted_region(addr, &state)
@@ -6643,6 +7824,26 @@ fn transfer_worker_block(
             } => {
                 let control_args =
                     dataflow_control_args_from_operand(guard, &state).unwrap_or_default();
+                if let Some(stack_root) = dataflow_stack_root(stack_address_roots, addr) {
+                    if let Some(root) = dataflow_rooted_region(val, &state) {
+                        insert_exact_dataflow_value(&mut state.stack_values, &stack_root, root);
+                    } else {
+                        insert_dataflow_value(
+                            &mut state.stack_values,
+                            &stack_root,
+                            DataflowValue::Unknown,
+                        );
+                    }
+                }
+                if let Some(observations) = observations.as_deref_mut()
+                    && let Some(location) = dataflow_memory_location(addr, &state)
+                {
+                    observations.memory_writes.push(MemoryWriteObservation {
+                        anchor: block.addr,
+                        location: location_with_access_width(location, val.size),
+                        width: val.size,
+                    });
+                }
                 if let Some(observations) = observations.as_deref_mut()
                     && let Some(SummaryMemoryRegion::Arg { index }) =
                         dataflow_rooted_region(addr, &state)
@@ -6659,13 +7860,25 @@ fn transfer_worker_block(
                         });
                 }
             }
-            SSAOp::CBranch { cond, .. } => {
+            SSAOp::CBranch { target, cond } => {
                 if let Some(control_args) = dataflow_control_args_from_operand(cond, &state)
                     && let Some(observations) = observations.as_deref_mut()
                 {
                     observations
                         .option_string_branch_controls
                         .extend(control_args);
+                }
+                if let Some(zero_comparison) = dataflow_zero_comparison(cond, &state)
+                    && let Some(observations) = observations.as_deref_mut()
+                {
+                    let source = dataflow_loaded_source(&zero_comparison.value, &state);
+                    observations.zero_guards.push(ZeroGuardObservation {
+                        anchor: block.addr,
+                        target: ram_address(target),
+                        value: zero_comparison.value,
+                        branch_when_zero: zero_comparison.branch_when_zero,
+                        source,
+                    });
                 }
             }
             SSAOp::CpuId { dst } => {
@@ -6697,6 +7910,9 @@ fn transfer_worker_block(
 
 fn compute_worker_dataflow_inputs(func: &SsaArtifact) -> BTreeMap<u64, WorkerDataflowState> {
     let function = func.function();
+    let stack_address_roots = function
+        .decompile_prep_facts()
+        .map(|facts| &facts.stack_address_roots);
     let block_addrs = function.block_addrs();
     let mut inputs = BTreeMap::<u64, WorkerDataflowState>::new();
     let mut outputs = BTreeMap::<u64, WorkerDataflowState>::new();
@@ -6718,7 +7934,7 @@ fn compute_worker_dataflow_inputs(func: &SsaArtifact) -> BTreeMap<u64, WorkerDat
             let Some(block) = function.get_block(*block_addr) else {
                 continue;
             };
-            let output = transfer_worker_block(block, &input, None);
+            let output = transfer_worker_block(block, &input, None, stack_address_roots);
             if outputs.get(block_addr) != Some(&output) {
                 outputs.insert(*block_addr, output);
                 changed = true;
@@ -6731,11 +7947,20 @@ fn compute_worker_dataflow_inputs(func: &SsaArtifact) -> BTreeMap<u64, WorkerDat
 
 fn collect_block_worker_observations(func: &SsaArtifact) -> BTreeMap<u64, BlockWorkerObservations> {
     let inputs = compute_worker_dataflow_inputs(func);
+    let stack_address_roots = func
+        .function()
+        .decompile_prep_facts()
+        .map(|facts| &facts.stack_address_roots);
     let mut observations = BTreeMap::new();
     for block in func.function().blocks() {
         let input = inputs.get(&block.addr).cloned().unwrap_or_default();
         let mut block_observations = BlockWorkerObservations::default();
-        let _ = transfer_worker_block(block, &input, Some(&mut block_observations));
+        let _ = transfer_worker_block(
+            block,
+            &input,
+            Some(&mut block_observations),
+            stack_address_roots,
+        );
         observations.insert(block.addr, block_observations);
     }
     observations
@@ -6774,8 +7999,15 @@ fn loop_effect_summaries(
         summary.folds.extend(block_observations.folds);
         summary.global_loads.extend(block_observations.global_loads);
         summary
+            .memory_writes
+            .extend(block_observations.memory_writes);
+        summary
             .numeric_transforms
             .extend(block_observations.numeric_transforms);
+        summary
+            .byte_predicates
+            .extend(block_observations.byte_predicates);
+        summary.zero_guards.extend(block_observations.zero_guards);
         for (arg, evidence) in block_observations.parser_comparisons {
             merge_parser_evidence(summary.parser_comparisons.entry(arg).or_default(), evidence);
         }
@@ -6783,14 +8015,323 @@ fn loop_effect_summaries(
     summaries.into_values().collect()
 }
 
+fn memory_write_arg(location: SummaryMemoryLocation) -> Option<usize> {
+    match location.region {
+        SummaryMemoryRegion::Arg { index } => Some(index),
+        SummaryMemoryRegion::Global { .. }
+        | SummaryMemoryRegion::HeapReturn
+        | SummaryMemoryRegion::Unknown => None,
+    }
+}
+
+fn parser_output_args_from_effects(effects: &[LoopEffectSummary]) -> BTreeMap<usize, usize> {
+    const MIN_DISTINCT_OUT_WRITES: usize = 2;
+
+    let mut parser_args = BTreeSet::new();
+    let mut writes_by_arg = BTreeMap::<usize, BTreeSet<SummaryMemoryLocation>>::new();
+    for effect in effects {
+        parser_args.extend(effect.parser_comparisons.keys().copied());
+        for write in &effect.memory_writes {
+            if let Some(arg) = memory_write_arg(write.location) {
+                writes_by_arg.entry(arg).or_default().insert(write.location);
+            }
+        }
+    }
+
+    parser_args
+        .into_iter()
+        .filter_map(|parser_arg| {
+            let dst_arg = writes_by_arg
+                .iter()
+                .filter(|(arg, writes)| {
+                    **arg != parser_arg && writes.len() >= MIN_DISTINCT_OUT_WRITES
+                })
+                .map(|(arg, _)| *arg)
+                .next()?;
+            Some((parser_arg, dst_arg))
+        })
+        .collect()
+}
+
+fn parser_return_predicates_from_effects(
+    func: &SsaArtifact,
+    effects: &[LoopEffectSummary],
+) -> BTreeMap<usize, NativeParserReturnPredicate> {
+    let mut parser_anchors = BTreeMap::<usize, u64>::new();
+    let mut zero_scan_blocks = BTreeMap::<usize, BTreeSet<u64>>::new();
+    let mut guards = Vec::<ZeroGuardObservation>::new();
+
+    for effect in effects {
+        for (arg, evidence) in &effect.parser_comparisons {
+            parser_anchors
+                .entry(*arg)
+                .and_modify(|anchor| *anchor = (*anchor).min(evidence.anchor))
+                .or_insert(evidence.anchor);
+        }
+        for scan in &effect.scans {
+            if scan.terminator == NativeWorkerTerminator::ZeroByte
+                && let Some(arg) = source_arg(scan.source)
+            {
+                zero_scan_blocks.entry(arg).or_default().insert(scan.anchor);
+            }
+        }
+        guards.extend(effect.zero_guards.iter().cloned());
+    }
+
+    let mut predicates = BTreeMap::new();
+    for (arg, parser_anchor) in parser_anchors {
+        let Some(zero_blocks) = zero_scan_blocks.get(&arg) else {
+            continue;
+        };
+        let has_nonzero_then_zero_check = guards.iter().any(|guard| {
+            if guard.anchor < parser_anchor {
+                return false;
+            }
+            let successors = func.function().successors(guard.anchor);
+            let nonzero_successors = successors.into_iter().filter(|succ| {
+                if guard.branch_when_zero {
+                    Some(*succ) != guard.target
+                } else {
+                    Some(*succ) == guard.target
+                }
+            });
+            nonzero_successors
+                .filter(|succ| *succ >= parser_anchor)
+                .any(|succ| zero_blocks.contains(&succ))
+        });
+        if has_nonzero_then_zero_check {
+            predicates.insert(
+                arg,
+                NativeParserReturnPredicate {
+                    kind: NativeParserReturnPredicateKind::NonzeroCursorAndZeroTerminator,
+                    cursor_arg: arg,
+                },
+            );
+        }
+    }
+    predicates
+}
+
+fn loaded_source_offset(source: LoadedSource) -> Option<u64> {
+    let range = source.location.range?;
+    if range.offset_lo == range.offset_hi && range.offset_lo >= 0 {
+        u64::try_from(range.offset_lo).ok()
+    } else {
+        None
+    }
+}
+
+fn zero_guard_successors(func: &SsaArtifact, guard: &ZeroGuardObservation) -> BTreeSet<u64> {
+    if guard.branch_when_zero {
+        return guard.target.into_iter().collect();
+    }
+    func.function()
+        .successors(guard.anchor)
+        .into_iter()
+        .filter(|successor| Some(*successor) != guard.target)
+        .collect()
+}
+
+fn island_exit_reaches_block(func: &SsaArtifact, island: &LoopIsland, target: u64) -> bool {
+    if island.body.contains(&target) {
+        return false;
+    }
+    let mut visited = BTreeSet::new();
+    let mut stack: Vec<_> = island.exits.iter().copied().collect();
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if current == target {
+            return true;
+        }
+        if island.body.contains(&current) {
+            continue;
+        }
+        stack.extend(func.function().successors(current));
+    }
+    false
+}
+
+fn zero_guard_exits_island(
+    func: &SsaArtifact,
+    island: &LoopIsland,
+    guard: &ZeroGuardObservation,
+) -> bool {
+    zero_guard_successors(func, guard)
+        .into_iter()
+        .any(|successor| {
+            !island.body.contains(&successor)
+                || island.exits.contains(&successor)
+                || island_exit_reaches_block(func, island, successor)
+        })
+}
+
+fn table_walk_return_blocks(
+    func: &SsaArtifact,
+    island: &LoopIsland,
+    observations: &BTreeMap<u64, BlockWorkerObservations>,
+) -> Vec<ReturnObservation> {
+    observations
+        .values()
+        .flat_map(|block| block.returns.iter())
+        .filter(|ret| island_exit_reaches_block(func, island, ret.anchor))
+        .cloned()
+        .collect()
+}
+
+fn table_walk_details_from_effects(
+    func: &SsaArtifact,
+    observations: &BTreeMap<u64, BlockWorkerObservations>,
+    effects: &[LoopEffectSummary],
+) -> BTreeMap<(usize, u64), NativeTableWalkSummary> {
+    let mut details = BTreeMap::new();
+    for effect in effects.iter().filter(|effect| effect.natural_loop) {
+        let mut table_args = BTreeSet::<usize>::new();
+        for guard in &effect.zero_guards {
+            if let Some(source) = guard.source
+                && let Some(arg) = source_arg(source)
+            {
+                table_args.insert(arg);
+            }
+        }
+        for scan in &effect.scans {
+            if let Some(arg) = source_arg(scan.source)
+                && loaded_source_access_width(scan.source) >= 2
+            {
+                table_args.insert(arg);
+            }
+        }
+
+        let return_blocks = table_walk_return_blocks(func, &effect.island, observations);
+        for table_arg in table_args {
+            let mut next_offset = None;
+            let mut name_offset = None;
+            let mut len_offset = None;
+
+            for guard in &effect.zero_guards {
+                let Some(source) = guard.source else {
+                    continue;
+                };
+                if source_arg(source) != Some(table_arg) {
+                    continue;
+                }
+                let Some(offset) = loaded_source_offset(source) else {
+                    continue;
+                };
+                let width = loaded_source_access_width(source);
+                if width >= 4 {
+                    if zero_guard_exits_island(func, &effect.island, guard) {
+                        next_offset = Some(next_offset.map_or(offset, |old: u64| old.min(offset)));
+                    } else {
+                        name_offset = Some(name_offset.map_or(offset, |old: u64| old.min(offset)));
+                    }
+                } else if width <= 4 && offset > 0 {
+                    len_offset = Some(len_offset.map_or(offset, |old: u64| old.min(offset)));
+                }
+            }
+
+            if len_offset.is_none() {
+                len_offset = effect
+                    .scans
+                    .iter()
+                    .filter(|scan| source_arg(scan.source) == Some(table_arg))
+                    .filter(|scan| loaded_source_access_width(scan.source) <= 4)
+                    .filter_map(|scan| loaded_source_offset(scan.source))
+                    .filter(|offset| *offset > 0)
+                    .min();
+            }
+
+            let needle_arg = effect
+                .scans
+                .iter()
+                .filter(|scan| loaded_source_access_width(scan.source) == 1)
+                .filter(|scan| loaded_source_offset(scan.source) == Some(0))
+                .filter_map(|scan| source_arg(scan.source))
+                .find(|arg| *arg != table_arg);
+
+            let mut id_offset = None;
+            let mut count_accumulator = None;
+            let mut match_returns_field_plus_count = false;
+            let mut exhausted_returns_negative_count = false;
+            for ret in &return_blocks {
+                if let Some((source, accumulator)) = &ret.field_plus_count
+                    && source_arg(*source) == Some(table_arg)
+                    && let Some(offset) = loaded_source_offset(*source)
+                {
+                    id_offset = Some(offset);
+                    count_accumulator = Some(accumulator.clone());
+                    match_returns_field_plus_count = true;
+                }
+                exhausted_returns_negative_count |= ret.negative_count_return;
+            }
+
+            if count_accumulator.is_none() {
+                count_accumulator = effect
+                    .numeric_transforms
+                    .iter()
+                    .find(|transform| {
+                        transform.operation == NativeWorkerFoldOperation::Add
+                            && transform.length_arg.is_none()
+                    })
+                    .map(|transform| transform.accumulator.clone());
+            }
+
+            if needle_arg.is_some()
+                && id_offset.is_some()
+                && len_offset.is_some()
+                && name_offset.is_some()
+                && next_offset.is_some()
+                && match_returns_field_plus_count
+                && exhausted_returns_negative_count
+            {
+                details.insert(
+                    (table_arg, effect.island.header),
+                    NativeTableWalkSummary {
+                        table_arg,
+                        needle_arg,
+                        id_offset,
+                        len_offset,
+                        name_offset,
+                        next_offset,
+                        count_accumulator,
+                        match_returns_field_plus_count,
+                        exhausted_returns_negative_count,
+                    },
+                );
+            }
+        }
+    }
+    details
+}
+
+fn attach_table_walk_detail(
+    summary: &mut NativeWorkerSummary,
+    details: &BTreeMap<(usize, u64), NativeTableWalkSummary>,
+) {
+    if summary.kind != NativeWorkerSummaryKind::TableWalk {
+        return;
+    }
+    let Some(loop_summary) = summary.loop_summary.as_mut() else {
+        return;
+    };
+    let Some(memory) = summary.memory else {
+        return;
+    };
+    let SummaryMemoryRegion::Arg { index } = memory.region else {
+        return;
+    };
+    if let Some(detail) = details.get(&(index, loop_summary.header)).cloned() {
+        loop_summary.table_walk = Some(detail);
+    }
+}
+
 fn parser_summary_from_evidence(
     arg: usize,
     evidence: &ParserLoopEvidence,
+    digit_fold_evidence: bool,
 ) -> Option<NativeParserSummary> {
-    let numeric_range = evidence
-        .byte_ranges
-        .iter()
-        .any(|range| range.lo <= b'0' && range.hi >= b'9');
+    let numeric_range = parser_evidence_proves_digit_range(evidence, digit_fold_evidence);
     let digit_values = evidence
         .byte_values
         .iter()
@@ -6820,7 +8361,63 @@ fn parser_summary_from_evidence(
         digit_min: matches!(kind, NativeParserKind::Numeric).then_some(b'0'),
         digit_max: matches!(kind, NativeParserKind::Numeric).then_some(b'9'),
         accepts_sign: evidence.accepts_sign,
+        return_predicate: None,
     })
+}
+
+fn parser_evidence_proves_digit_range(
+    evidence: &ParserLoopEvidence,
+    digit_fold_evidence: bool,
+) -> bool {
+    if evidence
+        .byte_ranges
+        .iter()
+        .any(|range| range.lo <= b'0' && range.hi >= b'9')
+    {
+        return true;
+    }
+
+    let lower_bound = evidence
+        .byte_ranges
+        .iter()
+        .filter(|range| range.hi == u8::MAX)
+        .map(|range| range.lo)
+        .max();
+    let upper_bound = evidence
+        .byte_ranges
+        .iter()
+        .filter(|range| range.lo == 0)
+        .map(|range| range.hi)
+        .min();
+    if matches!((lower_bound, upper_bound), (Some(lo), Some(hi)) if lo <= b'0' && hi >= b'9' && lo <= hi)
+    {
+        return true;
+    }
+
+    if digit_fold_evidence
+        && evidence
+            .byte_ranges
+            .iter()
+            .any(|range| range.lo == b'0' && range.hi >= b'8')
+        && (evidence.byte_values.contains(&b'9')
+            || evidence
+                .byte_ranges
+                .iter()
+                .any(|range| range.lo == b'0' && range.hi >= b'9'))
+    {
+        return true;
+    }
+
+    digit_fold_evidence
+        && evidence
+            .byte_ranges
+            .iter()
+            .any(|range| range.lo == 0 && range.hi.saturating_add(1) == b'0')
+        && (evidence.byte_values.contains(&b'9')
+            || evidence
+                .byte_ranges
+                .iter()
+                .any(|range| range.lo == 0 && range.hi.saturating_add(1) == b'9'))
 }
 
 fn option_string_control_args_by_block(
@@ -6922,16 +8519,19 @@ fn summaries_from_loop_effects(func: &SsaArtifact) -> Vec<NativeWorkerSummary> {
     let observations = collect_block_worker_observations(func);
     let mut summaries = Vec::<NativeWorkerSummary>::new();
     summaries.extend(option_string_render_summaries(func, &observations));
-    for effect in loop_effect_summaries(func, observations) {
+    let effects = loop_effect_summaries(func, observations.clone());
+    let parser_output_args = parser_output_args_from_effects(&effects);
+    let parser_return_predicates = parser_return_predicates_from_effects(func, &effects);
+    let table_walk_details = table_walk_details_from_effects(func, &observations, &effects);
+    for effect in effects {
         let mut seen_scans = BTreeSet::new();
         for scan in effect.scans {
             if seen_scans.insert((scan.source.location, scan.terminator)) {
                 if effect.natural_loop {
-                    summaries.push(scan_summary_for_island(
-                        &effect.island,
-                        scan.source,
-                        scan.terminator,
-                    ));
+                    let mut summary =
+                        scan_summary_for_island(&effect.island, scan.source, scan.terminator);
+                    attach_table_walk_detail(&mut summary, &table_walk_details);
+                    summaries.push(summary);
                 } else {
                     summaries.push(scan_summary(
                         func,
@@ -6943,20 +8543,58 @@ fn summaries_from_loop_effects(func: &SsaArtifact) -> Vec<NativeWorkerSummary> {
             }
         }
 
+        let digit_fold_args = effect
+            .folds
+            .iter()
+            .filter(|fold| fold.source.value_delta == -i64::from(b'0'))
+            .filter_map(|fold| source_arg(fold.source))
+            .collect::<BTreeSet<_>>();
+        let mut parser_value_folds = BTreeMap::<usize, NativeWorkerFold>::new();
+        for fold in effect.folds.iter().filter(|fold| {
+            fold.source.value_delta == -i64::from(b'0')
+                && fold.operation == NativeWorkerFoldOperation::Add
+        }) {
+            let Some(arg) = source_arg(fold.source) else {
+                continue;
+            };
+            parser_value_folds
+                .entry(arg)
+                .or_insert_with(|| NativeWorkerFold {
+                    accumulator: fold.accumulator.clone(),
+                    bits: fold.source.size.saturating_mul(8),
+                    operation: fold.operation,
+                    predicate: None,
+                    init: Some(0),
+                    multiplier: Some(10),
+                    byte_transform: None,
+                });
+        }
+
         let mut seen_folds = BTreeSet::new();
-        for fold in effect.folds {
+        for fold in effect
+            .folds
+            .into_iter()
+            .filter(fold_observation_has_hash_stream_source)
+        {
             if seen_folds.insert((
                 fold.source.location,
                 fold.accumulator.clone(),
                 fold.operation,
             )) {
                 if effect.natural_loop {
-                    summaries.push(hash_fold_summary_for_island(
+                    let mut summary = hash_fold_summary_for_island(
                         &effect.island,
                         fold.source,
                         fold.accumulator,
                         fold.operation,
-                    ));
+                    );
+                    enrich_hash_fold_summary_for_island(
+                        func,
+                        &effect.island,
+                        fold.source,
+                        &mut summary,
+                    );
+                    summaries.push(summary);
                 } else {
                     summaries.push(hash_fold_summary(
                         func,
@@ -6974,7 +8612,10 @@ fn summaries_from_loop_effects(func: &SsaArtifact) -> Vec<NativeWorkerSummary> {
             if seen_global_loads.insert(load.source.location) {
                 match (effect.natural_loop, load.source.location.region) {
                     (true, SummaryMemoryRegion::Global { .. }) => {
-                        summaries.push(table_walk_summary_for_island(&effect.island, load.source));
+                        let mut summary =
+                            table_walk_summary_for_island(&effect.island, load.source);
+                        attach_table_walk_detail(&mut summary, &table_walk_details);
+                        summaries.push(summary);
                     }
                     _ => {
                         summaries.push(metadata_probe_worker_summary_for_memory(
@@ -6986,8 +8627,73 @@ fn summaries_from_loop_effects(func: &SsaArtifact) -> Vec<NativeWorkerSummary> {
             }
         }
 
+        let mut seen_memory_writes = BTreeSet::new();
+        for write in effect.memory_writes {
+            if seen_memory_writes.insert((write.location, write.width)) {
+                summaries.push(memory_worker_summary(
+                    write.anchor,
+                    SummaryMemoryEffect {
+                        kind: SummaryMemoryEffectKind::Write,
+                        location: write.location,
+                    },
+                ));
+            }
+        }
+
+        let mut predicated_numeric_transform_keys = BTreeSet::new();
+        if effect.natural_loop {
+            let mut predicates_by_source = BTreeMap::<
+                SummaryMemoryLocation,
+                (LoadedSource, BTreeSet<NativeWorkerPredicate>),
+            >::new();
+            for observation in &effect.byte_predicates {
+                let entry = predicates_by_source
+                    .entry(observation.source.location)
+                    .or_insert_with(|| (observation.source, BTreeSet::new()));
+                entry.1.insert(observation.predicate.clone());
+            }
+            for (_location, (source, predicates)) in predicates_by_source {
+                let Some(memory_arg) = source_arg(source) else {
+                    continue;
+                };
+                let Some(length_arg) = infer_length_arg_for_memory_arg(func, memory_arg) else {
+                    continue;
+                };
+                let Some(predicate) = combined_worker_predicate(predicates) else {
+                    continue;
+                };
+                for transform in effect
+                    .numeric_transforms
+                    .iter()
+                    .filter(|transform| transform.operation == NativeWorkerFoldOperation::Add)
+                {
+                    predicated_numeric_transform_keys.insert((
+                        transform.dst_arg,
+                        transform.accumulator.clone(),
+                        transform.bits,
+                        transform.operation,
+                    ));
+                    summaries.push(predicated_numeric_transform_summary_for_island(
+                        &effect.island,
+                        transform,
+                        source,
+                        length_arg,
+                        predicate.clone(),
+                    ));
+                }
+            }
+        }
+
         let mut seen_numeric_transforms = BTreeSet::new();
         for transform in effect.numeric_transforms {
+            if predicated_numeric_transform_keys.contains(&(
+                transform.dst_arg,
+                transform.accumulator.clone(),
+                transform.bits,
+                transform.operation,
+            )) {
+                continue;
+            }
             if seen_numeric_transforms.insert((
                 transform.dst_arg,
                 transform.length_arg,
@@ -7008,14 +8714,39 @@ fn summaries_from_loop_effects(func: &SsaArtifact) -> Vec<NativeWorkerSummary> {
 
         if effect.natural_loop {
             for (arg, evidence) in &effect.parser_comparisons {
-                if let Some(parser) = parser_summary_from_evidence(*arg, evidence) {
-                    summaries.push(parser_summary_for_island(&effect.island, *arg, parser));
+                if let Some(mut parser) =
+                    parser_summary_from_evidence(*arg, evidence, digit_fold_args.contains(arg))
+                {
+                    parser.return_predicate = parser_return_predicates.get(arg).copied();
+                    let value_fold = matches!(parser.kind, NativeParserKind::Numeric)
+                        .then(|| parser_value_folds.get(arg).cloned())
+                        .flatten();
+                    summaries.push(parser_summary_for_island(
+                        &effect.island,
+                        *arg,
+                        parser_output_args.get(arg).copied(),
+                        parser,
+                        value_fold,
+                    ));
                 }
             }
         } else if has_loopish_or_dispatch_control(func) {
             for (arg, evidence) in &effect.parser_comparisons {
-                if let Some(parser) = parser_summary_from_evidence(*arg, evidence) {
-                    summaries.push(parser_summary(func, evidence.anchor, *arg, parser));
+                if let Some(mut parser) =
+                    parser_summary_from_evidence(*arg, evidence, digit_fold_args.contains(arg))
+                {
+                    parser.return_predicate = parser_return_predicates.get(arg).copied();
+                    let value_fold = matches!(parser.kind, NativeParserKind::Numeric)
+                        .then(|| parser_value_folds.get(arg).cloned())
+                        .flatten();
+                    summaries.push(parser_summary(
+                        func,
+                        evidence.anchor,
+                        *arg,
+                        parser_output_args.get(arg).copied(),
+                        parser,
+                        value_fold,
+                    ));
                 }
             }
         }
@@ -7055,6 +8786,8 @@ mod tests {
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("x0", 0x00, 8));
         arch.add_register(RegisterDef::new("x1", 0x08, 8));
+        arch.add_register(RegisterDef::new("x2", 0x10, 8));
+        arch.add_register(RegisterDef::new("x3", 0x18, 8));
         arch
     }
 
@@ -7067,7 +8800,51 @@ mod tests {
         arch.add_register(RegisterDef::new("AL", 0x00, 1));
         arch.add_register(RegisterDef::new("RDI", 0x20, 8));
         arch.add_register(RegisterDef::new("RSI", 0x28, 8));
+        arch.add_register(RegisterDef::new("RDX", 0x30, 8));
+        arch.add_register(RegisterDef::new("EDX", 0x30, 4));
+        arch.add_register(RegisterDef::new("DX", 0x30, 2));
+        arch.add_register(RegisterDef::new("DL", 0x30, 1));
+        arch.add_register(RegisterDef::new("RCX", 0x38, 8));
+        arch.add_register(RegisterDef::new("ECX", 0x38, 4));
+        arch.add_register(RegisterDef::new("CX", 0x38, 2));
+        arch.add_register(RegisterDef::new("CL", 0x38, 1));
+        arch.add_register(RegisterDef::new("R8", 0x40, 8));
         arch
+    }
+
+    #[test]
+    fn function_semantic_summary_seed_models_known_imports_in_r2sym() {
+        let malloc =
+            function_semantic_summary_seed_for_name(InterprocFunctionId(1), "sym.imp.malloc")
+                .expect("malloc seed");
+        assert_eq!(malloc.return_relation, SummaryReturnRelation::HeapAlloc);
+        assert_eq!(
+            malloc.allocation_effects,
+            vec![SummaryAllocationEffect {
+                size_arg: Some(0),
+                zeroed: false,
+            }]
+        );
+
+        assert!(
+            function_semantic_summary_seed_for_name(InterprocFunctionId(2), "memcpy").is_none(),
+            "raw names without import/PLT evidence must not seed semantics"
+        );
+
+        let memcpy =
+            function_semantic_summary_seed_for_name(InterprocFunctionId(2), "sym.imp.memcpy")
+                .expect("memcpy seed");
+        assert_eq!(memcpy.return_relation, SummaryReturnRelation::Arg(0));
+        assert!(memcpy.arg_effects.get(&0).expect("dst").write);
+        assert!(memcpy.arg_effects.get(&1).expect("src").read);
+        assert_eq!(
+            memcpy.transfer_effects,
+            vec![SummaryTransferEffect {
+                dst: arg_location(0),
+                src: arg_location(1),
+                len: SummaryTransferLength::Arg(2),
+            }]
+        );
     }
 
     #[test]
@@ -7159,6 +8936,172 @@ mod tests {
         assert_eq!(
             hash_fold.evidence.reasons,
             vec![SemanticEvidenceReason::SummaryBudget]
+        );
+    }
+
+    #[test]
+    fn classifier_keeps_byte_hash_fold_after_widened_transform() {
+        let arch = aarch64_test_arch();
+        let loaded = Varnode::unique(0x80, 1);
+        let widened = Varnode::unique(0x81, 8);
+        let transformed = Varnode::unique(0x82, 8);
+        let mixed = Varnode::unique(0x83, 8);
+        let mut block = R2ILBlock::new(0x4080, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::IntZExt {
+            dst: widened.clone(),
+            src: loaded,
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: transformed.clone(),
+            a: widened,
+            b: Varnode::constant(32, 8),
+        });
+        block.push(R2ILOp::IntXor {
+            dst: mixed,
+            a: Varnode::register(0x08, 8),
+            b: transformed,
+        });
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("hash fold SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        let hash_fold = summaries
+            .iter()
+            .find(|summary| {
+                matches!(summary.kind, NativeWorkerSummaryKind::HashFold)
+                    && matches!(
+                        summary.memory.map(|memory| memory.region),
+                        Some(SummaryMemoryRegion::Arg { index: 0 })
+                    )
+            })
+            .expect("widened transformed byte still proves a hash-fold stream");
+        let fold = hash_fold
+            .loop_summary
+            .as_ref()
+            .and_then(|loop_summary| loop_summary.fold.as_ref())
+            .expect("hash fold summary carries a fold proof");
+        assert_eq!(fold.operation, NativeWorkerFoldOperation::Xor);
+        assert_eq!(fold.bits, 8);
+    }
+
+    #[test]
+    fn dataflow_load_source_tracks_size_adapted_ssa_identity() {
+        let mut state = WorkerDataflowState::default();
+        let wide = SSAVar::new("tmp:byte_carrier", 4, 8);
+        let narrow = SSAVar::new("tmp:byte_carrier", 4, 1);
+        let source = LoadedSource {
+            location: arg_location(0),
+            size: 8,
+            block_addr: 0x4090,
+            value_delta: 32,
+        };
+        insert_exact_load_source_value(&mut state, &wide, source);
+
+        let resolved = dataflow_loaded_source(&narrow, &state)
+            .expect("narrow same-identity view keeps load provenance");
+        assert_eq!(resolved.location, source.location);
+        assert_eq!(resolved.size, 1);
+        assert_eq!(resolved.value_delta, 32);
+
+        dataflow_kill_load_source_aliases(&wide, &mut state);
+        assert!(
+            dataflow_loaded_source(&narrow, &state).is_none(),
+            "killing one size view must remove stale same-identity provenance"
+        );
+    }
+
+    #[test]
+    fn classifier_does_not_treat_byte_transform_constant_as_hash_fold() {
+        let arch = aarch64_test_arch();
+        let loaded = Varnode::unique(0x30, 1);
+        let widened = Varnode::unique(0x31, 8);
+        let mut block = R2ILBlock::new(0x4020, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::IntZExt {
+            dst: widened.clone(),
+            src: loaded,
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x32, 8),
+            a: widened,
+            b: Varnode::constant(0x20, 8),
+        });
+        let artifact =
+            SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("byte transform SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::HashFold)),
+            "loaded byte plus literal is a byte transform, not a hash fold: {summaries:?}"
+        );
+    }
+
+    #[test]
+    fn classifier_does_not_treat_pointer_width_add_as_hash_fold() {
+        let arch = aarch64_test_arch();
+        let loaded = Varnode::unique(0x34, 8);
+        let mut block = R2ILBlock::new(0x4024, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x35, 8),
+            a: Varnode::register(0x08, 8),
+            b: loaded,
+        });
+        block.push(R2ILOp::Branch {
+            target: Varnode::constant(0x4024, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("pointer add SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::HashFold)),
+            "pointer-width field/list arithmetic is not byte-stream hash evidence: {summaries:?}"
+        );
+    }
+
+    #[test]
+    fn worker_constant_resolver_follows_single_assignment_defs() {
+        let arch = aarch64_test_arch();
+        let mut block = R2ILBlock::new(0x4020, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x120, 8),
+            src: Varnode::constant(0x14650fb0739d0383, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("constant copy SSA");
+        let block = artifact
+            .function()
+            .blocks()
+            .next()
+            .expect("single SSA block");
+        let SSAOp::Copy { dst, .. } = &block.ops[0] else {
+            panic!("expected SSA copy");
+        };
+
+        assert_eq!(
+            resolved_const_value(&artifact, dst),
+            Some(0x14650fb0739d0383)
         );
     }
 
@@ -7367,6 +9310,353 @@ mod tests {
     }
 
     #[test]
+    fn classifier_detects_numeric_parser_from_signed_add_delta() {
+        let arch = aarch64_test_arch();
+        let loaded = Varnode::unique(0x58, 1);
+        let wide = Varnode::unique(0x59, 8);
+        let digit = Varnode::unique(0x5a, 8);
+        let pred = Varnode::unique(0x5b, 1);
+        let mut block = R2ILBlock::new(0x4058, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::IntSExt {
+            dst: wide.clone(),
+            src: loaded,
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: digit.clone(),
+            a: wide,
+            b: Varnode::constant(0xffffffffffffffd0, 8),
+        });
+        block.push(R2ILOp::IntLessEqual {
+            dst: pred.clone(),
+            a: digit,
+            b: Varnode::constant(9, 8),
+        });
+        block.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x4058, 8),
+            cond: pred,
+        });
+        let artifact =
+            SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("signed-add parser SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        let parser = summaries
+            .iter()
+            .find(|summary| matches!(summary.kind, NativeWorkerSummaryKind::Parser))
+            .and_then(|summary| summary.parser.as_ref())
+            .expect("numeric parser summary from signed add");
+        assert_eq!(parser.kind, NativeParserKind::Numeric);
+        assert_eq!(parser.base, Some(10));
+    }
+
+    #[test]
+    fn parser_digit_range_accepts_x86_split_flag_bounds_with_digit_fold() {
+        let evidence = ParserLoopEvidence {
+            anchor: 0x4058,
+            byte_values: BTreeSet::from([b'9']),
+            byte_ranges: BTreeSet::from([
+                ParserByteRange { lo: 0, hi: b'/' },
+                ParserByteRange {
+                    lo: 0,
+                    hi: b'9' - 1,
+                },
+            ]),
+            accepts_sign: false,
+        };
+
+        let parser =
+            parser_summary_from_evidence(0, &evidence, true).expect("digit parser evidence");
+
+        assert_eq!(parser.kind, NativeParserKind::Numeric);
+        assert_eq!(parser.base, Some(10));
+        assert_eq!(parser.digit_min, Some(b'0'));
+        assert_eq!(parser.digit_max, Some(b'9'));
+    }
+
+    #[test]
+    fn parser_digit_range_accepts_normalized_less_than_nine_with_digit_fold() {
+        let evidence = ParserLoopEvidence {
+            anchor: 0x405a,
+            byte_values: BTreeSet::from([b'9']),
+            byte_ranges: BTreeSet::from([ParserByteRange { lo: b'0', hi: b'8' }]),
+            accepts_sign: false,
+        };
+
+        let parser =
+            parser_summary_from_evidence(0, &evidence, true).expect("split digit parser evidence");
+
+        assert_eq!(parser.kind, NativeParserKind::Numeric);
+        assert_eq!(parser.base, Some(10));
+        assert_eq!(parser.digit_min, Some(b'0'));
+        assert_eq!(parser.digit_max, Some(b'9'));
+    }
+
+    #[test]
+    fn parser_output_arg_requires_distinct_out_writes() {
+        let mut parser_comparisons = BTreeMap::new();
+        parser_comparisons.insert(
+            0,
+            ParserLoopEvidence {
+                anchor: 0x4060,
+                ..ParserLoopEvidence::default()
+            },
+        );
+        let effects = vec![LoopEffectSummary {
+            parser_comparisons,
+            memory_writes: vec![
+                MemoryWriteObservation {
+                    anchor: 0x4070,
+                    location: SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::Arg { index: 1 },
+                        range: Some(SummaryMemoryRange {
+                            offset_lo: 0,
+                            offset_hi: 0,
+                            width: Some(4),
+                        }),
+                    },
+                    width: 4,
+                },
+                MemoryWriteObservation {
+                    anchor: 0x4070,
+                    location: SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::Arg { index: 1 },
+                        range: Some(SummaryMemoryRange {
+                            offset_lo: 8,
+                            offset_hi: 8,
+                            width: Some(8),
+                        }),
+                    },
+                    width: 8,
+                },
+            ],
+            ..LoopEffectSummary::default()
+        }];
+
+        assert_eq!(parser_output_args_from_effects(&effects).get(&0), Some(&1));
+    }
+
+    #[test]
+    fn parser_return_predicate_requires_nonzero_guard_to_zero_scan() {
+        let arch = aarch64_test_arch();
+        let mut guard_block = R2ILBlock::new(0x5000, 4);
+        guard_block.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x6000, 8),
+            cond: Varnode::unique(0x5010, 1),
+        });
+        let zero_block = R2ILBlock::new(0x5004, 4);
+        let exit_block = R2ILBlock::new(0x6000, 4);
+        let artifact =
+            SsaArtifact::for_symbolic(&[guard_block, zero_block, exit_block], Some(&arch))
+                .expect("guarded return predicate CFG");
+
+        let mut parser_comparisons = BTreeMap::new();
+        parser_comparisons.insert(
+            0,
+            ParserLoopEvidence {
+                anchor: 0x4000,
+                ..ParserLoopEvidence::default()
+            },
+        );
+        let effects = vec![
+            LoopEffectSummary {
+                parser_comparisons,
+                ..LoopEffectSummary::default()
+            },
+            LoopEffectSummary {
+                scans: vec![ScanObservation {
+                    anchor: 0x5004,
+                    source: LoadedSource {
+                        location: arg_byte_location(0),
+                        size: 1,
+                        block_addr: 0x5004,
+                        value_delta: 0,
+                    },
+                    terminator: NativeWorkerTerminator::ZeroByte,
+                }],
+                zero_guards: vec![ZeroGuardObservation {
+                    anchor: 0x5000,
+                    target: Some(0x6000),
+                    value: SSAVar::new("cursor", 1, 8),
+                    branch_when_zero: true,
+                    source: None,
+                }],
+                ..LoopEffectSummary::default()
+            },
+        ];
+
+        let predicates = parser_return_predicates_from_effects(&artifact, &effects);
+
+        assert_eq!(
+            predicates.get(&0).map(|predicate| predicate.kind),
+            Some(NativeParserReturnPredicateKind::NonzeroCursorAndZeroTerminator)
+        );
+    }
+
+    fn arg_source(index: usize, offset: i64, width: u32, block_addr: u64) -> LoadedSource {
+        LoadedSource {
+            location: SummaryMemoryLocation {
+                region: SummaryMemoryRegion::Arg { index },
+                range: Some(SummaryMemoryRange {
+                    offset_lo: offset,
+                    offset_hi: offset,
+                    width: Some(width),
+                }),
+            },
+            size: width,
+            block_addr,
+            value_delta: 0,
+        }
+    }
+
+    #[test]
+    fn table_walk_details_require_fields_and_exit_returns() {
+        let arch = aarch64_test_arch();
+        let mut next_guard_block = R2ILBlock::new(0x5100, 4);
+        next_guard_block.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x6000, 8),
+            cond: Varnode::unique(0x5100, 1),
+        });
+        let mut name_guard_block = R2ILBlock::new(0x5104, 4);
+        name_guard_block.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x5108, 8),
+            cond: Varnode::unique(0x5104, 1),
+        });
+        let mut latch_block = R2ILBlock::new(0x5108, 4);
+        latch_block.push(R2ILOp::Branch {
+            target: Varnode::constant(0x5100, 8),
+        });
+        let match_return_block = R2ILBlock::new(0x6000, 4);
+        let exhausted_return_block = R2ILBlock::new(0x6010, 4);
+        let artifact = SsaArtifact::for_symbolic(
+            &[
+                next_guard_block,
+                name_guard_block,
+                latch_block,
+                match_return_block,
+                exhausted_return_block,
+            ],
+            Some(&arch),
+        )
+        .expect("table walk proof CFG");
+        let island = LoopIsland {
+            header: 0x5100,
+            body: BTreeSet::from([0x5100, 0x5104, 0x5108]),
+            entries: BTreeSet::from([0x5100]),
+            exits: BTreeSet::from([0x6000, 0x6010]),
+        };
+        let effects = vec![LoopEffectSummary {
+            island,
+            natural_loop: true,
+            scans: vec![
+                ScanObservation {
+                    anchor: 0x5104,
+                    source: arg_source(0, 6, 2, 0x5104),
+                    terminator: NativeWorkerTerminator::ZeroByte,
+                },
+                ScanObservation {
+                    anchor: 0x5108,
+                    source: arg_source(1, 0, 1, 0x5108),
+                    terminator: NativeWorkerTerminator::ZeroByte,
+                },
+            ],
+            numeric_transforms: vec![NumericTransformObservation {
+                anchor: 0x5100,
+                dst_arg: None,
+                length_arg: None,
+                accumulator: "seen".to_string(),
+                bits: 32,
+                operation: NativeWorkerFoldOperation::Add,
+            }],
+            zero_guards: vec![
+                ZeroGuardObservation {
+                    anchor: 0x5100,
+                    target: Some(0x6000),
+                    value: SSAVar::new("next", 1, 8),
+                    branch_when_zero: true,
+                    source: Some(arg_source(0, 32, 8, 0x5100)),
+                },
+                ZeroGuardObservation {
+                    anchor: 0x5104,
+                    target: Some(0x5108),
+                    value: SSAVar::new("name", 1, 8),
+                    branch_when_zero: true,
+                    source: Some(arg_source(0, 24, 8, 0x5104)),
+                },
+                ZeroGuardObservation {
+                    anchor: 0x5104,
+                    target: Some(0x5108),
+                    value: SSAVar::new("len", 1, 2),
+                    branch_when_zero: true,
+                    source: Some(arg_source(0, 6, 2, 0x5104)),
+                },
+            ],
+            ..LoopEffectSummary::default()
+        }];
+        let observations = BTreeMap::from([
+            (
+                0x6000,
+                BlockWorkerObservations {
+                    returns: vec![ReturnObservation {
+                        anchor: 0x6000,
+                        field_plus_count: Some((arg_source(0, 0, 4, 0x6000), "seen".to_string())),
+                        negative_count_return: false,
+                    }],
+                    ..BlockWorkerObservations::default()
+                },
+            ),
+            (
+                0x6010,
+                BlockWorkerObservations {
+                    returns: vec![ReturnObservation {
+                        anchor: 0x6010,
+                        field_plus_count: None,
+                        negative_count_return: true,
+                    }],
+                    ..BlockWorkerObservations::default()
+                },
+            ),
+        ]);
+
+        let details = table_walk_details_from_effects(&artifact, &observations, &effects);
+        let detail = details.get(&(0, 0x5100)).expect("table walk detail");
+
+        assert_eq!(detail.needle_arg, Some(1));
+        assert_eq!(detail.id_offset, Some(0));
+        assert_eq!(detail.len_offset, Some(6));
+        assert_eq!(detail.name_offset, Some(24));
+        assert_eq!(detail.next_offset, Some(32));
+        assert!(detail.match_returns_field_plus_count);
+        assert!(detail.exhausted_returns_negative_count);
+    }
+
+    #[test]
+    fn parser_digit_range_rejects_split_flag_bounds_without_digit_fold() {
+        let evidence = ParserLoopEvidence {
+            anchor: 0x405c,
+            byte_values: BTreeSet::from([b'9']),
+            byte_ranges: BTreeSet::from([
+                ParserByteRange { lo: 0, hi: b'/' },
+                ParserByteRange {
+                    lo: 0,
+                    hi: b'9' - 1,
+                },
+            ]),
+            accepts_sign: false,
+        };
+
+        let parser =
+            parser_summary_from_evidence(0, &evidence, false).expect("token parser evidence");
+
+        assert_eq!(parser.kind, NativeParserKind::Token);
+    }
+
+    #[test]
     fn classifier_detects_token_parser_loop_from_whitespace_range() {
         let arch = aarch64_test_arch();
         let loaded = Varnode::unique(0x60, 1);
@@ -7462,6 +9752,50 @@ mod tests {
     }
 
     #[test]
+    fn classifier_detects_table_walk_from_arg_pointer_null_check() {
+        let arch = aarch64_test_arch();
+        let loaded = Varnode::unique(0x84, 8);
+        let pred = Varnode::unique(0x85, 1);
+        let mut block = R2ILBlock::new(0x4084, 4);
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::IntEqual {
+            dst: pred.clone(),
+            a: loaded,
+            b: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x4084, 8),
+            cond: pred,
+        });
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("table pointer SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::TableWalk)
+                && matches!(
+                    summary.memory.map(|memory| memory.region),
+                    Some(SummaryMemoryRegion::Arg { index: 0 })
+                )
+                && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+                    loop_summary.terminator == Some(NativeWorkerTerminator::ZeroByte)
+                })
+        }));
+        assert!(!summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::StringScan)
+                && matches!(
+                    summary.memory.map(|memory| memory.region),
+                    Some(SummaryMemoryRegion::Arg { index: 0 })
+                )
+        }));
+    }
+
+    #[test]
     fn classifier_detects_metadata_probe_from_single_global_load() {
         let arch = aarch64_test_arch();
         let mut block = R2ILBlock::new(0x4090, 4);
@@ -7519,6 +9853,157 @@ mod tests {
                             .fold
                             .as_ref()
                             .is_some_and(|fold| fold.bits == 64)
+                })
+        }));
+    }
+
+    #[test]
+    fn classifier_detects_predicated_byte_count_from_sub_zero_compares() {
+        let arch = aarch64_test_arch();
+        let end = Varnode::unique(0xb0, 8);
+        let loaded = Varnode::unique(0xb1, 1);
+        let diff_a = Varnode::unique(0xb2, 8);
+        let diff_b = Varnode::unique(0xb3, 8);
+        let pred_a = Varnode::unique(0xb4, 1);
+        let pred_b = Varnode::unique(0xb5, 1);
+        let count = Varnode::unique(0xb6, 8);
+        let mut block = R2ILBlock::new(0x40b0, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: end,
+            a: Varnode::register(0x00, 8),
+            b: Varnode::register(0x08, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x00, 8),
+        });
+        block.push(R2ILOp::IntSub {
+            dst: diff_a.clone(),
+            a: Varnode::register(0x10, 8),
+            b: loaded.clone(),
+        });
+        block.push(R2ILOp::IntEqual {
+            dst: pred_a.clone(),
+            a: diff_a,
+            b: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::IntSub {
+            dst: diff_b.clone(),
+            a: loaded,
+            b: Varnode::register(0x18, 8),
+        });
+        block.push(R2ILOp::IntEqual {
+            dst: pred_b,
+            a: diff_b,
+            b: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: count,
+            a: Varnode::unique(0xb7, 8),
+            b: Varnode::constant(1, 8),
+        });
+        block.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x40b0, 8),
+            cond: pred_a,
+        });
+        let artifact = SsaArtifact::for_symbolic(&[block], Some(&arch)).expect("byte count SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::NumericTransform)
+                && matches!(
+                    summary.memory.map(|memory| memory.region),
+                    Some(SummaryMemoryRegion::Arg { index: 0 })
+                )
+                && matches!(summary.len, Some(SummaryTransferLength::Arg(1)))
+                && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+                    loop_summary.length_arg == Some(1)
+                        && loop_summary.fold.as_ref().is_some_and(|fold| {
+                            fold.operation == NativeWorkerFoldOperation::Add
+                                && matches!(
+                                    fold.predicate,
+                                    Some(NativeWorkerPredicate::AnyOf(ref predicates))
+                                        if predicates == &vec![
+                                            NativeWorkerPredicate::ByteEqArg { arg: 2 },
+                                            NativeWorkerPredicate::ByteEqArg { arg: 3 },
+                                        ]
+                                )
+                        })
+                })
+        }));
+    }
+
+    #[test]
+    fn classifier_detects_x86_aliased_predicated_byte_count() {
+        let arch = x86_64_alias_test_arch();
+        let end = Varnode::unique(0xc0, 8);
+        let loaded = Varnode::unique(0xc1, 1);
+        let diff = Varnode::unique(0xc2, 8);
+        let arg_byte = Varnode::unique(0xc3, 1);
+        let pred = Varnode::unique(0xc4, 1);
+        let count = Varnode::unique(0xc5, 8);
+        let mut block = R2ILBlock::new(0x40c0, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: end,
+            a: Varnode::register(0x20, 8),
+            b: Varnode::register(0x28, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x20, 8),
+        });
+        block.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x00, 4),
+            src: loaded,
+        });
+        block.push(R2ILOp::Copy {
+            dst: arg_byte.clone(),
+            src: Varnode::register(0x30, 1),
+        });
+        block.push(R2ILOp::IntSub {
+            dst: diff.clone(),
+            a: arg_byte,
+            b: Varnode::register(0x00, 1),
+        });
+        block.push(R2ILOp::IntEqual {
+            dst: pred.clone(),
+            a: diff,
+            b: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: count,
+            a: Varnode::register(0x40, 8),
+            b: Varnode::constant(1, 8),
+        });
+        block.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x40c0, 8),
+            cond: pred,
+        });
+        let artifact =
+            SsaArtifact::for_decompile(&[block], Some(&arch)).expect("x86 byte count SSA");
+
+        let summaries =
+            bounded_worker_summaries(classify_function_worker_summaries_unbounded(&artifact));
+
+        assert!(summaries.iter().any(|summary| {
+            matches!(summary.kind, NativeWorkerSummaryKind::NumericTransform)
+                && matches!(
+                    summary.memory.map(|memory| memory.region),
+                    Some(SummaryMemoryRegion::Arg { index: 0 })
+                )
+                && matches!(summary.len, Some(SummaryTransferLength::Arg(1)))
+                && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+                    loop_summary.fold.as_ref().is_some_and(|fold| {
+                        fold.operation == NativeWorkerFoldOperation::Add
+                            && matches!(
+                                fold.predicate,
+                                Some(NativeWorkerPredicate::ByteEqArg { arg: 2 })
+                            )
+                    })
                 })
         }));
     }
@@ -7633,7 +10118,155 @@ mod tests {
     }
 
     #[test]
-    fn interproc_summary_adds_hash_pattern_and_getopt_families() {
+    fn worker_dataflow_recovers_arg_root_through_stack_spill() {
+        let slot_addr = SSAVar::new("tmp:slot_addr", 1, 8);
+        let saved_ptr = SSAVar::new("tmp:saved_ptr", 1, 8);
+        let indexed_ptr = SSAVar::new("tmp:indexed_ptr", 1, 8);
+        let loaded_byte = SSAVar::new("tmp:loaded_byte", 1, 1);
+        let stack_root = StackAddressRoot {
+            base: r2ssa::StackAddressBase::FramePointer,
+            offset: -0x18,
+        };
+        let stack_roots = BTreeMap::from([(slot_addr.clone(), stack_root)]);
+        let block = r2ssa::function::SSABlock {
+            addr: 0x4200,
+            size: 4,
+            phis: Vec::new(),
+            ops: vec![
+                SSAOp::Store {
+                    space: "Ram".to_string(),
+                    addr: slot_addr.clone(),
+                    val: SSAVar::new("RDI", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: saved_ptr.clone(),
+                    space: "Ram".to_string(),
+                    addr: slot_addr,
+                },
+                SSAOp::IntAdd {
+                    dst: indexed_ptr.clone(),
+                    a: saved_ptr,
+                    b: SSAVar::constant(1, 8),
+                },
+                SSAOp::Load {
+                    dst: loaded_byte.clone(),
+                    space: "Ram".to_string(),
+                    addr: indexed_ptr,
+                },
+            ],
+        };
+
+        let state = transfer_worker_block(
+            &block,
+            &WorkerDataflowState::default(),
+            None,
+            Some(&stack_roots),
+        );
+        let source = dataflow_loaded_source(&loaded_byte, &state).expect("arg byte source");
+
+        assert_eq!(
+            source.location.region,
+            SummaryMemoryRegion::Arg { index: 0 }
+        );
+    }
+
+    #[test]
+    fn worker_dataflow_records_offset_arg_memory_write() {
+        let ptr = SSAVar::new("tmp:out_plus_hash", 1, 8);
+        let value = SSAVar::new("tmp:hash_value", 1, 8);
+        let block = r2ssa::function::SSABlock {
+            addr: 0x4280,
+            size: 4,
+            phis: Vec::new(),
+            ops: vec![
+                SSAOp::IntAdd {
+                    dst: ptr.clone(),
+                    a: SSAVar::new("RSI", 0, 8),
+                    b: SSAVar::constant(8, 8),
+                },
+                SSAOp::Store {
+                    space: "Ram".to_string(),
+                    addr: ptr,
+                    val: value,
+                },
+            ],
+        };
+        let mut observations = BlockWorkerObservations::default();
+
+        transfer_worker_block(
+            &block,
+            &WorkerDataflowState::default(),
+            Some(&mut observations),
+            None,
+        );
+
+        assert_eq!(
+            observations.memory_writes,
+            vec![MemoryWriteObservation {
+                anchor: 0x4280,
+                location: SummaryMemoryLocation {
+                    region: SummaryMemoryRegion::Arg { index: 1 },
+                    range: Some(SummaryMemoryRange {
+                        offset_lo: 8,
+                        offset_hi: 8,
+                        width: Some(8),
+                    }),
+                },
+                width: 8,
+            }]
+        );
+    }
+
+    #[test]
+    fn worker_dataflow_preserves_x86_byte_source_after_same_family_widening() {
+        let loaded_byte = SSAVar::new("tmp:loaded_byte", 1, 1);
+        let mut input = WorkerDataflowState::default();
+        insert_exact_dataflow_value(
+            &mut input.roots,
+            &SSAVar::new("RDI", 0, 8),
+            SummaryMemoryRegion::Arg { index: 0 },
+        );
+        let block = r2ssa::function::SSABlock {
+            addr: 0x4300,
+            size: 4,
+            phis: Vec::new(),
+            ops: vec![
+                SSAOp::Load {
+                    dst: loaded_byte.clone(),
+                    space: "Ram".to_string(),
+                    addr: SSAVar::new("RDI", 0, 8),
+                },
+                SSAOp::IntZExt {
+                    dst: SSAVar::new("EAX", 1, 4),
+                    src: loaded_byte,
+                },
+                SSAOp::IntZExt {
+                    dst: SSAVar::new("RAX", 2, 8),
+                    src: SSAVar::new("EAX", 1, 4),
+                },
+                SSAOp::IntLess {
+                    dst: SSAVar::new("CF", 1, 1),
+                    a: SSAVar::new("AL", 0, 1),
+                    b: SSAVar::constant(u64::from(b'/'), 1),
+                },
+            ],
+        };
+        let mut observations = BlockWorkerObservations::default();
+
+        transfer_worker_block(&block, &input, Some(&mut observations), None);
+
+        let evidence = observations
+            .parser_comparisons
+            .get(&0)
+            .expect("arg byte compare should survive EAX/RAX widening");
+        assert!(evidence.byte_ranges.contains(&ParserByteRange {
+            lo: 0,
+            hi: b'/' - 1
+        }));
+    }
+
+    #[test]
+    fn interproc_summary_rejects_name_only_getopt_and_hash_pattern_families() {
         let md5 = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x5000),
             Some("sym._md5_process_block".to_string()),
@@ -7651,96 +10284,36 @@ mod tests {
         let fnmatch_summaries = summaries_from_interproc_summary_unbounded(0x5010, &fnmatch);
         let getopt_summaries = summaries_from_interproc_summary_unbounded(0x5020, &getopt);
 
-        assert!(md5_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::HashFold)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Arg(1)))
-                && matches!(
-                    summary.dst.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 2 })
-                )
-                && summary
-                    .loop_summary
-                    .as_ref()
-                    .and_then(|loop_summary| loop_summary.fold.as_ref())
-                    .is_some_and(|fold| {
-                        fold.accumulator == "md5_state"
-                            && fold.bits == 32
-                            && fold.operation == NativeWorkerFoldOperation::RotateMix
-                    })
-        }));
-        assert!(fnmatch_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
-        assert!(fnmatch_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::StringScan)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-        }));
-        assert!(getopt_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 2 })
-                )
-        }));
-        assert!(getopt_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::TableWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 3 })
-                )
-        }));
+        assert!(
+            md5_summaries.is_empty(),
+            "function names alone must not manufacture hash-fold semantics: {md5_summaries:?}"
+        );
+        assert!(
+            fnmatch_summaries.is_empty(),
+            "function names alone must not manufacture parser/string-scan semantics: {fnmatch_summaries:?}"
+        );
+        assert!(
+            getopt_summaries.is_empty(),
+            "function names alone must not manufacture parser/table-walk semantics: {getopt_summaries:?}"
+        );
     }
 
     #[test]
-    fn hash_context_read_summaries_are_bounded_state_copies() {
+    fn hash_context_read_name_alone_does_not_create_state_copy() {
         let summary = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x5028),
             Some("dbg.sha384_read_ctx".to_string()),
         );
         let summaries = summaries_from_interproc_summary_unbounded(0x5028, &summary);
 
-        assert!(summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::MemoryRead)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Const(48)))
-        }));
-        assert!(summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Const(48)))
-        }));
-        assert!(summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::NumericTransform)
-                && matches!(
-                    summary.dst.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && summary
-                    .loop_summary
-                    .as_ref()
-                    .is_some_and(|loop_summary| loop_summary.iterations == Some(6))
-        }));
+        assert!(
+            summaries.is_empty(),
+            "function names alone must not manufacture digest context effects: {summaries:?}"
+        );
     }
 
     #[test]
-    fn interproc_summary_adds_broad_coreutils_blocker_families() {
+    fn interproc_summary_rejects_broad_coreutils_name_only_families() {
         let digest = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x5030),
             Some("sym.digest_file.isra.0".to_string()),
@@ -7806,124 +10379,28 @@ mod tests {
         let xpalloc_summaries = summaries_from_interproc_summary_unbounded(0x50d0, &xpalloc);
         let version_summaries = summaries_from_interproc_summary_unbounded(0x50e0, &version);
 
-        assert!(
-            digest_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::HashFold))
-        );
-        assert!(
-            digest_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::RecordStream))
-        );
-        assert!(
-            binop_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::Parser))
-        );
-        assert!(
-            binop_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::TableWalk))
-        );
+        assert!(digest_summaries.is_empty());
+        assert!(binop_summaries.is_empty());
         let test_or = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x5041),
             Some("dbg.or".to_string()),
         );
         let test_or_summaries = summaries_from_interproc_summary_unbounded(0x5041, &test_or);
-        assert!(test_or_summaries.iter().all(|summary| {
-            matches!(
-                summary.memory.map(|location| location.region),
-                Some(SummaryMemoryRegion::Global { .. })
-            ) && summary.arg_indices().is_empty()
-        }));
-        assert!(quote_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::StringScan)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-        }));
-        assert!(
-            quote_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::FormatRender))
-        );
-        assert!(mbrtowc_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Arg(2)))
-        }));
-        assert!(
-            write_counts_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::FormatRender))
-        );
-        assert!(
-            write_counts_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::OutputStream))
-        );
-        assert!(verror_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::DiagnosticWrapper)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 4 })
-                )
-        }));
-        assert!(argmatch_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::TableWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-        }));
-        assert!(renameatu_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::PathWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 3 })
-                )
-        }));
-        assert!(
-            streamsavedir_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::DirectoryTraversal))
-        );
-        assert!(
-            quote_alloc_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::Allocation))
-        );
-        assert!(quote_alloc_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::TableWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 3 })
-                )
-        }));
-        assert!(xpalloc_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Allocation)
-                && matches!(
-                    summary.allocation,
-                    Some(SummaryAllocationEffect {
-                        size_arg: Some(4),
-                        zeroed: false,
-                    })
-                )
-        }));
-        assert!(
-            version_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::FormatRender))
-        );
+        assert!(test_or_summaries.is_empty());
+        assert!(quote_summaries.is_empty());
+        assert!(mbrtowc_summaries.is_empty());
+        assert!(write_counts_summaries.is_empty());
+        assert!(verror_summaries.is_empty());
+        assert!(argmatch_summaries.is_empty());
+        assert!(renameatu_summaries.is_empty());
+        assert!(streamsavedir_summaries.is_empty());
+        assert!(quote_alloc_summaries.is_empty());
+        assert!(xpalloc_summaries.is_empty());
+        assert!(version_summaries.is_empty());
     }
 
     #[test]
-    fn interproc_summary_adds_named_worker_families() {
+    fn interproc_summary_rejects_named_worker_families_without_evidence() {
         let diagnose = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x5100),
             Some("sym.diagnose".to_string()),
@@ -8072,259 +10549,49 @@ mod tests {
         let sort_merge_summaries = summaries_from_interproc_summary_unbounded(0x5f00, &sort_merge);
         let main_summaries = summaries_from_interproc_summary_unbounded(0x6000, &main_summary);
 
-        assert!(diagnose_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::DiagnosticWrapper)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-        }));
-        assert!(fetch_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::FormatArgumentFetch)
-                && matches!(
-                    summary.src.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(
-                    summary.dst.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-        }));
-        assert!(usage_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::DiagnosticWrapper)
-                && summary.memory.is_none()
-        }));
-        assert!(keycompare_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::TableWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
-        assert!(readlinebuffer_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.dst.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && summary
-                    .parser
-                    .as_ref()
-                    .is_some_and(|parser| parser.kind == NativeParserKind::Token)
-        }));
-        assert!(quotearg_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::StringScan)
-                && matches!(
-                    summary.dst.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 2 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Arg(3)))
-        }));
-        assert!(mbrtoc32_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.dst.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Arg(2)))
-        }));
-        assert!(xstrtoumax_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && summary
-                    .parser
-                    .as_ref()
-                    .is_some_and(|parser| parser.kind == NativeParserKind::Numeric)
-        }));
-        assert!(vstrtoimax_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && summary
-                    .parser
-                    .as_ref()
-                    .is_some_and(|parser| parser.kind == NativeParserKind::Numeric)
-        }));
-        assert!(copy_file_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::FileTransfer)
-                && matches!(
-                    summary.src.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(
-                    summary.dst.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 4 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Arg(8)))
-        }));
-        assert!(copy_with_unblock_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::OutputStream)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Arg(1)))
-        }));
-        assert!(iwrite_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::OutputStream)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && matches!(summary.len, Some(SummaryTransferLength::Arg(2)))
-        }));
-        assert!(translate_charset_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::TableWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
-        assert!(invalidate_cache_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::MetadataProbe)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
-        assert!(parse_long_options_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && summary
-                    .parser
-                    .as_ref()
-                    .is_some_and(|parser| parser.kind == NativeParserKind::Token)
-        }));
-        assert!(parse_gnu_options_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 1 })
-                )
-                && summary
-                    .parser
-                    .as_ref()
-                    .is_some_and(|parser| parser.kind == NativeParserKind::Token)
-        }));
-        assert!(human_options_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && summary
-                    .parser
-                    .as_ref()
-                    .is_some_and(|parser| parser.kind == NativeParserKind::Numeric)
-        }));
-        assert!(parse_integer_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Parser)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-                && summary
-                    .parser
-                    .as_ref()
-                    .is_some_and(|parser| parser.kind == NativeParserKind::Numeric)
-        }));
-        assert!(
-            synchronize_output_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::Synchronization))
-        );
-        assert!(copy_internal_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::PathWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
-        assert!(
-            copy_internal_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::FileTransfer))
-        );
-        assert!(fts_read_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::DirectoryTraversal)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
-        assert!(fts_close_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::DirectoryTraversal)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
-        assert!(changedir_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::PathWalk)
-                && matches!(
-                    summary.memory.map(|location| location.region),
-                    Some(SummaryMemoryRegion::Arg { index: 3 })
-                )
-        }));
-        assert!(
-            cut_field_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::RecordStream))
-        );
-        assert!(
-            cut_field_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::FieldSelection))
-        );
-        assert!(
-            cut_field_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::OutputStream))
-        );
-        assert!(
-            print_long_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::FormatRender))
-        );
-        assert!(
-            print_long_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::MetadataProbe))
-        );
-        assert!(
-            sort_merge_summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::SortMerge))
-        );
-        assert!(main_summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::ProgramOrchestrator)
-                && summary.memory.is_none()
-                && summary.loop_summary.is_none()
-        }));
+        let name_only_summaries = [
+            ("sym.diagnose", &diagnose_summaries),
+            ("sym.printf_fetchargs", &fetch_summaries),
+            ("dbg.usage", &usage_summaries),
+            ("dbg.keycompare", &keycompare_summaries),
+            ("sym.readlinebuffer_delim", &readlinebuffer_summaries),
+            ("sym.quotearg_buffer_restyled", &quotearg_summaries),
+            ("sym.rpl_mbrtoc32", &mbrtoc32_summaries),
+            ("dbg.xstrtoumax", &xstrtoumax_summaries),
+            ("dbg.vstrtoimax", &vstrtoimax_summaries),
+            ("sym.copy_file_data", &copy_file_summaries),
+            ("dbg.copy_with_unblock", &copy_with_unblock_summaries),
+            ("sym.iwrite.constprop.0", &iwrite_summaries),
+            ("dbg.translate_charset", &translate_charset_summaries),
+            ("dbg.invalidate_cache", &invalidate_cache_summaries),
+            ("dbg.parse_long_options", &parse_long_options_summaries),
+            (
+                "dbg.parse_gnu_standard_options_only",
+                &parse_gnu_options_summaries,
+            ),
+            ("dbg.human_options", &human_options_summaries),
+            ("dbg.parse_integer", &parse_integer_summaries),
+            ("dbg.synchronize_output", &synchronize_output_summaries),
+            ("sym.copy_internal", &copy_internal_summaries),
+            ("sym.rpl_fts_read", &fts_read_summaries),
+            ("sym.rpl_fts_close", &fts_close_summaries),
+            ("sym.fts_safe_changedir", &changedir_summaries),
+            ("dbg.cut_fields_bytesearch", &cut_field_summaries),
+            ("dbg.print_long_format", &print_long_summaries),
+            ("dbg.mergefps", &sort_merge_summaries),
+            ("dbg.main", &main_summaries),
+        ];
+
+        for (name, summaries) in name_only_summaries {
+            assert!(
+                summaries.is_empty(),
+                "function name alone must not manufacture native-worker summaries for {name}: {summaries:?}"
+            );
+        }
     }
 
     #[test]
-    fn interproc_summary_adds_broad_hard_failure_worker_families() {
+    fn interproc_summary_rejects_broad_hard_failure_name_only_families() {
         let cases: &[(&str, &[NativeWorkerSummaryKind])] = &[
             (
                 "dbg.__xargmatch_internal",
@@ -8350,28 +10617,6 @@ mod tests {
                 ],
             ),
             (
-                "dbg.mem_scan2",
-                &[
-                    NativeWorkerSummaryKind::StringScan,
-                    NativeWorkerSummaryKind::NumericTransform,
-                ],
-            ),
-            (
-                "dbg.out_param_parse",
-                &[
-                    NativeWorkerSummaryKind::HashFold,
-                    NativeWorkerSummaryKind::MemoryWrite,
-                    NativeWorkerSummaryKind::Parser,
-                ],
-            ),
-            (
-                "dbg.table_walk",
-                &[
-                    NativeWorkerSummaryKind::StringScan,
-                    NativeWorkerSummaryKind::TableWalk,
-                ],
-            ),
-            (
                 "dbg.hash_print_statistics",
                 &[
                     NativeWorkerSummaryKind::TableWalk,
@@ -8381,26 +10626,12 @@ mod tests {
             ),
             (
                 "sym.hash_insert_if_absent",
-                &[
-                    NativeWorkerSummaryKind::TableWalk,
-                    NativeWorkerSummaryKind::HashFold,
-                ],
+                &[NativeWorkerSummaryKind::TableWalk],
             ),
-            (
-                "dbg.hash_lookup",
-                &[
-                    NativeWorkerSummaryKind::TableWalk,
-                    NativeWorkerSummaryKind::HashFold,
-                ],
-            ),
+            ("dbg.hash_lookup", &[NativeWorkerSummaryKind::TableWalk]),
             (
                 "dbg.hash_get_entries",
                 &[NativeWorkerSummaryKind::TableWalk],
-            ),
-            ("dbg.raw_hasher", &[NativeWorkerSummaryKind::HashFold]),
-            (
-                "sym.sha256_process_block",
-                &[NativeWorkerSummaryKind::HashFold],
             ),
             ("entry0", &[NativeWorkerSummaryKind::ProgramOrchestrator]),
             (
@@ -8463,10 +10694,7 @@ mod tests {
             ),
             (
                 "dbg.wc_lines_avx2",
-                &[
-                    NativeWorkerSummaryKind::RecordStream,
-                    NativeWorkerSummaryKind::HashFold,
-                ],
+                &[NativeWorkerSummaryKind::RecordStream],
             ),
             (
                 "dbg.full_read",
@@ -8489,13 +10717,7 @@ mod tests {
                     NativeWorkerSummaryKind::OutputStream,
                 ],
             ),
-            (
-                "dbg.isaac_refill",
-                &[
-                    NativeWorkerSummaryKind::TableWalk,
-                    NativeWorkerSummaryKind::HashFold,
-                ],
-            ),
+            ("dbg.isaac_refill", &[NativeWorkerSummaryKind::TableWalk]),
             (
                 "dbg.sort_files",
                 &[
@@ -8745,7 +10967,6 @@ mod tests {
                 &[
                     NativeWorkerSummaryKind::TableWalk,
                     NativeWorkerSummaryKind::MemoryWrite,
-                    NativeWorkerSummaryKind::HashFold,
                 ],
             ),
             (
@@ -8832,47 +11053,18 @@ mod tests {
             ("dbg.alloc_ibuf", &[NativeWorkerSummaryKind::Allocation]),
         ];
 
-        for (idx, (name, expected_kinds)) in cases.iter().enumerate() {
+        for (idx, (name, _expected_kinds)) in cases.iter().enumerate() {
             let summary = FunctionSemanticSummary::unknown(
                 r2ssa::InterprocFunctionId(0x7000 + idx as u64),
                 Some((*name).to_string()),
             );
             let summaries =
                 summaries_from_interproc_summary_unbounded(0x7000 + idx as u64, &summary);
-            for expected_kind in *expected_kinds {
-                assert!(
-                    summaries
-                        .iter()
-                        .any(|summary| summary.kind == *expected_kind),
-                    "missing {expected_kind:?} for {name}: {summaries:?}"
-                );
-            }
+            assert!(
+                summaries.is_empty(),
+                "function name alone must not manufacture native-worker summaries for {name}: {summaries:?}"
+            );
         }
-    }
-
-    #[test]
-    fn mem_scan2_summary_carries_count_predicate() {
-        let summary = FunctionSemanticSummary::unknown(
-            r2ssa::InterprocFunctionId(0x7010),
-            Some("dbg.mem_scan2".to_string()),
-        );
-        let summaries = summaries_from_interproc_summary_unbounded(0x7010, &summary);
-
-        let predicate = summaries
-            .iter()
-            .find(|summary| summary.kind == NativeWorkerSummaryKind::NumericTransform)
-            .and_then(|summary| summary.loop_summary.as_ref())
-            .and_then(|loop_summary| loop_summary.fold.as_ref())
-            .and_then(|fold| fold.predicate.as_ref())
-            .expect("mem_scan2 count summary must preserve byte-match predicate");
-
-        assert_eq!(
-            predicate,
-            &NativeWorkerPredicate::AnyOf(vec![
-                NativeWorkerPredicate::ByteEqArg { arg: 2 },
-                NativeWorkerPredicate::ByteEqArg { arg: 3 },
-            ])
-        );
     }
 
     #[test]
@@ -8883,8 +11075,8 @@ mod tests {
         assert!(has_native_worker_summary_family(
             "sym.quotearg_buffer_restyled"
         ));
-        assert!(has_native_worker_summary_family("sym._md5_process_block"));
-        assert!(has_native_worker_summary_family("dbg.sha384_read_ctx"));
+        assert!(!has_native_worker_summary_family("sym._md5_process_block"));
+        assert!(!has_native_worker_summary_family("dbg.sha384_read_ctx"));
         assert!(has_native_worker_summary_family("sym._internal_fnwmatch"));
         assert!(has_native_worker_summary_family("sym._getopt_internal_r"));
         assert!(has_native_worker_summary_family("sym.digest_file.isra.0"));
@@ -9031,9 +11223,13 @@ mod tests {
             "dbg.length_of_file_name_and_frills"
         ));
         assert!(has_native_worker_summary_family("dbg.yesno"));
-        assert!(has_native_worker_summary_family("sym.sha256_process_block"));
-        assert!(has_native_worker_summary_family("sym.sha256_process_bytes"));
-        assert!(has_native_worker_summary_family("sym.sm3_process_block"));
+        assert!(!has_native_worker_summary_family(
+            "sym.sha256_process_block"
+        ));
+        assert!(!has_native_worker_summary_family(
+            "sym.sha256_process_bytes"
+        ));
+        assert!(!has_native_worker_summary_family("sym.sm3_process_block"));
         assert!(has_native_worker_summary_family("dbg.save_token"));
         assert!(has_native_worker_summary_family("dbg.filename_unescape"));
         assert!(has_native_worker_summary_family("sym.compare"));
@@ -9096,8 +11292,8 @@ mod tests {
         assert!(has_native_worker_summary_family("dbg.hash_lookup"));
         assert!(has_native_worker_summary_family("dbg.hash_get_entries"));
         assert!(has_native_worker_summary_family("dbg.heap_insert"));
-        assert!(has_native_worker_summary_family("dbg.raw_hasher"));
-        assert!(has_native_worker_summary_family("sym.blake2b_compress"));
+        assert!(!has_native_worker_summary_family("dbg.raw_hasher"));
+        assert!(!has_native_worker_summary_family("sym.blake2b_compress"));
         assert!(has_native_worker_summary_family(
             "dbg.re_string_reconstruct"
         ));
@@ -9162,7 +11358,7 @@ mod tests {
     }
 
     #[test]
-    fn named_coreutils_tail_helpers_project_specific_summary_kinds() {
+    fn named_coreutils_tail_helpers_do_not_materialize_without_evidence() {
         let cases: &[(&str, &[NativeWorkerSummaryKind])] = &[
             (
                 "dbg.error_tail",
@@ -9229,11 +11425,6 @@ mod tests {
                 ],
             ),
             ("dbg.indent", &[NativeWorkerSummaryKind::NumericTransform]),
-            ("sym.blake2b_compress", &[NativeWorkerSummaryKind::HashFold]),
-            (
-                "sym.sm3_process_block",
-                &[NativeWorkerSummaryKind::HashFold],
-            ),
             (
                 "dbg.re_string_reconstruct",
                 &[
@@ -9362,52 +11553,38 @@ mod tests {
             ),
         ];
 
-        for (idx, (name, expected_kinds)) in cases.iter().enumerate() {
+        for (idx, (name, _expected_kinds)) in cases.iter().enumerate() {
             let summary = FunctionSemanticSummary::unknown(
                 r2ssa::InterprocFunctionId(0x9100 + idx as u64),
                 Some((*name).to_string()),
             );
             let summaries =
                 summaries_from_interproc_summary_unbounded(0x9100 + idx as u64, &summary);
-            for expected_kind in *expected_kinds {
-                assert!(
-                    summaries
-                        .iter()
-                        .any(|summary| summary.kind == *expected_kind),
-                    "missing {expected_kind:?} for {name}: {summaries:?}"
-                );
-            }
+            assert!(
+                summaries.is_empty(),
+                "function name alone must not manufacture native-worker summaries for {name}: {summaries:?}"
+            );
         }
     }
 
     #[test]
-    fn native_worker_summary_applicability_marks_name_hint_families() {
+    fn native_worker_summary_applicability_rejects_name_hint_families() {
         let applicability =
             native_worker_summary_applicability_for_name(0x401000, "dbg.save_token");
 
-        assert!(applicability.is_supported());
-        assert!(applicability.is_name_hint_only());
-        assert!(
-            applicability
-                .worker_kinds
-                .contains(&NativeWorkerSummaryKind::TableWalk)
-        );
-        assert!(
-            applicability
-                .sources
-                .contains(&NativeWorkerSummaryApplicabilitySource::NameHint)
-        );
-        assert!(
-            applicability
-                .evidence
-                .reasons
-                .contains(&SemanticEvidenceReason::NameHint)
+        assert!(!applicability.is_supported());
+        assert!(applicability.worker_kinds.is_empty());
+        assert!(applicability.sources.is_empty());
+        assert_eq!(
+            applicability.evidence.reasons,
+            vec![SemanticEvidenceReason::ResidualSearchRequired]
         );
     }
 
     #[test]
     fn native_worker_summary_applicability_marks_structural_seed_evidence() {
-        let applicability = native_worker_summary_applicability_for_name(0x401000, "malloc");
+        let applicability =
+            native_worker_summary_applicability_for_name(0x401000, "sym.imp.malloc");
 
         assert!(applicability.is_supported());
         assert!(!applicability.is_name_hint_only());
@@ -9435,15 +11612,7 @@ mod tests {
 
     #[test]
     fn native_worker_summary_route_policy_rejects_name_only_direct_summary_roles() {
-        for name in [
-            "sym.blake2b_compress",
-            "dbg.sha384_read_ctx",
-            "dbg.settimeout",
-            "dbg.xnmalloc",
-            "dbg.mem_scan2",
-            "dbg.out_param_parse",
-            "dbg.table_walk",
-        ] {
+        for name in ["sym.blake2b_compress", "dbg.sha384_read_ctx"] {
             let policy = native_worker_summary_route_policy_for_name(0x401000, name);
 
             assert_eq!(
@@ -9452,8 +11621,27 @@ mod tests {
                 "unexpected policy for {name}: {policy:?}"
             );
             assert!(!policy.should_use_direct_summary());
-            assert!(policy.applicability.is_supported());
-            assert!(policy.applicability.is_name_hint_only());
+            assert!(policy.certificate.is_none());
+            assert!(
+                !policy.applicability.is_supported(),
+                "hash/digest names alone must not create worker applicability for {name}: {policy:?}"
+            );
+        }
+
+        for name in ["dbg.settimeout", "dbg.xnmalloc"] {
+            let policy = native_worker_summary_route_policy_for_name(0x401000, name);
+
+            assert_eq!(
+                policy.kind,
+                NativeWorkerSummaryRouteKind::Standard,
+                "unexpected policy for {name}: {policy:?}"
+            );
+            assert!(!policy.should_use_direct_summary());
+            assert!(policy.certificate.is_none());
+            assert!(
+                !policy.applicability.is_supported(),
+                "function names alone must not create worker applicability for {name}: {policy:?}"
+            );
             assert!(
                 !policy
                     .applicability
@@ -9465,13 +11653,154 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_summary_route_policy_prefers_full_when_configured() {
+    fn native_worker_summary_route_policy_rejects_prefer_full_without_compatible_evidence() {
         let policy = native_worker_summary_route_policy_for_name(0x401000, "dbg.diagnose");
 
-        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::PreferFull);
-        assert!(policy.should_prefer_full());
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
+        assert!(!policy.should_prefer_full());
         assert!(!policy.should_use_direct_summary());
-        assert!(policy.applicability.is_supported());
+        assert!(policy.certificate.is_none());
+        assert!(!policy.applicability.is_supported());
+
+        let mut summary = FunctionSemanticSummary::unknown(
+            InterprocFunctionId(0x401000),
+            Some("dbg.diagnose".to_string()),
+        );
+        summary.return_relation = SummaryReturnRelation::Void;
+        let policy = native_worker_summary_route_policy_for_summary(0x401000, &summary);
+
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
+        assert!(!policy.should_prefer_full());
+        assert!(!policy.should_use_direct_summary());
+        assert!(policy.applicability.has_route_evidence());
+        assert!(
+            policy.certificate.is_none(),
+            "void return evidence alone is not compatible diagnostic route evidence"
+        );
+    }
+
+    #[test]
+    fn native_worker_summary_route_policy_certifies_direct_summary_only_with_evidence() {
+        let mut summary = FunctionSemanticSummary::unknown(
+            InterprocFunctionId(0x401000),
+            Some("dbg.xnmalloc".to_string()),
+        );
+        summary.allocation_effects.push(SummaryAllocationEffect {
+            size_arg: Some(1),
+            zeroed: false,
+        });
+        summary.return_relation = SummaryReturnRelation::HeapAlloc;
+
+        let policy = native_worker_summary_route_policy_for_summary(0x401000, &summary);
+
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::DirectSummary);
+        assert!(policy.should_use_direct_summary());
+        let certificate = policy.certificate.as_ref().expect("route certificate");
+        assert_eq!(
+            certificate.route_kind,
+            SummaryRouteCertificateKind::DirectSummary
+        );
+        assert_eq!(certificate.normalized_name.as_deref(), Some("xnmalloc"));
+        assert_ne!(certificate.source, SemanticClaimSource::NameHint);
+        assert_eq!(
+            certificate.route_evidence_kinds,
+            BTreeSet::from([NativeWorkerSummaryKind::Allocation])
+        );
+    }
+
+    #[test]
+    fn summary_route_certificate_identity_includes_route_evidence_kind() {
+        let applicability = |kind| NativeWorkerSummaryApplicability {
+            normalized_name: Some("xnmalloc".to_string()),
+            worker_kinds: BTreeSet::from([kind]),
+            route_evidence_kinds: BTreeSet::from([kind]),
+            sources: BTreeSet::from([NativeWorkerSummaryApplicabilitySource::AllocationEffect]),
+            evidence: SemanticEvidence::likely(SemanticEvidenceReason::SummaryBudget),
+        };
+        let allocation = summary_route_certificate(
+            0x401000,
+            NativeWorkerSummaryRouteKind::DirectSummary,
+            Some("xnmalloc"),
+            &applicability(NativeWorkerSummaryKind::Allocation),
+            "allocation route",
+        );
+        let transfer = summary_route_certificate(
+            0x401000,
+            NativeWorkerSummaryRouteKind::DirectSummary,
+            Some("xnmalloc"),
+            &applicability(NativeWorkerSummaryKind::MemoryTransfer),
+            "allocation route",
+        );
+
+        assert_ne!(allocation.stable_id, transfer.stable_id);
+        assert_ne!(
+            allocation.route_evidence_kinds,
+            transfer.route_evidence_kinds
+        );
+    }
+
+    #[test]
+    fn native_worker_summary_route_policy_rejects_stale_route_certificate_kind() {
+        let mut summary = FunctionSemanticSummary::unknown(
+            InterprocFunctionId(0x401000),
+            Some("dbg.xnmalloc".to_string()),
+        );
+        summary.allocation_effects.push(SummaryAllocationEffect {
+            size_arg: Some(1),
+            zeroed: false,
+        });
+        summary.return_relation = SummaryReturnRelation::HeapAlloc;
+        let mut policy = native_worker_summary_route_policy_for_summary(0x401000, &summary);
+        policy
+            .certificate
+            .as_mut()
+            .expect("route certificate")
+            .route_kind = SummaryRouteCertificateKind::Standard;
+
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::DirectSummary);
+        assert!(!policy.has_route_certificate());
+        assert!(!policy.should_use_direct_summary());
+    }
+
+    #[test]
+    fn native_worker_summary_route_policy_rejects_name_hint_route_certificate() {
+        let mut summary = FunctionSemanticSummary::unknown(
+            InterprocFunctionId(0x401000),
+            Some("dbg.xnmalloc".to_string()),
+        );
+        summary.allocation_effects.push(SummaryAllocationEffect {
+            size_arg: Some(1),
+            zeroed: false,
+        });
+        summary.return_relation = SummaryReturnRelation::HeapAlloc;
+        let mut policy = native_worker_summary_route_policy_for_summary(0x401000, &summary);
+        policy
+            .certificate
+            .as_mut()
+            .expect("route certificate")
+            .source = SemanticClaimSource::NameHint;
+
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::DirectSummary);
+        assert!(!policy.has_route_certificate());
+        assert!(!policy.should_use_direct_summary());
+    }
+
+    #[test]
+    fn native_worker_summary_route_policy_rejects_unrelated_structural_evidence_for_named_family() {
+        let mut summary = FunctionSemanticSummary::unknown(
+            InterprocFunctionId(0x401000),
+            Some("dbg.error_tail".to_string()),
+        );
+        summary.return_relation = SummaryReturnRelation::Arg(0);
+
+        let policy = native_worker_summary_route_policy_for_summary(0x401000, &summary);
+
+        assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
+        assert!(!policy.should_use_direct_summary());
+        assert!(
+            policy.certificate.is_none(),
+            "unrelated structural evidence must not certify the error_tail route"
+        );
     }
 
     #[test]
@@ -9482,6 +11811,7 @@ mod tests {
         assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
         assert!(!policy.should_use_direct_summary());
         assert!(!policy.should_prefer_full());
+        assert!(policy.certificate.is_none());
         assert!(!policy.applicability.is_supported());
     }
 
@@ -9514,6 +11844,10 @@ mod tests {
         let second = bounded_worker_summaries(summaries_for_names(&names));
 
         assert_eq!(first, second);
+        assert!(
+            first.is_empty(),
+            "function names alone must not manufacture bounded worker summaries: {first:?}"
+        );
         assert!(first.windows(2).all(|pair| {
             native_worker_summary_sort_key(&pair[0]) <= native_worker_summary_sort_key(&pair[1])
         }));
@@ -9540,38 +11874,23 @@ mod tests {
     }
 
     #[test]
-    fn named_hash_fold_family_remains_weak_hint() {
+    fn named_hash_fold_family_does_not_create_summary_without_evidence() {
         let summary = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x9000),
             Some("dbg.raw_hasher".to_string()),
         );
 
         let summaries = summaries_from_interproc_summary_unbounded(0x9000, &summary);
-        let hash_fold = summaries
-            .iter()
-            .find(|summary| matches!(summary.kind, NativeWorkerSummaryKind::HashFold))
-            .expect("named hash fold summary");
-
-        assert_eq!(hash_fold.evidence.tier, SemanticConfidence::Heuristic);
-        assert_eq!(
-            hash_fold.evidence.provenance,
-            SemanticEvidenceProvenance::Ranked
-        );
-        assert_eq!(
-            hash_fold.evidence.ambiguity,
-            SemanticEvidenceAmbiguity::Ranked
-        );
-        assert_eq!(
-            hash_fold.evidence.reasons,
-            vec![
-                SemanticEvidenceReason::SummaryBudget,
-                SemanticEvidenceReason::NameHint
-            ]
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::HashFold)),
+            "raw_hasher name alone must not create hash-fold semantics: {summaries:?}"
         );
     }
 
     #[test]
-    fn scratch_buffer_growth_summary_is_bounded_name_hint_not_transfer_proof() {
+    fn scratch_buffer_growth_name_alone_does_not_create_summary() {
         let summary = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x9100),
             Some("dbg._gl_scratch_buffer_grow_preserve".to_string()),
@@ -9579,30 +11898,14 @@ mod tests {
 
         let summaries = summaries_from_interproc_summary_unbounded(0x9100, &summary);
 
-        assert!(summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::Allocation)
-                && summary
-                    .evidence
-                    .reasons
-                    .contains(&SemanticEvidenceReason::NameHint)
-        }));
-        assert!(summaries.iter().any(|summary| {
-            matches!(summary.kind, NativeWorkerSummaryKind::MemoryWrite)
-                && matches!(
-                    summary.memory.map(|memory| memory.region),
-                    Some(SummaryMemoryRegion::Arg { index: 0 })
-                )
-        }));
         assert!(
-            summaries
-                .iter()
-                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::MemoryTransfer)),
-            "grow_preserve must not claim a copy/preserve transfer without evidence"
+            summaries.is_empty(),
+            "function names alone must not manufacture scratch-buffer effects: {summaries:?}"
         );
     }
 
     #[test]
-    fn argv_iterator_summary_is_bounded_name_hint() {
+    fn argv_iterator_name_alone_does_not_create_summary() {
         let summary = FunctionSemanticSummary::unknown(
             r2ssa::InterprocFunctionId(0x9200),
             Some("dbg.argv_iter".to_string()),
@@ -9610,21 +11913,9 @@ mod tests {
 
         let summaries = summaries_from_interproc_summary_unbounded(0x9200, &summary);
 
-        let parser = summaries
-            .iter()
-            .find(|summary| matches!(summary.kind, NativeWorkerSummaryKind::Parser))
-            .expect("argv iterator parser summary");
-        assert_eq!(parser.evidence.tier, SemanticConfidence::Heuristic);
         assert!(
-            parser
-                .evidence
-                .reasons
-                .contains(&SemanticEvidenceReason::NameHint)
-        );
-        assert!(
-            summaries
-                .iter()
-                .any(|summary| matches!(summary.kind, NativeWorkerSummaryKind::TableWalk))
+            summaries.is_empty(),
+            "function names alone must not manufacture argv-iterator semantics: {summaries:?}"
         );
     }
 

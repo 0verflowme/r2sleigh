@@ -1,0 +1,10 @@
+warning: semantic storage/address classification by string prefix; use a typed classifier owned by the canonical fact producer
+  --> $DIR/main.rs:2:5
+   |
+LL |     name.starts_with("tmp:")
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(string_prefix_semantic_classification)]` on by default
+
+warning: 1 warning emitted
+

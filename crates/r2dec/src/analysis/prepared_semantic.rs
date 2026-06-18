@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::function::DefLocation;
 use r2ssa::{
@@ -10,12 +10,15 @@ use r2types::{
     VisibleBindingKind,
 };
 
+use super::lower::LowerCtx;
 use super::{
     BaseRef, CallArgBinding, DecompilerFacts, FlagInfo, NormalizedAddr, PassEnv, ScalarValue,
     SemanticCallArg, SemanticOwnershipFacts, SemanticValue, StackInfo, StackSlotProvenance,
     StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
 };
-use crate::analysis::utils::{compare_const_to_expr, compare_const_to_expr_with_width};
+use crate::analysis::utils::{
+    compare_const_to_expr, compare_const_to_expr_with_width, is_cpu_flag, parse_const_value,
+};
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::fold::SSABlock;
 use crate::fold::op_lower::is_generic_stack_placeholder_alias;
@@ -32,6 +35,7 @@ pub(crate) struct PreparedCallView {
     pub(crate) direct_target: Option<u64>,
     pub(crate) callee_name: Option<String>,
     pub(crate) authoritative_args: Vec<CExpr>,
+    pub(crate) authoritative_arg_values: Vec<ValueId>,
     pub(crate) result_owner: Option<CExpr>,
 }
 
@@ -39,6 +43,7 @@ pub(crate) struct PreparedCallView {
 pub(crate) struct PreparedSemanticView {
     pub(crate) stack_aliases_by_offset: BTreeMap<i64, StackAliasView>,
     pub(crate) param_alias_by_reg: HashMap<String, String>,
+    pub(crate) param_rank_by_alias: HashMap<String, usize>,
     pub(crate) value_id_by_var: HashMap<SSAVar, ValueId>,
     pub(crate) var_by_value_id: HashMap<ValueId, SSAVar>,
     pub(crate) owner_expr_by_value: HashMap<ValueId, CExpr>,
@@ -72,6 +77,13 @@ impl PreparedSemanticView {
             param_alias_by_reg: inputs.param_register_aliases.clone(),
             ..Self::default()
         };
+        for (rank, reg) in inputs.abi_arg_regs.iter().enumerate() {
+            if let Some(alias) = inputs.param_register_aliases.get(reg) {
+                view.param_rank_by_alias.insert(alias.clone(), rank);
+                view.param_rank_by_alias
+                    .insert(alias.to_ascii_lowercase(), rank);
+            }
+        }
         view.init_value_indexes(inputs.prepared);
 
         populate_stack_aliases(&mut view, &inputs);
@@ -242,9 +254,12 @@ pub(crate) fn build_prepared_runtime_facts(
     seed_prepared_param_aliases(&mut use_info, blocks, env);
     seed_prepared_stack_facts(&mut use_info, &mut stack_info, prepared, view);
     collect_prepared_runtime_facts(&mut use_info, &mut flag_info, blocks, env, prepared, view);
+    pin_prepared_loop_carried_phi_values(&mut use_info, prepared);
+    pin_aliases_for_prepared_pinned_values(&mut use_info);
     populate_prepared_call_runtime_facts(&mut use_info, blocks, env, prepared, view);
     overlay_local_struct_semantics(&mut use_info, blocks, env);
     overlay_prepared_switch_roots(&mut use_info, prepared);
+    populate_prepared_render_definitions(&mut use_info, blocks, env);
     finalize_prepared_call_inlining(&mut use_info);
 
     DecompilerFacts {
@@ -255,9 +270,286 @@ pub(crate) fn build_prepared_runtime_facts(
     }
 }
 
+fn pin_prepared_loop_carried_phi_values(use_info: &mut UseInfo, prepared: &SsaArtifact) {
+    let materialized_values = prepared_loop_phi_materialization_values(prepared);
+    for loop_fact in prepared.structured().loops.values() {
+        let Some(header) = prepared.function().get_block(loop_fact.header) else {
+            continue;
+        };
+        for phi in &header.phis {
+            if !phi
+                .sources
+                .iter()
+                .any(|(pred, _)| loop_fact.latches.contains(pred))
+            {
+                continue;
+            }
+            let Some(dst_value) = use_info.value_id_for_var(&phi.dst) else {
+                continue;
+            };
+            if !materialized_values.contains(&dst_value)
+                && !phi.sources.iter().any(|(_, src)| {
+                    use_info
+                        .value_id_for_var(src)
+                        .is_some_and(|value| materialized_values.contains(&value))
+                })
+            {
+                continue;
+            }
+            pin_prepared_phi_materialized_var(use_info, &phi.dst);
+            for (_, src) in &phi.sources {
+                pin_prepared_phi_materialized_var(use_info, src);
+            }
+        }
+    }
+}
+
+fn prepared_loop_phi_materialization_values(prepared: &SsaArtifact) -> BTreeSet<ValueId> {
+    let mut values = BTreeSet::new();
+    for loop_fact in prepared.structured().loops.values() {
+        values.extend(loop_fact.induction_phi);
+        values.extend(loop_fact.induction_init);
+        values.extend(loop_fact.induction_update);
+        values.extend(loop_fact.bound);
+    }
+    for ret in &prepared.certificates().returns {
+        collect_prepared_expression_dependencies(prepared, ret.value, &mut values);
+    }
+    values
+}
+
+fn collect_prepared_expression_dependencies(
+    prepared: &SsaArtifact,
+    value: ValueId,
+    out: &mut BTreeSet<ValueId>,
+) {
+    if !out.insert(value) {
+        return;
+    }
+    let Some(cert) = prepared.certificates().expressions.get(&value) else {
+        return;
+    };
+    for input in &cert.inputs {
+        collect_prepared_expression_dependencies(prepared, *input, out);
+    }
+}
+
+fn pin_prepared_phi_materialized_var(use_info: &mut UseInfo, var: &SSAVar) {
+    if var.is_const() || var.is_temp() || is_cpu_flag(&var.name.to_ascii_lowercase()) {
+        return;
+    }
+    let display = var.display_name();
+    use_info.pinned.insert(display.clone());
+    use_info.pinned.insert(display.to_ascii_lowercase());
+}
+
+fn pin_aliases_for_prepared_pinned_values(use_info: &mut UseInfo) {
+    let mut aliases = Vec::new();
+    for pinned in &use_info.pinned {
+        if let Some(alias) = use_info.var_aliases.get(pinned)
+            && !alias.trim().is_empty()
+        {
+            aliases.push(alias.clone());
+        }
+    }
+    for alias in aliases {
+        use_info.pinned.insert(alias);
+    }
+}
+
+fn populate_prepared_render_definitions(
+    use_info: &mut UseInfo,
+    blocks: &[SSABlock],
+    env: &PassEnv<'_>,
+) {
+    for block in blocks {
+        for op in &block.ops {
+            let Some(dst) = op.dst() else {
+                continue;
+            };
+            if !prepared_op_has_render_definition(op) {
+                continue;
+            }
+            let expr = {
+                let lower = LowerCtx {
+                    use_info: Some(use_info),
+                    definitions: &use_info.definitions,
+                    semantic_values: &use_info.semantic_values,
+                    use_counts: &use_info.use_counts,
+                    condition_vars: &use_info.condition_vars,
+                    pinned: &use_info.pinned,
+                    var_aliases: &use_info.var_aliases,
+                    param_register_aliases: env.param_register_aliases,
+                    type_hints: &use_info.type_hints,
+                    ptr_arith: &use_info.ptr_arith,
+                    stack_slots: &use_info.stack_slots,
+                    forwarded_values: &use_info.forwarded_values,
+                    function_names: env.function_names,
+                    strings: env.strings,
+                    symbols: env.symbols,
+                    type_oracle: env.type_oracle,
+                };
+                lower.op_to_expr(op)
+            };
+            if is_self_render_definition(dst, &expr) {
+                continue;
+            }
+            if !prepared_render_definition_is_safe(&expr, env) {
+                continue;
+            }
+            let key = dst.display_name();
+            use_info
+                .definitions
+                .entry(key.clone())
+                .or_insert_with(|| expr.clone());
+            if let Some(value_id) = use_info.value_id_for_var(dst) {
+                use_info
+                    .definitions_by_value
+                    .entry(value_id)
+                    .or_insert_with(|| expr.clone());
+            }
+            use_info.formatted_defs.entry(key).or_insert(expr);
+        }
+    }
+}
+
+fn prepared_op_has_render_definition(op: &SSAOp) -> bool {
+    matches!(
+        op,
+        SSAOp::Copy { .. }
+            | SSAOp::Load { .. }
+            | SSAOp::IntAdd { .. }
+            | SSAOp::IntSub { .. }
+            | SSAOp::IntMult { .. }
+            | SSAOp::IntDiv { .. }
+            | SSAOp::IntSDiv { .. }
+            | SSAOp::IntRem { .. }
+            | SSAOp::IntSRem { .. }
+            | SSAOp::IntAnd { .. }
+            | SSAOp::IntOr { .. }
+            | SSAOp::IntXor { .. }
+            | SSAOp::IntLeft { .. }
+            | SSAOp::IntRight { .. }
+            | SSAOp::IntSRight { .. }
+            | SSAOp::IntEqual { .. }
+            | SSAOp::IntNotEqual { .. }
+            | SSAOp::IntLess { .. }
+            | SSAOp::IntLessEqual { .. }
+            | SSAOp::IntSLess { .. }
+            | SSAOp::IntSLessEqual { .. }
+            | SSAOp::IntZExt { .. }
+            | SSAOp::IntSExt { .. }
+            | SSAOp::IntCarry { .. }
+            | SSAOp::IntSCarry { .. }
+            | SSAOp::IntSBorrow { .. }
+            | SSAOp::IntNegate { .. }
+            | SSAOp::IntNot { .. }
+            | SSAOp::BoolNot { .. }
+            | SSAOp::BoolAnd { .. }
+            | SSAOp::BoolOr { .. }
+            | SSAOp::BoolXor { .. }
+            | SSAOp::Piece { .. }
+            | SSAOp::FloatAdd { .. }
+            | SSAOp::FloatSub { .. }
+            | SSAOp::FloatMult { .. }
+            | SSAOp::FloatDiv { .. }
+            | SSAOp::FloatNeg { .. }
+            | SSAOp::FloatAbs { .. }
+            | SSAOp::FloatSqrt { .. }
+            | SSAOp::FloatEqual { .. }
+            | SSAOp::FloatNotEqual { .. }
+            | SSAOp::FloatLess { .. }
+            | SSAOp::FloatLessEqual { .. }
+            | SSAOp::Trunc { .. }
+            | SSAOp::Int2Float { .. }
+            | SSAOp::Float2Int { .. }
+            | SSAOp::FloatCeil { .. }
+            | SSAOp::FloatFloor { .. }
+            | SSAOp::FloatRound { .. }
+            | SSAOp::FloatNaN { .. }
+            | SSAOp::Subpiece { .. }
+            | SSAOp::FloatFloat { .. }
+            | SSAOp::Cast { .. }
+            | SSAOp::PtrAdd { .. }
+            | SSAOp::PtrSub { .. }
+            | SSAOp::CallOther {
+                output: Some(_),
+                ..
+            }
+            | SSAOp::CpuId { .. }
+    )
+}
+
+fn prepared_render_definition_is_safe(expr: &CExpr, env: &PassEnv<'_>) -> bool {
+    let arg_regs = env
+        .arg_regs
+        .iter()
+        .map(|reg| reg.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let caller_saved = env
+        .caller_saved_regs
+        .iter()
+        .map(|reg| reg.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let sp = env.sp_name.to_ascii_lowercase();
+    let fp = env.fp_name.to_ascii_lowercase();
+    let ret = env.ret_reg_name.to_ascii_lowercase();
+    let mut safe = true;
+    expr.visit(&mut |node| {
+        if matches!(
+            node,
+            CExpr::Deref(_)
+                | CExpr::Subscript { .. }
+                | CExpr::Member { .. }
+                | CExpr::PtrMember { .. }
+        ) {
+            safe = false;
+            return;
+        }
+        let CExpr::Var(name) = node else {
+            return;
+        };
+        let lower = name.to_ascii_lowercase();
+        let base = lower.split('_').next().unwrap_or(lower.as_str());
+        if base == sp
+            || base == fp
+            || base == ret
+            || arg_regs.contains(base)
+            || caller_saved.contains(base)
+            || lower.starts_with("tmp:")
+            || lower.starts_with("unique:")
+            || lower.starts_with("ram:")
+        {
+            safe = false;
+        }
+    });
+    safe
+}
+
+fn is_self_render_definition(dst: &SSAVar, expr: &CExpr) -> bool {
+    let dst_display = dst.display_name();
+    let dst_rendered = if dst.name.starts_with("tmp:") {
+        let suffix = if dst.version > 0 {
+            format!("_{}", dst.version)
+        } else {
+            String::new()
+        };
+        format!("t{}{}", dst.name.trim_start_matches("tmp:"), suffix)
+    } else if dst.version > 0 {
+        format!("{}_{}", dst.name.to_ascii_lowercase(), dst.version)
+    } else {
+        dst.name.to_ascii_lowercase()
+    };
+    matches!(expr, CExpr::Var(name) if name == &dst_display || name.eq_ignore_ascii_case(&dst_rendered))
+}
+
 fn overlay_local_struct_semantics(use_info: &mut UseInfo, blocks: &[SSABlock], env: &PassEnv<'_>) {
     let semantic = UseInfo::analyze_for_local_struct_accesses(blocks, env);
     for (name, value) in semantic.semantic_values {
+        // Prepared ValueId-bound facts are canonical; local struct inference is heuristic.
+        if use_info.value_ids_by_name.contains_key(&name) {
+            continue;
+        }
         let should_replace = match use_info.semantic_values.get(&name) {
             None => true,
             Some(SemanticValue::Address(_) | SemanticValue::Load { .. }) => false,
@@ -482,6 +774,15 @@ fn populate_stack_offsets(view: &mut PreparedSemanticView, prepared: &SsaArtifac
 }
 
 fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
+    let mut producer_by_dst = HashMap::<SSAVar, &SSAOp>::new();
+    for block in prepared.function().blocks() {
+        for op in &block.ops {
+            if let Some(dst) = op.dst() {
+                producer_by_dst.insert(dst.clone(), op);
+            }
+        }
+    }
+
     for (value, offset) in view.stack_offset_entries() {
         if !is_prepared_stack_address_carrier(prepared, &value) {
             continue;
@@ -545,7 +846,10 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact)
                     | SSAOp::Trunc { dst, src }
                     | SSAOp::Cast { dst, src, .. }
                     | SSAOp::Subpiece { dst, src, .. } => {
-                        if let Some(expr) = view.owner_expr_for_var(src).cloned()
+                        if let Some(expr) = view
+                            .owner_expr_for_var(src)
+                            .cloned()
+                            .or_else(|| scalar_owner_expr_for_value(view, src, src.size))
                             && view.owner_expr_for_var(dst) != Some(&expr)
                         {
                             view.insert_owner_expr(dst, expr);
@@ -560,63 +864,153 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact)
                     }
                     SSAOp::IntSub { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let Some(lhs) =
-                            prepared_address_owner_expr_for_value(view, a, compare_width)
-                        else {
-                            continue;
-                        };
-                        let Some(rhs) =
-                            prepared_address_owner_expr_for_value(view, b, compare_width)
-                        else {
-                            continue;
-                        };
-                        let expr = CExpr::binary(BinaryOp::Sub, lhs, rhs);
-                        if view.owner_expr_for_var(dst) != Some(&expr) {
+                        let derived =
+                            prepared_binary_owner_expr(view, BinaryOp::Sub, a, b, compare_width)
+                                .or_else(|| {
+                                    prepared_address_owner_expr_for_value(view, a, compare_width)
+                                        .zip(prepared_address_owner_expr_for_value(
+                                            view,
+                                            b,
+                                            compare_width,
+                                        ))
+                                        .map(|(lhs, rhs)| {
+                                            prepared_simplify_binary_expr(
+                                                view,
+                                                BinaryOp::Sub,
+                                                lhs,
+                                                rhs,
+                                            )
+                                        })
+                                });
+                        if let Some(expr) = derived
+                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        {
                             view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                     }
                     SSAOp::IntLeft { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let Some(lhs) = prepared_scaled_index_owner_expr(view, a, compare_width)
-                        else {
-                            continue;
-                        };
-                        let Some(rhs) = scalar_owner_expr_for_value(view, b, compare_width) else {
-                            continue;
-                        };
-                        let expr = CExpr::binary(BinaryOp::Shl, lhs, rhs);
-                        if view.owner_expr_for_var(dst) != Some(&expr) {
+                        let derived =
+                            prepared_binary_owner_expr(view, BinaryOp::Shl, a, b, compare_width)
+                                .or_else(|| {
+                                    prepared_scaled_index_owner_expr(view, a, compare_width)
+                                        .zip(scalar_owner_expr_for_value(view, b, compare_width))
+                                        .map(|(lhs, rhs)| {
+                                            prepared_simplify_binary_expr(
+                                                view,
+                                                BinaryOp::Shl,
+                                                lhs,
+                                                rhs,
+                                            )
+                                        })
+                                });
+                        if let Some(expr) = derived
+                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        {
                             view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                     }
                     SSAOp::IntMult { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let Some(lhs) = prepared_scaled_index_owner_expr(view, a, compare_width)
-                        else {
-                            continue;
-                        };
-                        let Some(rhs) = prepared_scaled_index_owner_expr(view, b, compare_width)
-                        else {
-                            continue;
-                        };
-                        let expr = CExpr::binary(BinaryOp::Mul, lhs, rhs);
-                        if view.owner_expr_for_var(dst) != Some(&expr) {
+                        let derived =
+                            prepared_binary_owner_expr(view, BinaryOp::Mul, a, b, compare_width)
+                                .or_else(|| {
+                                    prepared_scaled_index_owner_expr(view, a, compare_width)
+                                        .zip(prepared_scaled_index_owner_expr(
+                                            view,
+                                            b,
+                                            compare_width,
+                                        ))
+                                        .map(|(lhs, rhs)| {
+                                            prepared_simplify_binary_expr(
+                                                view,
+                                                BinaryOp::Mul,
+                                                lhs,
+                                                rhs,
+                                            )
+                                        })
+                                });
+                        if let Some(expr) = derived
+                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        {
                             view.insert_owner_expr(dst, expr);
                             changed = true;
                         }
                     }
                     SSAOp::IntAdd { dst, a, b } => {
                         let compare_width = a.size.max(b.size);
-                        let derived = prepared_address_owner_expr_for_value(view, a, compare_width)
-                            .zip(prepared_address_owner_expr_for_value(
-                                view,
-                                b,
-                                compare_width,
-                            ))
-                            .map(|(lhs, rhs)| CExpr::binary(BinaryOp::Add, lhs, rhs));
+                        let derived =
+                            prepared_binary_owner_expr(view, BinaryOp::Add, a, b, compare_width)
+                                .or_else(|| {
+                                    prepared_address_owner_expr_for_value(view, a, compare_width)
+                                        .zip(prepared_address_owner_expr_for_value(
+                                            view,
+                                            b,
+                                            compare_width,
+                                        ))
+                                        .map(|(lhs, rhs)| {
+                                            prepared_simplify_binary_expr(
+                                                view,
+                                                BinaryOp::Add,
+                                                lhs,
+                                                rhs,
+                                            )
+                                        })
+                                });
                         if let Some(expr) = derived
+                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        {
+                            view.insert_owner_expr(dst, expr);
+                            changed = true;
+                        }
+                    }
+                    SSAOp::IntDiv { dst, a, b } | SSAOp::IntRem { dst, a, b } => {
+                        let op = if matches!(op, SSAOp::IntDiv { .. }) {
+                            BinaryOp::Div
+                        } else {
+                            BinaryOp::Mod
+                        };
+                        let compare_width = a.size.max(b.size);
+                        if let Some(expr) =
+                            prepared_binary_owner_expr(view, op, a, b, compare_width)
+                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        {
+                            view.insert_owner_expr(dst, expr);
+                            changed = true;
+                        }
+                    }
+                    SSAOp::IntSDiv { dst, a, b } | SSAOp::IntSRem { dst, a, b } => {
+                        let op = if matches!(op, SSAOp::IntSDiv { .. }) {
+                            BinaryOp::Div
+                        } else {
+                            BinaryOp::Mod
+                        };
+                        let compare_width = a.size.max(b.size);
+                        let derived = prepared_signed_dividend_expr(view, &producer_by_dst, a)
+                            .zip(scalar_owner_expr_for_value(view, b, compare_width))
+                            .map(|(lhs, rhs)| prepared_simplify_binary_expr(view, op, lhs, rhs))
+                            .or_else(|| prepared_binary_owner_expr(view, op, a, b, compare_width));
+                        if let Some(expr) = derived
+                            && view.owner_expr_for_var(dst) != Some(&expr)
+                        {
+                            view.insert_owner_expr(dst, expr);
+                            changed = true;
+                        }
+                    }
+                    SSAOp::IntAnd { dst, a, b }
+                    | SSAOp::IntOr { dst, a, b }
+                    | SSAOp::IntXor { dst, a, b } => {
+                        let op = match op {
+                            SSAOp::IntAnd { .. } => BinaryOp::BitAnd,
+                            SSAOp::IntOr { .. } => BinaryOp::BitOr,
+                            SSAOp::IntXor { .. } => BinaryOp::BitXor,
+                            _ => unreachable!(),
+                        };
+                        let compare_width = a.size.max(b.size);
+                        if let Some(expr) =
+                            prepared_binary_owner_expr(view, op, a, b, compare_width)
                             && view.owner_expr_for_var(dst) != Some(&expr)
                         {
                             view.insert_owner_expr(dst, expr);
@@ -1228,6 +1622,7 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
                 .direct_target
                 .and_then(|addr| lookup_callee_name(inputs, addr)),
             authoritative_args: Vec::new(),
+            authoritative_arg_values: Vec::new(),
             result_owner: None,
         };
         if call_view.callee_name.is_none()
@@ -1266,13 +1661,37 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
                 .and_then(|set| set.summaries.get(&r2ssa::InterprocFunctionId(target)))
                 .and_then(|summary| summary.arg_count_hint)
         });
-        call_view.authoritative_args = infer_call_authoritative_args(
+        let mut authoritative_args = infer_call_authoritative_args(
             site,
             inputs.prepared.function(),
             view,
             inputs.abi_arg_regs,
             max_arity,
         );
+        let remaining_stack_args = max_arity
+            .unwrap_or(usize::MAX)
+            .saturating_sub(authoritative_args.len());
+        if remaining_stack_args > 0
+            && let Some(call_cert) = inputs.prepared.certificates().callsites.get(&call_site.id)
+        {
+            authoritative_args.extend(
+                infer_stack_call_authoritative_args(
+                    site,
+                    inputs.prepared.function(),
+                    inputs.prepared,
+                    view,
+                    call_cert,
+                )
+                .into_iter()
+                .take(remaining_stack_args),
+            );
+        }
+        call_view.authoritative_arg_values =
+            authoritative_args.iter().map(|(value, _)| *value).collect();
+        call_view.authoritative_args = authoritative_args
+            .into_iter()
+            .map(|(_, expr)| expr)
+            .collect();
         view.call_view_by_site.insert(site, call_view);
     }
 }
@@ -1283,7 +1702,7 @@ fn infer_call_authoritative_args(
     view: &PreparedSemanticView,
     abi_arg_regs: &[String],
     max_arity: Option<usize>,
-) -> Vec<CExpr> {
+) -> Vec<(ValueId, CExpr)> {
     let (block_addr, op_idx) = site;
     let Some(block) = function.get_block(block_addr) else {
         return Vec::new();
@@ -1292,13 +1711,38 @@ fn infer_call_authoritative_args(
     let mut args = Vec::new();
     let max_regs = max_arity.unwrap_or(abi_arg_regs.len());
     for reg_name in abi_arg_regs.iter().take(max_regs) {
-        let Some(expr) = infer_call_authoritative_arg_expr(block, op_idx, reg_name, view) else {
+        let Some(arg) = infer_call_authoritative_arg_expr(block, op_idx, reg_name, view) else {
             break;
         };
-        args.push(expr);
+        args.push(arg);
     }
 
     args
+}
+
+fn infer_stack_call_authoritative_args(
+    site: (u64, usize),
+    function: &r2ssa::SSAFunction,
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+    call_cert: &r2ssa::CallsiteCertificate,
+) -> Vec<(ValueId, CExpr)> {
+    let Some(block) = function.get_block(site.0) else {
+        return Vec::new();
+    };
+
+    call_cert
+        .stack_argument_values
+        .iter()
+        .filter_map(|arg| {
+            let var = prepared.value_var(arg.value)?;
+            let expr = authoritative_scalar_expr_for_value(block, view, var, 0)
+                .or_else(|| scalar_owner_expr_for_value(view, var, var.size))
+                .or_else(|| view.owner_expr_for_var(var).cloned())
+                .or_else(|| Some(CExpr::Var(var.display_name())))?;
+            Some((arg.value, expr))
+        })
+        .collect()
 }
 
 fn infer_call_authoritative_arg_expr(
@@ -1306,7 +1750,7 @@ fn infer_call_authoritative_arg_expr(
     op_idx: usize,
     reg_name: &str,
     view: &PreparedSemanticView,
-) -> Option<CExpr> {
+) -> Option<(ValueId, CExpr)> {
     let reg_name = reg_name.to_ascii_lowercase();
     for op in block.ops[..op_idx].iter().rev() {
         match op {
@@ -1318,10 +1762,12 @@ fn infer_call_authoritative_arg_expr(
             | SSAOp::Subpiece { dst, src, .. }
                 if dst.name.eq_ignore_ascii_case(&reg_name) =>
             {
-                return authoritative_scalar_expr_for_value(block, view, src, 0)
+                let value = view.value_id_for_var(src)?;
+                let expr = authoritative_scalar_expr_for_value(block, view, src, 0)
                     .or_else(|| scalar_owner_expr_for_value(view, src, src.size))
                     .or_else(|| view.owner_expr_for_var(src).cloned())
                     .or_else(|| Some(CExpr::Var(src.display_name())));
+                return expr.map(|expr| (value, expr));
             }
             other
                 if other
@@ -1329,10 +1775,12 @@ fn infer_call_authoritative_arg_expr(
                     .is_some_and(|dst| dst.name.eq_ignore_ascii_case(&reg_name)) =>
             {
                 let dst = other.dst().expect("checked above");
-                return authoritative_scalar_expr_for_value(block, view, dst, 0)
+                let value = view.value_id_for_var(dst)?;
+                let expr = authoritative_scalar_expr_for_value(block, view, dst, 0)
                     .or_else(|| scalar_owner_expr_for_value(view, dst, dst.size))
                     .or_else(|| view.owner_expr_for_var(dst).cloned())
                     .or_else(|| Some(CExpr::Var(dst.display_name())));
+                return expr.map(|expr| (value, expr));
             }
             SSAOp::Call { .. } | SSAOp::CallInd { .. } => break,
             _ => {}
@@ -1745,6 +2193,332 @@ fn scalar_owner_expr_for_value(
         })
         .or_else(|| view.predicate_expr_for_cond(var).cloned())
         .or_else(|| generic_prepared_owner_expr(view, var))
+}
+
+fn prepared_binary_owner_expr(
+    view: &PreparedSemanticView,
+    op: BinaryOp,
+    a: &SSAVar,
+    b: &SSAVar,
+    compare_width: u32,
+) -> Option<CExpr> {
+    let lhs = scalar_owner_expr_for_value(view, a, compare_width)?;
+    let rhs = scalar_owner_expr_for_value(view, b, compare_width)?;
+    Some(prepared_simplify_binary_expr(view, op, lhs, rhs))
+}
+
+fn prepared_simplify_binary_expr(
+    view: &PreparedSemanticView,
+    op: BinaryOp,
+    mut lhs: CExpr,
+    mut rhs: CExpr,
+) -> CExpr {
+    if prepared_binary_op_is_commutative(op)
+        && prepared_expr_order_key(view, &rhs) < prepared_expr_order_key(view, &lhs)
+    {
+        std::mem::swap(&mut lhs, &mut rhs);
+    }
+
+    match op {
+        BinaryOp::Add => {
+            if prepared_expr_is_zero(&lhs) {
+                rhs
+            } else if prepared_expr_is_zero(&rhs) {
+                lhs
+            } else if let Some(expr) = prepared_simplify_linear_addition(view, &lhs, &rhs) {
+                expr
+            } else {
+                CExpr::binary(op, lhs, rhs)
+            }
+        }
+        BinaryOp::Sub => {
+            if prepared_expr_is_zero(&rhs) {
+                lhs
+            } else {
+                CExpr::binary(op, lhs, rhs)
+            }
+        }
+        BinaryOp::Mul => {
+            if prepared_expr_is_one(&lhs) {
+                rhs
+            } else if prepared_expr_is_one(&rhs) {
+                lhs
+            } else {
+                CExpr::binary(op, lhs, rhs)
+            }
+        }
+        BinaryOp::Div => {
+            if prepared_expr_is_one(&rhs) {
+                lhs
+            } else {
+                CExpr::binary(op, lhs, rhs)
+            }
+        }
+        BinaryOp::BitOr | BinaryOp::BitXor => {
+            if matches!(op, BinaryOp::BitXor) && lhs == rhs {
+                CExpr::IntLit(0)
+            } else if prepared_expr_is_zero(&lhs) {
+                rhs
+            } else if prepared_expr_is_zero(&rhs) {
+                lhs
+            } else {
+                CExpr::binary(op, lhs, rhs)
+            }
+        }
+        _ => CExpr::binary(op, lhs, rhs),
+    }
+}
+
+fn prepared_simplify_linear_addition(
+    view: &PreparedSemanticView,
+    left: &CExpr,
+    right: &CExpr,
+) -> Option<CExpr> {
+    let mut terms = Vec::new();
+    let mut constant = 0i64;
+    prepared_collect_linear_add_terms(view, left, 1, &mut terms, &mut constant)?;
+    prepared_collect_linear_add_terms(view, right, 1, &mut terms, &mut constant)?;
+    terms.retain(|(_, coeff)| *coeff != 0);
+    terms.sort_by_key(|(term, _)| prepared_expr_order_key(view, term));
+
+    let mut pieces: Vec<CExpr> = terms
+        .into_iter()
+        .map(|(term, coeff)| prepared_linear_coeff_expr(term, coeff))
+        .collect::<Option<Vec<_>>>()?;
+    if constant != 0 {
+        pieces.push(CExpr::IntLit(constant));
+    }
+
+    let mut iter = pieces.into_iter();
+    let first = iter.next().unwrap_or(CExpr::IntLit(0));
+    Some(iter.fold(first, |acc, expr| CExpr::binary(BinaryOp::Add, acc, expr)))
+}
+
+fn prepared_collect_linear_add_terms(
+    view: &PreparedSemanticView,
+    expr: &CExpr,
+    scale: i64,
+    terms: &mut Vec<(CExpr, i64)>,
+    constant: &mut i64,
+) -> Option<()> {
+    match expr {
+        CExpr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
+            prepared_collect_linear_add_terms(view, left, scale, terms, constant)?;
+            prepared_collect_linear_add_terms(view, right, scale, terms, constant)
+        }
+        CExpr::Binary {
+            op: BinaryOp::Mul,
+            left,
+            right,
+        } => {
+            if let Some(coeff) = prepared_literal_i64(right)
+                && let Some(term) = prepared_linear_atom_expr(view, left)
+            {
+                return prepared_push_linear_term(terms, term, scale.checked_mul(coeff)?);
+            }
+            if let Some(coeff) = prepared_literal_i64(left)
+                && let Some(term) = prepared_linear_atom_expr(view, right)
+            {
+                return prepared_push_linear_term(terms, term, scale.checked_mul(coeff)?);
+            }
+            None
+        }
+        CExpr::IntLit(value) => {
+            *constant = constant.checked_add(scale.checked_mul(*value)?)?;
+            Some(())
+        }
+        CExpr::UIntLit(value) => {
+            let value = i64::try_from(*value).ok()?;
+            *constant = constant.checked_add(scale.checked_mul(value)?)?;
+            Some(())
+        }
+        CExpr::Paren(inner) => {
+            prepared_collect_linear_add_terms(view, inner, scale, terms, constant)
+        }
+        _ => {
+            let term = prepared_linear_atom_expr(view, expr)?;
+            prepared_push_linear_term(terms, term, scale)
+        }
+    }
+}
+
+fn prepared_linear_atom_expr(view: &PreparedSemanticView, expr: &CExpr) -> Option<CExpr> {
+    match expr {
+        CExpr::Var(name)
+            if view.param_rank_by_alias.contains_key(name)
+                || view
+                    .param_rank_by_alias
+                    .contains_key(&name.to_ascii_lowercase()) =>
+        {
+            Some(expr.clone())
+        }
+        CExpr::Paren(inner) => prepared_linear_atom_expr(view, inner),
+        CExpr::Cast { ty, expr: inner }
+            if ty.is_integer() && prepared_linear_atom_expr(view, inner).is_some() =>
+        {
+            Some(expr.clone())
+        }
+        _ => None,
+    }
+}
+
+fn prepared_push_linear_term(terms: &mut Vec<(CExpr, i64)>, term: CExpr, coeff: i64) -> Option<()> {
+    if coeff == 0 {
+        return Some(());
+    }
+    if let Some((_, existing)) = terms.iter_mut().find(|(existing, _)| *existing == term) {
+        *existing = existing.checked_add(coeff)?;
+    } else {
+        terms.push((term, coeff));
+    }
+    Some(())
+}
+
+fn prepared_linear_coeff_expr(term: CExpr, coeff: i64) -> Option<CExpr> {
+    match coeff {
+        0 => Some(CExpr::IntLit(0)),
+        1 => Some(term),
+        _ => Some(CExpr::binary(BinaryOp::Mul, term, CExpr::IntLit(coeff))),
+    }
+}
+
+fn prepared_literal_i64(expr: &CExpr) -> Option<i64> {
+    match expr {
+        CExpr::IntLit(value) => Some(*value),
+        CExpr::UIntLit(value) => i64::try_from(*value).ok(),
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => prepared_literal_i64(inner),
+        _ => None,
+    }
+}
+
+fn prepared_binary_op_is_commutative(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Mul | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+    )
+}
+
+fn prepared_expr_order_key(view: &PreparedSemanticView, expr: &CExpr) -> (u8, usize, String) {
+    match expr {
+        CExpr::Var(name) => view
+            .param_rank_by_alias
+            .get(name)
+            .or_else(|| view.param_rank_by_alias.get(&name.to_ascii_lowercase()))
+            .map(|rank| (0, *rank, name.clone()))
+            .unwrap_or_else(|| (1, usize::MAX, name.clone())),
+        CExpr::IntLit(value) => (2, usize::MAX, format!("{value:020}")),
+        CExpr::UIntLit(value) => (2, usize::MAX, format!("{value:020}")),
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+            prepared_expr_order_key(view, inner)
+        }
+        _ => (1, usize::MAX, format!("{expr:?}")),
+    }
+}
+
+fn prepared_expr_is_zero(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::IntLit(value) => *value == 0,
+        CExpr::UIntLit(value) => *value == 0,
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => prepared_expr_is_zero(inner),
+        _ => false,
+    }
+}
+
+fn prepared_expr_is_one(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::IntLit(value) => *value == 1,
+        CExpr::UIntLit(value) => *value == 1,
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => prepared_expr_is_one(inner),
+        _ => false,
+    }
+}
+
+fn prepared_signed_dividend_expr(
+    view: &PreparedSemanticView,
+    producer_by_dst: &HashMap<SSAVar, &SSAOp>,
+    dividend: &SSAVar,
+) -> Option<CExpr> {
+    let SSAOp::IntOr {
+        a: high_part,
+        b: low_part,
+        ..
+    } = producer_by_dst.get(dividend).copied()?
+    else {
+        return None;
+    };
+    prepared_sign_extended_pair_low_root(producer_by_dst, high_part, low_part)
+        .or_else(|| prepared_sign_extended_pair_low_root(producer_by_dst, low_part, high_part))
+        .and_then(|root| scalar_owner_expr_for_value(view, root, root.size))
+}
+
+fn prepared_sign_extended_pair_low_root<'a>(
+    producer_by_dst: &'a HashMap<SSAVar, &SSAOp>,
+    shifted_high: &'a SSAVar,
+    low_zext: &'a SSAVar,
+) -> Option<&'a SSAVar> {
+    let SSAOp::IntLeft {
+        a: high_zext,
+        b: shift,
+        ..
+    } = producer_by_dst.get(shifted_high).copied()?
+    else {
+        return None;
+    };
+    let SSAOp::IntZExt { src: high, .. } = producer_by_dst.get(high_zext).copied()? else {
+        return None;
+    };
+    let low_root = prepared_signed_high_limb_low_root(producer_by_dst, high)?;
+    let SSAOp::IntZExt { src: low, .. } = producer_by_dst.get(low_zext).copied()? else {
+        return None;
+    };
+    if low == low_root
+        && prepared_shift_matches_signed_concat_width(&shift.name, high, low, low_root)
+    {
+        Some(low_root)
+    } else {
+        None
+    }
+}
+
+fn prepared_signed_high_limb_low_root<'a>(
+    producer_by_dst: &'a HashMap<SSAVar, &SSAOp>,
+    high: &'a SSAVar,
+) -> Option<&'a SSAVar> {
+    match producer_by_dst.get(high).copied()? {
+        SSAOp::Subpiece { src: sext, .. } => match producer_by_dst.get(sext).copied()? {
+            SSAOp::IntSExt { src, .. } => Some(src),
+            _ => None,
+        },
+        SSAOp::IntSExt { src, .. } => Some(src),
+        _ => None,
+    }
+}
+
+fn prepared_shift_matches_signed_concat_width(
+    shift_name: &str,
+    high: &SSAVar,
+    low: &SSAVar,
+    low_root: &SSAVar,
+) -> bool {
+    [low.size, low_root.size, high.size]
+        .into_iter()
+        .filter(|size| *size > 0)
+        .any(|size| prepared_const_may_equal(shift_name, u64::from(size.saturating_mul(8))))
+}
+
+fn prepared_const_may_equal(name: &str, expected: u64) -> bool {
+    if parse_const_value(name) == Some(expected) {
+        return true;
+    }
+    let Some(raw) = name.strip_prefix("const:") else {
+        return false;
+    };
+    let raw = raw.split('_').next().unwrap_or(raw);
+    u64::from_str_radix(raw.trim_start_matches("0x"), 16) == Ok(expected)
 }
 
 fn prepared_param_alias_for_var(view: &PreparedSemanticView, var: &SSAVar) -> Option<String> {
@@ -2240,8 +3014,11 @@ fn populate_prepared_call_runtime_facts(
                 .authoritative_args
                 .iter()
                 .cloned()
-                .map(SemanticCallArg::FallbackExpr)
-                .map(CallArgBinding::input)
+                .zip(call_view.authoritative_arg_values.iter().copied())
+                .map(|(expr, value)| {
+                    CallArgBinding::input(SemanticCallArg::FallbackExpr(expr))
+                        .with_source_value_id(value)
+                })
                 .collect::<Vec<_>>();
             if !args.is_empty() {
                 use_info.call_args.insert(site, args);
@@ -2440,6 +3217,9 @@ fn prepared_call_expr(
     view: &PreparedSemanticView,
     env: &PassEnv<'_>,
 ) -> Option<CExpr> {
+    if !prepared_call_args_have_value_bijection(call_view) {
+        return None;
+    }
     let callee = prepared_call_callee_expr(call_view)?;
     let args = call_view
         .authoritative_args
@@ -2465,11 +3245,18 @@ fn prepared_call_callee_expr(call_view: &PreparedCallView) -> Option<CExpr> {
 }
 
 fn prepared_call_expr_from_view(call_view: &PreparedCallView) -> Option<CExpr> {
+    if !prepared_call_args_have_value_bijection(call_view) {
+        return None;
+    }
     let callee = prepared_call_callee_expr(call_view)?;
     Some(CExpr::Call {
         func: Box::new(callee),
         args: call_view.authoritative_args.clone(),
     })
+}
+
+fn prepared_call_args_have_value_bijection(call_view: &PreparedCallView) -> bool {
+    call_view.authoritative_args.len() == call_view.authoritative_arg_values.len()
 }
 
 fn record_prepared_consumed_by_call(
@@ -2837,4 +3624,228 @@ fn param_alias_for_name(name: &str, env: &PassEnv<'_>) -> Option<String> {
         .filter(|(_, version)| *version == "0")
         .and_then(|(base, _)| env.param_register_aliases.get(base))
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_var(name: &str, version: u32, size: u32) -> SSAVar {
+        SSAVar::new(name, version, size)
+    }
+
+    #[test]
+    fn prepared_call_expr_requires_argument_value_bijection() {
+        let unproved = PreparedCallView {
+            callee_name: Some("sym.helper".to_string()),
+            authoritative_args: vec![CExpr::IntLit(7)],
+            authoritative_arg_values: Vec::new(),
+            ..PreparedCallView::default()
+        };
+        assert!(
+            prepared_call_expr_from_view(&unproved).is_none(),
+            "prepared call expressions must not carry rendered args without ValueId proof"
+        );
+
+        let proved = PreparedCallView {
+            callee_name: Some("sym.helper".to_string()),
+            authoritative_args: vec![CExpr::IntLit(7)],
+            authoritative_arg_values: vec![ValueId(7)],
+            ..PreparedCallView::default()
+        };
+        assert_eq!(
+            prepared_call_expr_from_view(&proved),
+            Some(CExpr::Call {
+                func: Box::new(CExpr::Var("sym.helper".to_string())),
+                args: vec![CExpr::IntLit(7)],
+            })
+        );
+    }
+
+    #[test]
+    fn prepared_scalar_expr_orders_commutative_params_by_abi_rank() {
+        let view = PreparedSemanticView {
+            param_rank_by_alias: HashMap::from([
+                ("op".to_string(), 0),
+                ("a".to_string(), 1),
+                ("b".to_string(), 2),
+            ]),
+            ..PreparedSemanticView::default()
+        };
+
+        let expr = prepared_simplify_binary_expr(
+            &view,
+            BinaryOp::BitXor,
+            CExpr::Var("b".to_string()),
+            CExpr::Var("a".to_string()),
+        );
+
+        assert_eq!(
+            expr,
+            CExpr::binary(
+                BinaryOp::BitXor,
+                CExpr::Var("a".to_string()),
+                CExpr::Var("b".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn prepared_scalar_expr_simplifies_repeated_scaled_add() {
+        let view = PreparedSemanticView {
+            param_rank_by_alias: HashMap::from([("a".to_string(), 1)]),
+            ..PreparedSemanticView::default()
+        };
+        let expr = prepared_simplify_binary_expr(
+            &view,
+            BinaryOp::Add,
+            CExpr::Var("a".to_string()),
+            CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(2)),
+        );
+
+        assert_eq!(
+            expr,
+            CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(3))
+        );
+    }
+
+    #[test]
+    fn prepared_scalar_expr_collects_nested_linear_adds_by_param_rank() {
+        let view = PreparedSemanticView {
+            param_rank_by_alias: HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)]),
+            ..PreparedSemanticView::default()
+        };
+        let expr = prepared_simplify_binary_expr(
+            &view,
+            BinaryOp::Add,
+            CExpr::Var("b".to_string()),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("a".to_string()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Var("a".to_string()),
+                    CExpr::Var("a".to_string()),
+                ),
+            ),
+        );
+
+        assert_eq!(
+            expr,
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(3)),
+                CExpr::Var("b".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn prepared_signed_dividend_expr_collapses_cdq_pair_to_low_root() {
+        let eax = test_var("EAX", 1, 4);
+        let edx = test_var("EDX", 1, 4);
+        let sext = test_var("tmp:sext", 1, 8);
+        let high_zext = test_var("tmp:high_zext", 1, 8);
+        let shifted_high = test_var("tmp:shifted_high", 1, 8);
+        let low_zext = test_var("tmp:low_zext", 1, 8);
+        let dividend = test_var("tmp:dividend", 1, 8);
+        let shift = SSAVar::constant(32, 8);
+
+        let sext_op = SSAOp::IntSExt {
+            dst: sext.clone(),
+            src: eax.clone(),
+        };
+        let high_op = SSAOp::Subpiece {
+            dst: edx.clone(),
+            src: sext.clone(),
+            offset: 4,
+        };
+        let high_zext_op = SSAOp::IntZExt {
+            dst: high_zext.clone(),
+            src: edx.clone(),
+        };
+        let shift_op = SSAOp::IntLeft {
+            dst: shifted_high.clone(),
+            a: high_zext.clone(),
+            b: shift,
+        };
+        let low_zext_op = SSAOp::IntZExt {
+            dst: low_zext.clone(),
+            src: eax.clone(),
+        };
+        let dividend_op = SSAOp::IntOr {
+            dst: dividend.clone(),
+            a: shifted_high.clone(),
+            b: low_zext.clone(),
+        };
+
+        let producers = HashMap::from([
+            (sext.clone(), &sext_op),
+            (edx, &high_op),
+            (high_zext, &high_zext_op),
+            (shifted_high, &shift_op),
+            (low_zext, &low_zext_op),
+            (dividend.clone(), &dividend_op),
+        ]);
+        let view = PreparedSemanticView {
+            owner_expr_by_name: HashMap::from([(eax.display_name(), CExpr::Var("a".to_string()))]),
+            ..PreparedSemanticView::default()
+        };
+
+        assert_eq!(
+            prepared_signed_dividend_expr(&view, &producers, &dividend),
+            Some(CExpr::Var("a".to_string()))
+        );
+    }
+
+    #[test]
+    fn prepared_signed_dividend_expr_accepts_direct_sign_extended_high_limb() {
+        let eax = test_var("EAX", 1, 4);
+        let sext = test_var("tmp:sext", 1, 8);
+        let high_zext = test_var("tmp:high_zext", 1, 8);
+        let shifted_high = test_var("tmp:shifted_high", 1, 8);
+        let low_zext = test_var("tmp:low_zext", 1, 8);
+        let dividend = test_var("tmp:dividend", 1, 8);
+        let shift = SSAVar::constant(32, 8);
+
+        let sext_op = SSAOp::IntSExt {
+            dst: sext.clone(),
+            src: eax.clone(),
+        };
+        let high_zext_op = SSAOp::IntZExt {
+            dst: high_zext.clone(),
+            src: sext.clone(),
+        };
+        let shift_op = SSAOp::IntLeft {
+            dst: shifted_high.clone(),
+            a: high_zext.clone(),
+            b: shift,
+        };
+        let low_zext_op = SSAOp::IntZExt {
+            dst: low_zext.clone(),
+            src: eax.clone(),
+        };
+        let dividend_op = SSAOp::IntOr {
+            dst: dividend.clone(),
+            a: shifted_high.clone(),
+            b: low_zext.clone(),
+        };
+
+        let producers = HashMap::from([
+            (sext.clone(), &sext_op),
+            (high_zext, &high_zext_op),
+            (shifted_high, &shift_op),
+            (low_zext, &low_zext_op),
+            (dividend.clone(), &dividend_op),
+        ]);
+        let view = PreparedSemanticView {
+            owner_expr_by_name: HashMap::from([(eax.display_name(), CExpr::Var("a".to_string()))]),
+            ..PreparedSemanticView::default()
+        };
+
+        assert_eq!(
+            prepared_signed_dividend_expr(&view, &producers, &dividend),
+            Some(CExpr::Var("a".to_string()))
+        );
+    }
 }

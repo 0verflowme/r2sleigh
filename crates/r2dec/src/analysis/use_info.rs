@@ -89,6 +89,7 @@ fn analyze_with_definition_overrides_mode(
     for block in blocks {
         count_uses_and_conditions(&mut scratch, block);
     }
+    pin_loop_carried_phi_values(&mut scratch, blocks);
     for block in blocks {
         collect_definitions(&mut scratch, block, env, definition_overrides);
     }
@@ -105,6 +106,7 @@ fn analyze_with_definition_overrides_mode(
     rerun_semantic_call_analysis_after_result_binding(&mut scratch, blocks, env);
     if matches!(mode, UseInfoAnalysisMode::Full) {
         coalesce_variables(&mut scratch, blocks, env);
+        pin_aliases_for_pinned_values(&mut scratch.info);
         build_formatted_defs(&mut scratch, env);
     }
     rebuild_id_mirrors_from_name_maps(&mut scratch.info);
@@ -269,6 +271,33 @@ struct StackHomeQuery<'a, 'b> {
     info: &'a UseInfo,
     lower: &'a LowerCtx<'b>,
     env: &'a PassEnv<'b>,
+}
+
+fn bind_call_arg_source_var(
+    info: &UseInfo,
+    binding: CallArgBinding,
+    source_var: &SSAVar,
+) -> CallArgBinding {
+    let binding = binding.with_source_var(source_var);
+    if let Some(value_id) = exact_call_arg_source_value_id(info, source_var) {
+        binding.with_source_value_id(value_id)
+    } else {
+        binding
+    }
+}
+
+fn exact_call_arg_source_value_id(info: &UseInfo, source_var: &SSAVar) -> Option<ValueId> {
+    info.exact_value_id_for_var(source_var)
+}
+
+fn same_register_family_call_arg_source(src: &SSAVar, dst: &SSAVar) -> bool {
+    let Some(src_family) = register_family_name(&src.name) else {
+        return false;
+    };
+    let Some(dst_family) = register_family_name(&dst.name) else {
+        return false;
+    };
+    src_family == dst_family
 }
 
 fn push_unique_casefold(names: &mut Vec<String>, name: String) {
@@ -2027,6 +2056,12 @@ fn seed_entry_param_aliases(scratch: &mut UseScratch, blocks: &[SSABlock], env: 
 }
 
 fn count_uses_and_conditions(scratch: &mut UseScratch, block: &SSABlock) {
+    for phi in &block.phis {
+        for (_, src) in &phi.sources {
+            scratch.info.note_use_for_var(src);
+        }
+    }
+
     for op in &block.ops {
         for src in op.sources() {
             scratch.info.note_use_for_var(src);
@@ -2036,6 +2071,136 @@ fn count_uses_and_conditions(scratch: &mut UseScratch, block: &SSABlock) {
             scratch.info.note_condition_var(cond);
         }
     }
+}
+
+fn pin_loop_carried_phi_values(scratch: &mut UseScratch, blocks: &[SSABlock]) {
+    if blocks.is_empty() {
+        return;
+    }
+
+    let block_set: HashSet<u64> = blocks.iter().map(|block| block.addr).collect();
+    let mut successors = BTreeMap::new();
+    for (idx, block) in blocks.iter().enumerate() {
+        let mut succs = infer_successors(block, idx, blocks, &block_set);
+        succs.sort_unstable();
+        succs.dedup();
+        successors.insert(block.addr, succs);
+    }
+    let components = strongly_connected_components(&successors);
+
+    for block in blocks {
+        let Some(block_component) = components.get(&block.addr).copied() else {
+            continue;
+        };
+        for phi in &block.phis {
+            let is_loop_carried = phi.sources.iter().any(|(pred, _)| {
+                components.get(pred).copied() == Some(block_component)
+                    && successors
+                        .get(pred)
+                        .is_some_and(|succs| succs.contains(&block.addr))
+            });
+            if !is_loop_carried {
+                continue;
+            }
+
+            pin_phi_materialized_var(&mut scratch.info, &phi.dst);
+            for (_, src) in &phi.sources {
+                pin_phi_materialized_var(&mut scratch.info, src);
+            }
+        }
+    }
+}
+
+fn pin_phi_materialized_var(info: &mut UseInfo, var: &SSAVar) {
+    if var.is_const() || var.is_temp() || utils::is_cpu_flag(&var.name.to_ascii_lowercase()) {
+        return;
+    }
+    let display = var.display_name();
+    info.pinned.insert(display.clone());
+    info.pinned.insert(display.to_ascii_lowercase());
+}
+
+fn pin_aliases_for_pinned_values(info: &mut UseInfo) {
+    let mut aliases = Vec::new();
+    for pinned in &info.pinned {
+        if let Some(alias) = info.var_aliases.get(pinned)
+            && !alias.trim().is_empty()
+        {
+            aliases.push(alias.clone());
+        }
+    }
+    for alias in aliases {
+        info.pinned.insert(alias);
+    }
+}
+
+fn strongly_connected_components(successors: &BTreeMap<u64, Vec<u64>>) -> HashMap<u64, usize> {
+    let mut visited = HashSet::new();
+    let mut order = Vec::with_capacity(successors.len());
+    for start in successors.keys().copied() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((node, exiting)) = stack.pop() {
+            if exiting {
+                order.push(node);
+                continue;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            stack.push((node, true));
+            if let Some(succs) = successors.get(&node) {
+                for succ in succs.iter().rev().copied() {
+                    if successors.contains_key(&succ) && !visited.contains(&succ) {
+                        stack.push((succ, false));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut reverse: BTreeMap<u64, Vec<u64>> = successors
+        .keys()
+        .copied()
+        .map(|addr| (addr, Vec::new()))
+        .collect();
+    for (src, succs) in successors {
+        for succ in succs {
+            if reverse.contains_key(succ) {
+                reverse.entry(*succ).or_default().push(*src);
+            }
+        }
+    }
+    for preds in reverse.values_mut() {
+        preds.sort_unstable();
+        preds.dedup();
+    }
+
+    let mut components = HashMap::new();
+    let mut next_component = 0usize;
+    while let Some(start) = order.pop() {
+        if components.contains_key(&start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if components.insert(node, next_component).is_some() {
+                continue;
+            }
+            if let Some(preds) = reverse.get(&node) {
+                for pred in preds.iter().rev().copied() {
+                    if !components.contains_key(&pred) {
+                        stack.push(pred);
+                    }
+                }
+            }
+        }
+        next_component += 1;
+    }
+
+    components
 }
 
 fn collect_definitions(
@@ -4934,13 +5099,13 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                                     .with_source_call(block.addr, result_call_idx)
                             })
                             .unwrap_or_else(|| {
-                                CallArgBinding::input(semantic_call_arg_for_var(
+                                let binding = CallArgBinding::input(semantic_call_arg_for_var(
                                     &scratch.info,
                                     input_var,
                                     input_expr.clone(),
                                     env,
-                                ))
-                                .with_source_var(input_var)
+                                ));
+                                bind_call_arg_source_var(&scratch.info, binding, input_var)
                             });
                         let binding_has_stable_negative_source =
                             canonicalize_call_arg_binding_to_negative_stack_load(
@@ -4952,6 +5117,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                             .is_some();
                         if !binding.is_result()
                             && !binding_has_stable_negative_source
+                            && same_register_family_call_arg_source(input_var, dst)
                             && let Some(family_value) = same_register_family_semantic_value_before(
                                 &scratch.info,
                                 ops,
@@ -5060,10 +5226,11 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                         && !phi.dst.name.eq_ignore_ascii_case(env.fp_name)
                 }) {
                     let dst_key = phi.dst.display_name();
-                    args.push(
-                        CallArgBinding::input(SemanticCallArg::value_root(phi.dst.clone()))
-                            .with_source_var(&phi.dst),
-                    );
+                    args.push(bind_call_arg_source_var(
+                        &scratch.info,
+                        CallArgBinding::input(SemanticCallArg::value_root(phi.dst.clone())),
+                        &phi.dst,
+                    ));
                     consumed_keys.push(dst_key);
                 } else {
                     break;
@@ -5986,10 +6153,10 @@ fn collect_immediate_stack_call_args(
                                         .with_source_call(block_addr, call_idx)
                                 })
                                 .unwrap_or_else(|| {
-                                    CallArgBinding::input(preferred_stack_input_call_arg(
-                                        info, val, &expr, env,
-                                    ))
-                                    .with_source_var(val)
+                                    let binding = CallArgBinding::input(
+                                        preferred_stack_input_call_arg(info, val, &expr, env),
+                                    );
+                                    bind_call_arg_source_var(info, binding, val)
                                 })
                         })
                         .with_stack_offset(offset);
@@ -6055,14 +6222,6 @@ fn collect_immediate_stack_call_args(
     }
 
     args.sort_by_key(|(offset, _, _, _)| *offset);
-    let stack_home_query = StackHomeQuery {
-        ops,
-        producers,
-        info,
-        lower,
-        env,
-    };
-    repair_duplicate_negative_stack_home_inputs(&mut args, &stack_home_query);
     (args, inlined_call_results)
 }
 
@@ -6100,6 +6259,7 @@ fn preserved_input_binding_from_stack_home(
             }
             _ => None,
         })?;
+    let preserved_input_value = exact_call_arg_source_value_id(query.info, &preserved_input)?;
     let expr = visible_call_arg_seed_expr(query.lower, &preserved_input);
     let mut binding = CallArgBinding::input(preferred_stack_input_call_arg(
         query.info,
@@ -6108,6 +6268,7 @@ fn preserved_input_binding_from_stack_home(
         query.env,
     ))
     .with_source_var(&preserved_input)
+    .with_source_value_id(preserved_input_value)
     .with_stack_offset(printf_stack_offset);
     canonicalize_call_arg_binding_to_negative_stack_load(
         query.info,
@@ -6125,58 +6286,6 @@ fn duplicate_result_input_binding_from_preserved_stack_home(
     printf_stack_offset: i64,
 ) -> Option<CallArgBinding> {
     preserved_input_binding_from_stack_home(query, val, result_call_idx, printf_stack_offset)
-}
-
-fn repair_duplicate_negative_stack_home_inputs(
-    args: &mut [(i64, CallArgBinding, String, String)],
-    query: &StackHomeQuery<'_, '_>,
-) {
-    let mut seen_negative_offsets = HashSet::new();
-
-    for (printf_stack_offset, binding, value_key, _) in args.iter_mut() {
-        if binding.is_result() {
-            continue;
-        }
-
-        let current_negative_offset =
-            call_arg_semantic_source_offset(query.info, &binding.arg, 0, &mut HashSet::new())
-                .filter(|offset| *offset < 0);
-
-        let Some(current_negative_offset) = current_negative_offset else {
-            continue;
-        };
-
-        if seen_negative_offsets.insert(current_negative_offset) {
-            continue;
-        }
-
-        let Some(source_var) = ssa_var_from_display_name(value_key, 8) else {
-            continue;
-        };
-        let Some((_, load_idx)) = producer_entry_for_var(query.producers, &source_var) else {
-            continue;
-        };
-        let Some(candidate) = preserved_input_binding_from_stack_home(
-            query,
-            &source_var,
-            load_idx,
-            *printf_stack_offset,
-        ) else {
-            continue;
-        };
-        let candidate_negative_offset =
-            call_arg_semantic_source_offset(query.info, &candidate.arg, 0, &mut HashSet::new())
-                .filter(|offset| *offset < 0);
-        let Some(candidate_negative_offset) = candidate_negative_offset else {
-            continue;
-        };
-        if candidate_negative_offset == current_negative_offset {
-            continue;
-        }
-
-        *binding = candidate;
-        seen_negative_offsets.insert(candidate_negative_offset);
-    }
 }
 
 fn preferred_stack_input_call_arg(
@@ -6250,13 +6359,13 @@ fn improve_call_arg_binding_from_copy_root(
     }
 
     let root_expr = visible_call_arg_seed_expr(lower, &root_var);
-    let mut root_binding = CallArgBinding::input(semantic_call_arg_for_var(
+    let root_binding = CallArgBinding::input(semantic_call_arg_for_var(
         info,
         &root_var,
         root_expr.clone(),
         env,
-    ))
-    .with_source_var(&root_var);
+    ));
+    let mut root_binding = bind_call_arg_source_var(info, root_binding, &root_var);
     let root_has_stable_negative_source = canonicalize_call_arg_binding_to_negative_stack_load(
         info,
         &mut root_binding,
@@ -8407,6 +8516,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn value_id_for_var_does_not_use_ambiguous_base_register_versions() {
+        let x8_0 = mk("X8", 0, 8);
+        let x8_1 = mk("X8", 1, 8);
+        let x8_2 = mk("X8", 2, 8);
+        let info = analyze_info(vec![single_block(vec![
+            SSAOp::Copy {
+                dst: x8_1.clone(),
+                src: x8_0.clone(),
+            },
+            SSAOp::Copy {
+                dst: x8_2.clone(),
+                src: x8_1.clone(),
+            },
+        ])]);
+
+        let entry_id = info
+            .value_id_for_var(&x8_0)
+            .expect("entry register value id");
+        assert_eq!(info.value_id_for_name("X8"), Some(entry_id));
+        assert_eq!(
+            info.exact_value_id_for_var(&x8_1),
+            info.value_id_for_var(&x8_1)
+        );
+        assert_eq!(
+            info.exact_value_id_for_var(&x8_2),
+            info.value_id_for_var(&x8_2)
+        );
+        assert_ne!(info.value_id_for_var(&x8_1), Some(entry_id));
+        assert_ne!(info.value_id_for_var(&x8_2), Some(entry_id));
+    }
+
     fn single_block(ops: Vec<SSAOp>) -> SSABlock {
         SSABlock {
             addr: 0x1000,
@@ -8932,7 +9073,7 @@ mod tests {
             SSAOp::Store {
                 space: "ram".to_string(),
                 addr: preserved_home.clone(),
-                val: local_arg,
+                val: local_arg.clone(),
             },
             SSAOp::Call {
                 target: mk("ram:10000081c", 0, 8),
@@ -8953,7 +9094,7 @@ mod tests {
             SSAOp::Store {
                 space: "ram".to_string(),
                 addr: call_home0,
-                val: reloaded_home,
+                val: reloaded_home.clone(),
             },
             SSAOp::IntAdd {
                 dst: call_home1.clone(),
@@ -8970,7 +9111,58 @@ mod tests {
             },
         ]);
 
-        let info = analyze(&[block], &env);
+        let info = analyze(std::slice::from_ref(&block), &env);
+        let lower = LowerCtx {
+            use_info: Some(&info),
+            definitions: &info.definitions,
+            semantic_values: &info.semantic_values,
+            use_counts: &info.use_counts,
+            condition_vars: &info.condition_vars,
+            pinned: &info.pinned,
+            var_aliases: &info.var_aliases,
+            param_register_aliases: env.param_register_aliases,
+            type_hints: &info.type_hints,
+            ptr_arith: &info.ptr_arith,
+            stack_slots: &info.stack_slots,
+            forwarded_values: &info.forwarded_values,
+            function_names: env.function_names,
+            strings: env.strings,
+            symbols: env.symbols,
+            type_oracle: env.type_oracle,
+        };
+        let producers = block
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| op.dst().map(|dst| (dst.display_name(), idx)))
+            .collect::<HashMap<_, _>>();
+        let (_, reloaded_home_idx) =
+            producer_entry_for_var(&producers, &reloaded_home).expect("reloaded home producer");
+        let stack_home_query = StackHomeQuery {
+            ops: &block.ops,
+            producers: &producers,
+            info: &info,
+            lower: &lower,
+            env: &env,
+        };
+        let preserved = preserved_input_binding_from_stack_home(
+            &stack_home_query,
+            &reloaded_home,
+            reloaded_home_idx,
+            0,
+        )
+        .expect("preserved stack-home binding");
+        let local_arg_name = local_arg.display_name();
+        assert_eq!(
+            preserved.source_var_name.as_deref(),
+            Some(local_arg_name.as_str())
+        );
+        assert_eq!(
+            preserved.source_value_id,
+            info.value_id_for_var(&local_arg),
+            "stack-home repair candidates must be backed by canonical ValueId provenance"
+        );
+
         let args = info.call_args.get(&(0x1000, 13)).expect("printf args");
         assert!(
             !matches!(
@@ -8995,6 +9187,19 @@ mod tests {
             ),
             "first post-helper printf arg should not regress to a stack placeholder fallback, got {args:?}"
         );
+        let repaired = args
+            .get(1)
+            .expect("first post-helper printf arg should stay bound");
+        if let Some(source_value_id) = repaired.source_value_id {
+            let resolved_name = info
+                .display_name_for_value_id(source_value_id)
+                .expect("post-helper printf arg ValueId should resolve");
+            assert_eq!(
+                repaired.source_var_name.as_deref(),
+                Some(resolved_name.as_str()),
+                "post-helper printf arg source variable and ValueId must agree, binding={repaired:?}"
+            );
+        }
     }
 
     #[test]

@@ -38,6 +38,61 @@ second shell.
 13. Rewrite bad seams instead of patching around them.
 14. Validation is part of the change, not optional cleanup.
 15. Never fabricate C/control/type semantics just to avoid a residual.
+16. Never land or preserve hacky behavior to make one case, benchmark, or
+    snapshot look good.
+
+## Anti-Hack Standard
+
+Hacky shortcuts are correctness bugs, even when they improve a local score.
+If you find one, do not normalize it, route around it, or add another layer on
+top. Remove it, rewrite it, or replace it with a mathematically defensible
+analysis path owned by the right crate.
+
+Treat these as blockers:
+
+- test-specific or fixture-specific semantic recovery
+- source-gold, r2r, or benchmark expectations that bless source-shaped output
+  generated from summary templates instead of reconstructed CFG/dataflow proof
+- name-owned summaries that pretend to be structural proof
+- fake helper calls, fake loops, fake switches, fake stack slots, or fake types
+- output cleanup that hides missing upstream facts
+- benchmark logic that rewards guessed semantics instead of source-gold behavior
+- broad fallback behavior that silently turns unknown facts into confident C
+
+The required standard is mathematical, not cosmetic:
+
+- state the invariant being proven or refused
+- state the canonical owner of the fact
+- state the evidence needed to justify the output
+- state the complexity target and why it avoids repeated weak scans
+- prefer a visible residual/refusal over plausible but unproven C
+- prefer manual source-gold reversing checks over benchmark-only confidence
+
+If the clean fix requires a rewrite, do the rewrite. A smaller patch is not
+better when it preserves a bad proof model.
+
+### Synthetic Output Test Ban
+
+Tests must not train the engine to look good. If a test expects source-shaped C,
+the expected shape must be justified by native CFG/control/dataflow/type facts,
+not by a summary template that happens to match the fixture source.
+
+Rules:
+
+- Do not add source-gold expectations that require `summary_*` locals, synthetic
+  iterator names, or pretty source-shaped loops as a substitute for native proof.
+- Do not accept "looks like source" output from summary routes unless the test
+  also proves the output is visibly summary-only and not scored as native
+  reconstruction.
+- Do not keep a positive oracle whose only purpose is preserving a pretty
+  synthetic projection. Delete it or convert it into a negative oracle that
+  rejects fake C.
+- Summary-only routes may render comments, facts, residuals, and explicit
+  refusal. They must not emit executable C, even when summary evidence is exact;
+  exact summaries should feed native render proofs first, then render through the
+  normal CFG/control/dataflow path.
+- Every time a clean-looking decompile appears too good for the available facts,
+  stop feature work and audit the renderer, oracle, and benchmark gate first.
 
 ## Optimization Doctrine
 
@@ -85,6 +140,8 @@ that requires invasive refactors.
 - Do not preserve a bad abstraction because it already exists.
 - Do not add end-stage hacks in `r2plugin` or `r2dec` to hide missing upstream
   semantics.
+- If hacky behavior is found anywhere in the pipeline, remove or rewrite it
+  before building more behavior on top of it.
 - If a crate is carrying policy it should not own, move that policy.
 - Keep the next major direction as a spine rewrite, not a blank-slate rewrite:
   move orchestration to `r2engine`, evidence to `r2sym`, dataflow facts to
@@ -103,6 +160,8 @@ same class of bug:
 - invented loop/switch/control structure without CFG or semantic evidence
 - invented switch case values when jump-table facts are missing
 - summary pseudo-calls presented as full native decompilation
+- summary templates that emit source-shaped loops, switches, struct walks, or
+  returns from bounded/likely evidence
 - hardcoded function-name summaries treated as proof
 - hardcoded role signatures overriding stronger typed context
 - decompiler-side call argument repair hiding missing callsite provenance
@@ -116,6 +175,9 @@ Correct responses:
 - use symbol names only as weak hints unless backed by typed context or
   structural evidence
 - add benchmark/r2r checks that detect the fake output class
+- convert source-gold tests that bless fake C into negative/refusal tests
+- remove existing fake-output paths when discovered, even if doing so makes a
+  benchmark temporarily worse
 
 ## Task-Start Protocol
 
@@ -132,6 +194,8 @@ For any non-trivial change, follow this order:
    canonical facts or mark it as residual/summary-driven.
 8. If the seam crosses into `../radare2`, validate both repos before claiming
    the work is complete.
+9. If the task reveals hacky behavior, remove or rewrite that behavior before
+   adding new feature work that depends on it.
 
 ## Ownership Boundaries
 

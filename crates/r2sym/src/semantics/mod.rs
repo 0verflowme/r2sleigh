@@ -1,5 +1,6 @@
 mod artifact;
 mod cache;
+mod claims;
 mod classify;
 mod compiler;
 pub(crate) mod facts;
@@ -18,6 +19,13 @@ pub use cache::{
     SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticCompilationResult, SemanticSeedMode,
     stable_scope_hash,
 };
+pub use claims::{
+    CheckedClaim, PROOF_COVERAGE_SCHEMA_VERSION, ProofCoverage, ProofFailure, ProofObligation,
+    ProofObligationKind, ProofOwner, RenderPermission, RenderPermissionKind,
+    SEMANTIC_CLAIM_SCHEMA_VERSION, SemanticClaim, SemanticClaimKind, SemanticClaimSource,
+    SemanticClaimSummary, SemanticTypeSeedKind, SummaryRoleCertificate, SummaryRouteCertificate,
+    SummaryRouteCertificateKind,
+};
 pub use compiler::compile_semantic_artifact_default_with_scope;
 pub use compiler::{
     compile_function_semantics_with_scope, compile_function_semantics_with_scope_and_replay_seed,
@@ -31,9 +39,10 @@ pub use facts::{SymbolicReachabilityStatus, augment_semantic_artifact_with_inter
 pub use native_worker::{
     NativeWorkerSummaryApplicability, NativeWorkerSummaryApplicabilitySource,
     NativeWorkerSummaryRouteKind, NativeWorkerSummaryRoutePolicy,
-    direct_native_worker_summary_applicability_for_name, has_native_worker_summary_family,
-    has_program_orchestrator_summary_family, native_worker_summary_applicability_for_name,
-    native_worker_summary_applicability_for_summary, native_worker_summary_route_policy_for_name,
+    direct_native_worker_summary_applicability_for_name, function_semantic_summary_seed_for_name,
+    has_native_worker_summary_family, has_program_orchestrator_summary_family,
+    native_worker_summary_applicability_for_name, native_worker_summary_applicability_for_summary,
+    native_worker_summary_route_policy_for_name, native_worker_summary_route_policy_for_summary,
 };
 pub use plan::{
     ArtifactBuildPlan, DecompilePlan, QueryGuidanceMode, QueryPlan, TargetQueryExecutionRoute,
@@ -42,12 +51,13 @@ pub use plan::{
 pub use region::{
     ArtifactGranularity, ControlFact, ExecutionModel, Judged, MemoryFact, NativeArtifactBody,
     NativeFunctionSummary, NativeLoopSummary, NativeMemoryAccessKind, NativeMemoryAccessSummary,
-    NativeParserKind, NativeParserSummary, NativeReductionSummary, NativeRegionSummary,
-    NativeSummarySpecificity, NativeWorkerFold, NativeWorkerFoldOperation, NativeWorkerLoopSummary,
-    NativeWorkerPredicate, NativeWorkerRoleIdentity, NativeWorkerRoleSource, NativeWorkerSummary,
-    NativeWorkerSummaryKind, NativeWorkerTerminator, RefinementStage, RegionKey,
-    SemanticArtifactDiagnostics, SemanticPredicate, SemanticRegion, SemanticTargetConditionSource,
-    TargetFact, VmArtifactBody,
+    NativeParserKind, NativeParserReturnPredicate, NativeParserReturnPredicateKind,
+    NativeParserSummary, NativeReductionSummary, NativeRegionSummary, NativeSummarySpecificity,
+    NativeTableWalkSummary, NativeWorkerByteTransform, NativeWorkerFold, NativeWorkerFoldOperation,
+    NativeWorkerLoopSummary, NativeWorkerPredicate, NativeWorkerRoleIdentity,
+    NativeWorkerRoleSource, NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator,
+    RefinementStage, RegionKey, SemanticArtifactDiagnostics, SemanticPredicate, SemanticRegion,
+    SemanticTargetConditionSource, TargetFact, VmArtifactBody,
 };
 pub use vm::{
     InterpreterDispatchSummary, InterpreterKind, VmBinaryOp, VmGuardCondition, VmGuardedExit,

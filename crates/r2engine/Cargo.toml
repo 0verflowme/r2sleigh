@@ -12,8 +12,7 @@ r2sym = { path = "../r2sym" }
 r2types = { path = "../r2types" }
 r2dec = { path = "../r2dec" }
 serde.workspace = true
-thiserror.workspace = true
-z3 = "0.20.0"
+z3.workspace = true
 
 [features]
 default = []

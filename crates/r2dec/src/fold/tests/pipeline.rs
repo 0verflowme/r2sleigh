@@ -7,9 +7,11 @@ mod tests {
         FoldArchConfig, FoldInputs,
         analysis::{
             CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, PassEnv,
-            PreparedSemanticView, ScalarValue, StackInfo, UseInfo,
+            PreparedSemanticView, ScalarValue, StackInfo, StackSlotProvenance, StackSlotValueKind,
+            UseInfo,
         },
     };
+    use crate::fold::context::EffectRenderProofKind;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2types::{
         CalleeArgEffect, CalleeFact, CalleeReturnRelation, ExternalField, ExternalStackBase,
@@ -148,6 +150,15 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn external_signature_certificate(
+        signature: &FunctionSignatureSpec,
+    ) -> Option<r2types::SignatureCertificate> {
+        r2types::SignatureCertificate::from_signature(
+            signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        )
     }
 
     fn visible_stack_binding(name: &str, ty: Option<CType>, offset: i64) -> VisibleBinding {
@@ -418,6 +429,10 @@ mod tests {
             &CExpr::Var("i".to_string()),
             CExpr::Var("local_3".to_string()),
         );
+        let cross_slot_rhs = ctx.rewrite_scalar_stack_placeholder_rhs(
+            &CExpr::Var("sum".to_string()),
+            CExpr::Var("local_17".to_string()),
+        );
 
         assert!(
             expr_contains_var(&sum_rhs, "sum") && !expr_contains_addr_of(&sum_rhs),
@@ -438,6 +453,29 @@ mod tests {
                     && matches!(right.as_ref(), CExpr::IntLit(1))
             ),
             "scalar loop increment should render as `i + 1`: {i_rhs:?}"
+        );
+        assert_eq!(
+            cross_slot_rhs,
+            CExpr::Var("local_17".to_string()),
+            "large cross-slot placeholder deltas must not be rewritten as scalar arithmetic"
+        );
+    }
+
+    #[test]
+    fn canonical_frame_stack_slot_offsets_are_rmw_candidates() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_external_stack_vars(HashMap::from([(
+            -8,
+            stack_var_spec("count", Some(CType::UInt(64)), Some("rbp")),
+        )]));
+        ctx.state.analysis_ctx.stack_info.stack_vars =
+            HashMap::from([(-8, "count".to_string())]);
+
+        let offsets = ctx.stack_offsets_for_visible_storage_name("count");
+        assert!(offsets.contains(&-8), "keeps derived offset: {offsets:?}");
+        assert!(
+            offsets.contains(&8),
+            "canonical frame-pointer stack slot should be available as an RMW proof candidate: {offsets:?}"
         );
     }
 
@@ -664,7 +702,8 @@ mod tests {
     #[test]
     fn test_constant_parsing() {
         assert_eq!(parse_const_value("const:0x42"), Some(0x42));
-        assert_eq!(parse_const_value("const:42"), Some(42));
+        assert_eq!(parse_const_value("const:42"), Some(0x42));
+        assert_eq!(parse_const_value("const:0d42"), Some(42));
         assert_eq!(parse_const_value("const:fffffffc"), Some(0xfffffffc));
         assert_eq!(parse_const_value("const:0x42_0"), Some(0x42));
     }
@@ -1227,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_imported_printf_result_slot_prefers_source_inputs_over_replayed_helper_calls() {
+    fn test_imported_printf_result_slot_does_not_repair_uncertified_siblings() {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
             (0x401020, "sym._unlock".to_string()),
@@ -1301,12 +1340,12 @@ mod tests {
             args,
             vec![
                 CExpr::StringLit("unlock(%d, %d, %d) = %d\\n".to_string()),
-                CExpr::Var("a".to_string()),
+                helper_call.clone(),
                 CExpr::Var("b".to_string()),
                 CExpr::Var("c".to_string()),
                 helper_call,
             ],
-            "printf sibling repair should replace replayed helper inputs with source locals, got {args:?}"
+            "uncertified printf sibling inputs must not be silently repaired, got {args:?}"
         );
     }
 
@@ -3391,7 +3430,7 @@ mod tests {
             rendered_args,
             vec![
                 CExpr::Var("dup".to_string()),
-                CExpr::Var("local_10".to_string()),
+                CExpr::Var("s".to_string()),
                 CExpr::binary(
                     BinaryOp::Add,
                     CExpr::Var("len".to_string()),
@@ -3419,7 +3458,7 @@ mod tests {
                             && args
                                 == &vec![
                                     CExpr::Var("dup".to_string()),
-                                    CExpr::Var("local_10".to_string()),
+                                    CExpr::Var("s".to_string()),
                                     CExpr::binary(
                                         BinaryOp::Add,
                                         CExpr::Var("len".to_string()),
@@ -4176,6 +4215,31 @@ mod tests {
     }
 
     #[test]
+    fn certified_phi_source_resolution_refuses_divergent_sources() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("phi_refusal");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.state.analysis_ctx.use_info.phi_sources.insert(
+            "RAX_3".to_string(),
+            vec![
+                make_var("const:1", 0, 8),
+                make_var("const:2", 0, 8),
+            ],
+        );
+
+        let mut visited = HashSet::new();
+        let resolved = ctx.resolve_expr_from_phi_sources("RAX_3", 0, &mut visited, false);
+        assert_eq!(
+            resolved, None,
+            "certified non-identity phi cannot pick one source as a fake expression"
+        );
+    }
+
+    #[test]
     fn test_constant_pointer_offset_load_renders_as_subscript() {
         let mut ctx = FoldingContext::new(64);
         ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
@@ -4203,6 +4267,73 @@ mod tests {
             }
             other => panic!("expected constant-index subscript, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_integer_linear_addition_collects_nested_terms_deterministically() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_type_hints(HashMap::from([
+            ("a".to_string(), CType::Int(32)),
+            ("b".to_string(), CType::Int(32)),
+        ]));
+
+        let expr = ctx.identity_simplify_binary(
+            BinaryOp::Add,
+            CExpr::Var("b".to_string()),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("a".to_string()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Var("a".to_string()),
+                    CExpr::Var("a".to_string()),
+                ),
+            ),
+            Some(4),
+        );
+
+        assert_eq!(
+            expr,
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::binary(BinaryOp::Mul, CExpr::Var("a".to_string()), CExpr::IntLit(3)),
+                CExpr::Var("b".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_linear_addition_refuses_pointer_terms() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_type_hints(HashMap::from([
+            ("buf".to_string(), CType::ptr(CType::UInt(8))),
+            ("i".to_string(), CType::Int(32)),
+        ]));
+
+        let expr = ctx.identity_simplify_binary(
+            BinaryOp::Add,
+            CExpr::Var("buf".to_string()),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("i".to_string()),
+                CExpr::Var("i".to_string()),
+            ),
+            Some(8),
+        );
+
+        assert_eq!(
+            expr,
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("buf".to_string()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Var("i".to_string()),
+                    CExpr::Var("i".to_string())
+                )
+            ),
+            "pointer arithmetic must not be reordered or collapsed by scalar linear normalization"
+        );
     }
 
     #[test]
@@ -4700,6 +4831,94 @@ mod tests {
     }
 
     #[test]
+    fn test_subscript_swaps_scalar_stack_slot_base_with_address_like_index() {
+        let len_value = make_var("tmp:9400", 1, 8);
+        let buf_value = make_var("tmp:9401", 1, 8);
+        let store_addr = make_var("tmp:9402", 1, 8);
+
+        let mut ctx = FoldingContext::new(64);
+        ctx.state.analysis_ctx.use_info.stack_slots.insert(
+            "len".to_string(),
+            StackSlotProvenance {
+                offset: -0x20,
+                predicate_carrier: false,
+                return_carrier: false,
+                value_kind: StackSlotValueKind::Scalar,
+            },
+        );
+        ctx.state.analysis_ctx.use_info.stack_slots.insert(
+            "buf".to_string(),
+            StackSlotProvenance {
+                offset: -0x8,
+                predicate_carrier: false,
+                return_carrier: false,
+                value_kind: StackSlotValueKind::AddressLike,
+            },
+        );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .type_hints
+            .insert("len".to_string(), CType::u64());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .type_hints
+            .insert("buf".to_string(), CType::ptr(CType::i8()));
+        ctx.state.analysis_ctx.use_info.semantic_values.insert(
+            len_value.display_name(),
+            crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
+                "len".to_string(),
+            ))),
+        );
+        ctx.state.analysis_ctx.use_info.semantic_values.insert(
+            buf_value.display_name(),
+            crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Expr(CExpr::Var(
+                "buf".to_string(),
+            ))),
+        );
+        ctx.state.analysis_ctx.use_info.semantic_values.insert(
+            store_addr.display_name(),
+            crate::analysis::SemanticValue::Load {
+                addr: crate::analysis::NormalizedAddr {
+                    base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::from(
+                        len_value.clone(),
+                    )),
+                    index: Some(crate::analysis::ValueRef::from(buf_value.clone())),
+                    scale_bytes: 1,
+                    offset_bytes: 0,
+                },
+                size: 1,
+            },
+        );
+
+        let mut visited = HashSet::new();
+        let expr = ctx
+            .render_semantic_value(
+                ctx.state
+                    .analysis_ctx
+                    .use_info
+                    .semantic_values
+                    .get(&store_addr.display_name())
+                    .expect("semantic load should exist"),
+                0,
+                &mut visited,
+            )
+            .expect("semantic load should render");
+        let CExpr::Subscript { base, index } = expr else {
+            panic!("expected subscript expression, got {expr:?}");
+        };
+        assert!(
+            matches!(base.as_ref(), CExpr::Var(name) if name == "buf"),
+            "address-like stack slot must be the subscript base, got base={base:?} index={index:?}"
+        );
+        assert!(
+            matches!(index.as_ref(), CExpr::Var(name) if name == "len"),
+            "scalar stack slot must remain the subscript index, got base={base:?} index={index:?}"
+        );
+    }
+
+    #[test]
     fn test_member_access_uses_subscript_base_when_base_has_generic_ptr_arith_definition() {
         let idx = make_var("arg2", 0, 4);
         let base = make_var("tmp:9400", 1, 8);
@@ -4823,6 +5042,56 @@ mod tests {
         assert!(
             matches!(index.as_ref(), CExpr::Var(name) if name == "arg2"),
             "shift-scaled index must preserve the semantic scalar index"
+        );
+    }
+
+    #[test]
+    fn test_typed_load_reconstructs_commuted_pointer_index_visible_address() {
+        let addr = make_var("tmp:9550", 1, 8);
+        let dst = make_var("tmp:9551", 1, 1);
+        let mut ctx = FoldingContext::new(64);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .type_hints
+            .insert("buf".to_string(), CType::ptr(CType::u8()));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .type_hints
+            .insert("i".to_string(), CType::u64());
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            addr.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("i".to_string()),
+                CExpr::Var("buf".to_string()),
+            ),
+        );
+
+        let direct = ctx
+            .indexed_pointer_add_expr(
+                &CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Var("i".to_string()),
+                    CExpr::Var("buf".to_string()),
+                ),
+                &CType::u8(),
+            )
+            .expect("typed commuted pointer add should normalize directly");
+        assert!(matches!(direct, CExpr::Subscript { .. }), "{direct:?}");
+
+        let expr = ctx.render_canonical_load_expr(&dst, &addr, CType::u8());
+        let CExpr::Subscript { base, index } = expr else {
+            panic!("expected commuted pointer addition to render as subscript, got {expr:?}");
+        };
+        assert!(
+            matches!(base.as_ref(), CExpr::Var(name) if name == "buf"),
+            "typed pointer operand must be the subscript base, got base={base:?} index={index:?}"
+        );
+        assert!(
+            matches!(index.as_ref(), CExpr::Var(name) if name == "i"),
+            "scalar operand must be the subscript index, got base={base:?} index={index:?}"
         );
     }
 
@@ -5341,6 +5610,113 @@ mod tests {
         assert!(
             rendered_text.contains("third") && rendered_text.contains("arg1"),
             "expected layout-backed indexed member render, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_semanticize_raw_subscript_recovers_exact_indexed_field_from_layout() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(
+            [
+                ("rdi".to_string(), "items".to_string()),
+                ("esi".to_string(), "idx".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        ctx.set_type_hints(
+            [
+                (
+                    "items".to_string(),
+                    CType::ptr(CType::Struct("Item".to_string())),
+                ),
+                ("idx".to_string(), CType::Int(32)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
+            structs: [(
+                "item".to_string(),
+                ExternalStruct {
+                    name: "Item".to_string(),
+                    fields: [
+                        (
+                            0,
+                            ExternalField {
+                                name: "id".to_string(),
+                                offset: 0,
+                                ty: Some("int32_t".to_string()),
+                            },
+                        ),
+                        (
+                            4,
+                            ExternalField {
+                                name: "flags".to_string(),
+                                offset: 4,
+                                ty: Some("uint16_t".to_string()),
+                            },
+                        ),
+                        (
+                            6,
+                            ExternalField {
+                                name: "len".to_string(),
+                                offset: 6,
+                                ty: Some("uint16_t".to_string()),
+                            },
+                        ),
+                        (
+                            8,
+                            ExternalField {
+                                name: "scores".to_string(),
+                                offset: 8,
+                                ty: Some("int32_t[4]".to_string()),
+                            },
+                        ),
+                        (
+                            24,
+                            ExternalField {
+                                name: "next".to_string(),
+                                offset: 24,
+                                ty: Some("Item*".to_string()),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+
+        let raw = CExpr::Subscript {
+            base: Box::new(CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("items".to_string()),
+                CExpr::binary(
+                    BinaryOp::Mul,
+                    CExpr::Var("idx".to_string()),
+                    CExpr::IntLit(40),
+                ),
+            )),
+            index: Box::new(CExpr::IntLit(3)),
+        };
+
+        let semantic = ctx.debug_semanticize_visible_expr(&raw);
+        let rendered = format!("{semantic:?}");
+        assert!(
+            matches!(semantic, CExpr::Member { .. } | CExpr::PtrMember { .. }),
+            "raw subscript should promote only through exact layout proof, got {semantic:?}"
+        );
+        assert!(
+            rendered.contains("len") && rendered.contains("items") && rendered.contains("idx"),
+            "expected exact indexed len field, got {semantic:?}"
+        );
+        assert!(
+            !rendered.contains("scores"),
+            "field-width proof should not reinterpret the subscript as an array element, got {semantic:?}"
         );
     }
 
@@ -5866,7 +6242,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Eq,
                 CExpr::Var("x".to_string()),
-                CExpr::Var("0xdead".to_string())
+                CExpr::IntLit(0xdead)
             )
         );
     }
@@ -5912,7 +6288,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Eq,
                 CExpr::Var("x".to_string()),
-                CExpr::Var("0xffffffff".to_string())
+                CExpr::UIntLit(0xffff_ffff)
             )
         );
     }
@@ -6001,6 +6377,22 @@ mod tests {
             Some(4),
         );
         assert_eq!(simplified, CExpr::Var("x".to_string()));
+    }
+
+    #[test]
+    fn test_identity_add_repeated_scaled_term() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_type_hints(HashMap::from([("x".to_string(), CType::Int(32))]));
+        let simplified = ctx.identity_simplify_binary(
+            BinaryOp::Add,
+            CExpr::Var("x".to_string()),
+            CExpr::binary(BinaryOp::Mul, CExpr::Var("x".to_string()), CExpr::IntLit(2)),
+            Some(4),
+        );
+        assert_eq!(
+            simplified,
+            CExpr::binary(BinaryOp::Mul, CExpr::Var("x".to_string()), CExpr::IntLit(3))
+        );
     }
 
     #[test]
@@ -6285,7 +6677,7 @@ mod tests {
             CExpr::binary(
                 BinaryOp::Eq,
                 CExpr::Var("result".to_string()),
-                CExpr::IntLit(19),
+                    CExpr::IntLit(25),
             ),
         );
         ctx.state.analysis_ctx.use_info.definitions.insert(
@@ -7344,6 +7736,28 @@ mod tests {
         assert!(
             stmt.is_none(),
             "arg1 = edi entry alias copy should be suppressed"
+        );
+    }
+
+    #[test]
+    fn test_copy_suppresses_uninitialized_return_register_phi_carrier() {
+        let ctx = FoldingContext::new(64);
+        let stmt = ctx.op_to_stmt(&SSAOp::Copy {
+            dst: make_var("EAX", 1, 4),
+            src: make_var("EAX", 0, 4),
+        });
+        assert!(
+            stmt.is_none(),
+            "version-0 return-register phi carriers should not render as source assignments"
+        );
+
+        let real_copy = ctx.op_to_stmt(&SSAOp::Copy {
+            dst: make_var("EAX", 1, 4),
+            src: make_var("EDI", 0, 4),
+        });
+        assert!(
+            real_copy.is_some(),
+            "only uninitialized return-register carriers should be suppressed"
         );
     }
 
@@ -8925,6 +9339,303 @@ mod tests {
     }
 
     #[test]
+    fn conditional_loop_latch_with_exit_edge_is_not_whole_return_context() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: Varnode::constant(0x1004, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: Varnode::constant(0x1000, 8),
+                    cond: Varnode::constant(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: Varnode::constant(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa func");
+        func.get_block_mut(0x1000).expect("header").ops = vec![SSAOp::Branch {
+            target: make_var("ram:1004", 0, 8),
+        }];
+        func.get_block_mut(0x1004).expect("latch").ops = vec![
+            SSAOp::IntAdd {
+                dst: make_var("RAX", 1, 8),
+                a: make_var("RAX", 0, 8),
+                b: make_var("const:1", 0, 8),
+            },
+            SSAOp::IntNotEqual {
+                dst: make_var("tmp:cond", 1, 1),
+                a: make_var("RSI", 0, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::CBranch {
+                target: make_var("ram:1000", 0, 8),
+                cond: make_var("tmp:cond", 1, 1),
+            },
+        ];
+        func.get_block_mut(0x1008).expect("exit").ops = vec![SSAOp::Return {
+            target: make_var("RIP", 1, 8),
+        }];
+
+        let mut ctx = make_x86_64_ctx();
+        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
+        ctx.analyze_blocks(&fold_blocks);
+        ctx.analyze_function_structure(&func);
+
+        assert!(
+            !ctx.state.return_blocks.contains(&0x1004),
+            "loop latch has a return edge, not block-wide return semantics: {:?}",
+            ctx.state.return_blocks
+        );
+
+        let latch_stmts = ctx.fold_block(func.get_block(0x1004).expect("latch"), 0x1004);
+        assert!(
+            !latch_stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "loop latch must not synthesize an unconditional return: {latch_stmts:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_preheader_with_exit_edge_and_body_successor_is_not_whole_return_context() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: Varnode::constant(0x1008, 8),
+                    cond: Varnode::constant(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Branch {
+                    target: Varnode::constant(0x1004, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1008,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: Varnode::constant(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa func");
+        func.get_block_mut(0x1000).expect("preheader").ops = vec![
+            SSAOp::Copy {
+                dst: make_var("RAX", 1, 8),
+                src: make_var("const:14650fb0739d0383", 0, 8),
+            },
+            SSAOp::IntNotEqual {
+                dst: make_var("tmp:cond", 1, 1),
+                a: make_var("RSI", 0, 8),
+                b: make_var("const:0", 0, 8),
+            },
+            SSAOp::CBranch {
+                target: make_var("ram:1008", 0, 8),
+                cond: make_var("tmp:cond", 1, 1),
+            },
+        ];
+        func.get_block_mut(0x1004).expect("body").ops = vec![SSAOp::Branch {
+            target: make_var("ram:1004", 0, 8),
+        }];
+        func.get_block_mut(0x1008).expect("exit").ops = vec![SSAOp::Return {
+            target: make_var("RIP", 1, 8),
+        }];
+
+        let mut ctx = make_x86_64_ctx();
+        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
+        ctx.analyze_blocks(&fold_blocks);
+        ctx.analyze_function_structure(&func);
+
+        assert!(
+            !ctx.state.return_blocks.contains(&0x1000),
+            "preheader has both an exit edge and a body edge, not block-wide return semantics: {:?}",
+            ctx.state.return_blocks
+        );
+
+        let preheader_stmts = ctx.fold_block(func.get_block(0x1000).expect("preheader"), 0x1000);
+        assert!(
+            !preheader_stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "preheader must not synthesize an unconditional return: {preheader_stmts:?}"
+        );
+    }
+
+    #[test]
+    fn phi_sources_count_as_edge_uses_for_liveness() {
+        use r2ssa::PhiNode;
+
+        let rax_1 = make_var("RAX", 1, 8);
+        let rax_2 = make_var("RAX", 2, 8);
+        let blocks = vec![
+            SSABlock {
+                addr: 0x1000,
+                size: 4,
+                phis: Vec::new(),
+                ops: vec![
+                    SSAOp::IntAdd {
+                        dst: rax_1.clone(),
+                        a: make_var("RAX", 0, 8),
+                        b: make_var("const:1", 0, 8),
+                    },
+                    SSAOp::Branch {
+                        target: make_var("ram:1004", 0, 8),
+                    },
+                ],
+            },
+            SSABlock {
+                addr: 0x1004,
+                size: 4,
+                phis: vec![PhiNode {
+                    dst: rax_2.clone(),
+                    sources: vec![(0x1000, rax_1.clone())],
+                }],
+                ops: vec![SSAOp::Return { target: rax_2 }],
+            },
+        ];
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.analyze_blocks(&blocks);
+
+        assert_eq!(
+            ctx.use_counts_map().get("RAX_1").copied(),
+            Some(1),
+            "phi operands are edge uses and must keep loop-carried values live"
+        );
+        assert!(
+            !ctx.is_dead(&rax_1),
+            "phi source should not be pruned as a dead caller-saved register"
+        );
+    }
+
+    #[test]
+    fn loop_carried_phi_members_are_materialized_not_inlined() {
+        use r2ssa::PhiNode;
+
+        let rax_1 = make_var("RAX", 1, 8);
+        let rax_2 = make_var("RAX", 2, 8);
+        let rax_3 = make_var("RAX", 3, 8);
+        let blocks = vec![
+            SSABlock {
+                addr: 0x1000,
+                size: 4,
+                phis: Vec::new(),
+                ops: vec![
+                    SSAOp::Copy {
+                        dst: rax_1.clone(),
+                        src: make_var("const:14650fb0739d0383", 0, 8),
+                    },
+                    SSAOp::Branch {
+                        target: make_var("ram:1010", 0, 8),
+                    },
+                ],
+            },
+            SSABlock {
+                addr: 0x1010,
+                size: 4,
+                phis: vec![PhiNode {
+                    dst: rax_2.clone(),
+                    sources: vec![(0x1000, rax_1.clone()), (0x1020, rax_3.clone())],
+                }],
+                ops: vec![SSAOp::CBranch {
+                    target: make_var("ram:1020", 0, 8),
+                    cond: make_var("const:1", 0, 1),
+                }],
+            },
+            SSABlock {
+                addr: 0x1020,
+                size: 4,
+                phis: Vec::new(),
+                ops: vec![
+                    SSAOp::IntAdd {
+                        dst: rax_3.clone(),
+                        a: rax_2.clone(),
+                        b: make_var("const:1", 0, 8),
+                    },
+                    SSAOp::CBranch {
+                        target: make_var("ram:1010", 0, 8),
+                        cond: make_var("const:1", 0, 1),
+                    },
+                ],
+            },
+        ];
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.analyze_blocks(&blocks);
+
+        assert!(
+            ctx.pinned_set().contains("RAX_1")
+                && ctx.pinned_set().contains("RAX_2")
+                && ctx.pinned_set().contains("RAX_3"),
+            "loop-carried phi class should be pinned for out-of-SSA materialization: {:?}",
+            ctx.pinned_set()
+        );
+        assert!(
+            !ctx.is_dead(&rax_3),
+            "pinned loop-carried update should not be considered dead; uses={:?} pinned={:?}",
+            ctx.use_counts_map(),
+            ctx.pinned_set()
+        );
+        assert!(
+            !ctx.should_inline("RAX_3"),
+            "pinned loop-carried update should not be inlined"
+        );
+        assert!(
+            !ctx.should_suppress_shadow_call_result_assignment(&rax_3),
+            "loop-carried update should not be suppressed as a call-result shadow"
+        );
+        let direct_stmt = ctx.op_to_stmt_with_args(&blocks[2].ops[0], 0x1020, 0);
+        assert!(
+            direct_stmt.is_some(),
+            "loop-carried update should lower to a statement before block pruning"
+        );
+
+        let latch_stmts = ctx.fold_block(blocks.get(2).expect("latch"), 0x1020);
+        assert!(
+            latch_stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    CStmt::Expr(CExpr::Binary {
+                        op: BinaryOp::Assign,
+                        ..
+                    })
+                )
+            }),
+            "loop-carried recurrence update must survive as a materialized assignment: {latch_stmts:?}"
+        );
+    }
+
+    #[test]
     fn test_x86_64_saved_fp_reload_epilogue_still_marks_branch_arms_as_return_blocks() {
         let blocks = vec![
             R2ILBlock {
@@ -9469,6 +10180,192 @@ mod tests {
             }
             other => panic!("Expected return statement, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_signed_idiv_return_uses_low_signed_dividend_root() {
+        let ecx_1 = make_var("ECX", 1, 4);
+        let eax_1 = make_var("EAX", 1, 4);
+        let edx_1 = make_var("EDX", 1, 4);
+        let sext_eax = make_var("tmp:3d680", 1, 8);
+        let sext_ecx = make_var("tmp:49680", 1, 8);
+        let high_zext = make_var("tmp:49700", 1, 8);
+        let shifted_high = make_var("tmp:49780", 1, 8);
+        let low_zext = make_var("tmp:49800", 1, 8);
+        let dividend = make_var("tmp:49900", 1, 8);
+        let quotient = make_var("tmp:49a00", 1, 8);
+        let eax_2 = make_var("EAX", 2, 4);
+        let rip_1 = make_var("RIP", 1, 8);
+
+        let block = make_block(vec![
+            SSAOp::Copy {
+                dst: ecx_1.clone(),
+                src: make_var("EDX", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: eax_1.clone(),
+                src: make_var("ESI", 0, 4),
+            },
+            SSAOp::IntSExt {
+                dst: sext_eax.clone(),
+                src: eax_1.clone(),
+            },
+            SSAOp::Subpiece {
+                dst: edx_1.clone(),
+                src: sext_eax,
+                offset: 4,
+            },
+            SSAOp::IntZExt {
+                dst: high_zext.clone(),
+                src: edx_1,
+            },
+            SSAOp::IntLeft {
+                dst: shifted_high.clone(),
+                a: high_zext,
+                b: make_var("const:20", 0, 8),
+            },
+            SSAOp::IntZExt {
+                dst: low_zext.clone(),
+                src: eax_1.clone(),
+            },
+            SSAOp::IntOr {
+                dst: dividend.clone(),
+                a: shifted_high,
+                b: low_zext,
+            },
+            SSAOp::IntSExt {
+                dst: sext_ecx.clone(),
+                src: ecx_1,
+            },
+            SSAOp::IntSDiv {
+                dst: quotient.clone(),
+                a: dividend.clone(),
+                b: sext_ecx,
+            },
+            SSAOp::Subpiece {
+                dst: eax_2,
+                src: quotient,
+                offset: 0,
+            },
+            SSAOp::Return { target: rip_1 },
+        ]);
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
+            ("esi".to_string(), "a".to_string()),
+            ("edx".to_string(), "b".to_string()),
+        ])));
+        ctx.analyze_block(&block);
+        ctx.state.return_blocks.insert(block.addr);
+        assert_eq!(
+            ctx.signed_extended_dividend_low_root(&dividend),
+            Some(eax_1),
+            "signed idiv producer proof should recover the low dividend root"
+        );
+
+        let stmts = ctx.fold_block(&block, block.addr);
+        let Some(CStmt::Return(Some(expr))) = stmts.last() else {
+            panic!("expected signed division return, got {stmts:?}");
+        };
+        assert_eq!(
+            expr,
+            &CExpr::binary(
+                BinaryOp::Div,
+                CExpr::Var("a".to_string()),
+                CExpr::Var("b".to_string())
+            )
+        );
+        assert!(
+            stmts.iter().all(|stmt| {
+                let rendered = format!("{stmt:?}");
+                !rendered.contains("t49900") && !rendered.contains("t49a00")
+            }),
+            "signed idiv lowering should not leak dividend construction temps: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn test_signed_idiv_accepts_direct_sign_extended_high_limb() {
+        let ecx_1 = make_var("ECX", 1, 4);
+        let eax_1 = make_var("EAX", 1, 4);
+        let sext_eax = make_var("tmp:3d680", 1, 8);
+        let sext_ecx = make_var("tmp:49680", 1, 8);
+        let high_zext = make_var("tmp:49700", 1, 8);
+        let shifted_high = make_var("tmp:49780", 1, 8);
+        let low_zext = make_var("tmp:49800", 1, 8);
+        let dividend = make_var("tmp:49900", 1, 8);
+        let quotient = make_var("tmp:49a00", 1, 8);
+        let eax_2 = make_var("EAX", 2, 4);
+        let rip_1 = make_var("RIP", 1, 8);
+
+        let block = make_block(vec![
+            SSAOp::Copy {
+                dst: ecx_1.clone(),
+                src: make_var("EDX", 0, 4),
+            },
+            SSAOp::Copy {
+                dst: eax_1.clone(),
+                src: make_var("ESI", 0, 4),
+            },
+            SSAOp::IntSExt {
+                dst: sext_eax.clone(),
+                src: eax_1.clone(),
+            },
+            SSAOp::IntZExt {
+                dst: high_zext.clone(),
+                src: sext_eax,
+            },
+            SSAOp::IntLeft {
+                dst: shifted_high.clone(),
+                a: high_zext,
+                b: make_var("const:20", 0, 8),
+            },
+            SSAOp::IntZExt {
+                dst: low_zext.clone(),
+                src: eax_1.clone(),
+            },
+            SSAOp::IntOr {
+                dst: dividend.clone(),
+                a: shifted_high,
+                b: low_zext,
+            },
+            SSAOp::IntSExt {
+                dst: sext_ecx.clone(),
+                src: ecx_1,
+            },
+            SSAOp::IntSDiv {
+                dst: quotient.clone(),
+                a: dividend.clone(),
+                b: sext_ecx,
+            },
+            SSAOp::Subpiece {
+                dst: eax_2,
+                src: quotient,
+                offset: 0,
+            },
+            SSAOp::Return { target: rip_1 },
+        ]);
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
+            ("esi".to_string(), "a".to_string()),
+            ("edx".to_string(), "b".to_string()),
+        ])));
+        ctx.analyze_block(&block);
+        ctx.state.return_blocks.insert(block.addr);
+
+        let stmts = ctx.fold_block(&block, block.addr);
+        let Some(CStmt::Return(Some(expr))) = stmts.last() else {
+            panic!("expected signed division return, got {stmts:?}");
+        };
+        assert_eq!(
+            expr,
+            &CExpr::binary(
+                BinaryOp::Div,
+                CExpr::Var("a".to_string()),
+                CExpr::Var("b".to_string())
+            )
+        );
     }
 
     #[test]
@@ -14311,7 +15208,7 @@ mod tests {
     }
 
     #[test]
-    fn folded_arm64_printf_live_unlock_shape_with_prior_atoi_keeps_result_slot_owned() {
+    fn folded_arm64_printf_live_unlock_shape_with_prior_atoi_preserves_uncertified_siblings() {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
             (0x1000005d4, "sym._unlock".to_string()),
@@ -14662,36 +15559,30 @@ mod tests {
         );
         assert_eq!(args[1], CExpr::Var("local_2c".to_string()));
         assert_eq!(args[2], CExpr::Var("local_30".to_string()));
-        assert!(
-            args[3] == CExpr::Var("local_34".to_string())
-                || args[3] == CExpr::Var("tmp:24d00_10".to_string()),
-            "expected third helper arg to stay stable, got {args:?}"
+        let uncertified_third_arg = CExpr::call(
+            CExpr::Var("sym.imp.atoi".to_string()),
+            vec![CExpr::Subscript {
+                base: Box::new(CExpr::Var("argv".to_string())),
+                index: Box::new(CExpr::IntLit(4)),
+            }],
         );
-        assert!(
-            args[4]
-                == CExpr::call(
-                    CExpr::Var("sym._unlock".to_string()),
-                    vec![
-                        CExpr::Var("local_2c".to_string()),
-                        CExpr::Var("local_30".to_string()),
-                        CExpr::Var("local_34".to_string()),
-                    ],
-                )
-                || args[4]
-                    == CExpr::call(
-                        CExpr::Var("sym._unlock".to_string()),
-                        vec![
-                            CExpr::Var("local_2c".to_string()),
-                            CExpr::Var("local_30".to_string()),
-                            CExpr::Var("tmp:24d00_10".to_string()),
-                        ],
-                    ),
-            "expected final helper result arg to stay stable, got {args:?}"
+        assert_eq!(args[3], uncertified_third_arg);
+        assert_eq!(
+            args[4],
+            CExpr::call(
+                CExpr::Var("sym._unlock".to_string()),
+                vec![
+                    CExpr::IntLit(1),
+                    CExpr::IntLit(2),
+                    uncertified_third_arg,
+                ],
+            ),
+            "uncertified printf sibling inputs must not be silently repaired, got {args:?}"
         );
     }
 
     #[test]
-    fn folded_arm64_printf_live_unlock_shape_direct_result_store_keeps_result_slot_owned() {
+    fn folded_arm64_printf_live_unlock_shape_direct_result_store_preserves_uncertified_siblings() {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
             (0x1000005d4, "sym._unlock".to_string()),
@@ -15033,43 +15924,24 @@ mod tests {
         );
         assert_eq!(args[1], CExpr::Var("local_2c".to_string()));
         assert_eq!(args[2], CExpr::Var("local_30".to_string()));
-        assert!(
-            args[3] == CExpr::Var("local_34".to_string())
-                || args[3]
-                    == CExpr::call(
-                        CExpr::Var("sym.imp.atoi".to_string()),
-                        vec![CExpr::Subscript {
-                            base: Box::new(CExpr::Var("argv".to_string())),
-                            index: Box::new(CExpr::IntLit(4)),
-                        }],
-                    ),
-            "expected third helper arg to stay stable, got {args:?}"
-        );
-        assert!(
-            matches!(
-                &args[4],
-                CExpr::Call { func, args }
-                    if **func == CExpr::Var("sym._unlock".to_string())
-                        && (args
-                            == &vec![
-                                CExpr::Var("local_2c".to_string()),
-                                CExpr::Var("local_30".to_string()),
-                                CExpr::Var("local_34".to_string()),
-                            ]
-                            || args
-                                == &vec![
-                                    CExpr::Var("local_2c".to_string()),
-                                    CExpr::Var("local_30".to_string()),
-                                    CExpr::call(
-                                        CExpr::Var("sym.imp.atoi".to_string()),
-                                        vec![CExpr::Subscript {
-                                            base: Box::new(CExpr::Var("argv".to_string())),
-                                            index: Box::new(CExpr::IntLit(4)),
-                                        }],
-                                    ),
-                                ])
+        let atoi_arg = |index| {
+            CExpr::call(
+                CExpr::Var("sym.imp.atoi".to_string()),
+                vec![CExpr::Subscript {
+                    base: Box::new(CExpr::Var("argv".to_string())),
+                    index: Box::new(CExpr::IntLit(index)),
+                }],
+            )
+        };
+        let uncertified_third_arg = atoi_arg(4);
+        assert_eq!(args[3], uncertified_third_arg);
+        assert_eq!(
+            args[4],
+            CExpr::call(
+                CExpr::Var("sym._unlock".to_string()),
+                vec![atoi_arg(2), atoi_arg(3), uncertified_third_arg],
             ),
-            "expected final printf arg to be helper result call, got {args:?}"
+            "uncertified printf sibling inputs must not be silently repaired, got {args:?}"
         );
     }
 
@@ -15167,14 +16039,16 @@ mod tests {
         ];
 
         let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
+        let signature = signature_spec(
+            Some(crate::CType::Int(64)),
+            vec![
+                ("arg1", Some(crate::CType::Int(32))),
+                ("arg2", Some(crate::CType::Int(32))),
+            ],
+        );
         decompiler.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(
-                Some(crate::CType::Int(64)),
-                vec![
-                    ("arg1", Some(crate::CType::Int(32))),
-                    ("arg2", Some(crate::CType::Int(32))),
-                ],
-            )),
+            signature_certificate: external_signature_certificate(&signature),
+            merged_signature: Some(signature),
             external_stack_vars: HashMap::from([(
                 -4,
                 stack_var_spec("var_4h", Some(crate::CType::Int(32)), Some("RBP")),
@@ -15586,12 +16460,12 @@ mod tests {
                 ),
                 CExpr::IntLit(5),
             ),
-            CExpr::IntLit(19),
+            CExpr::IntLit(25),
         );
         let expected_named_local = CExpr::binary(
             BinaryOp::Ne,
             CExpr::Var("local_c".to_string()),
-            CExpr::IntLit(19),
+            CExpr::IntLit(25),
         );
         assert!(
             cond == expected_arithmetic || cond == expected_named_local,
@@ -15599,11 +16473,13 @@ mod tests {
         );
 
         let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
+        let signature = signature_spec(
+            Some(crate::CType::Int(64)),
+            vec![("arg1", Some(crate::CType::Int(32)))],
+        );
         decompiler.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(
-                Some(crate::CType::Int(64)),
-                vec![("arg1", Some(crate::CType::Int(32)))],
-            )),
+            signature_certificate: external_signature_certificate(&signature),
+            merged_signature: Some(signature),
             external_stack_vars: HashMap::from([
                 (
                     -12,
@@ -15635,8 +16511,8 @@ mod tests {
             "unexpected function signature:\n{output}"
         );
         assert!(
-            output.contains("if ((arg1 << 1) + 5 != 19)")
-                || output.contains("if (var_ch != 19)"),
+            output.contains("if ((arg1 << 1) + 5 != 25)")
+                || output.contains("if (var_ch != 25)"),
             "expected arg-backed or at least named-local scalar condition, got:\n{output}"
         );
         assert!(
@@ -15918,14 +16794,16 @@ mod tests {
         assert_eq!(else_expr, &CExpr::Var("arg2".to_string()));
 
         let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
+        let signature = signature_spec(
+            Some(crate::CType::Int(64)),
+            vec![
+                ("arg1", Some(crate::CType::Int(32))),
+                ("arg2", Some(crate::CType::Int(32))),
+            ],
+        );
         decompiler.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(
-                Some(crate::CType::Int(64)),
-                vec![
-                    ("arg1", Some(crate::CType::Int(32))),
-                    ("arg2", Some(crate::CType::Int(32))),
-                ],
-            )),
+            signature_certificate: external_signature_certificate(&signature),
+            merged_signature: Some(signature),
             external_stack_vars: HashMap::from([
                 (
                     -4,
@@ -16474,14 +17352,16 @@ mod tests {
         );
 
         let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
+        let signature = signature_spec(
+            Some(crate::CType::Int(64)),
+            vec![
+                ("arg1", Some(crate::CType::Int(32))),
+                ("arg2", Some(crate::CType::Int(32))),
+            ],
+        );
         decompiler.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(
-                Some(crate::CType::Int(64)),
-                vec![
-                    ("arg1", Some(crate::CType::Int(32))),
-                    ("arg2", Some(crate::CType::Int(32))),
-                ],
-            )),
+            signature_certificate: external_signature_certificate(&signature),
+            merged_signature: Some(signature),
             external_stack_vars: HashMap::from([
                 (
                     -4,
@@ -16627,7 +17507,7 @@ mod tests {
     }
 
     #[test]
-    fn folded_x86_printf_result_slot_recovers_helper_call_from_eax_alias() {
+    fn folded_x86_printf_result_slot_preserves_uncertified_sibling_args() {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
             (0x1000005d4, "sym._unlock".to_string()),
@@ -16894,6 +17774,331 @@ mod tests {
         assert_eq!(
             ctx.resolve_call_target_for_site(block.addr, 1, target),
             CExpr::Var("sym.helper".to_string())
+        );
+    }
+
+    #[test]
+    fn certified_prepared_call_args_require_argument_value_proof() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_call_arg");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("call stmt");
+
+        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+            panic!("expected certified call expression, got {stmt:?}");
+        };
+        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert_eq!(args, vec![CExpr::IntLit(7)]);
+    }
+
+    #[test]
+    fn prepared_call_arg_value_mismatch_residualizes() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("mismatched_call_arg");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate");
+        assert_ne!(
+            call_cert.target, call_cert.argument_values[0],
+            "target value should be a distinct wrong argument proof"
+        );
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_name: Some("sym.helper".to_string()),
+                    authoritative_args: vec![CExpr::IntLit(7)],
+                    authoritative_arg_values: vec![call_cert.target],
+                    result_owner: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("residual stmt");
+
+        let CStmt::Comment(comment) = stmt else {
+            panic!("expected residual comment, got {stmt:?}");
+        };
+        assert!(
+            comment.contains("uncertified callsite arguments"),
+            "unexpected residual comment: {comment}"
+        );
+    }
+
+    #[test]
+    fn synthesized_source_call_expr_requires_certified_argument_values() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_synth_source_call");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_name: Some("sym.helper".to_string()),
+                    authoritative_args: vec![CExpr::IntLit(7)],
+                    authoritative_arg_values: vec![call_cert.target],
+                    result_owner: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        assert!(
+            ctx.synthesized_call_expr_for_source_call((0x1000, 2))
+                .is_none(),
+            "synthesized source-call expressions must not reuse unproved prepared args"
+        );
+    }
+
+    #[test]
+    fn rendered_synthesized_source_call_records_callsite_proof() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_synth_rendered_call");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_name: Some("sym.helper".to_string()),
+                    authoritative_args: vec![CExpr::IntLit(7)],
+                    authoritative_arg_values: vec![call_cert.argument_values[0]],
+                    result_owner: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        let call = ctx
+            .synthesized_call_expr_for_source_call((0x1000, 2))
+            .expect("certified synthesized call");
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert((0x1000, 2), call.clone());
+        ctx.clear_effect_render_proofs();
+
+        ctx.record_certified_call_render_proofs_for_stmt(&CStmt::Return(Some(call)))
+            .expect("rendered call proof");
+
+        let proofs = ctx.effect_render_proofs();
+        assert_eq!(proofs.len(), 1, "expected one rendered call proof");
+        assert_eq!(proofs[0].kind, EffectRenderProofKind::Call);
+        assert_eq!((proofs[0].block_addr, proofs[0].op_idx), (0x1000, 2));
+        assert_eq!(proofs[0].target, Some(call_cert.target));
+        assert_eq!(proofs[0].values, vec![call_cert.argument_values[0]]);
+    }
+
+    #[test]
+    fn certified_prepared_call_args_include_stack_home_certificate_values() {
+        let arch = make_test_arch_x86_64();
+        let stack_home = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x1200,
+            size: 8,
+            meta: None,
+        };
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntAdd {
+            dst: stack_home.clone(),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(0x20, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: stack_home,
+            val: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::constant(0x401050, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("stack_home_call_arg");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("call stmt");
+
+        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+            panic!("expected certified call expression, got {stmt:?}");
+        };
+        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert_eq!(args, vec![CExpr::IntLit(7)]);
+    }
+
+    #[test]
+    fn uncertified_prepared_call_args_render_residual_comment() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Call {
+            target: Varnode::constant(0x401050, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("uncertified_call_arg");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 0),
+                crate::analysis::PreparedCallView {
+                    authoritative_args: vec![CExpr::Var("fake_arg".to_string())],
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
+            .expect("residual stmt");
+
+        let CStmt::Comment(comment) = stmt else {
+            panic!("expected residual comment, got {stmt:?}");
+        };
+        assert!(
+            comment.contains("uncertified callsite arguments"),
+            "unexpected residual comment: {comment}"
+        );
+    }
+
+    #[test]
+    fn certified_materialized_phi_carriers_do_not_emit_residual_comments() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1810, 4);
+        entry.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x1818, 8),
+        });
+
+        let mut left = R2ILBlock::new(0x1814, 4);
+        left.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(1, 8),
+        });
+        left.push(R2ILOp::Branch {
+            target: Varnode::constant(0x181c, 8),
+        });
+
+        let mut right = R2ILBlock::new(0x1818, 4);
+        right.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(2, 8),
+        });
+        right.push(R2ILOp::Branch {
+            target: Varnode::constant(0x181c, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x181c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry, left, right, exit], &arch).with_name("phi_carrier");
+        let normalized = crate::normalize::materialize_phis(prepared.function());
+        let fold_blocks = normalized.blocks().cloned().collect::<Vec<_>>();
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.analyze_blocks(&fold_blocks);
+
+        let left_stmts = ctx.fold_block(
+            normalized.get_block(0x1814).expect("left predecessor"),
+            0x1814,
+        );
+        let right_stmts = ctx.fold_block(
+            normalized.get_block(0x1818).expect("right predecessor"),
+            0x1818,
+        );
+        let mut rendered = Vec::new();
+        rendered.extend(left_stmts.iter().map(|stmt| format!("{stmt:?}")));
+        rendered.extend(right_stmts.iter().map(|stmt| format!("{stmt:?}")));
+        assert!(
+            rendered
+                .iter()
+                .all(|stmt| !stmt.contains("r2sleigh residual:")),
+            "materialized SSA phi carriers should stay cleanup candidates, got {rendered:?}"
         );
     }
 
@@ -17175,7 +18380,7 @@ mod tests {
                         CExpr::Var("var_8h".to_string()),
                         CExpr::Var("var_8h".to_string()),
                     ),
-                    CExpr::IntLit(64),
+                    CExpr::IntLit(100),
                 ),
             )]),
             ..PreparedSemanticView::default()
@@ -17207,7 +18412,7 @@ mod tests {
                     CExpr::Var("arg1".to_string()),
                     CExpr::Var("arg1".to_string()),
                 ),
-                CExpr::IntLit(64),
+                CExpr::IntLit(100),
             ))
         );
     }

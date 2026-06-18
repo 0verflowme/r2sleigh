@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
+use serde::{Deserialize, Serialize};
+
 use crate::context::{
     ExternalRegisterParamSpec, ExternalStackSlotSpec, ExternalStackVarSpec, StackSlotKey,
     legacy_external_stack_vars_from_slots, stack_slots_from_legacy_external_stack_vars,
@@ -24,6 +26,222 @@ pub struct LocalFieldAccessFact {
     pub field_offset: u64,
     pub field_name: String,
     pub field_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FieldAccessCertificate {
+    pub slot: usize,
+    pub field_offset: u64,
+    pub field_name: String,
+    pub field_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ArrayIndexBase {
+    Param { index: usize },
+    StackSlot { slot: StackSlotKey },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArrayIndexCertificate {
+    pub slot: usize,
+    pub base: Option<ArrayIndexBase>,
+    pub field_offset: u64,
+    pub element_stride: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum OutParamCertificateEvidence {
+    SemanticTypeSeed,
+    InterprocArgWrite,
+    InterprocMemoryWrite,
+    InterprocTransferDst,
+    NativeWorkerWrite,
+    NativeRegionWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum OutParamCertificateSource {
+    SemanticClaim {
+        stable_id: u64,
+        anchor: u64,
+    },
+    NativeWorkerSummary {
+        stable_id: u64,
+        anchor: u64,
+        summary_kind: r2sym::NativeWorkerSummaryKind,
+        param_index: usize,
+    },
+    NativeRegionSummary {
+        stable_id: u64,
+        anchor: u64,
+        summary_kind: r2sym::NativeWorkerSummaryKind,
+        param_index: usize,
+    },
+    InterprocSummaryEffect {
+        function_id: u64,
+        evidence: OutParamCertificateEvidence,
+        param_index: usize,
+        effect_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OutParamCertificate {
+    pub param_index: usize,
+    pub param_name: String,
+    pub pointee_type: Option<String>,
+    pub evidence: Vec<OutParamCertificateEvidence>,
+    pub sources: Vec<OutParamCertificateSource>,
+}
+
+impl OutParamCertificate {
+    pub fn has_source_identity(&self) -> bool {
+        !self.evidence.is_empty()
+            && self.sources.iter().any(|source| match source {
+                OutParamCertificateSource::SemanticClaim { .. } => true,
+                OutParamCertificateSource::NativeWorkerSummary { param_index, .. } => {
+                    *param_index == self.param_index
+                        && self
+                            .evidence
+                            .contains(&OutParamCertificateEvidence::NativeWorkerWrite)
+                }
+                OutParamCertificateSource::NativeRegionSummary { param_index, .. } => {
+                    *param_index == self.param_index
+                        && self
+                            .evidence
+                            .contains(&OutParamCertificateEvidence::NativeRegionWrite)
+                }
+                OutParamCertificateSource::InterprocSummaryEffect {
+                    evidence,
+                    param_index,
+                    ..
+                } => *param_index == self.param_index && self.evidence.contains(evidence),
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureCertificate {
+    pub signature: FunctionSignatureSpec,
+    pub confidence: u8,
+    pub sources: Vec<SignatureCertificateSource>,
+}
+
+impl SignatureCertificate {
+    pub fn from_signature(
+        signature: &FunctionSignatureSpec,
+        sources: impl IntoIterator<Item = SignatureCertificateSource>,
+    ) -> Option<Self> {
+        let mut sources = sources.into_iter().collect::<Vec<_>>();
+        if sources.is_empty() {
+            sources.push(SignatureCertificateSource::LocalInference);
+        }
+        sources.sort();
+        sources.dedup();
+
+        let source_authorizes_empty_arity = signature.params.is_empty()
+            && sources
+                .iter()
+                .any(|source| source.authorizes_signature_writeback());
+        if !(signature_param_count_is_authoritative(signature) || source_authorizes_empty_arity) {
+            return None;
+        }
+
+        Some(Self {
+            signature: signature.clone(),
+            confidence: signature_strength(signature),
+            sources,
+        })
+    }
+
+    pub fn authorizes_signature_writeback(&self) -> bool {
+        self.confidence >= SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+            && self
+                .sources
+                .iter()
+                .any(|source| source.authorizes_signature_writeback())
+            && !self.signature.params.iter().any(|param| {
+                signature_param_type_uncertified(
+                    param.ty.as_ref(),
+                    self.sources.iter().any(|source| {
+                        matches!(
+                            source,
+                            SignatureCertificateSource::ExternalContext
+                                | SignatureCertificateSource::TypeAssumption
+                        )
+                    }),
+                )
+            })
+    }
+
+    pub fn authorizes_signature_render(&self) -> bool {
+        self.confidence >= SIGNATURE_PROJECTION_STRONG_CONFIDENCE
+    }
+}
+
+fn signature_param_type_uncertified(ty: Option<&CTypeLike>, allow_void_pointer: bool) -> bool {
+    if allow_void_pointer
+        && matches!(
+            ty,
+            Some(CTypeLike::Pointer(inner)) if matches!(inner.as_ref(), CTypeLike::Void)
+        )
+    {
+        return false;
+    }
+    is_generic_signature_type(ty)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SignatureCertificateSource {
+    ExternalContext,
+    LocalInference,
+    TypeAssumption,
+    RecoveredVariable,
+    SlotTypeOverride,
+    SummaryRole,
+    SummaryKind,
+    SemanticProjection,
+    InterprocSummary,
+}
+
+impl SignatureCertificateSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExternalContext => "external_context",
+            Self::LocalInference => "local_inference",
+            Self::TypeAssumption => "type_assumption",
+            Self::RecoveredVariable => "recovered_variable",
+            Self::SlotTypeOverride => "slot_type_override",
+            Self::SummaryRole => "summary_role",
+            Self::SummaryKind => "summary_kind",
+            Self::SemanticProjection => "semantic_projection",
+            Self::InterprocSummary => "interproc_summary",
+        }
+    }
+
+    pub fn authorizes_signature_writeback(self) -> bool {
+        matches!(
+            self,
+            Self::ExternalContext
+                | Self::TypeAssumption
+                | Self::RecoveredVariable
+                | Self::SlotTypeOverride
+                | Self::SemanticProjection
+                | Self::InterprocSummary
+        )
+    }
+}
+
+impl From<SignatureProjectionSource> for SignatureCertificateSource {
+    fn from(source: SignatureProjectionSource) -> Self {
+        match source {
+            SignatureProjectionSource::SummaryRole => Self::SummaryRole,
+            SignatureProjectionSource::SummaryKind => Self::SummaryKind,
+            SignatureProjectionSource::SemanticProjection => Self::SemanticProjection,
+            SignatureProjectionSource::InterprocSummary => Self::InterprocSummary,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -386,6 +604,10 @@ pub struct FunctionTypeFacts {
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
+    pub field_access_certificates: Vec<FieldAccessCertificate>,
+    pub array_index_certificates: Vec<ArrayIndexCertificate>,
+    pub out_param_certificates: Vec<OutParamCertificate>,
+    pub signature_certificate: Option<SignatureCertificate>,
     pub interproc_diagnostics: InterprocFactDiagnostics,
     pub diagnostics: Vec<String>,
 }
@@ -403,6 +625,10 @@ pub struct FunctionTypeFactInputs {
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub local_field_accesses: Vec<LocalFieldAccessFact>,
+    pub field_access_certificates: Vec<FieldAccessCertificate>,
+    pub array_index_certificates: Vec<ArrayIndexCertificate>,
+    pub out_param_certificates: Vec<OutParamCertificate>,
+    pub signature_certificate: Option<SignatureCertificate>,
     pub interproc_diagnostics: InterprocFactDiagnostics,
     pub diagnostics: Vec<String>,
 }
@@ -428,6 +654,10 @@ impl FunctionTypeFacts {
             && self.external_type_db.diagnostics.is_empty()
             && self.slot_type_overrides.is_empty()
             && self.slot_field_profiles.is_empty()
+            && self.field_access_certificates.is_empty()
+            && self.array_index_certificates.is_empty()
+            && self.out_param_certificates.is_empty()
+            && self.signature_certificate.is_none()
             && self.interproc_diagnostics == InterprocFactDiagnostics::default()
             && self.diagnostics.is_empty()
     }
@@ -445,6 +675,10 @@ impl FunctionTypeFacts {
             slot_type_overrides: self.slot_type_overrides,
             slot_field_profiles: self.slot_field_profiles,
             local_field_accesses: Vec::new(),
+            field_access_certificates: self.field_access_certificates,
+            array_index_certificates: self.array_index_certificates,
+            out_param_certificates: self.out_param_certificates,
+            signature_certificate: self.signature_certificate,
             interproc_diagnostics: self.interproc_diagnostics,
             diagnostics: self.diagnostics,
         })
@@ -474,6 +708,53 @@ impl FunctionTypeFacts {
 
         let changed = apply_signature_projection_to_existing(existing, &projection, ptr_bits);
         SignatureProjectionResult::applied(changed)
+    }
+
+    pub fn certify_current_signature_with_source(
+        &mut self,
+        source: SignatureCertificateSource,
+    ) -> bool {
+        let Some(signature) = self.merged_signature.as_ref() else {
+            self.signature_certificate = None;
+            return false;
+        };
+        let mut sources = self
+            .signature_certificate
+            .as_ref()
+            .filter(|certificate| certificate.signature == *signature)
+            .map(|certificate| certificate.sources.clone())
+            .unwrap_or_default();
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+        self.signature_certificate = SignatureCertificate::from_signature(signature, sources);
+        self.signature_certificate.is_some()
+    }
+
+    pub fn render_authorized_signature(&self) -> Option<&FunctionSignatureSpec> {
+        let certificate = self.signature_certificate.as_ref()?;
+        if !certificate.authorizes_signature_render() {
+            return None;
+        }
+        let signature = self.merged_signature.as_ref()?;
+        (certificate.signature == *signature).then_some(signature)
+    }
+
+    pub fn writeback_authorized_signature(&self) -> Option<&FunctionSignatureSpec> {
+        let certificate = self.signature_certificate.as_ref()?;
+        if !certificate.authorizes_signature_writeback() {
+            return None;
+        }
+        let signature = self.merged_signature.as_ref()?;
+        (certificate.signature == *signature).then_some(signature)
+    }
+
+    pub fn source_authorized_out_param_certificates(
+        &self,
+    ) -> impl Iterator<Item = &OutParamCertificate> {
+        self.out_param_certificates
+            .iter()
+            .filter(|certificate| certificate.has_source_identity())
     }
 }
 
@@ -939,6 +1220,26 @@ impl FunctionTypeFactsBuilder {
             &mut self.inputs.slot_field_profiles,
             &self.inputs.local_field_accesses,
         );
+        let mut field_access_certificates =
+            std::mem::take(&mut self.inputs.field_access_certificates);
+        field_access_certificates.extend(self.inputs.local_field_accesses.iter().map(|access| {
+            FieldAccessCertificate {
+                slot: access.slot,
+                field_offset: access.field_offset,
+                field_name: access.field_name.clone(),
+                field_type: access.field_type.clone(),
+            }
+        }));
+        field_access_certificates.sort();
+        field_access_certificates.dedup();
+        let mut array_index_certificates =
+            std::mem::take(&mut self.inputs.array_index_certificates);
+        array_index_certificates.sort();
+        array_index_certificates.dedup();
+        let mut out_param_certificates = std::mem::take(&mut self.inputs.out_param_certificates);
+        out_param_certificates.retain(OutParamCertificate::has_source_identity);
+        out_param_certificates.sort();
+        out_param_certificates.dedup();
 
         let FunctionTypeFactInputs {
             merged_signature,
@@ -951,6 +1252,7 @@ impl FunctionTypeFactsBuilder {
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
+            signature_certificate,
             interproc_diagnostics,
             diagnostics,
             ..
@@ -981,6 +1283,10 @@ impl FunctionTypeFactsBuilder {
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
+            field_access_certificates,
+            array_index_certificates,
+            out_param_certificates,
+            signature_certificate,
             interproc_diagnostics,
             diagnostics,
         }
@@ -1189,6 +1495,288 @@ mod tests {
         }
     }
 
+    fn exact_signature() -> FunctionSignatureSpec {
+        FunctionSignatureSpec {
+            ret_type: Some(test_int(32)),
+            params: vec![test_param("value", test_int(32))],
+        }
+    }
+
+    #[test]
+    fn local_only_signature_certificate_does_not_authorize_writeback() {
+        let certificate = SignatureCertificate::from_signature(
+            &exact_signature(),
+            [SignatureCertificateSource::LocalInference],
+        )
+        .expect("exact local signature should still be recorded as a certificate");
+
+        assert!(
+            !certificate.authorizes_signature_writeback(),
+            "local inference alone is not enough evidence to mutate radare2 signature state"
+        );
+    }
+
+    #[test]
+    fn external_signature_certificate_authorizes_writeback() {
+        let certificate = SignatureCertificate::from_signature(
+            &exact_signature(),
+            [SignatureCertificateSource::ExternalContext],
+        )
+        .expect("exact external signature should be certifiable");
+
+        assert!(
+            certificate.authorizes_signature_writeback(),
+            "external typed context is authoritative signature evidence"
+        );
+    }
+
+    #[test]
+    fn external_empty_signature_certificate_authorizes_exact_empty_arity() {
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Void),
+            params: Vec::new(),
+        };
+        let certificate = SignatureCertificate::from_signature(
+            &signature,
+            [SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external void(void) signature should certify exact empty arity");
+
+        assert!(certificate.authorizes_signature_writeback());
+        assert!(certificate.signature.params.is_empty());
+    }
+
+    #[test]
+    fn external_void_pointer_params_are_certifiable_context_types() {
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Void),
+            params: vec![FunctionParamSpec {
+                name: "dst".to_string(),
+                ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
+            }],
+        };
+        let certificate = SignatureCertificate::from_signature(
+            &signature,
+            [SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external void pointer parameters are explicit C types");
+
+        assert!(certificate.authorizes_signature_writeback());
+    }
+
+    #[test]
+    fn external_name_only_signature_authorizes_render_not_writeback() {
+        let signature = FunctionSignatureSpec {
+            ret_type: None,
+            params: vec![FunctionParamSpec {
+                name: "count".to_string(),
+                ty: None,
+            }],
+        };
+        let certificate = SignatureCertificate::from_signature(
+            &signature,
+            [SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external name and arity evidence should be renderable");
+
+        assert!(certificate.authorizes_signature_render());
+        assert!(
+            !certificate.authorizes_signature_writeback(),
+            "incomplete parameter types must not mutate radare2 signature state"
+        );
+    }
+
+    #[test]
+    fn current_signature_certification_preserves_and_adds_sources() {
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(exact_signature()),
+            signature_certificate: SignatureCertificate::from_signature(
+                &exact_signature(),
+                [SignatureCertificateSource::ExternalContext],
+            ),
+            ..FunctionTypeFacts::default()
+        };
+
+        assert!(
+            facts.certify_current_signature_with_source(
+                SignatureCertificateSource::SemanticProjection
+            )
+        );
+        let certificate = facts
+            .signature_certificate
+            .expect("current signature should remain certified");
+
+        assert_eq!(
+            certificate.sources,
+            vec![
+                SignatureCertificateSource::ExternalContext,
+                SignatureCertificateSource::SemanticProjection,
+            ]
+        );
+    }
+
+    #[test]
+    fn render_authorized_signature_requires_matching_certificate() {
+        let signature = exact_signature();
+        let different_signature = FunctionSignatureSpec {
+            ret_type: Some(test_int(32)),
+            params: vec![test_param("other", test_int(32))],
+        };
+        let facts = FunctionTypeFacts {
+            merged_signature: Some(signature),
+            signature_certificate: SignatureCertificate::from_signature(
+                &different_signature,
+                [SignatureCertificateSource::ExternalContext],
+            ),
+            ..FunctionTypeFacts::default()
+        };
+
+        assert!(
+            facts.render_authorized_signature().is_none(),
+            "consumers must not render a merged signature that is not the certified signature"
+        );
+    }
+
+    #[test]
+    fn render_authorized_signature_returns_certified_current_signature() {
+        let signature = exact_signature();
+        let facts = FunctionTypeFacts {
+            merged_signature: Some(signature.clone()),
+            signature_certificate: SignatureCertificate::from_signature(
+                &signature,
+                [SignatureCertificateSource::ExternalContext],
+            ),
+            ..FunctionTypeFacts::default()
+        };
+
+        assert_eq!(facts.render_authorized_signature(), Some(&signature));
+    }
+
+    #[test]
+    fn writeback_authorized_signature_rejects_render_only_certificate() {
+        let signature = FunctionSignatureSpec {
+            ret_type: None,
+            params: vec![FunctionParamSpec {
+                name: "count".to_string(),
+                ty: None,
+            }],
+        };
+        let facts = FunctionTypeFacts {
+            merged_signature: Some(signature),
+            signature_certificate: SignatureCertificate::from_signature(
+                &FunctionSignatureSpec {
+                    ret_type: None,
+                    params: vec![FunctionParamSpec {
+                        name: "count".to_string(),
+                        ty: None,
+                    }],
+                },
+                [SignatureCertificateSource::ExternalContext],
+            ),
+            ..FunctionTypeFacts::default()
+        };
+
+        assert!(facts.render_authorized_signature().is_some());
+        assert!(facts.writeback_authorized_signature().is_none());
+    }
+
+    #[test]
+    fn out_param_certificate_requires_source_identity() {
+        let unsourced = OutParamCertificate {
+            param_index: 0,
+            param_name: "out".to_string(),
+            pointee_type: Some("int".to_string()),
+            evidence: vec![OutParamCertificateEvidence::InterprocArgWrite],
+            sources: Vec::new(),
+        };
+        assert!(!unsourced.has_source_identity());
+
+        let mismatched_source = OutParamCertificate {
+            sources: vec![OutParamCertificateSource::InterprocSummaryEffect {
+                function_id: 0x401000,
+                evidence: OutParamCertificateEvidence::InterprocMemoryWrite,
+                param_index: 1,
+                effect_index: 0,
+            }],
+            ..unsourced.clone()
+        };
+        assert!(!mismatched_source.has_source_identity());
+
+        let sourced = OutParamCertificate {
+            sources: vec![OutParamCertificateSource::InterprocSummaryEffect {
+                function_id: 0x401000,
+                evidence: OutParamCertificateEvidence::InterprocArgWrite,
+                param_index: 0,
+                effect_index: 0,
+            }],
+            ..unsourced.clone()
+        };
+        assert!(sourced.has_source_identity());
+
+        let mismatched_native_param = OutParamCertificate {
+            param_index: 0,
+            param_name: "out".to_string(),
+            pointee_type: Some("int".to_string()),
+            evidence: vec![OutParamCertificateEvidence::NativeWorkerWrite],
+            sources: vec![OutParamCertificateSource::NativeWorkerSummary {
+                stable_id: 0x55,
+                anchor: 0x401000,
+                summary_kind: r2sym::NativeWorkerSummaryKind::MemoryWrite,
+                param_index: 1,
+            }],
+        };
+        assert!(!mismatched_native_param.has_source_identity());
+
+        let mismatched_native_evidence = OutParamCertificate {
+            evidence: vec![OutParamCertificateEvidence::NativeRegionWrite],
+            sources: vec![OutParamCertificateSource::NativeWorkerSummary {
+                stable_id: 0x55,
+                anchor: 0x401000,
+                summary_kind: r2sym::NativeWorkerSummaryKind::MemoryWrite,
+                param_index: 0,
+            }],
+            ..mismatched_native_param
+        };
+        assert!(!mismatched_native_evidence.has_source_identity());
+    }
+
+    #[test]
+    fn builder_rejects_unsourced_out_param_certificates() {
+        let unsourced = OutParamCertificate {
+            param_index: 0,
+            param_name: "out".to_string(),
+            pointee_type: Some("int".to_string()),
+            evidence: vec![OutParamCertificateEvidence::InterprocArgWrite],
+            sources: Vec::new(),
+        };
+        let sourced = OutParamCertificate {
+            param_index: 1,
+            param_name: "written".to_string(),
+            pointee_type: Some("char".to_string()),
+            evidence: vec![OutParamCertificateEvidence::NativeWorkerWrite],
+            sources: vec![OutParamCertificateSource::NativeWorkerSummary {
+                stable_id: 0x55,
+                anchor: 0x401000,
+                summary_kind: r2sym::NativeWorkerSummaryKind::MemoryWrite,
+                param_index: 1,
+            }],
+        };
+
+        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
+            out_param_certificates: vec![unsourced, sourced.clone()],
+            ..FunctionTypeFactInputs::default()
+        })
+        .build();
+
+        assert_eq!(facts.out_param_certificates, vec![sourced]);
+        assert_eq!(
+            facts
+                .source_authorized_out_param_certificates()
+                .collect::<Vec<_>>(),
+            facts.out_param_certificates.iter().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn builder_merges_local_field_accesses_into_slot_profiles() {
         let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
@@ -1223,6 +1811,24 @@ mod tests {
                 .get(&1)
                 .and_then(|profile| profile.get(&8)),
             Some(&"second".to_string())
+        );
+        assert_eq!(
+            facts.field_access_certificates,
+            vec![
+                FieldAccessCertificate {
+                    slot: 1,
+                    field_offset: 0,
+                    field_name: "first".to_string(),
+                    field_type: None,
+                },
+                FieldAccessCertificate {
+                    slot: 1,
+                    field_offset: 8,
+                    field_name: "second".to_string(),
+                    field_type: None,
+                },
+            ],
+            "local field facts should remain as explicit r2types-owned layout certificates"
         );
     }
 

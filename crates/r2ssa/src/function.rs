@@ -25,8 +25,9 @@ use crate::rename::{
     rename_function_with_names_and_call_boundaries,
 };
 use crate::semantic::{
-    CallSiteFacts, MemoryDefFact, MemorySSAFacts, MemoryUseFact, ObjectId, ObjectModel,
-    PredicateFacts, PreparedFunctionFacts, StructuredDataflowFacts,
+    CallSiteFacts, CallsiteCertificate, MemoryAccessCertificate, MemoryDefFact, MemorySSAFacts,
+    MemoryUseFact, ObjectId, ObjectModel, PredicateFacts, PreparedFunctionFacts,
+    ReturnValueCertificate, StructuredDataflowFacts,
 };
 use crate::var::SSAVar;
 
@@ -133,6 +134,9 @@ impl SsaArtifact {
 
     pub fn for_symbolic(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
         let mut function = SSAFunction::from_blocks_raw(blocks, arch)?;
+        if let Some(arch) = arch {
+            function.normalize_subregister_sources_for_decompile(arch);
+        }
         function.refresh_decompile_prep_facts(arch);
         Some(Self::new(function, FunctionPrepareMode::Symbolic))
     }
@@ -189,6 +193,67 @@ impl SsaArtifact {
 
     pub fn structured(&self) -> &StructuredDataflowFacts {
         &self.facts.structured
+    }
+
+    pub fn certificates(&self) -> &crate::semantic::PreparedFunctionCertificates {
+        &self.facts.certificates
+    }
+
+    pub fn callsite_certificate_for_op(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<&CallsiteCertificate> {
+        let inst = self.graph.inst_id_for_op_site(block_addr, op_idx)?;
+        let callsite = self.facts.certificates.callsites_by_inst.get(&inst)?;
+        self.facts.certificates.callsites.get(callsite)
+    }
+
+    pub fn memory_certificates_for_op_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Vec<&MemoryAccessCertificate> {
+        let certs = &self.facts.certificates;
+        let read = certs
+            .memory_accesses_by_op
+            .get(&(block_addr, op_idx, false))
+            .into_iter()
+            .flatten();
+        let write = certs
+            .memory_accesses_by_op
+            .get(&(block_addr, op_idx, true))
+            .into_iter()
+            .flatten();
+        read.chain(write)
+            .filter_map(|id| certs.memory_accesses.get(id))
+            .collect()
+    }
+
+    pub fn memory_certificate_for_op_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        is_write: bool,
+    ) -> Option<&MemoryAccessCertificate> {
+        let certs = &self.facts.certificates;
+        self.facts
+            .certificates
+            .memory_accesses_by_op
+            .get(&(block_addr, op_idx, is_write))?
+            .iter()
+            .filter_map(|id| certs.memory_accesses.get(id))
+            .find(|cert| cert.is_write == is_write)
+    }
+
+    pub fn return_certificate_for_op(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<&ReturnValueCertificate> {
+        let inst = self.graph.inst_id_for_op_site(block_addr, op_idx)?;
+        let index = self.facts.certificates.returns_by_inst.get(&inst)?;
+        self.facts.certificates.returns.get(*index)
     }
 
     pub fn resolved_call_target(&self, call: &crate::semantic::CallSiteFact) -> Option<u64> {
@@ -1945,6 +2010,10 @@ impl RegisterFamilyInfo {
                 .insert(reg.size);
         }
 
+        if arch.name.eq_ignore_ascii_case("x86-64") || arch.name.eq_ignore_ascii_case("x86") {
+            seed_x86_low_register_aliases(&mut name_to_member, &mut family_width_sets);
+        }
+
         let family_widths = family_width_sets
             .into_iter()
             .map(|(family_id, mut widths)| {
@@ -1971,6 +2040,49 @@ impl RegisterFamilyInfo {
                 .copied();
         }
         None
+    }
+}
+
+fn seed_x86_low_register_aliases(
+    name_to_member: &mut HashMap<String, RegisterFamilyMember>,
+    family_width_sets: &mut HashMap<usize, HashSet<u32>>,
+) {
+    const GPR_ALIASES: &[&[(&str, u32)]] = &[
+        &[("rax", 8), ("eax", 4), ("ax", 2), ("al", 1)],
+        &[("rbx", 8), ("ebx", 4), ("bx", 2), ("bl", 1)],
+        &[("rcx", 8), ("ecx", 4), ("cx", 2), ("cl", 1)],
+        &[("rdx", 8), ("edx", 4), ("dx", 2), ("dl", 1)],
+        &[("rsi", 8), ("esi", 4), ("si", 2), ("sil", 1)],
+        &[("rdi", 8), ("edi", 4), ("di", 2), ("dil", 1)],
+        &[("rbp", 8), ("ebp", 4), ("bp", 2), ("bpl", 1)],
+        &[("rsp", 8), ("esp", 4), ("sp", 2), ("spl", 1)],
+        &[("r8", 8), ("r8d", 4), ("r8w", 2), ("r8b", 1)],
+        &[("r9", 8), ("r9d", 4), ("r9w", 2), ("r9b", 1)],
+        &[("r10", 8), ("r10d", 4), ("r10w", 2), ("r10b", 1)],
+        &[("r11", 8), ("r11d", 4), ("r11w", 2), ("r11b", 1)],
+        &[("r12", 8), ("r12d", 4), ("r12w", 2), ("r12b", 1)],
+        &[("r13", 8), ("r13d", 4), ("r13w", 2), ("r13b", 1)],
+        &[("r14", 8), ("r14d", 4), ("r14w", 2), ("r14b", 1)],
+        &[("r15", 8), ("r15d", 4), ("r15w", 2), ("r15b", 1)],
+    ];
+
+    for family in GPR_ALIASES {
+        let Some(family_id) = family
+            .iter()
+            .find_map(|(name, _)| name_to_member.get(*name).map(|member| member.family_id))
+        else {
+            continue;
+        };
+        let widths = family_width_sets.entry(family_id).or_default();
+        for (name, width) in *family {
+            widths.insert(*width);
+            name_to_member
+                .entry((*name).to_string())
+                .or_insert(RegisterFamilyMember {
+                    family_id,
+                    width: *width,
+                });
+        }
     }
 }
 
@@ -2026,6 +2138,8 @@ fn apply_op_family_effect(
         return;
     };
 
+    let preserved_narrow_roots =
+        preserved_narrow_family_roots_for_widening(op, state, family_info, member);
     kill_family_roots(state, member.family_id);
 
     let exact_slot = RegisterFamilySlot {
@@ -2046,6 +2160,9 @@ fn apply_op_family_effect(
         SSAOp::IntZExt { src, .. } | SSAOp::IntSExt { src, .. } => {
             state.insert(exact_slot, dst.clone());
             seed_narrow_family_roots(state, family_info, member.family_id, member.width, dst);
+            for (slot, root) in preserved_narrow_roots {
+                state.insert(slot, root);
+            }
             if let Some(root) = adapt_family_root(src, src.size) {
                 state.insert(
                     RegisterFamilySlot {
@@ -2058,15 +2175,52 @@ fn apply_op_family_effect(
         }
         SSAOp::Trunc { src, .. } | SSAOp::Subpiece { src, .. } => {
             if let Some(root) = adapt_family_root(src, member.width) {
-                state.insert(exact_slot, root);
+                state.insert(exact_slot, root.clone());
+                seed_narrow_family_roots(state, family_info, member.family_id, member.width, &root);
             } else {
                 state.insert(exact_slot, dst.clone());
+                seed_narrow_family_roots(state, family_info, member.family_id, member.width, dst);
             }
         }
         _ => {
             state.insert(exact_slot, dst.clone());
         }
     }
+}
+
+fn preserved_narrow_family_roots_for_widening(
+    op: &SSAOp,
+    state: &FamilyRootState,
+    family_info: &RegisterFamilyInfo,
+    dst_member: RegisterFamilyMember,
+) -> Vec<(RegisterFamilySlot, SSAVar)> {
+    let src = match op {
+        SSAOp::IntZExt { src, .. } | SSAOp::IntSExt { src, .. } => src,
+        _ => return Vec::new(),
+    };
+    let Some(src_member) = family_info.member_for(src) else {
+        return Vec::new();
+    };
+    if src_member.family_id != dst_member.family_id || src.size >= dst_member.width {
+        return Vec::new();
+    }
+    let Some(widths) = family_info.family_widths.get(&dst_member.family_id) else {
+        return Vec::new();
+    };
+
+    widths
+        .iter()
+        .copied()
+        .filter(|width| *width <= src.size)
+        .filter_map(|width| {
+            let slot = RegisterFamilySlot {
+                family_id: dst_member.family_id,
+                width,
+            };
+            let root = state.get(&slot)?;
+            adapt_family_root(root, width).map(|root| (slot, root))
+        })
+        .collect()
 }
 
 fn rewrite_decompile_family_source(
@@ -2107,13 +2261,20 @@ fn adapt_family_root(root: &SSAVar, width: u32) -> Option<SSAVar> {
     if root.size == width {
         return Some(root.clone());
     }
-    if root.size > width && !root.is_const() {
+    if root.size > width && can_width_adapt_register_family_root(root) {
         return Some(SSAVar::new(root.name.clone(), root.version, width));
     }
     if !root.is_const() {
         return None;
     }
     const_value(root).map(|value| SSAVar::constant(mask_const_to_width(value, width), width))
+}
+
+fn can_width_adapt_register_family_root(root: &SSAVar) -> bool {
+    !root.is_const()
+        && !root.is_temp()
+        && !root.name.starts_with("ram:")
+        && !root.name.starts_with("space")
 }
 
 fn seed_narrow_family_roots(
@@ -2521,6 +2682,15 @@ mod tests {
         }
     }
 
+    fn make_unique(offset: u64, size: u32) -> Varnode {
+        Varnode {
+            space: SpaceId::Unique,
+            offset,
+            size,
+            meta: None,
+        }
+    }
+
     fn make_arm64_alias_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("aarch64");
         arch.add_register(RegisterDef::new("x0", 0x00, 8));
@@ -2818,6 +2988,76 @@ mod tests {
             use_sites.len(),
             1,
             "return should consume the copied value once"
+        );
+    }
+
+    #[test]
+    fn prepared_function_certifies_return_register_writes_at_exit_predecessors() {
+        let arch = make_x86_64_prep_arch();
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1010, 8),
+                    cond: make_reg(8, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1014, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1010,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(2, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1014, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1014,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let return_write_blocks = prepared
+            .certificates()
+            .returns
+            .iter()
+            .filter(|cert| cert.block_addr == 0x1004 || cert.block_addr == 0x1010)
+            .count();
+
+        assert_eq!(
+            return_write_blocks, 2,
+            "both branch-arm return-register writes should carry ReturnValueCertificate proof"
         );
     }
 
@@ -3203,6 +3443,15 @@ mod tests {
         assert!(structured.memory_accesses.values().any(|access| {
             access.block_addr == 0x1408 && access.op_index == 0 && access.is_write
         }));
+        let certificates = prepared.certificates();
+        assert_eq!(certificates.loops.len(), 1);
+        assert!(certificates.switches.is_empty());
+        assert!(!certificates.expressions.is_empty());
+        assert_eq!(
+            certificates.memory_accesses.len(),
+            structured.memory_accesses.len()
+        );
+        assert!(!certificates.returns.is_empty());
 
         let recursive_blocks = vec![
             R2ILBlock {
@@ -3235,6 +3484,462 @@ mod tests {
         assert_eq!(recursive.structured().recursive_calls.len(), 1);
         assert_eq!(call.block_addr, 0x1500);
         assert_eq!(call.target, 0x1500);
+    }
+
+    #[test]
+    fn prepared_certificates_index_call_args_memory_and_returns() {
+        let arch = make_arm64_alias_arch();
+        let blocks = vec![R2ILBlock {
+            addr: 0x1600,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(7, 8),
+                },
+                R2ILOp::Load {
+                    dst: make_reg(0x80, 8),
+                    space: SpaceId::Ram,
+                    addr: make_const(0x5000, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x2000, 8),
+                },
+                R2ILOp::Return {
+                    target: make_reg(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let prepared = SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA");
+        let call = prepared
+            .callsite_certificate_for_op(0x1600, 2)
+            .expect("callsite certificate");
+        assert_eq!(call.block_addr, 0x1600);
+        assert_eq!(call.op_index, 2);
+        assert_eq!(call.argument_values.len(), 1);
+        let arg = prepared
+            .value_var(call.argument_values[0])
+            .expect("arg value");
+        assert!(arg.is_const());
+
+        let memory = prepared
+            .memory_certificate_for_op_site(0x1600, 1, false)
+            .expect("memory certificate");
+        assert_eq!(memory.block_addr, 0x1600);
+        assert_eq!(memory.op_index, 1);
+        assert!(!memory.is_write);
+
+        let return_idx = prepared
+            .function()
+            .get_block(0x1600)
+            .and_then(|block| {
+                block
+                    .ops
+                    .iter()
+                    .position(|op| matches!(op, SSAOp::Return { .. }))
+            })
+            .expect("return op index");
+        let ret = prepared
+            .return_certificate_for_op(0x1600, return_idx)
+            .expect("return certificate");
+        assert_eq!(ret.block_addr, 0x1600);
+        assert_eq!(ret.op_index, return_idx);
+        assert_eq!(ret.width, 8);
+    }
+
+    #[test]
+    fn prepared_callsite_certifies_stack_home_arguments() {
+        let arch = make_x86_64_prep_arch();
+        let stack_home = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x1740,
+            size: 8,
+            meta: None,
+        };
+        let blocks = vec![R2ILBlock {
+            addr: 0x1740,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntAdd {
+                    dst: stack_home.clone(),
+                    a: make_reg(16, 8),
+                    b: make_const(0x20, 8),
+                },
+                R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: stack_home,
+                    val: make_const(7, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x401000, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let call = prepared
+            .callsite_certificate_for_op(0x1740, 2)
+            .expect("callsite certificate");
+
+        assert_eq!(call.stack_argument_values.len(), 1);
+        let stack_arg = &call.stack_argument_values[0];
+        assert_eq!(stack_arg.stack_offset, 0x20);
+        let value = prepared
+            .value_var(stack_arg.value)
+            .expect("stack argument value");
+        assert!(value.is_const());
+        assert_eq!(value.name, "const:7");
+    }
+
+    #[test]
+    fn prepared_expression_certificates_require_structural_render_proof() {
+        let pure_blocks = vec![R2ILBlock {
+            addr: 0x1700,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(7, 8),
+                },
+                R2ILOp::IntAdd {
+                    dst: make_reg(8, 8),
+                    a: make_reg(0, 8),
+                    b: make_const(1, 8),
+                },
+                R2ILOp::Return {
+                    target: make_reg(8, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let pure = SsaArtifact::raw(&pure_blocks, None).expect("pure SSA");
+        let pure_ret = pure
+            .return_certificate_for_op(0x1700, 2)
+            .expect("pure return certificate");
+        assert!(
+            pure.certificates()
+                .expressions
+                .get(&pure_ret.value)
+                .is_some_and(|cert| cert.renderable),
+            "pure expression outputs should be renderable"
+        );
+
+        let load_blocks = vec![R2ILBlock {
+            addr: 0x1710,
+            size: 4,
+            ops: vec![
+                R2ILOp::Load {
+                    dst: make_reg(0, 8),
+                    space: SpaceId::Ram,
+                    addr: make_const(0x5000, 8),
+                },
+                R2ILOp::Return {
+                    target: make_reg(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let loaded = SsaArtifact::raw(&load_blocks, None).expect("load SSA");
+        let loaded_ret = loaded
+            .return_certificate_for_op(0x1710, 1)
+            .expect("loaded return certificate");
+        assert!(
+            loaded
+                .certificates()
+                .expressions
+                .get(&loaded_ret.value)
+                .is_some_and(|cert| cert.renderable),
+            "memory-load expression outputs require a structured memory-read certificate"
+        );
+
+        let userop_out = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x2222,
+            size: 8,
+            meta: None,
+        };
+        let userop_blocks = vec![R2ILBlock {
+            addr: 0x1720,
+            size: 4,
+            ops: vec![
+                R2ILOp::CallOther {
+                    output: Some(userop_out.clone()),
+                    userop: 99,
+                    inputs: vec![make_reg(0, 8)],
+                },
+                R2ILOp::Return { target: userop_out },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let userop = SsaArtifact::raw(&userop_blocks, None).expect("userop SSA");
+        let userop_ret = userop
+            .return_certificate_for_op(0x1720, 1)
+            .expect("userop return certificate");
+        assert!(
+            userop
+                .certificates()
+                .expressions
+                .get(&userop_ret.value)
+                .is_some_and(|cert| !cert.renderable),
+            "opaque userop outputs must not be renderable by width alone"
+        );
+    }
+
+    #[test]
+    fn prepared_return_register_subpiece_zext_chain_is_renderable() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0x00, 8));
+        arch.add_register(RegisterDef::new("eax", 0x00, 4));
+        arch.add_register(RegisterDef::new("rsi", 0x10, 8));
+        arch.add_register(RegisterDef::new("esi", 0x10, 4));
+        arch.add_register(RegisterDef::new("rdx", 0x18, 8));
+        arch.add_register(RegisterDef::new("edx", 0x18, 4));
+        arch.add_register(RegisterDef::new("rip", 0x20, 8));
+
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1740,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntAdd {
+                        dst: make_unique(0x4000, 8),
+                        a: make_reg(0x18, 8),
+                        b: make_reg(0x10, 8),
+                    },
+                    R2ILOp::Subpiece {
+                        dst: make_reg(0x00, 4),
+                        src: make_unique(0x4000, 8),
+                        offset: 0,
+                    },
+                    R2ILOp::IntZExt {
+                        dst: make_reg(0x00, 8),
+                        src: make_reg(0x00, 4),
+                    },
+                    R2ILOp::CBranch {
+                        target: make_ram(0x1750, 8),
+                        cond: make_reg(0x18, 4),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1750,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0x20, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let prepared = SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA");
+        let ret = prepared
+            .certificates()
+            .returns
+            .iter()
+            .find(|cert| {
+                cert.block_addr == 0x1740
+                    && prepared
+                        .value_var(cert.value)
+                        .is_some_and(|var| var.name.eq_ignore_ascii_case("rax"))
+            })
+            .expect("return-register certificate");
+
+        let expr_cert = prepared
+            .certificates()
+            .expressions
+            .get(&ret.value)
+            .expect("return value expression certificate");
+        let input_debug = expr_cert
+            .inputs
+            .iter()
+            .map(|value| {
+                let name = prepared
+                    .value_var(*value)
+                    .map(|var| var.display_name())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let renderable = prepared
+                    .certificates()
+                    .expressions
+                    .get(value)
+                    .is_some_and(|cert| cert.renderable);
+                format!("{name}:{renderable}")
+            })
+            .collect::<Vec<_>>();
+        let mut tmp_debug = Vec::new();
+        for value in &expr_cert.inputs {
+            if let Some(cert) = prepared.certificates().expressions.get(value) {
+                let value_name = prepared
+                    .value_var(*value)
+                    .map(|var| var.display_name())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                for input in &cert.inputs {
+                    let input_name = prepared
+                        .value_var(*input)
+                        .map(|var| var.display_name())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let renderable = prepared
+                        .certificates()
+                        .expressions
+                        .get(input)
+                        .is_some_and(|cert| cert.renderable);
+                    tmp_debug.push(format!("{value_name}->{input_name}:{renderable}"));
+                }
+            }
+        }
+        assert!(
+            expr_cert.renderable,
+            "return-register subpiece/zext chain should be renderable; ret={:?} inputs={:?} tmp_inputs={:?}",
+            prepared.value_var(ret.value),
+            input_debug,
+            tmp_debug
+        );
+    }
+
+    #[test]
+    fn prepared_expression_certificates_render_only_identity_phis() {
+        fn prepared_with_phi_sources(sources: Vec<SSAVar>) -> SsaArtifact {
+            let blocks = vec![R2ILBlock {
+                addr: 0x1730,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }];
+            let mut function =
+                SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+            let phi_dst = SSAVar::new("reg:0", 1, 8);
+            let phi_sources = sources
+                .into_iter()
+                .enumerate()
+                .map(|(index, source)| (0x1720 + (index as u64 * 4), source))
+                .collect();
+            let block = function.get_block_mut(0x1730).expect("merge block");
+            block.phis = vec![PhiNode {
+                dst: phi_dst.clone(),
+                sources: phi_sources,
+            }];
+            block.ops = vec![SSAOp::Return { target: phi_dst }];
+            SsaArtifact::new(function, FunctionPrepareMode::Raw)
+        }
+
+        let same_source = SSAVar::constant(7, 8);
+        let identity_phi = prepared_with_phi_sources(vec![same_source.clone(), same_source]);
+        let identity_ret = identity_phi
+            .return_certificate_for_op(0x1730, 0)
+            .expect("identity phi return certificate");
+        assert!(
+            identity_phi
+                .certificates()
+                .expressions
+                .get(&identity_ret.value)
+                .is_some_and(|cert| cert.renderable),
+            "identity phi over one renderable ValueId should be renderable"
+        );
+
+        let mixed_phi =
+            prepared_with_phi_sources(vec![SSAVar::constant(7, 8), SSAVar::constant(9, 8)]);
+        let mixed_ret = mixed_phi
+            .return_certificate_for_op(0x1730, 0)
+            .expect("mixed phi return certificate");
+        assert!(
+            mixed_phi
+                .certificates()
+                .expressions
+                .get(&mixed_ret.value)
+                .is_some_and(|cert| !cert.renderable),
+            "path-dependent phi must stay unrenderable without a stronger phi proof"
+        );
+    }
+
+    #[test]
+    fn prepared_expression_certificates_render_loop_carried_recurrence_phi() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1800,
+                size: 0x10,
+                ops: vec![R2ILOp::Branch {
+                    target: make_ram(0x1810, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1810,
+                size: 0x4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_ram(0x1820, 8),
+                    cond: make_const(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1814,
+                size: 0x4,
+                ops: vec![R2ILOp::Return {
+                    target: make_const(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1820,
+                size: 0x4,
+                ops: vec![R2ILOp::Branch {
+                    target: make_ram(0x1810, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let init = SSAVar::new("RAX", 0, 8);
+        let phi = SSAVar::new("RAX", 2, 8);
+        let update = SSAVar::new("RAX", 3, 8);
+        function.get_block_mut(0x1810).expect("loop header").phis = vec![PhiNode {
+            dst: phi.clone(),
+            sources: vec![(0x1800, init), (0x1820, update.clone())],
+        }];
+        function.get_block_mut(0x1820).expect("loop latch").ops = vec![
+            SSAOp::IntAdd {
+                dst: update,
+                a: phi.clone(),
+                b: SSAVar::constant(1, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:1810", 0, 8),
+            },
+        ];
+        function.get_block_mut(0x1814).expect("loop exit").ops =
+            vec![SSAOp::Return { target: phi }];
+
+        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let ret = prepared
+            .return_certificate_for_op(0x1814, 0)
+            .expect("loop-carried return certificate");
+        assert!(
+            prepared
+                .certificates()
+                .expressions
+                .get(&ret.value)
+                .is_some_and(|cert| cert.renderable),
+            "loop-header phi is renderable when the loop certificate proves the backedge and the update is pure modulo that phi"
+        );
     }
 
     #[test]
@@ -3933,6 +4638,165 @@ mod tests {
                 assert_eq!(a, &SSAVar::new("x8", 1, 4));
             }
             other => panic!("expected IntRight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decompile_normalization_seeds_missing_x86_low_byte_alias() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(RegisterDef::new("EAX", 0x00, 4));
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let block = func.get_block_mut(0x1000).expect("entry block");
+        block.ops = vec![
+            SSAOp::IntZExt {
+                dst: SSAVar::new("EAX", 1, 4),
+                src: SSAVar::new("tmp:loaded_byte", 1, 1),
+            },
+            SSAOp::IntSub {
+                dst: SSAVar::new("tmp:cmp", 1, 1),
+                a: SSAVar::new("AL", 0, 1),
+                b: SSAVar::constant(0x30, 1),
+            },
+        ];
+
+        func.normalize_subregister_sources_for_decompile(&arch);
+
+        match &func.get_block(0x1000).expect("entry block").ops[1] {
+            SSAOp::IntSub { a, .. } => {
+                assert_eq!(a, &SSAVar::new("tmp:loaded_byte", 1, 1));
+            }
+            other => panic!("expected IntSub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decompile_normalization_preserves_low_byte_after_x86_widening() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(RegisterDef::new("EAX", 0x00, 4));
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let block = func.get_block_mut(0x1000).expect("entry block");
+        block.ops = vec![
+            SSAOp::IntZExt {
+                dst: SSAVar::new("EAX", 1, 4),
+                src: SSAVar::new("tmp:loaded_byte", 1, 1),
+            },
+            SSAOp::IntZExt {
+                dst: SSAVar::new("RAX", 2, 8),
+                src: SSAVar::new("EAX", 1, 4),
+            },
+            SSAOp::IntLess {
+                dst: SSAVar::new("CF", 1, 1),
+                a: SSAVar::new("AL", 0, 1),
+                b: SSAVar::constant(b'0' as u64, 1),
+            },
+        ];
+
+        func.normalize_subregister_sources_for_decompile(&arch);
+
+        match &func.get_block(0x1000).expect("entry block").ops[2] {
+            SSAOp::IntLess { a, .. } => {
+                assert_eq!(a, &SSAVar::new("tmp:loaded_byte", 1, 1));
+            }
+            other => panic!("expected IntLess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decompile_normalization_seeds_low_byte_after_x86_subpiece_write() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_ram(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("R8", 0x40, 8));
+        arch.add_register(RegisterDef::new("R8D", 0x40, 4));
+
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let block = func.get_block_mut(0x1000).expect("entry block");
+        block.ops = vec![
+            SSAOp::Subpiece {
+                dst: SSAVar::new("R8D", 1, 4),
+                src: SSAVar::new("tmp:src", 1, 8),
+                offset: 0,
+            },
+            SSAOp::IntLess {
+                dst: SSAVar::new("CF", 1, 1),
+                a: SSAVar::new("R8B", 0, 1),
+                b: SSAVar::constant(0x1a, 1),
+            },
+        ];
+
+        func.normalize_subregister_sources_for_decompile(&arch);
+
+        match &func.get_block(0x1000).expect("entry block").ops[1] {
+            SSAOp::IntLess { a, .. } => {
+                assert_eq!(a, &SSAVar::new("R8D", 1, 1));
+            }
+            other => panic!("expected IntLess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_symbolic_ssa_normalizes_x86_low_byte_alias_sources() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
+        arch.add_register(RegisterDef::new("EAX", 0x00, 4));
+        arch.add_register(RegisterDef::new("AL", 0x00, 1));
+
+        let blocks = vec![R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0, 4),
+                    src: make_const(0x41, 4),
+                },
+                R2ILOp::IntEqual {
+                    dst: make_reg(0x200, 1),
+                    a: make_reg(0, 1),
+                    b: make_const(0x41, 1),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let artifact =
+            SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("symbolic SSA should build");
+        let block = artifact.function().get_block(0x1000).expect("entry block");
+
+        match &block.ops[1] {
+            SSAOp::IntEqual { a, .. } => {
+                assert_eq!(a, &SSAVar::constant(0x41, 1));
+            }
+            other => panic!("expected IntEqual, got {other:?}"),
         }
     }
 

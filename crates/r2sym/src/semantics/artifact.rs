@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::claims::SemanticClaimSummary;
 use super::plan::{
     ArtifactBuildPlan, DecompilePlan, QueryPlan, TargetQueryExecutionRoute, TargetQueryPlan,
     TargetQueryRoutePlan, TypePlan, derive_artifact_build_plan, derive_decompile_plan,
@@ -559,6 +560,12 @@ impl SemanticArtifact {
             SemanticArtifactBody::Native(body) => Some(body),
             SemanticArtifactBody::Vm(_) => None,
         }
+    }
+
+    pub fn semantic_claim_summary(&self) -> SemanticClaimSummary {
+        self.native_body()
+            .map(SemanticClaimSummary::from_native_body)
+            .unwrap_or_else(SemanticClaimSummary::empty)
     }
 
     pub fn vm_body(&self) -> Option<&VmArtifactBody> {

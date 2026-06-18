@@ -164,10 +164,9 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
         super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, summary);
     let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
     let named_worker_family = has_named_worker_family(&worker_summaries);
-    let direct_named_worker = summary.name.as_deref().is_some_and(|name| {
-        super::native_worker::native_worker_summary_route_policy_for_name(func.entry, name)
-            .should_use_direct_summary()
-    });
+    let direct_named_worker =
+        super::native_worker::native_worker_summary_route_policy_for_summary(func.entry, summary)
+            .should_use_direct_summary();
     if worker_summaries.len() < SUMMARY_DENSE_WORKER_ISLAND_MIN
         && !(named_worker_family && direct_named_worker)
     {
@@ -255,6 +254,11 @@ pub fn compile_named_native_worker_summary_artifact(
     let worker_summaries =
         super::native_worker::summaries_from_interproc_summary_unbounded(summary.id.0, summary);
     let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
+    let route_policy =
+        super::native_worker::native_worker_summary_route_policy_for_summary(summary.id.0, summary);
+    if !route_policy.has_route_certificate() {
+        return None;
+    }
     let named_worker_family = has_named_worker_family(&worker_summaries);
     if worker_summaries.is_empty() || !named_worker_family {
         return None;
@@ -301,7 +305,7 @@ pub fn compile_native_worker_summary_artifact(
     }
     let has_primary_interproc_summary = worker_summaries
         .iter()
-        .any(NativeWorkerSummary::is_primary_render_summary);
+        .any(NativeWorkerSummary::is_primary_non_name_summary);
     let cfg_summary = func.function().cfg_risk_summary();
     let op_count = func
         .function()
@@ -321,7 +325,13 @@ pub fn compile_native_worker_summary_artifact(
         }
     }
     let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
-    let named_worker_family = has_named_worker_family(&worker_summaries);
+    let named_worker_family = has_named_worker_family(
+        &worker_summaries
+            .iter()
+            .filter(|summary| !summary.has_name_hint_evidence())
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     let summary_owned_worker = summary
         .and_then(|summary| summary.name.as_deref())
         .is_some_and(super::native_worker::has_native_worker_summary_family);
@@ -351,14 +361,19 @@ pub fn compile_native_worker_summary_artifact(
     };
     let has_primary_summary = worker_summaries
         .iter()
-        .any(NativeWorkerSummary::is_primary_render_summary)
+        .any(NativeWorkerSummary::is_primary_non_name_summary)
         || region_summaries
             .iter()
-            .any(crate::NativeRegionSummary::is_primary_render_summary);
+            .any(crate::NativeRegionSummary::is_primary_non_name_summary);
     let stage = if has_primary_summary {
         RefinementStage::Compiled
     } else {
         RefinementStage::Residual
+    };
+    let role_name_hint = if has_primary_interproc_summary {
+        summary.and_then(|summary| summary.name.clone())
+    } else {
+        None
     };
     let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
     let collected = CollectedNativeSemanticRegions {
@@ -376,7 +391,7 @@ pub fn compile_native_worker_summary_artifact(
         granularity: ArtifactGranularity::SummaryOnly,
         execution: ExecutionModel::Native,
         suppress_large_cfg_reason: has_primary_summary,
-        role_name_hint: summary.and_then(|summary| summary.name.clone()),
+        role_name_hint,
         slice_class,
         closure_functions,
         helper_functions,
@@ -1267,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_summary_artifact_trusts_primary_interproc_summary() {
+    fn native_worker_summary_artifact_ignores_name_hint_and_keeps_structure() {
         let loaded = Varnode::unique(0x10, 1);
         let pred = Varnode::unique(0x11, 1);
         let blocks = vec![R2ILBlock {
@@ -1299,19 +1314,30 @@ mod tests {
         );
 
         let artifact = compile_native_worker_summary_artifact(&func, None, Some(&summary), true)
-            .expect("named worker summary");
+            .expect("structural worker summary");
 
         let native = artifact.native_body().expect("native artifact");
-        assert!(native.summary.worker_summaries.iter().any(|summary| {
-            matches!(
+        assert!(native.summary.worker_summaries.iter().all(|summary| {
+            !matches!(
                 summary.kind,
                 crate::NativeWorkerSummaryKind::FormatArgumentFetch
             )
         }));
         assert!(
-            !native.summary.worker_summaries.iter().any(|summary| {
+            native.summary.worker_summaries.iter().any(|summary| {
                 matches!(summary.kind, crate::NativeWorkerSummaryKind::StringScan)
             })
+        );
+        let role = native
+            .summary
+            .role_identity
+            .as_ref()
+            .expect("role identity");
+        assert_eq!(role.role_name, "string_scan");
+        assert_eq!(role.source, crate::NativeWorkerRoleSource::Structural);
+        assert!(
+            role.source_names.is_empty(),
+            "structural worker evidence must not inherit an arbitrary summary name"
         );
         assert_eq!(artifact.slice_class(), Some(crate::SliceClass::Worker));
         assert!(matches!(

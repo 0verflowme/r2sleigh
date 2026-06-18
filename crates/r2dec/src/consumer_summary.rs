@@ -1,6 +1,114 @@
 use crate::ast::{self, CFunction, CStmt, CType};
 use crate::codegen::{CodeGenConfig, CodeGenerator};
-use r2types::{FunctionFacts, FunctionTypeFacts};
+use r2types::{CTypeLike, FunctionFacts, FunctionTypeFacts};
+use std::collections::BTreeSet;
+
+fn worker_summary_display_selection(
+    summaries: &[r2sym::NativeWorkerSummary],
+    limit: usize,
+) -> Vec<&r2sym::NativeWorkerSummary> {
+    let mut selected = (0..summaries.len().min(limit)).collect::<BTreeSet<_>>();
+
+    for pred in [
+        worker_summary_is_out_parser as fn(&r2sym::NativeWorkerSummary) -> bool,
+        worker_summary_is_memory_write,
+    ] {
+        if selected.iter().any(|idx| pred(&summaries[*idx])) {
+            continue;
+        }
+        if let Some(idx) = summaries.iter().position(pred) {
+            selected.insert(idx);
+        }
+    }
+
+    selected
+        .into_iter()
+        .map(|idx| &summaries[idx])
+        .collect::<Vec<_>>()
+}
+
+fn append_worker_summary_evidence_comments(
+    body: &mut Vec<CStmt>,
+    summaries: &[r2sym::NativeWorkerSummary],
+) {
+    body.push(CStmt::comment(format!(
+        "native worker summaries: {}",
+        summaries.len()
+    )));
+    let displayed_worker_summaries = worker_summary_display_selection(summaries, 6);
+    for summary in &displayed_worker_summaries {
+        if let Some(pseudocode) = crate::native_worker_summary_pseudocode(summary) {
+            body.push(CStmt::comment(format!(
+                "worker loop: {}",
+                crate::sanitize_comment_text(&pseudocode)
+            )));
+        }
+        body.push(CStmt::comment(format!(
+            "worker summary: {}",
+            crate::sanitize_comment_text(&crate::native_worker_summary_detail(summary))
+        )));
+    }
+    if summaries.len() > displayed_worker_summaries.len() {
+        body.push(CStmt::comment(format!(
+            "worker summary: {} more omitted",
+            summaries.len() - displayed_worker_summaries.len()
+        )));
+    }
+}
+
+fn worker_summary_is_out_parser(summary: &r2sym::NativeWorkerSummary) -> bool {
+    summary.kind == r2sym::NativeWorkerSummaryKind::Parser && summary.dst.is_some()
+}
+
+fn worker_summary_is_memory_write(summary: &r2sym::NativeWorkerSummary) -> bool {
+    summary.kind == r2sym::NativeWorkerSummaryKind::MemoryWrite
+}
+
+pub(crate) fn certified_out_param_labels(type_facts: &FunctionTypeFacts) -> Vec<String> {
+    type_facts
+        .source_authorized_out_param_certificates()
+        .map(|cert| {
+            if cert.param_name.trim().is_empty() {
+                cert.param_index.to_string()
+            } else {
+                format!("{}:{}", cert.param_index, cert.param_name)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn certified_field_access_labels(type_facts: &FunctionTypeFacts) -> Vec<String> {
+    let mut certificates = type_facts
+        .field_access_certificates
+        .iter()
+        .collect::<Vec<_>>();
+    certificates.sort();
+
+    let mut labels = certificates
+        .into_iter()
+        .map(|cert| {
+            let param = type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|signature| signature.params.get(cert.slot));
+            let base = param
+                .map(|param| param.name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("arg{}", cert.slot + 1));
+            let separator = if param
+                .and_then(|param| param.ty.as_ref())
+                .is_some_and(|ty| matches!(ty, CTypeLike::Pointer(_)))
+            {
+                "->"
+            } else {
+                "."
+            };
+            format!("{base}{separator}{}", cert.field_name)
+        })
+        .collect::<Vec<_>>();
+    labels.dedup();
+    labels
+}
 
 pub(crate) fn render_for_route(
     func_name: &str,
@@ -21,6 +129,11 @@ pub(crate) fn render_for_route(
     let is_residual_route = !is_summary_island_route
         && (matches!(semantic_artifact.stage, r2sym::RefinementStage::Residual)
             || !semantic_artifact.diagnostics.residual_reasons.is_empty());
+    let claim_summary = semantic_artifact.semantic_claim_summary();
+    let certified_out_param_count = function_facts
+        .types
+        .source_authorized_out_param_certificates()
+        .count();
 
     let mut body = Vec::new();
     if is_summary_island_route {
@@ -40,6 +153,9 @@ pub(crate) fn render_for_route(
                 .map(crate::semantic_slice_class_label)
                 .unwrap_or("unknown")
         )));
+        body.push(CStmt::comment(
+            "render contract: summary facts only; no executable native C reconstructed".to_string(),
+        ));
     } else if is_residual_route {
         body.push(CStmt::comment(format!(
             "r2dec residual: semantic worker summary for {}",
@@ -53,6 +169,9 @@ pub(crate) fn render_for_route(
                 .map(crate::semantic_slice_class_label)
                 .unwrap_or("unknown")
         )));
+        body.push(CStmt::comment(
+            "render contract: residual summary only; no certified native C".to_string(),
+        ));
     } else {
         body.push(CStmt::comment(format!(
             "r2dec summary: semantic worker linear summary for {}",
@@ -66,7 +185,23 @@ pub(crate) fn render_for_route(
                 .map(crate::semantic_slice_class_label)
                 .unwrap_or("unknown")
         )));
+        body.push(CStmt::comment(
+            "render contract: summary facts only; no executable native C reconstructed".to_string(),
+        ));
     }
+
+    body.push(CStmt::comment(format!(
+        "semantic claims: renderable={}, control={}, memory={}, value={}, summary_roles={}, type_args={}, out_args={}, name_hint={}, residual={}",
+        claim_summary.renderable_summary_claims,
+        claim_summary.structural_control_claims,
+        claim_summary.structural_memory_claims,
+        claim_summary.structural_value_claims,
+        claim_summary.summary_role_certificates.len(),
+        claim_summary.pointer_param_indices.len(),
+        certified_out_param_count,
+        claim_summary.name_hint_claims,
+        claim_summary.residual_claims
+    )));
 
     if !semantic_artifact.diagnostics.residual_reasons.is_empty() {
         let reasons = semantic_artifact
@@ -86,7 +221,7 @@ pub(crate) fn render_for_route(
     if let Some(native) = semantic_artifact.native_body() {
         if let Some(role) = native.summary.role_identity.as_ref() {
             body.push(CStmt::comment(format!(
-                "semantic role: {}; source={:?}; confidence={:?}",
+                "summary role hint: {}; source={:?}; confidence={:?}",
                 crate::sanitize_comment_text(&role.role_name),
                 role.source,
                 role.confidence
@@ -110,9 +245,6 @@ pub(crate) fn render_for_route(
                 native.summary.region_summaries.len()
             )));
             for summary in native.summary.region_summaries.iter().take(12) {
-                if let Some(stmt) = crate::native_region_summary_structured_stmt(summary) {
-                    body.push(stmt);
-                }
                 if let Some(pseudocode) = crate::native_region_summary_pseudocode(summary) {
                     body.push(CStmt::comment(format!(
                         "summary island: {}",
@@ -130,21 +262,20 @@ pub(crate) fn render_for_route(
                     native.summary.region_summaries.len() - 12
                 )));
             }
+            if is_summary_island_route && !native.summary.worker_summaries.is_empty() {
+                append_worker_summary_evidence_comments(
+                    &mut body,
+                    &native.summary.worker_summaries,
+                );
+            }
         } else if !native.summary.worker_summaries.is_empty() {
             body.push(CStmt::comment(format!(
                 "native worker summaries: {}",
                 native.summary.worker_summaries.len()
             )));
-            for summary in native.summary.worker_summaries.iter().take(6) {
-                let predicated_count_stmts =
-                    crate::predicated_count_loop_stmts(summary, function_facts);
-                if let Some(stmts) = predicated_count_stmts {
-                    body.extend(stmts);
-                    continue;
-                }
-                if let Some(stmt) = crate::native_worker_summary_structured_stmt(summary) {
-                    body.push(stmt);
-                }
+            let displayed_worker_summaries =
+                worker_summary_display_selection(&native.summary.worker_summaries, 6);
+            for summary in &displayed_worker_summaries {
                 if let Some(pseudocode) = crate::native_worker_summary_pseudocode(summary) {
                     body.push(CStmt::comment(format!(
                         "worker loop: {}",
@@ -156,10 +287,10 @@ pub(crate) fn render_for_route(
                     crate::sanitize_comment_text(&crate::native_worker_summary_detail(summary))
                 )));
             }
-            if native.summary.worker_summaries.len() > 6 {
+            if native.summary.worker_summaries.len() > displayed_worker_summaries.len() {
                 body.push(CStmt::comment(format!(
                     "worker summary: {} more omitted",
-                    native.summary.worker_summaries.len() - 6
+                    native.summary.worker_summaries.len() - displayed_worker_summaries.len()
                 )));
             }
         }
@@ -177,21 +308,25 @@ pub(crate) fn render_for_route(
         ));
     }
 
+    let certified_fields = certified_field_access_labels(&function_facts.types);
+    if !certified_fields.is_empty() {
+        body.push(CStmt::comment(format!(
+            "certified field accesses: {}",
+            certified_fields.join(", ")
+        )));
+    }
+
     if let Some(rollup) = function_facts.summary_rollup() {
         if let Some(return_relation) = rollup.root_return_relation.as_ref() {
             body.push(CStmt::comment(format!(
                 "summary return: {return_relation:?}"
             )));
         }
-        if !rollup.out_param_indices.is_empty() {
+        let certified_out_params = certified_out_param_labels(&function_facts.types);
+        if !certified_out_params.is_empty() {
             body.push(CStmt::comment(format!(
-                "summary out params: {}",
-                rollup
-                    .out_param_indices
-                    .iter()
-                    .map(usize::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "certified out params: {}",
+                certified_out_params.join(", ")
             )));
         }
         if rollup.transfer_count
@@ -246,16 +381,12 @@ fn semantic_worker_summary_function(
     type_facts: &FunctionTypeFacts,
     body: Vec<CStmt>,
 ) -> CFunction {
-    let ret_type = type_facts
-        .merged_signature
-        .as_ref()
+    let trusted_signature = type_facts.render_authorized_signature();
+    let ret_type = trusted_signature
         .and_then(|sig| sig.ret_type.as_ref().map(crate::type_like_to_ctype))
         .unwrap_or(CType::Unknown);
-    let has_merged_signature = type_facts.merged_signature.is_some();
-    let mut params = crate::merge_params_with_external_signature(
-        Vec::new(),
-        type_facts.merged_signature.as_ref(),
-    );
+    let has_merged_signature = trusted_signature.is_some();
+    let mut params = crate::merge_params_with_external_signature(Vec::new(), trusted_signature);
     if params.is_empty() && !has_merged_signature {
         params = type_facts
             .register_params
@@ -287,5 +418,198 @@ fn semantic_worker_summary_function(
         params,
         locals: Vec::new(),
         body,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certified_out_param_labels_require_source_identity() {
+        let type_facts = FunctionTypeFacts {
+            out_param_certificates: vec![
+                r2types::OutParamCertificate {
+                    param_index: 0,
+                    param_name: "raw".to_string(),
+                    pointee_type: None,
+                    evidence: vec![r2types::OutParamCertificateEvidence::InterprocArgWrite],
+                    sources: Vec::new(),
+                },
+                r2types::OutParamCertificate {
+                    param_index: 1,
+                    param_name: "out".to_string(),
+                    pointee_type: None,
+                    evidence: vec![r2types::OutParamCertificateEvidence::NativeWorkerWrite],
+                    sources: vec![r2types::OutParamCertificateSource::NativeWorkerSummary {
+                        stable_id: 0x55,
+                        anchor: 0x401000,
+                        summary_kind: r2sym::NativeWorkerSummaryKind::MemoryWrite,
+                        param_index: 1,
+                    }],
+                },
+            ],
+            ..FunctionTypeFacts::default()
+        };
+
+        assert_eq!(certified_out_param_labels(&type_facts), vec!["1:out"]);
+    }
+
+    #[test]
+    fn certified_field_access_labels_use_signature_parameter_names() {
+        let type_facts = FunctionTypeFacts {
+            merged_signature: Some(r2types::FunctionSignatureSpec {
+                ret_type: None,
+                params: vec![r2types::FunctionParamSpec {
+                    name: "out".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
+                        "Result".to_string(),
+                    )))),
+                }],
+            }),
+            field_access_certificates: vec![r2types::FieldAccessCertificate {
+                slot: 0,
+                field_offset: 8,
+                field_name: "hash".to_string(),
+                field_type: Some("uint64_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        };
+
+        assert_eq!(
+            certified_field_access_labels(&type_facts),
+            vec!["out->hash"]
+        );
+    }
+
+    #[test]
+    fn summary_comment_out_args_count_requires_certified_type_facts() {
+        let mut semantic_artifact = crate::test_native_semantic_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::ArtifactGranularity::Regioned,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
+            panic!("expected native artifact");
+        };
+        native
+            .summary
+            .worker_summaries
+            .push(r2sym::NativeWorkerSummary {
+                anchor: 0x401000,
+                kind: r2sym::NativeWorkerSummaryKind::MemoryWrite,
+                dst: None,
+                src: None,
+                memory: Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                }),
+                len: None,
+                allocation: None,
+                lifetime: None,
+                sync: None,
+                atomic: None,
+                parser: None,
+                loop_summary: None,
+                evidence: r2sym::SemanticEvidence::likely(
+                    r2sym::SemanticEvidenceReason::SummaryBudget,
+                ),
+            });
+        let function_facts =
+            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
+
+        let output = render_for_route(
+            "dbg.write_out",
+            &function_facts,
+            &crate::planner::SemanticRoutePlan::LinearWorker {
+                reason: "test summary".to_string(),
+            },
+            CodeGenConfig::default(),
+        )
+        .expect("summary output");
+
+        assert!(output.contains("out_args=0"));
+        assert!(!output.contains("out_params=["));
+    }
+
+    fn test_worker_summary(
+        anchor: u64,
+        kind: r2sym::NativeWorkerSummaryKind,
+    ) -> r2sym::NativeWorkerSummary {
+        r2sym::NativeWorkerSummary {
+            anchor,
+            kind,
+            dst: if kind == r2sym::NativeWorkerSummaryKind::Parser {
+                Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
+                    range: None,
+                })
+            } else {
+                None
+            },
+            src: None,
+            memory: if matches!(
+                kind,
+                r2sym::NativeWorkerSummaryKind::Parser
+                    | r2sym::NativeWorkerSummaryKind::MemoryWrite
+            ) {
+                Some(r2ssa::SummaryMemoryLocation {
+                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                    range: None,
+                })
+            } else {
+                None
+            },
+            len: None,
+            allocation: None,
+            lifetime: None,
+            sync: None,
+            atomic: None,
+            parser: if kind == r2sym::NativeWorkerSummaryKind::Parser {
+                Some(r2sym::NativeParserSummary {
+                    kind: r2sym::NativeParserKind::Numeric,
+                    cursor_arg: Some(0),
+                    base: Some(10),
+                    digit_min: Some(b'0'),
+                    digit_max: Some(b'9'),
+                    accepts_sign: true,
+                    return_predicate: None,
+                })
+            } else {
+                None
+            },
+            loop_summary: None,
+            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
+        }
+    }
+
+    #[test]
+    fn worker_summary_display_keeps_late_out_parser_and_memory_write() {
+        let mut summaries = Vec::new();
+        for idx in 0..6 {
+            summaries.push(test_worker_summary(
+                0x401000 + idx,
+                r2sym::NativeWorkerSummaryKind::MemoryRead,
+            ));
+        }
+        summaries.push(test_worker_summary(
+            0x401100,
+            r2sym::NativeWorkerSummaryKind::Parser,
+        ));
+        summaries.push(test_worker_summary(
+            0x401108,
+            r2sym::NativeWorkerSummaryKind::MemoryWrite,
+        ));
+
+        let selected = worker_summary_display_selection(&summaries, 6)
+            .into_iter()
+            .map(|summary| summary.anchor)
+            .collect::<Vec<_>>();
+
+        assert!(selected.contains(&0x401100));
+        assert!(selected.contains(&0x401108));
     }
 }

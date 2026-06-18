@@ -6,7 +6,7 @@ use crate::analysis;
 use crate::ast::CType;
 use r2ssa::{
     CallSiteFacts, FunctionSSABlock, InterprocSummarySet, MemorySSAFacts, ObjectModel,
-    PredicateFacts, SSAVar, SsaArtifact,
+    PredicateFacts, SSAVar, SsaArtifact, ValueId,
 };
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
@@ -32,6 +32,27 @@ pub(crate) enum ResolutionPhase {
 pub(crate) struct ResolutionGuardKey {
     pub(crate) phase: ResolutionPhase,
     pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EffectRenderProofKind {
+    Call,
+    Expression,
+    MemoryRead,
+    MemoryWrite,
+    Return,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EffectRenderProof {
+    pub(crate) kind: EffectRenderProofKind,
+    pub(crate) block_addr: u64,
+    pub(crate) op_idx: usize,
+    pub(crate) target: Option<ValueId>,
+    pub(crate) address: Option<ValueId>,
+    pub(crate) value: Option<ValueId>,
+    pub(crate) values: Vec<ValueId>,
+    pub(crate) materialized_phi_copy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +137,7 @@ pub struct FoldingContext<'a> {
     pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
     pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
+    pub(crate) effect_render_proofs: std::cell::RefCell<Vec<EffectRenderProof>>,
 }
 
 impl FoldArchConfig {
@@ -197,7 +219,101 @@ impl<'a> FoldingContext<'a> {
             definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
             definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
             resolution_guard: std::cell::RefCell::new(HashSet::new()),
+            effect_render_proofs: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn clear_effect_render_proofs(&self) {
+        self.effect_render_proofs.borrow_mut().clear();
+    }
+
+    pub(crate) fn effect_render_proofs(&self) -> Vec<EffectRenderProof> {
+        self.effect_render_proofs.borrow().clone()
+    }
+
+    pub(crate) fn record_effect_render_proof_for_values(
+        &self,
+        kind: EffectRenderProofKind,
+        block_addr: u64,
+        op_idx: usize,
+        target: Option<ValueId>,
+        values: Vec<ValueId>,
+    ) {
+        self.effect_render_proofs
+            .borrow_mut()
+            .push(EffectRenderProof {
+                kind,
+                block_addr,
+                op_idx,
+                target,
+                address: None,
+                value: None,
+                values,
+                materialized_phi_copy: false,
+            });
+    }
+
+    pub(crate) fn record_effect_render_proof_for_value(
+        &self,
+        kind: EffectRenderProofKind,
+        block_addr: u64,
+        op_idx: usize,
+        value: Option<ValueId>,
+    ) {
+        self.effect_render_proofs
+            .borrow_mut()
+            .push(EffectRenderProof {
+                kind,
+                block_addr,
+                op_idx,
+                target: None,
+                address: None,
+                value,
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            });
+    }
+
+    pub(crate) fn record_effect_render_proof_for_materialized_phi_copy(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        value: Option<ValueId>,
+    ) {
+        self.effect_render_proofs
+            .borrow_mut()
+            .push(EffectRenderProof {
+                kind: EffectRenderProofKind::Expression,
+                block_addr,
+                op_idx,
+                target: None,
+                address: None,
+                value,
+                values: Vec::new(),
+                materialized_phi_copy: true,
+            });
+    }
+
+    pub(crate) fn record_effect_render_proof_for_memory(
+        &self,
+        kind: EffectRenderProofKind,
+        block_addr: u64,
+        op_idx: usize,
+        address: ValueId,
+        value: Option<ValueId>,
+    ) {
+        self.effect_render_proofs
+            .borrow_mut()
+            .push(EffectRenderProof {
+                kind,
+                block_addr,
+                op_idx,
+                target: None,
+                address: Some(address),
+                value,
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            });
     }
 
     /// Test convenience constructor.

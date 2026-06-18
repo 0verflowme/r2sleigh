@@ -9,17 +9,16 @@ description = "SSA (Static Single Assignment) form for r2il"
 r2il = { path = "../r2il" }
 r2sleigh-lift = { path = "../r2sleigh-lift" }
 serde.workspace = true
-thiserror.workspace = true
 petgraph = "0.8"
-
-[dev-dependencies]
-sleigh-config = { version = "1.0", features = ["x86"] }
 
 [features]
 default = []
 sleigh-config = ["dep:sleigh-config"]
 
 [dependencies.sleigh-config]
-version = "1.0"
+workspace = true
 optional = true
 features = ["x86"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

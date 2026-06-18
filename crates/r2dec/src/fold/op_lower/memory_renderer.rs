@@ -5,6 +5,106 @@ use r2ssa::SSAVar;
 use super::*;
 
 impl<'a> FoldingContext<'a> {
+    fn expr_is_store_target_candidate(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Var(_)
+            | CExpr::Deref(_)
+            | CExpr::Subscript { .. }
+            | CExpr::Member { .. }
+            | CExpr::PtrMember { .. } => true,
+            CExpr::Paren(inner) => Self::expr_is_store_target_candidate(inner),
+            _ => false,
+        }
+    }
+
+    fn byte_indexed_pointer_add_expr(&self, expr: &CExpr) -> Option<CExpr> {
+        self.indexed_pointer_add_expr(expr, &CType::u8())
+    }
+
+    pub(super) fn indexed_pointer_add_expr(&self, expr: &CExpr, elem_ty: &CType) -> Option<CExpr> {
+        let CExpr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } = expr
+        else {
+            return None;
+        };
+
+        for (base, index) in [
+            (left.as_ref(), right.as_ref()),
+            (right.as_ref(), left.as_ref()),
+        ] {
+            let normalized_base = self.normalize_pointer_base_expr(base, 0);
+            if !(self.looks_like_pointer(&normalized_base)
+                || self.is_non_index_pointer_expr(&normalized_base))
+            {
+                continue;
+            }
+            if self.looks_like_pointer(index) || self.is_non_index_pointer_expr(index) {
+                continue;
+            }
+            let elem_ty = match self.expr_type_hint(&normalized_base) {
+                Some(CType::Pointer(inner)) | Some(CType::Array(inner, _)) => *inner,
+                _ => elem_ty.clone(),
+            };
+            let elem_size = elem_ty
+                .bits()
+                .map(|bits| bits.div_ceil(8).max(1))
+                .unwrap_or(1);
+            let Some(index) = self.scaled_index_expr(index, elem_size) else {
+                continue;
+            };
+            let index = self.normalize_index_expr(&index, 0).unwrap_or(index);
+            let base_source_ty = self.expr_type_hint(&normalized_base);
+            let normalized_base = self.cast_expr_if_needed(
+                normalized_base,
+                CType::ptr(elem_ty),
+                base_source_ty.as_ref(),
+            );
+            return Some(CExpr::Subscript {
+                base: Box::new(normalized_base),
+                index: Box::new(index),
+            });
+        }
+
+        None
+    }
+
+    fn scaled_index_expr(&self, expr: &CExpr, elem_size: u32) -> Option<CExpr> {
+        if elem_size <= 1 {
+            return Some(expr.clone());
+        }
+
+        match expr {
+            CExpr::Binary {
+                op: BinaryOp::Mul,
+                left,
+                right,
+            } => {
+                if self.literal_to_i64(right) == Some(i64::from(elem_size)) {
+                    return Some((**left).clone());
+                }
+                if self.literal_to_i64(left) == Some(i64::from(elem_size)) {
+                    return Some((**right).clone());
+                }
+                None
+            }
+            CExpr::Binary {
+                op: BinaryOp::Shl,
+                left,
+                right,
+            } => {
+                let shift = self.literal_to_i64(right)?;
+                if !(0..=30).contains(&shift) {
+                    return None;
+                }
+                (1u32.checked_shl(shift as u32)? == elem_size).then(|| (**left).clone())
+            }
+            _ => None,
+        }
+    }
+
     fn has_authoritative_memory_semantics(&self, name: &str) -> bool {
         matches!(
             self.lookup_semantic_value(name),
@@ -83,6 +183,17 @@ impl<'a> FoldingContext<'a> {
         best = self
             .choose_preferred_visible_expr(best, self.prepared_named_memory_expr_for_current_op());
         if let Some(expr) = best {
+            if let CExpr::Deref(inner) = &expr
+                && let Some(indexed) = self.indexed_pointer_add_expr(inner, &elem_ty)
+            {
+                return indexed;
+            }
+            if !Self::expr_is_scalar_memory_candidate(&expr)
+                && !matches!(elem_ty, CType::Pointer(_) | CType::Array(_, _))
+                && self.normalized_addr_from_visible_expr(&expr, 0).is_some()
+            {
+                return self.typed_deref_expr(addr, expr, elem_ty);
+            }
             return expr;
         }
 
@@ -164,7 +275,7 @@ impl<'a> FoldingContext<'a> {
             best,
             self.prepared_named_memory_def_expr_for_current_op(),
         );
-        if let Some(expr) = best {
+        if let Some(expr) = best.filter(Self::expr_is_store_target_candidate) {
             return expr;
         }
 
@@ -190,6 +301,12 @@ impl<'a> FoldingContext<'a> {
             return exact;
         }
 
+        if value_size == 1
+            && let Some(indexed) = self.byte_indexed_pointer_add_expr(&fallback_addr_expr)
+        {
+            return indexed;
+        }
+
         self.typed_deref_expr(addr, fallback_addr_expr, elem_ty)
     }
 
@@ -213,7 +330,19 @@ impl<'a> FoldingContext<'a> {
         } else {
             expr.clone()
         };
+        if let Some(rendered) = try_render(&preferred, self).or_else(|| try_render(expr, self)) {
+            return Some(rendered);
+        }
+        let elem_ty = type_from_size(elem_size);
+        if let Some(indexed) = self.indexed_pointer_add_expr(&preferred, &elem_ty) {
+            return Some(indexed);
+        }
+        if preferred != *expr
+            && let Some(indexed) = self.indexed_pointer_add_expr(expr, &elem_ty)
+        {
+            return Some(indexed);
+        }
 
-        try_render(&preferred, self).or_else(|| try_render(expr, self))
+        None
     }
 }

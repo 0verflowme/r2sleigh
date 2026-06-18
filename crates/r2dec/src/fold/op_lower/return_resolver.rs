@@ -315,6 +315,23 @@ impl<'a> FoldingContext<'a> {
         self.resolve_return_candidate_in_context(expr, self.return_context_for_expr(expr))
     }
 
+    pub(crate) fn certified_raw_carrier_definition(&self, name: &str) -> Option<CExpr> {
+        let mut candidates = vec![name.to_string()];
+        if let Some((base, version)) = name.rsplit_once('_')
+            && !base.is_empty()
+            && version.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            candidates.push(format!("{}_{}", base.to_ascii_uppercase(), version));
+        }
+        candidates.into_iter().find_map(|candidate| {
+            let context = self.return_context_for_name(&candidate);
+            self.semanticized_raw_definition_candidate_in_context(&candidate, context)
+                .or_else(|| self.lookup_definition(&candidate))
+                .or_else(|| self.best_visible_definition_in_context(&candidate, context))
+                .map(|expr| self.resolve_return_candidate_in_context(&expr, context))
+        })
+    }
+
     fn resolve_return_candidate_in_context(
         &self,
         expr: &CExpr,
@@ -507,6 +524,172 @@ impl<'a> FoldingContext<'a> {
         }
 
         best
+    }
+
+    pub(crate) fn merged_return_register_candidate_for_block_predecessor_with_proof(
+        &self,
+        block_addr: u64,
+        pred_addr: u64,
+    ) -> Option<(CExpr, u64, usize, r2ssa::ValueId)> {
+        let func = self
+            .inputs
+            .prepared_ssa
+            .map(|prepared| prepared.function())?;
+        let prepared = self.inputs.prepared_ssa?;
+        let block = func.get_block(block_addr)?;
+        let mut best = None;
+
+        for phi in &block.phis {
+            if !self
+                .inputs
+                .arch
+                .is_return_register_name(&phi.dst.name.to_ascii_lowercase())
+            {
+                continue;
+            }
+
+            for (source_pred, source) in &phi.sources {
+                if *source_pred != pred_addr {
+                    continue;
+                }
+                let candidate =
+                    self.return_register_candidate_for_phi_source_in_predecessor(pred_addr, source);
+                let Some(expr) = candidate else {
+                    continue;
+                };
+                let Some(value) = self.prepared_value_id_for_var(source) else {
+                    continue;
+                };
+                let Some(cert) = prepared
+                    .certificates()
+                    .returns
+                    .iter()
+                    .find(|cert| cert.block_addr == pred_addr && cert.value == value)
+                else {
+                    continue;
+                };
+                let candidate = Some((expr, cert.block_addr, cert.op_index, cert.value));
+                best = match (best, candidate) {
+                    (None, next) => next,
+                    (Some(current), None) => Some(current),
+                    (
+                        Some((current_expr, current_block, current_op, current_value)),
+                        Some((next_expr, next_block, next_op, next_value)),
+                    ) => {
+                        let preferred = self.preferred_return_candidate(
+                            Some(current_expr.clone()),
+                            Some(next_expr.clone()),
+                        );
+                        if preferred.as_ref() == Some(&next_expr) {
+                            Some((next_expr, next_block, next_op, next_value))
+                        } else {
+                            Some((current_expr, current_block, current_op, current_value))
+                        }
+                    }
+                };
+            }
+        }
+
+        best
+    }
+
+    pub(crate) fn predecessor_return_register_candidate_with_proof(
+        &self,
+        pred_addr: u64,
+    ) -> Option<(CExpr, u64, usize, r2ssa::ValueId)> {
+        let prepared = self.inputs.prepared_ssa?;
+        let cert = prepared
+            .certificates()
+            .returns
+            .iter()
+            .filter(|cert| cert.block_addr == pred_addr)
+            .max_by_key(|cert| cert.op_index)?;
+        let source = prepared.value_var(cert.value)?;
+        let expr = self
+            .return_register_candidate_from_predecessor_definition(pred_addr, source)
+            .or_else(|| self.return_register_candidate_for_phi_source(source))?;
+        Some((expr, cert.block_addr, cert.op_index, cert.value))
+    }
+
+    fn return_register_candidate_for_phi_source_in_predecessor(
+        &self,
+        pred_addr: u64,
+        source: &SSAVar,
+    ) -> Option<CExpr> {
+        self.return_register_candidate_for_phi_source(source)
+            .or_else(|| {
+                self.return_register_candidate_from_predecessor_definition(pred_addr, source)
+            })
+    }
+
+    fn return_register_candidate_from_predecessor_definition(
+        &self,
+        pred_addr: u64,
+        source: &SSAVar,
+    ) -> Option<CExpr> {
+        let func = self.inputs.prepared_ssa?.function();
+        let block = func.get_block(pred_addr)?;
+        let (_, op) = block
+            .ops
+            .iter()
+            .enumerate()
+            .find(|(_, op)| op.dst().is_some_and(|dst| dst == source))?;
+        let candidate = match op {
+            SSAOp::Copy { src, .. } => self.get_return_expr(src),
+            SSAOp::IntZExt { dst, src }
+            | SSAOp::IntSExt { dst, src }
+            | SSAOp::Trunc { dst, src }
+            | SSAOp::Cast { dst, src } => {
+                self.tracked_return_cast_expr(dst, src, self.tracked_return_source_expr(src))
+            }
+            _ => {
+                let mut visited = HashSet::new();
+                let raw = self.op_to_expr(op);
+                let expanded = self.expand_return_expr(&raw, 0, &mut visited);
+                let mut semantic_visited = HashSet::new();
+                let semanticized =
+                    self.semanticize_visible_expr(&expanded, 0, &mut semantic_visited);
+                if self.is_predicate_like_expr(&semanticized) {
+                    self.simplify_condition_expr(semanticized)
+                } else {
+                    semanticized
+                }
+            }
+        };
+        let normalized = self.normalize_final_return_candidate(candidate.clone());
+        let sanitized = self.sanitize_final_return_expr(normalized, candidate);
+        (!self
+            .expr_is_bad_return_candidate_in_context(&sanitized, VisibleExprContext::ScalarReturn))
+        .then_some(sanitized)
+    }
+
+    fn return_register_candidate_for_phi_source(&self, source: &SSAVar) -> Option<CExpr> {
+        let source_name = source.display_name();
+        let mut visited = HashSet::new();
+        let candidate = self
+            .render_semantic_value_by_name(&source_name, 0, &mut visited)
+            .or_else(|| {
+                self.lookup_definition_raw_with_depth(&source_name, 0, &mut visited)
+                    .map(|expr| self.semanticize_visible_expr(&expr, 0, &mut visited))
+            })
+            .or_else(|| {
+                self.render_value_ref(&analysis::ValueRef::from(source.clone()), 0, &mut visited)
+            })
+            .or_else(|| self.lookup_definition_with_depth(&source_name, 0, &mut visited))
+            .or_else(|| self.best_visible_definition_with_depth(&source_name, 0, &mut visited))
+            .or_else(|| Some(self.tracked_return_source_expr(source)));
+
+        candidate
+            .map(|expr| self.resolve_return_candidate(&expr))
+            .filter(|expr| !self.expr_is_transient_return_artifact(expr))
+            .map(|expr| {
+                let normalized = self.normalize_final_return_candidate(expr.clone());
+                self.sanitize_final_return_expr(normalized, expr)
+            })
+            .filter(|expr| {
+                !self
+                    .expr_is_bad_return_candidate_in_context(expr, VisibleExprContext::ScalarReturn)
+            })
     }
 
     pub(super) fn expr_is_transient_return_artifact(&self, expr: &CExpr) -> bool {
@@ -1076,8 +1259,28 @@ impl<'a> FoldingContext<'a> {
             Some(self.resolve_return_candidate_in_context(&expr, context)),
             context,
         )
-        .map(|expr| self.rewrite_typed_return_literal_expr(expr, context))
+        .map(|expr| {
+            let expr = self.rewrite_typed_return_literal_expr(expr, context);
+            self.strip_widening_cast_for_function_return(expr)
+        })
         .unwrap_or_else(|| CExpr::Var("return".to_string()))
+    }
+
+    fn strip_widening_cast_for_function_return(&self, expr: CExpr) -> CExpr {
+        let CExpr::Cast { ty, expr: inner } = expr else {
+            return expr;
+        };
+        let Some(return_bits) = self.function_return_int_bits() else {
+            return CExpr::Cast { ty, expr: inner };
+        };
+        let Some(cast_bits) = ty.bits() else {
+            return CExpr::Cast { ty, expr: inner };
+        };
+        if ty.is_integer() && cast_bits > return_bits {
+            *inner
+        } else {
+            CExpr::Cast { ty, expr: inner }
+        }
     }
 
     /// Convert an SSA variable to a C variable name.

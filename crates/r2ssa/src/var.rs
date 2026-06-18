@@ -37,12 +37,15 @@ impl SSAVar {
     }
 
     /// Create the next version of this variable.
-    pub fn next_version(&self) -> Self {
-        Self {
+    ///
+    /// Returns `None` when the version counter is exhausted instead of
+    /// silently wrapping and aliasing a different SSA definition.
+    pub fn next_version(&self) -> Option<Self> {
+        Some(Self {
             name: self.name.clone(),
-            version: self.version + 1,
+            version: self.version.checked_add(1)?,
             size: self.size,
-        }
+        })
     }
 
     /// Get a display name like "RAX_0" or "RAX_1".
@@ -101,15 +104,36 @@ mod tests {
     }
 
     #[test]
+    fn test_display_name_preserves_special_prefixes() {
+        let cases = [
+            ("reg:10", "reg:10_3"),
+            ("tmp:0x1000", "tmp:0x1000_3"),
+            ("const:0x42", "const:0x42_3"),
+            ("ram:0x401000", "ram:0x401000_3"),
+            ("space1:0x20", "space1:0x20_3"),
+        ];
+
+        for (name, expected) in cases {
+            assert_eq!(SSAVar::new(name, 3, 8).display_name(), expected);
+        }
+    }
+
+    #[test]
     fn test_next_version() {
         let v0 = SSAVar::initial("RSP", 8);
-        let v1 = v0.next_version();
-        let v2 = v1.next_version();
+        let v1 = v0.next_version().expect("version 0 has a successor");
+        let v2 = v1.next_version().expect("version 1 has a successor");
 
         assert_eq!(v0.version, 0);
         assert_eq!(v1.version, 1);
         assert_eq!(v2.version, 2);
         assert_eq!(v0.name, v1.name);
+    }
+
+    #[test]
+    fn test_next_version_refuses_wraparound() {
+        let max = SSAVar::new("RSP", u32::MAX, 8);
+        assert_eq!(max.next_version(), None);
     }
 
     #[test]
@@ -127,5 +151,27 @@ mod tests {
 
         assert!(cst.is_const());
         assert!(!cst.is_register());
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn next_version_is_checked_and_monotonic() {
+        let version: u32 = kani::any();
+        let size: u32 = kani::any();
+        let var = SSAVar::new("rax", version, size);
+        let next = var.next_version();
+
+        if version == u32::MAX {
+            assert!(next.is_none());
+        } else {
+            let next = next.expect("non-maximum version has a successor");
+            assert_eq!(next.size, var.size);
+            assert_eq!(next.version, version + 1);
+            assert!(next.version > var.version);
+        }
     }
 }

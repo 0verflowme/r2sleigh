@@ -34,28 +34,7 @@ pub(crate) fn type_like_to_ctype(ty: &CTypeLike) -> CType {
 }
 
 fn parse_const_value(name: &str) -> Option<u64> {
-    let value = name.strip_prefix("const:")?;
-    let value = value.split('_').next().unwrap_or(value);
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Some(dec) = value
-        .strip_prefix("0d")
-        .or_else(|| value.strip_prefix("0D"))
-    {
-        return dec.parse::<u64>().ok();
-    }
-    if value.chars().all(|ch| ch.is_ascii_hexdigit())
-        && value
-            .chars()
-            .any(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_digit())
-    {
-        return u64::from_str_radix(value, 16).ok();
-    }
-    value.parse::<u64>().ok()
+    utils::parse_const_value(name)
 }
 
 /// Variable information.
@@ -222,8 +201,7 @@ impl VariableRecovery {
             .any(|binding| binding.name.eq_ignore_ascii_case(name))
             || self
                 .type_facts
-                .merged_signature
-                .as_ref()
+                .render_authorized_signature()
                 .map(|sig| {
                     sig.params
                         .iter()
@@ -284,9 +262,23 @@ impl VariableRecovery {
     }
 
     fn visible_stack_type_for_offset(&self, offset: i64) -> Option<CType> {
-        self.visible_stack_binding_for_offset(offset)
+        if let Some(ty) = self
+            .visible_stack_binding_for_offset(offset)
             .and_then(|binding| binding.ty.as_ref())
             .map(type_like_to_ctype)
+        {
+            return Some(ty);
+        }
+
+        self.type_facts
+            .stack_slots
+            .iter()
+            .find_map(|(slot_key, slot_spec)| {
+                (Self::stack_slot_matches_offset(slot_key, offset)
+                    && Self::is_visible_external_stack_name_role(slot_spec.role))
+                .then(|| slot_spec.ty.as_ref().map(type_like_to_ctype))
+                .flatten()
+            })
     }
 
     /// Recover variables from an SSA function.
@@ -607,7 +599,7 @@ impl VariableRecovery {
             }
         }
 
-        let Some(signature) = self.type_facts.merged_signature.as_ref() else {
+        let Some(signature) = self.type_facts.render_authorized_signature() else {
             return;
         };
         let Some(ext) = signature.params.get(index) else {
@@ -854,6 +846,18 @@ mod tests {
         }
     }
 
+    fn type_facts_with_external_signature(signature: FunctionSignatureSpec) -> FunctionTypeFacts {
+        let signature_certificate = r2types::SignatureCertificate::from_signature(
+            &signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        );
+        FunctionTypeFacts {
+            merged_signature: Some(signature),
+            signature_certificate,
+            ..FunctionTypeFacts::default()
+        }
+    }
+
     fn visible_stack_binding(name: &str, ty: Option<CType>, offset: i64) -> VisibleBinding {
         VisibleBinding {
             name: name.to_string(),
@@ -989,17 +993,15 @@ mod tests {
     #[test]
     fn test_external_stack_var_name_matching_param_alias_falls_back_to_generic_local() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(vec![
-                ("a", Some(CType::Int(32))),
-                ("b", Some(CType::Int(32))),
-            ])),
-            external_stack_vars: HashMap::from([(
-                -8,
-                stack_var_spec_from_ctype("a", Some(CType::Int(32)), Some("RBP")),
-            )]),
-            ..FunctionTypeFacts::default()
-        });
+        let mut type_facts = type_facts_with_external_signature(signature_spec(vec![
+            ("a", Some(CType::Int(32))),
+            ("b", Some(CType::Int(32))),
+        ]));
+        type_facts.external_stack_vars = HashMap::from([(
+            -8,
+            stack_var_spec_from_ctype("a", Some(CType::Int(32)), Some("RBP")),
+        )]);
+        vr.set_type_facts(type_facts);
 
         let name = vr.gen_stack_var_name(8);
         assert_eq!(name, "local_8");
@@ -1008,19 +1010,17 @@ mod tests {
     #[test]
     fn test_external_signature_overrides_meaningful_param_name_and_type() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_type_facts(FunctionTypeFacts {
-            visible_bindings: vec![visible_param_binding(
-                "user_input",
-                Some(CType::ptr(CType::Int(8))),
-                0,
-                "rdi",
-            )],
-            merged_signature: Some(signature_spec(vec![(
-                "user_input",
-                Some(CType::ptr(CType::Int(8))),
-            )])),
-            ..FunctionTypeFacts::default()
-        });
+        let mut type_facts = type_facts_with_external_signature(signature_spec(vec![(
+            "user_input",
+            Some(CType::ptr(CType::Int(8))),
+        )]));
+        type_facts.visible_bindings = vec![visible_param_binding(
+            "user_input",
+            Some(CType::ptr(CType::Int(8))),
+            0,
+            "rdi",
+        )];
+        vr.set_type_facts(type_facts);
 
         let mut name = "arg1".to_string();
         let mut ty = CType::Int(64);
@@ -1071,12 +1071,57 @@ mod tests {
     }
 
     #[test]
-    fn test_external_signature_generic_param_name_is_ignored() {
+    fn canonical_stack_slot_type_drives_stack_local_recovery() {
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&[block]).expect("ssa function");
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::IntAdd {
+                dst: SSAVar::new("tmp:addr", 1, 8),
+                a: SSAVar::new("RBP", 1, 8),
+                b: SSAVar::new("const:ffffffffffffffff", 0, 8),
+            },
+            SSAOp::Load {
+                dst: SSAVar::new("tmp:byte", 1, 1),
+                space: "ram".to_string(),
+                addr: SSAVar::new("tmp:addr", 1, 8),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("tmp:byte", 1, 1),
+            },
+        ];
+
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
         vr.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(vec![("arg0", Some(CType::Int(32)))])),
+            stack_slots: std::collections::BTreeMap::from([(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: -1,
+                },
+                stack_var_spec_from_ctype("c", Some(CType::UInt(8)), Some("RBP")),
+            )]),
             ..FunctionTypeFacts::default()
         });
+
+        vr.recover(&func);
+
+        let local = vr
+            .locals()
+            .into_iter()
+            .find(|info| info.name == "c")
+            .expect("canonical typed stack local");
+        assert_eq!(local.ty, CType::UInt(8));
+    }
+
+    #[test]
+    fn test_external_signature_generic_param_name_is_ignored() {
+        let mut vr = VariableRecovery::new("rsp", "rbp", 64);
+        vr.set_type_facts(type_facts_with_external_signature(signature_spec(vec![(
+            "arg0",
+            Some(CType::Int(32)),
+        )])));
 
         let mut name = "arg1".to_string();
         let mut ty = CType::Int(64);
@@ -1089,10 +1134,9 @@ mod tests {
     #[test]
     fn test_external_signature_type_override_only_when_available() {
         let mut vr = VariableRecovery::new("rsp", "rbp", 64);
-        vr.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(vec![("count", None)])),
-            ..FunctionTypeFacts::default()
-        });
+        vr.set_type_facts(type_facts_with_external_signature(signature_spec(vec![(
+            "count", None,
+        )])));
 
         let mut name = "arg1".to_string();
         let mut ty = CType::Int(64);

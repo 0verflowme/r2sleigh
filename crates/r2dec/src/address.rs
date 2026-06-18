@@ -3,7 +3,7 @@
 /// Parse an address from a var name such as:
 /// - `const:0x403000`
 /// - `const:403000`
-/// - `const:42`
+/// - `const:42` (SSA payloads are hex by default)
 /// - `ram:403000`
 /// - `ram:403000_0`
 pub(crate) fn parse_address_from_var_name(name: &str) -> Option<u64> {
@@ -27,13 +27,7 @@ pub(crate) fn parse_address_from_var_name(name: &str) -> Option<u64> {
     }
 
     if value.chars().all(|c| c.is_ascii_hexdigit()) {
-        if value.chars().any(|c| c.is_ascii_alphabetic()) {
-            return u64::from_str_radix(value, 16).ok();
-        }
-        if value.len() > 4 {
-            return u64::from_str_radix(value, 16).ok();
-        }
-        return value.parse().ok();
+        return u64::from_str_radix(value, 16).ok();
     }
 
     value.parse().ok()
@@ -50,7 +44,7 @@ mod tests {
             Some(0x403000)
         );
         assert_eq!(parse_address_from_var_name("const:403000"), Some(0x403000));
-        assert_eq!(parse_address_from_var_name("const:42"), Some(42));
+        assert_eq!(parse_address_from_var_name("const:42"), Some(0x42));
         assert_eq!(parse_address_from_var_name("const:0x42_0"), Some(0x42));
     }
 

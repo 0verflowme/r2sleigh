@@ -347,10 +347,16 @@ fn parse_const_value(name: &str) -> Option<u64> {
     {
         return u64::from_str_radix(hex, 16).ok();
     }
-    if let Ok(v) = val_str.parse::<u64>() {
-        return Some(v);
+    if let Some(dec) = val_str
+        .strip_prefix("0d")
+        .or_else(|| val_str.strip_prefix("0D"))
+    {
+        return dec.parse::<u64>().ok();
     }
-    u64::from_str_radix(val_str, 16).ok()
+    if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        return u64::from_str_radix(val_str, 16).ok();
+    }
+    val_str.parse::<u64>().ok()
 }
 
 fn ssa_var_is_const(var: &SSAVar) -> bool {

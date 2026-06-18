@@ -606,6 +606,7 @@ static size_t sleigh_profile_cap = 0;
 #define SLEIGH_LIFT_BLOCK_MAX_ALLOC (1024 * 1024)
 #define SLEIGH_LIFT_PREFIX_HEAL_MAX_TRIMS 64
 #define SLEIGH_TAINT_MAX_BLOCKS 200
+#define SLEIGH_TAINT_GLOBAL_MAX_FCNS 128
 #define SLEIGH_SIG_WRITEBACK_MAX_BLOCKS 200
 #define SLEIGH_SIG_WRITEBACK_GLOBAL_MAX_FCNS 128
 #define SLEIGH_SIG_MIN_CONFIDENCE 70
@@ -640,6 +641,45 @@ typedef struct {
 #define SLEIGH_POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC (30ULL * 1000000ULL)
 
 typedef struct {
+	ut64 start_us;
+	ut64 budget_us;
+	bool exhausted;
+} SleighPostAnalysisBudget;
+
+static SleighPostAnalysisBudget sleigh_post_analysis_budget_new(ut64 budget_us) {
+	SleighPostAnalysisBudget budget = {
+		.start_us = r_time_now_mono (),
+		.budget_us = budget_us,
+		.exhausted = false,
+	};
+	return budget;
+}
+
+static ut64 sleigh_post_analysis_budget_elapsed(const SleighPostAnalysisBudget *budget) {
+	if (!budget || !budget->start_us) {
+		return 0;
+	}
+	return r_time_now_mono () - budget->start_us;
+}
+
+static bool sleigh_post_analysis_budget_allows(SleighPostAnalysisBudget *budget, const char *stage) {
+	if (!budget || !budget->budget_us) {
+		return true;
+	}
+	ut64 elapsed = sleigh_post_analysis_budget_elapsed (budget);
+	if (elapsed <= budget->budget_us) {
+		return true;
+	}
+	if (!budget->exhausted) {
+		R_LOG_WARN ("r2sleigh: post-analysis budget exhausted during %s after %llu usec; refusing remaining automatic enrichment",
+			stage && *stage ? stage : "unknown",
+			(unsigned long long)elapsed);
+	}
+	budget->exhausted = true;
+	return false;
+}
+
+typedef struct {
 	R2ILFunctionBlocks *functions;
 	BlockArray *owned_blocks;
 	char **owned_names;
@@ -657,6 +697,7 @@ typedef struct {
 static const char *function_context_stack_base_name(RAnalFcnSlotBase base, const char *base_name);
 static unsigned int function_context_stack_slot_role_id(RAnalFcnSlotRole role);
 static unsigned int function_context_base_type_kind_id(RAnalBaseTypeKind kind);
+static bool sleigh_import_dwarf_base_types_if_needed(RAnal *anal);
 
 typedef struct {
 	R2SleighFunctionContext context;
@@ -690,6 +731,68 @@ static void sleigh_typed_function_context_clear(SleighTypedFunctionContext *type
 	memset (typed, 0, sizeof (*typed));
 }
 
+static bool sleigh_import_dwarf_base_types_if_needed(RAnal *anal) {
+	static RCore *last_core = NULL;
+	static RBinFile *last_binfile = NULL;
+	static bool last_attempted = false;
+
+	RCore *core;
+	RBinFile *bf;
+	RVecDwarfAbbrevDecl *da;
+	RBinDwarfDebugInfo *info;
+	HtUP *loc_table = NULL;
+	ut64 before_epoch;
+	ut64 after_epoch;
+	bool changed = false;
+
+	if (!anal) {
+		return false;
+	}
+	core = anal->coreb.core;
+	if (!core || !core->bin) {
+		return false;
+	}
+	bf = r_bin_cur (core->bin);
+	if (!bf) {
+		return false;
+	}
+	if (last_attempted && last_core == core && last_binfile == bf) {
+		return false;
+	}
+	last_core = core;
+	last_binfile = bf;
+	last_attempted = true;
+
+	da = r_bin_dwarf_parse_abbrev (bf, R_MODE_SET);
+	if (!da) {
+		R_LOG_DEBUG ("r2sleigh: DWARF base type import skipped; no abbreviations");
+		return false;
+	}
+	r_bin_dwarf_parse_comp_dirs (bf, da);
+	info = r_bin_dwarf_parse_info (bf, da, R_MODE_SET);
+	if (info) {
+		RAnalDwarfContext ctx = {0};
+		const int addr_size = anal->config && anal->config->bits > 0
+			? R_MAX (1, anal->config->bits / 8)
+			: 8;
+		before_epoch = r_anal_types_dirty_epoch (anal);
+		loc_table = r_bin_dwarf_parse_loc (bf, addr_size);
+		ctx.info = info;
+		ctx.loc = loc_table;
+		r_anal_dwarf_process_info (anal, &ctx);
+		after_epoch = r_anal_types_dirty_epoch (anal);
+		changed = after_epoch != before_epoch;
+		R_LOG_DEBUG ("r2sleigh: DWARF base type import %s type DB epoch %" PFMT64u " -> %" PFMT64u,
+			changed ? "updated" : "left unchanged", before_epoch, after_epoch);
+		r_bin_dwarf_free_loc (loc_table);
+		r_bin_dwarf_free_debug_info (info);
+	} else {
+		R_LOG_DEBUG ("r2sleigh: DWARF base type import skipped; no debug info");
+	}
+	r_bin_dwarf_free_debug_abbrev (da);
+	return changed;
+}
+
 static bool sleigh_typed_function_context_build(
 	RAnal *anal,
 	RAnalFunction *fcn,
@@ -709,6 +812,7 @@ static bool sleigh_typed_function_context_build(
 	typed->context.schema_version = 1;
 	typed->context.dirty_epoch = r_anal_function_dirty_epoch (fcn);
 	typed->context.context_hash = r_anal_function_context_hash (anal, fcn);
+	sleigh_import_dwarf_base_types_if_needed (anal);
 	typed->context.type_dirty_epoch = r_anal_types_dirty_epoch (anal);
 	typed->context.external_context_json = "{}";
 	if (sleigh_function_context_api.available && sleigh_function_context_api.collect && sleigh_function_context_api.free) {
@@ -805,6 +909,8 @@ static bool sleigh_typed_function_context_build(
 		}
 		if (typed->typed_base_type_entries) {
 			size_t idx = 0;
+			size_t struct_count = 0;
+			size_t struct_member_count = 0;
 			RAnalBaseType *base_type;
 			r_list_foreach (typed->typed_base_types, iter, base_type) {
 				if (!base_type || idx >= typed_base_type_count) {
@@ -817,11 +923,13 @@ static bool sleigh_typed_function_context_build(
 				entry->size_bits = base_type->size;
 				entry->has_size_bits = base_type->size? 1: 0;
 				if (base_type->kind == R_ANAL_BASE_TYPE_KIND_STRUCT) {
+					struct_count++;
 					size_t member_count = 0;
 					RAnalStructMember *member;
 					R_VEC_FOREACH (&base_type->struct_data.members, member) {
 						member_count++;
 					}
+					struct_member_count += member_count;
 					if (member_count) {
 						R2SleighContextBaseMember *members = R_NEWS0 (R2SleighContextBaseMember, member_count);
 						if (members) {
@@ -893,6 +1001,8 @@ static bool sleigh_typed_function_context_build(
 			}
 			typed->context.base_types = typed->typed_base_type_entries;
 			typed->context.num_base_types = idx;
+			R_LOG_DEBUG ("r2sleigh: typed context captured %zu base types (%zu structs, %zu struct members)",
+				idx, struct_count, struct_member_count);
 		}
 	}
 	if (!typed->typed_ctx && (!typed->typed_base_type_entries || !typed->context.num_base_types)) {
@@ -11517,12 +11627,12 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	bool sigwrite_enabled = post_mode == SLEIGH_MODE_BALANCED || post_mode == SLEIGH_MODE_FULL;
 	bool type_writeback_enabled = sigwrite_enabled && type_wb_mode != SLEIGH_TYPE_WRITEBACK_OFF;
 	bool sigverify_enabled = false;
-	ut64 post_start_us = r_time_now_mono ();
 	ut64 post_budget_us = post_mode == SLEIGH_MODE_FULL
 		? SLEIGH_POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC
 		: (post_mode == SLEIGH_MODE_BALANCED
 			? SLEIGH_POST_ANALYSIS_BALANCED_BUDGET_USEC
 			: SLEIGH_POST_ANALYSIS_FAST_BUDGET_USEC);
+	SleighPostAnalysisBudget post_budget = sleigh_post_analysis_budget_new (post_budget_us);
 	bool post_budget_exhausted = false;
 	ut64 *type_eligible_addrs = NULL;
 	size_t type_eligible_count = 0;
@@ -11550,13 +11660,18 @@ static bool sleigh_post_analysis(RAnal *anal) {
 
 	int num_fcns = r_list_length (anal->fcns);
 	bool xref_enabled = post_mode == SLEIGH_MODE_BALANCED || post_mode == SLEIGH_MODE_FULL;
-	bool sigwrite_focus_only = sigwrite_enabled && num_fcns > SLEIGH_SIG_WRITEBACK_GLOBAL_MAX_FCNS;
-	bool type_writeback_focus_only = type_writeback_enabled && num_fcns > SLEIGH_TYPE_WRITEBACK_GLOBAL_MAX_FCNS;
+	bool balanced_focus_only = post_mode == SLEIGH_MODE_BALANCED;
+	bool taint_focus_only = taint_enabled && num_fcns > SLEIGH_TAINT_GLOBAL_MAX_FCNS;
+	bool sigwrite_focus_only = sigwrite_enabled
+		&& (balanced_focus_only || num_fcns > SLEIGH_SIG_WRITEBACK_GLOBAL_MAX_FCNS);
+	bool type_writeback_focus_only = type_writeback_enabled
+		&& (balanced_focus_only || num_fcns > SLEIGH_TYPE_WRITEBACK_GLOBAL_MAX_FCNS);
 	if (num_fcns == 0) {
 		struct_decl_memo_clear ();
 		return true;
 	}
 	sleigh_profile_clear ();
+	sleigh_import_dwarf_base_types_if_needed (anal);
 	post_base_type_snapshot = r_anal_types_snapshot (anal);
 	caller_propagation_state_init (&prop_state);
 	if (post_mode == SLEIGH_MODE_FAST) {
@@ -11570,20 +11685,24 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	RListIter *iter;
 	RAnalFunction *fcn;
 	r_list_foreach (anal->fcns, iter, fcn) {
-		if (post_budget_us && r_time_now_mono () - post_start_us > post_budget_us) {
+		if (!sleigh_post_analysis_budget_allows (&post_budget, "function sweep")) {
 			post_budget_exhausted = true;
-			R_LOG_WARN ("r2sleigh: post-analysis budget exhausted after %llu usec; refusing remaining automatic enrichment",
-				(unsigned long long)(r_time_now_mono () - post_start_us));
 			break;
 		}
 		int bb_count = (fcn && fcn->bbs) ? r_list_length (fcn->bbs) : 0;
+		bool auto_cost_exceeded = function_exceeds_auto_callback_budget (fcn);
+		bool taint_scope_eligible = !taint_focus_only
+			|| (focus_callee_addr && fcn && fcn->addr == focus_callee_addr);
 		bool sig_scope_eligible = !sigwrite_focus_only || (focus_callee_addr && fcn && fcn->addr == focus_callee_addr);
 		bool type_scope_eligible = !type_writeback_focus_only || (focus_callee_addr && fcn && fcn->addr == focus_callee_addr);
-		bool taint_eligible = taint_enabled && bb_count <= SLEIGH_TAINT_MAX_BLOCKS;
+		bool taint_eligible = taint_enabled && taint_scope_eligible
+			&& bb_count <= SLEIGH_TAINT_MAX_BLOCKS && !auto_cost_exceeded;
 		bool sig_eligible = sigwrite_enabled && sig_arch_supported && core
-			&& bb_count <= SLEIGH_SIG_WRITEBACK_MAX_BLOCKS && sig_scope_eligible;
+			&& bb_count <= SLEIGH_SIG_WRITEBACK_MAX_BLOCKS && sig_scope_eligible
+			&& !auto_cost_exceeded;
 		bool type_eligible = type_writeback_enabled && type_arch_supported && core
-			&& bb_count <= type_max_blocks && type_scope_eligible;
+			&& bb_count <= type_max_blocks && type_scope_eligible
+			&& !auto_cost_exceeded;
 		bool semantic_for_fcn = false;
 		bool need_blocks = taint_eligible || sig_eligible || type_eligible;
 		const char *fcn_name = (fcn && fcn->name) ? fcn->name : "unknown";
@@ -11603,7 +11722,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		if (type_writeback_enabled) {
 			if (!type_arch_supported || !core) {
 				type_wb.type_fcns_skipped_arch++;
-			} else if (bb_count > type_max_blocks) {
+			} else if (bb_count > type_max_blocks || auto_cost_exceeded) {
 				type_wb.type_fcns_skipped_size++;
 			}
 		}
@@ -11611,11 +11730,20 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		if (!fcn || !need_blocks) {
 			continue;
 		}
+		if (!sleigh_post_analysis_budget_allows (&post_budget, "function lift")) {
+			post_budget_exhausted = true;
+			break;
+		}
 		profile_start_us = r_time_now_mono ();
 		if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 			continue;
 		}
 		sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
+		if (!sleigh_post_analysis_budget_allows (&post_budget, "function enrichment")) {
+			post_budget_exhausted = true;
+			block_array_free (&blocks);
+			break;
+		}
 
 		if (semantic_for_fcn) {
 			semantic_comments_total += write_semantic_comments_for_function (
@@ -11624,11 +11752,21 @@ static bool sleigh_post_analysis(RAnal *anal) {
 
 		/* Remove previous auto-generated taint artifacts only when taint sweep is active. */
 		if (taint_enabled) {
+			if (!sleigh_post_analysis_budget_allows (&post_budget, "taint cleanup")) {
+				post_budget_exhausted = true;
+				block_array_free (&blocks);
+				break;
+			}
 			profile_start_us = r_time_now_mono ();
 			clear_taint_function_artifacts (anal, core, fcn, &blocks);
 			}
 
 			if (taint_eligible) {
+				if (!sleigh_post_analysis_budget_allows (&post_budget, "taint summary")) {
+					post_budget_exhausted = true;
+					block_array_free (&blocks);
+					break;
+				}
 				R2TaintFunctionSummary *taint_summary = r2taint_function_summary_typed (ctx,
 					(const R2ILBlock **)blocks.blocks, blocks.count);
 				if (taint_summary) {
@@ -11880,7 +12018,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			if (sigwrite_enabled) {
 				sig_fcns_skipped_arch++;
 			}
-		} else if (bb_count > SLEIGH_SIG_WRITEBACK_MAX_BLOCKS && !type_eligible) {
+		} else if ((bb_count > SLEIGH_SIG_WRITEBACK_MAX_BLOCKS || auto_cost_exceeded) && !type_eligible) {
 			sig_fcns_skipped_size++;
 		} else {
 				R2SleighSessionResult *session = NULL;
@@ -11919,6 +12057,11 @@ static bool sleigh_post_analysis(RAnal *anal) {
 				/* Automatic post-analysis must stay bounded across all functions.
 				 * Focused reports/decompile still build typed helper scopes. */
 				have_type_scope = false;
+				if (!sleigh_post_analysis_budget_allows (&post_budget, "typed context")) {
+					post_budget_exhausted = true;
+					block_array_free (&blocks);
+					break;
+				}
 				profile_start_us = r_time_now_mono ();
 				if (!sleigh_typed_function_context_build (anal, fcn, &typed_context, "{}", post_base_type_snapshot)) {
 					if (have_type_scope) {
@@ -11969,6 +12112,16 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					}
 				}
 
+				if (!sleigh_post_analysis_budget_allows (&post_budget, "type session")) {
+					post_budget_exhausted = true;
+					sleigh_typed_function_context_clear (&typed_context);
+					if (have_type_scope) {
+						sym_function_scope_free (&type_scope);
+						sleigh_interproc_seeds_free (&interproc_seeds);
+					}
+					block_array_free (&blocks);
+					break;
+				}
 				profile_start_us = r_time_now_mono ();
 				session = sleigh_analyze_type_session (anal, ctx, fcn, &blocks, &typed_context,
 					1, type_max_iters, true,
@@ -11980,6 +12133,17 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					(size_t)type_max_decls,
 					(size_t)type_max_mutations);
 				sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_SESSION, r_time_now_mono () - profile_start_us);
+				if (!sleigh_post_analysis_budget_allows (&post_budget, "writeback mutation")) {
+					post_budget_exhausted = true;
+					r2sleigh_session_result_free (session);
+					sleigh_typed_function_context_clear (&typed_context);
+					if (have_type_scope) {
+						sym_function_scope_free (&type_scope);
+						sleigh_interproc_seeds_free (&interproc_seeds);
+					}
+					block_array_free (&blocks);
+					break;
+				}
 			payload_hash = r2sleigh_session_result_type_writeback_hash (session);
 			if (!session || !payload_hash) {
 				if (sig_metrics_eligible) {
@@ -12139,10 +12303,8 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		}
 
 		while (xref_queue_count > 0) {
-			if (post_budget_us && r_time_now_mono () - post_start_us > post_budget_us) {
+			if (!sleigh_post_analysis_budget_allows (&post_budget, "xref sweep")) {
 				post_budget_exhausted = true;
-				R_LOG_WARN ("r2sleigh: post-analysis xref budget exhausted after %llu usec; refusing remaining automatic xrefs",
-					(unsigned long long)(r_time_now_mono () - post_start_us));
 				break;
 			}
 			ut64 faddr = xref_queue[--xref_queue_count];
@@ -12158,11 +12320,23 @@ static bool sleigh_post_analysis(RAnal *anal) {
 			if (!xref_fcn_cur) {
 				continue;
 			}
+			if (function_exceeds_auto_callback_budget (xref_fcn_cur)) {
+				continue;
+			}
+			if (!sleigh_post_analysis_budget_allows (&post_budget, "xref lift")) {
+				post_budget_exhausted = true;
+				break;
+			}
 			profile_start_us = r_time_now_mono ();
 			if (!lift_function_blocks (anal, xref_fcn_cur, ctx, &xref_blocks, true)) {
 				continue;
 			}
 			sleigh_profile_add (anal, xref_fcn_cur, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
+			if (!sleigh_post_analysis_budget_allows (&post_budget, "xref extraction")) {
+				post_budget_exhausted = true;
+				block_array_free (&xref_blocks);
+				break;
+			}
 			cache_key = compute_xref_cache_key (xref_fcn_cur, &xref_blocks, post_mode);
 			profile_start_us = r_time_now_mono ();
 			typed_refs = r2sleigh_data_refs_typed (ctx,
@@ -12207,11 +12381,9 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					&queue, &queue_count, &queue_cap, &type_wb, false);
 			}
 		}
-		while (queue_count > 0 && iter_idx < type_max_iters) {
-			if (post_budget_us && r_time_now_mono () - post_start_us > post_budget_us) {
+		while (queue_count > 0 && iter_idx < type_max_iters && !post_budget_exhausted) {
+			if (!sleigh_post_analysis_budget_allows (&post_budget, "type fixpoint")) {
 				post_budget_exhausted = true;
-				R_LOG_WARN ("r2sleigh: post-analysis type fixpoint budget exhausted after %llu usec; refusing remaining type propagation",
-					(unsigned long long)(r_time_now_mono () - post_start_us));
 				break;
 			}
 			ut64 *current = queue;
@@ -12248,15 +12420,24 @@ static bool sleigh_post_analysis(RAnal *anal) {
 					continue;
 				}
 				bb_count = (fcn->bbs)? r_list_length (fcn->bbs): 0;
-				if (bb_count > type_max_blocks) {
+				if (bb_count > type_max_blocks || function_exceeds_auto_callback_budget (fcn)) {
 					type_wb.type_fcns_skipped_size++;
 					continue;
+				}
+				if (!sleigh_post_analysis_budget_allows (&post_budget, "type fixpoint lift")) {
+					post_budget_exhausted = true;
+					break;
 				}
 				ut64 profile_start_us = r_time_now_mono ();
 				if (!lift_function_blocks (anal, fcn, ctx, &blocks, true)) {
 					continue;
 				}
 				sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_LIFT, r_time_now_mono () - profile_start_us);
+				if (!sleigh_post_analysis_budget_allows (&post_budget, "type fixpoint context")) {
+					post_budget_exhausted = true;
+					block_array_free (&blocks);
+					break;
+				}
 
 					/* Automatic fixpoint iterations reuse the root-only session path;
 					 * helper scopes are reserved for focused commands. */
@@ -12311,6 +12492,16 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						}
 					}
 
+					if (!sleigh_post_analysis_budget_allows (&post_budget, "type fixpoint session")) {
+						post_budget_exhausted = true;
+						sleigh_typed_function_context_clear (&typed_context);
+						if (have_type_scope) {
+							sym_function_scope_free (&type_scope);
+							sleigh_interproc_seeds_free (&interproc_seeds);
+						}
+						block_array_free (&blocks);
+						break;
+					}
 					profile_start_us = r_time_now_mono ();
 					session = sleigh_analyze_type_session (anal, ctx, fcn, &blocks, &typed_context,
 						(size_t)iter_idx, (size_t)type_max_iters, false,
@@ -12322,6 +12513,17 @@ static bool sleigh_post_analysis(RAnal *anal) {
 						(size_t)type_max_decls,
 						(size_t)type_max_mutations);
 					sleigh_profile_add (anal, fcn, SLEIGH_PROFILE_STAGE_SESSION, r_time_now_mono () - profile_start_us);
+				if (!sleigh_post_analysis_budget_allows (&post_budget, "type fixpoint mutation")) {
+					post_budget_exhausted = true;
+					r2sleigh_session_result_free (session);
+					sleigh_typed_function_context_clear (&typed_context);
+					if (have_type_scope) {
+						sym_function_scope_free (&type_scope);
+						sleigh_interproc_seeds_free (&interproc_seeds);
+					}
+					block_array_free (&blocks);
+					break;
+				}
 				payload_hash = r2sleigh_session_result_type_writeback_hash (session);
 				if (!session || !payload_hash) {
 					type_wb.payload_missing++;
@@ -12424,6 +12626,10 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		type_wb.fixpoint_converged = converged? 1: 0;
 	}
 
+	post_budget_exhausted = post_budget_exhausted || post_budget.exhausted;
+	if (post_budget_exhausted && type_writeback_enabled && !type_wb.fixpoint_stop_reason[0]) {
+		snprintf (type_wb.fixpoint_stop_reason, sizeof (type_wb.fixpoint_stop_reason), "budget");
+	}
 	R_LOG_INFO ("r2sleigh: post-analysis added %d xrefs", xrefs_added);
 	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%d flags=%d xrefs=%d sink_hits=%d parse_failures=%d",
 		taint_enabled? 1: 0, taint_fcns_eligible, taint_fcns_skipped, taint_comments, taint_flags, taint_xrefs,

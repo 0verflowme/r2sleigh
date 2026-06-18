@@ -10,10 +10,12 @@ r2sym = { path = "../r2sym" }
 r2ssa = { path = "../r2ssa" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 
 [features]
 default = []
 
 [dev-dependencies]
 r2il = { path = "../r2il" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

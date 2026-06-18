@@ -62,13 +62,16 @@ pub use interproc::{
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};
 pub use semantic::{
-    BlockAssumption, CallMemoryEffect, CallSiteFact, CallSiteFacts, CallSiteId, CompareKind,
-    CompareProvenance, GlobalObjectKey, LoopId, MemoryDefFact, MemoryLocation, MemoryPhiFact,
+    BlockAssumption, CallMemoryEffect, CallSiteFact, CallSiteFacts, CallSiteId,
+    CallsiteCertificate, CompareKind, CompareProvenance, GlobalObjectKey, IfRegionCertificate,
+    LoopCertificate, LoopId, MemoryAccessCertificate, MemoryDefFact, MemoryLocation, MemoryPhiFact,
     MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel,
     PredicateFact, PredicateFacts, PredicateId, PreparedAssumptionBinding,
-    PreparedAssumptionBindingKind, PreparedFunctionFacts, StructuredAccessId,
-    StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
-    StructuredRecursiveCallFact, SwitchPredicateFact,
+    PreparedAssumptionBindingKind, PreparedFunctionCertificates, PreparedFunctionFacts,
+    PreparedProofFailure, ProofNodeId, ReturnValueCertificate, StackSlotCertificate,
+    StructuredAccessId, StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind,
+    StructuredMemoryAccessFact, StructuredRecursiveCallFact, SwitchCertificate,
+    SwitchPredicateFact,
 };
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
 pub use var::SSAVar;

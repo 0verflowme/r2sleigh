@@ -15,7 +15,7 @@ use r2il::R2ILBlock;
 use r2ssa::{CFGRiskSummary, SSAFunction, SsaArtifact};
 use r2types::{
     DecompileCapabilityView, FunctionFacts, FunctionSignatureProjection, FunctionTypeFactInputs,
-    FunctionTypeFacts, TypeWritebackPlan,
+    FunctionTypeFacts, SignatureCertificateSource, TypeWritebackPlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -121,8 +121,10 @@ impl EngineFunctionIdentity {
     }
 
     pub fn has_program_orchestrator_family(&self) -> bool {
-        self.name_candidates()
-            .any(r2sym::has_program_orchestrator_summary_family)
+        self.name_candidates().any(|name| {
+            r2sym::has_program_orchestrator_summary_family(name)
+                && has_summary_applicability(self.function_addr, name)
+        })
     }
 }
 
@@ -316,6 +318,7 @@ pub struct ArtifactCacheKey {
     pub interproc_budget_hash: u64,
     pub symbolic_scope_hash: u64,
     pub semantic_schema_version: u32,
+    pub semantic_claim_schema_version: u32,
 }
 
 pub type EngineFunctionKey = ArtifactCacheKey;
@@ -367,6 +370,7 @@ impl ArtifactCacheKey {
             interproc_budget_hash,
             symbolic_scope_hash,
             semantic_schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
+            semantic_claim_schema_version: r2sym::SEMANTIC_CLAIM_SCHEMA_VERSION,
         }
     }
 }
@@ -429,7 +433,7 @@ pub fn decompile_render_cache_key(input: DecompileRenderCacheKeyInput<'_>) -> Re
         stable_blocks_hash(input.blocks),
         stable_fnv1a_debug_hash(input.function_facts),
         u64::from(input.ptr_bits),
-        stable_fnv1a_hash("decompile-render-v1"),
+        stable_fnv1a_hash("decompile-render-v2-claim-schema"),
     );
     let artifact = ArtifactCacheKey::from_hashes(analysis, 0, 0);
     let render_payload_hash = stable_fnv1a_hash(&(
@@ -442,6 +446,8 @@ pub fn decompile_render_cache_key(input: DecompileRenderCacheKeyInput<'_>) -> Re
         "decompile-render-config-v1",
         stable_fnv1a_debug_hash(&input.arch),
         input.ptr_bits,
+        r2sym::SEMANTIC_CLAIM_SCHEMA_VERSION,
+        r2sym::PROOF_COVERAGE_SCHEMA_VERSION,
     ));
     RenderCacheKey::from_artifact(artifact, render_payload_hash, render_config_hash)
 }
@@ -460,8 +466,45 @@ pub struct EngineMetrics {
 pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,
     pub route_reason: Option<String>,
+    pub proof_coverage: Option<r2sym::ProofCoverage>,
+    pub render_permission: Option<r2sym::RenderPermission>,
     pub warnings: Vec<String>,
     pub refusal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineRouteContext<'a> {
+    pub func_name: &'a str,
+    pub function_facts: &'a FunctionFacts,
+    pub cfg_summary: &'a CFGRiskSummary,
+    pub semantic_claims: r2sym::SemanticClaimSummary,
+}
+
+impl<'a> EngineRouteContext<'a> {
+    pub fn new(
+        func_name: &'a str,
+        function_facts: &'a FunctionFacts,
+        cfg_summary: &'a CFGRiskSummary,
+    ) -> Self {
+        let semantic_claims = function_facts
+            .semantic_artifact()
+            .map(r2sym::SemanticArtifact::semantic_claim_summary)
+            .unwrap_or_else(r2sym::SemanticClaimSummary::empty);
+        Self {
+            func_name,
+            function_facts,
+            cfg_summary,
+            semantic_claims,
+        }
+    }
+
+    pub fn has_renderable_semantic_claims(&self) -> bool {
+        self.semantic_claims.has_renderable_non_name_claim()
+    }
+
+    pub fn has_structured_control_claims(&self) -> bool {
+        self.semantic_claims.structural_control_claims > 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,6 +515,8 @@ pub struct EngineRouteDecision {
     pub route_reason: Option<String>,
     pub skip_runtime_type_inference: bool,
     pub use_prepared_semantic_view: bool,
+    pub proof_coverage: r2sym::ProofCoverage,
+    pub render_permission: r2sym::RenderPermission,
     pub refusal: Option<String>,
 }
 
@@ -507,7 +552,7 @@ pub struct EngineProfileRouteDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineTypedRouteDecision {
-    Decompile(EngineRouteDecision),
+    Decompile(Box<EngineRouteDecision>),
     Types(EngineTypeRouteDecision),
     Profile(EngineProfileRouteDecision),
 }
@@ -544,10 +589,26 @@ impl EngineTypedRouteDecision {
         }
     }
 
+    pub fn proof_coverage(&self) -> Option<r2sym::ProofCoverage> {
+        match self {
+            Self::Decompile(decision) => Some(decision.proof_coverage.clone()),
+            Self::Types(_) | Self::Profile(_) => None,
+        }
+    }
+
+    pub fn render_permission(&self) -> Option<r2sym::RenderPermission> {
+        match self {
+            Self::Decompile(decision) => Some(decision.render_permission.clone()),
+            Self::Types(_) | Self::Profile(_) => None,
+        }
+    }
+
     pub fn diagnostics(&self) -> EngineDiagnostics {
         EngineDiagnostics {
             plan: Some(self.plan()),
             route_reason: self.reason(),
+            proof_coverage: self.proof_coverage(),
+            render_permission: self.render_permission(),
             refusal: self.refusal(),
             warnings: Vec::new(),
         }
@@ -570,7 +631,7 @@ impl EngineRequestPlan {
     }
 
     pub fn decompile(decision: EngineRouteDecision) -> Self {
-        Self::new(EngineTypedRouteDecision::Decompile(decision))
+        Self::new(EngineTypedRouteDecision::Decompile(Box::new(decision)))
     }
 
     pub fn types(decision: EngineTypeRouteDecision) -> Self {
@@ -661,7 +722,7 @@ where
         let id = r2ssa::InterprocFunctionId(addr);
         let Some(mut summary) = name
             .as_deref()
-            .and_then(|name| r2ssa::FunctionSemanticSummary::seed_for_name(id, name))
+            .and_then(|name| r2sym::function_semantic_summary_seed_for_name(id, name))
             .or_else(|| {
                 arg_count_hint.map(|_| r2ssa::FunctionSemanticSummary::unknown(id, name.clone()))
             })
@@ -1580,10 +1641,13 @@ impl EngineSession {
 
         let mut artifact =
             rename_engine_analysis_artifact(analyze_response.artifact, &display_name);
-        if let Some(signature) = decompile_type_override(&identity, &analysis_request, &artifact)
-            .and_then(|facts| facts.merged_signature)
+        if let Some(type_override) =
+            decompile_type_override(&identity, &analysis_request, &artifact)
+            && let Some(signature) = type_override.render_authorized_signature().cloned()
         {
             artifact.function_facts.types.merged_signature = Some(signature);
+            artifact.function_facts.types.signature_certificate =
+                type_override.signature_certificate;
         }
 
         let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
@@ -1635,6 +1699,7 @@ impl EngineSession {
         let EngineTypedRouteDecision::Decompile(decision) = request_plan.decision else {
             unreachable!("decompile request planning returned non-decompile decision");
         };
+        let decision = *decision;
         let planning_time = started.elapsed();
 
         let cache_lookup = self.cached_render_with_decision(
@@ -1703,9 +1768,14 @@ impl EngineSession {
         let EngineTypedRouteDecision::Decompile(decision) = request_plan.decision else {
             unreachable!("decompile request planning returned non-decompile decision");
         };
+        let decision = *decision;
         let planning_time = started.elapsed();
         if matches!(decision.route, r2dec::SemanticRoutePlan::Standard)
-            && request.fallback_comment.is_none()
+            && (request.fallback_comment.is_none()
+                || prefers_standard_native_for_summary_only_worker(
+                    &request.function_facts,
+                    &request.cfg_summary,
+                ))
         {
             return None;
         }
@@ -1796,7 +1866,11 @@ impl EngineSession {
         };
         let fallback_comment = function_facts
             .semantic_artifact()
-            .filter(|_| has_renderable_primary_summary_only_native_worker(&function_facts))
+            .filter(|_| {
+                has_renderable_primary_summary_only_native_worker(&function_facts)
+                    && (probe.summary_probe_skipped_large_cfg
+                        || has_renderable_native_linear_worker_summary(&function_facts))
+            })
             .map(|artifact| summary_only_native_worker_fallback(request.display_name, artifact))
             .or_else(|| {
                 (request.fallback_if_guarded_without_summary
@@ -2278,8 +2352,16 @@ fn render_engine_decompile_request(
         return output;
     }
 
+    let suppress_unrenderable_summary = should_suppress_unrenderable_standard_summary_artifact(
+        &decision.route,
+        &request.function_facts,
+    );
+    let mut function_facts = request.function_facts.clone();
+    if suppress_unrenderable_summary {
+        function_facts.set_semantics(None);
+    }
     let context = r2dec::DecompilerContext::from_function_facts(
-        request.function_facts.clone(),
+        function_facts,
         request.function_names.clone(),
         request.strings.clone(),
         request.symbols.clone(),
@@ -2292,12 +2374,40 @@ fn render_engine_decompile_request(
         return output;
     }
 
-    request.fallback_comment.clone().unwrap_or_else(|| {
-        format!(
-            "/* r2dec fallback: skipped decompilation for {} (empty output) */",
-            request.function_name
+    request
+        .fallback_comment
+        .clone()
+        .filter(|_| !suppress_unrenderable_summary)
+        .unwrap_or_else(|| {
+            format!(
+                "/* r2dec fallback: skipped decompilation for {} (empty output) */",
+                request.function_name
+            )
+        })
+}
+
+fn should_suppress_unrenderable_standard_summary_artifact(
+    route: &r2dec::SemanticRoutePlan,
+    function_facts: &FunctionFacts,
+) -> bool {
+    if !matches!(route, r2dec::SemanticRoutePlan::Standard) {
+        return false;
+    }
+    let Some(artifact) = function_facts.semantic_artifact() else {
+        return false;
+    };
+    if artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly
+        || artifact.diagnostics.skipped_large_cfg
+        || !matches!(
+            artifact.decompile_plan(),
+            r2sym::DecompilePlan::NativeLinear { .. }
         )
-    })
+    {
+        return false;
+    }
+    artifact
+        .native_body()
+        .is_some_and(|native| !native_body_has_renderable_worker_summary(native))
 }
 
 fn decompile_type_override(
@@ -2305,29 +2415,36 @@ fn decompile_type_override(
     request: &EngineAnalyzeRequest,
     artifact: &EngineAnalysisArtifact,
 ) -> Option<FunctionTypeFacts> {
+    let facts = r2types::function_type_facts_from_parsed_context(
+        &request.function_name,
+        &request.parsed_context,
+    );
+    if facts.render_authorized_signature().is_some() {
+        return Some(facts);
+    }
+
     let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch.as_ref());
-    native_worker_type_projection_for_identity(
+    if let Some(projection) = native_worker_type_projection_for_identity(
         identity,
         &arch_name,
         request.ptr_bits,
         &request.parsed_context,
         true,
-    )
-    .map(|projection| projection.function_facts.types)
-    .or_else(|| {
-        let facts = r2types::inferred_signature_to_function_type_facts(
-            &artifact.writeback_plan.signature,
-            request.ptr_bits,
-        );
-        facts.merged_signature.is_some().then_some(facts)
-    })
-    .or_else(|| {
-        let facts = r2types::function_type_facts_from_parsed_context(
-            &request.function_name,
-            &request.parsed_context,
-        );
-        facts.merged_signature.is_some().then_some(facts)
-    })
+    ) {
+        let facts = projection.function_facts.types;
+        if facts.render_authorized_signature().is_some() {
+            return Some(facts);
+        }
+    }
+
+    let facts = r2types::inferred_signature_to_function_type_facts(
+        &artifact.writeback_plan.signature,
+        request.ptr_bits,
+    );
+    facts
+        .render_authorized_signature()
+        .is_some()
+        .then_some(facts)
 }
 
 fn refused_decompile_response(
@@ -2336,6 +2453,8 @@ fn refused_decompile_response(
     planning_time: Duration,
 ) -> EngineDecompileResponse {
     let output = r2dec::artifact_guard_fallback_comment(function_name, reason);
+    let render_permission =
+        r2sym::RenderPermission::refuse(r2sym::ProofOwner::R2engine, reason.to_string());
     EngineDecompileResponse {
         output: output.clone(),
         decision: EngineRouteDecision {
@@ -2347,6 +2466,11 @@ fn refused_decompile_response(
             route_reason: Some(reason.to_string()),
             skip_runtime_type_inference: true,
             use_prepared_semantic_view: false,
+            proof_coverage: r2sym::ProofCoverage {
+                refusals: 1,
+                ..r2sym::ProofCoverage::default()
+            },
+            render_permission: render_permission.clone(),
             refusal: Some(output.clone()),
         },
         metrics: EngineMetrics {
@@ -2357,6 +2481,11 @@ fn refused_decompile_response(
         diagnostics: EngineDiagnostics {
             plan: Some(EnginePlan::RefuseWithEvidence),
             route_reason: Some(reason.to_string()),
+            proof_coverage: Some(r2sym::ProofCoverage {
+                refusals: 1,
+                ..r2sym::ProofCoverage::default()
+            }),
+            render_permission: Some(render_permission),
             warnings: Vec::new(),
             refusal: Some(output),
         },
@@ -2547,7 +2676,7 @@ pub fn build_interproc_summary_set_with_scope_facts(
             let Some(name) = function.name.as_deref() else {
                 continue;
             };
-            if let Some(summary) = r2ssa::FunctionSemanticSummary::seed_for_name(function.id, name)
+            if let Some(summary) = r2sym::function_semantic_summary_seed_for_name(function.id, name)
             {
                 seeds.entry(function.id).or_insert(summary);
             }
@@ -2613,7 +2742,7 @@ fn build_engine_analysis_artifact(
         }
     };
     let pattern_ssa_blocks = semantic_analysis.pattern_ssa_func.local_ssa_blocks();
-    let (arch_name, _, decompiler_cfg) = r2dec::DecompilerConfig::for_arch(request.arch.as_ref());
+    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch.as_ref());
     let signature = infer_signature_from_engine_analysis(
         &request.function_name,
         &arch_name,
@@ -2630,13 +2759,13 @@ fn build_engine_analysis_artifact(
         request.ptr_bits,
         &mut diagnostics,
     );
-    let local_field_accesses =
-        local_field_accesses_to_writeback(r2dec::infer_local_struct_field_accesses(
-            &semantic_analysis.pattern_ssa_func,
-            &decompiler_cfg,
-        ));
-    let local_struct_semantics_required = !local_field_accesses.is_empty()
-        && parsed_context_has_layout_hints(&request.parsed_context);
+    let local_field_accesses = r2types::local_field_accesses_from_struct_artifacts(&local_structs);
+    let optional_semantics_required = optional_semantics_required_for_analysis(
+        &request.parsed_context,
+        &semantic_analysis.ssa_func,
+        &pattern_ssa_blocks,
+        !local_field_accesses.is_empty(),
+    );
     let root_summary = interproc_summary_set.as_ref().and_then(|summary_set| {
         summary_set
             .root
@@ -2644,8 +2773,21 @@ fn build_engine_analysis_artifact(
     });
     let semantic_artifact = request.precomputed_semantic_artifact.clone().or_else(|| {
         if matches!(request.semantic_mode, EngineSemanticMode::Full) {
+            if should_skip_full_semantics_for_layout_backed_prepared_proofs(
+                &request.parsed_context,
+                &semantic_analysis.ssa_func,
+                &pattern_ssa_blocks,
+            ) {
+                return None;
+            }
+            if should_skip_full_semantics_for_opaque_layout(
+                &request.parsed_context,
+                &semantic_analysis.ssa_func,
+            ) {
+                return None;
+            }
             return maybe_compile_semantic_artifact_for_analysis(
-                &semantic_analysis.pattern_ssa_func,
+                &semantic_analysis.ssa_func,
                 request.function_addr,
                 &request.function_name,
                 request.symbolic_scope.as_ref(),
@@ -2653,7 +2795,7 @@ fn build_engine_analysis_artifact(
                 root_summary,
             );
         }
-        local_struct_semantics_required.then(|| {
+        optional_semantics_required.then(|| {
             r2sym::compile_semantic_artifact_default_with_scope(
                 &z3::Context::thread_local(),
                 &semantic_analysis.ssa_func,
@@ -2695,6 +2837,10 @@ fn build_engine_analysis_artifact(
     let mut usage = semantic_analysis.ssa_func.facts().assumption_usage.clone();
     usage.extend(&function_facts.assumption_usage);
     function_facts.assumption_usage = usage;
+    function_facts.merge_proof_coverage(r2sym::ProofCoverage::from_prepared_certificates(
+        semantic_analysis.ssa_func.certificates(),
+    ));
+    function_facts.merge_proof_coverage(proof_coverage_from_type_facts(&function_facts.types));
     Some(EngineAnalysisArtifact {
         ssa_func: semantic_analysis.ssa_func,
         pattern_ssa_func: semantic_analysis.pattern_ssa_func,
@@ -2716,17 +2862,22 @@ fn maybe_compile_semantic_artifact_for_analysis(
         .or_else(|| native_worker_summary_seed(function_addr, function_name));
     let summary_seed = summary_seed.as_ref();
     if should_probe_native_worker_summary_before_full_semantics(ssa_func, summary_seed) {
-        if should_skip_unbounded_semantic_artifact_after_worker_preprobe(ssa_func, summary_seed) {
+        let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
+        if !vm_route_evidence
+            && should_skip_unbounded_semantic_artifact_after_worker_preprobe(ssa_func, summary_seed)
+        {
             return None;
         }
-        if let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-            ssa_func,
-            symbolic_scope,
-            summary_seed,
-            false,
-        ) && artifact
-            .native_body()
-            .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
+        if !vm_route_evidence
+            && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
+                ssa_func,
+                symbolic_scope,
+                summary_seed,
+                false,
+            )
+            && artifact
+                .native_body()
+                .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
         {
             return Some(artifact);
         }
@@ -2745,13 +2896,13 @@ fn should_skip_unbounded_semantic_artifact_after_worker_preprobe(
     ssa_func: &SsaArtifact,
     root_summary: Option<&r2ssa::FunctionSemanticSummary>,
 ) -> bool {
-    if root_summary
-        .and_then(|summary| summary.name.as_deref())
-        .is_some_and(|name| {
-            should_use_direct_named_native_worker_decompile(name)
-                || should_prefer_full_decompile_for_named_worker(name)
-        })
-    {
+    if root_summary.is_some_and(|summary| {
+        let policy = r2sym::native_worker_summary_route_policy_for_summary(summary.id.0, summary);
+        policy.should_use_direct_summary() || policy.should_prefer_full()
+    }) {
+        return false;
+    }
+    if r2sym::has_strong_vm_evidence(ssa_func) {
         return false;
     }
     let cfg = ssa_func.function().cfg_risk_summary();
@@ -2771,7 +2922,9 @@ fn compile_semantic_artifact_for_analysis(
         .cloned()
         .or_else(|| native_worker_summary_seed(function_addr, function_name));
     let summary_seed = summary_seed.as_ref();
-    if let Some(summary) = summary_seed
+    let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
+    if !vm_route_evidence
+        && let Some(summary) = summary_seed
         && let Some(artifact) = r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
             ssa_func,
             symbolic_scope,
@@ -2780,7 +2933,8 @@ fn compile_semantic_artifact_for_analysis(
     {
         return artifact;
     }
-    if should_probe_native_worker_summary_before_full_semantics(ssa_func, summary_seed)
+    if !vm_route_evidence
+        && should_probe_native_worker_summary_before_full_semantics(ssa_func, summary_seed)
         && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
             ssa_func,
             symbolic_scope,
@@ -2813,13 +2967,10 @@ fn should_probe_native_worker_summary_before_full_semantics(
     ssa_func: &SsaArtifact,
     root_summary: Option<&r2ssa::FunctionSemanticSummary>,
 ) -> bool {
-    if root_summary
-        .and_then(|summary| summary.name.as_deref())
-        .is_some_and(|name| {
-            should_use_direct_named_native_worker_decompile(name)
-                || should_prefer_full_decompile_for_named_worker(name)
-        })
-    {
+    if root_summary.is_some_and(|summary| {
+        let policy = r2sym::native_worker_summary_route_policy_for_summary(summary.id.0, summary);
+        policy.should_use_direct_summary() || policy.should_prefer_full()
+    }) {
         return true;
     }
 
@@ -2827,17 +2978,8 @@ fn should_probe_native_worker_summary_before_full_semantics(
     if cfg.block_count == 0 || cfg.block_count > 64 {
         return false;
     }
-    let op_count = ssa_func
-        .function()
-        .blocks()
-        .map(|block| block.ops.len())
-        .sum::<usize>();
     let branch_count = ssa_func.predicates().predicates.len();
-    op_count <= 256
-        && (cfg.loop_count > 0
-            || cfg.back_edge_count > 0
-            || cfg.switch_block_count > 0
-            || branch_count >= 8)
+    cfg.loop_count > 0 || cfg.back_edge_count > 0 || cfg.switch_block_count > 0 || branch_count >= 8
 }
 
 fn infer_signature_from_engine_analysis(
@@ -2884,21 +3026,8 @@ fn infer_signature_from_engine_analysis(
     ))
 }
 
-fn local_field_accesses_to_writeback(
-    accesses: Vec<r2dec::LocalStructFieldAccess>,
-) -> Vec<r2types::LocalFieldAccessFact> {
-    accesses
-        .into_iter()
-        .map(|access| r2types::LocalFieldAccessFact {
-            slot: access.arg_index,
-            field_offset: access.field_offset,
-            field_name: format!("f_{:x}", access.field_offset),
-            field_type: Some(r2types::size_to_type(access.access_size)),
-        })
-        .collect()
-}
-
 fn parsed_context_has_layout_hints(parsed_context: &r2types::ParsedExternalContext) -> bool {
+    let external_type_db = &parsed_context.external_type_db;
     parsed_context
         .current_signature
         .as_ref()
@@ -2908,62 +3037,254 @@ fn parsed_context_has_layout_hints(parsed_context: &r2types::ParsedExternalConte
             signature
                 .ret_type
                 .as_ref()
-                .is_some_and(type_like_has_layout_hint)
+                .is_some_and(|ty| type_like_has_layout_hint(ty, external_type_db))
                 || signature
                     .params
                     .iter()
                     .filter_map(|param| param.ty.as_ref())
-                    .any(type_like_has_layout_hint)
+                    .any(|ty| type_like_has_layout_hint(ty, external_type_db))
         })
         || parsed_context
             .register_params
             .iter()
             .filter_map(|param| param.ty.as_ref())
-            .any(type_like_has_layout_hint)
+            .any(|ty| type_like_has_layout_hint(ty, external_type_db))
         || parsed_context
             .stack_slots
             .values()
             .filter_map(|slot| slot.ty.as_ref())
-            .any(type_like_has_layout_hint)
+            .any(|ty| type_like_has_layout_hint(ty, external_type_db))
 }
 
-fn type_like_has_layout_hint(ty: &r2types::CTypeLike) -> bool {
+fn optional_semantics_required_for_analysis(
+    parsed_context: &r2types::ParsedExternalContext,
+    ssa_func: &SsaArtifact,
+    pattern_ssa_blocks: &[r2ssa::SSABlock],
+    _has_local_field_accesses: bool,
+) -> bool {
+    if parsed_context_has_layout_hints(parsed_context) {
+        return true;
+    }
+    let has_typed_stack_memory = parsed_context_has_typed_stack_memory_hints(parsed_context);
+    if !has_typed_stack_memory {
+        return false;
+    }
+    optional_semantic_proof_budget_allows(ssa_func, pattern_ssa_blocks)
+}
+
+fn should_skip_full_semantics_for_opaque_layout(
+    parsed_context: &r2types::ParsedExternalContext,
+    ssa_func: &SsaArtifact,
+) -> bool {
+    !r2sym::has_strong_vm_evidence(ssa_func)
+        && parsed_context_has_opaque_aggregate_signature(parsed_context)
+        && !parsed_context_has_layout_hints(parsed_context)
+        && !parsed_context_has_typed_stack_memory_hints(parsed_context)
+}
+
+fn should_skip_full_semantics_for_layout_backed_prepared_proofs(
+    parsed_context: &r2types::ParsedExternalContext,
+    ssa_func: &SsaArtifact,
+    pattern_ssa_blocks: &[r2ssa::SSABlock],
+) -> bool {
+    parsed_context_has_layout_hints(parsed_context)
+        && !r2sym::has_strong_vm_evidence(ssa_func)
+        && prepared_layout_route_has_no_semantic_side_effect_need(ssa_func, pattern_ssa_blocks)
+}
+
+fn prepared_layout_route_has_no_semantic_side_effect_need(
+    ssa_func: &SsaArtifact,
+    pattern_ssa_blocks: &[r2ssa::SSABlock],
+) -> bool {
+    let cfg = ssa_func.function().cfg_risk_summary();
+    cfg.loop_count == 0
+        && cfg.back_edge_count == 0
+        && cfg.switch_block_count == 0
+        && pattern_ssa_blocks.iter().all(|block| {
+            block
+                .ops
+                .iter()
+                .all(|op| !matches!(op, r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. }))
+        })
+}
+
+fn parsed_context_has_opaque_aggregate_signature(
+    parsed_context: &r2types::ParsedExternalContext,
+) -> bool {
+    parsed_context
+        .current_signature
+        .as_ref()
+        .into_iter()
+        .chain(parsed_context.merged_signature.as_ref())
+        .any(signature_has_opaque_aggregate)
+}
+
+fn signature_has_opaque_aggregate(signature: &r2types::FunctionSignatureSpec) -> bool {
+    signature
+        .ret_type
+        .as_ref()
+        .is_some_and(type_like_is_opaque_aggregate)
+        || signature
+            .params
+            .iter()
+            .filter_map(|param| param.ty.as_ref())
+            .any(type_like_is_opaque_aggregate)
+}
+
+fn optional_semantic_proof_budget_allows(
+    ssa_func: &SsaArtifact,
+    pattern_ssa_blocks: &[r2ssa::SSABlock],
+) -> bool {
+    let cfg = ssa_func.function().cfg_risk_summary();
+    let op_count = pattern_ssa_blocks
+        .iter()
+        .map(|block| block.ops.len())
+        .sum::<usize>();
+    let predicate_count = ssa_func.predicates().predicates.len();
+    cfg.block_count <= 8
+        && cfg.loop_count == 0
+        && cfg.back_edge_count == 0
+        && cfg.switch_block_count == 0
+        && op_count <= 160
+        && predicate_count <= 4
+}
+
+fn parsed_context_has_typed_stack_memory_hints(
+    parsed_context: &r2types::ParsedExternalContext,
+) -> bool {
+    parsed_context
+        .stack_slots
+        .values()
+        .filter_map(|slot| slot.ty.as_ref())
+        .any(type_like_is_memory_hint)
+}
+
+fn type_like_has_layout_hint(
+    ty: &r2types::CTypeLike,
+    external_type_db: &r2types::ExternalTypeDb,
+) -> bool {
     match ty {
         r2types::CTypeLike::Pointer(inner) | r2types::CTypeLike::Array(inner, _) => {
-            type_like_has_layout_hint(inner)
+            type_like_has_layout_hint(inner, external_type_db)
         }
-        r2types::CTypeLike::Struct(_) | r2types::CTypeLike::Union(_) => true,
+        r2types::CTypeLike::Struct(name) => external_struct_has_fields(external_type_db, name),
+        r2types::CTypeLike::Union(name) => external_union_has_fields(external_type_db, name),
+        r2types::CTypeLike::Enum(name) => external_enum_has_variants(external_type_db, name),
         r2types::CTypeLike::Typedef(name) => {
             let normalized = name.trim().to_ascii_lowercase();
-            !matches!(
-                normalized.as_str(),
-                "bool"
-                    | "char"
-                    | "signed char"
-                    | "unsigned char"
-                    | "short"
-                    | "unsigned short"
-                    | "int"
-                    | "unsigned int"
-                    | "long"
-                    | "unsigned long"
-                    | "long long"
-                    | "unsigned long long"
-                    | "int8_t"
-                    | "uint8_t"
-                    | "int16_t"
-                    | "uint16_t"
-                    | "int32_t"
-                    | "uint32_t"
-                    | "int64_t"
-                    | "uint64_t"
-                    | "size_t"
-                    | "ssize_t"
-                    | "void"
-            )
+            !is_scalar_typedef_name(&normalized)
+                && (external_struct_has_fields(external_type_db, name)
+                    || external_union_has_fields(external_type_db, name)
+                    || external_enum_has_variants(external_type_db, name))
         }
         _ => false,
     }
+}
+
+fn type_like_is_memory_hint(ty: &r2types::CTypeLike) -> bool {
+    match ty {
+        r2types::CTypeLike::Pointer(inner) | r2types::CTypeLike::Array(inner, _) => {
+            !matches!(
+                inner.as_ref(),
+                r2types::CTypeLike::Unknown | r2types::CTypeLike::Void
+            ) || type_like_is_memory_hint(inner)
+        }
+        r2types::CTypeLike::Struct(_)
+        | r2types::CTypeLike::Union(_)
+        | r2types::CTypeLike::Typedef(_) => true,
+        _ => false,
+    }
+}
+
+fn type_like_is_opaque_aggregate(ty: &r2types::CTypeLike) -> bool {
+    match ty {
+        r2types::CTypeLike::Pointer(inner) | r2types::CTypeLike::Array(inner, _) => {
+            type_like_is_opaque_aggregate(inner)
+        }
+        r2types::CTypeLike::Struct(_)
+        | r2types::CTypeLike::Union(_)
+        | r2types::CTypeLike::Enum(_) => true,
+        r2types::CTypeLike::Typedef(name) => {
+            !is_scalar_typedef_name(&name.trim().to_ascii_lowercase())
+        }
+        _ => false,
+    }
+}
+
+fn is_scalar_typedef_name(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "bool"
+            | "char"
+            | "signed char"
+            | "unsigned char"
+            | "short"
+            | "unsigned short"
+            | "int"
+            | "unsigned int"
+            | "long"
+            | "unsigned long"
+            | "long long"
+            | "unsigned long long"
+            | "int8_t"
+            | "uint8_t"
+            | "int16_t"
+            | "uint16_t"
+            | "int32_t"
+            | "uint32_t"
+            | "int64_t"
+            | "uint64_t"
+            | "size_t"
+            | "ssize_t"
+            | "void"
+    )
+}
+
+fn external_layout_keys(name: &str) -> Vec<String> {
+    let normalized = r2types::normalize_external_type_name(name);
+    let mut keys = Vec::new();
+    for candidate in [name.trim(), normalized.as_str()] {
+        let lower = candidate.to_ascii_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        keys.push(lower.clone());
+        for prefix in ["struct ", "union ", "enum "] {
+            if let Some(stripped) = lower.strip_prefix(prefix) {
+                keys.push(stripped.trim().to_string());
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn external_struct_has_fields(external_type_db: &r2types::ExternalTypeDb, name: &str) -> bool {
+    external_layout_keys(name).into_iter().any(|key| {
+        external_type_db
+            .structs
+            .get(&key)
+            .is_some_and(|st| !st.fields.is_empty())
+    })
+}
+
+fn external_union_has_fields(external_type_db: &r2types::ExternalTypeDb, name: &str) -> bool {
+    external_layout_keys(name).into_iter().any(|key| {
+        external_type_db
+            .unions
+            .get(&key)
+            .is_some_and(|un| !un.fields.is_empty())
+    })
+}
+
+fn external_enum_has_variants(external_type_db: &r2types::ExternalTypeDb, name: &str) -> bool {
+    external_layout_keys(name).into_iter().any(|key| {
+        external_type_db
+            .enums
+            .get(&key)
+            .is_some_and(|en| !en.variants.is_empty())
+    })
 }
 
 fn ctype_to_type_like(ty: &r2dec::CType) -> r2types::CTypeLike {
@@ -3119,24 +3440,24 @@ fn engine_name_route_facts(identity: &EngineFunctionIdentity) -> EngineNameRoute
     for name in identity.name_candidates() {
         let policy =
             r2sym::native_worker_summary_route_policy_for_name(identity.function_addr, name);
-        let summary_supported = policy.applicability.is_supported();
+        let summary_route_backed = policy.has_route_certificate();
         let program_orchestrator = r2sym::has_program_orchestrator_summary_family(name);
 
         if name == identity.display_name {
-            display_summary_family |= summary_supported;
-            display_program_orchestrator_family |= program_orchestrator;
+            display_summary_family |= summary_route_backed;
+            display_program_orchestrator_family |= program_orchestrator && summary_route_backed;
         }
         if name == identity.canonical_name {
-            canonical_summary_family |= summary_supported;
-            canonical_program_orchestrator_family |= program_orchestrator;
+            canonical_summary_family |= summary_route_backed;
+            canonical_program_orchestrator_family |= program_orchestrator && summary_route_backed;
         }
 
-        summary_family |= summary_supported;
-        program_orchestrator_family |= program_orchestrator;
+        summary_family |= summary_route_backed;
+        program_orchestrator_family |= program_orchestrator && summary_route_backed;
         prefer_full_named_worker |= policy.should_prefer_full();
         direct_named_worker_guarded |= policy.should_use_direct_summary();
 
-        if summary_supported {
+        if summary_route_backed {
             first_supported_summary_name.get_or_insert_with(|| name.to_string());
             if first_preferred_summary_name.is_none()
                 && (policy.should_use_direct_summary() || !is_anonymous_engine_route_name(name))
@@ -3180,6 +3501,12 @@ pub fn decompile_probe_decision_for_identity(
     let name_facts = engine_name_route_facts(identity);
     let cfg_guard_reason = cfg_guard_reason(blocks);
     let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
+    let raw_cfg = raw_cfg_risk_summary_for_preprobe(blocks);
+    let small_structural_worker_probe = raw_cfg.block_count > 0
+        && raw_cfg.block_count <= 64
+        && (raw_cfg.loop_count > 0
+            || raw_cfg.back_edge_count > 0
+            || raw_cfg.switch_block_count > 0);
     let program_orchestrator_guarded = name_facts.program_orchestrator_family
         && should_guard_program_orchestrator_decompile(blocks.len(), op_count);
     let skipped_large_cfg_guarded = !name_facts.prefer_full_named_worker
@@ -3190,8 +3517,10 @@ pub fn decompile_probe_decision_for_identity(
             || program_orchestrator_guarded)
         && (!name_facts.program_orchestrator_family || program_orchestrator_guarded);
     let block_guarded = named_worker_guarded || skipped_large_cfg_guarded;
-    let summary_probe_needed =
-        block_guarded || cfg_guard_reason.is_some() || name_facts.prefer_full_named_worker;
+    let summary_probe_needed = block_guarded
+        || cfg_guard_reason.is_some()
+        || name_facts.prefer_full_named_worker
+        || small_structural_worker_probe;
 
     DecompileProbeDecision {
         op_count,
@@ -3210,7 +3539,7 @@ pub fn decompile_probe_decision_for_identity(
 }
 
 fn has_summary_applicability(function_addr: u64, name: &str) -> bool {
-    r2sym::native_worker_summary_applicability_for_name(function_addr, name).is_supported()
+    r2sym::native_worker_summary_route_policy_for_name(function_addr, name).has_route_certificate()
 }
 
 pub fn should_use_direct_named_native_worker_decompile(function_name: &str) -> bool {
@@ -3240,11 +3569,7 @@ fn should_prefer_full_decompile_for_named_worker(function_name: &str) -> bool {
 }
 
 pub fn should_use_direct_named_native_worker_type_projection(function_name: &str) -> bool {
-    let applicability = r2sym::native_worker_summary_applicability_for_name(0, function_name);
     should_use_direct_named_native_worker_decompile(function_name)
-        || r2sym::has_program_orchestrator_summary_family(function_name)
-        || (applicability.has_route_evidence()
-            && r2types::signature_hint_for_name_candidates([function_name], 0).is_some())
 }
 
 fn normalize_engine_route_name(name: &str) -> String {
@@ -3313,6 +3638,11 @@ fn native_linear_artifact_plan_allows_summary_route(
     let Some(native) = semantic_artifact.native_body() else {
         return false;
     };
+    if !semantic_artifact.diagnostics.skipped_large_cfg
+        && !native_body_has_renderable_worker_summary(native)
+    {
+        return false;
+    }
     let summary_count =
         native.summary.region_summaries.len() + native.summary.worker_summaries.len();
     let has_specific_summary = native.has_memory_read_write_summary_pair()
@@ -3415,45 +3745,28 @@ struct SummaryProjectionOptions {
 fn type_facts_with_summary_projection_for_candidates_with_options<'a>(
     mut type_facts: FunctionTypeFacts,
     function_name: &str,
-    name_candidates: impl IntoIterator<Item = &'a str>,
+    _name_candidates: impl IntoIterator<Item = &'a str>,
     arch_name: &str,
     ptr_bits: u32,
     semantic_artifact: &r2sym::SemanticArtifact,
     options: SummaryProjectionOptions,
 ) -> FunctionTypeFacts {
     let signature_param_count = type_facts
-        .merged_signature
-        .as_ref()
+        .render_authorized_signature()
         .map(|signature| signature.params.len())
         .unwrap_or_default();
     let current_param_count = signature_param_count.max(type_facts.register_params.len());
-    let mut candidates = Vec::new();
-    for candidate in name_candidates {
-        let candidate = candidate.trim();
-        if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
-            candidates.push(candidate);
-        }
-    }
-    if candidates.is_empty() {
-        candidates.push(function_name);
-    }
-    let role_identity = semantic_artifact
-        .native_body()
-        .and_then(|native| native.summary.role_identity.as_ref());
-    if let Some(role_identity) = role_identity {
-        for candidate in std::iter::once(role_identity.role_name.as_str())
-            .chain(role_identity.source_names.iter().map(String::as_str))
-        {
-            let candidate = candidate.trim();
-            if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
-                candidates.push(candidate);
-            }
-        }
-    }
-    let name_signature = r2types::signature_hint_for_name_candidates(
-        candidates.iter().copied(),
-        current_param_count,
-    );
+    let artifact_projection =
+        r2types::signature_projection_for_semantic_artifact(semantic_artifact, current_param_count);
+    let name_signature = artifact_projection
+        .as_ref()
+        .filter(|projection| {
+            matches!(
+                projection.source,
+                r2types::SignatureProjectionSource::SummaryRole
+            )
+        })
+        .map(|projection| projection.signature.clone());
     let fallback_plan = r2types::build_semantic_type_fallback_plan(
         function_name,
         arch_name,
@@ -3467,46 +3780,65 @@ fn type_facts_with_summary_projection_for_candidates_with_options<'a>(
         } else {
             None
         };
-    let projected_signature = if let Some(mut signature) = name_signature.clone() {
-        if signature.ret_type.is_none()
+    let projection = if let Some(mut projection) = artifact_projection {
+        if projection.signature.ret_type.is_none()
             && let Some(fallback_signature) = fallback_signature.as_ref()
         {
-            signature.ret_type = fallback_signature.ret_type.clone();
+            projection.signature.ret_type = fallback_signature.ret_type.clone();
         }
-        Some(signature)
+        Some(projection)
     } else {
-        fallback_signature
+        fallback_signature.map(FunctionSignatureProjection::weak_summary_kind)
     };
-    let Some(projected_signature) = projected_signature else {
+    let Some(projection) = projection else {
+        r2types::augment_function_type_facts_with_summary_evidence(
+            &mut type_facts,
+            semantic_artifact,
+            ptr_bits,
+        );
         return type_facts;
     };
     if options.preserve_authoritative_context_signature
         && name_signature.is_none()
         && type_facts
-            .merged_signature
-            .as_ref()
+            .render_authorized_signature()
             .is_some_and(signature_is_authoritative_context_seed)
     {
+        r2types::augment_function_type_facts_with_summary_evidence(
+            &mut type_facts,
+            semantic_artifact,
+            ptr_bits,
+        );
         return type_facts;
     }
     let name_owned_exact_arity = name_signature.is_some()
-        && projected_signature.ret_type.is_some()
-        && projected_signature
+        && projection.signature.ret_type.is_some()
+        && projection
+            .signature
             .params
             .iter()
             .all(|param| !param.name.is_empty() && param.ty.is_some());
-    let projected_param_count = projected_signature.params.len();
-    let projection = if name_signature.is_some() {
-        FunctionSignatureProjection::strong_summary(projected_signature).with_exact_arity(true)
-    } else {
-        FunctionSignatureProjection::weak_summary_kind(projected_signature)
-            .with_return_confidence(fallback_plan.signature.confidence)
-            .with_default_param_confidence(fallback_plan.signature.confidence)
-    };
-    let _ = type_facts.apply_signature_projection(function_name, projection, ptr_bits);
+    let projected_param_count = projection.signature.params.len();
+    let projection_source = SignatureCertificateSource::from(projection.source);
+    let projection_result =
+        type_facts.apply_signature_projection(function_name, projection.clone(), ptr_bits);
+    if projection_result.was_applied()
+        && projection.has_strong_signature_confidence()
+        && !matches!(
+            projection.source,
+            r2types::SignatureProjectionSource::SummaryKind
+        )
+    {
+        type_facts.certify_current_signature_with_source(projection_source);
+    }
     if name_owned_exact_arity && type_facts.register_params.len() > projected_param_count {
         type_facts.register_params.truncate(projected_param_count);
     }
+    r2types::augment_function_type_facts_with_summary_evidence(
+        &mut type_facts,
+        semantic_artifact,
+        ptr_bits,
+    );
     type_facts
 }
 
@@ -3543,18 +3875,10 @@ pub fn native_worker_summary_seed(
     function_addr: u64,
     function_name: &str,
 ) -> Option<r2ssa::FunctionSemanticSummary> {
-    r2ssa::FunctionSemanticSummary::seed_for_name(
+    r2sym::function_semantic_summary_seed_for_name(
         r2ssa::InterprocFunctionId(function_addr),
         function_name,
     )
-    .or_else(|| {
-        r2sym::has_native_worker_summary_family(function_name).then(|| {
-            r2ssa::FunctionSemanticSummary::unknown(
-                r2ssa::InterprocFunctionId(function_addr),
-                Some(function_name.to_string()),
-            )
-        })
-    })
 }
 
 pub fn native_worker_summary_artifact(
@@ -3570,19 +3894,18 @@ pub fn native_worker_summary_artifact(
     }
     let summary_id =
         r2ssa::InterprocFunctionId(blocks.first().map(|block| block.addr).unwrap_or_default());
-    let root_summary =
-        native_worker_summary_seed(summary_id.0, function_name).unwrap_or_else(|| {
-            r2ssa::FunctionSemanticSummary::unknown(summary_id, Some(function_name.to_string()))
-        });
+    let root_summary = native_worker_summary_seed(summary_id.0, function_name);
     if let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
         &ssa_func,
         symbolic_scope,
-        Some(&root_summary),
+        root_summary.as_ref(),
         skipped_large_cfg,
     ) {
         return Some(artifact);
     }
-    r2sym::compile_named_native_worker_summary_artifact(&root_summary, skipped_large_cfg)
+    root_summary.as_ref().and_then(|summary| {
+        r2sym::compile_named_native_worker_summary_artifact(summary, skipped_large_cfg)
+    })
 }
 
 fn fast_program_orchestrator_summary_artifact(
@@ -3597,14 +3920,34 @@ fn fast_program_orchestrator_summary_artifact(
     r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)
 }
 
+fn proof_coverage_from_type_facts(type_facts: &FunctionTypeFacts) -> r2sym::ProofCoverage {
+    r2sym::ProofCoverage {
+        certified_field_accesses: type_facts.field_access_certificates.len(),
+        certified_array_indexes: type_facts.array_index_certificates.len(),
+        certified_out_params: type_facts
+            .source_authorized_out_param_certificates()
+            .count(),
+        certified_signatures: usize::from(type_facts.render_authorized_signature().is_some()),
+        ..r2sym::ProofCoverage::default()
+    }
+}
+
 pub fn type_facts_from_parsed_context(
     parsed_context: &r2types::ParsedExternalContext,
 ) -> FunctionTypeFacts {
+    let merged_signature = parsed_context
+        .merged_signature
+        .clone()
+        .or_else(|| parsed_context.current_signature.clone());
+    let signature_certificate = merged_signature.as_ref().and_then(|signature| {
+        r2types::SignatureCertificate::from_signature(
+            signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        )
+    });
     FunctionTypeFacts::builder(FunctionTypeFactInputs {
-        merged_signature: parsed_context
-            .merged_signature
-            .clone()
-            .or_else(|| parsed_context.current_signature.clone()),
+        merged_signature,
+        signature_certificate,
         known_function_signatures: parsed_context.known_function_signatures.clone(),
         register_params: parsed_context.register_params.clone(),
         stack_slots: parsed_context.stack_slots.clone(),
@@ -3653,15 +3996,19 @@ pub fn native_worker_type_projection_for_identity(
     }
     let type_facts = type_facts_from_parsed_context(parsed_context);
     let current_param_count = type_facts
-        .merged_signature
-        .as_ref()
+        .render_authorized_signature()
         .map(|signature| signature.params.len())
         .unwrap_or_default();
-    let name_owned_signature = r2types::signature_hint_for_name_candidates(
-        identity.name_candidates(),
+    let name_owned_signature = r2types::signature_projection_for_semantic_artifact(
+        &semantic_artifact,
         current_param_count,
     )
-    .is_some();
+    .is_some_and(|projection| {
+        matches!(
+            projection.source,
+            r2types::SignatureProjectionSource::SummaryRole
+        )
+    });
     let context_owned_signature =
         parsed_context_current_signature_is_authoritative(parsed_context) && !name_owned_signature;
     let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
@@ -3790,12 +4137,14 @@ pub fn type_summary_preprobe(
 fn summary_preprobe_type_payload_prefers_semantic_fallback(
     artifact: &r2sym::SemanticArtifact,
 ) -> bool {
-    matches!(
-        artifact.granularity,
-        r2sym::ArtifactGranularity::SummaryOnly
-    ) && artifact
-        .native_body()
-        .is_some_and(r2sym::NativeArtifactBody::has_summary_islands)
+    matches!(artifact.stage, r2sym::RefinementStage::Compiled)
+        && matches!(
+            artifact.granularity,
+            r2sym::ArtifactGranularity::SummaryOnly
+        )
+        && artifact
+            .native_body()
+            .is_some_and(r2sym::NativeArtifactBody::has_primary_non_name_summary_islands)
         && matches!(
             artifact.slice_class(),
             Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
@@ -3929,28 +4278,36 @@ pub fn semantic_route_plan(
     function_facts: &FunctionFacts,
     cfg_summary: &CFGRiskSummary,
 ) -> r2dec::SemanticRoutePlan {
-    if let Some(reason) = preferred_vm_summary_reason(function_facts) {
+    let context = EngineRouteContext::new(func_name, function_facts, cfg_summary);
+    semantic_route_plan_from_context(&context)
+}
+
+pub fn semantic_route_plan_from_context(
+    context: &EngineRouteContext<'_>,
+) -> r2dec::SemanticRoutePlan {
+    if let Some(reason) = preferred_vm_summary_reason(context.function_facts) {
         return r2dec::SemanticRoutePlan::VmSummary { reason };
     }
-    if let Some(comment) = preferred_semantic_fallback_comment(func_name, function_facts) {
+    if let Some(comment) =
+        preferred_semantic_fallback_comment(context.func_name, context.function_facts)
+    {
         return r2dec::SemanticRoutePlan::FallbackComment { comment };
     }
-    if let Some(reason) = preferred_semantic_summary_islands_reason(function_facts, cfg_summary) {
+    if let Some(reason) = preferred_semantic_summary_islands_reason(context) {
         return r2dec::SemanticRoutePlan::SummaryIslands { reason };
     }
-    if let Some(reason) =
-        preferred_semantic_structuring_reason(func_name, function_facts, cfg_summary)
-    {
+    if let Some(reason) = preferred_semantic_structuring_reason(context) {
         return r2dec::SemanticRoutePlan::StructuredWorker { reason };
     }
-    if let Some(reason) =
-        preferred_semantic_linearization_reason(func_name, function_facts, cfg_summary)
-    {
+    if let Some(reason) = preferred_semantic_linearization_reason(context) {
         return r2dec::SemanticRoutePlan::LinearWorker { reason };
     }
-    if let Some(route) = function_facts
-        .semantic_artifact()
-        .and_then(semantic_route_from_artifact_plan)
+    if !prefers_standard_native_for_summary_only_worker(context.function_facts, context.cfg_summary)
+        && let Some(route) = context
+            .function_facts
+            .semantic_artifact()
+            .and_then(semantic_route_from_artifact_plan)
+            .filter(|_| context.has_renderable_semantic_claims())
     {
         return route;
     }
@@ -3975,6 +4332,17 @@ pub fn decompile_route_decision(
         r2dec::SemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
         _ => None,
     };
+    let proof_coverage = prepared
+        .map(|prepared| r2sym::ProofCoverage::from_prepared_certificates(prepared.certificates()))
+        .unwrap_or_default()
+        .merge(function_facts.proof.clone())
+        .merge(proof_coverage_from_type_facts(type_facts));
+    let render_permission = render_permission_for_decompile_route(
+        &route,
+        cfg_summary,
+        &proof_coverage,
+        prepared.is_some(),
+    );
     EngineRouteDecision {
         request: EngineRequestKind::Decompile,
         plan,
@@ -3986,7 +4354,31 @@ pub fn decompile_route_decision(
         use_prepared_semantic_view: should_use_prepared_semantic_view(prepared, function_facts),
         route,
         route_reason,
+        proof_coverage,
+        render_permission,
         refusal,
+    }
+}
+
+fn render_permission_for_decompile_route(
+    route: &r2dec::SemanticRoutePlan,
+    cfg_summary: &CFGRiskSummary,
+    proof_coverage: &r2sym::ProofCoverage,
+    prepared_available: bool,
+) -> r2sym::RenderPermission {
+    match route {
+        r2dec::SemanticRoutePlan::Standard => {
+            proof_coverage.standard_control_render_permission(cfg_summary, prepared_available)
+        }
+        r2dec::SemanticRoutePlan::FallbackComment { comment } => {
+            r2sym::RenderPermission::refuse(r2sym::ProofOwner::R2engine, comment.clone())
+        }
+        r2dec::SemanticRoutePlan::VmSummary { reason }
+        | r2dec::SemanticRoutePlan::SummaryIslands { reason }
+        | r2dec::SemanticRoutePlan::LinearWorker { reason }
+        | r2dec::SemanticRoutePlan::StructuredWorker { reason } => {
+            r2sym::RenderPermission::summary(r2sym::ProofOwner::R2engine, reason.clone())
+        }
     }
 }
 
@@ -3996,6 +4388,7 @@ pub fn decompiler_context_with_route_decision(
 ) -> r2dec::DecompilerContext {
     context
         .with_semantic_route(Some(decision.route.clone()))
+        .with_render_permission(Some(decision.render_permission.clone()))
         .with_runtime_type_inference_policy(Some(decision.skip_runtime_type_inference))
         .with_prepared_semantic_view_policy(Some(decision.use_prepared_semantic_view))
 }
@@ -4169,15 +4562,17 @@ pub fn signature_override_from_type_facts(
     callconv: Option<&str>,
     type_facts: &r2types::FunctionTypeFacts,
 ) -> Option<r2types::InferredSignature> {
-    type_facts.merged_signature.as_ref().map(|signature| {
-        r2types::inferred_signature_from_signature_spec(
-            function_name,
-            arch_name,
-            ptr_bits,
-            callconv,
-            signature,
-        )
-    })
+    type_facts
+        .writeback_authorized_signature()
+        .map(|signature| {
+            r2types::inferred_signature_from_signature_spec(
+                function_name,
+                arch_name,
+                ptr_bits,
+                callconv,
+                signature,
+            )
+        })
 }
 
 pub fn bounded_cfg_type_writeback_plan(
@@ -4379,16 +4774,22 @@ fn preferred_semantic_fallback_comment(
     None
 }
 
-fn preferred_semantic_linearization_reason(
-    func_name: &str,
-    function_facts: &FunctionFacts,
-    cfg_summary: &CFGRiskSummary,
-) -> Option<String> {
+fn preferred_semantic_linearization_reason(context: &EngineRouteContext<'_>) -> Option<String> {
+    if !context.has_renderable_semantic_claims() {
+        return None;
+    }
+    let function_facts = context.function_facts;
     let capability = function_facts.decompile_capability();
     let plan = capability.plan.as_ref()?;
+    let prefer_standard_native =
+        prefers_standard_native_for_summary_only_worker(function_facts, context.cfg_summary);
+    let compact_renderable_worker = !capability.skipped_large_cfg
+        && !prefer_standard_native
+        && has_renderable_native_linear_worker_summary(function_facts);
     if let r2sym::DecompilePlan::NativeLinear { reason } = plan
         && capability.has_native_regions
-        && (!capability.skipped_large_cfg || !is_autogenerated_function_name(func_name))
+        && ((capability.skipped_large_cfg && !is_autogenerated_function_name(context.func_name))
+            || compact_renderable_worker)
         && matches!(capability.slice_class, Some(r2sym::SliceClass::Worker))
         && !capability.assumption_conflicted
         && capability.ambiguous_targets.is_empty()
@@ -4400,6 +4801,7 @@ fn preferred_semantic_linearization_reason(
         && capability.has_summary_islands
         && capability.has_primary_summary_islands
         && !capability.has_native_regions
+        && (capability.skipped_large_cfg || compact_renderable_worker)
         && matches!(
             capability.slice_class,
             Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
@@ -4411,7 +4813,7 @@ fn preferred_semantic_linearization_reason(
     {
         return Some(reason.clone());
     }
-    if !is_autogenerated_function_name(func_name) {
+    if !is_autogenerated_function_name(context.func_name) {
         return None;
     }
     let downgraded_from_structured = matches!(plan, r2sym::DecompilePlan::NativeStructured)
@@ -4423,14 +4825,19 @@ fn preferred_semantic_linearization_reason(
     if !linear_ready || !capability.skipped_large_cfg || !capability.has_native_regions {
         return None;
     }
-    Some(preferred_semantic_worker_reason(cfg_summary))
+    Some(preferred_semantic_worker_reason(context.cfg_summary))
 }
 
-fn preferred_semantic_summary_islands_reason(
-    function_facts: &FunctionFacts,
-    cfg_summary: &CFGRiskSummary,
-) -> Option<String> {
+fn preferred_semantic_summary_islands_reason(context: &EngineRouteContext<'_>) -> Option<String> {
+    if !context.has_renderable_semantic_claims() {
+        return None;
+    }
+    let function_facts = context.function_facts;
+    let cfg_summary = context.cfg_summary;
     let capability = function_facts.decompile_capability();
+    if prefers_standard_native_for_summary_only_worker(function_facts, cfg_summary) {
+        return None;
+    }
     if has_weak_summary_arg_contract_conflict(function_facts) {
         return None;
     }
@@ -4473,6 +4880,9 @@ fn preferred_semantic_summary_islands_reason(
             }
         }
         r2sym::DecompilePlan::NativeLinear { reason } => {
+            if has_summary_only_scan_table_worker(function_facts) {
+                return Some(reason.clone());
+            }
             if dense_summary_only_memory_worker {
                 return Some("dense summary-only memory worker".to_string());
             }
@@ -4492,13 +4902,12 @@ fn preferred_semantic_summary_islands_reason(
     }
 }
 
-fn preferred_semantic_structuring_reason(
-    func_name: &str,
-    function_facts: &FunctionFacts,
-    _cfg_summary: &CFGRiskSummary,
-) -> Option<String> {
-    let capability = function_facts.decompile_capability();
-    if !is_autogenerated_function_name(func_name) {
+fn preferred_semantic_structuring_reason(context: &EngineRouteContext<'_>) -> Option<String> {
+    let capability = context.function_facts.decompile_capability();
+    if !is_autogenerated_function_name(context.func_name) {
+        return None;
+    }
+    if !context.has_structured_control_claims() {
         return None;
     }
     if !capability
@@ -4518,7 +4927,7 @@ fn preferred_semantic_structuring_reason(
     {
         return None;
     }
-    Some(preferred_semantic_worker_reason(_cfg_summary))
+    Some(preferred_semantic_worker_reason(context.cfg_summary))
 }
 
 fn preferred_semantic_worker_reason(cfg_summary: &CFGRiskSummary) -> String {
@@ -4549,8 +4958,169 @@ fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) ->
         )
 }
 
+fn has_renderable_native_linear_worker_summary(function_facts: &FunctionFacts) -> bool {
+    let Some(native) = function_facts
+        .semantic_artifact()
+        .and_then(r2sym::SemanticArtifact::native_body)
+    else {
+        return false;
+    };
+    native_body_has_renderable_worker_summary(native)
+}
+
+fn native_body_has_renderable_worker_summary(native: &r2sym::NativeArtifactBody) -> bool {
+    if !r2sym::SemanticClaimSummary::from_native_body(native).has_renderable_non_name_claim() {
+        return false;
+    }
+    native
+        .summary
+        .worker_summaries
+        .iter()
+        .any(is_renderable_native_worker_summary)
+}
+
+fn is_renderable_native_worker_summary(summary: &r2sym::NativeWorkerSummary) -> bool {
+    if summary.has_name_hint_evidence() {
+        return false;
+    }
+    match summary.kind {
+        r2sym::NativeWorkerSummaryKind::NumericTransform => {
+            summary.dst.is_none()
+                && summary.memory.is_some()
+                && worker_summary_has_known_length(summary)
+                && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+                    loop_summary.fold.as_ref().is_some_and(|fold| {
+                        fold.operation == r2sym::NativeWorkerFoldOperation::Add
+                            && fold.predicate.is_some()
+                    })
+                })
+        }
+        r2sym::NativeWorkerSummaryKind::HashFold => {
+            summary.memory.is_some()
+                && worker_summary_has_known_length(summary)
+                && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+                    loop_summary.fold.as_ref().is_some_and(|fold| {
+                        fold.operation == r2sym::NativeWorkerFoldOperation::Xor
+                            && fold.init.is_some()
+                            && fold.multiplier.is_some()
+                    })
+                })
+        }
+        r2sym::NativeWorkerSummaryKind::Parser => {
+            summary.memory.is_some() && summary.parser.is_some()
+        }
+        r2sym::NativeWorkerSummaryKind::StringScan | r2sym::NativeWorkerSummaryKind::TableWalk => {
+            is_renderable_scan_table_worker_summary(summary)
+        }
+        _ => false,
+    }
+}
+
+fn has_summary_only_scan_table_worker(function_facts: &FunctionFacts) -> bool {
+    let Some(semantic_artifact) = function_facts.semantic_artifact() else {
+        return false;
+    };
+    if semantic_artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly {
+        return false;
+    }
+    semantic_artifact.native_body().is_some_and(|native| {
+        native
+            .summary
+            .worker_summaries
+            .iter()
+            .any(is_renderable_scan_table_worker_summary)
+    })
+}
+
+fn prefers_standard_native_for_summary_only_worker(
+    function_facts: &FunctionFacts,
+    cfg_summary: &CFGRiskSummary,
+) -> bool {
+    if cfg_guard_reason_from_summary(cfg_summary).is_some() {
+        return false;
+    }
+    let Some(semantic_artifact) = function_facts.semantic_artifact() else {
+        return false;
+    };
+    if semantic_artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly
+        || semantic_artifact.diagnostics.skipped_large_cfg
+    {
+        return false;
+    }
+    semantic_artifact.native_body().is_some_and(|native| {
+        native.summary.worker_summaries.iter().any(|summary| {
+            exact_hash_fold_summary_ready_for_native_render(summary)
+                || complete_table_walk_summary_ready_for_native_render(summary)
+        })
+    })
+}
+
+fn exact_hash_fold_summary_ready_for_native_render(summary: &r2sym::NativeWorkerSummary) -> bool {
+    if summary.kind != r2sym::NativeWorkerSummaryKind::HashFold
+        || summary.has_name_hint_evidence()
+        || summary.memory.is_none()
+        || !worker_summary_has_known_length(summary)
+    {
+        return false;
+    }
+    summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+        loop_summary.fold.as_ref().is_some_and(|fold| {
+            fold.operation == r2sym::NativeWorkerFoldOperation::Xor
+                && fold.init.is_some()
+                && fold.multiplier.is_some()
+        })
+    })
+}
+
+fn complete_table_walk_summary_ready_for_native_render(
+    summary: &r2sym::NativeWorkerSummary,
+) -> bool {
+    if summary.kind != r2sym::NativeWorkerSummaryKind::TableWalk
+        || summary.has_name_hint_evidence()
+        || summary.memory.is_none()
+    {
+        return false;
+    }
+    summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+        let Some(detail) = loop_summary.table_walk.as_ref() else {
+            return false;
+        };
+        detail.needle_arg.is_some()
+            && detail.id_offset.is_some()
+            && detail.len_offset.is_some()
+            && detail.name_offset.is_some()
+            && detail.next_offset.is_some()
+            && detail.count_accumulator.is_some()
+            && detail.match_returns_field_plus_count
+            && detail.exhausted_returns_negative_count
+    })
+}
+
+fn is_renderable_scan_table_worker_summary(summary: &r2sym::NativeWorkerSummary) -> bool {
+    matches!(
+        summary.kind,
+        r2sym::NativeWorkerSummaryKind::StringScan | r2sym::NativeWorkerSummaryKind::TableWalk
+    ) && summary.memory.is_some()
+        && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+            loop_summary.terminator.is_some_and(|terminator| {
+                !matches!(terminator, r2sym::NativeWorkerTerminator::Unknown)
+            })
+        })
+}
+
+fn worker_summary_has_known_length(summary: &r2sym::NativeWorkerSummary) -> bool {
+    matches!(
+        summary.len,
+        Some(r2ssa::SummaryTransferLength::Arg(_) | r2ssa::SummaryTransferLength::Const(_))
+    ) || summary
+        .loop_summary
+        .as_ref()
+        .and_then(|loop_summary| loop_summary.length_arg)
+        .is_some()
+}
+
 fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> bool {
-    let Some(signature) = function_facts.types.merged_signature.as_ref() else {
+    let Some(signature) = function_facts.types.render_authorized_signature() else {
         return false;
     };
     let Some(native) = function_facts
@@ -4760,6 +5330,293 @@ mod tests {
         vec![block]
     }
 
+    const VM_TEST_RAX: u64 = 0;
+    const VM_TEST_RBP: u64 = 8;
+
+    fn vm_test_arch() -> r2il::ArchSpec {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("RAX", VM_TEST_RAX, 8));
+        arch.add_register(r2il::RegisterDef::new("RBP", VM_TEST_RBP, 8));
+        arch
+    }
+
+    fn vm_reg(offset: u64, size: u32) -> r2il::Varnode {
+        r2il::Varnode::register(offset, size)
+    }
+
+    fn vm_const(value: u64, size: u32) -> r2il::Varnode {
+        r2il::Varnode::constant(value, size)
+    }
+
+    #[test]
+    fn opaque_typedef_signature_is_not_a_concrete_layout_hint() {
+        let mut parsed = r2types::ParsedExternalContext {
+            current_signature: Some(r2types::FunctionSignatureSpec {
+                ret_type: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+                params: vec![r2types::FunctionParamSpec {
+                    name: "items".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Typedef("Item".to_string()),
+                    ))),
+                }],
+            }),
+            ..r2types::ParsedExternalContext::default()
+        };
+
+        assert!(!parsed_context_has_layout_hints(&parsed));
+        let ssa = r2ssa::SsaArtifact::for_decompile(&const_return_blocks(0x401000, 0), None)
+            .expect("ssa");
+        assert!(should_skip_full_semantics_for_opaque_layout(&parsed, &ssa));
+
+        parsed.external_type_db.structs.insert(
+            "item".to_string(),
+            r2types::ExternalStruct {
+                name: "Item".to_string(),
+                fields: BTreeMap::from([(
+                    0,
+                    r2types::ExternalField {
+                        name: "id".to_string(),
+                        offset: 0,
+                        ty: Some("int32_t".to_string()),
+                    },
+                )]),
+            },
+        );
+
+        assert!(parsed_context_has_layout_hints(&parsed));
+        assert!(!should_skip_full_semantics_for_opaque_layout(&parsed, &ssa));
+    }
+
+    #[test]
+    fn concrete_layout_acyclic_call_free_route_skips_full_semantics() {
+        let parsed = concrete_item_context();
+        let ssa = r2ssa::SsaArtifact::for_decompile(&const_return_blocks(0x401000, 0), None)
+            .expect("ssa");
+        let pattern_blocks = ssa.local_ssa_blocks();
+
+        assert!(parsed_context_has_layout_hints(&parsed));
+        assert!(
+            should_skip_full_semantics_for_layout_backed_prepared_proofs(
+                &parsed,
+                &ssa,
+                &pattern_blocks,
+            )
+        );
+    }
+
+    #[test]
+    fn concrete_layout_loop_route_keeps_semantic_owner_available() {
+        let parsed = concrete_item_context();
+        let mut entry = R2ILBlock::new(0x401000, 4);
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::constant(0x401000, 8),
+            cond: r2il::Varnode::constant(1, 1),
+        });
+        let ssa = r2ssa::SsaArtifact::for_decompile(&[entry], None).expect("ssa");
+        let pattern_blocks = ssa.local_ssa_blocks();
+
+        assert!(
+            !should_skip_full_semantics_for_layout_backed_prepared_proofs(
+                &parsed,
+                &ssa,
+                &pattern_blocks,
+            )
+        );
+    }
+
+    #[test]
+    fn optional_semantics_needs_bounded_local_memory_evidence() {
+        let mut parsed = r2types::ParsedExternalContext {
+            current_signature: Some(r2types::FunctionSignatureSpec {
+                ret_type: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+                params: vec![r2types::FunctionParamSpec {
+                    name: "items".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Typedef("Item".to_string()),
+                    ))),
+                }],
+            }),
+            ..r2types::ParsedExternalContext::default()
+        };
+        let ssa = r2ssa::SsaArtifact::for_decompile(&const_return_blocks(0x401000, 0), None)
+            .expect("ssa");
+        let pattern_blocks = ssa.local_ssa_blocks();
+
+        assert!(!optional_semantics_required_for_analysis(
+            &parsed,
+            &ssa,
+            &pattern_blocks,
+            true,
+        ));
+
+        parsed.stack_slots.insert(
+            r2types::StackSlotKey {
+                base: r2types::ExternalStackBase::FramePointer,
+                offset: -8,
+            },
+            r2types::ExternalStackSlotSpec {
+                name: "loc".to_string(),
+                ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                    r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    },
+                ))),
+                base: r2types::ExternalStackBase::FramePointer,
+                role: r2types::ExternalStackSlotRole::Local,
+                ..r2types::ExternalStackSlotSpec::default()
+            },
+        );
+
+        assert!(optional_semantics_required_for_analysis(
+            &parsed,
+            &ssa,
+            &pattern_blocks,
+            false,
+        ));
+    }
+
+    fn concrete_item_context() -> r2types::ParsedExternalContext {
+        let mut parsed = r2types::ParsedExternalContext {
+            current_signature: Some(r2types::FunctionSignatureSpec {
+                ret_type: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+                params: vec![r2types::FunctionParamSpec {
+                    name: "items".to_string(),
+                    ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Typedef("Item".to_string()),
+                    ))),
+                }],
+            }),
+            ..r2types::ParsedExternalContext::default()
+        };
+        parsed.external_type_db.structs.insert(
+            "item".to_string(),
+            r2types::ExternalStruct {
+                name: "Item".to_string(),
+                fields: BTreeMap::from([(
+                    0,
+                    r2types::ExternalField {
+                        name: "id".to_string(),
+                        offset: 0,
+                        ty: Some("int32_t".to_string()),
+                    },
+                )]),
+            },
+        );
+        parsed
+    }
+
+    fn vm_selector_dispatch_ops() -> Vec<r2il::R2ILOp> {
+        vec![
+            r2il::R2ILOp::Load {
+                dst: vm_reg(VM_TEST_RAX, 8),
+                space: r2il::SpaceId::Ram,
+                addr: vm_reg(VM_TEST_RBP, 8),
+            },
+            r2il::R2ILOp::IntMult {
+                dst: vm_reg(VM_TEST_RAX, 8),
+                a: vm_reg(VM_TEST_RAX, 8),
+                b: vm_const(8, 8),
+            },
+            r2il::R2ILOp::BranchInd {
+                target: vm_reg(VM_TEST_RAX, 8),
+            },
+        ]
+    }
+
+    fn switch_loop_vm_blocks() -> Vec<R2ILBlock> {
+        let mut entry = R2ILBlock::new(0x9300, 4);
+        entry.push(r2il::R2ILOp::Branch {
+            target: vm_const(0x9304, 8),
+        });
+
+        let mut dispatch = R2ILBlock::new(0x9304, 4);
+        for op in vm_selector_dispatch_ops() {
+            dispatch.push(op);
+        }
+        dispatch.switch_info = Some(r2il::SwitchInfo {
+            switch_addr: 0x9304,
+            min_val: 0,
+            max_val: 4,
+            default_target: Some(0x9318),
+            cases: vec![
+                r2il::SwitchCase {
+                    value: 0,
+                    target: 0x9308,
+                },
+                r2il::SwitchCase {
+                    value: 1,
+                    target: 0x930c,
+                },
+                r2il::SwitchCase {
+                    value: 2,
+                    target: 0x9310,
+                },
+                r2il::SwitchCase {
+                    value: 3,
+                    target: 0x9314,
+                },
+            ],
+        });
+
+        let mut add = R2ILBlock::new(0x9308, 4);
+        add.push(r2il::R2ILOp::IntAdd {
+            dst: vm_reg(VM_TEST_RAX, 8),
+            a: vm_reg(VM_TEST_RAX, 8),
+            b: vm_const(1, 8),
+        });
+        add.push(r2il::R2ILOp::Branch {
+            target: vm_const(0x9304, 8),
+        });
+
+        let mut sub = R2ILBlock::new(0x930c, 4);
+        sub.push(r2il::R2ILOp::IntSub {
+            dst: vm_reg(VM_TEST_RAX, 8),
+            a: vm_reg(VM_TEST_RAX, 8),
+            b: vm_const(1, 8),
+        });
+        sub.push(r2il::R2ILOp::Branch {
+            target: vm_const(0x9304, 8),
+        });
+
+        let mut xor = R2ILBlock::new(0x9310, 4);
+        xor.push(r2il::R2ILOp::IntXor {
+            dst: vm_reg(VM_TEST_RAX, 8),
+            a: vm_reg(VM_TEST_RAX, 8),
+            b: vm_const(0x55, 8),
+        });
+        xor.push(r2il::R2ILOp::Branch {
+            target: vm_const(0x9304, 8),
+        });
+
+        let mut shl = R2ILBlock::new(0x9314, 4);
+        shl.push(r2il::R2ILOp::IntLeft {
+            dst: vm_reg(VM_TEST_RAX, 8),
+            a: vm_reg(VM_TEST_RAX, 8),
+            b: vm_const(1, 8),
+        });
+        shl.push(r2il::R2ILOp::Branch {
+            target: vm_const(0x9304, 8),
+        });
+
+        let mut default = R2ILBlock::new(0x9318, 4);
+        default.push(r2il::R2ILOp::Branch {
+            target: vm_const(0x9304, 8),
+        });
+
+        vec![entry, dispatch, add, sub, xor, shl, default]
+    }
+
     #[test]
     fn raw_cfg_preprobe_summary_counts_back_edges_without_ssa() {
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -4855,6 +5712,191 @@ mod tests {
                 cache_hit: false,
             },
         }
+    }
+
+    fn native_linear_predicated_count_artifact() -> r2sym::SemanticArtifact {
+        let mut artifact = native_linear_artifact(r2sym::SliceClass::Worker);
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            unreachable!("native artifact helper must build native body");
+        };
+        native.summary.worker_summaries = vec![r2sym::NativeWorkerSummary {
+            anchor: 0x401100,
+            kind: r2sym::NativeWorkerSummaryKind::NumericTransform,
+            dst: None,
+            src: None,
+            memory: Some(r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                range: None,
+            }),
+            len: Some(r2ssa::SummaryTransferLength::Arg(1)),
+            allocation: None,
+            lifetime: None,
+            sync: None,
+            atomic: None,
+            parser: None,
+            loop_summary: Some(r2sym::NativeWorkerLoopSummary {
+                header: 0x401100,
+                exit_target: Some(0x401140),
+                iterations: None,
+                length_arg: Some(1),
+                stride: Some(1),
+                terminator: Some(r2sym::NativeWorkerTerminator::LengthBound),
+                table_walk: None,
+                fold: Some(r2sym::NativeWorkerFold {
+                    accumulator: "count".to_string(),
+                    bits: 64,
+                    operation: r2sym::NativeWorkerFoldOperation::Add,
+                    predicate: Some(r2sym::NativeWorkerPredicate::ByteEqArg { arg: 2 }),
+                    init: None,
+                    multiplier: None,
+                    byte_transform: None,
+                }),
+            }),
+            evidence: r2sym::SemanticEvidence::likely(
+                r2sym::SemanticEvidenceReason::DerivedFromRanking,
+            ),
+        }];
+        artifact
+    }
+
+    fn native_linear_table_walk_artifact() -> r2sym::SemanticArtifact {
+        let mut artifact = native_linear_artifact(r2sym::SliceClass::Worker);
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            unreachable!("native artifact helper must build native body");
+        };
+        native.summary.worker_summaries = vec![r2sym::NativeWorkerSummary {
+            anchor: 0x401100,
+            kind: r2sym::NativeWorkerSummaryKind::TableWalk,
+            dst: None,
+            src: None,
+            memory: Some(r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                range: Some(r2ssa::SummaryMemoryRange {
+                    offset_lo: 0,
+                    offset_hi: 0,
+                    width: Some(8),
+                }),
+            }),
+            len: None,
+            allocation: None,
+            lifetime: None,
+            sync: None,
+            atomic: None,
+            parser: None,
+            loop_summary: Some(r2sym::NativeWorkerLoopSummary {
+                header: 0x401100,
+                exit_target: Some(0x401140),
+                iterations: None,
+                length_arg: None,
+                stride: Some(1),
+                terminator: Some(r2sym::NativeWorkerTerminator::ZeroByte),
+                fold: None,
+                table_walk: None,
+            }),
+            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
+        }];
+        artifact
+    }
+
+    fn summary_only_table_walk_artifact() -> r2sym::SemanticArtifact {
+        let mut artifact = native_linear_table_walk_artifact();
+        artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            unreachable!("native artifact helper must build native body");
+        };
+        native.regions.clear();
+        artifact
+    }
+
+    fn summary_only_complete_table_walk_artifact() -> r2sym::SemanticArtifact {
+        let mut artifact = summary_only_table_walk_artifact();
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            unreachable!("native artifact helper must build native body");
+        };
+        let loop_summary = native.summary.worker_summaries[0]
+            .loop_summary
+            .as_mut()
+            .expect("table walk loop summary");
+        loop_summary.table_walk = Some(r2sym::NativeTableWalkSummary {
+            table_arg: 0,
+            needle_arg: Some(1),
+            id_offset: Some(0),
+            len_offset: Some(6),
+            name_offset: Some(24),
+            next_offset: Some(32),
+            count_accumulator: Some("seen".to_string()),
+            match_returns_field_plus_count: true,
+            exhausted_returns_negative_count: true,
+        });
+        artifact
+    }
+
+    fn summary_only_exact_hash_fold_artifact() -> r2sym::SemanticArtifact {
+        let mut artifact = native_linear_artifact(r2sym::SliceClass::Worker);
+        artifact.granularity = r2sym::ArtifactGranularity::SummaryOnly;
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            unreachable!("native artifact helper must build native body");
+        };
+        native.regions.clear();
+        native.summary.worker_summaries = vec![r2sym::NativeWorkerSummary {
+            anchor: 0x401100,
+            kind: r2sym::NativeWorkerSummaryKind::HashFold,
+            dst: None,
+            src: None,
+            memory: Some(r2ssa::SummaryMemoryLocation {
+                region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
+                range: Some(r2ssa::SummaryMemoryRange {
+                    offset_lo: 0,
+                    offset_hi: 0,
+                    width: Some(1),
+                }),
+            }),
+            len: Some(r2ssa::SummaryTransferLength::Arg(1)),
+            allocation: None,
+            lifetime: None,
+            sync: None,
+            atomic: None,
+            parser: None,
+            loop_summary: Some(r2sym::NativeWorkerLoopSummary {
+                header: 0x401100,
+                exit_target: Some(0x401140),
+                iterations: None,
+                length_arg: Some(1),
+                stride: Some(1),
+                terminator: Some(r2sym::NativeWorkerTerminator::LengthBound),
+                fold: Some(r2sym::NativeWorkerFold {
+                    accumulator: "hash".to_string(),
+                    bits: 64,
+                    operation: r2sym::NativeWorkerFoldOperation::Xor,
+                    predicate: None,
+                    init: Some(0x14650fb0739d0383),
+                    multiplier: Some(0x100000001b3),
+                    byte_transform: Some(r2sym::NativeWorkerByteTransform::AsciiLowercase),
+                }),
+                table_walk: None,
+            }),
+            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
+        }];
+        artifact
+    }
+
+    fn pad_summary_only_artifact_to_dense(
+        mut artifact: r2sym::SemanticArtifact,
+    ) -> r2sym::SemanticArtifact {
+        let r2sym::SemanticArtifactBody::Native(native) = &mut artifact.body else {
+            unreachable!("native artifact helper must build native body");
+        };
+        let template = native.summary.worker_summaries[0].clone();
+        while native.summary.worker_summaries.len() < 8 {
+            let mut summary = template.clone();
+            summary.anchor += native.summary.worker_summaries.len() as u64 * 0x10;
+            summary.kind = r2sym::NativeWorkerSummaryKind::Unknown;
+            summary.memory = None;
+            summary.len = None;
+            summary.loop_summary = None;
+            native.summary.worker_summaries.push(summary);
+        }
+        artifact
     }
 
     #[test]
@@ -5073,6 +6115,150 @@ mod tests {
     }
 
     #[test]
+    fn decompile_route_decision_reports_prepared_proof_coverage() {
+        let mut entry = R2ILBlock::new(0x401000, 4);
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::constant(0x401000, 8),
+            cond: r2il::Varnode::constant(1, 1),
+        });
+        let blocks = vec![entry];
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
+            .expect("prepared")
+            .with_name("sym.loop");
+        let cfg_summary = prepared.function().cfg_risk_summary();
+        let function_facts = FunctionFacts::default();
+
+        let decision = decompile_route_decision(
+            "sym.loop",
+            &function_facts,
+            Some(&prepared),
+            &function_facts.types,
+            &cfg_summary,
+        );
+
+        assert!(decision.proof_coverage.certified_loops > 0);
+        assert_eq!(
+            decision.render_permission.kind,
+            r2sym::RenderPermissionKind::CertifiedC
+        );
+        assert_eq!(
+            EngineRequestPlan::decompile(decision)
+                .diagnostics()
+                .proof_coverage
+                .expect("proof coverage")
+                .certified_loops,
+            1
+        );
+    }
+
+    #[test]
+    fn type_fact_proof_coverage_counts_only_source_authorized_out_params() {
+        let type_facts = FunctionTypeFacts {
+            out_param_certificates: vec![
+                r2types::OutParamCertificate {
+                    param_index: 0,
+                    param_name: "raw".to_string(),
+                    pointee_type: None,
+                    evidence: vec![r2types::OutParamCertificateEvidence::InterprocArgWrite],
+                    sources: Vec::new(),
+                },
+                r2types::OutParamCertificate {
+                    param_index: 1,
+                    param_name: "out".to_string(),
+                    pointee_type: None,
+                    evidence: vec![r2types::OutParamCertificateEvidence::NativeWorkerWrite],
+                    sources: vec![r2types::OutParamCertificateSource::NativeWorkerSummary {
+                        stable_id: 0x55,
+                        anchor: 0x401000,
+                        summary_kind: r2sym::NativeWorkerSummaryKind::MemoryWrite,
+                        param_index: 1,
+                    }],
+                },
+            ],
+            ..FunctionTypeFacts::default()
+        };
+
+        assert_eq!(
+            proof_coverage_from_type_facts(&type_facts).certified_out_params,
+            1
+        );
+    }
+
+    #[test]
+    fn type_fact_proof_coverage_counts_only_render_authorized_signature() {
+        let current_signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Typedef("size_t".to_string())),
+            params: vec![r2types::FunctionParamSpec {
+                name: "buf".to_string(),
+                ty: r2types::parse_type_like_spec("uint8_t*", 64),
+            }],
+        };
+        let stale_signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Typedef("int".to_string())),
+            params: vec![r2types::FunctionParamSpec {
+                name: "other".to_string(),
+                ty: Some(r2types::CTypeLike::Typedef("int".to_string())),
+            }],
+        };
+        let stale_certified = FunctionTypeFacts {
+            merged_signature: Some(current_signature.clone()),
+            signature_certificate: r2types::SignatureCertificate::from_signature(
+                &stale_signature,
+                [r2types::SignatureCertificateSource::ExternalContext],
+            ),
+            ..FunctionTypeFacts::default()
+        };
+        let current_certified = FunctionTypeFacts {
+            merged_signature: Some(current_signature.clone()),
+            signature_certificate: r2types::SignatureCertificate::from_signature(
+                &current_signature,
+                [r2types::SignatureCertificateSource::ExternalContext],
+            ),
+            ..FunctionTypeFacts::default()
+        };
+
+        assert_eq!(
+            proof_coverage_from_type_facts(&stale_certified).certified_signatures,
+            0
+        );
+        assert_eq!(
+            proof_coverage_from_type_facts(&current_certified).certified_signatures,
+            1
+        );
+    }
+
+    #[test]
+    fn decompile_route_decision_residualizes_loop_cfg_without_prepared_proof() {
+        let cfg_summary = r2ssa::CFGRiskSummary {
+            block_count: 2,
+            loop_count: 1,
+            back_edge_count: 1,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let function_facts = FunctionFacts::default();
+
+        let decision = decompile_route_decision(
+            "sym.loop",
+            &function_facts,
+            None,
+            &function_facts.types,
+            &cfg_summary,
+        );
+
+        assert_eq!(
+            decision.render_permission.kind,
+            r2sym::RenderPermissionKind::Residual
+        );
+        assert!(
+            decision
+                .render_permission
+                .reason
+                .contains("missing prepared SSA certificates")
+        );
+    }
+
+    #[test]
     fn engine_session_summary_decompile_owns_render_cache() {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x402000, 0);
@@ -5102,6 +6288,25 @@ mod tests {
         assert_eq!(metrics.renders.hits, 1);
         assert_eq!(metrics.renders.misses, 1);
         assert_eq!(metrics.renders.insertions, 1);
+    }
+
+    #[test]
+    fn summary_preprobe_standard_exact_worker_defers_to_full_native_decompile() {
+        let session = EngineSession::new(4);
+        let blocks = const_return_blocks(0x402000, 0);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
+        let artifact = pad_summary_only_artifact_to_dense(summary_only_exact_hash_fold_artifact());
+        let request = EngineSummaryDecompileRequest {
+            function_name: "dbg.fnv_fold".to_string(),
+            cfg_summary: prepared.function().cfg_risk_summary(),
+            function_facts: FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact)),
+            named_worker_guarded: false,
+            config: r2dec::DecompilerConfig::x86_64(),
+            render_cache_key: None,
+            fallback_comment: Some("/* summary fallback */".to_string()),
+        };
+
+        assert!(session.decompile_summary(request).is_none());
     }
 
     #[test]
@@ -5158,8 +6363,9 @@ mod tests {
         let decision =
             decompile_probe_decision(&blocks, 0x4b30, "fcn.00004b30", "readlinebuffer_delim");
 
-        assert!(decision.display_summary_family);
-        assert!(decision.named_worker_guarded);
+        assert!(!decision.display_summary_family);
+        assert!(!decision.named_worker_guarded);
+        assert!(decision.block_guarded);
         assert!(decision.summary_probe_needed);
         assert!(decision.summary_probe_skipped_large_cfg);
         assert_eq!(decision.summary_probe_name, "readlinebuffer_delim");
@@ -5188,7 +6394,7 @@ mod tests {
     }
 
     #[test]
-    fn decompile_probe_decision_prefers_full_diagnostic_wrappers() {
+    fn decompile_probe_decision_does_not_prefer_full_diagnostic_name_without_evidence() {
         let mut blocks = const_return_blocks(0x4bc0, 0);
         for idx in 0..600 {
             blocks[0].push(r2il::R2ILOp::Copy {
@@ -5199,10 +6405,10 @@ mod tests {
 
         let decision = decompile_probe_decision(&blocks, 0x4bc0, "sym.diagnose", "sym.diagnose");
 
-        assert!(decision.display_summary_family);
-        assert!(!decision.block_guarded);
+        assert!(!decision.display_summary_family);
+        assert!(decision.block_guarded);
         assert!(decision.summary_probe_needed);
-        assert!(!decision.summary_probe_skipped_large_cfg);
+        assert!(decision.summary_probe_skipped_large_cfg);
     }
 
     #[test]
@@ -5226,7 +6432,10 @@ mod tests {
             ]
         );
         assert_eq!(identity.summary_probe_name(), "sym.limfield.isra.0");
-        assert!(identity.has_summary_family());
+        assert!(
+            !identity.has_summary_family(),
+            "name aliases alone must not create summary-family applicability"
+        );
     }
 
     #[test]
@@ -5238,8 +6447,8 @@ mod tests {
             ["dbg.init_node"],
         );
 
-        assert!(identity.name_candidates().any(|name| {
-            r2sym::native_worker_summary_applicability_for_name(identity.function_addr, name)
+        assert!(identity.name_candidates().all(|name| {
+            !r2sym::native_worker_summary_applicability_for_name(identity.function_addr, name)
                 .is_supported()
         }));
         assert!(
@@ -5247,7 +6456,7 @@ mod tests {
                 .name_candidates()
                 .any(should_use_direct_named_native_worker_decompile)
         );
-        assert_eq!(identity.summary_probe_name(), "dbg.init_node");
+        assert_eq!(identity.summary_probe_name(), "fcn.00008b50");
     }
 
     #[test]
@@ -5304,9 +6513,6 @@ mod tests {
             "dbg.write_bytes",
             "dbg.is_utf8_charset",
             "dbg.mcel_tocmp",
-            "sym.blake2b_compress",
-            "sym.sm3_process_block",
-            "sym.sha256_process_block",
             "dbg.re_string_reconstruct",
             "dbg.parse_datetime_body",
             "dbg.posixtime",
@@ -5340,10 +6546,9 @@ mod tests {
             "dbg.posix2_version",
         ] {
             let applicability = r2sym::native_worker_summary_applicability_for_name(0, name);
-            assert!(applicability.is_supported(), "missing hint for {name}");
             assert!(
-                applicability.is_name_hint_only(),
-                "expected name-only hint for {name}: {applicability:?}"
+                !applicability.is_supported(),
+                "name-only worker families must not create applicability for {name}: {applicability:?}"
             );
             assert!(
                 !should_use_direct_named_native_worker_decompile(name),
@@ -5360,14 +6565,29 @@ mod tests {
         assert!(!should_use_direct_named_native_worker_decompile(
             "dbg.canonicalize_filename_mode"
         ));
-        assert!(should_prefer_full_decompile_for_named_worker(
+        for name in [
+            "sym.blake2b_compress",
+            "sym.sm3_process_block",
+            "sym.sha256_process_block",
+        ] {
+            let applicability = r2sym::native_worker_summary_applicability_for_name(0, name);
+            assert!(
+                !applicability.is_supported(),
+                "crypto/hash names alone must not create worker applicability for {name}: {applicability:?}"
+            );
+            assert!(
+                !should_use_direct_named_native_worker_decompile(name),
+                "unsupported hash name must not select direct decompile for {name}"
+            );
+        }
+        assert!(!should_prefer_full_decompile_for_named_worker(
             "sym.diagnose"
         ));
     }
 
     #[test]
-    fn direct_named_worker_type_projection_includes_program_orchestrators() {
-        assert!(should_use_direct_named_native_worker_type_projection(
+    fn direct_named_worker_type_projection_rejects_program_orchestrator_name_hints() {
+        assert!(!should_use_direct_named_native_worker_type_projection(
             "dbg.main"
         ));
         for name in [
@@ -5473,11 +6693,40 @@ mod tests {
     }
 
     #[test]
-    fn prefer_full_named_workers_request_decompile_preprobe() {
+    fn semantic_compile_preprobes_flag_expanded_loop_workers_before_solver() {
+        let mut entry = R2ILBlock::new(0x9050, 4);
+        for index in 0..300 {
+            entry.push(r2il::R2ILOp::Copy {
+                dst: r2il::Varnode::unique(index, 1),
+                src: r2il::Varnode::constant(index, 1),
+            });
+        }
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::constant(0x9050, 8),
+            cond: r2il::Varnode::constant(1, 1),
+        });
+        let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry.clone()], None)
+            .expect("loop ssa")
+            .with_name("dbg.flag_expanded_loop_worker");
+        let decision = decompile_probe_decision(
+            &[entry],
+            0x9050,
+            "dbg.flag_expanded_loop_worker",
+            "dbg.flag_expanded_loop_worker",
+        );
+
+        assert!(should_probe_native_worker_summary_before_full_semantics(
+            &loop_ssa, None
+        ));
+        assert!(decision.summary_probe_needed);
+    }
+
+    #[test]
+    fn prefer_full_named_workers_need_evidence_before_decompile_preprobe() {
         let blocks = const_return_blocks(0x401000, 0);
         let decision = decompile_probe_decision(&blocks, 0x401000, "dbg.diagnose", "dbg.diagnose");
 
-        assert!(decision.summary_probe_needed);
+        assert!(!decision.summary_probe_needed);
         assert!(!decision.summary_probe_skipped_large_cfg);
     }
 
@@ -5504,6 +6753,37 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn semantic_compile_keeps_vm_evidence_after_loop_preprobe() {
+        let blocks = switch_loop_vm_blocks();
+        let arch = vm_test_arch();
+        let vm_ssa = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch))
+            .expect("vm ssa")
+            .with_name("dbg.vm_loop_worker");
+
+        assert!(should_probe_native_worker_summary_before_full_semantics(
+            &vm_ssa, None
+        ));
+        assert!(
+            r2sym::has_strong_vm_evidence(&vm_ssa),
+            "test fixture must carry enough structural VM evidence to justify bypassing the refusal gate"
+        );
+        assert!(!should_skip_unbounded_semantic_artifact_after_worker_preprobe(&vm_ssa, None));
+
+        let artifact = maybe_compile_semantic_artifact_for_analysis(
+            &vm_ssa,
+            0x9300,
+            "dbg.vm_loop_worker",
+            None,
+            Some(&arch),
+            None,
+        )
+        .expect("vm artifact should not be refused before classification");
+
+        assert_eq!(artifact.execution, r2sym::ExecutionModel::Vm);
+        assert!(artifact.vm_body().is_some());
     }
 
     #[test]
@@ -5554,11 +6834,15 @@ mod tests {
         };
         let projected = type_facts_with_summary_projection_for_candidates_with_options(
             FunctionTypeFacts {
+                signature_certificate: r2types::SignatureCertificate::from_signature(
+                    &source_signature,
+                    [r2types::SignatureCertificateSource::ExternalContext],
+                ),
                 merged_signature: Some(source_signature),
                 ..FunctionTypeFacts::default()
             },
-            "dbg.mem_scan2",
-            ["dbg.mem_scan2"],
+            "dbg.scan_example",
+            ["dbg.scan_example"],
             "x86-64",
             64,
             &artifact,
@@ -5590,88 +6874,26 @@ mod tests {
     }
 
     #[test]
-    fn summary_projection_uses_register_params_when_signature_is_absent() {
-        let summary = native_worker_summary_seed(0x401000, "sym.diagnose")
-            .expect("expected diagnostic summary seed");
-        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
-            .expect("expected diagnostic summary artifact");
-        let type_facts = FunctionTypeFacts {
-            register_params: [
-                "rdi", "rsi", "rdx", "rcx", "r8", "r9", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(idx, reg)| r2types::ExternalRegisterParamSpec {
-                name: format!("arg{}", idx + 1),
-                ty: None,
-                reg: reg.to_string(),
-            })
-            .collect(),
-            ..FunctionTypeFacts::default()
-        };
-
-        let projected = type_facts_with_summary_projection_for_candidates(
-            type_facts,
+    fn name_only_native_worker_seed_is_not_created() {
+        for name in [
             "sym.diagnose",
-            ["sym.diagnose"],
-            "x86-64",
-            64,
-            &artifact,
-        );
-        let signature = projected
-            .merged_signature
-            .expect("diagnostic summary should project a signature");
-
-        assert_eq!(signature.params.len(), 11);
-        assert_eq!(signature.params[0].name, "errnum");
-        assert_eq!(signature.params[1].name, "fmt");
-        assert_eq!(signature.params[10].name, "diag_value9");
+            "dbg.parse_field_count",
+            "randread",
+            "dbg.print_current_files",
+        ] {
+            assert!(
+                native_worker_summary_seed(0x401000, name).is_none(),
+                "name-only worker seed must not be created for {name}"
+            );
+        }
     }
 
     #[test]
-    fn name_owned_summary_projection_truncates_noisy_register_args() {
-        let summary = native_worker_summary_seed(0x401000, "dbg.parse_field_count")
-            .expect("expected parser summary seed");
-        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
-            .expect("expected parser summary artifact");
-        let noisy_signature = r2types::FunctionSignatureSpec {
-            ret_type: Some(r2types::CTypeLike::Typedef("int64_t".to_string())),
-            params: (0..4)
-                .map(|idx| r2types::FunctionParamSpec {
-                    name: format!("arg{}", idx + 1),
-                    ty: Some(r2types::CTypeLike::Typedef("int64_t".to_string())),
-                })
-                .collect(),
-        };
-        let type_facts = FunctionTypeFacts {
-            merged_signature: Some(noisy_signature),
-            register_params: ["rdi", "rsi", "rdx", "rcx"]
-                .into_iter()
-                .enumerate()
-                .map(|(idx, reg)| r2types::ExternalRegisterParamSpec {
-                    name: format!("arg{}", idx + 1),
-                    ty: Some(r2types::CTypeLike::Typedef("int64_t".to_string())),
-                    reg: reg.to_string(),
-                })
-                .collect(),
-            ..FunctionTypeFacts::default()
-        };
+    fn libc_summary_seed_still_represents_known_import_semantics() {
+        let summary = native_worker_summary_seed(0x401000, "sym.imp.memcpy").expect("memcpy seed");
 
-        let projected = type_facts_with_summary_projection_for_candidates(
-            type_facts,
-            "dbg.parse_field_count",
-            ["dbg.parse_field_count"],
-            "x86-64",
-            64,
-            &artifact,
-        );
-        let signature = projected
-            .merged_signature
-            .expect("parser summary should project a signature");
-
-        assert_eq!(signature.params.len(), 3);
-        assert_eq!(projected.register_params.len(), 3);
-        assert_eq!(signature.params[2].name, "msgid");
+        assert!(!summary.transfer_effects.is_empty());
+        assert_eq!(summary.arg_count_hint, Some(3));
     }
 
     #[test]
@@ -5717,13 +6939,12 @@ mod tests {
     }
 
     #[test]
-    fn type_route_decision_keeps_summary_only_worker_as_type_input() {
-        let summary = native_worker_summary_seed(0x11a9, "randread")
-            .expect("expected randread native-worker seed");
-        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
-            .expect("expected randread native-worker artifact");
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact.clone()));
+    fn type_route_decision_does_not_treat_name_only_workers_as_type_input() {
+        let summary = r2ssa::FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x11a9),
+            Some("randread".to_string()),
+        );
+        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true);
         let cfg_summary = r2ssa::CFGRiskSummary {
             block_count: 200,
             loop_count: 8,
@@ -5731,15 +6952,9 @@ mod tests {
             switch_block_count: 0,
             max_switch_cases: 0,
         };
+        let function_facts = FunctionFacts::default();
 
-        assert!(semantic_or_cfg_prefers_bounded_type_plan(
-            &artifact,
-            &cfg_summary
-        ));
-        assert!(!semantic_artifact_needs_fallback_type_payload(
-            &artifact,
-            &cfg_summary
-        ));
+        assert!(artifact.is_none());
         assert_eq!(
             type_route_decision(&function_facts, &cfg_summary, false).kind,
             EngineTypeRouteKind::FullWriteback
@@ -5748,17 +6963,22 @@ mod tests {
 
     #[test]
     fn bounded_cfg_writeback_plan_preserves_signature_context() {
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Void),
+            params: vec![r2types::FunctionParamSpec {
+                name: "status".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            }],
+        };
         let type_facts = FunctionTypeFacts {
-            merged_signature: Some(r2types::FunctionSignatureSpec {
-                ret_type: Some(r2types::CTypeLike::Void),
-                params: vec![r2types::FunctionParamSpec {
-                    name: "status".to_string(),
-                    ty: Some(r2types::CTypeLike::Int {
-                        bits: 32,
-                        signedness: r2types::Signedness::Signed,
-                    }),
-                }],
-            }),
+            signature_certificate: r2types::SignatureCertificate::from_signature(
+                &signature,
+                [r2types::SignatureCertificateSource::ExternalContext],
+            ),
+            merged_signature: Some(signature),
             ..FunctionTypeFacts::default()
         };
         let function_facts = FunctionFacts::new(type_facts, None);
@@ -5780,46 +7000,97 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fallback_writeback_plan_preserves_name_owned_role_signature() {
-        let summary = r2ssa::FunctionSemanticSummary::seed_for_name(
-            r2ssa::InterprocFunctionId(0x11a9),
-            "verror_at_line",
-        )
-        .unwrap_or_else(|| {
-            r2ssa::FunctionSemanticSummary::unknown(
-                r2ssa::InterprocFunctionId(0x11a9),
-                Some("verror_at_line".to_string()),
-            )
-        });
-        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
-            .expect("expected named diagnostic summary artifact");
-        let role_signature = r2types::signature_hint_for_name_candidates(["verror_at_line"], 6)
-            .expect("expected exact diagnostic role signature");
-        let function_facts = FunctionFacts::new(
-            FunctionTypeFacts {
-                merged_signature: Some(role_signature),
-                ..FunctionTypeFacts::default()
+    fn decompile_type_override_prefers_authoritative_context_signature() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let signature = r2types::FunctionSignatureSpec {
+            ret_type: Some(r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            }),
+            params: vec![r2types::FunctionParamSpec {
+                name: "buf".to_string(),
+                ty: Some(r2types::CTypeLike::Pointer(Box::new(
+                    r2types::CTypeLike::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    },
+                ))),
+            }],
+        };
+        let request = EngineAnalyzeRequest {
+            function_name: "dbg.fnv_fold".to_string(),
+            function_addr: 0x401000,
+            blocks: blocks.clone(),
+            arch: None,
+            ptr_bits: 64,
+            semantic_metadata_enabled: false,
+            reg_type_hints: HashMap::new(),
+            parsed_context: r2types::ParsedExternalContext {
+                current_signature: Some(signature.clone()),
+                merged_signature: Some(signature),
+                ..r2types::ParsedExternalContext::default()
             },
-            Some(artifact.clone()),
-        );
+            external_context_fallback_hash: 0,
+            scope_facts: InterprocScopeFacts::empty(),
+            interproc_max_iterations: 1,
+            symbolic_scope: None,
+            precomputed_semantic_artifact: None,
+            semantic_mode: EngineSemanticMode::Full,
+            include_interproc_summary_set: true,
+        };
+        let ssa = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("ssa");
+        let artifact = EngineAnalysisArtifact {
+            ssa_func: ssa.clone(),
+            pattern_ssa_func: ssa,
+            function_facts: FunctionFacts::default(),
+            writeback_plan: r2types::TypeWritebackPlan {
+                signature: r2types::InferredSignature {
+                    function_name: "dbg.fnv_fold".to_string(),
+                    signature: "int64_t dbg.fnv_fold (int64_t arg1)".to_string(),
+                    ret_type: "int64_t".to_string(),
+                    params: vec![r2types::InferredSignatureParam {
+                        name: "arg1".to_string(),
+                        param_type: "int64_t".to_string(),
+                    }],
+                    callconv: "amd64".to_string(),
+                    arch: "x86-64".to_string(),
+                    confidence: 80,
+                    callconv_confidence: 80,
+                },
+                var_type_candidates: Vec::new(),
+                var_rename_candidates: Vec::new(),
+                struct_decls: Vec::new(),
+                global_type_links: Vec::new(),
+                diagnostics: r2types::TypeWritebackDiagnostics::default(),
+            },
+        };
+        let identity = EngineFunctionIdentity::new(0x401000, "dbg.fnv_fold", "fnv_fold");
 
-        let plan = semantic_fallback_type_writeback_plan(
-            "verror_at_line",
-            "x86-64",
-            64,
-            Some("amd64"),
-            &artifact,
-            &function_facts,
-            false,
-        );
+        let type_facts =
+            decompile_type_override(&identity, &request, &artifact).expect("type override");
+        let render_signature = type_facts
+            .render_authorized_signature()
+            .expect("render-authorized signature");
 
-        assert_eq!(plan.signature.ret_type, "void");
-        assert_eq!(plan.signature.params[3].param_type, "unsigned int");
-        assert_eq!(plan.signature.params[5].param_type, "__va_list_tag*");
+        assert_eq!(
+            render_signature.ret_type,
+            request.parsed_context.current_signature.unwrap().ret_type
+        );
+        assert_eq!(render_signature.params[0].name, "buf");
     }
 
     #[test]
-    fn type_summary_preprobe_bounds_large_program_orchestrator_without_full_analysis() {
+    fn compile_named_summary_rejects_name_owned_role_signature() {
+        let summary = r2ssa::FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0x11a9),
+            Some("verror_at_line".to_string()),
+        );
+
+        assert!(r2sym::compile_named_native_worker_summary_artifact(&summary, true).is_none());
+    }
+
+    #[test]
+    fn type_summary_preprobe_rejects_name_only_program_orchestrator() {
         let mut blocks = const_return_blocks(0x55a0, 0);
         for idx in 0..210 {
             blocks.push(R2ILBlock::new(0x5600 + idx, 1));
@@ -5838,31 +7109,9 @@ mod tests {
             type_seed: Some(FunctionTypeFacts::default()),
             caller_prefers_bounded_type_plan: false,
             fallback_if_guarded_without_summary: false,
-        })
-        .expect("large program orchestrator should use summary type preprobe");
+        });
 
-        assert_eq!(
-            response.route_decision.kind,
-            EngineTypeRouteKind::SemanticFallback
-        );
-        let signature = response
-            .function_facts
-            .types
-            .merged_signature
-            .as_ref()
-            .expect("main role signature");
-        assert_eq!(signature.params[0].name, "argc");
-        assert!(
-            response
-                .function_facts
-                .semantic_artifact()
-                .and_then(r2sym::SemanticArtifact::native_body)
-                .is_some_and(|native| {
-                    native.summary.worker_summaries.iter().any(|summary| {
-                        summary.kind == r2sym::NativeWorkerSummaryKind::ProgramOrchestrator
-                    })
-                })
-        );
+        assert!(response.is_none());
     }
 
     #[test]
@@ -5895,13 +7144,12 @@ mod tests {
                 },
                 caller_prefers_bounded_type_plan: false,
             })
-            .expect("large program orchestrator should be typed by engine preprobe");
+            .expect("large main should be typed without name-owned program orchestrator route");
 
         assert_eq!(
             response.route_decision.kind,
             EngineTypeRouteKind::SemanticFallback
         );
-        assert!(response.artifact_key.is_none());
         assert_eq!(response.writeback_plan.signature.params[0].name, "argc");
         assert_eq!(response.writeback_plan.signature.params[1].name, "argv");
     }
@@ -6082,6 +7330,11 @@ mod tests {
             route_reason: Some(comment.clone()),
             skip_runtime_type_inference: false,
             use_prepared_semantic_view: false,
+            proof_coverage: r2sym::ProofCoverage::default(),
+            render_permission: r2sym::RenderPermission::refuse(
+                r2sym::ProofOwner::R2engine,
+                comment.clone(),
+            ),
             refusal: Some(comment.clone()),
         };
 
@@ -6091,17 +7344,28 @@ mod tests {
         assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
         assert_eq!(request_plan.cache.layer, EngineCacheLayer::Render);
         assert_eq!(diagnostics.refusal, Some(comment.clone()));
-        assert_eq!(diagnostics.route_reason, Some(comment));
+        assert_eq!(diagnostics.route_reason, Some(comment.clone()));
+        assert_eq!(
+            diagnostics
+                .render_permission
+                .as_ref()
+                .map(|permission| permission.kind),
+            Some(r2sym::RenderPermissionKind::Refuse)
+        );
     }
 
     #[test]
-    fn native_linear_artifact_plan_keeps_regioned_generic_workers_standard_by_default() {
+    fn native_linear_artifact_plan_keeps_regioned_unrenderable_workers_standard_by_default() {
         let blocks = const_return_blocks(0x401000, 0);
         let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
             .expect("ssa")
             .cfg_risk_summary();
 
-        for slice_class in [r2sym::SliceClass::GenericLarge, r2sym::SliceClass::Wrapper] {
+        for slice_class in [
+            r2sym::SliceClass::Worker,
+            r2sym::SliceClass::GenericLarge,
+            r2sym::SliceClass::Wrapper,
+        ] {
             let artifact = native_linear_artifact(slice_class);
             assert!(matches!(
                 artifact.decompile_plan(),
@@ -6116,6 +7380,114 @@ mod tests {
                 Some(route)
             );
         }
+    }
+
+    #[test]
+    fn compact_renderable_worker_summary_can_route_to_linear_summary() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+        let artifact = native_linear_predicated_count_artifact();
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+        let route = semantic_route_plan("dbg.mem_scan2", &function_facts, &cfg_summary);
+
+        assert!(matches!(
+            route,
+            r2dec::SemanticRoutePlan::LinearWorker { .. }
+        ));
+    }
+
+    #[test]
+    fn compact_table_walk_worker_summary_can_route_to_linear_summary() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+        let artifact = native_linear_table_walk_artifact();
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
+
+        assert!(matches!(
+            route,
+            r2dec::SemanticRoutePlan::LinearWorker { .. }
+        ));
+    }
+
+    #[test]
+    fn summary_only_scan_table_worker_routes_to_summary_islands() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+        let artifact = summary_only_table_walk_artifact();
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
+
+        assert!(matches!(
+            route,
+            r2dec::SemanticRoutePlan::SummaryIslands { .. }
+        ));
+    }
+
+    #[test]
+    fn summary_only_exact_hash_fold_prefers_standard_native_render() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+        let artifact = summary_only_exact_hash_fold_artifact();
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+        let route = semantic_route_plan("dbg.fnv_fold", &function_facts, &cfg_summary);
+
+        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+    }
+
+    #[test]
+    fn dense_summary_only_exact_hash_fold_still_prefers_standard_native_render() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+        let artifact = pad_summary_only_artifact_to_dense(summary_only_exact_hash_fold_artifact());
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+        let route = semantic_route_plan("dbg.fnv_fold", &function_facts, &cfg_summary);
+
+        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+    }
+
+    #[test]
+    fn summary_only_complete_table_walk_prefers_standard_native_render() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+        let artifact = summary_only_complete_table_walk_artifact();
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
+
+        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+    }
+
+    #[test]
+    fn dense_summary_only_complete_table_walk_still_prefers_standard_native_render() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
+            .expect("ssa")
+            .cfg_risk_summary();
+        let artifact =
+            pad_summary_only_artifact_to_dense(summary_only_complete_table_walk_artifact());
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
+
+        let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
+
+        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
     }
 
     #[test]
@@ -6158,21 +7530,14 @@ mod tests {
 
     #[test]
     fn named_summary_route_rejects_name_only_summary_worker() {
-        let summary = native_worker_summary_seed(0xe0a0, "dbg.print_current_files")
-            .expect("expected print_current_files native-worker seed");
-        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true)
-            .expect("expected print_current_files summary artifact");
-        let function_facts = FunctionFacts::new(
-            FunctionTypeFacts {
-                merged_signature: Some(r2types::FunctionSignatureSpec {
-                    ret_type: Some(r2types::CTypeLike::Void),
-                    params: Vec::new(),
-                }),
-                ..FunctionTypeFacts::default()
-            },
-            Some(artifact),
+        let summary = r2ssa::FunctionSemanticSummary::unknown(
+            r2ssa::InterprocFunctionId(0xe0a0),
+            Some("dbg.print_current_files".to_string()),
         );
+        let artifact = r2sym::compile_named_native_worker_summary_artifact(&summary, true);
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
 
+        assert!(artifact.is_none());
         assert!(!has_renderable_primary_summary_only_native_worker(
             &function_facts
         ));

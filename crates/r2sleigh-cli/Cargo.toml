@@ -12,21 +12,21 @@ path = "src/main.rs"
 [dependencies]
 r2il = { path = "../r2il" }
 r2sleigh-lift = { path = "../r2sleigh-lift" }
-r2sleigh-export = { path = "../r2sleigh-export" }
+r2sleigh-export = { path = "../r2sleigh-export", optional = true }
 clap.workspace = true
-thiserror.workspace = true
-hex = "0.4"
-serde_json = "1"
+hex = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enable specific architecture support for disasm command
-x86 = ["sleigh-config/x86"]
-arm = ["sleigh-config/ARM", "sleigh-config/AARCH64"]
-mips = ["sleigh-config/MIPS"]
-riscv = ["sleigh-config/RISCV"]
+sleigh-config = ["dep:sleigh-config", "dep:r2sleigh-export", "dep:hex", "dep:serde_json"]
+x86 = ["sleigh-config", "dep:sleigh-config", "sleigh-config/x86"]
+arm = ["sleigh-config", "dep:sleigh-config", "sleigh-config/ARM", "sleigh-config/AARCH64"]
+mips = ["sleigh-config", "dep:sleigh-config", "sleigh-config/MIPS"]
+riscv = ["sleigh-config", "dep:sleigh-config", "sleigh-config/RISCV"]
 all-archs = ["x86", "arm", "mips", "riscv"]
 
 [dependencies.sleigh-config]
-version = "1.0"
+workspace = true
 optional = true

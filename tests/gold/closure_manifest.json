@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "description": "Source-gold closure fixture manifest for recurring r2sleigh benchmark gates.",
+  "binaries": [
+    {
+      "name": "stress_test_x86",
+      "path": "../r2r/bins/stress_test_x86",
+      "corpus": "repo-fixtures",
+      "analysis": "aaa",
+      "targets": ["parse_number", "tiny_vm_dispatch"],
+      "max_functions": 2
+    },
+    {
+      "name": "vuln_test_x86",
+      "path": "../r2r/bins/vuln_test_x86",
+      "corpus": "repo-fixtures",
+      "analysis": "aaa",
+      "targets": ["test_struct_array_index"],
+      "max_functions": 1
+    },
+    {
+      "name": "r2sleigh_manual_limits_O2",
+      "path": "../r2r/bins/r2sleigh_manual_limits_O2",
+      "corpus": "manual",
+      "analysis": "aaa",
+      "targets": [
+        "mem_scan2",
+        "fnv_fold",
+        "out_param_parse",
+        "table_walk",
+        "struct_nested_array",
+        "sparse_switch"
+      ],
+      "max_functions": 6
+    },
+    {
+      "name": "r2sleigh_manual_limits_O0",
+      "path": "../r2r/bins/r2sleigh_manual_limits_O0",
+      "corpus": "manual",
+      "analysis": "aaa",
+      "targets": ["mem_scan2", "fnv_fold", "sparse_switch"],
+      "max_functions": 3
+    }
+  ]
+}

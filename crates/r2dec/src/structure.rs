@@ -3,14 +3,95 @@
 //! This module converts unstructured control flow (gotos, CFG edges) into
 //! structured high-level constructs (if-then-else, while, for, etc.).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use r2ssa::cfg::BlockTerminator;
-use r2ssa::{CFGEdge, SSAFunction};
+use r2ssa::{CFGEdge, PredicateId, SSAFunction, SSAOp, ValueId};
 
+use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::fold::FoldingContext;
+use crate::fold::context::EffectRenderProofKind;
 use crate::region::{Region, RegionAnalyzer};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRenderProofKind {
+    Loop,
+    Switch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlRenderProof {
+    pub kind: ControlRenderProofKind,
+    pub anchor: u64,
+    pub loop_condition: Option<PredicateId>,
+    pub loop_condition_value: Option<ValueId>,
+    pub loop_body_blocks: Vec<u64>,
+    pub loop_latches: Vec<u64>,
+    pub loop_exits: Vec<u64>,
+    pub switch_selector: Option<ValueId>,
+    pub switch_cases: Vec<(u64, u64)>,
+    pub switch_default: Option<u64>,
+}
+
+impl ControlRenderProof {
+    pub fn new(kind: ControlRenderProofKind, anchor: u64) -> Self {
+        Self {
+            kind,
+            anchor,
+            loop_condition: None,
+            loop_condition_value: None,
+            loop_body_blocks: Vec::new(),
+            loop_latches: Vec::new(),
+            loop_exits: Vec::new(),
+            switch_selector: None,
+            switch_cases: Vec::new(),
+            switch_default: None,
+        }
+    }
+
+    fn loop_proof(
+        anchor: u64,
+        loop_condition: Option<PredicateId>,
+        loop_condition_value: Option<ValueId>,
+        loop_body_blocks: Vec<u64>,
+        loop_latches: Vec<u64>,
+        loop_exits: Vec<u64>,
+    ) -> Self {
+        Self {
+            kind: ControlRenderProofKind::Loop,
+            anchor,
+            loop_condition,
+            loop_condition_value,
+            loop_body_blocks,
+            loop_latches,
+            loop_exits,
+            switch_selector: None,
+            switch_cases: Vec::new(),
+            switch_default: None,
+        }
+    }
+
+    fn switch_proof(
+        anchor: u64,
+        switch_selector: Option<ValueId>,
+        switch_cases: Vec<(u64, u64)>,
+        switch_default: Option<u64>,
+    ) -> Self {
+        Self {
+            kind: ControlRenderProofKind::Switch,
+            anchor,
+            loop_condition: None,
+            loop_condition_value: None,
+            loop_body_blocks: Vec::new(),
+            loop_latches: Vec::new(),
+            loop_exits: Vec::new(),
+            switch_selector,
+            switch_cases,
+            switch_default,
+        }
+    }
+}
 
 /// Control flow structurer.
 ///
@@ -31,6 +112,8 @@ pub struct ControlFlowStructurer<'a, 'o> {
     safety_budget_remaining: usize,
     safety_budget_max: usize,
     safety_reason: Option<String>,
+    /// Structured control nodes emitted by this structurer, in render order.
+    control_render_proofs: Vec<ControlRenderProof>,
 }
 
 struct SwitchRegionView<'r> {
@@ -58,6 +141,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_remaining: safety_budget_max,
             safety_budget_max,
             safety_reason: None,
+            control_render_proofs: Vec::new(),
         }
     }
 
@@ -74,6 +158,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             safety_budget_remaining: safety_budget_max,
             safety_budget_max,
             safety_reason: None,
+            control_render_proofs: Vec::new(),
         }
     }
 
@@ -118,6 +203,88 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.safety_reason.as_deref()
     }
 
+    pub fn control_render_proofs(&self) -> &[ControlRenderProof] {
+        &self.control_render_proofs
+    }
+
+    fn record_loop_render_proof(
+        &mut self,
+        anchor: u64,
+        condition: Option<PredicateId>,
+        condition_value: Option<ValueId>,
+        body: &Region,
+    ) {
+        let loop_body_blocks = self.canonical_loop_body_blocks(anchor, body);
+        let (loop_latches, loop_exits) = self.rendered_loop_edges(anchor, &loop_body_blocks);
+        self.control_render_proofs
+            .push(ControlRenderProof::loop_proof(
+                anchor,
+                condition,
+                condition_value,
+                loop_body_blocks,
+                loop_latches,
+                loop_exits,
+            ));
+    }
+
+    fn canonical_loop_body_blocks(&self, anchor: u64, body: &Region) -> Vec<u64> {
+        if let Some(loop_body) = self
+            .region_analyzer
+            .as_ref()
+            .and_then(|analyzer| analyzer.get_loop_body(anchor))
+        {
+            let mut blocks = loop_body.iter().copied().collect::<BTreeSet<_>>();
+            blocks.insert(anchor);
+            return blocks.into_iter().collect();
+        }
+        Self::sorted_region_blocks_with_anchor(anchor, body)
+    }
+
+    fn record_switch_render_proof(
+        &mut self,
+        anchor: u64,
+        selector: Option<ValueId>,
+        cases: &[(Option<u64>, Box<Region>)],
+        default: Option<&Region>,
+    ) {
+        let mut switch_cases = cases
+            .iter()
+            .filter_map(|(value, region)| value.map(|value| (value, region.entry())))
+            .collect::<Vec<_>>();
+        switch_cases.sort_unstable();
+        let switch_default = default.map(Region::entry);
+        self.control_render_proofs
+            .push(ControlRenderProof::switch_proof(
+                anchor,
+                selector,
+                switch_cases,
+                switch_default,
+            ));
+    }
+
+    fn sorted_region_blocks_with_anchor(anchor: u64, region: &Region) -> Vec<u64> {
+        let mut blocks = region.blocks().into_iter().collect::<BTreeSet<_>>();
+        blocks.insert(anchor);
+        blocks.into_iter().collect()
+    }
+
+    fn rendered_loop_edges(&self, anchor: u64, loop_body_blocks: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        let body = loop_body_blocks.iter().copied().collect::<BTreeSet<_>>();
+        let mut latches = BTreeSet::new();
+        let mut exits = BTreeSet::new();
+        for block in &body {
+            for succ in self.func.successors(*block) {
+                if succ == anchor {
+                    latches.insert(*block);
+                }
+                if !body.contains(&succ) {
+                    exits.insert(succ);
+                }
+            }
+        }
+        (latches.into_iter().collect(), exits.into_iter().collect())
+    }
+
     /// Get the set of variable names that survive folding (for filtering declarations).
     pub fn emitted_var_names(&self) -> HashSet<String> {
         let blocks: Vec<_> = self.func.blocks().cloned().collect();
@@ -127,6 +294,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Structure the function's control flow.
     pub fn structure(&mut self) -> CStmt {
         self.reset_safety_budget();
+        self.control_render_proofs.clear();
         if self.region_analyzer.is_none() {
             self.region_analyzer = Some(RegionAnalyzer::new(self.func));
         }
@@ -194,6 +362,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ) {
                     return rewritten;
                 }
+                if let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
+                    *cond_block,
+                    then_region,
+                    else_region.as_deref(),
+                    *merge_block,
+                ) {
+                    return rewritten;
+                }
                 if let Some(rewritten) = self.try_structure_guarded_switch_with_default(
                     *cond_block,
                     then_region,
@@ -213,12 +389,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 {
                     cond = Self::negate_condition(cond);
                 }
-                let then_stmt = self.structure_region(then_region);
-                let else_stmt = else_region.as_ref().map(|r| self.structure_region(r));
+                let then_stmt = self.structure_branch_region(*cond_block, then_region);
+                let else_stmt = else_region
+                    .as_ref()
+                    .map(|r| self.structure_branch_region(*cond_block, r));
+                let branches_terminate = else_stmt.as_ref().is_some_and(|else_stmt| {
+                    Self::stmt_guarantees_termination(&then_stmt)
+                        && Self::stmt_guarantees_termination(else_stmt)
+                });
                 let if_stmt = CStmt::if_stmt(cond, then_stmt, else_stmt);
                 let mut prefix = self.structure_block_prefix_stmts(*cond_block);
                 prefix.push(if_stmt);
-                if let Some(merge_addr) = merge_block {
+                if let Some(merge_addr) = merge_block
+                    && !branches_terminate
+                {
                     Self::append_stmt_body_flat(&mut prefix, self.structure_block(*merge_addr));
                 }
                 if prefix.len() == 1 {
@@ -228,13 +412,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
             Region::WhileLoop { header, body } => {
-                let cond = self.get_branch_condition(*header);
+                let (cond, predicate, condition_value) =
+                    self.get_branch_condition_with_predicate(*header);
+                self.record_loop_render_proof(*header, predicate, condition_value, body);
                 let body_stmt = self.structure_loop_body(body);
                 CStmt::while_loop(cond, body_stmt)
             }
             Region::DoWhileLoop { body, cond_block } => {
+                let (cond, predicate, condition_value) =
+                    self.get_branch_condition_with_predicate(*cond_block);
+                self.record_loop_render_proof(body.entry(), predicate, condition_value, body);
                 let body_stmt = self.structure_loop_body(body);
-                let cond = self.get_branch_condition(*cond_block);
                 CStmt::DoWhile {
                     body: Box::new(body_stmt),
                     cond,
@@ -252,12 +440,78 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
+    fn structure_branch_region(&mut self, pred_block: u64, region: &Region) -> CStmt {
+        if self.func.successors(pred_block).contains(&region.entry()) {
+            self.structure_region_from_predecessor(region, pred_block)
+        } else {
+            self.structure_region(region)
+        }
+    }
+
+    fn structure_region_from_predecessor(&mut self, region: &Region, pred_block: u64) -> CStmt {
+        match region {
+            Region::Block(addr) => self.structure_block_from_predecessor(*addr, pred_block),
+            _ => self.structure_region(region),
+        }
+    }
+
+    fn structure_block_from_predecessor(&mut self, addr: u64, pred_block: u64) -> CStmt {
+        let stmt = self.structure_block(addr);
+        if !self.block_allows_predecessor_return_register_rewrite(addr) {
+            return stmt;
+        }
+        let Some((expr, proof_block, proof_op, proof_value)) =
+            self.return_register_candidate_for_merge_predecessor(addr, pred_block)
+        else {
+            return stmt;
+        };
+        if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
+            self.record_return_value_render_proof(proof_block, proof_op, proof_value);
+            rewritten
+        } else {
+            stmt
+        }
+    }
+
+    fn block_allows_predecessor_return_register_rewrite(&self, addr: u64) -> bool {
+        let Some(block) = self.func.get_block(addr) else {
+            return false;
+        };
+        block.ops.iter().all(|op| {
+            op.dst().is_none_or(|dst| {
+                !self
+                    .fold_ctx
+                    .inputs
+                    .arch
+                    .is_return_register_name(&dst.name.to_ascii_lowercase())
+            })
+        })
+    }
+
+    fn return_register_candidate_for_merge_predecessor(
+        &self,
+        merge_addr: u64,
+        pred_addr: u64,
+    ) -> Option<(CExpr, u64, usize, ValueId)> {
+        if !self.block_allows_predecessor_return_register_rewrite(merge_addr) {
+            return None;
+        }
+        self.fold_ctx
+            .merged_return_register_candidate_for_block_predecessor_with_proof(
+                merge_addr, pred_addr,
+            )
+            .or_else(|| {
+                self.fold_ctx
+                    .predecessor_return_register_candidate_with_proof(pred_addr)
+            })
+    }
+
     /// Get the switch expression from a block.
-    fn get_switch_expression(&mut self, addr: u64) -> CExpr {
+    fn get_switch_expression(&mut self, addr: u64) -> (CExpr, Option<ValueId>) {
         let switch_addr = self.unique_switch_block().unwrap_or(addr);
         let block = match self.func.get_block(switch_addr) {
             Some(b) => b,
-            None => return CExpr::Var("switch_expr".to_string()),
+            None => return (CExpr::Var("switch_expr".to_string()), None),
         };
 
         if let Some(vm_step) = self
@@ -273,30 +527,33 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             })
             && let Some(selector) = vm_step.selector.as_ref()
         {
-            return CExpr::Var(selector.clone());
+            return (CExpr::Var(selector.clone()), None);
         }
 
-        if let Some(expr) = self.fold_ctx.resolve_switch_expr_for_block(switch_addr) {
-            return expr;
+        if let Some((expr, selector)) = self
+            .fold_ctx
+            .resolve_switch_expr_for_block_with_selector(switch_addr)
+        {
+            return (expr, selector);
         }
 
         if let Some(expr) =
             Self::selector_expr_from_condition(&self.get_branch_condition(switch_addr))
         {
-            return expr;
+            return (expr, None);
         }
         if let Some(expr) = self.selector_expr_from_switch_predecessors(switch_addr) {
-            return expr;
+            return (expr, None);
         }
 
         // Look for an indirect branch which typically has the switch variable
         for op in &block.ops {
             if let Some(expr) = self.fold_ctx.extract_switch_expr(op) {
-                return expr;
+                return (expr, None);
             }
         }
 
-        CExpr::Var("test".to_string())
+        (CExpr::Var("test".to_string()), None)
     }
 
     fn unique_switch_block(&self) -> Option<u64> {
@@ -359,8 +616,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         default: Option<&Region>,
         merge_block: Option<u64>,
     ) -> CStmt {
-        let switch_expr = self.get_switch_expression(switch_block);
+        let (switch_expr, switch_selector) = self.get_switch_expression(switch_block);
         let case_display_bias = self.switch_case_display_bias(switch_block, cases);
+        self.record_switch_render_proof(switch_block, switch_selector, cases, default);
 
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
@@ -432,6 +690,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .exact_reachable_target_for_block(cond_block)
     }
 
+    #[cfg(test)]
     fn symbolic_actionable_reachable_target(&self, cond_block: u64) -> Option<u64> {
         self.fold_ctx
             .inputs
@@ -756,9 +1015,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         else_region: Option<&Region>,
         merge_block: Option<u64>,
     ) -> Option<CStmt> {
-        let reachable_target = self
-            .symbolic_exact_reachable_target(cond_block)
-            .or_else(|| self.symbolic_actionable_reachable_target(cond_block))?;
+        let reachable_target = self.symbolic_exact_reachable_target(cond_block)?;
         let reachable_stmt = if then_region.blocks().contains(&reachable_target) {
             self.structure_region_suffix_from_target(then_region, reachable_target)?
         } else {
@@ -1052,24 +1309,44 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Get the branch condition from a block.
     fn get_branch_condition(&mut self, addr: u64) -> CExpr {
+        self.get_branch_condition_with_predicate(addr).0
+    }
+
+    fn get_branch_condition_with_predicate(
+        &mut self,
+        addr: u64,
+    ) -> (CExpr, Option<PredicateId>, Option<ValueId>) {
         let block = match self.func.get_block(addr) {
             Some(b) => b,
-            None => return CExpr::IntLit(1),
+            None => return (CExpr::IntLit(1), None, None),
         };
+        let predicate = self
+            .fold_ctx
+            .inputs
+            .prepared_predicates
+            .and_then(|facts| {
+                facts
+                    .predicates
+                    .values()
+                    .find(|predicate| predicate.block_addr == addr)
+            })
+            .map(|predicate| (predicate.id, predicate.condition));
+        let predicate_id = predicate.map(|(id, _)| id);
+        let condition_value = predicate.map(|(_, value)| value);
 
         if let Some(cond) = self.fold_ctx.extract_condition_from_block(block) {
-            return cond;
+            return (cond, predicate_id, condition_value);
         }
 
         // Look for a conditional branch in the block
         for op in &block.ops {
             if let Some(cond) = self.fold_ctx.extract_condition(op) {
-                return cond;
+                return (cond, predicate_id, condition_value);
             }
         }
 
         // Default to true
-        CExpr::IntLit(1)
+        (CExpr::IntLit(1), predicate_id, condition_value)
     }
 
     /// Structure an irreducible region using gotos.
@@ -1111,7 +1388,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// - Fix B: Remove trailing `continue` in loop bodies (implicit) and
     ///   trailing `break` in single-exit if-then inside loops.
     /// - Fix C: Convert `do { if (c) break; ... } while(1)` to `while(!c) { ... }`.
-    fn cleanup(stmt: CStmt) -> CStmt {
+    pub(crate) fn cleanup(stmt: CStmt) -> CStmt {
         // Recurse first, then simplify
         let stmt = Self::cleanup_recurse(stmt);
         Self::flatten(stmt)
@@ -1128,6 +1405,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .collect();
                 let cleaned = Self::rewrite_block_tail_guard_clauses(cleaned);
                 let cleaned = Self::rewrite_guarded_switch_if_else(cleaned);
+                let cleaned = Self::rewrite_continue_tail_merges(cleaned);
                 let cleaned = Self::truncate_dead_straight_line_tail(cleaned);
                 let rewritten = Self::rewrite_block_loops_to_for(cleaned);
                 if rewritten.is_empty() {
@@ -1157,6 +1435,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let stmt = Self::rewrite_if_short_circuit(stmt);
                 let stmt = Self::rewrite_if_condition_inversion(stmt);
                 let stmt = Self::rewrite_empty_if_bodies(stmt);
+                let stmt = Self::rewrite_if_return_ternary(stmt);
                 Self::rewrite_guarded_switch_with_trailing_return(stmt)
             }
             CStmt::While { cond, body } => {
@@ -1181,6 +1460,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } => {
                 let cond = cond.map(Self::normalize_condition_addr_artifacts);
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(*body));
+                let body = update
+                    .as_ref()
+                    .map(|update| Self::strip_trailing_for_update(body.clone(), update))
+                    .unwrap_or(body);
+                let body = Self::remove_dead_generated_artifact_assignments(body);
                 CStmt::For {
                     init,
                     cond,
@@ -1197,18 +1481,157 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .into_iter()
                     .map(|c| crate::ast::SwitchCase {
                         value: c.value,
-                        body: c.body.into_iter().map(Self::cleanup_recurse).collect(),
+                        body: Self::cleanup_switch_body(c.body),
                     })
                     .collect();
-                let default = default.map(|d| d.into_iter().map(Self::cleanup_recurse).collect());
+                let default = default.map(Self::cleanup_switch_body);
                 CStmt::Switch {
                     expr,
                     cases,
                     default,
                 }
             }
+            CStmt::Expr(expr) => CStmt::Expr(Self::rewrite_compound_assignment_expr(expr)),
             other => other,
         }
+    }
+
+    fn cleanup_switch_body(stmts: Vec<CStmt>) -> Vec<CStmt> {
+        let cleaned = stmts
+            .into_iter()
+            .map(Self::cleanup_recurse)
+            .filter(|stmt| !matches!(stmt, CStmt::Empty))
+            .collect();
+        Self::truncate_dead_straight_line_tail(cleaned)
+    }
+
+    fn rewrite_compound_assignment_expr(expr: CExpr) -> CExpr {
+        let CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        } = expr
+        else {
+            return expr;
+        };
+
+        let CExpr::Var(target_name) = left.as_ref() else {
+            return CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            };
+        };
+
+        let Some((op, rhs)) = Self::compound_assignment_rhs(target_name, right.as_ref()) else {
+            return CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            };
+        };
+
+        CExpr::Binary {
+            op,
+            left,
+            right: Box::new(rhs),
+        }
+    }
+
+    fn compound_assignment_rhs(target_name: &str, rhs: &CExpr) -> Option<(BinaryOp, CExpr)> {
+        let CExpr::Binary { op, left, right } = rhs else {
+            return None;
+        };
+        let compound_op = Self::compound_assignment_op(*op)?;
+
+        if Self::expr_is_var_named(left, target_name) && Self::expr_is_side_effect_free(right) {
+            return Some((compound_op, right.as_ref().clone()));
+        }
+
+        if Self::binary_op_is_commutative_for_compound(*op)
+            && Self::expr_is_var_named(right, target_name)
+            && Self::expr_is_side_effect_free(left)
+        {
+            return Some((compound_op, left.as_ref().clone()));
+        }
+
+        None
+    }
+
+    fn compound_assignment_op(op: BinaryOp) -> Option<BinaryOp> {
+        match op {
+            BinaryOp::Add => Some(BinaryOp::AddAssign),
+            BinaryOp::Sub => Some(BinaryOp::SubAssign),
+            BinaryOp::Mul => Some(BinaryOp::MulAssign),
+            BinaryOp::Div => Some(BinaryOp::DivAssign),
+            BinaryOp::Mod => Some(BinaryOp::ModAssign),
+            BinaryOp::BitAnd => Some(BinaryOp::BitAndAssign),
+            BinaryOp::BitOr => Some(BinaryOp::BitOrAssign),
+            BinaryOp::BitXor => Some(BinaryOp::BitXorAssign),
+            BinaryOp::Shl => Some(BinaryOp::ShlAssign),
+            BinaryOp::Shr => Some(BinaryOp::ShrAssign),
+            _ => None,
+        }
+    }
+
+    fn binary_op_is_commutative_for_compound(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Mul | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+        )
+    }
+
+    fn expr_is_var_named(expr: &CExpr, target_name: &str) -> bool {
+        matches!(expr, CExpr::Var(name) if name == target_name)
+    }
+
+    fn expr_is_side_effect_free(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::IntLit(_)
+            | CExpr::UIntLit(_)
+            | CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::Var(_)
+            | CExpr::SizeofType(_) => true,
+            CExpr::Paren(inner)
+            | CExpr::AddrOf(inner)
+            | CExpr::Deref(inner)
+            | CExpr::Cast { expr: inner, .. }
+            | CExpr::Sizeof(inner) => Self::expr_is_side_effect_free(inner),
+            CExpr::Unary { op, operand } => {
+                !matches!(
+                    op,
+                    UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
+                ) && Self::expr_is_side_effect_free(operand)
+            }
+            CExpr::Binary { op, left, right } => {
+                !Self::is_assignment_like_op(*op)
+                    && Self::expr_is_side_effect_free(left)
+                    && Self::expr_is_side_effect_free(right)
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_is_side_effect_free(cond)
+                    && Self::expr_is_side_effect_free(then_expr)
+                    && Self::expr_is_side_effect_free(else_expr)
+            }
+            CExpr::Subscript { base, index } => {
+                Self::expr_is_side_effect_free(base) && Self::expr_is_side_effect_free(index)
+            }
+            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+                Self::expr_is_side_effect_free(base)
+            }
+            CExpr::Comma(items) => items.iter().all(Self::expr_is_side_effect_free),
+            CExpr::Call { .. } => false,
+        }
+    }
+
+    fn is_assignment_like_op(op: BinaryOp) -> bool {
+        op == BinaryOp::Assign || Self::is_compound_assign_op(op)
     }
 
     fn rewrite_constant_condition_stmt(stmt: CStmt) -> CStmt {
@@ -1216,7 +1639,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             CStmt::If {
                 cond,
                 then_body,
-                else_body,
+                else_body: _,
             } if Self::is_const_true_expr(&cond) => *then_body,
             CStmt::If {
                 cond,
@@ -1276,6 +1699,26 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return CStmt::If {
                 cond: CExpr::binary(BinaryOp::Or, cond, right_cond.clone()),
                 then_body: Box::new(then_stmt),
+                else_body: None,
+            };
+        }
+
+        // if (a) { if (b) { T } } else { T } -> if (!a || b) { T }
+        if let CStmt::If {
+            cond: inner_cond,
+            then_body: inner_then,
+            else_body: None,
+        } = &then_stmt
+            && let Some(outer_else) = else_stmt.as_ref()
+            && *outer_else == **inner_then
+        {
+            return CStmt::If {
+                cond: CExpr::binary(
+                    BinaryOp::Or,
+                    Self::negate_condition(cond),
+                    inner_cond.clone(),
+                ),
+                then_body: inner_then.clone(),
                 else_body: None,
             };
         }
@@ -1370,6 +1813,99 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             cond,
             then_body,
             else_body,
+        }
+    }
+
+    fn rewrite_if_return_ternary(stmt: CStmt) -> CStmt {
+        let CStmt::If {
+            cond,
+            then_body,
+            else_body: Some(else_body),
+        } = stmt
+        else {
+            return stmt;
+        };
+
+        if let (Some(then_expr), Some(else_expr)) = (
+            Self::single_return_expr(then_body.as_ref()),
+            Self::single_return_expr(else_body.as_ref()),
+        ) && Self::is_zero_guarded_division_return(&cond, &then_expr, &else_expr)
+        {
+            CStmt::Return(Some(CExpr::Ternary {
+                cond: Box::new(cond),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            }))
+        } else {
+            CStmt::If {
+                cond,
+                then_body,
+                else_body: Some(else_body),
+            }
+        }
+    }
+
+    fn single_return_expr(stmt: &CStmt) -> Option<CExpr> {
+        match stmt {
+            CStmt::Return(Some(expr)) => Some(expr.clone()),
+            CStmt::Block(stmts) if stmts.len() == 1 => Self::single_return_expr(&stmts[0]),
+            _ => None,
+        }
+    }
+
+    fn is_zero_guarded_division_return(cond: &CExpr, then_expr: &CExpr, else_expr: &CExpr) -> bool {
+        let Some((guarded, zero_when_true)) = Self::zero_compare_operand(cond) else {
+            return false;
+        };
+        if zero_when_true {
+            Self::expr_divides_by(else_expr, guarded)
+        } else {
+            Self::expr_divides_by(then_expr, guarded)
+        }
+    }
+
+    fn zero_compare_operand(cond: &CExpr) -> Option<(&CExpr, bool)> {
+        match cond {
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::zero_compare_operand(inner)
+            }
+            CExpr::Binary { op, left, right } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
+                let zero_when_true = matches!(op, BinaryOp::Eq);
+                if Self::is_zero_literal(left) {
+                    return Some((right, zero_when_true));
+                }
+                if Self::is_zero_literal(right) {
+                    return Some((left, zero_when_true));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn is_zero_literal(expr: &CExpr) -> bool {
+        matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
+    }
+
+    fn expr_divides_by(expr: &CExpr, denominator: &CExpr) -> bool {
+        match expr {
+            CExpr::Binary {
+                op: BinaryOp::Div,
+                right,
+                ..
+            } => right.as_ref() == denominator,
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::expr_divides_by(inner, denominator)
+            }
+            CExpr::Ternary {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                Self::expr_divides_by(then_expr, denominator)
+                    || Self::expr_divides_by(else_expr, denominator)
+            }
+            _ => false,
         }
     }
 
@@ -1502,6 +2038,72 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         })
     }
 
+    fn try_structure_if_else_with_register_merge_returns(
+        &mut self,
+        cond_block: u64,
+        then_region: &Region,
+        else_region: Option<&Region>,
+        merge_block: Option<u64>,
+    ) -> Option<CStmt> {
+        let merge_block = merge_block?;
+        let else_region = else_region?;
+        let then_pred = self.unique_region_predecessor_to_merge(then_region, merge_block);
+        let else_pred = self.unique_region_predecessor_to_merge(else_region, merge_block);
+        let mut then_can_rewrite =
+            then_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
+        let mut else_can_rewrite =
+            else_pred.is_some_and(|pred| self.has_merged_register_return_expr(merge_block, pred));
+
+        let mut then_stmt = self.structure_region(then_region);
+        let mut else_stmt = self.structure_region(else_region);
+        then_can_rewrite |= then_pred.is_some_and(|pred| {
+            self.stmt_has_predecessor_return_register_certificate(&then_stmt, pred)
+        });
+        else_can_rewrite |= else_pred.is_some_and(|pred| {
+            self.stmt_has_predecessor_return_register_certificate(&else_stmt, pred)
+        });
+        if !then_can_rewrite && !else_can_rewrite {
+            return None;
+        }
+        let mut rewrote_any = false;
+
+        if then_can_rewrite
+            && let Some(pred) = then_pred
+            && let Some(rewritten) =
+                self.append_merged_register_return_if_needed(then_stmt.clone(), merge_block, pred)
+        {
+            then_stmt = rewritten;
+            rewrote_any = true;
+        }
+        if else_can_rewrite
+            && let Some(pred) = else_pred
+            && let Some(rewritten) =
+                self.append_merged_register_return_if_needed(else_stmt.clone(), merge_block, pred)
+        {
+            else_stmt = rewritten;
+            rewrote_any = true;
+        }
+        if !rewrote_any
+            || !Self::stmt_guarantees_termination(&then_stmt)
+            || !Self::stmt_guarantees_termination(&else_stmt)
+        {
+            return None;
+        }
+
+        let if_stmt = CStmt::If {
+            cond: self.get_branch_condition(cond_block),
+            then_body: Box::new(then_stmt),
+            else_body: Some(Box::new(else_stmt)),
+        };
+        let mut prefix = self.structure_block_prefix_stmts(cond_block);
+        prefix.push(if_stmt);
+        Some(if prefix.len() == 1 {
+            prefix.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(prefix)
+        })
+    }
+
     fn try_structure_guarded_switch_with_default(
         &mut self,
         cond_block: u64,
@@ -1590,12 +2192,105 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .into_iter()
             .filter(|addr| self.func.successors(*addr).contains(&merge_block))
             .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            candidates = region
+                .blocks()
+                .into_iter()
+                .filter_map(|addr| self.transparent_branch_successor_to_merge(addr, merge_block))
+                .collect::<Vec<_>>();
+        }
         candidates.sort_unstable();
         candidates.dedup();
         match candidates.as_slice() {
             [pred] => Some(*pred),
             _ => None,
         }
+    }
+
+    fn transparent_branch_successor_to_merge(&self, addr: u64, merge_block: u64) -> Option<u64> {
+        let block = self.func.get_block(addr)?;
+        if !block
+            .ops
+            .iter()
+            .all(|op| self.is_transparent_branch_forwarder_op(op))
+        {
+            return None;
+        }
+        if self.region_analyzer.as_ref().is_some_and(|analyzer| {
+            analyzer.is_loop_continue(addr)
+                || analyzer.is_loop_break(addr)
+                || analyzer.is_loop_goto(addr)
+        }) {
+            return None;
+        }
+        let successors = self.transparent_branch_successors(addr, block);
+        let [successor] = successors.as_slice() else {
+            return None;
+        };
+        self.block_flows_to_merge(*successor, merge_block)
+            .then_some(*successor)
+    }
+
+    fn is_transparent_branch_forwarder_op(&self, op: &SSAOp) -> bool {
+        match op {
+            SSAOp::Branch { .. } => true,
+            SSAOp::Copy { dst, .. } => {
+                !self
+                    .fold_ctx
+                    .inputs
+                    .arch
+                    .is_return_register_name(&dst.name.to_ascii_lowercase())
+                    && (dst.is_temp() || Self::is_status_flag_name(&dst.name))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_status_flag_name(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "cf" | "of" | "pf" | "sf" | "zf" | "af" | "df" | "if"
+        )
+    }
+
+    fn transparent_branch_successors(
+        &self,
+        addr: u64,
+        block: &r2ssa::FunctionSSABlock,
+    ) -> Vec<u64> {
+        let successors = self.func.successors(addr);
+        if !successors.is_empty() {
+            return successors;
+        }
+        let mut targets = block
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::Branch { target } => parse_address_from_var_name(&target.name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    fn block_flows_to_merge(&self, addr: u64, merge_block: u64) -> bool {
+        if self.func.successors(addr).contains(&merge_block) {
+            return true;
+        }
+        let Some(block) = self.func.get_block(addr) else {
+            return false;
+        };
+        if block.addr.checked_add(u64::from(block.size)) != Some(merge_block) {
+            return false;
+        }
+        self.func.cfg().get_block(addr).is_none_or(|cfg_block| {
+            matches!(
+                &cfg_block.terminator,
+                BlockTerminator::Fallthrough { next } if *next == merge_block
+            ) || matches!(&cfg_block.terminator, BlockTerminator::None)
+        })
     }
 
     fn append_merged_slot_return_if_needed(
@@ -1640,6 +2335,98 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 .fold_ctx
                 .merged_return_candidate_for_block_slot(pred_addr, summary.slot_offset)
                 .is_some()
+    }
+
+    fn append_merged_register_return_if_needed(
+        &self,
+        stmt: CStmt,
+        merge_addr: u64,
+        pred_addr: u64,
+    ) -> Option<CStmt> {
+        if !self.block_allows_predecessor_return_register_rewrite(merge_addr) {
+            return None;
+        }
+        let Some((expr, proof_block, proof_op, proof_value)) =
+            self.return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)
+        else {
+            if Self::single_return_expr(&stmt).is_some()
+                && let Some((proof_block, proof_op, proof_value)) =
+                    self.predecessor_return_register_certificate(pred_addr)
+            {
+                self.record_return_value_render_proof(proof_block, proof_op, proof_value);
+                return Some(stmt);
+            }
+            return None;
+        };
+        if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
+            self.record_return_value_render_proof(proof_block, proof_op, proof_value);
+            return Some(rewritten);
+        }
+        if Self::single_terminator_stmt(&stmt).is_some() {
+            return Some(stmt);
+        }
+        let mut stmts = Vec::new();
+        Self::append_stmt_body_flat(&mut stmts, stmt);
+        stmts.push(CStmt::Return(Some(expr)));
+        self.record_return_value_render_proof(proof_block, proof_op, proof_value);
+        Some(if stmts.len() == 1 {
+            stmts.into_iter().next().unwrap_or(CStmt::Empty)
+        } else {
+            CStmt::Block(stmts)
+        })
+    }
+
+    fn predecessor_return_register_certificate(
+        &self,
+        pred_addr: u64,
+    ) -> Option<(u64, usize, ValueId)> {
+        self.fold_ctx
+            .inputs
+            .prepared_ssa?
+            .certificates()
+            .returns
+            .iter()
+            .filter(|cert| cert.block_addr == pred_addr)
+            .max_by_key(|cert| cert.op_index)
+            .map(|cert| (cert.block_addr, cert.op_index, cert.value))
+    }
+
+    fn stmt_has_predecessor_return_register_certificate(
+        &self,
+        stmt: &CStmt,
+        pred_addr: u64,
+    ) -> bool {
+        Self::single_return_expr(stmt).is_some()
+            && self
+                .predecessor_return_register_certificate(pred_addr)
+                .is_some()
+    }
+
+    fn has_merged_register_return_expr(&self, merge_addr: u64, pred_addr: u64) -> bool {
+        self.return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)
+            .is_some()
+    }
+
+    fn record_return_value_render_proof(&self, block_addr: u64, op_idx: usize, value: ValueId) {
+        self.fold_ctx.record_effect_render_proof_for_value(
+            EffectRenderProofKind::Return,
+            block_addr,
+            op_idx,
+            Some(value),
+        );
+        if let Some((read_block, read_op, address, read_value)) = self
+            .fold_ctx
+            .certified_memory_read_for_value_dependency(value)
+            .map(|cert| (cert.block_addr, cert.op_index, cert.address, cert.value))
+        {
+            self.fold_ctx.record_effect_render_proof_for_memory(
+                EffectRenderProofKind::MemoryRead,
+                read_block,
+                read_op,
+                address,
+                read_value,
+            );
+        }
     }
 
     fn prepend_named_merged_slot_assignment_if_needed(
@@ -1693,6 +2480,13 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             // Once structure has matched the if/else -> merge-slot -> return pattern,
             // do not let an earlier synthesized return expression beat the merged value.
             CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(merged.clone()))),
+            CStmt::Comment(reason)
+                if reason.starts_with(
+                    "r2sleigh residual: unresolved value return for control-only exit",
+                ) =>
+            {
+                Some(CStmt::Return(Some(merged.clone())))
+            }
             CStmt::Block(stmts) => {
                 let (last, prefix) = stmts.split_last()?;
                 let rewritten_tail = self.rewrite_trailing_return_with_merged_expr(last, merged)?;
@@ -1783,6 +2577,293 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             i += 1;
         }
         rewritten
+    }
+
+    fn rewrite_continue_tail_merges(stmts: Vec<CStmt>) -> Vec<CStmt> {
+        let mut rewritten = Vec::with_capacity(stmts.len());
+        let mut i = 0;
+        while i < stmts.len() {
+            if i + 1 < stmts.len()
+                && let CStmt::If {
+                    cond,
+                    then_body,
+                    else_body: None,
+                } = &stmts[i]
+                && let Some((then_prefix, tail_stmt)) =
+                    Self::split_trailing_update_continue((**then_body).clone())
+            {
+                let else_stmts = stmts[i + 1..].to_vec();
+                let else_body = Self::stmt_from_vec(else_stmts.clone());
+                if !Self::stmt_guarantees_termination(&else_body) {
+                    rewritten.extend(Self::factor_guarded_common_suffix(
+                        cond.clone(),
+                        then_prefix,
+                        else_stmts,
+                    ));
+                    rewritten.push(tail_stmt);
+                    break;
+                }
+            }
+
+            rewritten.push(stmts[i].clone());
+            i += 1;
+        }
+
+        rewritten
+    }
+
+    fn factor_guarded_common_suffix(
+        cond: CExpr,
+        mut then_stmts: Vec<CStmt>,
+        mut else_stmts: Vec<CStmt>,
+    ) -> Vec<CStmt> {
+        let mut common_suffix = Vec::new();
+        while then_stmts.last().is_some()
+            && then_stmts.last() == else_stmts.last()
+            && !Self::stmt_list_contains_control_transfer(&then_stmts[..then_stmts.len() - 1])
+            && !Self::stmt_list_contains_control_transfer(&else_stmts[..else_stmts.len() - 1])
+        {
+            common_suffix.push(then_stmts.pop().expect("then suffix"));
+            else_stmts.pop();
+        }
+        common_suffix.reverse();
+
+        let mut out = Vec::new();
+        if then_stmts.is_empty() && else_stmts.is_empty() {
+            out.extend(common_suffix);
+            return out;
+        }
+
+        let guarded = if then_stmts.is_empty() {
+            CStmt::If {
+                cond: Self::negate_condition(cond),
+                then_body: Box::new(Self::stmt_from_vec(else_stmts)),
+                else_body: None,
+            }
+        } else {
+            CStmt::If {
+                cond,
+                then_body: Box::new(Self::stmt_from_vec(then_stmts)),
+                else_body: (!else_stmts.is_empty())
+                    .then(|| Box::new(Self::stmt_from_vec(else_stmts))),
+            }
+        };
+        out.push(Self::rewrite_if_short_circuit(guarded));
+        out.extend(common_suffix);
+        out
+    }
+
+    fn stmt_list_contains_control_transfer(stmts: &[CStmt]) -> bool {
+        stmts.iter().any(Self::stmt_contains_control_transfer)
+    }
+
+    fn stmt_contains_control_transfer(stmt: &CStmt) -> bool {
+        if Self::stmt_is_unconditional_terminator(stmt) {
+            return true;
+        }
+        match stmt {
+            CStmt::Block(stmts) => Self::stmt_list_contains_control_transfer(stmts),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                Self::stmt_contains_control_transfer(then_body)
+                    || else_body
+                        .as_ref()
+                        .is_some_and(|stmt| Self::stmt_contains_control_transfer(stmt))
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
+                Self::stmt_contains_control_transfer(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|case| Self::stmt_list_contains_control_transfer(&case.body))
+                    || default
+                        .as_ref()
+                        .is_some_and(|body| Self::stmt_list_contains_control_transfer(body))
+            }
+            _ => false,
+        }
+    }
+
+    fn split_trailing_update_continue(stmt: CStmt) -> Option<(Vec<CStmt>, CStmt)> {
+        let mut stmts = Self::stmt_into_vec(stmt);
+        while matches!(stmts.last(), Some(CStmt::Empty)) {
+            stmts.pop();
+        }
+        if !matches!(stmts.last(), Some(CStmt::Continue)) {
+            return None;
+        }
+        stmts.pop();
+        while matches!(stmts.last(), Some(CStmt::Empty)) {
+            stmts.pop();
+        }
+        while stmts
+            .last()
+            .is_some_and(Self::is_generated_side_effect_free_assignment)
+        {
+            stmts.pop();
+            while matches!(stmts.last(), Some(CStmt::Empty)) {
+                stmts.pop();
+            }
+        }
+        let tail_stmt = stmts.pop()?;
+        Self::stmt_is_self_update(&tail_stmt).then_some((stmts, tail_stmt))
+    }
+
+    fn strip_trailing_for_update(body: CStmt, update: &CExpr) -> CStmt {
+        let mut stmts = Self::stmt_into_vec(body);
+        while matches!(stmts.last(), Some(CStmt::Empty)) {
+            stmts.pop();
+        }
+        if matches!(
+            stmts.last(),
+            Some(CStmt::Expr(expr)) if Self::expr_matches_for_update(expr, update)
+        ) {
+            stmts.pop();
+        }
+        Self::stmt_from_vec(stmts)
+    }
+
+    fn remove_dead_generated_artifact_assignments(stmt: CStmt) -> CStmt {
+        match stmt {
+            CStmt::Block(stmts) => {
+                let stmts = stmts
+                    .into_iter()
+                    .map(Self::remove_dead_generated_artifact_assignments)
+                    .collect();
+                Self::stmt_from_vec(Self::remove_dead_generated_artifact_assignments_from_vec(
+                    stmts,
+                ))
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => CStmt::If {
+                cond,
+                then_body: Box::new(Self::remove_dead_generated_artifact_assignments(*then_body)),
+                else_body: else_body
+                    .map(|body| Box::new(Self::remove_dead_generated_artifact_assignments(*body))),
+            },
+            CStmt::While { cond, body } => CStmt::While {
+                cond,
+                body: Box::new(Self::remove_dead_generated_artifact_assignments(*body)),
+            },
+            CStmt::DoWhile { body, cond } => CStmt::DoWhile {
+                body: Box::new(Self::remove_dead_generated_artifact_assignments(*body)),
+                cond,
+            },
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => CStmt::For {
+                init,
+                cond,
+                update,
+                body: Box::new(Self::remove_dead_generated_artifact_assignments(*body)),
+            },
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => CStmt::Switch {
+                expr,
+                cases: cases
+                    .into_iter()
+                    .map(|case| crate::ast::SwitchCase {
+                        value: case.value,
+                        body: Self::remove_dead_generated_artifact_assignments_from_vec(case.body),
+                    })
+                    .collect(),
+                default: default.map(Self::remove_dead_generated_artifact_assignments_from_vec),
+            },
+            other => other,
+        }
+    }
+
+    fn remove_dead_generated_artifact_assignments_from_vec(stmts: Vec<CStmt>) -> Vec<CStmt> {
+        let mut live = HashSet::new();
+        let mut kept = Vec::with_capacity(stmts.len());
+        for stmt in stmts.into_iter().rev() {
+            if let Some((def, reads, generated, side_effect_free)) =
+                Self::stmt_assignment_def_reads(&stmt)
+            {
+                if generated && side_effect_free && !Self::set_contains_loop_var(&live, &def) {
+                    continue;
+                }
+                Self::set_remove_loop_var_aliases(&mut live, &def);
+                live.extend(reads);
+            } else {
+                live.extend(Self::collect_stmt_vars(&stmt));
+            }
+            kept.push(stmt);
+        }
+        kept.reverse();
+        kept
+    }
+
+    fn expr_matches_for_update(body_expr: &CExpr, for_update: &CExpr) -> bool {
+        if body_expr == for_update {
+            return true;
+        }
+
+        Self::normalized_self_update_signature(body_expr)
+            .zip(Self::normalized_self_update_signature(for_update))
+            .is_some_and(|(body, update)| body == update)
+    }
+
+    fn normalized_self_update_signature(expr: &CExpr) -> Option<(String, BinaryOp, CExpr)> {
+        let CExpr::Binary { op, left, right } = expr else {
+            return None;
+        };
+        let CExpr::Var(name) = left.as_ref() else {
+            return None;
+        };
+
+        if Self::is_compound_assign_op(*op) {
+            return Some((name.clone(), *op, right.as_ref().clone()));
+        }
+
+        if *op == BinaryOp::Assign
+            && let Some((compound_op, rhs)) = Self::compound_assignment_rhs(name, right)
+        {
+            return Some((name.clone(), compound_op, rhs));
+        }
+
+        None
+    }
+
+    fn stmt_is_self_update(stmt: &CStmt) -> bool {
+        let CStmt::Expr(expr) = stmt else {
+            return false;
+        };
+        match expr {
+            CExpr::Unary { op, operand } => {
+                matches!(
+                    op,
+                    UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
+                ) && matches!(operand.as_ref(), CExpr::Var(_))
+            }
+            CExpr::Binary { op, left, right } => {
+                let CExpr::Var(name) = left.as_ref() else {
+                    return false;
+                };
+                if Self::is_compound_assign_op(*op) {
+                    return true;
+                }
+                if *op != BinaryOp::Assign {
+                    return false;
+                }
+                let rhs_vars = Self::collect_expr_vars(right);
+                Self::set_contains_loop_var(&rhs_vars, name)
+            }
+            _ => false,
+        }
     }
 
     fn truncate_dead_straight_line_tail(stmts: Vec<CStmt>) -> Vec<CStmt> {
@@ -2008,6 +3089,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         let mut rewritten = prefix_stmts;
+        let body_without_update =
+            Self::remove_dead_generated_artifact_assignments(body_without_update);
         rewritten.push(CStmt::For {
             init: Some(Box::new(init_stmt)),
             cond: Some(loop_cond),
@@ -2079,15 +3162,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         }
 
-        let prev_stmts = if effective.len() >= 2 {
-            &effective[..effective.len() - 1]
-        } else {
-            &[]
-        };
-        let (update, update_links_cond) =
-            Self::update_expr_from_stmt(var, cond_vars, prev_stmts, effective.last().unwrap())?;
-        effective.pop();
-        Some((update, Self::stmt_from_vec(effective), update_links_cond))
+        for idx in (0..effective.len()).rev() {
+            if !effective[idx + 1..]
+                .iter()
+                .all(|stmt| Self::is_removable_trailing_loop_artifact(stmt, var, cond_vars))
+            {
+                break;
+            }
+            let prev_stmts = &effective[..idx];
+            if let Some((update, update_links_cond)) =
+                Self::update_expr_from_stmt(var, cond_vars, prev_stmts, &effective[idx])
+            {
+                let body = effective[..idx].to_vec();
+                return Some((update, Self::stmt_from_vec(body), update_links_cond));
+            }
+        }
+
+        None
     }
 
     fn extract_guard_break_cond(body: CStmt) -> Option<(CExpr, CStmt)> {
@@ -2112,28 +3203,127 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if matches!(
                     op,
                     UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
-                ) && matches!(operand.as_ref(), CExpr::Var(_)) =>
+                ) && matches!(operand.as_ref(), CExpr::Var(name) if Self::loop_var_equiv(name, var)) =>
             {
                 Some((expr.clone(), false))
             }
             CExpr::Binary { op, left, right } if matches!(left.as_ref(), CExpr::Var(_)) => {
+                let CExpr::Var(left_name) = left.as_ref() else {
+                    return None;
+                };
+                let left_is_induction = Self::loop_var_equiv(left_name, var);
+                let left_feeds_condition = Self::set_contains_loop_var(cond_vars, left_name);
                 if *op == BinaryOp::Assign {
                     let rhs_vars = Self::collect_expr_vars(right);
                     let links_cond_direct = Self::sets_overlap_loop_vars(&rhs_vars, cond_vars);
                     let reads_induction = Self::set_contains_loop_var(&rhs_vars, var);
                     let links_cond_via_alias =
                         Self::rhs_links_cond_via_alias(prev_stmts, &rhs_vars, cond_vars);
-                    if reads_induction || links_cond_direct || links_cond_via_alias {
+                    if (left_is_induction && reads_induction)
+                        || (left_feeds_condition && (links_cond_direct || links_cond_via_alias))
+                    {
                         return Some((expr.clone(), links_cond_direct || links_cond_via_alias));
                     }
                 }
-                if Self::is_compound_assign_op(*op) {
+                if Self::is_compound_assign_op(*op)
+                    && matches!(left.as_ref(), CExpr::Var(name) if Self::loop_var_equiv(name, var))
+                {
                     return Some((expr.clone(), false));
                 }
                 None
             }
             _ => None,
         }
+    }
+
+    fn is_removable_trailing_loop_artifact(
+        stmt: &CStmt,
+        var: &str,
+        cond_vars: &HashSet<String>,
+    ) -> bool {
+        let (name, rhs) = match stmt {
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            }) => {
+                let CExpr::Var(name) = left.as_ref() else {
+                    return false;
+                };
+                (name.as_str(), right.as_ref())
+            }
+            CStmt::Decl {
+                name,
+                init: Some(rhs),
+                ..
+            } => (name.as_str(), rhs),
+            _ => return false,
+        };
+        if Self::loop_var_equiv(name, var) || Self::set_contains_loop_var(cond_vars, name) {
+            return false;
+        }
+        Self::is_generated_artifact_name(name) && Self::expr_is_side_effect_free(rhs)
+    }
+
+    fn is_generated_side_effect_free_assignment(stmt: &CStmt) -> bool {
+        let (name, rhs) = match stmt {
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            }) => {
+                let CExpr::Var(name) = left.as_ref() else {
+                    return false;
+                };
+                (name.as_str(), right.as_ref())
+            }
+            CStmt::Decl {
+                name,
+                init: Some(rhs),
+                ..
+            } => (name.as_str(), rhs),
+            _ => return false,
+        };
+        Self::is_generated_artifact_name(name) && Self::expr_is_side_effect_free(rhs)
+    }
+
+    fn is_generated_artifact_name(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        let versioned_register = lower.rsplit_once('_').is_some_and(|(base, version)| {
+            version.bytes().all(|byte| byte.is_ascii_digit())
+                && matches!(
+                    base,
+                    "al" | "ah"
+                        | "ax"
+                        | "eax"
+                        | "rax"
+                        | "bl"
+                        | "bh"
+                        | "bx"
+                        | "ebx"
+                        | "rbx"
+                        | "cl"
+                        | "ch"
+                        | "cx"
+                        | "ecx"
+                        | "rcx"
+                        | "dl"
+                        | "dh"
+                        | "dx"
+                        | "edx"
+                        | "rdx"
+                        | "esi"
+                        | "rsi"
+                        | "edi"
+                        | "rdi"
+                )
+        });
+        lower.starts_with("value_")
+            || lower.starts_with("tmp:")
+            || lower.starts_with("unique:")
+            || lower.contains(':')
+            || (lower.starts_with('t') && lower[1..].chars().all(|ch| ch.is_ascii_digit()))
+            || versioned_register
     }
 
     fn is_if_break_without_else(stmt: &CStmt) -> Option<CExpr> {
@@ -2227,6 +3417,117 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         };
         Some((def.clone(), Self::collect_expr_vars(right)))
+    }
+
+    fn stmt_assignment_def_reads(stmt: &CStmt) -> Option<(String, HashSet<String>, bool, bool)> {
+        match stmt {
+            CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                right,
+            }) => {
+                let CExpr::Var(def) = left.as_ref() else {
+                    return None;
+                };
+                Some((
+                    def.clone(),
+                    Self::collect_expr_vars(right),
+                    Self::is_generated_artifact_name(def),
+                    Self::expr_is_side_effect_free(right),
+                ))
+            }
+            CStmt::Decl {
+                name,
+                init: Some(init),
+                ..
+            } => Some((
+                name.clone(),
+                Self::collect_expr_vars(init),
+                Self::is_generated_artifact_name(name),
+                Self::expr_is_side_effect_free(init),
+            )),
+            _ => None,
+        }
+    }
+
+    fn collect_stmt_vars(stmt: &CStmt) -> HashSet<String> {
+        let mut vars = HashSet::new();
+        Self::collect_stmt_vars_into(stmt, &mut vars);
+        vars
+    }
+
+    fn collect_stmt_vars_into(stmt: &CStmt, out: &mut HashSet<String>) {
+        match stmt {
+            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
+                Self::collect_expr_vars_into(expr, out)
+            }
+            CStmt::Decl {
+                init: Some(init), ..
+            } => Self::collect_expr_vars_into(init, out),
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                Self::collect_expr_vars_into(cond, out);
+                Self::collect_stmt_vars_into(then_body, out);
+                if let Some(else_body) = else_body.as_ref() {
+                    Self::collect_stmt_vars_into(else_body, out);
+                }
+            }
+            CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+                Self::collect_expr_vars_into(cond, out);
+                Self::collect_stmt_vars_into(body, out);
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                if let Some(init) = init.as_ref() {
+                    Self::collect_stmt_vars_into(init, out);
+                }
+                if let Some(cond) = cond.as_ref() {
+                    Self::collect_expr_vars_into(cond, out);
+                }
+                if let Some(update) = update.as_ref() {
+                    Self::collect_expr_vars_into(update, out);
+                }
+                Self::collect_stmt_vars_into(body, out);
+            }
+            CStmt::Block(stmts) => {
+                for stmt in stmts {
+                    Self::collect_stmt_vars_into(stmt, out);
+                }
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                Self::collect_expr_vars_into(expr, out);
+                for case in cases {
+                    Self::collect_expr_vars_into(&case.value, out);
+                    for stmt in &case.body {
+                        Self::collect_stmt_vars_into(stmt, out);
+                    }
+                }
+                if let Some(default) = default.as_ref() {
+                    for stmt in default {
+                        Self::collect_stmt_vars_into(stmt, out);
+                    }
+                }
+            }
+            CStmt::Return(None)
+            | CStmt::Decl { init: None, .. }
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Comment(_)
+            | CStmt::Empty => {}
+        }
     }
 
     fn collect_expr_vars(expr: &CExpr) -> HashSet<String> {
@@ -2543,10 +3844,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 #[cfg(test)]
 mod tests {
     use super::ControlFlowStructurer;
-    use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
+    use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
     use crate::fold::FoldingContext;
+    use crate::region::Region;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
-    use r2ssa::SSAFunction;
+    use r2ssa::{BlockTerminator, SSAFunction};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn v(name: &str) -> CExpr {
@@ -2671,6 +3973,150 @@ mod tests {
         .with_name("worker_multiblock_demo")
     }
 
+    fn function_with_transparent_branch_to_merge() -> SSAFunction {
+        let mut branch = R2ILBlock::new(0x1000, 4);
+        branch.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x2000, 1),
+            src: Varnode::unique(0x1000, 1),
+        });
+        branch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut value_pred = R2ILBlock::new(0x1010, 4);
+        value_pred.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::constant(7, 8),
+        });
+        value_pred.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1020, 8),
+        });
+
+        let mut merge = R2ILBlock::new(0x1020, 4);
+        merge.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        SSAFunction::from_blocks_with_arch(&[branch, value_pred, merge], Some(&test_arch()))
+            .expect("ssa function")
+            .with_name("transparent_branch_demo")
+    }
+
+    fn function_with_terminating_if_and_shared_merge() -> SSAFunction {
+        let mut cond = R2ILBlock::new(0x1000, 4);
+        cond.push(R2ILOp::IntEqual {
+            dst: Varnode::register(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        cond.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1010, 8),
+            cond: Varnode::register(0x80, 1),
+        });
+
+        let mut false_block = R2ILBlock::new(0x1004, 4);
+        false_block.push(R2ILOp::Return {
+            target: Varnode::constant(2, 8),
+        });
+
+        let mut true_block = R2ILBlock::new(0x1010, 4);
+        true_block.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+
+        let mut merge = R2ILBlock::new(0x1020, 4);
+        merge.push(R2ILOp::Return {
+            target: Varnode::constant(99, 8),
+        });
+
+        SSAFunction::from_blocks_with_arch(
+            &[cond, false_block, true_block, merge],
+            Some(&test_arch()),
+        )
+        .expect("ssa function")
+        .with_name("terminating_if_merge_demo")
+    }
+
+    fn function_with_guarded_latch_loop_and_shared_exit() -> SSAFunction {
+        let mut entry = R2ILBlock::new(0x1000, 0x13);
+        entry.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x80, 1),
+            target: Varnode::constant(0x1044, 8),
+        });
+
+        let mut preheader = R2ILBlock::new(0x1013, 0x0d);
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1020, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x1020, 0x11);
+        header.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1031, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x1031, 0x13);
+        latch.push(R2ILOp::CBranch {
+            cond: Varnode::register(0x88, 1),
+            target: Varnode::constant(0x1020, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x1044, 1);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+
+        let mut func = SSAFunction::from_blocks_with_arch(
+            &[entry, preheader, header, latch, exit],
+            Some(&test_arch()),
+        )
+        .expect("ssa function")
+        .with_name("guarded_latch_loop_demo");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1044,
+                false_target: 0x1013,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1013, BlockTerminator::Branch { target: 0x1020 });
+        func.cfg_mut()
+            .set_terminator(0x1020, BlockTerminator::Branch { target: 0x1031 });
+        func.cfg_mut().set_terminator(
+            0x1031,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1020,
+                false_target: 0x1044,
+            },
+        );
+        func.refresh_after_cfg_mutation();
+        func
+    }
+
+    fn stmt_contains_loop(stmt: &CStmt) -> bool {
+        match stmt {
+            CStmt::While { .. } | CStmt::For { .. } | CStmt::DoWhile { .. } => true,
+            CStmt::Block(stmts) => stmts.iter().any(stmt_contains_loop),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stmt_contains_loop(then_body)
+                    || else_body.as_deref().is_some_and(stmt_contains_loop)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|case| case.body.iter().any(stmt_contains_loop))
+                    || default
+                        .as_ref()
+                        .is_some_and(|body| body.iter().any(stmt_contains_loop))
+            }
+            _ => false,
+        }
+    }
+
     fn trailing_if_stmt(stmt: &CStmt) -> &CStmt {
         match stmt {
             CStmt::If { .. } => stmt,
@@ -2681,6 +4127,127 @@ mod tests {
                 .expect("trailing if statement"),
             _ => panic!("expected structured if statement, got {stmt:?}"),
         }
+    }
+
+    #[test]
+    fn cleanup_rewrites_pure_if_else_returns_to_ternary_return() {
+        let input = CStmt::If {
+            cond: CExpr::binary(BinaryOp::Eq, v("b"), CExpr::IntLit(0)),
+            then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(-1)))),
+            else_body: Some(Box::new(CStmt::Return(Some(CExpr::binary(
+                BinaryOp::Div,
+                v("a"),
+                v("b"),
+            ))))),
+        };
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        assert_eq!(
+            cleaned,
+            CStmt::Return(Some(CExpr::Ternary {
+                cond: Box::new(CExpr::binary(BinaryOp::Eq, v("b"), CExpr::IntLit(0))),
+                then_expr: Box::new(CExpr::IntLit(-1)),
+                else_expr: Box::new(CExpr::binary(BinaryOp::Div, v("a"), v("b"))),
+            }))
+        );
+    }
+
+    #[test]
+    fn merge_predecessor_follows_transparent_branch_only_region() {
+        let func = function_with_transparent_branch_to_merge();
+        let ctx = FoldingContext::new(64);
+        let structurer = ControlFlowStructurer::new(&func, &ctx);
+
+        assert_eq!(
+            structurer.unique_region_predecessor_to_merge(&Region::Block(0x1000), 0x1020),
+            Some(0x1010)
+        );
+    }
+
+    #[test]
+    fn terminating_if_else_does_not_append_unreachable_merge_block() {
+        let func = function_with_terminating_if_and_shared_merge();
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let region = Region::IfThenElse {
+            cond_block: 0x1000,
+            then_region: Box::new(Region::Block(0x1010)),
+            else_region: Some(Box::new(Region::Block(0x1004))),
+            merge_block: Some(0x1020),
+        };
+
+        let stmt = structurer.structure_region(&region);
+        let rendered = format!("{stmt:?}");
+
+        assert!(
+            !rendered.contains("IntLit(99)") && !rendered.contains("UIntLit(99)"),
+            "terminating branches must not render the shared merge as fallthrough: {rendered}"
+        );
+        assert!(
+            ControlFlowStructurer::stmt_guarantees_termination(&stmt),
+            "structured if/else should still be terminating: {stmt:?}"
+        );
+    }
+
+    #[test]
+    fn do_while_render_proof_uses_body_entry_as_loop_anchor() {
+        let mut header = R2ILBlock::new(0x1000, 4);
+        header.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut latch = R2ILBlock::new(0x1004, 4);
+        latch.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1000, 8),
+            cond: Varnode::register(0x80, 1),
+        });
+        let mut exit = R2ILBlock::new(0x1008, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut func =
+            SSAFunction::from_blocks_with_arch(&[header, latch, exit], Some(&test_arch()))
+                .expect("ssa function");
+        func.cfg_mut()
+            .set_terminator(0x1000, BlockTerminator::Branch { target: 0x1004 });
+        func.cfg_mut().set_terminator(
+            0x1004,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1000,
+                false_target: 0x1008,
+            },
+        );
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let region = Region::DoWhileLoop {
+            body: Box::new(Region::Sequence(vec![
+                Region::Block(0x1000),
+                Region::Block(0x1004),
+            ])),
+            cond_block: 0x1004,
+        };
+
+        let _ = structurer.structure_region(&region);
+
+        assert_eq!(structurer.control_render_proofs()[0].anchor, 0x1000);
+        assert_eq!(
+            structurer.control_render_proofs()[0].loop_latches,
+            vec![0x1004]
+        );
+    }
+
+    #[test]
+    fn guarded_latch_loop_with_shared_exit_keeps_loop_construct() {
+        let func = function_with_guarded_latch_loop_and_shared_exit();
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+
+        let stmt = structurer.structure();
+
+        assert!(
+            stmt_contains_loop(&stmt),
+            "guarded latch-form loop must remain structured, got {stmt:?}; reason={:?}",
+            structurer.safety_reason()
+        );
     }
 
     #[test]
@@ -2716,6 +4283,331 @@ mod tests {
             !matches!(*body, CStmt::Empty),
             "for-loop body should retain side-effect statements"
         );
+    }
+
+    #[test]
+    fn rewrites_continue_tail_update_to_shared_for_latch() {
+        let input = CStmt::Block(vec![
+            CStmt::Block(vec![
+                assign("count", CExpr::IntLit(0)),
+                assign("i", CExpr::IntLit(0)),
+            ]),
+            CStmt::while_loop(
+                CExpr::binary(BinaryOp::Lt, v("i"), v("n")),
+                CStmt::Block(vec![
+                    assign(
+                        "c",
+                        CExpr::Subscript {
+                            base: Box::new(v("buf")),
+                            index: Box::new(v("i")),
+                        },
+                    ),
+                    CStmt::if_stmt(
+                        CExpr::binary(BinaryOp::Ne, v("c"), v("a")),
+                        CStmt::Block(vec![
+                            CStmt::if_stmt(
+                                CExpr::binary(BinaryOp::Eq, v("c"), v("b")),
+                                assign(
+                                    "count",
+                                    CExpr::binary(BinaryOp::Add, v("count"), CExpr::IntLit(1)),
+                                ),
+                                None,
+                            ),
+                            assign("i", CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1))),
+                            CStmt::Continue,
+                        ]),
+                        None,
+                    ),
+                    assign(
+                        "count",
+                        CExpr::binary(BinaryOp::Add, v("count"), CExpr::IntLit(1)),
+                    ),
+                ]),
+            ),
+        ]);
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        let CStmt::Block(stmts) = cleaned else {
+            panic!("Expected count init plus for-loop block, got {cleaned:?}");
+        };
+        let CStmt::For {
+            update: Some(update),
+            body,
+            ..
+        } = stmts.get(1).expect("for-loop")
+        else {
+            panic!("Expected continue-tail loop rewrite to produce CStmt::For, got {stmts:?}");
+        };
+        assert_eq!(
+            update,
+            &CExpr::binary(BinaryOp::AddAssign, v("i"), CExpr::IntLit(1))
+        );
+        let CStmt::Block(body_stmts) = body.as_ref() else {
+            panic!("Expected for body block, got {body:?}");
+        };
+        assert!(
+            !body_stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Continue)),
+            "shared latch rewrite should remove synthetic continue"
+        );
+        assert_eq!(
+            body_stmts.get(1),
+            Some(&CStmt::if_stmt(
+                CExpr::binary(
+                    BinaryOp::Or,
+                    CExpr::binary(BinaryOp::Eq, v("c"), v("a")),
+                    CExpr::binary(BinaryOp::Eq, v("c"), v("b"))
+                ),
+                CStmt::Expr(CExpr::binary(
+                    BinaryOp::AddAssign,
+                    v("count"),
+                    CExpr::IntLit(1),
+                )),
+                None
+            )),
+            "fallthrough suffix with duplicate effect should become a single OR guard"
+        );
+    }
+
+    #[test]
+    fn rewrites_nested_else_duplicate_effect_to_or_condition() {
+        let increment = expr_stmt(CExpr::Unary {
+            op: UnaryOp::PostInc,
+            operand: Box::new(v("count")),
+        });
+        let input = CStmt::if_stmt(
+            CExpr::binary(BinaryOp::Ne, v("c"), v("a")),
+            CStmt::if_stmt(
+                CExpr::binary(BinaryOp::Eq, v("c"), v("b")),
+                increment.clone(),
+                None,
+            ),
+            Some(increment.clone()),
+        );
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        assert_eq!(
+            cleaned,
+            CStmt::if_stmt(
+                CExpr::binary(
+                    BinaryOp::Or,
+                    CExpr::binary(BinaryOp::Eq, v("c"), v("a")),
+                    CExpr::binary(BinaryOp::Eq, v("c"), v("b"))
+                ),
+                increment,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn rewrites_continue_tail_with_common_suffix_before_shared_latch() {
+        let hash_xor = assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash")));
+        let hash_mul = assign(
+            "hash",
+            CExpr::binary(BinaryOp::Mul, v("hash"), CExpr::UIntLit(0x100000001b3)),
+        );
+        let i_update = assign("i", CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1)));
+        let lowercase_update = CStmt::Expr(CExpr::binary(
+            BinaryOp::AddAssign,
+            v("c"),
+            CExpr::IntLit(32),
+        ));
+
+        let input = CStmt::Block(vec![
+            assign("hash", CExpr::UIntLit(0x14650fb0739d0383)),
+            assign("i", CExpr::IntLit(0)),
+            CStmt::while_loop(
+                CExpr::binary(BinaryOp::Lt, v("i"), v("n")),
+                CStmt::Block(vec![
+                    assign(
+                        "c",
+                        CExpr::Subscript {
+                            base: Box::new(v("buf")),
+                            index: Box::new(v("i")),
+                        },
+                    ),
+                    CStmt::if_stmt(
+                        CExpr::binary(BinaryOp::Gt, v("c"), CExpr::IntLit(64)),
+                        CStmt::Block(vec![
+                            CStmt::if_stmt(
+                                CExpr::binary(BinaryOp::Le, v("c"), CExpr::IntLit(90)),
+                                lowercase_update.clone(),
+                                None,
+                            ),
+                            hash_xor.clone(),
+                            hash_mul.clone(),
+                            i_update.clone(),
+                            assign("value_1", v("c")),
+                            CStmt::Continue,
+                        ]),
+                        None,
+                    ),
+                    hash_xor.clone(),
+                    hash_mul.clone(),
+                ]),
+            ),
+        ]);
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        let CStmt::Block(stmts) = cleaned else {
+            panic!("Expected hash init plus for-loop block, got {cleaned:?}");
+        };
+        let CStmt::For {
+            update: Some(update),
+            body,
+            ..
+        } = stmts.get(1).expect("for-loop")
+        else {
+            panic!("Expected loop rewrite to produce CStmt::For, got {stmts:?}");
+        };
+        assert_eq!(
+            update,
+            &CExpr::binary(BinaryOp::AddAssign, v("i"), CExpr::IntLit(1))
+        );
+
+        let CStmt::Block(body_stmts) = body.as_ref() else {
+            panic!("Expected for body block, got {body:?}");
+        };
+        assert!(
+            !body_stmts
+                .iter()
+                .any(ControlFlowStructurer::stmt_contains_control_transfer),
+            "factored loop body should not keep synthetic continue"
+        );
+        assert_eq!(
+            body_stmts.get(1),
+            Some(&CStmt::if_stmt(
+                CExpr::binary(
+                    BinaryOp::And,
+                    CExpr::binary(BinaryOp::Gt, v("c"), CExpr::IntLit(64)),
+                    CExpr::binary(BinaryOp::Le, v("c"), CExpr::IntLit(90)),
+                ),
+                lowercase_update,
+                None
+            )),
+            "only the lowercase transform should remain guarded"
+        );
+        assert_eq!(
+            body_stmts.get(2),
+            Some(&CStmt::Expr(CExpr::binary(
+                BinaryOp::BitXorAssign,
+                v("hash"),
+                v("c")
+            )))
+        );
+        assert_eq!(
+            body_stmts.get(3),
+            Some(&CStmt::Expr(CExpr::binary(
+                BinaryOp::MulAssign,
+                v("hash"),
+                CExpr::UIntLit(0x100000001b3)
+            )))
+        );
+    }
+
+    #[test]
+    fn removes_duplicate_body_update_owned_by_for_latch() {
+        let i_update_expr = CExpr::binary(
+            BinaryOp::Assign,
+            v("i"),
+            CExpr::binary(BinaryOp::Add, v("i"), CExpr::IntLit(1)),
+        );
+        let hash_update = assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash")));
+        let input = CStmt::For {
+            init: Some(Box::new(assign("i", CExpr::IntLit(0)))),
+            cond: Some(CExpr::binary(BinaryOp::Lt, v("i"), v("n"))),
+            update: Some(i_update_expr.clone()),
+            body: Box::new(CStmt::Block(vec![
+                hash_update.clone(),
+                CStmt::Expr(i_update_expr.clone()),
+            ])),
+        };
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        let CStmt::For { body, .. } = cleaned else {
+            panic!("Expected for-loop, got {cleaned:?}");
+        };
+        assert_eq!(
+            body.as_ref(),
+            &CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v("hash"), v("c"))),
+            "for latch update should own the duplicated trailing body update"
+        );
+    }
+
+    #[test]
+    fn rewrites_side_effect_free_assignments_to_compound_assignments() {
+        let input = CStmt::Block(vec![
+            assign("hash", CExpr::binary(BinaryOp::BitXor, v("c"), v("hash"))),
+            assign(
+                "hash",
+                CExpr::binary(BinaryOp::Mul, v("hash"), CExpr::UIntLit(0x100000001b3)),
+            ),
+            assign(
+                "hash",
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::Call {
+                        func: Box::new(v("next")),
+                        args: Vec::new(),
+                    },
+                    v("hash"),
+                ),
+            ),
+        ]);
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        let CStmt::Block(stmts) = cleaned else {
+            panic!("Expected block, got {cleaned:?}");
+        };
+        assert_eq!(
+            stmts[0],
+            CStmt::Expr(CExpr::binary(BinaryOp::BitXorAssign, v("hash"), v("c")))
+        );
+        assert_eq!(
+            stmts[1],
+            CStmt::Expr(CExpr::binary(
+                BinaryOp::MulAssign,
+                v("hash"),
+                CExpr::UIntLit(0x100000001b3)
+            ))
+        );
+        assert!(
+            matches!(
+                &stmts[2],
+                CStmt::Expr(CExpr::Binary {
+                    op: BinaryOp::Assign,
+                    ..
+                })
+            ),
+            "side-effecting operands should not be reordered into compound assignments"
+        );
+    }
+
+    #[test]
+    fn removes_dead_trailing_returns_inside_switch_cases() {
+        let input = CStmt::Switch {
+            expr: v("op"),
+            cases: vec![crate::ast::SwitchCase {
+                value: CExpr::IntLit(0),
+                body: vec![
+                    CStmt::Return(Some(CExpr::IntLit(1))),
+                    CStmt::Return(Some(CExpr::IntLit(2))),
+                ],
+            }],
+            default: Some(vec![
+                CStmt::Return(Some(CExpr::IntLit(3))),
+                CStmt::Return(Some(CExpr::IntLit(4))),
+            ]),
+        };
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        let CStmt::Switch { cases, default, .. } = cleaned else {
+            panic!("Expected switch, got {cleaned:?}");
+        };
+        assert_eq!(cases[0].body, vec![CStmt::Return(Some(CExpr::IntLit(1)))]);
+        assert_eq!(default, Some(vec![CStmt::Return(Some(CExpr::IntLit(3)))]));
     }
 
     #[test]
@@ -2852,8 +4744,65 @@ mod tests {
             else {
                 panic!("Expected loop rewrite for accepted self-assign update form");
             };
-            assert_eq!(update, update_expr);
+            assert!(
+                ControlFlowStructurer::expr_matches_for_update(&update, &update_expr),
+                "Expected canonical loop update {update:?} to match source update {update_expr:?}"
+            );
         }
+    }
+
+    #[test]
+    fn rewrites_for_loop_past_generated_trailing_value_carrier() {
+        let input = CStmt::Block(vec![
+            CStmt::Block(vec![
+                assign("sum", CExpr::IntLit(0)),
+                assign("i", CExpr::IntLit(0)),
+            ]),
+            CStmt::while_loop(
+                CExpr::binary(BinaryOp::Lt, v("i"), v("len")),
+                CStmt::Block(vec![
+                    CStmt::Expr(CExpr::binary(
+                        BinaryOp::AddAssign,
+                        v("sum"),
+                        CExpr::Subscript {
+                            base: Box::new(v("arr")),
+                            index: Box::new(v("i")),
+                        },
+                    )),
+                    CStmt::Expr(CExpr::Unary {
+                        op: UnaryOp::PostInc,
+                        operand: Box::new(v("i")),
+                    }),
+                    CStmt::Decl {
+                        name: "tmp:11f00_4".to_string(),
+                        ty: CType::i32(),
+                        init: Some(CExpr::Deref(Box::new(CExpr::binary(
+                            BinaryOp::Add,
+                            v("arr"),
+                            CExpr::binary(BinaryOp::Mul, v("i"), CExpr::IntLit(4)),
+                        )))),
+                    },
+                ]),
+            ),
+        ]);
+
+        let cleaned = ControlFlowStructurer::cleanup(input);
+        let CStmt::Block(stmts) = cleaned else {
+            panic!("Expected block with sum init and for-loop, got {cleaned:?}");
+        };
+        assert!(
+            matches!(
+                stmts.get(1),
+                Some(CStmt::For {
+                    update: Some(CExpr::Unary {
+                        op: UnaryOp::PostInc,
+                        ..
+                    }),
+                    ..
+                })
+            ),
+            "generated trailing value carrier should not own loop update: {stmts:?}"
+        );
     }
 
     #[test]
@@ -2917,8 +4866,8 @@ mod tests {
         let input = CStmt::if_stmt(
             CExpr::binary(BinaryOp::Lt, v("x"), v("limit")),
             CStmt::Block(vec![
-                assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("x"))),
-                assign("x", CExpr::binary(BinaryOp::Add, v("x"), CExpr::IntLit(1))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1))),
             ]),
             Some(CStmt::ret(Some(CExpr::IntLit(0)))),
         );
@@ -2932,8 +4881,8 @@ mod tests {
                     CStmt::ret(Some(CExpr::IntLit(0))),
                     None
                 ),
-                assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("x"))),
-                assign("x", CExpr::binary(BinaryOp::Add, v("x"), CExpr::IntLit(1))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1),)),
             ])
         );
     }
@@ -2944,8 +4893,8 @@ mod tests {
             v("is_error"),
             CStmt::ret(Some(CExpr::IntLit(-1))),
             Some(CStmt::Block(vec![
-                assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("x"))),
-                assign("x", CExpr::binary(BinaryOp::Add, v("x"), CExpr::IntLit(1))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1))),
             ])),
         );
 
@@ -2954,8 +4903,8 @@ mod tests {
             cleaned,
             CStmt::Block(vec![
                 CStmt::if_stmt(v("is_error"), CStmt::ret(Some(CExpr::IntLit(-1))), None),
-                assign("sum", CExpr::binary(BinaryOp::Add, v("sum"), v("x"))),
-                assign("x", CExpr::binary(BinaryOp::Add, v("x"), CExpr::IntLit(1))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("sum"), v("x"))),
+                CStmt::Expr(CExpr::binary(BinaryOp::AddAssign, v("x"), CExpr::IntLit(1),)),
             ])
         );
     }
@@ -3355,7 +5304,7 @@ mod tests {
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         assert_eq!(
             structurer.get_switch_expression(0x1000),
-            CExpr::Var("vm.sel".to_string())
+            (CExpr::Var("vm.sel".to_string()), None)
         );
     }
 
@@ -3462,7 +5411,7 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_actionable_if_accepts_reachable_target_inside_region() {
+    fn symbolic_actionable_if_refuses_likely_target_without_exact_reachability() {
         let func = function_with_return_blocks(&[0x2000, 0x2004, 0x2008]);
         let mut ctx = FoldingContext::new(64);
         let likely =
@@ -3530,8 +5479,8 @@ mod tests {
         let rewritten =
             structurer.try_structure_symbolic_actionable_if(0x2000, &then_region, None, None);
         assert!(
-            rewritten.is_some(),
-            "reachable targets inside the structured region should still drive symbolic if shaping"
+            rewritten.is_none(),
+            "likely/actionable reachability is not enough to erase a native branch"
         );
     }
 

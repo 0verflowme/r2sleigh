@@ -205,6 +205,7 @@ mod ffi {
         schema_version: u32,
         dirty_epoch: u64,
         context_hash: u64,
+        type_dirty_epoch: u64,
         external_context_json: *const c_char,
         signature_name: *const c_char,
         signature_ret_type: *const c_char,
@@ -241,6 +242,8 @@ mod ffi {
         interproc_max_iters: usize,
         interproc_converged: i32,
         global_max_links: usize,
+        max_type_decls: usize,
+        max_mutations: usize,
     }
 
     #[repr(C)]
@@ -260,6 +263,48 @@ mod ffi {
         let mut out = bytes.to_vec();
         out.resize(16, 0x00);
         out
+    }
+
+    unsafe fn plugin_usize_symbol(lib: &libloading::Library, name: &[u8]) -> usize {
+        let f: libloading::Symbol<unsafe extern "C" fn() -> usize> =
+            unsafe { lib.get(name).unwrap() };
+        unsafe { f() }
+    }
+
+    #[test]
+    fn session_input_ffi_layout_matches_plugin() {
+        if !require_plugin() {
+            eprintln!("Skipping: plugin not built");
+            return;
+        }
+
+        unsafe {
+            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_function_context"),
+                std::mem::size_of::<R2SleighFunctionContext>()
+            );
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_function_context"),
+                std::mem::align_of::<R2SleighFunctionContext>()
+            );
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_budget_config"),
+                std::mem::size_of::<R2SleighBudgetConfig>()
+            );
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_budget_config"),
+                std::mem::align_of::<R2SleighBudgetConfig>()
+            );
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_session_input"),
+                std::mem::size_of::<R2SleighSessionInput>()
+            );
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_session_input"),
+                std::mem::align_of::<R2SleighSessionInput>()
+            );
+        }
     }
 
     unsafe fn session_type_writeback_json(
@@ -294,6 +339,7 @@ mod ffi {
                 schema_version: 1,
                 dirty_epoch: 0,
                 context_hash: 0,
+                type_dirty_epoch: 0,
                 external_context_json: external_context.as_ptr(),
                 signature_name: function_name.as_ptr(),
                 signature_ret_type: signature_ret_type
@@ -326,6 +372,8 @@ mod ffi {
                 interproc_max_iters: 1,
                 interproc_converged: 1,
                 global_max_links: 64,
+                max_type_decls: 32,
+                max_mutations: 128,
             },
         };
         let session = unsafe { session_analyze(&input) };

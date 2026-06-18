@@ -263,13 +263,13 @@ mod tests {
 
     #[test]
     fn ansi_highlight_preserves_source_text() {
-        let source = "size_t mem_scan2(uint8_t* buf, size_t n)\n{\n    return 0;\n}\n";
+        let source = "size_t count_bytes(uint8_t* buf, size_t n)\n{\n    return 0;\n}\n";
         let highlighted = highlight_c_ansi(source);
 
         assert_ne!(highlighted, source);
         assert_eq!(strip_ansi(&highlighted), source);
         assert!(highlighted.contains("\x1b[96msize_t\x1b[0m"));
-        assert!(highlighted.contains("\x1b[1mmem_scan2\x1b[0m"));
+        assert!(highlighted.contains("\x1b[1mcount_bytes\x1b[0m"));
         assert!(highlighted.contains("\x1b[95mreturn\x1b[0m"));
         assert!(highlighted.contains("\x1b[94m0\x1b[0m"));
     }

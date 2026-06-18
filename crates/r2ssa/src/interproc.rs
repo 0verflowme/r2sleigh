@@ -212,7 +212,8 @@ impl FunctionSemanticSummary {
         }
     }
 
-    pub fn seed_for_name(id: InterprocFunctionId, name: &str) -> Option<Self> {
+    #[cfg(test)]
+    fn seed_for_name(id: InterprocFunctionId, name: &str) -> Option<Self> {
         let normalized = normalize_seed_name(name)?;
         let mut arg_effects = BTreeMap::new();
         let mut effect = |idx: usize, read: bool, write: bool, escape: bool, free: bool| {
@@ -400,10 +401,6 @@ impl FunctionSemanticSummary {
             touches_unknown_memory: false,
         })
     }
-
-    pub fn seed_or_unknown(id: InterprocFunctionId, name: &str) -> Self {
-        Self::seed_for_name(id, name).unwrap_or_else(|| Self::unknown(id, Some(name.to_string())))
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,19 +459,17 @@ impl AbiProfile {
         };
         let lower = arch.name.to_ascii_lowercase();
         match lower.as_str() {
-            "x86-64" | "x86_64" | "x64" | "amd64" if arch.addr_size == 8 || lower != "x86-64" => {
-                Self::new(
-                    vec![
-                        ("rdi", 8, &["edi", "di", "dil"][..]),
-                        ("rsi", 8, &["esi", "si", "sil"][..]),
-                        ("rdx", 8, &["edx", "dx", "dl"][..]),
-                        ("rcx", 8, &["ecx", "cx", "cl"][..]),
-                        ("r8", 8, &["r8d", "r8w", "r8b"][..]),
-                        ("r9", 8, &["r9d", "r9w", "r9b"][..]),
-                    ],
-                    &[("rax", &["eax", "ax", "al"][..])],
-                )
-            }
+            "x86-64" | "x86_64" | "x64" | "amd64" => Self::new(
+                vec![
+                    ("rdi", 8, &["edi", "di", "dil"][..]),
+                    ("rsi", 8, &["esi", "si", "sil"][..]),
+                    ("rdx", 8, &["edx", "dx", "dl"][..]),
+                    ("rcx", 8, &["ecx", "cx", "cl"][..]),
+                    ("r8", 8, &["r8d", "r8w", "r8b"][..]),
+                    ("r9", 8, &["r9d", "r9w", "r9b"][..]),
+                ],
+                &[("rax", &["eax", "ax", "al"][..])],
+            ),
             name if name.starts_with("x86:")
                 && (arch.addr_size == 8 || name.split(':').any(|part| part == "64")) =>
             {
@@ -612,6 +607,12 @@ impl AbiProfile {
     }
 }
 
+fn formal_arg_index_for_var(abi: &AbiProfile, var: &SSAVar) -> Option<usize> {
+    (var.version == 0)
+        .then(|| abi.arg_index_for_name(&var.name))
+        .flatten()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SummaryOperand {
     Arg(usize),
@@ -720,6 +721,67 @@ fn shifted_range(
         }),
         None => exact_range(delta, width),
     }
+}
+
+fn bump_arg_count_hint(hint: &mut Option<usize>, index: usize) {
+    let count = index.saturating_add(1);
+    match hint {
+        Some(current) => *current = (*current).max(count),
+        None => *hint = Some(count),
+    }
+}
+
+fn bump_arg_count_hint_for_location(hint: &mut Option<usize>, location: SummaryMemoryLocation) {
+    if let SummaryMemoryRegion::Arg { index } = location.region {
+        bump_arg_count_hint(hint, index);
+    }
+}
+
+struct SummaryArgCountInputs<'a> {
+    base: Option<usize>,
+    arg_effects: &'a BTreeMap<usize, SummaryArgEffect>,
+    memory_effects: &'a BTreeSet<SummaryMemoryEffect>,
+    transfer_effects: &'a BTreeSet<SummaryTransferEffect>,
+    allocation_effects: &'a BTreeSet<SummaryAllocationEffect>,
+    lifetime_effects: &'a BTreeSet<SummaryLifetimeEffect>,
+    sync_effects: &'a BTreeSet<SummarySyncEffect>,
+    atomic_effects: &'a BTreeSet<SummaryAtomicEffect>,
+    return_relation: &'a SummaryReturnRelation,
+}
+
+fn summary_arg_count_hint(inputs: SummaryArgCountInputs<'_>) -> Option<usize> {
+    let mut hint = inputs.base;
+    for index in inputs.arg_effects.keys().copied() {
+        bump_arg_count_hint(&mut hint, index);
+    }
+    for effect in inputs.memory_effects {
+        bump_arg_count_hint_for_location(&mut hint, effect.location);
+    }
+    for effect in inputs.transfer_effects {
+        bump_arg_count_hint_for_location(&mut hint, effect.dst);
+        bump_arg_count_hint_for_location(&mut hint, effect.src);
+        if let SummaryTransferLength::Arg(index) = effect.len {
+            bump_arg_count_hint(&mut hint, index);
+        }
+    }
+    for effect in inputs.allocation_effects {
+        if let Some(index) = effect.size_arg {
+            bump_arg_count_hint(&mut hint, index);
+        }
+    }
+    for effect in inputs.lifetime_effects {
+        bump_arg_count_hint(&mut hint, effect.arg);
+    }
+    for effect in inputs.sync_effects {
+        bump_arg_count_hint(&mut hint, effect.arg);
+    }
+    for effect in inputs.atomic_effects {
+        bump_arg_count_hint_for_location(&mut hint, effect.location);
+    }
+    if let SummaryReturnRelation::Arg(index) = inputs.return_relation {
+        bump_arg_count_hint(&mut hint, *index);
+    }
+    hint
 }
 
 pub fn solve_interproc_summary_set(
@@ -882,10 +944,22 @@ fn initial_summary(
 ) -> FunctionSemanticSummary {
     let (reads_global_memory, writes_global_memory, touches_unknown_memory) =
         summarize_memory_effect_flags(&local.memory_effects);
+    let return_relation = resolve_return_relation(&local.return_observations, &BTreeMap::new());
+    let arg_count_hint = summary_arg_count_hint(SummaryArgCountInputs {
+        base: local.arg_count_hint,
+        arg_effects: &local.arg_effects,
+        memory_effects: &local.memory_effects,
+        transfer_effects: &local.transfer_effects,
+        allocation_effects: &local.allocation_effects,
+        lifetime_effects: &local.lifetime_effects,
+        sync_effects: &local.sync_effects,
+        atomic_effects: &local.atomic_effects,
+        return_relation: &return_relation,
+    });
     FunctionSemanticSummary {
         id,
         name,
-        arg_count_hint: local.arg_count_hint,
+        arg_count_hint,
         direct_callees: local.direct_callees.clone(),
         callsite_count: local.callsite_count,
         has_unknown_calls: local.has_unknown_calls,
@@ -896,7 +970,7 @@ fn initial_summary(
         lifetime_effects: local.lifetime_effects.iter().copied().collect(),
         sync_effects: local.sync_effects.iter().copied().collect(),
         atomic_effects: local.atomic_effects.iter().copied().collect(),
-        return_relation: resolve_return_relation(&local.return_observations, &BTreeMap::new()),
+        return_relation,
         reads_global_memory,
         writes_global_memory,
         touches_unknown_memory,
@@ -955,11 +1029,23 @@ fn resolve_summary(
     }
     let (reads_global_memory, writes_global_memory, touches_unknown_memory) =
         summarize_memory_effect_flags(&memory_effects);
+    let return_relation = resolve_return_relation_with_wrapper_fallback(local, current);
+    let arg_count_hint = summary_arg_count_hint(SummaryArgCountInputs {
+        base: local.arg_count_hint,
+        arg_effects: &arg_effects,
+        memory_effects: &memory_effects,
+        transfer_effects: &transfer_effects,
+        allocation_effects: &allocation_effects,
+        lifetime_effects: &lifetime_effects,
+        sync_effects: &sync_effects,
+        atomic_effects: &atomic_effects,
+        return_relation: &return_relation,
+    });
 
     FunctionSemanticSummary {
         id,
         name,
-        arg_count_hint: local.arg_count_hint,
+        arg_count_hint,
         direct_callees: local.direct_callees.clone(),
         callsite_count: local.callsite_count,
         has_unknown_calls: local.has_unknown_calls,
@@ -970,7 +1056,7 @@ fn resolve_summary(
         lifetime_effects: lifetime_effects.iter().copied().collect(),
         sync_effects: sync_effects.iter().copied().collect(),
         atomic_effects: atomic_effects.iter().copied().collect(),
-        return_relation: resolve_return_relation_with_wrapper_fallback(local, current),
+        return_relation,
         reads_global_memory,
         writes_global_memory,
         touches_unknown_memory,
@@ -1256,15 +1342,7 @@ fn collect_local_summary_facts(prepared: &SsaArtifact, abi: &AbiProfile) -> Loca
     }
 
     for block in function.blocks() {
-        for phi in &block.phis {
-            for (_, src) in &phi.sources {
-                record_arg_count_hint(prepared, abi, src, &mut out.arg_count_hint);
-            }
-        }
         for (op_idx, op) in block.ops.iter().enumerate() {
-            for src in op.sources() {
-                record_arg_count_hint(prepared, abi, src, &mut out.arg_count_hint);
-            }
             match op {
                 SSAOp::Load { addr, dst, .. }
                 | SSAOp::LoadLinked { addr, dst, .. }
@@ -1447,7 +1525,7 @@ fn classify_memory_access_location_value(
 
     for candidate in &candidates {
         if let Some(var) = prepared.value_var(*candidate) {
-            if let Some(idx) = abi.arg_index_for_name(&var.name) {
+            if let Some(idx) = formal_arg_index_for_var(abi, var) {
                 return arg_location(idx, Some(0), Some(width));
             }
             if let Some(address) = parse_const_name(&var.name) {
@@ -1603,40 +1681,6 @@ fn summary_const_value(
         _ => prepared
             .value_var(canonical_root_value(prepared, value_id))
             .and_then(|var| parse_const_name(&var.name)),
-    }
-}
-
-fn record_arg_count_hint(
-    prepared: &SsaArtifact,
-    abi: &AbiProfile,
-    var: &SSAVar,
-    hint: &mut Option<usize>,
-) {
-    if let Some(value_id) = prepared.graph().value_id_for_var(var) {
-        record_arg_count_hint_value(prepared, abi, value_id, hint);
-        return;
-    }
-    if let SummaryOperand::Arg(idx) = classify_var_operand(prepared, abi, var, 0) {
-        let count = idx.saturating_add(1);
-        match hint {
-            Some(current) => *current = (*current).max(count),
-            None => *hint = Some(count),
-        }
-    }
-}
-
-fn record_arg_count_hint_value(
-    prepared: &SsaArtifact,
-    abi: &AbiProfile,
-    value_id: ValueId,
-    hint: &mut Option<usize>,
-) {
-    if let SummaryOperand::Arg(idx) = classify_value_operand(prepared, abi, value_id, 0) {
-        let count = idx.saturating_add(1);
-        match hint {
-            Some(current) => *current = (*current).max(count),
-            None => *hint = Some(count),
-        }
     }
 }
 
@@ -1970,7 +2014,7 @@ fn classify_var_operand(
     if var.is_const() {
         return parse_const_name(&var.name).map_or(SummaryOperand::Unknown, SummaryOperand::Const);
     }
-    if let Some(idx) = abi.arg_index_for_name(&var.name) {
+    if let Some(idx) = formal_arg_index_for_var(abi, var) {
         return SummaryOperand::Arg(idx);
     }
     let Some(value_id) = prepared.graph().value_id_for_var(var) else {
@@ -1996,7 +2040,7 @@ fn classify_value_operand(
         return parse_const_name(&root_var.name)
             .map_or(SummaryOperand::Unknown, SummaryOperand::Const);
     }
-    if let Some(idx) = abi.arg_index_for_name(&root_var.name) {
+    if let Some(idx) = formal_arg_index_for_var(abi, root_var) {
         return SummaryOperand::Arg(idx);
     }
 
@@ -2082,9 +2126,18 @@ fn parse_const_name(name: &str) -> Option<u64> {
         .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
 }
 
+#[cfg(test)]
 fn normalize_seed_name(name: &str) -> Option<&'static str> {
     let normalized_owned = name.trim().to_ascii_lowercase();
     let mut normalized = normalized_owned.as_str();
+    let has_external_marker = normalized.starts_with("sym.imp.")
+        || normalized.starts_with("imp.")
+        || normalized.starts_with("reloc.")
+        || normalized.ends_with("@plt")
+        || normalized.ends_with(".plt");
+    if !has_external_marker {
+        return None;
+    }
     for prefix in ["sym.imp.", "sym.", "imp.", "reloc.", "dbg."] {
         while let Some(rest) = normalized.strip_prefix(prefix) {
             normalized = rest;
@@ -2158,6 +2211,19 @@ mod tests {
         arch
     }
 
+    fn x86_64_sysv_arg_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rdi", 8, 8));
+        arch.add_register(RegisterDef::new("rsi", 16, 8));
+        arch.add_register(RegisterDef::new("rdx", 24, 8));
+        arch.add_register(RegisterDef::new("rcx", 32, 8));
+        arch.add_register(RegisterDef::new("r8", 40, 8));
+        arch.add_register(RegisterDef::new("r9", 48, 8));
+        arch
+    }
+
     #[test]
     fn sleigh_aarch64_arch_name_uses_arm64_abi_profile() {
         let mut arch = ArchSpec::new("AARCH64:LE:64:v8A");
@@ -2174,6 +2240,16 @@ mod tests {
         let profile = AbiProfile::from_arch(Some(&arch));
 
         assert_eq!(profile.alias_to_arg.get("rdi"), Some(&0));
+        assert!(profile.alias_is_ret.contains("rax"));
+    }
+
+    #[test]
+    fn x86_64_arch_name_uses_amd64_abi_profile_without_addr_size() {
+        let arch = ArchSpec::new("x86-64");
+        let profile = AbiProfile::from_arch(Some(&arch));
+
+        assert_eq!(profile.alias_to_arg.get("rdi"), Some(&0));
+        assert_eq!(profile.alias_to_arg.get("rsi"), Some(&1));
         assert!(profile.alias_is_ret.contains("rax"));
     }
 
@@ -2226,8 +2302,9 @@ mod tests {
                 zeroed: false,
             }]
         );
-        let memcpy = FunctionSemanticSummary::seed_for_name(InterprocFunctionId(2), "memcpy")
-            .expect("memcpy seed");
+        let memcpy =
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(2), "sym.imp.memcpy")
+                .expect("memcpy seed");
         assert_eq!(memcpy.return_relation, SummaryReturnRelation::Arg(0));
         assert!(memcpy.arg_effects.get(&0).expect("dst").write);
         assert!(memcpy.arg_effects.get(&1).expect("src").read);
@@ -2242,9 +2319,26 @@ mod tests {
     }
 
     #[test]
+    fn seed_summary_requires_external_marker() {
+        for name in [
+            "malloc",
+            "memcpy",
+            "sym.malloc",
+            "dbg.memcpy",
+            "sym._copyin",
+        ] {
+            assert!(
+                FunctionSemanticSummary::seed_for_name(InterprocFunctionId(0xdead), name).is_none(),
+                "test seed must not accept local/name-only semantic owner for {name}"
+            );
+        }
+    }
+
+    #[test]
     fn seed_summary_models_kernel_helpers_as_canonical_effects() {
-        let copyin = FunctionSemanticSummary::seed_for_name(InterprocFunctionId(3), "sym._copyin")
-            .expect("copyin seed");
+        let copyin =
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(3), "sym.imp.copyin")
+                .expect("copyin seed");
         assert_eq!(
             copyin.transfer_effects,
             vec![SummaryTransferEffect {
@@ -2257,7 +2351,7 @@ mod tests {
         assert!(copyin.arg_effects.get(&1).expect("dst").write);
 
         let retain =
-            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(4), "sym._os_ref_retain")
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(4), "sym.imp.os_ref_retain")
                 .expect("retain seed");
         assert_eq!(retain.return_relation, SummaryReturnRelation::Arg(0));
         assert_eq!(
@@ -2269,7 +2363,7 @@ mod tests {
         );
 
         let lock =
-            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(5), "sym._lck_mtx_lock")
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(5), "sym.imp.lck_mtx_lock")
                 .expect("lock seed");
         assert_eq!(
             lock.sync_effects,
@@ -2312,7 +2406,7 @@ mod tests {
         let mut seeds = BTreeMap::new();
         seeds.insert(
             InterprocFunctionId(0x2000),
-            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(0x2000), "malloc")
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(0x2000), "sym.imp.malloc")
                 .expect("malloc"),
         );
 
@@ -2371,7 +2465,7 @@ mod tests {
         let mut seeds = BTreeMap::new();
         seeds.insert(
             InterprocFunctionId(0x2000),
-            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(0x2000), "malloc")
+            FunctionSemanticSummary::seed_for_name(InterprocFunctionId(0x2000), "sym.imp.malloc")
                 .expect("malloc"),
         );
 
@@ -2507,6 +2601,99 @@ mod tests {
                 .and_then(|summary| summary.arg_effects.get(&0))
                 .is_some_and(|effect| effect.read)
         );
+    }
+
+    #[test]
+    fn overwritten_abi_register_is_not_a_formal_argument_read() {
+        let arch = x86_64_sysv_arg_arch();
+        let blk = block(
+            0x4050,
+            vec![
+                R2ILOp::Copy {
+                    dst: reg(24, 8),
+                    src: c(0x5000, 8),
+                },
+                R2ILOp::Load {
+                    dst: tmp(1, 1),
+                    space: SpaceId::Ram,
+                    addr: reg(24, 8),
+                },
+                R2ILOp::Return { target: c(0, 4) },
+            ],
+        );
+        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let set = solve_interproc_summary_set(
+            &[InterprocFunctionInput {
+                id: InterprocFunctionId(0x4050),
+                name: Some("scratch_load".to_string()),
+                prepared: &prepared,
+            }],
+            Some(&arch),
+            Some(InterprocFunctionId(0x4050)),
+            &BTreeMap::new(),
+            InterprocSolveConfig::default(),
+        );
+        let summary = set
+            .summaries
+            .get(&InterprocFunctionId(0x4050))
+            .expect("summary");
+
+        assert!(
+            !summary.arg_effects.contains_key(&2),
+            "rdx was overwritten before the load, so it is not caller arg2: {summary:?}"
+        );
+        assert_eq!(summary.arg_count_hint, Some(0));
+        assert!(summary.memory_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                SummaryMemoryEffect {
+                    kind: SummaryMemoryEffectKind::Read,
+                    location: SummaryMemoryLocation {
+                        region: SummaryMemoryRegion::Global { address: 0x5000 },
+                        ..
+                    }
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn unused_entry_abi_register_source_does_not_inflate_arg_count_hint() {
+        let arch = x86_64_sysv_arg_arch();
+        let blk = block(
+            0x4060,
+            vec![
+                R2ILOp::IntAdd {
+                    dst: tmp(1, 8),
+                    a: reg(24, 8),
+                    b: c(1, 8),
+                },
+                R2ILOp::Return { target: c(0, 4) },
+            ],
+        );
+        let prepared = SsaArtifact::for_decompile(&[blk], Some(&arch)).expect("ssa");
+        let set = solve_interproc_summary_set(
+            &[InterprocFunctionInput {
+                id: InterprocFunctionId(0x4060),
+                name: Some("scratch_arg_reg".to_string()),
+                prepared: &prepared,
+            }],
+            Some(&arch),
+            Some(InterprocFunctionId(0x4060)),
+            &BTreeMap::new(),
+            InterprocSolveConfig::default(),
+        );
+        let summary = set
+            .summaries
+            .get(&InterprocFunctionId(0x4060))
+            .expect("summary");
+
+        assert_eq!(
+            summary.arg_count_hint,
+            Some(0),
+            "arg count must be derived from summary effects, not raw SSA register reads"
+        );
+        assert!(summary.arg_effects.is_empty());
     }
 
     #[test]

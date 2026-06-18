@@ -88,7 +88,7 @@ fn vm_summary_stats_comment(func_name: &str, vm_step: &r2sym::VmStepSummary) -> 
 }
 
 fn render_vm_signature(type_facts: &FunctionTypeFacts, func_name: &str) -> String {
-    let Some(signature) = type_facts.merged_signature.as_ref() else {
+    let Some(signature) = type_facts.render_authorized_signature() else {
         return format!("void {func_name}(void)");
     };
     let ret_ty = signature

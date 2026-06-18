@@ -1,29 +1,29 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 pub type TypeId = usize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Signedness {
     Signed,
     Unsigned,
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StructField {
     pub name: Option<String>,
     pub ty: TypeId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 pub struct StructShape {
     pub name: Option<String>,
     pub fields: BTreeMap<u64, StructField>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Type {
     Top,
     Bottom,
@@ -53,7 +53,7 @@ pub enum Type {
 #[derive(Debug, Clone)]
 pub struct TypeArena {
     types: Vec<Type>,
-    intern_index: HashMap<Type, TypeId>,
+    intern_index: BTreeMap<Type, TypeId>,
     top: TypeId,
     bottom: TypeId,
     bool_ty: TypeId,
@@ -63,7 +63,7 @@ impl Default for TypeArena {
     fn default() -> Self {
         let mut arena = Self {
             types: Vec::new(),
-            intern_index: HashMap::new(),
+            intern_index: BTreeMap::new(),
             top: 0,
             bottom: 0,
             bool_ty: 0,

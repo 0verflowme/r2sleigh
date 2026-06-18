@@ -22,6 +22,6 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~complex_check[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("complex_check") and contains("return 0;") and contains("return 1;") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("complex_check") and contains("diff = a - b;") and contains("return 0;") and contains("return 1;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
