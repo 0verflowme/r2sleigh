@@ -7938,6 +7938,7 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn is_low_signal_visible_name(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
+        let storage_kind = SSAVarNameKind::classify(&lower);
         let is_temp_family = |prefix: char| {
             lower
                 .strip_prefix(prefix)
@@ -7949,10 +7950,10 @@ impl<'a> FoldingContext<'a> {
                 })
                 .is_some_and(|tail| tail.is_empty() || tail.chars().all(|ch| ch.is_ascii_digit()))
         };
-        lower.starts_with("tmp:")
-            || lower.starts_with("tmp")
-            || lower.starts_with("const:")
-            || lower.starts_with("ram:")
+        matches!(
+            storage_kind,
+            SSAVarNameKind::Temporary | SSAVarNameKind::Constant | SSAVarNameKind::Memory
+        ) || lower.starts_with("tmp")
             || is_temp_family('t')
             || is_temp_family('v')
     }

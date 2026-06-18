@@ -5188,6 +5188,21 @@ mod tests {
     }
 
     #[test]
+    fn low_signal_visible_name_uses_typed_storage_kind_and_display_heuristics() {
+        let ctx = FoldingContext::new(64);
+
+        assert!(ctx.is_low_signal_visible_name("tmp:1_0"));
+        assert!(ctx.is_low_signal_visible_name("CONST:1_0"));
+        assert!(ctx.is_low_signal_visible_name("RAM:401000_0"));
+        assert!(ctx.is_low_signal_visible_name("tmp_loop_counter"));
+        assert!(ctx.is_low_signal_visible_name("t19"));
+        assert!(ctx.is_low_signal_visible_name("v3e_2"));
+        assert!(!ctx.is_low_signal_visible_name("space1:20"));
+        assert!(!ctx.is_low_signal_visible_name("value"));
+        assert!(!ctx.is_low_signal_visible_name("rax_1"));
+    }
+
+    #[test]
     fn test_member_access_uses_subscript_base_when_base_has_generic_ptr_arith_definition() {
         let idx = make_var("arg2", 0, 4);
         let base = make_var("tmp:9400", 1, 8);
