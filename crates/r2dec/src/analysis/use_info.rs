@@ -7119,7 +7119,7 @@ fn is_plausible_call_home_base(name: &str, env: &PassEnv<'_>) -> bool {
         return false;
     }
 
-    name.starts_with("tmp:")
+    utils::is_temporary_name(name)
         || name.starts_with('x')
         || name.starts_with('w')
         || name.starts_with('r')
@@ -8371,9 +8371,7 @@ fn is_call_arg_low_quality_name(name: &str) -> bool {
 
 fn is_call_arg_transient_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.starts_with("tmp:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("const:")
+    utils::is_temporary_constant_or_memory_name(name)
         || utils::is_cpu_flag(&lower)
         || lower.starts_with("eax")
         || lower.starts_with("rax")
@@ -9748,6 +9746,39 @@ mod tests {
         assert!(is_semantic_binding_base("sym.helper"));
         assert!(!is_low_signal_name("value"));
         assert!(!is_semantic_binding_base("value"));
+    }
+
+    #[test]
+    fn call_arg_name_filters_use_typed_ssa_storage_kinds() {
+        let fixture = TestEnvFixture::new();
+        let env = fixture.env();
+
+        assert!(is_plausible_call_home_base("tmp:home", &env));
+        assert!(is_plausible_call_home_base("TMP:home", &env));
+        assert!(is_plausible_call_home_base("x8", &env));
+        assert!(is_plausible_call_home_base("r10", &env));
+        assert!(!is_plausible_call_home_base("rsp", &env));
+        assert!(!is_plausible_call_home_base("rbp", &env));
+        assert!(!is_plausible_call_home_base("rdi", &env));
+
+        for name in [
+            "tmp:1",
+            "TMP:1",
+            "const:1",
+            "CONST:1",
+            "ram:401000",
+            "RAM:401000",
+        ] {
+            assert!(
+                is_call_arg_transient_name(name),
+                "{name} should be a transient call-argument carrier"
+            );
+        }
+
+        assert!(is_call_arg_transient_name("rax_1"));
+        assert!(is_call_arg_transient_name("x8_0"));
+        assert!(!is_call_arg_transient_name("space1:20"));
+        assert!(!is_call_arg_transient_name("value"));
     }
 
     #[test]
