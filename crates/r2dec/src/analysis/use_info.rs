@@ -2639,7 +2639,7 @@ fn preserve_temp_copy_root_identity(
     match value {
         SemanticValue::Scalar(ScalarValue::Root(root))
             if root.var == *src
-                && dst.name.starts_with("tmp:")
+                && utils::is_temporary_name(&dst.name)
                 && src.version == 0
                 && register_family_name(&src.name).is_some() =>
         {
@@ -11388,6 +11388,37 @@ mod tests {
             summary.incoming.get(&0x1008),
             Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(1))))
         ));
+    }
+
+    #[test]
+    fn preserve_temp_copy_root_identity_requires_raw_temp_copy_from_entry_register() {
+        let dst = mk("tmp:retcopy", 1, 4);
+        let src = mk("W8", 0, 4);
+        let root = SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(src.clone())));
+
+        assert_eq!(
+            preserve_temp_copy_root_identity(&dst, &src, root.clone()),
+            SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(dst.clone())))
+        );
+        assert_eq!(
+            preserve_temp_copy_root_identity(&mk("local_retcopy", 1, 4), &src, root.clone()),
+            root
+        );
+
+        let other_src = mk("W9", 0, 4);
+        let other_root = SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(other_src)));
+        assert_eq!(
+            preserve_temp_copy_root_identity(&dst, &src, other_root.clone()),
+            other_root
+        );
+
+        let versioned_src = mk("W8", 1, 4);
+        let versioned_root =
+            SemanticValue::Scalar(ScalarValue::Root(ValueRef::from(versioned_src.clone())));
+        assert_eq!(
+            preserve_temp_copy_root_identity(&dst, &versioned_src, versioned_root.clone()),
+            versioned_root
+        );
     }
 
     #[test]
