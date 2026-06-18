@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use r2il::R2ILBlock;
-use r2ssa::CFGRiskSummary;
-use r2types::FunctionFacts;
+use r2ssa::{CFGRiskSummary, SSAFunction, SsaArtifact};
+use r2types::{DecompileCapabilityView, FunctionFacts, FunctionTypeFacts};
 use serde::{Deserialize, Serialize};
 
 use crate::EngineCachePlan;
@@ -498,7 +498,7 @@ pub fn decompile_probe_decision_for_identity(
     identity: &EngineFunctionIdentity,
 ) -> DecompileProbeDecision {
     let name_facts = engine_name_route_facts(identity);
-    let cfg_guard_reason = super::cfg_guard_reason(blocks);
+    let cfg_guard_reason = cfg_guard_reason(blocks);
     let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
     let raw_cfg = raw_cfg_risk_summary_for_preprobe(blocks);
     let small_structural_worker_probe = raw_cfg.block_count > 0
@@ -602,4 +602,914 @@ fn is_anonymous_engine_route_name(name: &str) -> bool {
 
 pub fn should_guard_program_orchestrator_decompile(block_count: usize, op_count: usize) -> bool {
     block_count > 4 || op_count > 96
+}
+
+pub fn semantic_route_from_artifact_plan(
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> Option<r2dec::SemanticRoutePlan> {
+    match semantic_artifact.decompile_plan() {
+        r2sym::DecompilePlan::NativeLinear { reason }
+            if native_linear_artifact_plan_allows_summary_route(semantic_artifact) =>
+        {
+            Some(r2dec::SemanticRoutePlan::LinearWorker { reason })
+        }
+        r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
+            Some(r2dec::SemanticRoutePlan::SummaryIslands { reason })
+        }
+        r2sym::DecompilePlan::VmSummaryOnly { reason } => {
+            Some(r2dec::SemanticRoutePlan::VmSummary { reason })
+        }
+        _ => None,
+    }
+}
+
+fn native_linear_artifact_plan_allows_summary_route(
+    semantic_artifact: &r2sym::SemanticArtifact,
+) -> bool {
+    if semantic_artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly
+        && !semantic_artifact.diagnostics.skipped_large_cfg
+    {
+        return false;
+    }
+    let Some(native) = semantic_artifact.native_body() else {
+        return false;
+    };
+    if !semantic_artifact.diagnostics.skipped_large_cfg
+        && !native_body_has_renderable_worker_summary(native)
+    {
+        return false;
+    }
+    let summary_count =
+        native.summary.region_summaries.len() + native.summary.worker_summaries.len();
+    let has_specific_summary = native.has_memory_read_write_summary_pair()
+        || native.summary.worker_summaries.iter().any(|summary| {
+            !matches!(
+                summary.kind,
+                r2sym::NativeWorkerSummaryKind::MemoryRead
+                    | r2sym::NativeWorkerSummaryKind::MemoryWrite
+                    | r2sym::NativeWorkerSummaryKind::Unknown
+            )
+        });
+    summary_count >= 8
+        && has_specific_summary
+        && matches!(
+            semantic_artifact.slice_class(),
+            Some(
+                r2sym::SliceClass::Worker
+                    | r2sym::SliceClass::GenericLarge
+                    | r2sym::SliceClass::Wrapper
+            )
+        )
+}
+
+pub fn has_primary_summary_only_native_worker(semantic_artifact: &r2sym::SemanticArtifact) -> bool {
+    semantic_artifact.granularity == r2sym::ArtifactGranularity::SummaryOnly
+        && semantic_artifact
+            .native_body()
+            .is_some_and(|native| native.has_primary_non_name_summary_islands())
+}
+
+pub fn has_renderable_primary_summary_only_native_worker(function_facts: &FunctionFacts) -> bool {
+    function_facts
+        .semantic_artifact()
+        .is_some_and(has_primary_summary_only_native_worker)
+}
+
+pub fn named_worker_summary_route(
+    named_worker_guarded: bool,
+    function_facts: &FunctionFacts,
+) -> Option<r2dec::SemanticRoutePlan> {
+    (named_worker_guarded && has_renderable_primary_summary_only_native_worker(function_facts))
+        .then(|| r2dec::SemanticRoutePlan::SummaryIslands {
+            reason: "named native-worker summary projection".to_string(),
+        })
+}
+
+pub(super) fn proof_coverage_from_type_facts(
+    type_facts: &FunctionTypeFacts,
+) -> r2sym::ProofCoverage {
+    r2sym::ProofCoverage {
+        certified_field_accesses: type_facts.field_access_certificates.len(),
+        certified_array_indexes: type_facts.array_index_certificates.len(),
+        certified_out_params: type_facts
+            .source_authorized_out_param_certificates()
+            .count(),
+        certified_signatures: usize::from(type_facts.render_authorized_signature().is_some()),
+        ..r2sym::ProofCoverage::default()
+    }
+}
+
+pub fn select_engine_plan(
+    request: EngineRequestKind,
+    route: Option<&r2dec::SemanticRoutePlan>,
+    function_facts: Option<&FunctionFacts>,
+) -> EnginePlan {
+    match request {
+        EngineRequestKind::Types => {
+            if function_facts
+                .and_then(FunctionFacts::semantic_artifact)
+                .is_some()
+            {
+                EnginePlan::SemanticSummary
+            } else {
+                EnginePlan::PreparedOnly
+            }
+        }
+        EngineRequestKind::SymbolicQuery => EnginePlan::SemanticStructured,
+        EngineRequestKind::Profile | EngineRequestKind::DebugFacts => EnginePlan::PreparedOnly,
+        EngineRequestKind::Decompile => match route {
+            Some(r2dec::SemanticRoutePlan::Standard) | None => EnginePlan::FastLocal,
+            Some(r2dec::SemanticRoutePlan::FallbackComment { .. }) => {
+                EnginePlan::RefuseWithEvidence
+            }
+            Some(r2dec::SemanticRoutePlan::VmSummary { .. })
+            | Some(r2dec::SemanticRoutePlan::SummaryIslands { .. })
+            | Some(r2dec::SemanticRoutePlan::LinearWorker { .. }) => EnginePlan::SemanticSummary,
+            Some(r2dec::SemanticRoutePlan::StructuredWorker { .. }) => {
+                EnginePlan::SemanticStructured
+            }
+        },
+    }
+}
+
+pub fn plan_decompile_request(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+    prepared: Option<&SsaArtifact>,
+    type_facts: &FunctionTypeFacts,
+    cfg_summary: &CFGRiskSummary,
+) -> EngineRequestPlan {
+    EngineRequestPlan::decompile(decompile_route_decision(
+        func_name,
+        function_facts,
+        prepared,
+        type_facts,
+        cfg_summary,
+    ))
+}
+
+pub fn plan_type_request(
+    function_facts: &FunctionFacts,
+    cfg_summary: &CFGRiskSummary,
+    caller_prefers_bounded_type_plan: bool,
+) -> EngineRequestPlan {
+    EngineRequestPlan::types(type_route_decision(
+        function_facts,
+        cfg_summary,
+        caller_prefers_bounded_type_plan,
+    ))
+}
+
+pub fn profile_route_decision() -> EngineProfileRouteDecision {
+    EngineProfileRouteDecision {
+        request: EngineRequestKind::Profile,
+        plan: select_engine_plan(EngineRequestKind::Profile, None, None),
+        kind: EngineProfileRouteKind::MetricsSnapshot,
+        reason: Some("session cache metrics snapshot".to_string()),
+    }
+}
+
+pub fn plan_profile_request() -> EngineRequestPlan {
+    EngineRequestPlan::profile(profile_route_decision())
+}
+
+pub fn semantic_route_plan(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+    cfg_summary: &CFGRiskSummary,
+) -> r2dec::SemanticRoutePlan {
+    let context = EngineRouteContext::new(func_name, function_facts, cfg_summary);
+    semantic_route_plan_from_context(&context)
+}
+
+pub fn semantic_route_plan_from_context(
+    context: &EngineRouteContext<'_>,
+) -> r2dec::SemanticRoutePlan {
+    if let Some(reason) = preferred_vm_summary_reason(context.function_facts) {
+        return r2dec::SemanticRoutePlan::VmSummary { reason };
+    }
+    if let Some(comment) =
+        preferred_semantic_fallback_comment(context.func_name, context.function_facts)
+    {
+        return r2dec::SemanticRoutePlan::FallbackComment { comment };
+    }
+    if let Some(reason) = preferred_semantic_summary_islands_reason(context) {
+        return r2dec::SemanticRoutePlan::SummaryIslands { reason };
+    }
+    if let Some(reason) = preferred_semantic_structuring_reason(context) {
+        return r2dec::SemanticRoutePlan::StructuredWorker { reason };
+    }
+    if let Some(reason) = preferred_semantic_linearization_reason(context) {
+        return r2dec::SemanticRoutePlan::LinearWorker { reason };
+    }
+    if !prefers_standard_native_for_summary_only_worker(context.function_facts, context.cfg_summary)
+        && let Some(route) = context
+            .function_facts
+            .semantic_artifact()
+            .and_then(semantic_route_from_artifact_plan)
+            .filter(|_| context.has_renderable_semantic_claims())
+    {
+        return route;
+    }
+    r2dec::SemanticRoutePlan::Standard
+}
+
+pub fn decompile_route_decision(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+    prepared: Option<&SsaArtifact>,
+    type_facts: &FunctionTypeFacts,
+    cfg_summary: &CFGRiskSummary,
+) -> EngineRouteDecision {
+    let route = semantic_route_plan(func_name, function_facts, cfg_summary);
+    let plan = select_engine_plan(
+        EngineRequestKind::Decompile,
+        Some(&route),
+        Some(function_facts),
+    );
+    let route_reason = semantic_route_reason(&route);
+    let refusal = match &route {
+        r2dec::SemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+        _ => None,
+    };
+    let proof_coverage = prepared
+        .map(|prepared| r2sym::ProofCoverage::from_prepared_certificates(prepared.certificates()))
+        .unwrap_or_default()
+        .merge(function_facts.proof.clone())
+        .merge(proof_coverage_from_type_facts(type_facts));
+    let render_permission = render_permission_for_decompile_route(
+        &route,
+        cfg_summary,
+        &proof_coverage,
+        prepared.is_some(),
+    );
+    EngineRouteDecision {
+        request: EngineRequestKind::Decompile,
+        plan,
+        skip_runtime_type_inference: should_skip_runtime_type_inference(
+            prepared,
+            type_facts,
+            function_facts,
+        ),
+        use_prepared_semantic_view: should_use_prepared_semantic_view(prepared, function_facts),
+        route,
+        route_reason,
+        proof_coverage,
+        render_permission,
+        refusal,
+    }
+}
+
+fn render_permission_for_decompile_route(
+    route: &r2dec::SemanticRoutePlan,
+    cfg_summary: &CFGRiskSummary,
+    proof_coverage: &r2sym::ProofCoverage,
+    prepared_available: bool,
+) -> r2sym::RenderPermission {
+    match route {
+        r2dec::SemanticRoutePlan::Standard => {
+            proof_coverage.standard_control_render_permission(cfg_summary, prepared_available)
+        }
+        r2dec::SemanticRoutePlan::FallbackComment { comment } => {
+            r2sym::RenderPermission::refuse(r2sym::ProofOwner::R2engine, comment.clone())
+        }
+        r2dec::SemanticRoutePlan::VmSummary { reason }
+        | r2dec::SemanticRoutePlan::SummaryIslands { reason }
+        | r2dec::SemanticRoutePlan::LinearWorker { reason }
+        | r2dec::SemanticRoutePlan::StructuredWorker { reason } => {
+            r2sym::RenderPermission::summary(r2sym::ProofOwner::R2engine, reason.clone())
+        }
+    }
+}
+
+pub fn decompiler_context_with_route_decision(
+    context: r2dec::DecompilerContext,
+    decision: &EngineRouteDecision,
+) -> r2dec::DecompilerContext {
+    context
+        .with_semantic_route(Some(decision.route.clone()))
+        .with_render_permission(Some(decision.render_permission.clone()))
+        .with_runtime_type_inference_policy(Some(decision.skip_runtime_type_inference))
+        .with_prepared_semantic_view_policy(Some(decision.use_prepared_semantic_view))
+}
+
+pub fn semantic_route_reason(route: &r2dec::SemanticRoutePlan) -> Option<String> {
+    match route {
+        r2dec::SemanticRoutePlan::StructuredWorker { reason }
+        | r2dec::SemanticRoutePlan::SummaryIslands { reason }
+        | r2dec::SemanticRoutePlan::LinearWorker { reason }
+        | r2dec::SemanticRoutePlan::VmSummary { reason } => Some(reason.clone()),
+        r2dec::SemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+        r2dec::SemanticRoutePlan::Standard => None,
+    }
+}
+
+pub fn detached_semantic_route_plan(
+    func_name: &str,
+    blocks: &[R2ILBlock],
+    function_facts: &FunctionFacts,
+) -> Option<r2dec::SemanticRoutePlan> {
+    let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
+    Some(semantic_route_plan(
+        func_name,
+        function_facts,
+        &ssa_func.cfg_risk_summary(),
+    ))
+}
+
+pub fn detached_semantic_linearization_reason(
+    func_name: &str,
+    blocks: &[R2ILBlock],
+    function_facts: &FunctionFacts,
+) -> Option<String> {
+    match detached_semantic_route_plan(func_name, blocks, function_facts)? {
+        r2dec::SemanticRoutePlan::LinearWorker { reason }
+        | r2dec::SemanticRoutePlan::SummaryIslands { reason } => Some(reason),
+        _ => None,
+    }
+}
+
+pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
+    let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
+    cfg_guard_reason_from_summary(&ssa_func.cfg_risk_summary())
+}
+
+pub fn cfg_guard_reason_from_summary(summary: &CFGRiskSummary) -> Option<String> {
+    if summary.loop_count > 8 || summary.back_edge_count > 16 {
+        return Some(format!(
+            "complex loop graph (loops={}, back_edges={})",
+            summary.loop_count, summary.back_edge_count
+        ));
+    }
+
+    if summary.loop_count > 0 && summary.block_count >= 32 && summary.max_switch_cases >= 32 {
+        return Some(format!(
+            "dense switch in looped CFG (blocks={}, loops={}, max_switch_cases={})",
+            summary.block_count, summary.loop_count, summary.max_switch_cases
+        ));
+    }
+
+    if summary.loop_count > 4 && summary.block_count >= 96 && summary.max_switch_cases >= 32 {
+        return Some(format!(
+            "large dense switch in looped CFG (blocks={}, loops={}, max_switch_cases={})",
+            summary.block_count, summary.loop_count, summary.max_switch_cases
+        ));
+    }
+
+    None
+}
+
+pub fn type_cfg_prefers_bounded_plan(summary: &CFGRiskSummary) -> bool {
+    if cfg_guard_reason_from_summary(summary).is_some() {
+        return true;
+    }
+    summary.block_count >= 200
+        || (summary.block_count >= 96
+            && (summary.loop_count > 0
+                || summary.back_edge_count > 0
+                || summary.max_switch_cases >= 32))
+}
+
+pub fn type_cfg_forces_bounded_plan(summary: &CFGRiskSummary) -> bool {
+    cfg_guard_reason_from_summary(summary).is_some()
+}
+
+pub fn type_cfg_allows_semantic_plan(summary: &CFGRiskSummary) -> bool {
+    summary.block_count <= 96 && summary.loop_count <= 4 && summary.back_edge_count <= 8
+}
+
+pub fn type_cfg_bounded_reason(summary: &CFGRiskSummary) -> String {
+    cfg_guard_reason_from_summary(summary).unwrap_or_else(|| {
+        format!(
+            "bounded type plan for large CFG (blocks={}, loops={}, back_edges={}, max_switch_cases={})",
+            summary.block_count, summary.loop_count, summary.back_edge_count, summary.max_switch_cases
+        )
+    })
+}
+
+pub fn semantic_or_cfg_prefers_bounded_type_plan(
+    artifact: &r2sym::SemanticArtifact,
+    cfg_summary: &CFGRiskSummary,
+) -> bool {
+    if r2types::semantic_artifact_prefers_bounded_type_plan(artifact) {
+        return true;
+    }
+    type_cfg_prefers_bounded_plan(cfg_summary)
+        && !type_cfg_allows_semantic_plan(cfg_summary)
+        && artifact.type_plan().allows_native_augmentation()
+        && matches!(
+            artifact.slice_class(),
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+}
+
+pub fn semantic_artifact_needs_fallback_type_payload(
+    artifact: &r2sym::SemanticArtifact,
+    cfg_summary: &CFGRiskSummary,
+) -> bool {
+    !matches!(
+        artifact.granularity,
+        r2sym::ArtifactGranularity::SummaryOnly
+    ) && semantic_or_cfg_prefers_bounded_type_plan(artifact, cfg_summary)
+}
+
+pub fn type_route_decision(
+    function_facts: &FunctionFacts,
+    cfg_summary: &CFGRiskSummary,
+    caller_prefers_bounded_type_plan: bool,
+) -> EngineTypeRouteDecision {
+    let prefer_cfg_bounded = (type_cfg_forces_bounded_plan(cfg_summary)
+        && !type_cfg_allows_semantic_plan(cfg_summary))
+        || (caller_prefers_bounded_type_plan && type_cfg_prefers_bounded_plan(cfg_summary));
+    if prefer_cfg_bounded {
+        return EngineTypeRouteDecision {
+            request: EngineRequestKind::Types,
+            plan: EnginePlan::BoundedType,
+            kind: EngineTypeRouteKind::BoundedCfg,
+            prefer_bounded_type_plan: true,
+            reason: Some(type_cfg_bounded_reason(cfg_summary)),
+            apply_artifact_signature_hint: false,
+        };
+    }
+
+    if let Some(artifact) = function_facts.semantic_artifact()
+        && semantic_artifact_needs_fallback_type_payload(artifact, cfg_summary)
+    {
+        return EngineTypeRouteDecision {
+            request: EngineRequestKind::Types,
+            plan: EnginePlan::SemanticSummary,
+            kind: EngineTypeRouteKind::SemanticFallback,
+            prefer_bounded_type_plan: true,
+            reason: Some("semantic fallback type projection".to_string()),
+            apply_artifact_signature_hint: true,
+        };
+    }
+
+    EngineTypeRouteDecision {
+        request: EngineRequestKind::Types,
+        plan: select_engine_plan(EngineRequestKind::Types, None, Some(function_facts)),
+        kind: EngineTypeRouteKind::FullWriteback,
+        prefer_bounded_type_plan: false,
+        reason: None,
+        apply_artifact_signature_hint: false,
+    }
+}
+
+pub fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) -> bool {
+    let capability = function_facts.decompile_capability();
+    capability
+        .plan
+        .as_ref()
+        .is_some_and(r2sym::DecompilePlan::allows_native_linearization)
+        && capability.skipped_large_cfg
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+        && (capability.has_native_regions || capability.has_summary_islands)
+}
+
+pub fn should_skip_runtime_type_inference(
+    prepared: Option<&SsaArtifact>,
+    _type_facts: &FunctionTypeFacts,
+    function_facts: &FunctionFacts,
+) -> bool {
+    if prefer_symbolic_large_worker_decompile(function_facts) {
+        return true;
+    }
+    let Some(prepared) = prepared else {
+        return false;
+    };
+    let summary = prepared.function().cfg_risk_summary();
+    summary.block_count >= 96
+        && summary.switch_block_count > 0
+        && summary.max_switch_cases >= 32
+        && summary.back_edge_count == 0
+}
+
+pub fn should_use_prepared_semantic_view(
+    prepared: Option<&SsaArtifact>,
+    function_facts: &FunctionFacts,
+) -> bool {
+    prepared.is_some() && !prefer_symbolic_large_worker_decompile(function_facts)
+}
+
+fn preferred_vm_summary_reason(function_facts: &FunctionFacts) -> Option<String> {
+    match function_facts.decompile_plan()? {
+        r2sym::DecompilePlan::VmSummaryOnly { reason } => Some(reason),
+        _ => None,
+    }
+}
+
+fn preferred_semantic_fallback_comment(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+) -> Option<String> {
+    let capability = function_facts.decompile_capability();
+    if !is_autogenerated_function_name(func_name) {
+        return None;
+    }
+    if capability
+        .plan
+        .as_ref()
+        .is_some_and(r2sym::DecompilePlan::allows_native_linearization)
+    {
+        return None;
+    }
+    if capability.skipped_large_cfg
+        || capability
+            .residual_reasons
+            .contains(&r2sym::ResidualReason::InterpreterRequiresStepSummary)
+    {
+        return r2dec::semantic_fallback_comment(func_name, function_facts.semantics.as_ref());
+    }
+    None
+}
+
+fn preferred_semantic_linearization_reason(context: &EngineRouteContext<'_>) -> Option<String> {
+    if !context.has_renderable_semantic_claims() {
+        return None;
+    }
+    let function_facts = context.function_facts;
+    let capability = function_facts.decompile_capability();
+    let plan = capability.plan.as_ref()?;
+    let prefer_standard_native =
+        prefers_standard_native_for_summary_only_worker(function_facts, context.cfg_summary);
+    let compact_renderable_worker = !capability.skipped_large_cfg
+        && !prefer_standard_native
+        && has_renderable_native_linear_worker_summary(function_facts);
+    if let r2sym::DecompilePlan::NativeLinear { reason } = plan
+        && capability.has_native_regions
+        && ((capability.skipped_large_cfg && !is_autogenerated_function_name(context.func_name))
+            || compact_renderable_worker)
+        && matches!(capability.slice_class, Some(r2sym::SliceClass::Worker))
+        && !capability.assumption_conflicted
+        && capability.ambiguous_targets.is_empty()
+        && (!has_generic_only_summary_islands(&capability) || capability.skipped_large_cfg)
+    {
+        return Some(reason.clone());
+    }
+    if let r2sym::DecompilePlan::NativeLinear { reason } = plan
+        && capability.has_summary_islands
+        && capability.has_primary_summary_islands
+        && !capability.has_native_regions
+        && (capability.skipped_large_cfg || compact_renderable_worker)
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+        && !has_weak_summary_arg_contract_conflict(function_facts)
+        && !capability.assumption_conflicted
+        && !capability.summary_conflicted
+        && capability.ambiguous_targets.is_empty()
+    {
+        return Some(reason.clone());
+    }
+    if !is_autogenerated_function_name(context.func_name) {
+        return None;
+    }
+    let downgraded_from_structured = matches!(plan, r2sym::DecompilePlan::NativeStructured)
+        && (capability.assumption_conflicted
+            || capability.summary_conflicted
+            || !capability.ambiguous_targets.is_empty());
+    let linear_ready =
+        matches!(plan, r2sym::DecompilePlan::NativeLinear { .. }) || downgraded_from_structured;
+    if !linear_ready || !capability.skipped_large_cfg || !capability.has_native_regions {
+        return None;
+    }
+    Some(preferred_semantic_worker_reason(context.cfg_summary))
+}
+
+fn preferred_semantic_summary_islands_reason(context: &EngineRouteContext<'_>) -> Option<String> {
+    if !context.has_renderable_semantic_claims() {
+        return None;
+    }
+    let function_facts = context.function_facts;
+    let cfg_summary = context.cfg_summary;
+    let capability = function_facts.decompile_capability();
+    if prefers_standard_native_for_summary_only_worker(function_facts, cfg_summary) {
+        return None;
+    }
+    if has_weak_summary_arg_contract_conflict(function_facts) {
+        return None;
+    }
+    let large_bounded_memory_worker = has_large_bounded_memory_summary_worker(&capability);
+    let dense_summary_only_memory_worker = has_dense_summary_only_memory_worker(&capability);
+    if !capability.has_summary_islands
+        || (!capability.has_primary_summary_islands
+            && !large_bounded_memory_worker
+            && !dense_summary_only_memory_worker)
+        || !matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+    {
+        return None;
+    }
+    match capability.plan.as_ref()? {
+        r2sym::DecompilePlan::NativeStructured => {
+            if capability.skipped_large_cfg
+                && (cfg_guard_reason_from_summary(cfg_summary).is_some()
+                    || capability.primary_summary_island_count >= 8
+                    || large_bounded_memory_worker)
+            {
+                return Some(preferred_semantic_worker_reason(cfg_summary));
+            }
+            let summary_dense_native_worker = capability.primary_summary_island_count >= 16
+                && (cfg_summary.loop_count > 0
+                    || cfg_summary.back_edge_count > 0
+                    || capability.actionable_region_count >= 4);
+            summary_dense_native_worker.then(|| "summary-dense semantic worker islands".to_string())
+        }
+        r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
+            if !capability.skipped_large_cfg && capability.primary_summary_island_count < 16 {
+                return None;
+            }
+            if capability.summary_conflicted || capability.assumption_conflicted {
+                Some(preferred_semantic_worker_reason(cfg_summary))
+            } else {
+                Some(reason.clone())
+            }
+        }
+        r2sym::DecompilePlan::NativeLinear { reason } => {
+            if has_summary_only_scan_table_worker(function_facts) {
+                return Some(reason.clone());
+            }
+            if dense_summary_only_memory_worker {
+                return Some("dense summary-only memory worker".to_string());
+            }
+            let summary_dense_native_worker = capability.primary_summary_island_count >= 16
+                && (cfg_summary.loop_count > 0
+                    || cfg_summary.back_edge_count > 0
+                    || capability.actionable_region_count >= 4);
+            if summary_dense_native_worker {
+                return Some("summary-dense semantic worker islands".to_string());
+            }
+            let high_risk = cfg_guard_reason_from_summary(cfg_summary).is_some()
+                || (capability.skipped_large_cfg && capability.primary_summary_island_count >= 8)
+                || large_bounded_memory_worker;
+            high_risk.then(|| reason.clone())
+        }
+        _ => None,
+    }
+}
+
+fn preferred_semantic_structuring_reason(context: &EngineRouteContext<'_>) -> Option<String> {
+    let capability = context.function_facts.decompile_capability();
+    if !is_autogenerated_function_name(context.func_name) {
+        return None;
+    }
+    if !context.has_structured_control_claims() {
+        return None;
+    }
+    if !capability
+        .plan
+        .as_ref()
+        .is_some_and(r2sym::DecompilePlan::allows_native_structuring)
+    {
+        return None;
+    }
+    if !capability.skipped_large_cfg || !capability.has_native_regions {
+        return None;
+    }
+    if capability.actionable_region_count == 0
+        || capability.assumption_conflicted
+        || capability.summary_conflicted
+        || !capability.ambiguous_targets.is_empty()
+    {
+        return None;
+    }
+    Some(preferred_semantic_worker_reason(context.cfg_summary))
+}
+
+fn preferred_semantic_worker_reason(cfg_summary: &CFGRiskSummary) -> String {
+    cfg_guard_reason_from_summary(cfg_summary)
+        .unwrap_or_else(|| "semantic worker islands".to_string())
+}
+
+fn has_generic_only_summary_islands(capability: &DecompileCapabilityView) -> bool {
+    capability.has_summary_islands && !capability.has_primary_summary_islands
+}
+
+fn has_large_bounded_memory_summary_worker(capability: &DecompileCapabilityView) -> bool {
+    capability.skipped_large_cfg
+        && capability.has_memory_read_write_summary_pair
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+}
+
+fn has_dense_summary_only_memory_worker(capability: &DecompileCapabilityView) -> bool {
+    !capability.has_native_regions
+        && capability.has_memory_read_write_summary_pair
+        && capability.summary_island_count >= 24
+        && matches!(
+            capability.slice_class,
+            Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
+        )
+}
+
+pub(super) fn has_renderable_native_linear_worker_summary(function_facts: &FunctionFacts) -> bool {
+    let Some(native) = function_facts
+        .semantic_artifact()
+        .and_then(r2sym::SemanticArtifact::native_body)
+    else {
+        return false;
+    };
+    native_body_has_renderable_worker_summary(native)
+}
+
+pub(super) fn native_body_has_renderable_worker_summary(
+    native: &r2sym::NativeArtifactBody,
+) -> bool {
+    if !r2sym::SemanticClaimSummary::from_native_body(native).has_renderable_non_name_claim() {
+        return false;
+    }
+    native
+        .summary
+        .worker_summaries
+        .iter()
+        .any(is_renderable_native_worker_summary)
+}
+
+fn is_renderable_native_worker_summary(summary: &r2sym::NativeWorkerSummary) -> bool {
+    if summary.has_name_hint_evidence() {
+        return false;
+    }
+    match summary.kind {
+        r2sym::NativeWorkerSummaryKind::NumericTransform => {
+            summary.dst.is_none()
+                && summary.memory.is_some()
+                && worker_summary_has_known_length(summary)
+                && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+                    loop_summary.fold.as_ref().is_some_and(|fold| {
+                        fold.operation == r2sym::NativeWorkerFoldOperation::Add
+                            && fold.predicate.is_some()
+                    })
+                })
+        }
+        r2sym::NativeWorkerSummaryKind::HashFold => {
+            summary.memory.is_some()
+                && worker_summary_has_known_length(summary)
+                && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+                    loop_summary.fold.as_ref().is_some_and(|fold| {
+                        fold.operation == r2sym::NativeWorkerFoldOperation::Xor
+                            && fold.init.is_some()
+                            && fold.multiplier.is_some()
+                    })
+                })
+        }
+        r2sym::NativeWorkerSummaryKind::Parser => {
+            summary.memory.is_some() && summary.parser.is_some()
+        }
+        r2sym::NativeWorkerSummaryKind::StringScan | r2sym::NativeWorkerSummaryKind::TableWalk => {
+            is_renderable_scan_table_worker_summary(summary)
+        }
+        _ => false,
+    }
+}
+
+fn has_summary_only_scan_table_worker(function_facts: &FunctionFacts) -> bool {
+    let Some(semantic_artifact) = function_facts.semantic_artifact() else {
+        return false;
+    };
+    if semantic_artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly {
+        return false;
+    }
+    semantic_artifact.native_body().is_some_and(|native| {
+        native
+            .summary
+            .worker_summaries
+            .iter()
+            .any(is_renderable_scan_table_worker_summary)
+    })
+}
+
+pub(super) fn prefers_standard_native_for_summary_only_worker(
+    function_facts: &FunctionFacts,
+    cfg_summary: &CFGRiskSummary,
+) -> bool {
+    if cfg_guard_reason_from_summary(cfg_summary).is_some() {
+        return false;
+    }
+    let Some(semantic_artifact) = function_facts.semantic_artifact() else {
+        return false;
+    };
+    if semantic_artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly
+        || semantic_artifact.diagnostics.skipped_large_cfg
+    {
+        return false;
+    }
+    semantic_artifact.native_body().is_some_and(|native| {
+        native.summary.worker_summaries.iter().any(|summary| {
+            exact_hash_fold_summary_ready_for_native_render(summary)
+                || complete_table_walk_summary_ready_for_native_render(summary)
+        })
+    })
+}
+
+fn exact_hash_fold_summary_ready_for_native_render(summary: &r2sym::NativeWorkerSummary) -> bool {
+    if summary.kind != r2sym::NativeWorkerSummaryKind::HashFold
+        || summary.has_name_hint_evidence()
+        || summary.memory.is_none()
+        || !worker_summary_has_known_length(summary)
+    {
+        return false;
+    }
+    summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+        loop_summary.fold.as_ref().is_some_and(|fold| {
+            fold.operation == r2sym::NativeWorkerFoldOperation::Xor
+                && fold.init.is_some()
+                && fold.multiplier.is_some()
+        })
+    })
+}
+
+fn complete_table_walk_summary_ready_for_native_render(
+    summary: &r2sym::NativeWorkerSummary,
+) -> bool {
+    if summary.kind != r2sym::NativeWorkerSummaryKind::TableWalk
+        || summary.has_name_hint_evidence()
+        || summary.memory.is_none()
+    {
+        return false;
+    }
+    summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+        let Some(detail) = loop_summary.table_walk.as_ref() else {
+            return false;
+        };
+        detail.needle_arg.is_some()
+            && detail.id_offset.is_some()
+            && detail.len_offset.is_some()
+            && detail.name_offset.is_some()
+            && detail.next_offset.is_some()
+            && detail.count_accumulator.is_some()
+            && detail.match_returns_field_plus_count
+            && detail.exhausted_returns_negative_count
+    })
+}
+
+fn is_renderable_scan_table_worker_summary(summary: &r2sym::NativeWorkerSummary) -> bool {
+    matches!(
+        summary.kind,
+        r2sym::NativeWorkerSummaryKind::StringScan | r2sym::NativeWorkerSummaryKind::TableWalk
+    ) && summary.memory.is_some()
+        && summary.loop_summary.as_ref().is_some_and(|loop_summary| {
+            loop_summary.terminator.is_some_and(|terminator| {
+                !matches!(terminator, r2sym::NativeWorkerTerminator::Unknown)
+            })
+        })
+}
+
+fn worker_summary_has_known_length(summary: &r2sym::NativeWorkerSummary) -> bool {
+    matches!(
+        summary.len,
+        Some(r2ssa::SummaryTransferLength::Arg(_) | r2ssa::SummaryTransferLength::Const(_))
+    ) || summary
+        .loop_summary
+        .as_ref()
+        .and_then(|loop_summary| loop_summary.length_arg)
+        .is_some()
+}
+
+fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> bool {
+    let Some(signature) = function_facts.types.render_authorized_signature() else {
+        return false;
+    };
+    let Some(native) = function_facts
+        .semantic_artifact()
+        .and_then(r2sym::SemanticArtifact::native_body)
+    else {
+        return false;
+    };
+    let param_count = signature.params.len();
+    let weak_worker_conflict = native.summary.worker_summaries.iter().any(|summary| {
+        !summary.evidence.allows_guarded_structuring()
+            && summary
+                .arg_indices()
+                .into_iter()
+                .any(|index| index >= param_count)
+    });
+    let weak_region_conflict = native.summary.region_summaries.iter().any(|summary| {
+        !summary.evidence.allows_guarded_structuring()
+            && summary
+                .arg_indices()
+                .into_iter()
+                .any(|index| index >= param_count)
+    });
+    weak_worker_conflict || weak_region_conflict
+}
+
+fn is_autogenerated_function_name(name: &str) -> bool {
+    let underscore_hex_addr = name
+        .strip_prefix('_')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_hexdigit()));
+    name.is_empty()
+        || name.starts_with("fcn.")
+        || name.starts_with("fcn_")
+        || name.starts_with("sub.")
+        || name.starts_with("sub_")
+        || name.starts_with("loc.")
+        || underscore_hex_addr
 }
