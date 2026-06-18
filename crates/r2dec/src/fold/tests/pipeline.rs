@@ -8223,6 +8223,29 @@ mod tests {
     }
 
     #[test]
+    fn stack_frame_op_uses_typed_temp_for_indirect_callee_saved_push() {
+        let mut ctx = FoldingContext::new(64);
+        let addr = make_var("tmp:stack", 1, 8);
+        let saved = make_var("TMP:saved", 1, 8);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .copy_sources
+            .insert(saved.display_name(), "RBX_1".to_string());
+
+        assert!(ctx.is_stack_frame_op(&SSAOp::Store {
+            space: "ram".to_string(),
+            addr: addr.clone(),
+            val: saved,
+        }));
+        assert!(!ctx.is_stack_frame_op(&SSAOp::Store {
+            space: "ram".to_string(),
+            addr,
+            val: make_var("value", 1, 8),
+        }));
+    }
+
+    #[test]
     fn local_branch_condition_does_not_inline_return_register_call_history() {
         let block = make_block(vec![
             SSAOp::Call {

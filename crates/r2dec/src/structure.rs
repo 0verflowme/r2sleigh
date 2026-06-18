@@ -3319,7 +3319,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 )
         });
         lower.starts_with("value_")
-            || lower.starts_with("tmp:")
+            || crate::analysis::utils::is_temporary_name(name)
             || lower.starts_with("unique:")
             || lower.contains(':')
             || (lower.starts_with('t') && lower[1..].chars().all(|ch| ch.is_ascii_digit()))
@@ -4803,6 +4803,23 @@ mod tests {
             ),
             "generated trailing value carrier should not own loop update: {stmts:?}"
         );
+    }
+
+    #[test]
+    fn generated_artifact_name_uses_typed_temporary_kind() {
+        assert!(ControlFlowStructurer::is_generated_artifact_name(
+            "tmp:11f00_4"
+        ));
+        assert!(ControlFlowStructurer::is_generated_artifact_name(
+            "TMP:11f00_4"
+        ));
+        assert!(ControlFlowStructurer::is_generated_artifact_name(
+            "unique:12_0"
+        ));
+        assert!(ControlFlowStructurer::is_generated_artifact_name("value_1"));
+        assert!(!ControlFlowStructurer::is_generated_artifact_name(
+            "sha_state"
+        ));
     }
 
     #[test]

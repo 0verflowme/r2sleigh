@@ -678,7 +678,7 @@ impl<'a> FoldingContext<'a> {
                         return true;
                     }
                     // Indirect: val is a temp, trace it back via copy_sources
-                    if val.name.starts_with("tmp:") {
+                    if utils::is_temporary_name(&val.name) {
                         let val_key = val.display_name();
                         if let Some(src_key) = self.render_copy_source_for_name(&val_key) {
                             let src_lower = src_key.to_lowercase();

@@ -89,6 +89,9 @@ fn expr_contains_opaque_temp_uses_visit_over_nested_nodes() {
     let raw_tmp = CExpr::Var("tmp:2a000".to_string());
     assert!(ctx.expr_contains_opaque_temp(&raw_tmp));
 
+    let upper_raw_tmp = CExpr::Var("TMP:2a000".to_string());
+    assert!(ctx.expr_contains_opaque_temp(&upper_raw_tmp));
+
     let clean = CExpr::binary(
         BinaryOp::Eq,
         CExpr::Var("eax_1".to_string()),

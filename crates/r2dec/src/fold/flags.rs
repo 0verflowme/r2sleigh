@@ -3839,7 +3839,7 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn is_opaque_temp_name(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
-        if lower.starts_with("tmp_") || lower.starts_with("tmp:") {
+        if lower.starts_with("tmp_") || utils::is_temporary_name(name) {
             return true;
         }
         if name.starts_with("var_") {
