@@ -18600,6 +18600,19 @@ mod tests {
         });
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("stack_home_call_arg");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate");
+        assert_eq!(call_cert.stack_argument_values.len(), 1);
+        assert_eq!(call_cert.argument_certificates.len(), 1);
+        assert_eq!(
+            call_cert.argument_certificates[0].value,
+            call_cert.stack_argument_values[0].value
+        );
+        assert!(matches!(
+            &call_cert.argument_certificates[0].location,
+            r2ssa::CallArgumentLocation::Stack { .. }
+        ));
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
 

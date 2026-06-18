@@ -17,7 +17,12 @@ fn certified_callsite_argument_values(cert: &r2ssa::CallsiteCertificate) -> Vec<
     cert.argument_values
         .iter()
         .copied()
-        .chain(cert.stack_argument_values.iter().map(|arg| arg.value))
+        .chain(
+            cert.argument_certificates
+                .iter()
+                .filter(|arg| matches!(&arg.location, r2ssa::CallArgumentLocation::Stack { .. }))
+                .map(|arg| arg.value),
+        )
         .collect()
 }
 

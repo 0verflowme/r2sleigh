@@ -1731,9 +1731,12 @@ fn infer_stack_call_authoritative_args(
     };
 
     call_cert
-        .stack_argument_values
+        .argument_certificates
         .iter()
         .filter_map(|arg| {
+            let r2ssa::CallArgumentLocation::Stack { .. } = &arg.location else {
+                return None;
+            };
             let var = prepared.value_var(arg.value)?;
             let expr = authoritative_scalar_expr_for_value(block, view, var, 0)
                 .or_else(|| scalar_owner_expr_for_value(view, var, var.size))
