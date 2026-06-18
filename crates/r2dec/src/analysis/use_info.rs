@@ -3770,7 +3770,7 @@ fn semantic_addr_for_var_with_depth(
         Some(SemanticValue::Scalar(_)) | Some(SemanticValue::Load { .. })
     );
     if !has_non_address_semantic
-        && (copy_root != key || key.starts_with("tmp:"))
+        && (copy_root != key || utils::is_temporary_name(&key))
         && let Some(offset) =
             utils::extract_stack_offset_from_var(var, &info.definitions, env.fp_name, env.sp_name)
     {
@@ -3983,8 +3983,7 @@ fn semantic_source_value_for_var(info: &UseInfo, var: &SSAVar) -> Option<Semanti
     if lower == "stack"
         || lower == "saved_fp"
         || lower.starts_with("stack_")
-        || var.name.starts_with("tmp:")
-        || var.name.starts_with("ram:")
+        || is_raw_temporary_or_memory_like_name(&var.name)
     {
         return None;
     }
@@ -4056,8 +4055,7 @@ fn semantic_or_scalar_source_value(info: &UseInfo, source_name: &str) -> Option<
 
     let rendered = utils::format_traced_name(&root, &info.var_aliases);
     let lower = rendered.to_ascii_lowercase();
-    if root.starts_with("tmp:")
-        || root.starts_with("ram:")
+    if is_raw_temporary_or_memory_like_name(&root)
         || lower == "stack"
         || lower == "saved_fp"
         || lower.starts_with("stack_")
@@ -4291,6 +4289,13 @@ fn is_raw_ssa_storage_or_register_name(name: &str) -> bool {
             | SSAVarNameKind::Constant
             | SSAVarNameKind::Memory
             | SSAVarNameKind::AddressSpace
+    )
+}
+
+fn is_raw_temporary_or_memory_like_name(name: &str) -> bool {
+    matches!(
+        utils::ssa_name_kind(name),
+        SSAVarNameKind::Temporary | SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
     )
 }
 
@@ -9743,6 +9748,107 @@ mod tests {
         assert!(is_semantic_binding_base("sym.helper"));
         assert!(!is_low_signal_name("value"));
         assert!(!is_semantic_binding_base("value"));
+    }
+
+    #[test]
+    fn semantic_source_values_reject_raw_temporary_and_memory_storage_names() {
+        let info = UseInfo::default();
+
+        for var in [
+            mk("tmp:1", 0, 8),
+            mk("ram:401000", 0, 8),
+            mk("space1:20", 0, 8),
+            mk("stack", 0, 8),
+            mk("saved_fp", 0, 8),
+            mk("stack_10", 0, 8),
+        ] {
+            assert_eq!(
+                semantic_source_value_for_var(&info, &var),
+                None,
+                "{} should not become a semantic root",
+                var.display_name()
+            );
+            assert_eq!(
+                semantic_or_scalar_source_value(&info, &var.display_name()),
+                None,
+                "{} should not become a fallback scalar expression",
+                var.display_name()
+            );
+        }
+
+        let ordinary = mk("value", 0, 8);
+        assert!(matches!(
+            semantic_source_value_for_var(&info, &ordinary),
+            Some(SemanticValue::Scalar(ScalarValue::Root(root))) if root.var == ordinary
+        ));
+        assert!(matches!(
+            semantic_or_scalar_source_value(&info, "value_0"),
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(name)))) if name == "value"
+        ));
+        assert!(matches!(
+            semantic_or_scalar_source_value(&info, "const:1_0"),
+            Some(SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(1))))
+        ));
+    }
+
+    #[test]
+    fn semantic_source_addresses_recover_stack_slots_without_overriding_scalar_semantics() {
+        let fixture = TestEnvFixture::new();
+        let env = fixture.env();
+        let temp_slot = mk("tmp:slot", 1, 8);
+        let alias_slot = mk("alias", 1, 8);
+        let mut info = UseInfo::default();
+        info.definitions.insert(
+            temp_slot.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("rsp_0".to_string()),
+                CExpr::IntLit(0x20),
+            ),
+        );
+        info.definitions.insert(
+            alias_slot.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("rsp_0".to_string()),
+                CExpr::IntLit(0x28),
+            ),
+        );
+        info.copy_sources
+            .insert(alias_slot.display_name(), "source_1".to_string());
+
+        assert_eq!(
+            semantic_addr_for_var_with_depth(&info, &temp_slot, &env, 0),
+            Some(NormalizedAddr {
+                base: BaseRef::StackSlot(0x20),
+                index: None,
+                scale_bytes: 0,
+                offset_bytes: 0,
+            })
+        );
+        assert_eq!(
+            semantic_addr_for_var_with_depth(&info, &alias_slot, &env, 0),
+            Some(NormalizedAddr {
+                base: BaseRef::StackSlot(0x28),
+                index: None,
+                scale_bytes: 0,
+                offset_bytes: 0,
+            })
+        );
+
+        info.semantic_values.insert(
+            temp_slot.display_name(),
+            SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var("semantic".to_string()))),
+        );
+        assert!(matches!(
+            semantic_addr_for_var_with_depth(&info, &temp_slot, &env, 0),
+            Some(NormalizedAddr {
+                base: BaseRef::Raw(_),
+                index: None,
+                scale_bytes: 0,
+                offset_bytes: 0,
+            })
+        ));
     }
 
     #[test]
