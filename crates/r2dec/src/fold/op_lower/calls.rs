@@ -72,13 +72,10 @@ impl<'a> FoldingContext<'a> {
         {
             return CExpr::Var(name);
         }
-        if let Some(addr) = self.prepared_direct_call_target(block_addr, op_idx) {
-            if let Some(name) = self.lookup_function(addr) {
-                return CExpr::Var(name.clone());
-            }
-            if let Some(name) = self.lookup_symbol(addr) {
-                return CExpr::Var(name.clone());
-            }
+        if let Some(addr) = self.prepared_direct_call_target(block_addr, op_idx)
+            && let Some(name) = self.callee_identity_for_direct_target(addr).display_name
+        {
+            return CExpr::Var(name);
         }
         self.resolve_call_target(target)
     }
@@ -306,42 +303,30 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn resolve_call_target(&self, target: &SSAVar) -> CExpr {
-        if let Some(addr) = self.prepared_constish_target_addr(target) {
-            if let Some(name) = self.lookup_function(addr) {
-                return CExpr::Var(name.clone());
-            }
-            if let Some(name) = self.lookup_symbol(addr) {
-                return CExpr::Var(name.clone());
-            }
+        if let Some(addr) = self.prepared_constish_target_addr(target)
+            && let Some(name) = self.callee_identity_for_direct_target(addr).display_name
+        {
+            return CExpr::Var(name);
         }
         self.get_expr(target)
     }
 
-    fn is_modeled_call_target(&self, callee: &CExpr) -> bool {
-        let Some(name) = Self::extract_callee_name(callee) else {
+    pub(super) fn is_modeled_call_target(&self, callee: &CExpr) -> bool {
+        let Some(identity) = self.callee_identity_for_expr(callee) else {
             return false;
         };
-        let normalized = normalize_callee_name(name);
 
-        if self.summary_helper_view_for_name(name).is_some() {
+        if identity
+            .aliases
+            .iter()
+            .any(|alias| self.summary_helper_view_for_name(alias).is_some())
+        {
             return true;
         }
 
-        self.callee_facts_map().iter().any(|(addr, fact)| {
-            fact.name
-                .as_deref()
-                .is_some_and(|fact_name| normalize_callee_name(fact_name) == normalized)
-                || self
-                    .inputs
-                    .function_names
-                    .get(addr)
-                    .is_some_and(|function_name| normalize_callee_name(function_name) == normalized)
-                || self
-                    .inputs
-                    .symbols
-                    .get(addr)
-                    .is_some_and(|symbol_name| normalize_callee_name(symbol_name) == normalized)
-        })
+        self.callee_facts_map()
+            .keys()
+            .any(|addr| identity.matches_identity(&self.callee_identity_for_direct_target(*addr)))
     }
 
     pub(super) fn render_call_arg_for_callee(

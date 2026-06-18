@@ -4455,6 +4455,7 @@ impl Decompiler {
                 function_names: &self.context.function_names,
                 symbols: &self.context.symbols,
                 callee_facts: &self.context.type_facts().callee_facts,
+                known_function_signatures: &known_function_signatures,
                 stack_slots: &self.context.type_facts().stack_slots,
                 visible_bindings: &self.context.type_facts().visible_bindings,
                 param_register_aliases: &param_register_aliases,

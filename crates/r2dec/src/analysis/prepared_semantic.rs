@@ -6,8 +6,8 @@ use r2ssa::{
     SsaArtifact, ValueId,
 };
 use r2types::{
-    CalleeFact, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
-    VisibleBindingKind,
+    CalleeFact, CalleeIdentity, CalleeIdentityContext, ExternalStackSlotRole,
+    ExternalStackSlotSpec, FunctionType, StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
 
 use super::lower::LowerCtx;
@@ -34,6 +34,7 @@ pub(crate) struct StackAliasView {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct PreparedCallView {
     pub(crate) direct_target: Option<u64>,
+    pub(crate) callee_identity: Option<CalleeIdentity>,
     pub(crate) callee_name: Option<String>,
     pub(crate) authoritative_args: Vec<CExpr>,
     pub(crate) authoritative_arg_values: Vec<ValueId>,
@@ -67,6 +68,7 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) function_names: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
+    pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -1617,18 +1619,18 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
         };
         let mut call_view = PreparedCallView {
             direct_target: call_site.direct_target,
-            callee_name: call_site
+            callee_identity: call_site
                 .direct_target
-                .and_then(|addr| lookup_callee_name(inputs, addr)),
+                .map(|addr| lookup_callee_identity(inputs, addr)),
+            callee_name: None,
             authoritative_args: Vec::new(),
             authoritative_arg_values: Vec::new(),
             result_owner: None,
         };
-        if call_view.callee_name.is_none()
-            && let Some(addr) = call_site.direct_target
-        {
-            call_view.callee_name = lookup_callee_name(inputs, addr);
-        }
+        call_view.callee_name = call_view
+            .callee_identity
+            .as_ref()
+            .and_then(|identity| identity.display_name.clone());
         if call_view.callee_name.is_none()
             && inputs
                 .prepared
@@ -2167,13 +2169,16 @@ fn param_alias_for_var(
         .cloned()
 }
 
-fn lookup_callee_name(inputs: &PreparedSemanticViewInputs<'_>, addr: u64) -> Option<String> {
-    inputs
-        .callee_facts
-        .get(&addr)
-        .and_then(|fact| fact.name.clone())
-        .or_else(|| inputs.function_names.get(&addr).cloned())
-        .or_else(|| inputs.symbols.get(&addr).cloned())
+fn lookup_callee_identity(inputs: &PreparedSemanticViewInputs<'_>, addr: u64) -> CalleeIdentity {
+    CalleeIdentity::from_direct_target(
+        addr,
+        &CalleeIdentityContext {
+            function_names: inputs.function_names,
+            symbols: inputs.symbols,
+            callee_facts: inputs.callee_facts,
+            known_function_signatures: inputs.known_function_signatures,
+        },
+    )
 }
 
 fn scalar_owner_expr_for_value(
@@ -3231,9 +3236,22 @@ fn prepared_call_expr(
 
 fn prepared_call_callee_expr(call_view: &PreparedCallView) -> Option<CExpr> {
     call_view
-        .callee_name
+        .callee_identity
         .as_ref()
-        .map(|name| CExpr::Var(name.clone()))
+        .and_then(|identity| identity.display_name.clone())
+        .map(CExpr::Var)
+        .or_else(|| {
+            call_view
+                .callee_identity
+                .as_ref()
+                .map(|identity| CExpr::Var(identity.primary_key()))
+        })
+        .or_else(|| {
+            call_view
+                .callee_name
+                .as_ref()
+                .map(|name| CExpr::Var(name.clone()))
+        })
         .or_else(|| {
             call_view
                 .direct_target
@@ -3754,6 +3772,7 @@ mod tests {
         let function_names = HashMap::new();
         let symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::from([
@@ -3769,6 +3788,7 @@ mod tests {
             function_names: &function_names,
             symbols: &symbols,
             callee_facts: &callee_facts,
+            known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,

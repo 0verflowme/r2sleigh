@@ -33,9 +33,9 @@ use r2types::StackSlotKey;
 #[cfg(test)]
 use r2types::TypeOracle;
 use r2types::{
-    CTypeLike, CalleeFact, CalleeIdentity, ExternalField, ExternalStackBase, ExternalStackSlotRole,
-    ExternalStruct, ExternalUnion, TypeArena, normalize_callee_name, normalize_external_type_name,
-    parse_type_like_spec,
+    CTypeLike, CalleeFact, CalleeIdentity, CalleeIdentityContext, ExternalField, ExternalStackBase,
+    ExternalStackSlotRole, ExternalStruct, ExternalUnion, TypeArena, normalize_callee_name,
+    normalize_external_type_name, parse_type_like_spec,
 };
 
 use crate::address::parse_address_from_var_name;
@@ -807,6 +807,7 @@ impl<'a> FoldingContext<'a> {
                 function_names: self.inputs.function_names,
                 symbols: self.inputs.symbols,
                 callee_facts: self.inputs.callee_facts,
+                known_function_signatures: self.inputs.known_function_signatures,
                 stack_slots: self.inputs.stack_slots,
                 visible_bindings: self.inputs.visible_bindings,
                 param_register_aliases: self.inputs.param_register_aliases,
@@ -1008,6 +1009,26 @@ impl<'a> FoldingContext<'a> {
     }
     pub(crate) fn callee_facts_map(&self) -> &std::collections::BTreeMap<u64, CalleeFact> {
         self.inputs.callee_facts
+    }
+    pub(crate) fn callee_identity_context(&self) -> CalleeIdentityContext<'_> {
+        CalleeIdentityContext {
+            function_names: self.inputs.function_names,
+            symbols: self.inputs.symbols,
+            callee_facts: self.inputs.callee_facts,
+            known_function_signatures: self.inputs.known_function_signatures,
+        }
+    }
+    pub(crate) fn callee_identity_for_direct_target(&self, addr: u64) -> CalleeIdentity {
+        CalleeIdentity::from_direct_target(addr, &self.callee_identity_context())
+    }
+    pub(crate) fn callee_identity_for_name(&self, name: &str) -> CalleeIdentity {
+        if let Some(addr) = parse_address_from_var_name(name) {
+            return self.callee_identity_for_direct_target(addr);
+        }
+        CalleeIdentity::from_name(name).with_known_signature(self.inputs.known_function_signatures)
+    }
+    pub(crate) fn callee_identity_for_expr(&self, expr: &CExpr) -> Option<CalleeIdentity> {
+        call_arg_callee_name(expr).map(|name| self.callee_identity_for_name(name))
     }
     pub(crate) fn call_result_aliases_map(
         &self,
@@ -1861,6 +1882,7 @@ impl<'a> FoldingContext<'a> {
                     function_names: self.inputs.function_names,
                     symbols: self.inputs.symbols,
                     callee_facts: self.inputs.callee_facts,
+                    known_function_signatures: self.inputs.known_function_signatures,
                     stack_slots: self.inputs.stack_slots,
                     visible_bindings: self.inputs.visible_bindings,
                     param_register_aliases: self.inputs.param_register_aliases,
@@ -6633,21 +6655,13 @@ impl<'a> FoldingContext<'a> {
         let Some(CExpr::Call { func, .. }) = self.call_result_exprs_map().get(&source_call) else {
             return false;
         };
-        let Some(callee) = call_arg_callee_name(func) else {
+        let Some(identity) = self.callee_identity_for_expr(func) else {
             return false;
         };
-        let identity = CalleeIdentity::from_name(callee);
         if identity.is_raw_storage_target() {
             return false;
         }
-        let signature_key = self
-            .call_target_identity(func.as_ref())
-            .unwrap_or_else(|| identity.normalized_name().to_string());
-        if self
-            .inputs
-            .known_function_signatures
-            .contains_key(&signature_key)
-        {
+        if identity.has_known_signature() {
             return false;
         }
 
@@ -7121,22 +7135,13 @@ impl<'a> FoldingContext<'a> {
 
     fn call_target_identity(&self, expr: &CExpr) -> Option<String> {
         match expr {
-            CExpr::Var(name) => Some(self.call_target_identity_for_name(name)),
+            CExpr::Var(name) => Some(self.callee_identity_for_name(name).primary_key()),
             CExpr::Paren(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
                 self.call_target_identity(inner)
             }
             CExpr::Cast { expr: inner, .. } => self.call_target_identity(inner),
             _ => None,
         }
-    }
-
-    fn call_target_identity_for_name(&self, name: &str) -> String {
-        if let Some(addr) = parse_address_from_var_name(name)
-            && let Some(symbol) = self.inputs.function_names.get(&addr)
-        {
-            return normalize_callee_name(symbol);
-        }
-        normalize_callee_name(name)
     }
 
     fn recovered_owned_call_result_definition_rhs(
@@ -9991,14 +9996,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn is_imported_call_target(&self, callee: &CExpr) -> bool {
-        let Some(name) = call_arg_callee_name(callee) else {
-            return false;
-        };
-        let identity = CalleeIdentity::from_name(name);
-        self.inputs
-            .known_function_signatures
-            .contains_key(identity.normalized_name())
-            || identity.is_imported_name_hint()
+        self.callee_identity_for_expr(callee)
+            .is_some_and(|identity| {
+                identity.has_known_signature() || identity.is_imported_name_hint()
+            })
     }
 
     fn call_arg_contains_stack_placeholder(&self, expr: &CExpr, depth: u32) -> bool {

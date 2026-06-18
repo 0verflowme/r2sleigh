@@ -148,7 +148,30 @@ mod tests {
                     name: name.to_string(),
                     ty: ty.as_ref().map(crate::ctype_to_type_like),
                 })
-                .collect(),
+            .collect(),
+        }
+    }
+
+    fn minimal_callee_fact(addr: u64, name: &str) -> CalleeFact {
+        CalleeFact {
+            function_id: addr,
+            name: Some(name.to_string()),
+            direct_callees: Vec::new(),
+            callsite_count: 1,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: Vec::new(),
+            transfer_effects: Vec::new(),
+            allocation_effects: Vec::new(),
+            lifetime_effects: Vec::new(),
+            sync_effects: Vec::new(),
+            atomic_effects: Vec::new(),
+            param_type_hints: BTreeMap::new(),
+            return_type_hint: None,
+            return_relation: CalleeReturnRelation::Unknown,
+            reads_global_memory: false,
+            writes_global_memory: false,
+            touches_unknown_memory: false,
         }
     }
 
@@ -18372,16 +18395,52 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("prepared_call_root");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.set_function_names(HashMap::from([(
+            0x401050,
+            "sym.function_name".to_string(),
+        )]));
+        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
+            0x401050,
+            "sym.symbol_name".to_string(),
+        )])));
+        ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
+            0x401050,
+            minimal_callee_fact(0x401050, "sym.imp.fact_helper"),
+        )])));
 
         let block = prepared.function().get_block(0x1000).expect("entry");
         let SSAOp::Call { target } = &block.ops[1] else {
             panic!("expected call op, got {:?}", block.ops[1]);
         };
 
+        let call_view = ctx
+            .prepared_call_view_for_site(block.addr, 1)
+            .expect("prepared call view");
+        let identity = call_view
+            .callee_identity
+            .as_ref()
+            .expect("prepared call identity");
+        assert_eq!(identity.display_name.as_deref(), Some("sym.imp.fact_helper"));
+        assert_eq!(identity.primary_key(), "fact_helper");
+        assert!(identity.aliases.contains("sym.function_name"));
+        assert!(identity.aliases.contains("sym.symbol_name"));
+        assert_eq!(call_view.callee_name.as_deref(), Some("sym.imp.fact_helper"));
+
         assert_eq!(
             ctx.resolve_call_target_for_site(block.addr, 1, target),
-            CExpr::Var("sym.helper".to_string())
+            CExpr::Var("sym.imp.fact_helper".to_string())
+        );
+        assert_eq!(
+            ctx.call_target_identity(&CExpr::Var("const:401050".to_string())),
+            Some("fact_helper".to_string())
+        );
+        assert!(
+            ctx.is_imported_call_target(&CExpr::Var("const:401050".to_string())),
+            "direct target identity should classify imported callee-fact names"
+        );
+        assert!(
+            !ctx.is_modeled_call_target(&CExpr::Var("const:402000".to_string())),
+            "unrelated direct targets must not inherit modeled status from existing callee facts"
         );
     }
 
@@ -18450,6 +18509,7 @@ mod tests {
                 (0x1000, 2),
                 crate::analysis::PreparedCallView {
                     direct_target: Some(0x401050),
+                    callee_identity: None,
                     callee_name: Some("sym.helper".to_string()),
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.target],
@@ -18501,6 +18561,7 @@ mod tests {
                 (0x1000, 2),
                 crate::analysis::PreparedCallView {
                     direct_target: Some(0x401050),
+                    callee_identity: None,
                     callee_name: Some("sym.helper".to_string()),
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.target],
@@ -18545,6 +18606,7 @@ mod tests {
                 (0x1000, 2),
                 crate::analysis::PreparedCallView {
                     direct_target: Some(0x401050),
+                    callee_identity: None,
                     callee_name: Some("sym.helper".to_string()),
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.argument_values[0]],

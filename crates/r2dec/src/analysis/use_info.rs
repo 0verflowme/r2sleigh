@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 use r2ssa::{SSAFunction, SSAOp, SSAVar, SSAVarNameKind, ValueId};
-use r2types::CalleeIdentity;
+use r2types::{CalleeIdentity, CalleeIdentityContext};
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
@@ -6012,21 +6012,25 @@ fn rewrite_call_result_binding(
 }
 
 fn call_target_is_imported(op: &SSAOp, env: &PassEnv<'_>) -> bool {
-    let Some(name) = call_target_name(op, env) else {
-        return false;
-    };
-    CalleeIdentity::from_name(name).is_imported_name_hint()
-}
-
-fn call_target_name<'a>(op: &SSAOp, env: &'a PassEnv<'_>) -> Option<&'a String> {
     let target = match op {
         SSAOp::Call { target } | SSAOp::CallInd { target } => target,
-        _ => return None,
+        _ => return false,
     };
-    let addr = parse_target_addr(target)?;
-    env.function_names
-        .get(&addr)
-        .or_else(|| env.symbols.get(&addr))
+    let Some(addr) = parse_target_addr(target) else {
+        return false;
+    };
+    let callee_facts = BTreeMap::new();
+    let known_function_signatures = HashMap::new();
+    let identity = CalleeIdentity::from_direct_target(
+        addr,
+        &CalleeIdentityContext {
+            function_names: env.function_names,
+            symbols: env.symbols,
+            callee_facts: &callee_facts,
+            known_function_signatures: &known_function_signatures,
+        },
+    );
+    identity.is_imported_name_hint()
 }
 
 fn should_append_unknown_stack_args(
