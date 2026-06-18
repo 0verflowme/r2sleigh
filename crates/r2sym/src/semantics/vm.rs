@@ -540,13 +540,13 @@ fn record_block_state(
     state_outputs: &mut BTreeSet<String>,
 ) {
     block.for_each_source(|src| {
-        if (!src.var.is_register() && !src.var.name.starts_with("ram:")) || src.var.version != 0 {
+        if !is_vm_state_input_var(src.var) {
             return;
         }
         state_inputs.insert(src.var.display_name());
     });
     for phi in &block.phis {
-        if !phi.dst.is_const() && !phi.dst.is_temp() && !phi.dst.name.starts_with("ram:") {
+        if is_vm_state_output_var(&phi.dst) {
             state_outputs.insert(phi.dst.display_name());
         }
     }
@@ -554,11 +554,19 @@ fn record_block_state(
         let Some(dst) = op.dst() else {
             continue;
         };
-        if dst.is_const() || dst.is_temp() || dst.name.starts_with("ram:") {
+        if !is_vm_state_output_var(dst) {
             continue;
         }
         state_outputs.insert(dst.display_name());
     }
+}
+
+fn is_vm_state_input_var(var: &SSAVar) -> bool {
+    (var.is_register() || var.is_memory()) && var.version == 0
+}
+
+fn is_vm_state_output_var(var: &SSAVar) -> bool {
+    !var.is_const() && !var.is_temp() && !var.is_memory()
 }
 
 fn case_values_by_target(
@@ -1377,7 +1385,7 @@ fn summarize_handler_scc(
             if let Some(dst) = op.dst()
                 && !dst.is_const()
                 && !dst.is_temp()
-                && !dst.name.starts_with("ram:")
+                && !dst.is_memory()
             {
                 let value = classify_vm_op_value_at_site(func, *block_addr, op_idx, op, 0)
                     .unwrap_or_else(|| VmValueExpr::Var(dst.display_name()));

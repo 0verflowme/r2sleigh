@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use r2ssa::{
-    FunctionSemanticSummary, InterprocFunctionId, SSAOp, SSAVar, SsaArtifact, StackAddressRoot,
-    SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryLifetimeEffect,
-    SummaryLifetimeOp, SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation,
-    SummaryMemoryRange, SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect,
-    SummarySyncOp, SummaryTransferEffect, SummaryTransferLength,
+    FunctionSemanticSummary, InterprocFunctionId, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact,
+    StackAddressRoot, SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect,
+    SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect, SummaryMemoryEffectKind,
+    SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion, SummaryReturnRelation,
+    SummarySyncEffect, SummarySyncOp, SummaryTransferEffect, SummaryTransferLength,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1738,14 +1738,7 @@ fn normalize_semantic_summary_name(name: &str) -> Option<String> {
 fn normalize_semantic_summary_seed_name(name: &str) -> Option<&'static str> {
     let normalized_owned = name.trim().to_ascii_lowercase();
     let mut normalized = normalized_owned.as_str();
-    let has_external_marker = normalized.starts_with("sym.imp.")
-        || normalized.starts_with("imp.")
-        || normalized.starts_with("reloc.")
-        || normalized.ends_with("@plt")
-        || normalized.ends_with(".plt");
-    if !has_external_marker {
-        return None;
-    }
+    semantic_summary_seed_marker(normalized)?;
     for prefix in ["sym.imp.", "sym.", "imp.", "reloc.", "dbg."] {
         while let Some(rest) = normalized.strip_prefix(prefix) {
             normalized = rest;
@@ -1789,6 +1782,25 @@ fn normalize_semantic_summary_seed_name(name: &str) -> Option<&'static str> {
         "printf" | "__printf_chk" => Some("printf"),
         "exit" | "_exit" => Some("exit"),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticSummarySeedMarker {
+    Import,
+    Relocation,
+    Plt,
+}
+
+fn semantic_summary_seed_marker(normalized: &str) -> Option<SemanticSummarySeedMarker> {
+    if normalized.strip_prefix("sym.imp.").is_some() || normalized.strip_prefix("imp.").is_some() {
+        Some(SemanticSummarySeedMarker::Import)
+    } else if normalized.strip_prefix("reloc.").is_some() {
+        Some(SemanticSummarySeedMarker::Relocation)
+    } else if normalized.ends_with("@plt") || normalized.ends_with(".plt") {
+        Some(SemanticSummarySeedMarker::Plt)
+    } else {
+        None
     }
 }
 
@@ -6711,7 +6723,7 @@ fn source_arg(source: LoadedSource) -> Option<usize> {
 }
 
 fn fold_observation_has_accumulator_identity(fold: &FoldObservation) -> bool {
-    !fold.accumulator.starts_with("const:")
+    !SSAVarNameKind::classify(&fold.accumulator).is_constant()
 }
 
 fn loaded_source_access_width(source: LoadedSource) -> u32 {
