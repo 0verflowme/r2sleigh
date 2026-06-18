@@ -347,6 +347,19 @@ fn is_generated_carrier_name(name: &str) -> bool {
         || (lower.starts_with('t') && lower[1..].chars().all(|ch| ch.is_ascii_digit()))
 }
 
+fn is_static_jump_table_base_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        SSAVarNameKind::classify(&lower),
+        SSAVarNameKind::Symbol | SSAVarNameKind::Object
+    ) {
+        return true;
+    }
+    lower
+        .strip_prefix("0x")
+        .is_some_and(|hex| !hex.is_empty() && u64::from_str_radix(hex, 16).is_ok())
+}
+
 fn is_versioned_register_carrier_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.rsplit_once('_').is_some_and(|(base, version)| {
@@ -3415,9 +3428,7 @@ impl<'a> FoldingContext<'a> {
     fn is_jump_table_base_expr(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::UIntLit(_) | CExpr::IntLit(_) | CExpr::StringLit(_) => true,
-            CExpr::Var(name) => {
-                name.starts_with("sym.") || name.starts_with("obj.") || name.starts_with("0x")
-            }
+            CExpr::Var(name) => is_static_jump_table_base_name(name),
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 self.is_jump_table_base_expr(inner)
             }

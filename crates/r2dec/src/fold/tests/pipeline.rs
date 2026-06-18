@@ -4404,6 +4404,72 @@ mod tests {
     }
 
     #[test]
+    fn switch_selector_simplification_uses_typed_static_table_base_names() {
+        let ctx = FoldingContext::new(64);
+        for base in ["sym.jump_table", "obj.jump_table", "0x401000"] {
+            let expr = CExpr::Subscript {
+                base: Box::new(CExpr::Var(base.to_string())),
+                index: Box::new(CExpr::Var("selector".to_string())),
+            };
+            assert_eq!(
+                ctx.simplify_switch_selector_expr(expr),
+                CExpr::Var("selector".to_string()),
+                "{base}",
+            );
+        }
+
+        for base in [
+            CExpr::UIntLit(0x401000),
+            CExpr::IntLit(0x401000),
+            CExpr::StringLit(".rodata.jump_table".to_string()),
+        ] {
+            let expr = CExpr::Subscript {
+                base: Box::new(base),
+                index: Box::new(CExpr::Var("selector".to_string())),
+            };
+            assert_eq!(
+                ctx.simplify_switch_selector_expr(expr),
+                CExpr::Var("selector".to_string()),
+            );
+        }
+
+        for base in ["table", "tmp:1000_0", "arg1"] {
+            let expr = CExpr::Subscript {
+                base: Box::new(CExpr::Var(base.to_string())),
+                index: Box::new(CExpr::Var("selector".to_string())),
+            };
+            assert_eq!(ctx.simplify_switch_selector_expr(expr.clone()), expr, "{base}");
+        }
+
+        let low_signal_index = CExpr::Subscript {
+            base: Box::new(CExpr::Var("sym.jump_table".to_string())),
+            index: Box::new(CExpr::Var("tmp:idx_0".to_string())),
+        };
+        assert_eq!(
+            ctx.simplify_switch_selector_expr(low_signal_index.clone()),
+            low_signal_index
+        );
+
+        let non_old_global_kind = CExpr::Subscript {
+            base: Box::new(CExpr::Var("data.jump_table".to_string())),
+            index: Box::new(CExpr::Var("selector".to_string())),
+        };
+        assert_eq!(
+            ctx.simplify_switch_selector_expr(non_old_global_kind.clone()),
+            non_old_global_kind
+        );
+
+        let invalid_hex = CExpr::Subscript {
+            base: Box::new(CExpr::Var("0xnot_hex".to_string())),
+            index: Box::new(CExpr::Var("selector".to_string())),
+        };
+        assert_eq!(
+            ctx.simplify_switch_selector_expr(invalid_hex.clone()),
+            invalid_hex
+        );
+    }
+
+    #[test]
     fn typed_ssa_var_storage_filters_exclude_const_and_memory_sources() {
         let ctx = FoldingContext::new(64);
         let block = make_block(vec![
