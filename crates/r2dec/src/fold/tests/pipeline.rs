@@ -4475,6 +4475,48 @@ mod tests {
     }
 
     #[test]
+    fn assignment_lhs_uses_typed_ssa_kind_for_versioned_arg_carriers() {
+        fn lowered_lhs_for(dst: SSAVar) -> CExpr {
+            let mut ctx = FoldingContext::new(64);
+            ctx.state
+                .analysis_ctx
+                .use_info
+                .var_aliases
+                .insert(dst.display_name(), "arg1".to_string());
+
+            let stmt = ctx
+                .op_to_stmt(&SSAOp::Copy {
+                    dst,
+                    src: make_var("value", 2, 8),
+                })
+                .expect("versioned generic-arg carrier should lower to an assignment");
+
+            let CStmt::Expr(CExpr::Binary {
+                op: BinaryOp::Assign,
+                left,
+                ..
+            }) = stmt
+            else {
+                panic!("expected assignment expression");
+            };
+            *left
+        }
+
+        assert_eq!(lowered_lhs_for(make_var("reg:10", 2, 8)), CExpr::Var("r10_2".to_string()));
+        assert_eq!(lowered_lhs_for(make_var("reg:zf", 2, 1)), CExpr::Var("zf_2".to_string()));
+        assert_eq!(lowered_lhs_for(make_var("tmp:11f80", 2, 8)), CExpr::Var("t2".to_string()));
+        assert_eq!(lowered_lhs_for(make_var("unique:11f80", 2, 8)), CExpr::Var("t2".to_string()));
+        assert_eq!(
+            lowered_lhs_for(make_var("TMP:11f80", 2, 8)),
+            CExpr::Var("tmp_11f80_2".to_string())
+        );
+        assert_eq!(
+            lowered_lhs_for(make_var("reg:10", 0, 8)),
+            CExpr::Var("arg1".to_string())
+        );
+    }
+
+    #[test]
     fn test_dead_flag_elimination() {
         let rax_0 = make_var("RAX", 0, 8);
         let rax_1 = make_var("RAX", 1, 8);

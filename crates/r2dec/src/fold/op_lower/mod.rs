@@ -3027,17 +3027,18 @@ impl<'a> FoldingContext<'a> {
                 );
             }
 
-            let base = if dst.name.starts_with("reg:") {
-                let reg = dst.name.trim_start_matches("reg:");
-                if is_hex_name(reg) {
-                    format!("r{}", reg)
-                } else {
-                    reg.to_ascii_lowercase()
+            let base = match dst.name_kind() {
+                SSAVarNameKind::RegisterAlias => {
+                    let reg = dst.name.trim_start_matches("reg:");
+                    if is_hex_name(reg) {
+                        format!("r{}", reg)
+                    } else {
+                        reg.to_ascii_lowercase()
+                    }
                 }
-            } else if dst.name.starts_with("tmp:") || dst.name.starts_with("unique:") {
-                "t".to_string()
-            } else {
-                dst.name.to_ascii_lowercase().replace([':', '.'], "_")
+                SSAVarNameKind::Temporary => "t".to_string(),
+                _ if dst.name.starts_with("unique:") => "t".to_string(),
+                _ => dst.name.to_ascii_lowercase().replace([':', '.'], "_"),
             };
 
             return if base == "t" {
