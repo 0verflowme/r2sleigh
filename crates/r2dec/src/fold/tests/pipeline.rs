@@ -7125,6 +7125,35 @@ mod tests {
     }
 
     #[test]
+    fn lowered_alias_lookup_filters_raw_temporaries_with_typed_kind() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert("tmp:raw_2".to_string(), CExpr::IntLit(1));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert("value_2".to_string(), CExpr::IntLit(2));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert("TMP:raw_2".to_string(), CExpr::IntLit(3));
+
+        let temp_matches = ctx.ssa_names_for_lowered_temp_alias("t2");
+        assert!(temp_matches.contains(&"tmp:raw_2".to_string()), "{temp_matches:?}");
+        assert!(!temp_matches.contains(&"value_2".to_string()), "{temp_matches:?}");
+
+        let value_matches = ctx.ssa_names_for_lowered_temp_alias("v2");
+        assert!(value_matches.contains(&"value_2".to_string()), "{value_matches:?}");
+        assert!(value_matches.contains(&"TMP:raw_2".to_string()), "{value_matches:?}");
+        assert!(!value_matches.contains(&"tmp:raw_2".to_string()), "{value_matches:?}");
+    }
+
+    #[test]
     fn test_lookup_definition_prefers_forwarded_semantic_value_over_register_artifact() {
         let mut ctx = FoldingContext::new(64);
         ctx.state

@@ -9102,7 +9102,7 @@ impl<'a> FoldingContext<'a> {
                             alias_base.is_empty() || temp_base.eq_ignore_ascii_case(alias_base)
                         })
                 } else {
-                    !base.starts_with("tmp:")
+                    !SSAVarNameKind::classify(base).is_temporary()
                 };
 
                 if alias_version != ssa_version || !base_matches {
