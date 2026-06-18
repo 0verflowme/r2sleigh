@@ -6,7 +6,9 @@ use crate::convert::CTypeLike;
 use crate::facts::{FunctionSignatureSpec, FunctionType, FunctionTypeFacts, signature_strength};
 use crate::inference::TypeInference;
 use crate::model::Signedness;
-use crate::prepare::{SignatureTypeEvidenceContext, scalar_register_family_key};
+use crate::prepare::{
+    SignatureTypeEvidenceContext, scalar_register_family_key, ssa_var_is_register_like,
+};
 use crate::signature::SignatureRegistry;
 use crate::writeback::{InferredSignature, InferredSignatureParam};
 
@@ -633,7 +635,7 @@ pub fn collect_version0_input_regs(func: &SSAFunction) -> HashMap<String, u32> {
                 if src.version != 0 {
                     continue;
                 }
-                if src.name.starts_with("tmp:") || src.name.starts_with("const:") {
+                if !ssa_var_is_register_like(src) {
                     continue;
                 }
                 let key = src.name.to_ascii_lowercase();

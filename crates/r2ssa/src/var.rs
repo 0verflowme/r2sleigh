@@ -140,12 +140,7 @@ impl SSAVar {
     /// For temporaries, outputs "tmp:1000_0".
     pub fn display_name(&self) -> String {
         // Handle special prefixes (hex fallbacks and other spaces)
-        if self.name.starts_with("reg:")
-            || self.name.starts_with("tmp:")
-            || self.name.starts_with("const:")
-            || self.name.starts_with("ram:")
-            || self.name.starts_with("space")
-        {
+        if self.name_kind().is_prefixed_display_name() {
             return format!("{}_{}", self.name, self.version);
         }
         // Named register - uppercase it
@@ -156,14 +151,14 @@ impl SSAVar {
         SSAVarNameKind::classify(&self.name)
     }
 
-    /// Check if this is a constant (name starts with "const:").
+    /// Check if this is a constant SSA value.
     pub fn is_const(&self) -> bool {
-        self.name.starts_with("const:")
+        self.name_kind().is_constant()
     }
 
-    /// Check if this is a temporary (name starts with "tmp:").
+    /// Check if this is a temporary SSA value.
     pub fn is_temp(&self) -> bool {
-        self.name.starts_with("tmp:")
+        self.name_kind().is_temporary()
     }
 
     /// Check if this is a memory-backed SSA name (name starts with "ram:").

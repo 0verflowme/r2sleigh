@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use r2ssa::{SSABlock, SSAOp, SSAVar};
+use r2ssa::{SSABlock, SSAOp, SSAVar, SSAVarNameKind};
 
 use crate::writeback::RecoveredVariable;
 
@@ -227,20 +227,17 @@ pub fn recover_vars_from_ssa(
                     let b_name = b.name.to_lowercase();
 
                     let is_a_base = stack_bases.contains(&a_name.as_str());
-                    let is_b_const = b_name.starts_with("const:");
+                    let b_const = parse_const_value(&b.name);
 
-                    if is_a_base && is_b_const {
-                        if let Some(raw_offset) = parse_const_value(&b.name) {
-                            let offset = if matches!(op, SSAOp::IntSub { .. }) {
-                                -(raw_offset as i64)
-                            } else {
-                                raw_offset as i64
-                            };
-                            let dst_key = ssa_var_block_key(block.addr, dst);
-                            stack_addr_temps.insert(dst_key, (a_name.clone(), offset));
-                        }
+                    if is_a_base && let Some(raw_offset) = b_const {
+                        let offset = if matches!(op, SSAOp::IntSub { .. }) {
+                            -(raw_offset as i64)
+                        } else {
+                            raw_offset as i64
+                        };
+                        let dst_key = ssa_var_block_key(block.addr, dst);
+                        stack_addr_temps.insert(dst_key, (a_name.clone(), offset));
                     } else if stack_bases.contains(&b_name.as_str())
-                        && a_name.starts_with("const:")
                         && let Some(raw_offset) = parse_const_value(&a.name)
                     {
                         let offset = raw_offset as i64;
@@ -363,12 +360,12 @@ fn ssa_var_is_const(var: &SSAVar) -> bool {
     parse_const_value(&var.name).is_some()
 }
 
-fn ssa_var_is_register_like(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    !(lower.starts_with("tmp:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("space"))
+pub(crate) fn ssa_var_is_register_like(var: &SSAVar) -> bool {
+    let lower = var.name.to_ascii_lowercase();
+    matches!(
+        SSAVarNameKind::classify(&lower),
+        SSAVarNameKind::RegisterAlias | SSAVarNameKind::Ordinary
+    )
 }
 
 fn strongest_hint_for_aliases(
@@ -518,7 +515,7 @@ fn collect_register_version_keys(ssa_blocks: &[SSABlock]) -> HashMap<String, Vec
     for block in ssa_blocks {
         for op in &block.ops {
             let mut collect_var = |var: &SSAVar| {
-                if !ssa_var_is_register_like(&var.name) {
+                if !ssa_var_is_register_like(var) {
                     return;
                 }
                 let reg_name = scalar_register_family_key(&var.name);
@@ -849,8 +846,8 @@ fn infer_pointer_var_keys_from_ssa(ssa_blocks: &[SSABlock]) -> HashSet<String> {
                             } else if b_index_like && !a_index_like {
                                 changed |= pointer_vars.insert(a_key.clone());
                             } else if a_index_like && b_index_like {
-                                let a_is_tmp = a.name.starts_with("tmp:");
-                                let b_is_tmp = b.name.starts_with("tmp:");
+                                let a_is_tmp = a.is_temp();
+                                let b_is_tmp = b.is_temp();
                                 if a_is_tmp && !b_is_tmp {
                                     changed |= pointer_vars.insert(b_key.clone());
                                 } else if b_is_tmp && !a_is_tmp {
@@ -1236,7 +1233,7 @@ fn infer_usage_register_type_hints(
         for op in &block.ops {
             let mut maybe_add = |var: &SSAVar| {
                 let key = ssa_var_key(var);
-                if !pointer_vars.contains(&key) || !ssa_var_is_register_like(&var.name) {
+                if !pointer_vars.contains(&key) || !ssa_var_is_register_like(var) {
                     return;
                 }
                 merge_type_hint(
@@ -1253,4 +1250,31 @@ fn infer_usage_register_type_hints(
     }
 
     (hints, pointer_vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_like_filter_rejects_non_register_ssa_names() {
+        let cases = [
+            ("rax", true),
+            ("reg:10", true),
+            ("tmp:0x1000", false),
+            ("const:0x42", false),
+            ("CONST:0x42", false),
+            ("ram:0x401000", false),
+            ("space1:0x20", false),
+            ("sym.main", false),
+            ("obj.global", false),
+            ("data.rel.ro", false),
+            ("got.printf", false),
+        ];
+
+        for (name, expected) in cases {
+            let var = SSAVar::new(name, 0, 8);
+            assert_eq!(ssa_var_is_register_like(&var), expected, "{name}");
+        }
+    }
 }
