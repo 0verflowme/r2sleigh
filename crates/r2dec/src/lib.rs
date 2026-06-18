@@ -397,10 +397,8 @@ fn sanitize_comment_text(text: &str) -> String {
 
 fn summary_accumulator_label(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    if lower.starts_with("tmp:")
+    if crate::analysis::utils::is_temporary_constant_or_memory_name(name)
         || lower.starts_with("unique:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
         || is_ssa_versioned_register_label(name)
     {
         "accumulator".to_string()
@@ -2963,7 +2961,7 @@ fn collect_certified_expr_contract(
 fn is_uncertified_render_var_name(name: &str) -> bool {
     let stripped = name.trim_start_matches('&');
     let lower = stripped.to_ascii_lowercase();
-    lower.starts_with("tmp:")
+    crate::analysis::utils::is_temporary_name(stripped)
         || lower.starts_with("unique:")
         || lower.starts_with("tmp_")
         || lower.starts_with("unique_")
@@ -7566,6 +7564,44 @@ mod tests {
         let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
             .expect("raw temp should break certified rendering");
 
+        assert!(
+            reason.contains("rendered uncertified raw artifact name"),
+            "{reason}"
+        );
+
+        let func = CFunction::new("bad_temp_addr", CType::i64())
+            .with_body(vec![CStmt::Return(Some(CExpr::var("&TMP:_2")))]);
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("addressed raw temp should break certified rendering");
+        assert!(
+            reason.contains("rendered uncertified raw artifact name"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn typed_storage_render_filters_cover_summary_and_certified_paths() {
+        assert_eq!(summary_accumulator_label("TMP:2c280_2"), "accumulator");
+        assert_eq!(summary_accumulator_label("const:1_0"), "accumulator");
+        assert_eq!(summary_accumulator_label("ram:401000_0"), "accumulator");
+        assert_eq!(summary_accumulator_label("unique:12_0"), "accumulator");
+        assert_eq!(summary_accumulator_label("sha_state"), "sha_state");
+        assert!(is_uncertified_render_var_name("&TMP:_2"));
+        assert!(!is_uncertified_render_var_name("sha_state"));
+
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let func = CFunction::new("bad_temp_addr", CType::i64())
+            .with_body(vec![CStmt::Return(Some(CExpr::var("&TMP:_2")))]);
+
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("addressed raw temp should break certified rendering");
         assert!(
             reason.contains("rendered uncertified raw artifact name"),
             "{reason}"
@@ -12174,6 +12210,10 @@ mod tests {
     fn summary_accumulator_label_hides_ssa_register_versions() {
         assert_eq!(summary_accumulator_label("RDX_4"), "accumulator");
         assert_eq!(summary_accumulator_label("tmp:2c280_2"), "accumulator");
+        assert_eq!(summary_accumulator_label("TMP:2c280_2"), "accumulator");
+        assert_eq!(summary_accumulator_label("const:1_0"), "accumulator");
+        assert_eq!(summary_accumulator_label("ram:401000_0"), "accumulator");
+        assert_eq!(summary_accumulator_label("unique:12_0"), "accumulator");
         assert_eq!(summary_accumulator_label("sha_state"), "sha_state");
     }
 
