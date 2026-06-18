@@ -29,7 +29,7 @@ use crate::semantic::{
     MemoryUseFact, ObjectId, ObjectModel, PredicateFacts, PreparedFunctionFacts,
     ReturnValueCertificate, StructuredDataflowFacts,
 };
-use crate::var::SSAVar;
+use crate::var::{SSAVar, SSAVarNameKind};
 
 /// Switch case information: Vec of (case_value, target_address) pairs and optional default target.
 pub type SwitchInfo = (Vec<(u64, u64)>, Option<u64>);
@@ -1780,7 +1780,7 @@ impl SSAFunction {
     }
 
     fn is_constish_switch_value(var: &SSAVar) -> bool {
-        var.is_const() || var.name.starts_with("ram:")
+        var.is_const() || var.is_memory()
     }
 
     /// Print the function in a human-readable format.
@@ -2273,8 +2273,10 @@ fn adapt_family_root(root: &SSAVar, width: u32) -> Option<SSAVar> {
 fn can_width_adapt_register_family_root(root: &SSAVar) -> bool {
     !root.is_const()
         && !root.is_temp()
-        && !root.name.starts_with("ram:")
-        && !root.name.starts_with("space")
+        && !matches!(
+            root.name_kind(),
+            SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
+        )
 }
 
 fn seed_narrow_family_roots(

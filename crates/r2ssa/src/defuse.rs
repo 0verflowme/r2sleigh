@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::SSABlock;
 use crate::function::{DefLocation, SSAFunction};
 use crate::op::SSAOp;
-use crate::var::SSAVar;
+use crate::var::{SSAVar, SSAVarNameKind};
 
 /// Information about where a variable is defined and used.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -338,11 +338,7 @@ fn detect_address_provenance(var: &SSAVar) -> AddressProvenance {
             absolute: None,
         };
     }
-    if lower.starts_with("obj.")
-        || lower.starts_with("sym.")
-        || lower.starts_with("data.")
-        || lower.starts_with("got.")
-    {
+    if SSAVarNameKind::classify(&lower).is_global_symbol() {
         return AddressProvenance {
             region: AddressRegion::Global,
             base: Some(lower),

@@ -14,6 +14,10 @@ pub enum SSAVarNameKind {
     Constant,
     Memory,
     AddressSpace,
+    Symbol,
+    Object,
+    Data,
+    Got,
     Ordinary,
 }
 
@@ -29,6 +33,14 @@ impl SSAVarNameKind {
             Self::Memory
         } else if name.strip_prefix("space").is_some() {
             Self::AddressSpace
+        } else if name.strip_prefix("sym.").is_some() {
+            Self::Symbol
+        } else if name.strip_prefix("obj.").is_some() {
+            Self::Object
+        } else if name.strip_prefix("data.").is_some() {
+            Self::Data
+        } else if name.strip_prefix("got.").is_some() {
+            Self::Got
         } else {
             Self::Ordinary
         }
@@ -55,6 +67,14 @@ impl SSAVarNameKind {
 
     pub fn is_memory(self) -> bool {
         matches!(self, Self::Memory)
+    }
+
+    pub fn is_address_space(self) -> bool {
+        matches!(self, Self::AddressSpace)
+    }
+
+    pub fn is_global_symbol(self) -> bool {
+        matches!(self, Self::Symbol | Self::Object | Self::Data | Self::Got)
     }
 
     pub fn strip_constant_prefix(name: &str) -> Option<&str> {
@@ -199,6 +219,10 @@ mod tests {
             ("const:0x42", SSAVarNameKind::Constant),
             ("ram:0x401000", SSAVarNameKind::Memory),
             ("space1:0x20", SSAVarNameKind::AddressSpace),
+            ("sym.main", SSAVarNameKind::Symbol),
+            ("obj.global", SSAVarNameKind::Object),
+            ("data.rel.ro", SSAVarNameKind::Data),
+            ("got.printf", SSAVarNameKind::Got),
             ("rax", SSAVarNameKind::Ordinary),
         ];
 
@@ -206,6 +230,73 @@ mod tests {
             assert_eq!(SSAVarNameKind::classify(name), expected);
             assert_eq!(SSAVar::new(name, 0, 8).name_kind(), expected);
         }
+    }
+
+    #[test]
+    fn test_name_kind_predicates_and_prefix_stripping() {
+        let prefixed_display = [
+            SSAVarNameKind::RegisterAlias,
+            SSAVarNameKind::Temporary,
+            SSAVarNameKind::Constant,
+            SSAVarNameKind::Memory,
+            SSAVarNameKind::AddressSpace,
+        ];
+        let non_prefixed_display = [
+            SSAVarNameKind::Symbol,
+            SSAVarNameKind::Object,
+            SSAVarNameKind::Data,
+            SSAVarNameKind::Got,
+            SSAVarNameKind::Ordinary,
+        ];
+
+        for kind in prefixed_display {
+            assert!(kind.is_prefixed_display_name());
+        }
+        for kind in non_prefixed_display {
+            assert!(!kind.is_prefixed_display_name());
+        }
+
+        for kind in [
+            SSAVarNameKind::RegisterAlias,
+            SSAVarNameKind::Temporary,
+            SSAVarNameKind::Constant,
+            SSAVarNameKind::Memory,
+            SSAVarNameKind::AddressSpace,
+            SSAVarNameKind::Symbol,
+            SSAVarNameKind::Object,
+            SSAVarNameKind::Data,
+            SSAVarNameKind::Got,
+            SSAVarNameKind::Ordinary,
+        ] {
+            assert_eq!(kind.is_constant(), kind == SSAVarNameKind::Constant);
+            assert_eq!(kind.is_temporary(), kind == SSAVarNameKind::Temporary);
+            assert_eq!(kind.is_memory(), kind == SSAVarNameKind::Memory);
+            assert_eq!(
+                kind.is_address_space(),
+                kind == SSAVarNameKind::AddressSpace
+            );
+            assert_eq!(
+                kind.is_global_symbol(),
+                matches!(
+                    kind,
+                    SSAVarNameKind::Symbol
+                        | SSAVarNameKind::Object
+                        | SSAVarNameKind::Data
+                        | SSAVarNameKind::Got
+                )
+            );
+        }
+
+        assert_eq!(
+            SSAVarNameKind::strip_constant_prefix("const:0x42"),
+            Some("0x42")
+        );
+        assert_eq!(SSAVarNameKind::strip_constant_prefix("tmp:0x42"), None);
+        assert_eq!(
+            SSAVarNameKind::strip_temporary_prefix("tmp:0x1000"),
+            Some("0x1000")
+        );
+        assert_eq!(SSAVarNameKind::strip_temporary_prefix("const:0x1000"), None);
     }
 
     #[test]
@@ -235,15 +326,22 @@ mod tests {
         assert!(reg.is_register());
         assert!(!reg.is_temp());
         assert!(!reg.is_const());
+        assert!(!reg.is_memory());
 
         assert!(tmp.is_temp());
+        assert!(!tmp.is_const());
         assert!(!tmp.is_register());
+        assert!(!tmp.is_memory());
 
         assert!(cst.is_const());
+        assert!(!cst.is_temp());
         assert!(!cst.is_register());
+        assert!(!cst.is_memory());
 
         let mem = SSAVar::new("ram:0x1000", 0, 8);
         assert!(mem.is_memory());
+        assert!(!mem.is_const());
+        assert!(!mem.is_temp());
     }
 }
 
