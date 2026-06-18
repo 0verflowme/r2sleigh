@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
-use r2ssa::{SSAFunction, SSAOp, SSAVar, ValueId};
+use r2ssa::{SSAFunction, SSAOp, SSAVar, SSAVarNameKind, ValueId};
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
@@ -4283,12 +4283,20 @@ fn is_generic_stack_alias_name(name: &str) -> bool {
         || name == "saved_fp"
 }
 
+fn is_raw_ssa_storage_or_register_name(name: &str) -> bool {
+    matches!(
+        utils::ssa_name_kind(name),
+        SSAVarNameKind::RegisterAlias
+            | SSAVarNameKind::Temporary
+            | SSAVarNameKind::Constant
+            | SSAVarNameKind::Memory
+            | SSAVarNameKind::AddressSpace
+    )
+}
+
 fn is_low_signal_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.starts_with("tmp:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("reg:")
+    is_raw_ssa_storage_or_register_name(name)
         || lower.starts_with('t')
             && lower
                 .trim_start_matches('t')
@@ -4312,10 +4320,7 @@ fn is_semantic_binding_base(base: &str) -> bool {
         || lower.starts_with("str.")
         || lower.starts_with("0x")
         || lower.contains('.')
-        || lower.starts_with("tmp:")
-        || lower.starts_with("const:")
-        || lower.starts_with("ram:")
-        || lower.starts_with("reg:")
+        || is_raw_ssa_storage_or_register_name(base)
 }
 
 fn is_decimal_suffix(name: &str, prefix: &str) -> bool {
@@ -9709,6 +9714,35 @@ mod tests {
         assert_eq!(aliases.get("EAX_1"), Some(&"eax".to_string()));
         assert_eq!(aliases.get("EAX_2"), Some(&"eax".to_string()));
         assert_eq!(aliases.get("EAX_3"), Some(&"eax".to_string()));
+    }
+
+    #[test]
+    fn semantic_name_filters_use_typed_ssa_storage_and_register_kinds() {
+        for name in [
+            "tmp:1",
+            "TMP:1",
+            "const:1",
+            "ram:401000",
+            "reg:10",
+            "space1:20",
+        ] {
+            assert!(
+                is_low_signal_name(name),
+                "{name} should be low-signal raw SSA storage/register"
+            );
+            assert!(
+                is_semantic_binding_base(name),
+                "{name} should be a semantic binding base"
+            );
+        }
+
+        assert!(is_low_signal_name("t42"));
+        assert!(!is_semantic_binding_base("t42"));
+        assert!(is_semantic_binding_base("local_4"));
+        assert!(is_semantic_binding_base("arg1"));
+        assert!(is_semantic_binding_base("sym.helper"));
+        assert!(!is_low_signal_name("value"));
+        assert!(!is_semantic_binding_base("value"));
     }
 
     #[test]
