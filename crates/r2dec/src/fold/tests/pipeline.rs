@@ -5096,6 +5096,35 @@ mod tests {
     }
 
     #[test]
+    fn raw_ram_address_load_resolves_symbol_via_typed_memory_kind() {
+        let addr = make_var("ram:404000", 0, 8);
+        let dst = make_var("tmp:load", 1, 8);
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
+            0x404000,
+            "obj.global_value".to_string(),
+        )])));
+
+        let expr = ctx.render_canonical_load_expr(&dst, &addr, CType::u64());
+
+        assert_eq!(expr, CExpr::Var("obj.global_value".to_string()));
+    }
+
+    #[test]
+    fn raw_ram_address_store_target_resolves_symbol_via_typed_memory_kind() {
+        let addr = make_var("ram:404000", 0, 8);
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
+            0x404000,
+            "obj.global_value".to_string(),
+        )])));
+
+        let expr = ctx.render_canonical_store_target_expr(&addr, 8, CType::u64());
+
+        assert_eq!(expr, CExpr::Var("obj.global_value".to_string()));
+    }
+
+    #[test]
     fn test_member_access_reconstructs_combined_struct_array_index_scale() {
         let base = make_var("tmp:9600", 1, 8);
         let addr = make_var("tmp:9601", 1, 8);

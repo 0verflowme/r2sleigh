@@ -203,7 +203,7 @@ impl<'a> FoldingContext<'a> {
             return CExpr::Deref(Box::new(casted));
         }
 
-        if addr.name.starts_with("ram:")
+        if addr.is_memory()
             && let Some(address) = extract_call_address(&addr.name)
         {
             if let Some(sym) = self.lookup_symbol(address) {
@@ -279,7 +279,7 @@ impl<'a> FoldingContext<'a> {
             return expr;
         }
 
-        if addr.name.starts_with("ram:")
+        if addr.is_memory()
             && let Some(address) = extract_call_address(&addr.name)
             && let Some(sym) = self.lookup_symbol(address)
         {
