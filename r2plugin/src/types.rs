@@ -1685,11 +1685,16 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                     }
                 }
                 r2ssa::SSAOp::IntAdd { dst, a, b } => {
-                    if let (Some(lhs), Some(rhs)) = (
+                    let computed = if let (Some(lhs), Some(rhs)) = (
                         resolve_const_value(&const_env, a),
                         resolve_const_value(&const_env, b),
                     ) {
-                        const_env.insert(ssa_var_key(dst), lhs.wrapping_add(rhs));
+                        Some(lhs.wrapping_add(rhs))
+                    } else {
+                        None
+                    };
+                    if let Some(value) = computed {
+                        const_env.insert(ssa_var_key(dst), value);
                     }
                     if let Some(slot) =
                         resolve_memory_slot_from_add_sub(&addr_env, &const_env, a, b, false)
@@ -1710,7 +1715,10 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                             ref_type: "d".to_string(),
                         });
                     }
-                    if let Some(target) = resolve_const_addr(&const_env, dst) {
+                    if let Some(target) = computed
+                        .filter(|value| *value >= 0x10000)
+                        .or_else(|| resolve_const_addr(&const_env, dst))
+                    {
                         refs.push(DataRef {
                             from,
                             to: target,
@@ -1719,11 +1727,16 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                     }
                 }
                 r2ssa::SSAOp::IntSub { dst, a, b } => {
-                    if let (Some(lhs), Some(rhs)) = (
+                    let computed = if let (Some(lhs), Some(rhs)) = (
                         resolve_const_value(&const_env, a),
                         resolve_const_value(&const_env, b),
                     ) {
-                        const_env.insert(ssa_var_key(dst), lhs.wrapping_sub(rhs));
+                        Some(lhs.wrapping_sub(rhs))
+                    } else {
+                        None
+                    };
+                    if let Some(value) = computed {
+                        const_env.insert(ssa_var_key(dst), value);
                     }
                     if let Some(slot) =
                         resolve_memory_slot_from_add_sub(&addr_env, &const_env, a, b, true)
@@ -1744,7 +1757,10 @@ pub(crate) fn get_data_refs_from_ssa_with_op_sources(
                             ref_type: "d".to_string(),
                         });
                     }
-                    if let Some(target) = resolve_const_addr(&const_env, dst) {
+                    if let Some(target) = computed
+                        .filter(|value| *value >= 0x10000)
+                        .or_else(|| resolve_const_addr(&const_env, dst))
+                    {
                         refs.push(DataRef {
                             from,
                             to: target,
@@ -2281,8 +2297,59 @@ mod tests {
         let refs = get_data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
         assert!(
             refs.iter()
-                .any(|r| { r.from != 0x404000 && r.to == 0x404d6c && r.ref_type == "d" }),
-            "computed add-chain xref should use a non-block-head op source address"
+                .any(|r| { r.from == 0x40400c && r.to == 0x404e08 && r.ref_type == "d" }),
+            "computed add-chain xref should use the IntAdd op source address: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn get_data_refs_uses_per_op_source_addr_for_const_sub_chain() {
+        let block = r2ssa::SSABlock {
+            addr: 0x405000,
+            size: 0x20,
+            ops: vec![
+                r2ssa::SSAOp::Copy {
+                    dst: r2ssa::SSAVar::new("tmp:base", 1, 8),
+                    src: r2ssa::SSAVar::new("const:405000", 0, 8),
+                },
+                r2ssa::SSAOp::IntSub {
+                    dst: r2ssa::SSAVar::new("tmp:target", 1, 8),
+                    a: r2ssa::SSAVar::new("tmp:base", 1, 8),
+                    b: r2ssa::SSAVar::new("const:108", 0, 8),
+                },
+                r2ssa::SSAOp::Load {
+                    dst: r2ssa::SSAVar::new("tmp:load", 1, 8),
+                    space: "ram".to_string(),
+                    addr: r2ssa::SSAVar::new("tmp:target", 1, 8),
+                },
+            ],
+        };
+        let op_sources = vec![vec![0x405008, 0x40500c, 0x405010]];
+
+        let refs = get_data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
+        assert!(
+            refs.iter()
+                .any(|r| { r.from == 0x40500c && r.to == 0x404ef8 && r.ref_type == "d" }),
+            "computed sub-chain xref should use the IntSub op source address: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn get_data_refs_ignores_small_const_sub_chain() {
+        let block = r2ssa::SSABlock {
+            addr: 0x406000,
+            size: 4,
+            ops: vec![r2ssa::SSAOp::IntSub {
+                dst: r2ssa::SSAVar::new("tmp:small", 1, 8),
+                a: r2ssa::SSAVar::new("const:40", 0, 8),
+                b: r2ssa::SSAVar::new("const:2", 0, 8),
+            }],
+        };
+
+        let refs = get_data_refs_from_ssa_with_op_sources(&[block], None);
+        assert!(
+            !refs.iter().any(|r| r.to == 0x3e),
+            "small immediate sub constants should not be treated as addresses"
         );
     }
 
