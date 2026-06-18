@@ -13076,7 +13076,7 @@ mod tests {
         });
         let mut b_else = R2ILBlock::new(0x1014, 4);
         b_else.push(R2ILOp::Branch {
-            target: Varnode::constant(0x1028, 8),
+            target: Varnode::constant(0x1030, 8),
         });
         let mut b_then = R2ILBlock::new(0x1028, 4);
         b_then.push(R2ILOp::Branch {
@@ -13089,6 +13089,7 @@ mod tests {
         let blocks = vec![b0, b_fallthrough, b_else, b_then, b_exit];
         let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
         func = func.with_name("sym._check_secret");
+        assert_eq!(func.successors(0x1014), vec![0x1030]);
 
         func.get_block_mut(0x1000).expect("entry").ops = vec![
             SSAOp::IntSub {
@@ -13332,7 +13333,7 @@ mod tests {
         });
         let mut b_else = R2ILBlock::new(0x1014, 4);
         b_else.push(R2ILOp::Branch {
-            target: Varnode::constant(0x1028, 8),
+            target: Varnode::constant(0x1030, 8),
         });
         let mut b_then = R2ILBlock::new(0x1028, 4);
         b_then.push(R2ILOp::Branch {
@@ -13345,6 +13346,7 @@ mod tests {
         let blocks = vec![b0, b_fallthrough, b_else, b_then, b_exit];
         let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
         func = func.with_name("sym._check_secret");
+        assert_eq!(func.successors(0x1014), vec![0x1030]);
 
         func.get_block_mut(0x1000).expect("entry").ops = vec![
             SSAOp::IntSub {

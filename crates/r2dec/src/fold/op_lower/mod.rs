@@ -11403,13 +11403,6 @@ impl<'a> FoldingContext<'a> {
     pub fn fold_block(&self, block: &SSABlock, current_block_addr: u64) -> Vec<CStmt> {
         self.current_block_addr.set(Some(current_block_addr));
         self.current_op_idx.set(None);
-        if block.addr == self.state.exit_block.unwrap_or(0)
-            && !self.state.return_stack_slots.is_empty()
-        {
-            self.current_block_addr.set(None);
-            self.current_op_idx.set(None);
-            return Vec::new();
-        }
         let mut stmts = Vec::new();
         let mut last_ret_value: Option<CExpr> = None;
         let mut last_ret_value_op_idx: Option<usize> = None;
