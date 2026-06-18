@@ -87,7 +87,7 @@ pub use memory::{
     SymbolicMemoryRegionDef,
 };
 pub use path::{
-    ExploreConfig, PathExplorer, PathResult, SolvedPath, SolvedPathGeneration,
+    ExploreConfig, PathExplorer, PathResult, PublicSolvedPath, SolvedPath, SolvedPathGeneration,
     SolvedPathGenerationKind,
 };
 pub use query::{

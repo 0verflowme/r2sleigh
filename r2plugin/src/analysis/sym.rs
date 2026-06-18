@@ -1681,71 +1681,21 @@ fn path_solution_from_result<'ctx>(
     if !result.feasible {
         return None;
     }
-    explorer.solve_path(result).map(|solved| PathSolution {
-        inputs: solved
-            .inputs
-            .into_iter()
-            .filter(|(name, _)| is_public_solution_symbol(name))
-            .map(|(k, v)| (k, format!("0x{:x}", v)))
-            .collect(),
-        registers: solved
-            .registers
-            .into_iter()
-            .filter(|(name, _)| is_public_solution_register(name))
-            .map(|(k, v)| (k, format!("0x{:x}", v)))
-            .collect(),
+    explorer.solve_path(result).map(|solved| {
+        let public = solved.public_solution();
+        PathSolution {
+            inputs: public
+                .inputs
+                .into_iter()
+                .map(|(k, v)| (k, format!("0x{:x}", v)))
+                .collect(),
+            registers: public
+                .registers
+                .into_iter()
+                .map(|(k, v)| (k, format!("0x{:x}", v)))
+                .collect(),
+        }
     })
-}
-
-fn is_flag_like_symbol(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "cy" | "cf"
-            | "ng"
-            | "nf"
-            | "ov"
-            | "of"
-            | "zr"
-            | "zf"
-            | "sf"
-            | "pf"
-            | "af"
-            | "df"
-            | "tmpcy"
-            | "tmpng"
-            | "tmpov"
-            | "tmpzr"
-    )
-}
-
-fn is_public_solution_symbol(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    let kind = r2ssa::SSAVarNameKind::classify(&lower);
-    if matches!(
-        kind,
-        r2ssa::SSAVarNameKind::Temporary
-            | r2ssa::SSAVarNameKind::Constant
-            | r2ssa::SSAVarNameKind::Memory
-            | r2ssa::SSAVarNameKind::AddressSpace
-    ) {
-        return false;
-    }
-    let base = lower.split('_').next().unwrap_or(lower.as_str());
-    !is_flag_like_symbol(base) && !is_frame_scaffold_symbol(base)
-}
-
-fn is_public_solution_register(name: &str) -> bool {
-    if name.contains("_0") {
-        return false;
-    }
-    is_public_solution_symbol(name)
-}
-
-fn is_frame_scaffold_symbol(base: &str) -> bool {
-    matches!(
-        base,
-        "sp" | "fp" | "x29" | "w29" | "x30" | "w30" | "lr" | "pc"
-    )
 }
 
 fn buffer_solution(bytes: Vec<u8>) -> BufferSolution {
@@ -1773,24 +1723,25 @@ fn run_path_solution_from_result<'ctx>(
     if !result.feasible {
         return None;
     }
-    explorer.solve_path(result).map(|solved| RunPathSolution {
-        inputs: solved
-            .inputs
-            .into_iter()
-            .filter(|(name, _)| is_public_solution_symbol(name))
-            .map(|(k, v)| (k, format!("0x{:x}", v)))
-            .collect(),
-        input_buffers: solved
-            .input_buffers
-            .into_iter()
-            .map(|(k, v)| (k, buffer_solution(v)))
-            .collect(),
-        registers: solved
-            .registers
-            .into_iter()
-            .filter(|(name, _)| is_public_solution_register(name))
-            .map(|(k, v)| (k, format!("0x{:x}", v)))
-            .collect(),
+    explorer.solve_path(result).map(|solved| {
+        let public = solved.public_solution();
+        RunPathSolution {
+            inputs: public
+                .inputs
+                .into_iter()
+                .map(|(k, v)| (k, format!("0x{:x}", v)))
+                .collect(),
+            input_buffers: public
+                .input_buffers
+                .into_iter()
+                .map(|(k, v)| (k, buffer_solution(v)))
+                .collect(),
+            registers: public
+                .registers
+                .into_iter()
+                .map(|(k, v)| (k, format!("0x{:x}", v)))
+                .collect(),
+        }
     })
 }
 
@@ -3337,10 +3288,7 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_sym_exec_summary, is_public_solution_register, is_public_solution_symbol,
-        parse_scope_assumptions,
-    };
+    use super::{build_sym_exec_summary, parse_scope_assumptions};
     use std::ffi::CString;
 
     #[test]
@@ -3361,41 +3309,6 @@ mod tests {
         .expect("json");
         let assumptions = parse_scope_assumptions(json.as_ptr(), None).expect("assumptions");
         assert_eq!(assumptions.items.len(), 1);
-    }
-
-    #[test]
-    fn public_solution_filter_hides_temps_and_flags_but_keeps_abi_inputs() {
-        for hidden in [
-            "tmp:1234",
-            "TMPZR",
-            "TMPNG",
-            "unique:1234",
-            "CY",
-            "OV",
-            "const:4",
-            "ram:1000",
-            "space1:20",
-        ] {
-            assert!(
-                !is_public_solution_symbol(hidden),
-                "{hidden} should not be public solution input"
-            );
-        }
-        for visible in ["sym_input", "RDI_0", "x0_0", "arg1"] {
-            assert!(
-                is_public_solution_symbol(visible),
-                "{visible} should stay visible as a public solution input"
-            );
-        }
-        assert!(!is_public_solution_register("RDI_0"));
-        assert!(is_public_solution_register("RDI_1"));
-        for hidden in ["SP_1", "FP_1", "X29_1", "X30_1", "LR_1", "PC_1"] {
-            assert!(
-                !is_public_solution_register(hidden),
-                "{hidden} should not be a public ARM64 solution register"
-            );
-        }
-        assert!(is_public_solution_register("X0_1"));
     }
 
     #[test]

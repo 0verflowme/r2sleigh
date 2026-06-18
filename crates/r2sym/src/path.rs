@@ -271,6 +271,89 @@ pub struct SolvedPath {
     pub generation: Option<SolvedPathGeneration>,
 }
 
+/// Public model assignments that should be surfaced to users.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicSolvedPath {
+    /// User-visible scalar input assignments.
+    pub inputs: BTreeMap<String, u64>,
+    /// User-visible concrete input buffers.
+    pub input_buffers: BTreeMap<String, Vec<u8>>,
+    /// User-visible end-of-path register assignments.
+    pub registers: BTreeMap<String, u64>,
+}
+
+impl SolvedPath {
+    /// Project a solver model into user-visible assignments.
+    pub fn public_solution(&self) -> PublicSolvedPath {
+        PublicSolvedPath {
+            inputs: self
+                .inputs
+                .iter()
+                .filter(|(name, _)| public_solution_symbol_is_visible(name))
+                .map(|(name, value)| (name.clone(), *value))
+                .collect(),
+            input_buffers: self.input_buffers.clone(),
+            registers: self
+                .registers
+                .iter()
+                .filter(|(name, _)| public_solution_register_is_visible(name))
+                .map(|(name, value)| (name.clone(), *value))
+                .collect(),
+        }
+    }
+}
+
+fn flag_like_solution_symbol(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cy" | "cf"
+            | "ng"
+            | "nf"
+            | "ov"
+            | "of"
+            | "zr"
+            | "zf"
+            | "sf"
+            | "pf"
+            | "af"
+            | "df"
+            | "tmpcy"
+            | "tmpng"
+            | "tmpov"
+            | "tmpzr"
+    )
+}
+
+fn frame_scaffold_solution_symbol(base: &str) -> bool {
+    matches!(
+        base,
+        "sp" | "fp" | "x29" | "w29" | "x30" | "w30" | "lr" | "pc"
+    )
+}
+
+fn public_solution_symbol_is_visible(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let kind = r2ssa::SSAVarNameKind::classify(&lower);
+    if matches!(
+        kind,
+        r2ssa::SSAVarNameKind::Temporary
+            | r2ssa::SSAVarNameKind::Constant
+            | r2ssa::SSAVarNameKind::Memory
+            | r2ssa::SSAVarNameKind::AddressSpace
+    ) {
+        return false;
+    }
+    let base = lower.split('_').next().unwrap_or(lower.as_str());
+    !flag_like_solution_symbol(base) && !frame_scaffold_solution_symbol(base)
+}
+
+fn public_solution_register_is_visible(name: &str) -> bool {
+    if name.contains("_0") {
+        return false;
+    }
+    public_solution_symbol_is_visible(name)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolvedPathGenerationKind {
     ExactRecurrenceConstraintTactic,
@@ -3289,6 +3372,56 @@ mod tests {
         assert!(solved.memory.is_empty());
         assert_eq!(solved.final_pc, 0);
         assert_eq!(solved.num_constraints, 0);
+    }
+
+    #[test]
+    fn public_solution_hides_internal_model_artifacts_but_keeps_user_inputs() {
+        let mut solved = SolvedPath::default();
+        for name in [
+            "tmp:1234",
+            "TMPZR",
+            "TMPNG",
+            "unique:1234",
+            "CY",
+            "OV",
+            "const:4",
+            "ram:1000",
+            "space1:20",
+        ] {
+            solved.inputs.insert(name.to_string(), 1);
+        }
+        for name in ["sym_input", "RDI_0", "x0_0", "arg1"] {
+            solved.inputs.insert(name.to_string(), 2);
+        }
+        for name in ["RDI_0", "SP_1", "FP_1", "X29_1", "X30_1", "LR_1", "PC_1"] {
+            solved.registers.insert(name.to_string(), 3);
+        }
+        solved.registers.insert("RDI_1".to_string(), 4);
+        solved.registers.insert("X0_1".to_string(), 5);
+        solved
+            .input_buffers
+            .insert("stdin".to_string(), b"ok".to_vec());
+        solved
+            .memory
+            .insert("ram:1000".to_string(), b"raw".to_vec());
+
+        let public = solved.public_solution();
+
+        assert_eq!(
+            public.inputs.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "RDI_0".to_string(),
+                "arg1".to_string(),
+                "sym_input".to_string(),
+                "x0_0".to_string(),
+            ]
+        );
+        assert_eq!(
+            public.registers.keys().cloned().collect::<Vec<_>>(),
+            vec!["RDI_1".to_string(), "X0_1".to_string()]
+        );
+        assert_eq!(public.input_buffers.get("stdin"), Some(&b"ok".to_vec()));
+        assert!(!public.input_buffers.contains_key("ram:1000"));
     }
 
     #[test]
