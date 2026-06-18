@@ -1124,7 +1124,7 @@ impl<'a> FoldingContext<'a> {
                         continue;
                     }
                     let key = dst.display_name();
-                    if self.should_inline(&key) {
+                    if self.should_inline(dst) {
                         continue;
                     }
                     if self.consumed_by_call_set().contains(&key) {
@@ -2377,52 +2377,46 @@ impl<'a> FoldingContext<'a> {
         });
     }
 
-    fn should_inline(&self, var_name: &str) -> bool {
-        let use_count = self.use_counts_map().get(var_name).copied().unwrap_or(0);
+    fn should_inline(&self, var: &SSAVar) -> bool {
+        let var_name = var.display_name();
+        let use_count = self.use_counts_map().get(&var_name).copied().unwrap_or(0);
         if use_count == 0 || use_count > 3 {
             return false;
         }
 
-        if self.direct_call_result_aliases_set().contains(var_name)
+        if self.direct_call_result_aliases_set().contains(&var_name)
             && self
-                .call_result_source_for_ssa_name(var_name)
+                .call_result_source_for_ssa_name(&var_name)
                 .and_then(|source| self.stable_owned_call_result_name_for_source(source))
                 .is_some()
         {
             return false;
         }
 
-        if self.pinned_set().contains(var_name) {
+        if self.pinned_set().contains(&var_name) {
             return false;
         }
 
-        if self.condition_vars_set().contains(var_name)
-            && !self.is_condition_inline_candidate(var_name)
+        if self.condition_vars_set().contains(&var_name)
+            && !self.is_condition_inline_candidate(&var_name)
         {
             return false;
         }
 
         // Values that only feed flag computation should always disappear.
-        if self.flag_only_values_set().contains(var_name) {
+        if self.flag_only_values_set().contains(&var_name) {
             return true;
         }
 
-        // Multi-use inlining is only allowed for very small expressions.
-        if use_count > 1 && !self.is_simple_inline_candidate(var_name) {
+        // After the zero/>3 guard above, any non-1 count is multi-use.
+        if use_count != 1 && !self.is_simple_inline_candidate(&var_name) {
             return false;
         }
 
-        // Always inline temporaries and constants.
-        if var_name.starts_with("tmp:") || var_name.starts_with("const:") {
-            return true;
-        }
-
-        // Inline single-use register copies:
-        // If a named register variable is used exactly once and has a simple
-        // definition (Copy from const/string/var), inline it at the use site.
-        // This eliminates `rdi_2 = "hello"; foo(rdi_2)` -> `foo("hello")`.
-        if let Some((base, _version)) = var_name.rsplit_once('_') {
-            let base_lower = base.to_lowercase();
+        // Inline single-use or trivially small values after preserving
+        // structural return/stack registers.
+        {
+            let base_lower = var.name.to_lowercase();
             // Don't inline return register assignments in return blocks
             if self.inputs.arch.is_return_register_name(&base_lower)
                 && self.is_current_return_block()
@@ -2439,7 +2433,7 @@ impl<'a> FoldingContext<'a> {
             }
             // Inline any register with a definition when it is single-use
             // or the definition is trivially small.
-            if use_count == 1 || self.is_simple_inline_candidate(var_name) {
+            if use_count == 1 || self.is_simple_inline_candidate(&var_name) {
                 return true;
             }
         }
@@ -2678,7 +2672,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         // Try to inline if appropriate
-        if self.should_inline(&key)
+        if self.should_inline(var)
             && let Some(expr) = self.definition_for_name(&key)
         {
             return expr.clone();
@@ -11675,7 +11669,7 @@ impl<'a> FoldingContext<'a> {
 
                 // Skip if this will be inlined
                 let key = dst.display_name();
-                if self.should_inline(&key) {
+                if self.should_inline(dst) {
                     continue;
                 }
 
@@ -11814,7 +11808,7 @@ impl<'a> FoldingContext<'a> {
                     !self.is_low_signal_visible_name(&owner)
                         && !self.is_transient_visible_name(&owner)
                 });
-            if self.should_inline(&key)
+            if self.should_inline(dst)
                 && matches!(self.definition_for_name(&key), Some(CExpr::Call { .. }))
                 && has_stable_visible_owner
             {

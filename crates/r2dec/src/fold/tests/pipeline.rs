@@ -4577,7 +4577,7 @@ mod tests {
         ctx.analyze_block(&block);
 
         // t0 should be inlined (single use, temp)
-        assert!(ctx.should_inline(&t0.display_name()));
+        assert!(ctx.should_inline(&t0));
     }
 
     #[test]
@@ -4609,7 +4609,139 @@ mod tests {
         ctx.analyze_block(&block);
 
         // t0 has 3 uses but remains simple enough to inline.
-        assert!(ctx.should_inline(&t0.display_name()));
+        assert!(ctx.should_inline(&t0));
+    }
+
+    #[test]
+    fn should_inline_ssavar_guard_matrix_preserves_refusal_order() {
+        fn mark_use(ctx: &mut FoldingContext<'_>, var: &SSAVar, count: usize) {
+            ctx.state
+                .analysis_ctx
+                .use_info
+                .use_counts
+                .insert(var.display_name(), count);
+        }
+
+        fn mark_simple_def(ctx: &mut FoldingContext<'_>, var: &SSAVar) {
+            ctx.state
+                .analysis_ctx
+                .use_info
+                .definitions
+                .insert(var.display_name(), CExpr::IntLit(1));
+        }
+
+        let mut ctx = FoldingContext::new(64);
+
+        let zero_use = make_var("tmp:zero", 1, 8);
+        assert!(!ctx.should_inline(&zero_use));
+
+        let too_many_simple = make_var("ordinary_many", 1, 8);
+        mark_use(&mut ctx, &too_many_simple, 4);
+        mark_simple_def(&mut ctx, &too_many_simple);
+        assert!(!ctx.should_inline(&too_many_simple));
+
+        let three_use_simple = make_var("ordinary_three", 1, 8);
+        mark_use(&mut ctx, &three_use_simple, 3);
+        mark_simple_def(&mut ctx, &three_use_simple);
+        assert!(ctx.should_inline(&three_use_simple));
+
+        let pinned = make_var("pinned_value", 1, 8);
+        mark_use(&mut ctx, &pinned, 1);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .pinned
+            .insert(pinned.display_name());
+        assert!(!ctx.should_inline(&pinned));
+
+        let direct_unowned = make_var("tmp:123", 1, 8);
+        mark_use(&mut ctx, &direct_unowned, 1);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert(direct_unowned.display_name());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .insert(direct_unowned.display_name(), (0x1000, 1));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .entry((0x1000, 1))
+            .or_default()
+            .insert(direct_unowned.display_name());
+        assert!(ctx.should_inline(&direct_unowned));
+
+        let direct_owned = make_var("tmp:owned", 1, 8);
+        mark_use(&mut ctx, &direct_owned, 1);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert(direct_owned.display_name());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .insert(direct_owned.display_name(), (0x1000, 2));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .entry((0x1000, 2))
+            .or_default()
+            .insert(direct_owned.display_name());
+        assert!(!ctx.should_inline(&direct_owned));
+
+        let condition_non_candidate = make_var("condition_value", 1, 8);
+        mark_use(&mut ctx, &condition_non_candidate, 1);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .condition_vars
+            .insert(condition_non_candidate.display_name());
+        assert!(!ctx.should_inline(&condition_non_candidate));
+
+        let condition_flag = make_var("ZF", 1, 1);
+        mark_use(&mut ctx, &condition_flag, 1);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .condition_vars
+            .insert(condition_flag.display_name());
+        assert!(ctx.should_inline(&condition_flag));
+
+        let flag_only = make_var("flag_only", 1, 8);
+        mark_use(&mut ctx, &flag_only, 2);
+        ctx.state
+            .analysis_ctx
+            .flag_info
+            .flag_only_values
+            .insert(flag_only.display_name());
+        assert!(ctx.should_inline(&flag_only));
+
+        let multi_complex_caller_saved = make_var("RDI", 1, 8);
+        mark_use(&mut ctx, &multi_complex_caller_saved, 2);
+        assert!(!ctx.should_inline(&multi_complex_caller_saved));
+
+        let single_ordinary = make_var("ordinary_single", 1, 8);
+        mark_use(&mut ctx, &single_ordinary, 1);
+        assert!(ctx.should_inline(&single_ordinary));
+
+        let stack_base = make_var("RSP", 1, 8);
+        mark_use(&mut ctx, &stack_base, 1);
+        assert!(!ctx.should_inline(&stack_base));
+
+        let return_reg = make_var("RAX", 1, 8);
+        mark_use(&mut ctx, &return_reg, 1);
+        assert!(ctx.should_inline(&return_reg));
+        ctx.state.return_blocks.insert(0x2000);
+        ctx.current_block_addr.set(Some(0x2000));
+        assert!(!ctx.should_inline(&return_reg));
+        ctx.current_block_addr.set(None);
     }
 
     #[test]
@@ -9783,7 +9915,7 @@ mod tests {
             ctx.pinned_set()
         );
         assert!(
-            !ctx.should_inline("RAX_3"),
+            !ctx.should_inline(&rax_3),
             "pinned loop-carried update should not be inlined"
         );
         assert!(
