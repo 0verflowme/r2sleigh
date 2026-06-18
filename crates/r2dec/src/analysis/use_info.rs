@@ -750,8 +750,7 @@ fn call_arg_expr_preservation_score(expr: &CExpr, depth: u32) -> i32 {
                 -120
             } else if is_call_arg_transient_name(name) {
                 -60
-            } else if name.starts_with("sym.")
-                || name.starts_with("obj.")
+            } else if is_symbol_or_object_name(name)
                 || name.eq_ignore_ascii_case("argc")
                 || name.eq_ignore_ascii_case("argv")
                 || name.eq_ignore_ascii_case("envp")
@@ -4296,6 +4295,13 @@ fn is_raw_temporary_or_memory_like_name(name: &str) -> bool {
     matches!(
         utils::ssa_name_kind(name),
         SSAVarNameKind::Temporary | SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
+    )
+}
+
+fn is_symbol_or_object_name(name: &str) -> bool {
+    matches!(
+        SSAVarNameKind::classify(name),
+        SSAVarNameKind::Symbol | SSAVarNameKind::Object
     )
 }
 
@@ -9779,6 +9785,30 @@ mod tests {
         assert!(is_call_arg_transient_name("x8_0"));
         assert!(!is_call_arg_transient_name("space1:20"));
         assert!(!is_call_arg_transient_name("value"));
+    }
+
+    #[test]
+    fn call_arg_preservation_score_uses_typed_symbol_and_object_names() {
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("tmp:1".to_string()), 0),
+            -60
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("sym.helper".to_string()), 0),
+            180
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("obj.global".to_string()), 0),
+            180
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("data.global".to_string()), 0),
+            70
+        );
+        assert_eq!(
+            call_arg_expr_preservation_score(&CExpr::Var("got.slot".to_string()), 0),
+            70
+        );
     }
 
     #[test]
