@@ -1017,6 +1017,30 @@ pub extern "C" fn r2sleigh_writeback_apply_type_name_canonicalize(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_callee_name_is_import_like(name: *const c_char) -> i32 {
+    let Some(name) = raw_cstr_lossy(name) else {
+        return 0;
+    };
+    i32::from(r2types::callee_name_is_import_like(&name))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_callee_name_is_windows_runtime_registration(name: *const c_char) -> i32 {
+    let Some(name) = raw_cstr_lossy(name) else {
+        return 0;
+    };
+    i32::from(r2types::callee_name_is_windows_runtime_registration(&name))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_callee_name_is_runtime_copy(name: *const c_char) -> i32 {
+    let Some(name) = raw_cstr_lossy(name) else {
+        return 0;
+    };
+    i32::from(r2types::callee_name_is_runtime_copy(&name))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn r2dec_highlight_c_ansi(source: *const c_char) -> *mut c_char {
     if source.is_null() {
         return ptr::null_mut();
@@ -9299,6 +9323,27 @@ mod tests {
             .into_owned();
         r2il_string_free(canonical);
         assert_eq!(canonical_text, "struct foo_bar *");
+    }
+
+    #[test]
+    fn test_callee_name_policy_ffi_routes_to_r2types() {
+        let import = CString::new("reloc.memcpy").unwrap();
+        assert_eq!(r2sleigh_callee_name_is_import_like(import.as_ptr()), 1);
+        assert_eq!(r2sleigh_callee_name_is_runtime_copy(import.as_ptr()), 1);
+
+        let registration = CString::new("sym.imp.AddVectoredExceptionHandler").unwrap();
+        assert_eq!(
+            r2sleigh_callee_name_is_windows_runtime_registration(registration.as_ptr()),
+            1
+        );
+
+        let local = CString::new("sym.local_helper").unwrap();
+        assert_eq!(r2sleigh_callee_name_is_import_like(local.as_ptr()), 0);
+        assert_eq!(r2sleigh_callee_name_is_runtime_copy(local.as_ptr()), 0);
+        assert_eq!(
+            r2sleigh_callee_name_is_windows_runtime_registration(ptr::null()),
+            0
+        );
     }
 
     #[test]

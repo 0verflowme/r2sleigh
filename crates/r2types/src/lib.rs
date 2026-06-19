@@ -18,7 +18,8 @@ pub mod writeback;
 
 pub use callee::{
     CalleeClass, CalleeIdentity, CalleeIdentityContext, CalleeIdentityEvidence, CalleeIdentityKey,
-    CallsiteKey, normalize_callee_name,
+    CallsiteKey, callee_name_is_import_like, callee_name_is_runtime_copy,
+    callee_name_is_windows_runtime_registration, normalize_callee_name,
 };
 pub use constraint::{Constraint, ConstraintSource, MemoryCapability};
 pub use context::{

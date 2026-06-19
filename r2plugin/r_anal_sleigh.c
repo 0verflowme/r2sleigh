@@ -86,6 +86,9 @@ extern char *r2sleigh_engine_cache_stats_json(void);
 extern void r2sleigh_engine_cache_stats_reset(void);
 extern int r2sleigh_writeback_var_name_is_generated(const char *name);
 extern int r2sleigh_writeback_apply_type_name_is_generic(const char *type_name);
+extern int r2sleigh_callee_name_is_import_like(const char *name);
+extern int r2sleigh_callee_name_is_windows_runtime_registration(const char *name);
+extern int r2sleigh_callee_name_is_runtime_copy(const char *name);
 
 /* Typed analysis */
 extern char *r2il_block_regs_read(const R2ILContext *ctx, const R2ILBlock *block);
@@ -10098,71 +10101,16 @@ static ut64 *collect_type_interproc_direct_targets_from_blocks(
 	return targets;
 }
 
-static const char *strip_runtime_scope_name_prefixes(const char *name) {
-	const char *normalized = name;
-	if (!normalized) {
-		return NULL;
-	}
-	for (;;) {
-		if (!strncasecmp (normalized, "sym.imp.", 8)) {
-			normalized += 8;
-			continue;
-		}
-		if (!strncasecmp (normalized, "sym.", 4)) {
-			normalized += 4;
-			continue;
-		}
-		if (!strncasecmp (normalized, "imp.", 4)) {
-			normalized += 4;
-			continue;
-		}
-		if (!strncasecmp (normalized, "reloc.", 6)) {
-			normalized += 6;
-			continue;
-		}
-		if (!strncasecmp (normalized, "dbg.", 4)) {
-			normalized += 4;
-			continue;
-		}
-		if (!strncasecmp (normalized, "fcn.", 4)) {
-			normalized += 4;
-			continue;
-		}
-		break;
-	}
-	return normalized;
-}
-
 static bool function_name_is_windows_runtime_registration(const char *name) {
-	const char *normalized = strip_runtime_scope_name_prefixes (name);
-	if (!normalized || !*normalized) {
-		return false;
-	}
-	size_t len = strlen (normalized);
-	size_t suffix_len = strlen ("AddVectoredExceptionHandler");
-	if (len < suffix_len) {
-		return false;
-	}
-	return !strcasecmp (normalized + (len - suffix_len), "AddVectoredExceptionHandler");
+	return r2sleigh_callee_name_is_windows_runtime_registration (name) != 0;
 }
 
 static bool function_name_is_import_like(const char *name) {
-	if (!name || !*name) {
-		return false;
-	}
-	return !strncasecmp (name, "sym.imp.", 8)
-		|| !strncasecmp (name, "imp.", 4)
-		|| !strncasecmp (name, "reloc.", 6);
+	return r2sleigh_callee_name_is_import_like (name) != 0;
 }
 
 static bool function_name_is_runtime_copy(const char *name) {
-	const char *normalized = strip_runtime_scope_name_prefixes (name);
-	if (!normalized || !*normalized) {
-		return false;
-	}
-	return !strcasecmp (normalized, "memcpy")
-		|| !strcasecmp (normalized, "__memcpy_chk")
-		|| !strncasecmp (normalized, "memcpy", 6);
+	return r2sleigh_callee_name_is_runtime_copy (name) != 0;
 }
 
 static ut64 *collect_runtime_scope_targets_from_blocks(
