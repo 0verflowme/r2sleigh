@@ -124,11 +124,38 @@ rustc_session::declare_lint!(
     "r2plugin must not inspect signature certificates to decide writeback authority"
 );
 
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
+    /// Warns when production `r2plugin` code reads or recomputes type writeback
+    /// apply-threshold fields.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Apply thresholds are type-system policy. The plugin may select a
+    /// writeback mode and execute already-authorized mutations, but it must not
+    /// become a second owner for per-kind confidence thresholds.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// policy.mutation_min_confidence(kind);
+    /// policy.type_min_confidence;
+    /// ```
+    ///
+    /// Use instead a `r2types::TypeWritebackMutationPlan` built with the desired
+    /// `TypeWritebackApplyPolicy`.
+    pub R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
+    Warn,
+    "r2plugin must not compute or inspect type writeback apply thresholds"
+);
+
 rustc_session::declare_lint_pass!(R2sleighLintPass => [
     STRING_PREFIX_SEMANTIC_CLASSIFICATION,
     R2_JSON_COMMAND_INTERNAL_SEAM,
     R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
-    R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP
+    R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
+    R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP
 ]);
 
 #[unsafe(no_mangle)]
@@ -139,6 +166,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2_JSON_COMMAND_INTERNAL_SEAM,
         R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
         R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
+        R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
     ]);
     lint_store.register_late_pass(|_| Box::new(R2sleighLintPass));
 }
@@ -180,6 +208,15 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
                 expr.span,
                 "r2plugin must not inspect signature certificates to decide writeback authority; consume the r2types authority result",
+            );
+        }
+
+        if is_r2plugin_path(cx, expr) && plugin_type_writeback_apply_threshold_expr(expr) {
+            span_lint(
+                cx,
+                R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
+                expr.span,
+                "r2plugin must not compute or inspect type writeback apply thresholds; consume r2types mutation plans",
             );
         }
 
@@ -230,6 +267,20 @@ fn plugin_type_writeback_policy_expr(expr: &Expr<'_>) -> bool {
             };
             symbol.as_str().starts_with("signature mutation refused:")
         }
+        _ => false,
+    }
+}
+
+fn plugin_type_writeback_apply_threshold_expr(expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::MethodCall(method, _, _, _) => matches!(
+            method.ident.as_str(),
+            "effective_threshold" | "mutation_min_confidence"
+        ),
+        ExprKind::Field(_, ident) => matches!(
+            ident.name.as_str(),
+            "type_min_confidence" | "rename_min_confidence" | "struct_min_confidence"
+        ),
         _ => false,
     }
 }

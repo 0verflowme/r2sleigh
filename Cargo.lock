@@ -790,7 +790,6 @@ dependencies = [
  "r2sym",
  "r2types",
  "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -247,6 +247,12 @@ mod ffi {
     }
 
     #[repr(C)]
+    struct R2SleighTypeWritebackApplyPolicy {
+        schema_version: u32,
+        mode: u32,
+    }
+
+    #[repr(C)]
     struct R2SleighSessionInput {
         ctx: *const c_void,
         blocks: *const *const c_void,
@@ -256,6 +262,7 @@ mod ffi {
         function_context: R2SleighFunctionContext,
         interproc_scope: R2SleighInterprocScope,
         debug_seed: R2SleighDebugSeed,
+        apply_policy: R2SleighTypeWritebackApplyPolicy,
         budget: R2SleighBudgetConfig,
     }
 
@@ -295,6 +302,14 @@ mod ffi {
             assert_eq!(
                 plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_budget_config"),
                 std::mem::align_of::<R2SleighBudgetConfig>()
+            );
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_type_writeback_apply_policy"),
+                std::mem::size_of::<R2SleighTypeWritebackApplyPolicy>()
+            );
+            assert_eq!(
+                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_type_writeback_apply_policy"),
+                std::mem::align_of::<R2SleighTypeWritebackApplyPolicy>()
             );
             assert_eq!(
                 plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_session_input"),
@@ -365,6 +380,10 @@ mod ffi {
             debug_seed: R2SleighDebugSeed {
                 schema_version: 1,
                 seed_hash: 0,
+            },
+            apply_policy: R2SleighTypeWritebackApplyPolicy {
+                schema_version: 1,
+                mode: 1,
             },
             budget: R2SleighBudgetConfig {
                 schema_version: 1,

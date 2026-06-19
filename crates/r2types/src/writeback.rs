@@ -197,6 +197,12 @@ pub struct TypeWritebackPlan {
 }
 
 pub const MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE: u8 = 95;
+pub const TYPE_WRITEBACK_TYPE_MIN_CONFIDENCE_DEFAULT: u8 = 85;
+pub const TYPE_WRITEBACK_RENAME_MIN_CONFIDENCE_DEFAULT: u8 = 93;
+pub const TYPE_WRITEBACK_STRUCT_MIN_CONFIDENCE_DEFAULT: u8 = 85;
+const TYPE_WRITEBACK_AGGRESSIVE_TYPE_DELTA: u8 = 10;
+const TYPE_WRITEBACK_AGGRESSIVE_RENAME_DELTA: u8 = 8;
+const TYPE_WRITEBACK_OFF_THRESHOLD: u8 = 101;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeWritebackMutationBudget {
@@ -211,6 +217,88 @@ impl TypeWritebackMutationBudget {
             global_max_links: global_max_links.max(1),
             max_type_decls: max_type_decls.max(1),
             max_mutations: max_mutations.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeWritebackApplyMode {
+    Off,
+    #[default]
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct TypeWritebackApplyPolicy {
+    pub mode: TypeWritebackApplyMode,
+    pub type_min_confidence: u8,
+    pub rename_min_confidence: u8,
+    pub struct_min_confidence: u8,
+}
+
+impl Default for TypeWritebackApplyPolicy {
+    fn default() -> Self {
+        Self::balanced()
+    }
+}
+
+impl TypeWritebackApplyPolicy {
+    pub fn balanced() -> Self {
+        Self {
+            mode: TypeWritebackApplyMode::Balanced,
+            type_min_confidence: TYPE_WRITEBACK_TYPE_MIN_CONFIDENCE_DEFAULT,
+            rename_min_confidence: TYPE_WRITEBACK_RENAME_MIN_CONFIDENCE_DEFAULT,
+            struct_min_confidence: TYPE_WRITEBACK_STRUCT_MIN_CONFIDENCE_DEFAULT,
+        }
+    }
+
+    pub fn aggressive() -> Self {
+        Self {
+            mode: TypeWritebackApplyMode::Aggressive,
+            ..Self::balanced()
+        }
+    }
+
+    pub fn off() -> Self {
+        Self {
+            mode: TypeWritebackApplyMode::Off,
+            ..Self::balanced()
+        }
+    }
+
+    pub fn effective_threshold(self, base: u8, aggressive_delta: u8) -> u8 {
+        match self.mode {
+            TypeWritebackApplyMode::Off => TYPE_WRITEBACK_OFF_THRESHOLD,
+            TypeWritebackApplyMode::Balanced => base.clamp(1, 100),
+            TypeWritebackApplyMode::Aggressive => {
+                base.saturating_sub(aggressive_delta).clamp(1, 100)
+            }
+        }
+    }
+
+    pub fn mutation_min_confidence(self, kind: TypeWritebackMutationKind) -> u8 {
+        match kind {
+            TypeWritebackMutationKind::TypeDecl => self.effective_threshold(
+                self.struct_min_confidence,
+                TYPE_WRITEBACK_AGGRESSIVE_TYPE_DELTA,
+            ),
+            TypeWritebackMutationKind::VarRename => self.effective_threshold(
+                self.rename_min_confidence,
+                TYPE_WRITEBACK_AGGRESSIVE_RENAME_DELTA,
+            ),
+            TypeWritebackMutationKind::Var
+            | TypeWritebackMutationKind::VarType
+            | TypeWritebackMutationKind::TypeLink => self.effective_threshold(
+                self.type_min_confidence,
+                TYPE_WRITEBACK_AGGRESSIVE_TYPE_DELTA,
+            ),
+            TypeWritebackMutationKind::Signature
+            | TypeWritebackMutationKind::Callconv
+            | TypeWritebackMutationKind::Xref
+            | TypeWritebackMutationKind::Comment
+            | TypeWritebackMutationKind::Flag => 0,
         }
     }
 }
@@ -285,6 +373,7 @@ pub struct TypeWritebackMutation {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TypeWritebackMutationPlan {
+    pub apply_policy: TypeWritebackApplyPolicy,
     pub mutations: Vec<TypeWritebackMutation>,
     pub diagnostics: Vec<String>,
 }
@@ -379,6 +468,37 @@ fn push_budgeted_type_mutation(
     }
 }
 
+struct TypeMutationPushContext<'a> {
+    mutations: &'a mut Vec<TypeWritebackMutation>,
+    diagnostics: &'a mut Vec<String>,
+    emitted: &'a mut usize,
+    skipped_budgeted: &'a mut usize,
+    skipped_low_conf: &'a mut BTreeMap<&'static str, usize>,
+    budget: TypeWritebackMutationBudget,
+    apply_policy: TypeWritebackApplyPolicy,
+}
+
+fn push_apply_authorized_type_mutation(
+    ctx: &mut TypeMutationPushContext<'_>,
+    mutation: TypeWritebackMutation,
+) {
+    let min_confidence = ctx.apply_policy.mutation_min_confidence(mutation.kind);
+    if mutation.confidence < min_confidence {
+        *ctx.skipped_low_conf
+            .entry(mutation.kind.as_str())
+            .or_default() += 1;
+        return;
+    }
+    push_budgeted_type_mutation(
+        ctx.mutations,
+        ctx.diagnostics,
+        ctx.emitted,
+        ctx.skipped_budgeted,
+        ctx.budget,
+        mutation,
+    );
+}
+
 fn evidence_names(evidence: &[WritebackEvidence]) -> Vec<String> {
     evidence
         .iter()
@@ -391,10 +511,25 @@ pub fn type_writeback_mutation_plan(
     budget: TypeWritebackMutationBudget,
     type_facts: &FunctionTypeFacts,
 ) -> TypeWritebackMutationPlan {
+    type_writeback_mutation_plan_with_policy(
+        plan,
+        budget,
+        type_facts,
+        TypeWritebackApplyPolicy::balanced(),
+    )
+}
+
+pub fn type_writeback_mutation_plan_with_policy(
+    plan: &TypeWritebackPlan,
+    budget: TypeWritebackMutationBudget,
+    type_facts: &FunctionTypeFacts,
+    apply_policy: TypeWritebackApplyPolicy,
+) -> TypeWritebackMutationPlan {
     let mut mutations = Vec::new();
     let mut diagnostics = Vec::new();
     let mut emitted_budgeted = 0usize;
     let mut skipped_budgeted = 0usize;
+    let mut skipped_low_conf = BTreeMap::new();
 
     let signature_decision = signature_writeback_decision(type_facts);
     if let Some(refusal) = signature_decision.refusal.clone() {
@@ -448,34 +583,42 @@ pub fn type_writeback_mutation_plan(
         });
     }
 
-    for decl in plan.struct_decls.iter().take(budget.max_type_decls) {
-        push_budgeted_type_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
+    {
+        let mut mutation_ctx = TypeMutationPushContext {
+            mutations: &mut mutations,
+            diagnostics: &mut diagnostics,
+            emitted: &mut emitted_budgeted,
+            skipped_budgeted: &mut skipped_budgeted,
+            skipped_low_conf: &mut skipped_low_conf,
             budget,
-            TypeWritebackMutation {
-                kind: TypeWritebackMutationKind::TypeDecl,
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: None,
-                name: Some(decl.name.clone()),
-                reg: None,
-                type_name: None,
-                text: Some(decl.decl.clone()),
-                addr: None,
-                size: None,
-                delta: None,
-                var_kind: None,
-                is_arg: None,
-                confidence: decl.confidence,
-                source: decl.source.as_str().to_string(),
-                evidence: vec!["struct-declaration".to_string()],
-            },
-        );
+            apply_policy,
+        };
+
+        for decl in plan.struct_decls.iter().take(budget.max_type_decls) {
+            push_apply_authorized_type_mutation(
+                &mut mutation_ctx,
+                TypeWritebackMutation {
+                    kind: TypeWritebackMutationKind::TypeDecl,
+                    signature: None,
+                    ret_type: None,
+                    params: Vec::new(),
+                    callconv: None,
+                    old_name: None,
+                    name: Some(decl.name.clone()),
+                    reg: None,
+                    type_name: None,
+                    text: Some(decl.decl.clone()),
+                    addr: None,
+                    size: None,
+                    delta: None,
+                    var_kind: None,
+                    is_arg: None,
+                    confidence: decl.confidence,
+                    source: decl.source.as_str().to_string(),
+                    evidence: vec!["struct-declaration".to_string()],
+                },
+            );
+        }
     }
     if plan.struct_decls.len() > budget.max_type_decls {
         diagnostics.push(format!(
@@ -485,21 +628,52 @@ pub fn type_writeback_mutation_plan(
         ));
     }
 
-    for candidate in &plan.var_type_candidates {
-        if candidate.confidence >= MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE {
-            push_budgeted_type_mutation(
-                &mut mutations,
-                &mut diagnostics,
-                &mut emitted_budgeted,
-                &mut skipped_budgeted,
-                budget,
+    {
+        let mut mutation_ctx = TypeMutationPushContext {
+            mutations: &mut mutations,
+            diagnostics: &mut diagnostics,
+            emitted: &mut emitted_budgeted,
+            skipped_budgeted: &mut skipped_budgeted,
+            skipped_low_conf: &mut skipped_low_conf,
+            budget,
+            apply_policy,
+        };
+
+        for candidate in &plan.var_type_candidates {
+            if candidate.confidence >= MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE {
+                push_apply_authorized_type_mutation(
+                    &mut mutation_ctx,
+                    TypeWritebackMutation {
+                        kind: TypeWritebackMutationKind::Var,
+                        signature: None,
+                        ret_type: None,
+                        params: Vec::new(),
+                        callconv: None,
+                        old_name: None,
+                        name: Some(candidate.name.clone()),
+                        reg: candidate.reg.clone(),
+                        type_name: Some(candidate.var_type.clone()),
+                        text: None,
+                        addr: None,
+                        size: Some(candidate.size as u64),
+                        delta: Some(candidate.delta),
+                        var_kind: Some(candidate.kind.clone()),
+                        is_arg: Some(candidate.isarg),
+                        confidence: candidate.confidence,
+                        source: candidate.source.as_str().to_string(),
+                        evidence: evidence_names(&candidate.evidence),
+                    },
+                );
+            }
+            push_apply_authorized_type_mutation(
+                &mut mutation_ctx,
                 TypeWritebackMutation {
-                    kind: TypeWritebackMutationKind::Var,
+                    kind: TypeWritebackMutationKind::VarType,
                     signature: None,
                     ret_type: None,
                     params: Vec::new(),
                     callconv: None,
-                    old_name: None,
+                    old_name: Some(candidate.name.clone()),
                     name: Some(candidate.name.clone()),
                     reg: candidate.reg.clone(),
                     type_name: Some(candidate.var_type.clone()),
@@ -515,93 +689,58 @@ pub fn type_writeback_mutation_plan(
                 },
             );
         }
-        push_budgeted_type_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
-            budget,
-            TypeWritebackMutation {
-                kind: TypeWritebackMutationKind::VarType,
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: Some(candidate.name.clone()),
-                name: Some(candidate.name.clone()),
-                reg: candidate.reg.clone(),
-                type_name: Some(candidate.var_type.clone()),
-                text: None,
-                addr: None,
-                size: Some(candidate.size as u64),
-                delta: Some(candidate.delta),
-                var_kind: Some(candidate.kind.clone()),
-                is_arg: Some(candidate.isarg),
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: evidence_names(&candidate.evidence),
-            },
-        );
-    }
 
-    for candidate in &plan.var_rename_candidates {
-        push_budgeted_type_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
-            budget,
-            TypeWritebackMutation {
-                kind: TypeWritebackMutationKind::VarRename,
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: Some(candidate.name.clone()),
-                name: Some(candidate.target_name.clone()),
-                reg: None,
-                type_name: None,
-                text: None,
-                addr: None,
-                size: None,
-                delta: None,
-                var_kind: None,
-                is_arg: None,
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: evidence_names(&candidate.evidence),
-            },
-        );
-    }
+        for candidate in &plan.var_rename_candidates {
+            push_apply_authorized_type_mutation(
+                &mut mutation_ctx,
+                TypeWritebackMutation {
+                    kind: TypeWritebackMutationKind::VarRename,
+                    signature: None,
+                    ret_type: None,
+                    params: Vec::new(),
+                    callconv: None,
+                    old_name: Some(candidate.name.clone()),
+                    name: Some(candidate.target_name.clone()),
+                    reg: None,
+                    type_name: None,
+                    text: None,
+                    addr: None,
+                    size: None,
+                    delta: None,
+                    var_kind: None,
+                    is_arg: None,
+                    confidence: candidate.confidence,
+                    source: candidate.source.as_str().to_string(),
+                    evidence: evidence_names(&candidate.evidence),
+                },
+            );
+        }
 
-    for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
-        push_budgeted_type_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
-            budget,
-            TypeWritebackMutation {
-                kind: TypeWritebackMutationKind::TypeLink,
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: None,
-                name: None,
-                reg: None,
-                type_name: Some(candidate.target_type.clone()),
-                text: None,
-                addr: Some(candidate.addr),
-                size: None,
-                delta: None,
-                var_kind: None,
-                is_arg: None,
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: vec!["global-type-link".to_string()],
-            },
-        );
+        for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
+            push_apply_authorized_type_mutation(
+                &mut mutation_ctx,
+                TypeWritebackMutation {
+                    kind: TypeWritebackMutationKind::TypeLink,
+                    signature: None,
+                    ret_type: None,
+                    params: Vec::new(),
+                    callconv: None,
+                    old_name: None,
+                    name: None,
+                    reg: None,
+                    type_name: Some(candidate.target_type.clone()),
+                    text: None,
+                    addr: Some(candidate.addr),
+                    size: None,
+                    delta: None,
+                    var_kind: None,
+                    is_arg: None,
+                    confidence: candidate.confidence,
+                    source: candidate.source.as_str().to_string(),
+                    evidence: vec!["global-type-link".to_string()],
+                },
+            );
+        }
     }
     if plan.global_type_links.len() > budget.global_max_links {
         diagnostics.push(format!(
@@ -610,8 +749,14 @@ pub fn type_writeback_mutation_plan(
             budget.global_max_links
         ));
     }
+    for (kind, count) in skipped_low_conf {
+        diagnostics.push(format!(
+            "{kind} mutation plan withheld {count} low-confidence candidate(s)"
+        ));
+    }
 
     TypeWritebackMutationPlan {
+        apply_policy,
         mutations,
         diagnostics,
     }
@@ -646,6 +791,14 @@ pub struct TypeWritebackSemanticInputs<'a> {
 mod kani_proofs {
     use super::*;
 
+    fn pick_apply_mode(raw: u8) -> TypeWritebackApplyMode {
+        match raw % 3 {
+            0 => TypeWritebackApplyMode::Off,
+            1 => TypeWritebackApplyMode::Balanced,
+            _ => TypeWritebackApplyMode::Aggressive,
+        }
+    }
+
     #[kani::proof]
     fn type_writeback_mutation_budget_is_never_zero() {
         let budget = TypeWritebackMutationBudget::new(
@@ -657,6 +810,65 @@ mod kani_proofs {
         assert!(budget.global_max_links >= 1);
         assert!(budget.max_type_decls >= 1);
         assert!(budget.max_mutations >= 1);
+    }
+
+    #[kani::proof]
+    fn type_writeback_apply_threshold_is_total_and_nonzero() {
+        let mode = pick_apply_mode(kani::any::<u8>());
+        let base = kani::any::<u8>();
+        let delta = kani::any::<u8>();
+        let policy = TypeWritebackApplyPolicy {
+            mode,
+            ..TypeWritebackApplyPolicy::balanced()
+        };
+        let threshold = policy.effective_threshold(base, delta);
+
+        assert!(threshold >= 1);
+        if mode == TypeWritebackApplyMode::Off {
+            assert_eq!(threshold, TYPE_WRITEBACK_OFF_THRESHOLD);
+        } else {
+            assert!(threshold <= 100);
+        }
+    }
+
+    #[kani::proof]
+    fn aggressive_apply_threshold_is_never_stricter_than_balanced() {
+        let base = kani::any::<u8>();
+        let delta = kani::any::<u8>();
+        let balanced = TypeWritebackApplyPolicy::balanced().effective_threshold(base, delta);
+        let aggressive = TypeWritebackApplyPolicy::aggressive().effective_threshold(base, delta);
+
+        assert!(aggressive <= balanced);
+    }
+
+    #[kani::proof]
+    fn apply_policy_kind_thresholds_use_their_canonical_field() {
+        let type_min_confidence = kani::any::<u8>();
+        let rename_min_confidence = kani::any::<u8>();
+        let struct_min_confidence = kani::any::<u8>();
+        let policy = TypeWritebackApplyPolicy {
+            mode: TypeWritebackApplyMode::Balanced,
+            type_min_confidence,
+            rename_min_confidence,
+            struct_min_confidence,
+        };
+
+        assert_eq!(
+            policy.mutation_min_confidence(TypeWritebackMutationKind::TypeDecl),
+            struct_min_confidence.clamp(1, 100)
+        );
+        assert_eq!(
+            policy.mutation_min_confidence(TypeWritebackMutationKind::VarRename),
+            rename_min_confidence.clamp(1, 100)
+        );
+        assert_eq!(
+            policy.mutation_min_confidence(TypeWritebackMutationKind::VarType),
+            type_min_confidence.clamp(1, 100)
+        );
+        assert_eq!(
+            policy.mutation_min_confidence(TypeWritebackMutationKind::TypeLink),
+            type_min_confidence.clamp(1, 100)
+        );
     }
 }
 
@@ -8263,6 +8475,74 @@ mod tests {
         }
     }
 
+    fn certified_signature_facts(param_name: &str, param_bits: u32) -> FunctionTypeFacts {
+        let signature_spec = test_signature_spec(param_name, param_bits);
+        let signature_certificate = SignatureCertificate::from_signature(
+            &signature_spec,
+            [SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external signature should be certifiable");
+        FunctionTypeFacts {
+            merged_signature: Some(signature_spec),
+            signature_certificate: Some(signature_certificate),
+            ..FunctionTypeFacts::default()
+        }
+    }
+
+    fn policy_test_plan(
+        function_name: &str,
+        confidence: u8,
+        rename_confidence: u8,
+    ) -> TypeWritebackPlan {
+        TypeWritebackPlan {
+            signature: inferred_test_signature(function_name, "value"),
+            var_type_candidates: vec![VarTypeCandidate {
+                name: "var_8h".to_string(),
+                kind: "b".to_string(),
+                delta: -8,
+                var_type: "int32_t".to_string(),
+                isarg: false,
+                reg: None,
+                size: 4,
+                confidence,
+                source: WritebackSource::ExternalTypeDb,
+                evidence: vec![WritebackEvidence::ExternalStackAnnotation],
+            }],
+            var_rename_candidates: vec![VarRenameCandidate {
+                name: "arg1".to_string(),
+                target_name: "value".to_string(),
+                confidence: rename_confidence,
+                source: WritebackSource::ExistingState,
+                evidence: vec![WritebackEvidence::ExternalParamName],
+            }],
+            struct_decls: vec![StructDeclCandidate {
+                name: "struct policy_item".to_string(),
+                decl: "typedef struct policy_item { int x; } policy_item;".to_string(),
+                confidence,
+                source: StructDeclSource::ExternalTypeDb,
+                fields: Vec::new(),
+            }],
+            global_type_links: vec![GlobalTypeLinkCandidate {
+                addr: 0x404000,
+                target_type: "struct policy_item *".to_string(),
+                confidence,
+                source: WritebackSource::ExternalTypeDb,
+            }],
+            diagnostics: TypeWritebackDiagnostics::default(),
+        }
+    }
+
+    fn mutation_kind_count(
+        mutation_plan: &TypeWritebackMutationPlan,
+        kind: TypeWritebackMutationKind,
+    ) -> usize {
+        mutation_plan
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.kind == kind)
+            .count()
+    }
+
     #[test]
     fn inferred_signature_to_type_facts_preserves_merged_signature() {
         let inferred = inferred_test_signature("dbg.typed", "value");
@@ -8372,17 +8652,7 @@ mod tests {
 
     #[test]
     fn mutation_plan_materializes_typed_writeback_kinds_in_order() {
-        let signature_spec = test_signature_spec("a", 32);
-        let signature_certificate = SignatureCertificate::from_signature(
-            &signature_spec,
-            [SignatureCertificateSource::ExternalContext],
-        )
-        .expect("external signature should be certifiable");
-        let type_facts = FunctionTypeFacts {
-            merged_signature: Some(signature_spec),
-            signature_certificate: Some(signature_certificate),
-            ..FunctionTypeFacts::default()
-        };
+        let type_facts = certified_signature_facts("a", 32);
         let mut plan = empty_writeback_plan("dbg.sum");
         plan.signature = inferred_test_signature("dbg.sum", "a");
         plan.var_type_candidates.push(VarTypeCandidate {
@@ -8438,6 +8708,167 @@ mod tests {
         assert_eq!(
             mutation_plan.mutations[0].evidence,
             vec!["signature-certificate:external_context".to_string()]
+        );
+    }
+
+    #[test]
+    fn mutation_apply_policy_balanced_filters_by_kind_thresholds() {
+        let type_facts = FunctionTypeFacts::default();
+        let budget = TypeWritebackMutationBudget::new(64, 64, 64);
+        let below = policy_test_plan("dbg.policy_low", 84, 92);
+        let at_threshold = policy_test_plan("dbg.policy_ok", 85, 93);
+
+        let below_plan = type_writeback_mutation_plan_with_policy(
+            &below,
+            budget,
+            &type_facts,
+            TypeWritebackApplyPolicy::balanced(),
+        );
+        let threshold_plan = type_writeback_mutation_plan_with_policy(
+            &at_threshold,
+            budget,
+            &type_facts,
+            TypeWritebackApplyPolicy::balanced(),
+        );
+
+        assert_eq!(
+            mutation_kind_count(&below_plan, TypeWritebackMutationKind::TypeDecl),
+            0
+        );
+        assert_eq!(
+            mutation_kind_count(&below_plan, TypeWritebackMutationKind::VarType),
+            0
+        );
+        assert_eq!(
+            mutation_kind_count(&below_plan, TypeWritebackMutationKind::VarRename),
+            0
+        );
+        assert_eq!(
+            mutation_kind_count(&below_plan, TypeWritebackMutationKind::TypeLink),
+            0
+        );
+        assert_eq!(
+            mutation_kind_count(&threshold_plan, TypeWritebackMutationKind::TypeDecl),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&threshold_plan, TypeWritebackMutationKind::VarType),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&threshold_plan, TypeWritebackMutationKind::VarRename),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&threshold_plan, TypeWritebackMutationKind::TypeLink),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&threshold_plan, TypeWritebackMutationKind::Var),
+            0,
+            "materialized vars require their stronger confidence threshold"
+        );
+        assert!(below_plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "var_type mutation plan withheld 1 low-confidence candidate(s)"
+        }));
+    }
+
+    #[test]
+    fn mutation_apply_policy_aggressive_lowers_expected_thresholds() {
+        let type_facts = FunctionTypeFacts::default();
+        let budget = TypeWritebackMutationBudget::new(64, 64, 64);
+        let plan = policy_test_plan("dbg.policy_aggressive", 75, 85);
+
+        let balanced = type_writeback_mutation_plan_with_policy(
+            &plan,
+            budget,
+            &type_facts,
+            TypeWritebackApplyPolicy::balanced(),
+        );
+        let aggressive = type_writeback_mutation_plan_with_policy(
+            &plan,
+            budget,
+            &type_facts,
+            TypeWritebackApplyPolicy::aggressive(),
+        );
+
+        assert_eq!(
+            mutation_kind_count(&balanced, TypeWritebackMutationKind::TypeDecl),
+            0
+        );
+        assert_eq!(
+            mutation_kind_count(&balanced, TypeWritebackMutationKind::VarRename),
+            0
+        );
+        assert_eq!(
+            mutation_kind_count(&aggressive, TypeWritebackMutationKind::TypeDecl),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&aggressive, TypeWritebackMutationKind::VarType),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&aggressive, TypeWritebackMutationKind::VarRename),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&aggressive, TypeWritebackMutationKind::TypeLink),
+            1
+        );
+    }
+
+    #[test]
+    fn mutation_apply_policy_off_keeps_certified_signature_only() {
+        let type_facts = certified_signature_facts("value", 32);
+        let budget = TypeWritebackMutationBudget::new(64, 64, 64);
+        let plan = policy_test_plan("dbg.policy_off", 100, 100);
+
+        let mutation_plan = type_writeback_mutation_plan_with_policy(
+            &plan,
+            budget,
+            &type_facts,
+            TypeWritebackApplyPolicy::off(),
+        );
+        let kinds = mutation_plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.kind)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec![
+                TypeWritebackMutationKind::Signature,
+                TypeWritebackMutationKind::Callconv,
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_apply_policy_preserves_materialized_var_threshold() {
+        let type_facts = FunctionTypeFacts::default();
+        let budget = TypeWritebackMutationBudget::new(64, 64, 64);
+        let below_materialized = policy_test_plan(
+            "dbg.policy_materialized_var",
+            MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE - 1,
+            100,
+        );
+
+        let mutation_plan = type_writeback_mutation_plan_with_policy(
+            &below_materialized,
+            budget,
+            &type_facts,
+            TypeWritebackApplyPolicy::aggressive(),
+        );
+
+        assert_eq!(
+            mutation_kind_count(&mutation_plan, TypeWritebackMutationKind::VarType),
+            1
+        );
+        assert_eq!(
+            mutation_kind_count(&mutation_plan, TypeWritebackMutationKind::Var),
+            0
         );
     }
 

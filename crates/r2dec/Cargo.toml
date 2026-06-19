@@ -12,8 +12,5 @@ r2sym = { path = "../r2sym" }
 r2types = { path = "../r2types" }
 serde.workspace = true
 
-[dev-dependencies]
-serde_json.workspace = true
-
 [features]
 default = []

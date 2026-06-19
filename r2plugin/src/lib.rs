@@ -3527,6 +3527,7 @@ pub extern "C" fn r2dec_function_with_session_context(
         global_max_links: input.budget.global_max_links.max(1),
         max_type_decls: input.budget.max_type_decls.max(1),
         max_mutations: input.budget.max_mutations.max(1),
+        apply_policy: type_writeback_apply_policy_from_ffi(&input.apply_policy),
     };
     let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
     let parsed_context = unsafe {
@@ -3698,6 +3699,7 @@ pub extern "C" fn r2sleigh_named_native_worker_type_json(
         apply_artifact_signature_hint: !(projection.name_owned_signature
             || projection.context_owned_signature),
         budget: TypeOutputBudget::new(global_max_links, max_type_decls, max_mutations),
+        apply_policy: r2types::TypeWritebackApplyPolicy::balanced(),
     });
     serde_json::to_string(&payload)
         .ok()
@@ -4062,13 +4064,16 @@ pub struct R2SleighBudgetConfig {
 }
 
 #[repr(C)]
+pub struct R2SleighTypeWritebackApplyPolicy {
+    schema_version: u32,
+    mode: u32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct R2SleighAnalysisPolicy {
     mode: u32,
     type_writeback_mode: u32,
-    type_min_conf: i32,
-    type_rename_min_conf: i32,
-    type_struct_min_conf: i32,
     type_interproc_max_iters: i32,
     type_max_blocks: i32,
     type_global_max_links: i32,
@@ -4084,17 +4089,11 @@ const R2SLEIGH_MODE_FULL: u32 = 2;
 const R2SLEIGH_TYPE_WRITEBACK_OFF: u32 = 0;
 const R2SLEIGH_TYPE_WRITEBACK_BALANCED: u32 = 1;
 const R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE: u32 = 2;
-const R2SLEIGH_TYPE_MIN_CONF_DEFAULT: i32 = 85;
-const R2SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT: i32 = 93;
-const R2SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT: i32 = 85;
 
 fn analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
     let mut policy = R2SleighAnalysisPolicy {
         mode: R2SLEIGH_MODE_BALANCED,
         type_writeback_mode: R2SLEIGH_TYPE_WRITEBACK_BALANCED,
-        type_min_conf: R2SLEIGH_TYPE_MIN_CONF_DEFAULT,
-        type_rename_min_conf: R2SLEIGH_TYPE_RENAME_MIN_CONF_DEFAULT,
-        type_struct_min_conf: R2SLEIGH_TYPE_STRUCT_MIN_CONF_DEFAULT,
         type_interproc_max_iters: 4,
         type_max_blocks: 200,
         type_global_max_links: 32,
@@ -4151,6 +4150,16 @@ pub extern "C" fn r2sleigh_ffi_alignof_budget_config() -> usize {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_sizeof_type_writeback_apply_policy() -> usize {
+    std::mem::size_of::<R2SleighTypeWritebackApplyPolicy>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_ffi_alignof_type_writeback_apply_policy() -> usize {
+    std::mem::align_of::<R2SleighTypeWritebackApplyPolicy>()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_ffi_sizeof_session_input() -> usize {
     std::mem::size_of::<R2SleighSessionInput>()
 }
@@ -4170,7 +4179,18 @@ pub struct R2SleighSessionInput {
     function_context: R2SleighFunctionContext,
     interproc_scope: R2SleighInterprocScope,
     debug_seed: R2SleighDebugSeed,
+    apply_policy: R2SleighTypeWritebackApplyPolicy,
     budget: R2SleighBudgetConfig,
+}
+
+fn type_writeback_apply_policy_from_ffi(
+    policy: &R2SleighTypeWritebackApplyPolicy,
+) -> r2types::TypeWritebackApplyPolicy {
+    match policy.mode {
+        R2SLEIGH_TYPE_WRITEBACK_OFF => r2types::TypeWritebackApplyPolicy::off(),
+        R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE => r2types::TypeWritebackApplyPolicy::aggressive(),
+        _ => r2types::TypeWritebackApplyPolicy::balanced(),
+    }
 }
 
 fn optional_cstr(ptr: *const c_char) -> Option<String> {
@@ -4872,6 +4892,7 @@ struct BoundedCfgTypePayloadInput<'a> {
     function_facts: &'a r2types::FunctionFacts,
     symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
     budget: TypeOutputBudget,
+    apply_policy: r2types::TypeWritebackApplyPolicy,
     reason: String,
 }
 
@@ -4884,7 +4905,7 @@ fn bounded_cfg_type_payload(input: BoundedCfgTypePayloadInput<'_>) -> InferredTy
         input.function_facts,
         input.reason,
     );
-    writeback_plan_json(
+    writeback_plan_json_with_policy(
         plan,
         InterprocSummaryJson {
             callsite_count: 0,
@@ -4902,6 +4923,7 @@ fn bounded_cfg_type_payload(input: BoundedCfgTypePayloadInput<'_>) -> InferredTy
         None,
         None,
         input.budget,
+        input.apply_policy,
     )
 }
 
@@ -5093,6 +5115,7 @@ fn ffi_signature_fact_from_type_writeback(
     (fact, params)
 }
 
+#[cfg(test)]
 fn writeback_plan_json(
     plan: r2types::TypeWritebackPlan,
     interproc: InterprocSummaryJson,
@@ -5101,7 +5124,32 @@ fn writeback_plan_json(
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     budget: TypeOutputBudget,
 ) -> InferredTypeWritebackJson {
-    let mutation_plan = r2types::type_writeback_mutation_plan(&plan, budget, &function_facts.types);
+    writeback_plan_json_with_policy(
+        plan,
+        interproc,
+        function_facts,
+        semantics,
+        compiled_semantics,
+        budget,
+        r2types::TypeWritebackApplyPolicy::balanced(),
+    )
+}
+
+fn writeback_plan_json_with_policy(
+    plan: r2types::TypeWritebackPlan,
+    interproc: InterprocSummaryJson,
+    function_facts: &r2types::FunctionFacts,
+    semantics: Option<r2sym::SemanticArtifact>,
+    compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
+    budget: TypeOutputBudget,
+    apply_policy: r2types::TypeWritebackApplyPolicy,
+) -> InferredTypeWritebackJson {
+    let mutation_plan = r2types::type_writeback_mutation_plan_with_policy(
+        &plan,
+        budget,
+        &function_facts.types,
+        apply_policy,
+    );
     let signature_writeback = r2types::signature_writeback_decision(&function_facts.types);
     let signature_render_authorized = function_facts.types.render_authorized_signature().is_some();
     let signature_writeback_authorized = signature_writeback.authorized;
@@ -5316,6 +5364,7 @@ fn type_writeback_payload_from_engine_response(
     interproc: InterprocInferenceInput<'_>,
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     budget: TypeOutputBudget,
+    apply_policy: r2types::TypeWritebackApplyPolicy,
 ) -> InferredTypeWritebackJson {
     let semantics = response.function_facts.semantics.clone();
     let compiled_semantics = semantics
@@ -5327,7 +5376,7 @@ fn type_writeback_payload_from_engine_response(
         .as_ref()
         .and_then(|summary| serde_json::to_string(summary).ok());
 
-    writeback_plan_json(
+    writeback_plan_json_with_policy(
         response.writeback_plan,
         InterprocSummaryJson {
             callsite_count: response.callsite_count,
@@ -5342,6 +5391,7 @@ fn type_writeback_payload_from_engine_response(
         semantics,
         compiled_semantics,
         budget,
+        apply_policy,
     )
 }
 
@@ -5356,6 +5406,7 @@ struct SemanticTypeFallbackPayloadInput<'a> {
     symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
     apply_artifact_signature_hint: bool,
     budget: TypeOutputBudget,
+    apply_policy: r2types::TypeWritebackApplyPolicy,
 }
 
 fn semantic_type_fallback_payload(
@@ -5371,8 +5422,12 @@ fn semantic_type_fallback_payload(
         input.function_facts,
         input.apply_artifact_signature_hint,
     );
-    let mutation_plan =
-        r2types::type_writeback_mutation_plan(&plan, input.budget, &input.function_facts.types);
+    let mutation_plan = r2types::type_writeback_mutation_plan_with_policy(
+        &plan,
+        input.budget,
+        &input.function_facts.types,
+        input.apply_policy,
+    );
     let signature_writeback = r2types::signature_writeback_decision(&input.function_facts.types);
     let signature_render_authorized = input
         .function_facts
@@ -7714,6 +7769,7 @@ struct TypeWritebackInferenceInput<'a> {
     global_max_links: usize,
     max_type_decls: usize,
     max_mutations: usize,
+    apply_policy: r2types::TypeWritebackApplyPolicy,
 }
 
 struct SemanticWorkerLinearizationInput {
@@ -7829,6 +7885,7 @@ fn build_function_analysis_shared_bundle(
         input.interproc,
         symbolic_scope.as_ref(),
         output_budget,
+        input.apply_policy,
     );
     push_phase(&mut phase_timings, "writeback", phase_start);
     complete_type_phase_timings(&mut phase_timings);
@@ -7931,6 +7988,7 @@ pub extern "C" fn r2sleigh_session_analyze(
         global_max_links: input.budget.global_max_links.max(1),
         max_type_decls: input.budget.max_type_decls.max(1),
         max_mutations: input.budget.max_mutations.max(1),
+        apply_policy: type_writeback_apply_policy_from_ffi(&input.apply_policy),
     };
     let Some(bundle) = build_function_analysis_shared_bundle(inference_input) else {
         return ptr::null_mut();
@@ -8089,6 +8147,7 @@ pub extern "C" fn r2sleigh_bounded_type_json_ffi(
             max_type_decls.max(1),
             max_mutations.max(1),
         ),
+        apply_policy: r2types::TypeWritebackApplyPolicy::balanced(),
         reason,
     });
     payload.phase_timings = vec![PhaseTimingJson {
@@ -8219,6 +8278,7 @@ pub extern "C" fn r2sleigh_session_artifact_cache_key(input: *const R2SleighSess
         global_max_links: input.budget.global_max_links.max(1),
         max_type_decls: input.budget.max_type_decls.max(1),
         max_mutations: input.budget.max_mutations.max(1),
+        apply_policy: type_writeback_apply_policy_from_ffi(&input.apply_policy),
     };
     let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
     let ptr_bits = function_input
@@ -8282,6 +8342,7 @@ pub extern "C" fn r2sleigh_session_interproc_summary_json(
         global_max_links: input.budget.global_max_links.max(1),
         max_type_decls: input.budget.max_type_decls.max(1),
         max_mutations: input.budget.max_mutations.max(1),
+        apply_policy: type_writeback_apply_policy_from_ffi(&input.apply_policy),
     };
     let symbolic_scope = build_inference_symbolic_scope(&inference_input, &function_input);
     let ptr_bits = function_input
@@ -10234,6 +10295,7 @@ mod tests {
             symbolic_scope: None,
             apply_artifact_signature_hint: false,
             budget: TypeOutputBudget::new(64, usize::MAX, usize::MAX),
+            apply_policy: r2types::TypeWritebackApplyPolicy::balanced(),
         });
         let value = serde_json::to_value(payload).expect("payload should serialize");
         assert_eq!(
@@ -11019,6 +11081,10 @@ mod integration_tests {
             debug_seed: R2SleighDebugSeed {
                 schema_version: 1,
                 seed_hash: 0,
+            },
+            apply_policy: R2SleighTypeWritebackApplyPolicy {
+                schema_version: 1,
+                mode: R2SLEIGH_TYPE_WRITEBACK_BALANCED,
             },
             budget: R2SleighBudgetConfig {
                 schema_version: 1,
@@ -15542,6 +15608,10 @@ mod integration_tests {
             debug_seed: R2SleighDebugSeed {
                 schema_version: 1,
                 seed_hash: 0,
+            },
+            apply_policy: R2SleighTypeWritebackApplyPolicy {
+                schema_version: 1,
+                mode: R2SLEIGH_TYPE_WRITEBACK_BALANCED,
             },
             budget: R2SleighBudgetConfig {
                 schema_version: 1,
