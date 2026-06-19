@@ -335,9 +335,8 @@ impl<'a> FoldingContext<'a> {
             return true;
         }
 
-        self.callee_facts_map()
-            .keys()
-            .any(|addr| identity.matches_identity(&self.callee_identity_for_direct_target(*addr)))
+        self.modeled_callee_addr_for_identity(&identity)
+            .is_some_and(|addr| self.inputs.callee_facts.contains_key(&addr))
     }
 
     pub(super) fn render_call_arg_for_callee(

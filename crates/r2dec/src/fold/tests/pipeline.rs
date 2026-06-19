@@ -820,6 +820,37 @@ mod tests {
     }
 
     #[test]
+    fn modeled_call_target_uses_typed_resolution_without_fact_scan() {
+        let mut ctx = FoldingContext::new(64);
+        let typed_names = HashMap::from([(0x401000, "sym.imp.memcpy".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, minimal_callee_fact(0x401000, "sym.imp.memcpy"))]);
+        let known_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                r2types::CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            },
+        );
+        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+
+        assert!(ctx.is_modeled_call_target(&CExpr::Var(
+            "sym.imp.memcpy".to_string()
+        )));
+    }
+
+    #[test]
     fn test_call_args_do_not_clamp_variadic_signature() {
         let mut ctx = FoldingContext::new(64);
         let mut names = HashMap::new();
@@ -18475,11 +18506,8 @@ mod tests {
                 call_expr_keys: BTreeSet::new(),
             },
         );
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
-            0x401500,
-            "helper.alloc_wrapper".to_string(),
-        )])));
-        ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
+        let function_names = HashMap::from([(0x401500, "helper.alloc_wrapper".to_string())]);
+        let callee_facts = BTreeMap::from([(
             0x401500,
             CalleeFact {
                 function_id: 0x401500,
@@ -18509,7 +18537,26 @@ mod tests {
                 writes_global_memory: false,
                 touches_unknown_memory: false,
             },
-        )])));
+        )]);
+        let known_signatures = HashMap::new();
+        let callee_resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                r2types::CallsiteKey {
+                    block_addr: source_call.0,
+                    op_index: source_call.1,
+                },
+                0x401500,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: ctx.inputs.symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            },
+        );
+        ctx.inputs.function_names = Box::leak(Box::new(function_names));
+        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(callee_resolution)));
 
         let rendered = ctx.render_call_arg_for_callee(
             &CExpr::Var("helper.alloc_wrapper".to_string()),

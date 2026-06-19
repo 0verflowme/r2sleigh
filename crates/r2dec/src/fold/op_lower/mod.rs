@@ -33,7 +33,7 @@ use r2types::StackSlotKey;
 #[cfg(test)]
 use r2types::TypeOracle;
 use r2types::{
-    CTypeLike, CalleeFact, CalleeIdentity, CalleeIdentityContext, ExternalField, ExternalStackBase,
+    CTypeLike, CalleeIdentity, CalleeIdentityContext, ExternalField, ExternalStackBase,
     ExternalStackSlotRole, ExternalStruct, ExternalUnion, TypeArena, normalize_callee_name,
     normalize_external_type_name, parse_type_like_spec,
 };
@@ -1008,9 +1008,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn call_args_map(&self) -> &HashMap<(u64, usize), Vec<analysis::CallArgBinding>> {
         &self.use_info().call_args
     }
-    pub(crate) fn callee_facts_map(&self) -> &std::collections::BTreeMap<u64, CalleeFact> {
-        self.inputs.callee_facts
-    }
     pub(crate) fn callee_identity_context(&self) -> CalleeIdentityContext<'_> {
         CalleeIdentityContext {
             function_names: self.inputs.function_names,
@@ -1044,6 +1041,24 @@ impl<'a> FoldingContext<'a> {
     }
     pub(crate) fn callee_identity_for_expr(&self, expr: &CExpr) -> Option<CalleeIdentity> {
         call_arg_callee_name(expr).map(|name| self.callee_identity_for_name(name))
+    }
+    pub(crate) fn modeled_callee_addr_for_identity(
+        &self,
+        identity: &CalleeIdentity,
+    ) -> Option<u64> {
+        if let Some(addr) = identity.target_addr
+            && self.inputs.callee_facts.contains_key(&addr)
+        {
+            return Some(addr);
+        }
+
+        let facts = self.inputs.callee_resolution?;
+        identity
+            .aliases
+            .iter()
+            .find_map(|alias| facts.identity_for_name(alias))
+            .and_then(|identity| identity.target_addr)
+            .filter(|addr| self.inputs.callee_facts.contains_key(addr))
     }
     pub(crate) fn call_result_aliases_map(
         &self,
