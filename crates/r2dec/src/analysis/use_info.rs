@@ -6025,25 +6025,15 @@ fn call_target_is_imported(
         block_addr,
         op_index,
     };
-    if let Some(identity) = env
-        .callee_resolution
-        .and_then(|facts| facts.identity_for_callsite(callsite))
-    {
-        return identity.is_imported_name_hint();
-    }
-    let Some(addr) = parse_target_addr(target) else {
+    let Some(facts) = env.callee_resolution else {
         return false;
     };
-    if let Some(identity) = env
-        .callee_resolution
-        .and_then(|facts| facts.identity_for_direct_addr(addr))
-    {
+    if let Some(identity) = facts.identity_for_callsite(callsite) {
         return identity.is_imported_name_hint();
     }
-    env.function_names
-        .get(&addr)
-        .or_else(|| env.symbols.get(&addr))
-        .is_some_and(|name| r2types::callee_name_is_import_like(name))
+    parse_target_addr(target)
+        .and_then(|addr| facts.identity_for_direct_addr(addr))
+        .is_some_and(|identity| identity.is_imported_name_hint())
 }
 
 fn should_append_unknown_stack_args(
@@ -8589,6 +8579,29 @@ mod tests {
         }
     }
 
+    fn minimal_callee_fact(addr: u64, name: &str) -> r2types::CalleeFact {
+        r2types::CalleeFact {
+            function_id: addr,
+            name: Some(name.to_string()),
+            direct_callees: Vec::new(),
+            callsite_count: 0,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: Vec::new(),
+            transfer_effects: Vec::new(),
+            allocation_effects: Vec::new(),
+            lifetime_effects: Vec::new(),
+            sync_effects: Vec::new(),
+            atomic_effects: Vec::new(),
+            param_type_hints: BTreeMap::new(),
+            return_type_hint: None,
+            return_relation: r2types::CalleeReturnRelation::Unknown,
+            reads_global_memory: false,
+            writes_global_memory: false,
+            touches_unknown_memory: false,
+        }
+    }
+
     #[test]
     fn call_target_import_policy_uses_typed_callee_identity() {
         let op = SSAOp::Call {
@@ -8599,8 +8612,20 @@ mod tests {
             let mut fixture = TestEnvFixture::default();
             fixture.function_names.insert(0x401000, name.to_string());
             let env = fixture.env();
-            assert!(call_target_is_imported(0x1000, 0, &op, &env), "{name}");
+            assert!(
+                !call_target_is_imported(0x1000, 0, &op, &env),
+                "raw function-name fallback must not own import policy: {name}"
+            );
         }
+        let mut fixture = TestEnvFixture::default();
+        fixture
+            .symbols
+            .insert(0x401000, "sym.imp.printf".to_string());
+        let env = fixture.env();
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "raw symbol fallback must not own import policy"
+        );
 
         for name in ["sym.helper", "fcn.401000", "plain_helper"] {
             let mut fixture = TestEnvFixture::default();
@@ -8608,6 +8633,35 @@ mod tests {
             let env = fixture.env();
             assert!(!call_target_is_imported(0x1000, 0, &op, &env), "{name}");
         }
+
+        let mut fixture = TestEnvFixture::default();
+        fixture
+            .function_names
+            .insert(0x401000, "sym.imp.printf".to_string());
+        let base_env = fixture.env();
+        let empty_resolution = r2types::CalleeResolutionFacts::default();
+        let env = PassEnv {
+            callee_resolution: Some(&empty_resolution),
+            ..base_env
+        };
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "typed resolution miss must not inherit raw function-name import policy"
+        );
+
+        let mut fixture = TestEnvFixture::default();
+        fixture
+            .symbols
+            .insert(0x401000, "sym.imp.printf".to_string());
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_resolution: Some(&empty_resolution),
+            ..base_env
+        };
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "typed resolution miss must not inherit raw symbol import policy"
+        );
 
         let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
         let typed_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
@@ -8640,8 +8694,44 @@ mod tests {
         };
         assert!(call_target_is_imported(0x1000, 0, &op, &env));
 
+        let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let typed_function_names = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, minimal_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(
+            call_target_is_imported(0x1000, 0, &op, &env),
+            "callee facts can certify import policy only through typed resolution"
+        );
+
         let fallback_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
         let typed_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::new();
         let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
             [(
                 CallsiteKey {
@@ -8667,6 +8757,36 @@ mod tests {
             ..base_env
         };
         assert!(!call_target_is_imported(0x1000, 0, &op, &env));
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_typed_indirect_callsite_identity() {
+        let op = SSAOp::CallInd {
+            target: mk("X16", 0, 8),
+        };
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let key = r2types::CalleeIdentityKey::IndirectSite(callsite);
+        let mut resolution = r2types::CalleeResolutionFacts::default();
+        resolution.by_key.insert(
+            key.clone(),
+            r2types::CalleeIdentity::from_name("sym.imp.printf"),
+        );
+        resolution.by_callsite.insert(callsite, key);
+
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            call_target_is_imported(0x1000, 0, &op, &env),
+            "indirect calls must use typed callsite identity when no address can be parsed"
+        );
     }
 
     #[test]
