@@ -6,9 +6,8 @@ use r2ssa::{
     SsaArtifact, ValueId,
 };
 use r2types::{
-    CalleeFact, CalleeIdentity, CalleeIdentityContext, CalleeResolutionFacts, CallsiteKey,
-    ExternalStackSlotRole, ExternalStackSlotSpec, FunctionType, StackSlotKey, VisibleBinding,
-    VisibleBindingKind,
+    CalleeIdentity, CalleeResolutionFacts, CallsiteKey, ExternalStackSlotRole,
+    ExternalStackSlotSpec, FunctionType, StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
 
 use super::lower::LowerCtx;
@@ -65,9 +64,6 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
     pub(crate) abi_arg_regs: &'a [String],
     pub(crate) ret_reg_name: &'a str,
-    pub(crate) function_names: &'a HashMap<u64, String>,
-    pub(crate) symbols: &'a HashMap<u64, String>,
-    pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
@@ -2184,22 +2180,14 @@ fn param_alias_for_var(
         .cloned()
 }
 
-fn lookup_callee_identity(inputs: &PreparedSemanticViewInputs<'_>, addr: u64) -> CalleeIdentity {
-    if let Some(identity) = inputs
+fn lookup_callee_identity(
+    inputs: &PreparedSemanticViewInputs<'_>,
+    addr: u64,
+) -> Option<CalleeIdentity> {
+    inputs
         .callee_resolution
         .and_then(|facts| facts.identity_for_direct_addr(addr))
-    {
-        return identity.clone();
-    }
-    CalleeIdentity::from_direct_target(
-        addr,
-        &CalleeIdentityContext {
-            function_names: inputs.function_names,
-            symbols: inputs.symbols,
-            callee_facts: inputs.callee_facts,
-            known_function_signatures: inputs.known_function_signatures,
-        },
-    )
+        .cloned()
 }
 
 fn lookup_callee_identity_for_site(
@@ -2215,7 +2203,7 @@ fn lookup_callee_identity_for_site(
         .callee_resolution
         .and_then(|facts| facts.identity_for_callsite(callsite))
         .cloned()
-        .or_else(|| direct_target.map(|addr| lookup_callee_identity(inputs, addr)))
+        .or_else(|| direct_target.and_then(|addr| lookup_callee_identity(inputs, addr)))
 }
 
 fn scalar_owner_expr_for_value(
@@ -3839,9 +3827,6 @@ mod tests {
         let prepared = test_prepared_artifact();
         let summaries = InterprocSummarySet::default();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
-        let function_names = HashMap::new();
-        let symbols = HashMap::new();
-        let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
@@ -3855,9 +3840,6 @@ mod tests {
             interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
             ret_reg_name: "rax",
-            function_names: &function_names,
-            symbols: &symbols,
-            callee_facts: &callee_facts,
             callee_resolution: None,
             known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
@@ -3875,12 +3857,11 @@ mod tests {
         let prepared = test_prepared_call_artifact();
         let summaries = InterprocSummarySet::default();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
-        let fallback_function_names = HashMap::from([(0x401000, "sym.local_helper".to_string())]);
         let resolution_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
         let symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::new();
-        let resolution_ctx = CalleeIdentityContext {
+        let resolution_ctx = r2types::CalleeIdentityContext {
             function_names: &resolution_function_names,
             symbols: &symbols,
             callee_facts: &callee_facts,
@@ -3905,9 +3886,6 @@ mod tests {
             interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
             ret_reg_name: "rax",
-            function_names: &fallback_function_names,
-            symbols: &symbols,
-            callee_facts: &callee_facts,
             callee_resolution: Some(&callee_resolution),
             known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
@@ -3928,11 +3906,82 @@ mod tests {
     }
 
     #[test]
+    fn prepared_view_uses_typed_direct_addr_identity_without_callsite_binding() {
+        let prepared = test_prepared_call_artifact();
+        let summaries = InterprocSummarySet::default();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
+        let mut callee_resolution = CalleeResolutionFacts::default();
+        callee_resolution
+            .by_direct_addr
+            .insert(0x401000, key.clone());
+        callee_resolution
+            .by_key
+            .insert(key, CalleeIdentity::from_name("sym.imp.printf"));
+        let known_function_signatures = HashMap::new();
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            interproc_summary_set: Some(&summaries),
+            abi_arg_regs: &abi_arg_regs,
+            ret_reg_name: "rax",
+            callee_resolution: Some(&callee_resolution),
+            known_function_signatures: &known_function_signatures,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 0))
+            .expect("direct callsite should have prepared call view");
+        let identity = call_view
+            .callee_identity
+            .as_ref()
+            .expect("direct-address identity should be used without callsite binding");
+        assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
+        assert!(identity.is_imported_name_hint());
+    }
+
+    #[test]
+    fn prepared_view_refuses_raw_callee_identity_without_typed_resolution() {
+        let prepared = test_prepared_call_artifact();
+        let summaries = InterprocSummarySet::default();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let known_function_signatures = HashMap::new();
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            interproc_summary_set: Some(&summaries),
+            abi_arg_regs: &abi_arg_regs,
+            ret_reg_name: "rax",
+            callee_resolution: None,
+            known_function_signatures: &known_function_signatures,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 0))
+            .expect("direct callsite should have prepared call view");
+        assert!(
+            call_view.callee_identity.is_none(),
+            "prepared semantic view must not certify raw callee names without typed resolution"
+        );
+    }
+
+    #[test]
     fn prepared_call_arity_prefers_typed_callee_signature_over_summary_hint() {
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let typed_function_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
-        let fallback_function_names = HashMap::from([(0x401000, "sym.local_two_arg".to_string())]);
         let symbols = HashMap::new();
         let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::from([(
@@ -3946,7 +3995,7 @@ mod tests {
                 variadic: false,
             },
         )]);
-        let resolution_ctx = CalleeIdentityContext {
+        let resolution_ctx = r2types::CalleeIdentityContext {
             function_names: &typed_function_names,
             symbols: &symbols,
             callee_facts: &callee_facts,
@@ -3977,9 +4026,6 @@ mod tests {
             interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
             ret_reg_name: "rax",
-            function_names: &fallback_function_names,
-            symbols: &symbols,
-            callee_facts: &callee_facts,
             callee_resolution: Some(&callee_resolution),
             known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
@@ -4004,9 +4050,6 @@ mod tests {
     fn prepared_call_arity_uses_summary_hint_when_typed_signature_is_absent() {
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
-        let function_names = HashMap::from([(0x401000, "sym.local_two_arg".to_string())]);
-        let symbols = HashMap::new();
-        let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::new();
         let mut summaries = InterprocSummarySet::default();
         let summary_id = r2ssa::InterprocFunctionId(0x401000);
@@ -4023,9 +4066,6 @@ mod tests {
             interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
             ret_reg_name: "rax",
-            function_names: &function_names,
-            symbols: &symbols,
-            callee_facts: &callee_facts,
             callee_resolution: None,
             known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,

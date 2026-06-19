@@ -18766,18 +18766,35 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("prepared_call_root");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.set_function_names(HashMap::from([(
-            0x401050,
-            "sym.function_name".to_string(),
-        )]));
-        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
+        let function_names = HashMap::from([(0x401050, "sym.function_name".to_string())]);
+        let symbols = HashMap::from([(
             0x401050,
             "sym.symbol_name".to_string(),
-        )])));
-        ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
+        )]);
+        let callee_facts = BTreeMap::from([(
             0x401050,
             minimal_callee_fact(0x401050, "sym.imp.fact_helper"),
-        )])));
+        )]);
+        let known_signatures = HashMap::new();
+        let callee_resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                r2types::CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 1,
+                },
+                0x401050,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            },
+        );
+        ctx.inputs.function_names = Box::leak(Box::new(function_names));
+        ctx.inputs.symbols = Box::leak(Box::new(symbols));
+        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(callee_resolution)));
 
         let block = prepared.function().get_block(0x1000).expect("entry");
         let SSAOp::Call { target } = &block.ops[1] else {

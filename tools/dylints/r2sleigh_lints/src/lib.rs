@@ -8,7 +8,7 @@ extern crate rustc_session;
 
 use clippy_utils::diagnostics::span_lint;
 use rustc_ast::LitKind;
-use rustc_hir::{Expr, ExprKind};
+use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 
 dylint_linting::dylint_library!();
@@ -100,6 +100,33 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when `r2dec` analysis code reconstructs imported-callee policy from
+    /// raw names instead of consuming typed `CalleeResolutionFacts`.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Import classification depends on the same callsite, direct-address,
+    /// summary, and typed-signature evidence as callee identity. Rebuilding it in
+    /// analysis from `function_names`, `symbols`, or ad hoc name helpers creates a
+    /// second owner and lets raw hints override typed facts.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// r2types::callee_name_is_import_like(name);
+    /// r2types::CalleeIdentity::from_direct_target(addr, &ctx).is_imported_name_hint();
+    /// ```
+    ///
+    /// Use instead `CalleeResolutionFacts::identity_for_callsite()` or
+    /// `identity_for_direct_addr()` and query the returned `CalleeIdentity`.
+    pub R2DEC_RAW_CALLEE_IMPORT_POLICY,
+    Warn,
+    "r2dec analysis should use typed callee resolution for import policy"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2plugin` code directly reconstructs type
     /// signature writeback authority instead of consuming a typed `r2types`
     /// decision.
@@ -154,6 +181,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     STRING_PREFIX_SEMANTIC_CLASSIFICATION,
     R2_JSON_COMMAND_INTERNAL_SEAM,
     R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
+    R2DEC_RAW_CALLEE_IMPORT_POLICY,
     R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
     R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP
 ]);
@@ -165,6 +193,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         STRING_PREFIX_SEMANTIC_CLASSIFICATION,
         R2_JSON_COMMAND_INTERNAL_SEAM,
         R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
+        R2DEC_RAW_CALLEE_IMPORT_POLICY,
         R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
         R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
     ]);
@@ -199,6 +228,15 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
                 expr.span,
                 "r2dec must resolve function signatures through r2types::CalleeIdentity, not direct raw-map lookup",
+            );
+        }
+
+        if is_r2dec_analysis_path(cx, expr) && raw_callee_import_policy_expr(expr) {
+            span_lint(
+                cx,
+                R2DEC_RAW_CALLEE_IMPORT_POLICY,
+                expr.span,
+                "r2dec analysis must consume CalleeResolutionFacts for import policy, not reconstruct it from raw callee names",
             );
         }
 
@@ -303,9 +341,41 @@ fn expr_references_known_function_signatures(expr: &Expr<'_>) -> bool {
     }
 }
 
+fn raw_callee_import_policy_expr(expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::Call(callee, _) => {
+            expr_path_last_segment_is(callee, "callee_name_is_import_like")
+                || expr_path_last_segment_is(callee, "from_direct_target")
+        }
+        _ => false,
+    }
+}
+
+fn expr_path_last_segment_is(expr: &Expr<'_>, name: &str) -> bool {
+    match expr.kind {
+        ExprKind::Path(ref qpath) => qpath_last_segment_is(qpath, name),
+        _ => false,
+    }
+}
+
+fn qpath_last_segment_is(qpath: &QPath<'_>, name: &str) -> bool {
+    match qpath {
+        QPath::Resolved(_, path) => path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident.name.as_str() == name),
+        QPath::TypeRelative(_, segment) => segment.ident.name.as_str() == name,
+    }
+}
+
 fn is_r2dec_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let filename = cx.sess().source_map().span_to_filename(expr.span);
     format!("{filename:?}").contains("crates/r2dec/src/")
+}
+
+fn is_r2dec_analysis_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    let filename = cx.sess().source_map().span_to_filename(expr.span);
+    format!("{filename:?}").contains("crates/r2dec/src/analysis/")
 }
 
 fn is_r2plugin_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
