@@ -355,6 +355,10 @@ pub struct TypeWritebackMutation {
     #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
     pub type_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_materialization_key: Option<String>,
+    #[serde(skip_serializing_if = "bool_is_false")]
+    pub type_materialization_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub addr: Option<u64>,
@@ -478,6 +482,10 @@ struct TypeMutationPushContext<'a> {
     apply_policy: TypeWritebackApplyPolicy,
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn push_apply_authorized_type_mutation(
     ctx: &mut TypeMutationPushContext<'_>,
     mutation: TypeWritebackMutation,
@@ -550,6 +558,8 @@ pub fn type_writeback_mutation_plan_with_policy(
             name: Some(plan.signature.function_name.clone()),
             reg: None,
             type_name: None,
+            type_materialization_key: None,
+            type_materialization_required: false,
             text: None,
             addr: None,
             size: None,
@@ -571,6 +581,8 @@ pub fn type_writeback_mutation_plan_with_policy(
             name: Some(plan.signature.function_name.clone()),
             reg: None,
             type_name: None,
+            type_materialization_key: None,
+            type_materialization_required: false,
             text: None,
             addr: None,
             size: None,
@@ -607,6 +619,8 @@ pub fn type_writeback_mutation_plan_with_policy(
                     name: Some(decl.name.clone()),
                     reg: None,
                     type_name: None,
+                    type_materialization_key: None,
+                    type_materialization_required: false,
                     text: Some(decl.decl.clone()),
                     addr: None,
                     size: None,
@@ -640,6 +654,13 @@ pub fn type_writeback_mutation_plan_with_policy(
         };
 
         for candidate in &plan.var_type_candidates {
+            let apply_type = canonicalize_writeback_apply_type_name(&candidate.var_type)
+                .unwrap_or_else(|| candidate.var_type.clone());
+            let type_materialization_key = writeback_type_materialization_key(&apply_type);
+            let type_materialization_required = type_materialization_required_for_type(
+                &apply_type,
+                type_materialization_key.as_deref(),
+            );
             if candidate.confidence >= MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE {
                 push_apply_authorized_type_mutation(
                     &mut mutation_ctx,
@@ -652,7 +673,9 @@ pub fn type_writeback_mutation_plan_with_policy(
                         old_name: None,
                         name: Some(candidate.name.clone()),
                         reg: candidate.reg.clone(),
-                        type_name: Some(candidate.var_type.clone()),
+                        type_name: Some(apply_type.clone()),
+                        type_materialization_key: type_materialization_key.clone(),
+                        type_materialization_required,
                         text: None,
                         addr: None,
                         size: Some(candidate.size as u64),
@@ -676,7 +699,9 @@ pub fn type_writeback_mutation_plan_with_policy(
                     old_name: Some(candidate.name.clone()),
                     name: Some(candidate.name.clone()),
                     reg: candidate.reg.clone(),
-                    type_name: Some(candidate.var_type.clone()),
+                    type_name: Some(apply_type.clone()),
+                    type_materialization_key: type_materialization_key.clone(),
+                    type_materialization_required,
                     text: None,
                     addr: None,
                     size: Some(candidate.size as u64),
@@ -703,6 +728,8 @@ pub fn type_writeback_mutation_plan_with_policy(
                     name: Some(candidate.target_name.clone()),
                     reg: None,
                     type_name: None,
+                    type_materialization_key: None,
+                    type_materialization_required: false,
                     text: None,
                     addr: None,
                     size: None,
@@ -717,6 +744,13 @@ pub fn type_writeback_mutation_plan_with_policy(
         }
 
         for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
+            let apply_type = canonicalize_writeback_apply_type_name(&candidate.target_type)
+                .unwrap_or_else(|| candidate.target_type.clone());
+            let type_materialization_key = writeback_type_materialization_key(&apply_type);
+            let type_materialization_required = type_materialization_required_for_type(
+                &apply_type,
+                type_materialization_key.as_deref(),
+            );
             push_apply_authorized_type_mutation(
                 &mut mutation_ctx,
                 TypeWritebackMutation {
@@ -728,7 +762,9 @@ pub fn type_writeback_mutation_plan_with_policy(
                     old_name: None,
                     name: None,
                     reg: None,
-                    type_name: Some(candidate.target_type.clone()),
+                    type_name: Some(apply_type.clone()),
+                    type_materialization_key,
+                    type_materialization_required,
                     text: None,
                     addr: Some(candidate.addr),
                     size: None,
@@ -881,6 +917,20 @@ mod kani_proofs {
         }
 
         assert!(!ascii_suffix_is_nonempty_decimal(&[]));
+    }
+
+    #[kani::proof]
+    fn type_materialization_required_from_key_is_fail_closed() {
+        let key = match kani::any::<u8>() % 3 {
+            0 => None,
+            1 => Some("Foo"),
+            _ => Some(""),
+        };
+        let required = type_materialization_required_from_key(key);
+        match key {
+            Some(value) if !value.is_empty() => assert!(required),
+            _ => assert!(!required),
+        }
     }
 }
 
@@ -8406,6 +8456,34 @@ pub fn canonicalize_writeback_apply_type_name(type_name: &str) -> Option<String>
     }
 }
 
+pub fn writeback_type_materialization_key(type_name: &str) -> Option<String> {
+    if writeback_apply_type_name_is_generic(type_name) {
+        return None;
+    }
+    let canonical = canonicalize_writeback_apply_type_name(type_name)?;
+    aggregate_type_materialization_key(&canonical)
+        .or_else(|| named_type_materialization_key(&canonical))
+}
+
+pub fn writeback_type_materialization_required(type_name: &str) -> bool {
+    type_materialization_required_for_type(
+        type_name,
+        writeback_type_materialization_key(type_name).as_deref(),
+    )
+}
+
+fn type_materialization_required_for_type(
+    type_name: &str,
+    type_materialization_key: Option<&str>,
+) -> bool {
+    type_materialization_required_from_key(type_materialization_key)
+        || writeback_apply_type_name_is_opaque_placeholder(type_name)
+}
+
+fn type_materialization_required_from_key(type_materialization_key: Option<&str>) -> bool {
+    type_materialization_key.is_some_and(|key| !key.is_empty())
+}
+
 pub fn writeback_var_name_is_generated(name: &str) -> bool {
     if name.is_empty() {
         return true;
@@ -8427,6 +8505,94 @@ fn normalize_writeback_apply_compare_string(type_name: &str) -> String {
         .filter(|ch| !ch.is_whitespace() && *ch != ';')
         .map(|ch| ch.to_ascii_lowercase())
         .collect()
+}
+
+fn aggregate_type_materialization_key(type_name: &str) -> Option<String> {
+    for prefix in ["struct ", "struct.", "union ", "union.", "enum ", "enum."] {
+        let Some(mut rest) = type_name.trim().strip_prefix(prefix) else {
+            continue;
+        };
+        rest = rest.trim_start();
+        if let Some(stripped) = rest.strip_prefix("type.") {
+            rest = stripped;
+        }
+        let name = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect::<String>();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn named_type_materialization_key(type_name: &str) -> Option<String> {
+    let normalized = normalized_materialization_compare_key(type_name);
+    if normalized.is_empty() || writeback_apply_normalized_type_is_builtin(&normalized) {
+        None
+    } else {
+        exact_materialization_type_key(type_name)
+    }
+}
+
+fn normalized_materialization_compare_key(type_name: &str) -> String {
+    let mut normalized =
+        normalize_writeback_apply_compare_string(strip_leading_c_qualifiers(type_name));
+    while normalized.ends_with('*') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn exact_materialization_type_key(type_name: &str) -> Option<String> {
+    let mut exact = strip_leading_c_qualifiers(type_name).trim().to_string();
+    while exact.ends_with('*') {
+        exact.pop();
+        exact = exact.trim_end().to_string();
+    }
+    if exact.is_empty() { None } else { Some(exact) }
+}
+
+fn strip_leading_c_qualifiers(mut type_name: &str) -> &str {
+    loop {
+        let trimmed = type_name.trim_start();
+        let Some((token, rest)) = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(token, rest)| (token, rest.trim_start()))
+        else {
+            return trimmed;
+        };
+        if matches!(token, "const" | "volatile" | "restrict" | "register") {
+            type_name = rest;
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn writeback_apply_normalized_type_is_builtin(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "void"
+            | "bool"
+            | "char"
+            | "signedchar"
+            | "unsignedchar"
+            | "short"
+            | "unsignedshort"
+            | "int"
+            | "unsigned"
+            | "unsignedint"
+            | "long"
+            | "unsignedlong"
+            | "longlong"
+            | "unsignedlonglong"
+            | "float"
+            | "double"
+            | "size_t"
+    ) || normalized.starts_with("int")
+        || normalized.starts_with("uint")
 }
 
 fn ascii_suffix_is_nonempty_decimal(bytes: &[u8]) -> bool {
@@ -8685,6 +8851,111 @@ mod tests {
         assert_eq!(canonicalize_writeback_apply_type_name("   "), None);
     }
 
+    #[test]
+    fn writeback_type_materialization_key_extracts_live_type_db_keys() {
+        for (raw, expected) in [
+            ("struct.Foo*", "Foo"),
+            ("struct type.Foo *", "Foo"),
+            ("union.Bar *", "Bar"),
+            ("enum Baz", "Baz"),
+            ("IOCPU_VTable *", "IOCPU_VTable"),
+            ("const MyAlias *", "MyAlias"),
+            ("constant_t *", "constant_t"),
+        ] {
+            assert_eq!(
+                writeback_type_materialization_key(raw).as_deref(),
+                Some(expected),
+                "{raw:?} should derive the exact radare2 materialization key"
+            );
+            assert!(
+                writeback_type_materialization_required(raw),
+                "{raw:?} should require live type-db verification"
+            );
+        }
+    }
+
+    #[test]
+    fn writeback_type_materialization_key_omits_builtin_generic_and_opaque_types() {
+        for raw in [
+            "int *",
+            "int32_t *",
+            "uint64_t *",
+            "const uint64_t *",
+            "size_t *",
+            "unsigned long *",
+            "int32_t",
+            "uint64_t",
+            "void *",
+            "char *",
+            "byte[8]",
+        ] {
+            assert_eq!(writeback_type_materialization_key(raw), None);
+            assert!(
+                !writeback_type_materialization_required(raw),
+                "{raw:?} should not require a radare2 type-db key"
+            );
+        }
+
+        let opaque = "struct type_0x123 *";
+        assert_eq!(writeback_type_materialization_key(opaque), None);
+        assert!(
+            writeback_type_materialization_required(opaque),
+            "opaque placeholders should fail closed when no materialization key exists"
+        );
+    }
+
+    #[test]
+    fn type_writeback_mutation_serializes_materialization_required_only_when_true() {
+        let mut mutation = TypeWritebackMutation {
+            kind: TypeWritebackMutationKind::VarType,
+            signature: None,
+            ret_type: None,
+            params: Vec::new(),
+            callconv: None,
+            old_name: None,
+            name: Some("var_8h".to_string()),
+            reg: None,
+            type_name: Some("int32_t".to_string()),
+            type_materialization_key: None,
+            type_materialization_required: false,
+            text: None,
+            addr: None,
+            size: Some(4),
+            delta: Some(-8),
+            var_kind: Some("b".to_string()),
+            is_arg: Some(false),
+            confidence: 90,
+            source: WritebackSource::ExternalTypeDb.as_str().to_string(),
+            evidence: vec!["unit-test".to_string()],
+        };
+        let value = serde_json::to_value(&mutation).expect("mutation should serialize");
+        assert!(
+            value.get("type_materialization_required").is_none(),
+            "false materialization requirement should be omitted from JSON"
+        );
+        assert!(
+            value.get("type_materialization_key").is_none(),
+            "absent materialization key should be omitted from JSON"
+        );
+
+        mutation.type_name = Some("struct Foo *".to_string());
+        mutation.type_materialization_key = Some("Foo".to_string());
+        mutation.type_materialization_required = true;
+        let value = serde_json::to_value(&mutation).expect("mutation should serialize");
+        assert_eq!(
+            value
+                .get("type_materialization_required")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .get("type_materialization_key")
+                .and_then(serde_json::Value::as_str),
+            Some("Foo")
+        );
+    }
+
     fn certified_signature_facts(param_name: &str, param_bits: u32) -> FunctionTypeFacts {
         let signature_spec = test_signature_spec(param_name, param_bits);
         let signature_certificate = SignatureCertificate::from_signature(
@@ -8919,6 +9190,94 @@ mod tests {
             mutation_plan.mutations[0].evidence,
             vec!["signature-certificate:external_context".to_string()]
         );
+    }
+
+    #[test]
+    fn mutation_plan_propagates_type_materialization_keys() {
+        let mut plan = empty_writeback_plan("dbg.types");
+        plan.var_type_candidates.push(VarTypeCandidate {
+            name: "var_8h".to_string(),
+            kind: "b".to_string(),
+            delta: -8,
+            var_type: "struct type.Foo*".to_string(),
+            isarg: false,
+            reg: None,
+            size: 8,
+            confidence: MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE,
+            source: WritebackSource::ExternalTypeDb,
+            evidence: vec![WritebackEvidence::ExternalStackAnnotation],
+        });
+        plan.global_type_links.push(GlobalTypeLinkCandidate {
+            addr: 0x404000,
+            target_type: "struct.Foo*".to_string(),
+            confidence: 95,
+            source: WritebackSource::ExternalTypeDb,
+        });
+        plan.var_type_candidates.push(VarTypeCandidate {
+            name: "var_ch".to_string(),
+            kind: "b".to_string(),
+            delta: -12,
+            var_type: "int32_t".to_string(),
+            isarg: false,
+            reg: None,
+            size: 4,
+            confidence: 90,
+            source: WritebackSource::ExternalTypeDb,
+            evidence: vec![WritebackEvidence::ExternalStackAnnotation],
+        });
+        plan.var_type_candidates.push(VarTypeCandidate {
+            name: "var_10h".to_string(),
+            kind: "b".to_string(),
+            delta: -16,
+            var_type: "struct type_0x123 *".to_string(),
+            isarg: false,
+            reg: None,
+            size: 8,
+            confidence: 90,
+            source: WritebackSource::ExternalTypeDb,
+            evidence: vec![WritebackEvidence::ExternalStackAnnotation],
+        });
+
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(usize::MAX, usize::MAX, usize::MAX),
+            &FunctionTypeFacts::default(),
+        );
+        let type_mutations = mutation_plan
+            .mutations
+            .iter()
+            .filter(|mutation| {
+                matches!(
+                    mutation.kind,
+                    TypeWritebackMutationKind::Var
+                        | TypeWritebackMutationKind::VarType
+                        | TypeWritebackMutationKind::TypeLink
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(type_mutations.len(), 5);
+        let foo_mutations = type_mutations
+            .iter()
+            .filter(|mutation| mutation.type_name.as_deref() == Some("struct Foo *"))
+            .collect::<Vec<_>>();
+        assert_eq!(foo_mutations.len(), 3);
+        for mutation in foo_mutations {
+            assert_eq!(mutation.type_materialization_key.as_deref(), Some("Foo"));
+            assert!(mutation.type_materialization_required);
+        }
+        let builtin_var_type = type_mutations
+            .iter()
+            .find(|mutation| mutation.type_name.as_deref() == Some("int32_t"))
+            .expect("builtin var type mutation should be emitted");
+        assert_eq!(builtin_var_type.type_materialization_key, None);
+        assert!(!builtin_var_type.type_materialization_required);
+        let opaque_var_type = type_mutations
+            .iter()
+            .find(|mutation| mutation.type_name.as_deref() == Some("struct type_0x123 *"))
+            .expect("opaque var type mutation should be emitted fail-closed");
+        assert_eq!(opaque_var_type.type_materialization_key, None);
+        assert!(opaque_var_type.type_materialization_required);
     }
 
     #[test]

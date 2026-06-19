@@ -4456,6 +4456,8 @@ pub struct R2SleighMutation {
     name: *const c_char,
     reg: *const c_char,
     type_name: *const c_char,
+    type_materialization_key: *const c_char,
+    type_materialization_required: i32,
     text: *const c_char,
     addr: u64,
     size: u64,
@@ -5112,6 +5114,11 @@ fn ffi_mutations_from_session_plan(
             name: push_session_cstring(&mut strings, mutation.name.as_deref()),
             reg: push_session_cstring(&mut strings, mutation.reg.as_deref()),
             type_name: push_session_cstring(&mut strings, mutation.type_name.as_deref()),
+            type_materialization_key: push_session_cstring(
+                &mut strings,
+                mutation.type_materialization_key.as_deref(),
+            ),
+            type_materialization_required: i32::from(mutation.type_materialization_required),
             text: push_session_cstring(&mut strings, mutation.text.as_deref()),
             addr: mutation.addr.unwrap_or_default(),
             size: mutation.size.unwrap_or_default(),
@@ -10538,6 +10545,8 @@ mod tests {
         assert_eq!(ffi_mutations[2].delta, -8);
         assert_eq!(ffi_mutations[2].var_kind, b'b' as c_char);
         assert_eq!(ffi_mutations[2].confidence, 95);
+        assert!(ffi_mutations[3].type_materialization_key.is_null());
+        assert_eq!(ffi_mutations[3].type_materialization_required, 0);
 
         let payload = writeback_plan_json(
             plan,

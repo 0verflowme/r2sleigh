@@ -86,8 +86,6 @@ extern char *r2sleigh_engine_cache_stats_json(void);
 extern void r2sleigh_engine_cache_stats_reset(void);
 extern int r2sleigh_writeback_var_name_is_generated(const char *name);
 extern int r2sleigh_writeback_apply_type_name_is_generic(const char *type_name);
-extern int r2sleigh_writeback_apply_type_name_is_opaque_placeholder(const char *type_name);
-extern char *r2sleigh_writeback_apply_type_name_canonicalize(const char *type_name);
 
 /* Typed analysis */
 extern char *r2il_block_regs_read(const R2ILContext *ctx, const R2ILBlock *block);
@@ -315,6 +313,8 @@ typedef struct {
 	const char *name;
 	const char *reg;
 	const char *type_name;
+	const char *type_materialization_key;
+	int type_materialization_required;
 	const char *text;
 	unsigned long long addr;
 	unsigned long long size;
@@ -9409,10 +9409,6 @@ typedef struct {
 	char fixpoint_stop_reason[16];
 } TypeWritebackCounters;
 
-static bool is_opaque_placeholder_type_name(const char *type_name) {
-	return r2sleigh_writeback_apply_type_name_is_opaque_placeholder (type_name) != 0;
-}
-
 static bool is_generic_type_name(const char *type_name) {
 	return r2sleigh_writeback_apply_type_name_is_generic (type_name) != 0;
 }
@@ -9612,22 +9608,6 @@ static bool type_name_is_materialized(RAnal *anal, const char *type_name) {
 	return bitsize > 0 || is_composite_type_kind (kind);
 }
 
-static const char *canonicalize_type_name_for_apply(const char *type_name, char *buf, size_t buf_sz) {
-	char *canonical;
-
-	if (!type_name || !buf || buf_sz < 8) {
-		return type_name;
-	}
-	canonical = r2sleigh_writeback_apply_type_name_canonicalize (type_name);
-	if (!canonical || !*canonical) {
-		r2il_string_free (canonical);
-		return type_name;
-	}
-	snprintf (buf, buf_sz, "%s", canonical);
-	r2il_string_free (canonical);
-	return buf;
-}
-
 static bool apply_struct_decl_candidate(RAnal *anal, RCore *core, const char *name, const char *decl) {
 	bool imported;
 	ut64 memo_key;
@@ -9658,91 +9638,14 @@ static bool apply_struct_decl_candidate(RAnal *anal, RCore *core, const char *na
 	return false;
 }
 
-static bool candidate_type_has_known_struct(RAnal *anal, const char *type_name) {
-	const char *struct_kw;
-	const char *name_start;
-	char name_buf[192];
-	char *normalized = NULL;
-	size_t name_len;
-	size_t i = 0;
-	char canonical_type[192];
-	const char *candidate_type;
-
-	if (!anal || !type_name || !*type_name) {
+static bool mutation_type_materialization_available(RAnal *anal, bool required, const char *type_materialization_key) {
+	if (!required) {
+		return true;
+	}
+	if (!type_materialization_key || !*type_materialization_key) {
 		return false;
 	}
-	candidate_type = canonicalize_type_name_for_apply (type_name, canonical_type, sizeof (canonical_type));
-	struct_kw = strstr (candidate_type, "struct ");
-	if (!struct_kw) {
-		struct_kw = strstr (candidate_type, "struct.");
-	}
-	if (!struct_kw) {
-		normalized = normalize_compare_string (candidate_type);
-		if (!normalized) {
-			return false;
-		}
-		remove_substring_inplace (normalized, "const");
-		remove_substring_inplace (normalized, "volatile");
-		remove_substring_inplace (normalized, "restrict");
-		remove_substring_inplace (normalized, "register");
-		name_len = strlen (normalized);
-		while (name_len > 0 && normalized[name_len - 1] == '*') {
-			normalized[--name_len] = '\0';
-		}
-		if (!*normalized) {
-			free (normalized);
-			return false;
-		}
-		if (!strcmp (normalized, "void")
-				|| !strcmp (normalized, "bool")
-				|| !strcmp (normalized, "char")
-				|| !strcmp (normalized, "signedchar")
-				|| !strcmp (normalized, "unsignedchar")
-				|| !strcmp (normalized, "short")
-				|| !strcmp (normalized, "unsignedshort")
-				|| !strcmp (normalized, "int")
-				|| !strcmp (normalized, "unsigned")
-				|| !strcmp (normalized, "unsignedint")
-				|| !strcmp (normalized, "long")
-				|| !strcmp (normalized, "unsignedlong")
-				|| !strcmp (normalized, "longlong")
-				|| !strcmp (normalized, "unsignedlonglong")
-				|| !strcmp (normalized, "float")
-				|| !strcmp (normalized, "double")
-				|| !strcmp (normalized, "size_t")
-				|| !strncmp (normalized, "int", 3)
-				|| !strncmp (normalized, "uint", 4)) {
-			free (normalized);
-			return true;
-		}
-		if (name_len >= sizeof (name_buf)) {
-			name_len = sizeof (name_buf) - 1;
-		}
-		memcpy (name_buf, normalized, name_len);
-		name_buf[name_len] = '\0';
-		free (normalized);
-		return type_name_is_materialized (anal, name_buf);
-	}
-	name_start = struct_kw + strlen (!strncmp (struct_kw, "struct.", 7)? "struct.": "struct ");
-	while (*name_start && isspace ((unsigned char)*name_start)) {
-		name_start++;
-	}
-	if (!strncmp (name_start, "type.", 5)) {
-		name_start += 5;
-	}
-	while (name_start[i] && i + 1 < sizeof (name_buf)) {
-		char ch = name_start[i];
-		if (!(isalnum ((unsigned char)ch) || ch == '_')) {
-			break;
-		}
-		name_buf[i] = ch;
-		i++;
-	}
-	name_buf[i] = '\0';
-	if (!name_buf[0]) {
-		return false;
-	}
-	return type_name_is_materialized (anal, name_buf);
+	return type_name_is_materialized (anal, type_materialization_key);
 }
 
 static bool apply_var_type_candidate(
@@ -9752,22 +9655,19 @@ static bool apply_var_type_candidate(
 	RAnalVar *var,
 	const char *candidate_name,
 	const char *candidate_type,
+	const char *type_materialization_key,
+	bool type_materialization_required,
 	TypeWritebackCounters *counters
 ) {
 	char *existing_type = NULL;
 	bool api_ok = false;
-	char canonical_type[192];
-	const char *apply_type;
+	const char *apply_type = candidate_type;
 
 	if (!anal || !fcn || !var || !candidate_type || !*candidate_type) {
 		return false;
 	}
 	(void)core;
 	(void)candidate_name;
-	apply_type = canonicalize_type_name_for_apply (candidate_type, canonical_type, sizeof (canonical_type));
-	if (!apply_type || !*apply_type) {
-		return false;
-	}
 
 	if (var->type && *var->type) {
 		existing_type = strdup (var->type);
@@ -9781,7 +9681,7 @@ static bool apply_var_type_candidate(
 	}
 	free (existing_type);
 
-	if (!candidate_type_has_known_struct (anal, apply_type)) {
+	if (!mutation_type_materialization_available (anal, type_materialization_required, type_materialization_key)) {
 		if (counters) {
 			counters->vars_skipped_conflict++;
 		}
@@ -9839,19 +9739,14 @@ static bool apply_var_rename_candidate(
 	return false;
 }
 
-static bool apply_global_type_link_candidate(RAnal *anal, RCore *core, ut64 addr, const char *type_name, TypeWritebackCounters *tc) {
+static bool apply_global_type_link_candidate(RAnal *anal, RCore *core, ut64 addr, const char *type_name, const char *type_materialization_key, bool type_materialization_required, TypeWritebackCounters *tc) {
 	char *existing = NULL;
-	char canonical_type[192];
-	const char *apply_type;
+	const char *apply_type = type_name;
 	if (!anal || !type_name || !*type_name || !addr) {
 		return false;
 	}
 	(void)core;
-	apply_type = canonicalize_type_name_for_apply (type_name, canonical_type, sizeof (canonical_type));
-	if (!apply_type || !*apply_type) {
-		return false;
-	}
-	if (is_opaque_placeholder_type_name (apply_type) || !candidate_type_has_known_struct (anal, apply_type)) {
+	if (!mutation_type_materialization_available (anal, type_materialization_required, type_materialization_key)) {
 		if (tc) {
 			tc->global_links_conflict_skip++;
 		}
@@ -9928,15 +9823,14 @@ static bool apply_type_writeback_session_result(
 			}
 			break;
 		case R2SLEIGH_MUTATION_VAR: {
-			char canonical_candidate_type[192];
-			const char *apply_type;
+			const char *apply_type = mutation->type_name;
 			char var_kind = mutation->var_kind? mutation->var_kind: R_ANAL_VAR_KIND_SPV;
 			if (!mutation->name || !*mutation->name || !mutation->type_name || !*mutation->type_name) {
 				continue;
 			}
-			apply_type = canonicalize_type_name_for_apply (mutation->type_name,
-				canonical_candidate_type, sizeof (canonical_candidate_type));
-			if (!apply_type || !*apply_type || !candidate_type_has_known_struct (anal, apply_type)) {
+			if (!mutation_type_materialization_available (anal,
+					mutation->type_materialization_required != 0,
+					mutation->type_materialization_key)) {
 				continue;
 			}
 			RAnalMutation typed = {
@@ -9980,7 +9874,9 @@ static bool apply_type_writeback_session_result(
 				}
 				continue;
 			}
-			if (apply_var_type_candidate (anal, core, fcn, var, candidate_name, candidate_type, tc)) {
+			if (apply_var_type_candidate (anal, core, fcn, var, candidate_name, candidate_type,
+					mutation->type_materialization_key,
+					mutation->type_materialization_required != 0, tc)) {
 				if (tc) {
 					tc->vars_applied++;
 				}
@@ -10035,7 +9931,9 @@ static bool apply_type_writeback_session_result(
 				}
 				continue;
 			}
-			if (apply_global_type_link_candidate (anal, core, mutation->addr, mutation->type_name, tc)) {
+			if (apply_global_type_link_candidate (anal, core, mutation->addr, mutation->type_name,
+					mutation->type_materialization_key,
+					mutation->type_materialization_required != 0, tc)) {
 				if (tc) {
 					tc->global_links_applied++;
 				}

@@ -106,6 +106,7 @@ pub use writeback::{
     signature_projection_for_semantic_artifact, signature_writeback_decision,
     type_writeback_mutation_plan, type_writeback_mutation_plan_with_policy,
     writeback_apply_type_name_is_generic, writeback_apply_type_name_is_opaque_placeholder,
+    writeback_type_materialization_key, writeback_type_materialization_required,
     writeback_type_name_is_generic, writeback_type_name_is_opaque_placeholder,
     writeback_var_name_is_generated,
 };
