@@ -789,6 +789,37 @@ mod tests {
     }
 
     #[test]
+    fn typed_callee_resolution_overrides_raw_fold_identity_maps() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_function_names(HashMap::from([(0x401000, "sym.local".to_string())]));
+        let typed_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                r2types::CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            },
+        );
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+
+        let identity = ctx.callee_identity_for_direct_target(0x401000);
+
+        assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
+        assert!(identity.is_imported_name_hint());
+    }
+
+    #[test]
     fn test_call_args_do_not_clamp_variadic_signature() {
         let mut ctx = FoldingContext::new(64);
         let mut names = HashMap::new();
@@ -9767,6 +9798,7 @@ mod tests {
             function_names: empty_u64,
             strings: empty_u64,
             symbols: empty_u64,
+            callee_resolution: None,
             arg_regs,
             param_register_aliases: empty_str,
             caller_saved_regs: empty_saved,
@@ -13915,6 +13947,7 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_resolution: None,
             arg_regs: &arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,
@@ -14373,6 +14406,7 @@ mod tests {
             function_names: &function_names,
             strings: &HashMap::new(),
             symbols: &HashMap::new(),
+            callee_resolution: None,
             arg_regs: &arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,

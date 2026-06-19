@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 use r2ssa::{SSAFunction, SSAOp, SSAVar, SSAVarNameKind, ValueId};
-use r2types::{CalleeIdentity, CalleeIdentityContext};
+use r2types::CallsiteKey;
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
@@ -5225,7 +5225,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
 
             let mut args = Vec::new();
             let mut consumed_keys = Vec::new();
-            let imported_call_target = call_target_is_imported(op, env);
+            let imported_call_target = call_target_is_imported(block.addr, call_idx, op, env);
             scratch
                 .info
                 .inlined_call_results
@@ -6011,26 +6011,39 @@ fn rewrite_call_result_binding(
     })
 }
 
-fn call_target_is_imported(op: &SSAOp, env: &PassEnv<'_>) -> bool {
+fn call_target_is_imported(
+    block_addr: u64,
+    op_index: usize,
+    op: &SSAOp,
+    env: &PassEnv<'_>,
+) -> bool {
     let target = match op {
         SSAOp::Call { target } | SSAOp::CallInd { target } => target,
         _ => return false,
     };
+    let callsite = CallsiteKey {
+        block_addr,
+        op_index,
+    };
+    if let Some(identity) = env
+        .callee_resolution
+        .and_then(|facts| facts.identity_for_callsite(callsite))
+    {
+        return identity.is_imported_name_hint();
+    }
     let Some(addr) = parse_target_addr(target) else {
         return false;
     };
-    let callee_facts = BTreeMap::new();
-    let known_function_signatures = HashMap::new();
-    let identity = CalleeIdentity::from_direct_target(
-        addr,
-        &CalleeIdentityContext {
-            function_names: env.function_names,
-            symbols: env.symbols,
-            callee_facts: &callee_facts,
-            known_function_signatures: &known_function_signatures,
-        },
-    );
-    identity.is_imported_name_hint()
+    if let Some(identity) = env
+        .callee_resolution
+        .and_then(|facts| facts.identity_for_direct_addr(addr))
+    {
+        return identity.is_imported_name_hint();
+    }
+    env.function_names
+        .get(&addr)
+        .or_else(|| env.symbols.get(&addr))
+        .is_some_and(|name| r2types::callee_name_is_import_like(name))
 }
 
 fn should_append_unknown_stack_args(
@@ -8489,6 +8502,7 @@ mod tests {
                 function_names: &self.function_names,
                 strings: &self.strings,
                 symbols: &self.symbols,
+                callee_resolution: None,
                 arg_regs: &self.arg_regs,
                 param_register_aliases: &self.param_register_aliases,
                 caller_saved_regs: &self.caller_saved_regs,
@@ -8585,15 +8599,74 @@ mod tests {
             let mut fixture = TestEnvFixture::default();
             fixture.function_names.insert(0x401000, name.to_string());
             let env = fixture.env();
-            assert!(call_target_is_imported(&op, &env), "{name}");
+            assert!(call_target_is_imported(0x1000, 0, &op, &env), "{name}");
         }
 
         for name in ["sym.helper", "fcn.401000", "plain_helper"] {
             let mut fixture = TestEnvFixture::default();
             fixture.function_names.insert(0x401000, name.to_string());
             let env = fixture.env();
-            assert!(!call_target_is_imported(&op, &env), "{name}");
+            assert!(!call_target_is_imported(0x1000, 0, &op, &env), "{name}");
         }
+
+        let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let typed_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(call_target_is_imported(0x1000, 0, &op, &env));
+
+        let fallback_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
+        let typed_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(!call_target_is_imported(0x1000, 0, &op, &env));
     }
 
     #[test]

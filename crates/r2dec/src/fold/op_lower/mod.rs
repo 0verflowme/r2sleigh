@@ -1020,11 +1020,25 @@ impl<'a> FoldingContext<'a> {
         }
     }
     pub(crate) fn callee_identity_for_direct_target(&self, addr: u64) -> CalleeIdentity {
+        if let Some(identity) = self
+            .inputs
+            .callee_resolution
+            .and_then(|facts| facts.identity_for_direct_addr(addr))
+        {
+            return identity.clone();
+        }
         CalleeIdentity::from_direct_target(addr, &self.callee_identity_context())
     }
     pub(crate) fn callee_identity_for_name(&self, name: &str) -> CalleeIdentity {
         if let Some(addr) = parse_address_from_var_name(name) {
             return self.callee_identity_for_direct_target(addr);
+        }
+        if let Some(identity) = self
+            .inputs
+            .callee_resolution
+            .and_then(|facts| facts.identity_for_name(name))
+        {
+            return identity.clone();
         }
         CalleeIdentity::from_name(name).with_known_signature(self.inputs.known_function_signatures)
     }
@@ -1080,6 +1094,7 @@ impl<'a> FoldingContext<'a> {
             function_names: self.inputs.function_names,
             strings: self.inputs.strings,
             symbols: self.inputs.symbols,
+            callee_resolution: self.inputs.callee_resolution,
             arg_regs: &self.inputs.arch.arg_regs,
             param_register_aliases: self.inputs.param_register_aliases,
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,
@@ -1303,6 +1318,7 @@ impl<'a> FoldingContext<'a> {
             function_names: self.inputs.function_names,
             strings: self.inputs.strings,
             symbols: self.inputs.symbols,
+            callee_resolution: self.inputs.callee_resolution,
             arg_regs: &self.inputs.arch.arg_regs,
             param_register_aliases: self.inputs.param_register_aliases,
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,

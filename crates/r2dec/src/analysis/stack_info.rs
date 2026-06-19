@@ -639,6 +639,7 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_resolution: None,
             arg_regs: &arch.arg_regs,
             param_register_aliases: &param_aliases,
             caller_saved_regs: &arch.caller_saved_regs,

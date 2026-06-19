@@ -2170,6 +2170,12 @@ fn param_alias_for_var(
 }
 
 fn lookup_callee_identity(inputs: &PreparedSemanticViewInputs<'_>, addr: u64) -> CalleeIdentity {
+    if let Some(identity) = inputs
+        .callee_resolution
+        .and_then(|facts| facts.identity_for_direct_addr(addr))
+    {
+        return identity.clone();
+    }
     CalleeIdentity::from_direct_target(
         addr,
         &CalleeIdentityContext {
@@ -3905,6 +3911,7 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_resolution: None,
             arg_regs: &arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,
@@ -3934,6 +3941,7 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_resolution: None,
             arg_regs: &arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,

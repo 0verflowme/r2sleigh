@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::{SSAVar, ValueId};
-use r2types::TypeOracle;
+use r2types::{CalleeResolutionFacts, TypeOracle};
 
 use crate::ast::{CExpr, CType};
 use crate::fold::{PtrArith, SSABlock};
@@ -73,6 +73,7 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) function_names: &'a HashMap<u64, String>,
     pub(crate) strings: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
+    pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) arg_regs: &'a [String],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
