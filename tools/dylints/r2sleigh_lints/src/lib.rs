@@ -97,10 +97,38 @@ rustc_session::declare_lint!(
     "r2dec should query signatures through typed callee identity, not the raw signature map"
 );
 
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
+    /// Warns when production `r2plugin` code directly reconstructs type
+    /// signature writeback authority instead of consuming a typed `r2types`
+    /// decision.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Signature certificates, source authority, and stale-certificate refusal
+    /// are type-system policy. Keeping that logic in plugin glue creates a
+    /// second owner and lets FFI code decide which type facts are authoritative.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// certificate.authorizes_signature_writeback();
+    /// "signature mutation refused: ...";
+    /// ```
+    ///
+    /// Use instead `r2types::signature_writeback_decision()` and serialize the
+    /// resulting typed authority report.
+    pub R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
+    Warn,
+    "r2plugin must not inspect signature certificates to decide writeback authority"
+);
+
 rustc_session::declare_lint_pass!(R2sleighLintPass => [
     STRING_PREFIX_SEMANTIC_CLASSIFICATION,
     R2_JSON_COMMAND_INTERNAL_SEAM,
-    R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP
+    R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
+    R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP
 ]);
 
 #[unsafe(no_mangle)]
@@ -110,6 +138,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         STRING_PREFIX_SEMANTIC_CLASSIFICATION,
         R2_JSON_COMMAND_INTERNAL_SEAM,
         R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
+        R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
     ]);
     lint_store.register_late_pass(|_| Box::new(R2sleighLintPass));
 }
@@ -142,6 +171,15 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_DIRECT_KNOWN_SIGNATURE_LOOKUP,
                 expr.span,
                 "r2dec must resolve function signatures through r2types::CalleeIdentity, not direct raw-map lookup",
+            );
+        }
+
+        if is_r2plugin_path(cx, expr) && plugin_type_writeback_policy_expr(expr) {
+            span_lint(
+                cx,
+                R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
+                expr.span,
+                "r2plugin must not inspect signature certificates to decide writeback authority; consume the r2types authority result",
             );
         }
 
@@ -181,6 +219,21 @@ fn forbidden_r2_json_command_literal(expr: &Expr<'_>) -> bool {
     matches!(command, "afcfj" | "afvj" | "tsj")
 }
 
+fn plugin_type_writeback_policy_expr(expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::MethodCall(method, _, _, _) => {
+            method.ident.as_str() == "authorizes_signature_writeback"
+        }
+        ExprKind::Lit(lit) => {
+            let LitKind::Str(symbol, _) = lit.node else {
+                return false;
+            };
+            symbol.as_str().starts_with("signature mutation refused:")
+        }
+        _ => false,
+    }
+}
+
 fn expr_references_known_function_signatures(expr: &Expr<'_>) -> bool {
     match expr.kind {
         ExprKind::Field(base, ident) => {
@@ -202,6 +255,11 @@ fn expr_references_known_function_signatures(expr: &Expr<'_>) -> bool {
 fn is_r2dec_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let filename = cx.sess().source_map().span_to_filename(expr.span);
     format!("{filename:?}").contains("crates/r2dec/src/")
+}
+
+fn is_r2plugin_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    let filename = cx.sess().source_map().span_to_filename(expr.span);
+    format!("{filename:?}").contains("r2plugin/src/")
 }
 
 fn is_canonical_ssa_var_classifier(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {

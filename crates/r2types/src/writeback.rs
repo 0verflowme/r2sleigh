@@ -94,7 +94,7 @@ impl StructDeclSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InferredSignatureParam {
     pub name: String,
     pub param_type: String,
@@ -196,6 +196,427 @@ pub struct TypeWritebackPlan {
     pub diagnostics: TypeWritebackDiagnostics,
 }
 
+pub const MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE: u8 = 95;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeWritebackMutationBudget {
+    pub global_max_links: usize,
+    pub max_type_decls: usize,
+    pub max_mutations: usize,
+}
+
+impl TypeWritebackMutationBudget {
+    pub fn new(global_max_links: usize, max_type_decls: usize, max_mutations: usize) -> Self {
+        Self {
+            global_max_links: global_max_links.max(1),
+            max_type_decls: max_type_decls.max(1),
+            max_mutations: max_mutations.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeWritebackMutationKind {
+    Signature,
+    Callconv,
+    Var,
+    VarRename,
+    VarType,
+    Xref,
+    Comment,
+    Flag,
+    TypeDecl,
+    TypeLink,
+}
+
+impl TypeWritebackMutationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Signature => "signature",
+            Self::Callconv => "callconv",
+            Self::Var => "var",
+            Self::VarRename => "var_rename",
+            Self::VarType => "var_type",
+            Self::Xref => "xref",
+            Self::Comment => "comment",
+            Self::Flag => "flag",
+            Self::TypeDecl => "type_decl",
+            Self::TypeLink => "type_link",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TypeWritebackMutation {
+    pub kind: TypeWritebackMutationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ret_type: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<InferredSignatureParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callconv: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub var_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_arg: Option<bool>,
+    pub confidence: u8,
+    pub source: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TypeWritebackMutationPlan {
+    pub mutations: Vec<TypeWritebackMutation>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignatureWritebackDecision {
+    pub authorized: bool,
+    pub refusal: Option<String>,
+    pub sources: Vec<String>,
+}
+
+pub fn signature_certificate_source_names(
+    certificate: Option<&SignatureCertificate>,
+) -> Vec<String> {
+    certificate
+        .map(|certificate| {
+            certificate
+                .sources
+                .iter()
+                .map(|source| source.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn signature_writeback_decision(type_facts: &FunctionTypeFacts) -> SignatureWritebackDecision {
+    let Some(certificate) = type_facts.signature_certificate.as_ref() else {
+        return SignatureWritebackDecision {
+            authorized: false,
+            refusal: Some(
+                "signature mutation refused: missing exact SignatureCertificate".to_string(),
+            ),
+            sources: Vec::new(),
+        };
+    };
+    let sources = signature_certificate_source_names(Some(certificate));
+    let Some(signature) = type_facts.merged_signature.as_ref() else {
+        return SignatureWritebackDecision {
+            authorized: false,
+            refusal: Some(
+                "signature mutation refused: missing current merged signature".to_string(),
+            ),
+            sources,
+        };
+    };
+    if certificate.signature != *signature {
+        return SignatureWritebackDecision {
+            authorized: false,
+            refusal: Some(
+                "signature mutation refused: SignatureCertificate does not match current merged signature"
+                    .to_string(),
+            ),
+            sources,
+        };
+    }
+    if !certificate.authorizes_signature_writeback() {
+        return SignatureWritebackDecision {
+            authorized: false,
+            refusal: Some(format!(
+                "signature mutation refused: certificate sources are not authoritative for writeback ({})",
+                sources.join(",")
+            )),
+            sources,
+        };
+    }
+    SignatureWritebackDecision {
+        authorized: true,
+        refusal: None,
+        sources,
+    }
+}
+
+fn push_budgeted_type_mutation(
+    mutations: &mut Vec<TypeWritebackMutation>,
+    diagnostics: &mut Vec<String>,
+    emitted: &mut usize,
+    skipped: &mut usize,
+    budget: TypeWritebackMutationBudget,
+    mutation: TypeWritebackMutation,
+) {
+    if *emitted < budget.max_mutations {
+        mutations.push(mutation);
+        *emitted += 1;
+    } else {
+        *skipped += 1;
+        if *skipped == 1 {
+            diagnostics.push(format!(
+                "non-signature mutation plan truncated to {} item(s)",
+                budget.max_mutations
+            ));
+        }
+    }
+}
+
+fn evidence_names(evidence: &[WritebackEvidence]) -> Vec<String> {
+    evidence
+        .iter()
+        .map(|tag| tag.as_str().to_string())
+        .collect()
+}
+
+pub fn type_writeback_mutation_plan(
+    plan: &TypeWritebackPlan,
+    budget: TypeWritebackMutationBudget,
+    type_facts: &FunctionTypeFacts,
+) -> TypeWritebackMutationPlan {
+    let mut mutations = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut emitted_budgeted = 0usize;
+    let mut skipped_budgeted = 0usize;
+
+    let signature_decision = signature_writeback_decision(type_facts);
+    if let Some(refusal) = signature_decision.refusal.clone() {
+        diagnostics.push(refusal);
+    } else {
+        let signature_evidence = signature_decision
+            .sources
+            .iter()
+            .map(|source| format!("signature-certificate:{source}"))
+            .collect::<Vec<_>>();
+        mutations.push(TypeWritebackMutation {
+            kind: TypeWritebackMutationKind::Signature,
+            signature: Some(plan.signature.signature.clone()),
+            ret_type: Some(plan.signature.ret_type.clone()),
+            params: plan.signature.params.clone(),
+            callconv: Some(plan.signature.callconv.clone()),
+            old_name: None,
+            name: Some(plan.signature.function_name.clone()),
+            reg: None,
+            type_name: None,
+            text: None,
+            addr: None,
+            size: None,
+            delta: None,
+            var_kind: None,
+            is_arg: None,
+            confidence: plan.signature.confidence,
+            source: "function_facts".to_string(),
+            evidence: signature_evidence.clone(),
+        });
+
+        mutations.push(TypeWritebackMutation {
+            kind: TypeWritebackMutationKind::Callconv,
+            signature: None,
+            ret_type: None,
+            params: Vec::new(),
+            callconv: Some(plan.signature.callconv.clone()),
+            old_name: None,
+            name: Some(plan.signature.function_name.clone()),
+            reg: None,
+            type_name: None,
+            text: None,
+            addr: None,
+            size: None,
+            delta: None,
+            var_kind: None,
+            is_arg: None,
+            confidence: plan.signature.callconv_confidence,
+            source: "function_facts".to_string(),
+            evidence: signature_evidence,
+        });
+    }
+
+    for decl in plan.struct_decls.iter().take(budget.max_type_decls) {
+        push_budgeted_type_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            TypeWritebackMutation {
+                kind: TypeWritebackMutationKind::TypeDecl,
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: None,
+                name: Some(decl.name.clone()),
+                reg: None,
+                type_name: None,
+                text: Some(decl.decl.clone()),
+                addr: None,
+                size: None,
+                delta: None,
+                var_kind: None,
+                is_arg: None,
+                confidence: decl.confidence,
+                source: decl.source.as_str().to_string(),
+                evidence: vec!["struct-declaration".to_string()],
+            },
+        );
+    }
+    if plan.struct_decls.len() > budget.max_type_decls {
+        diagnostics.push(format!(
+            "type declaration mutation plan truncated from {} to {} item(s)",
+            plan.struct_decls.len(),
+            budget.max_type_decls
+        ));
+    }
+
+    for candidate in &plan.var_type_candidates {
+        if candidate.confidence >= MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE {
+            push_budgeted_type_mutation(
+                &mut mutations,
+                &mut diagnostics,
+                &mut emitted_budgeted,
+                &mut skipped_budgeted,
+                budget,
+                TypeWritebackMutation {
+                    kind: TypeWritebackMutationKind::Var,
+                    signature: None,
+                    ret_type: None,
+                    params: Vec::new(),
+                    callconv: None,
+                    old_name: None,
+                    name: Some(candidate.name.clone()),
+                    reg: candidate.reg.clone(),
+                    type_name: Some(candidate.var_type.clone()),
+                    text: None,
+                    addr: None,
+                    size: Some(candidate.size as u64),
+                    delta: Some(candidate.delta),
+                    var_kind: Some(candidate.kind.clone()),
+                    is_arg: Some(candidate.isarg),
+                    confidence: candidate.confidence,
+                    source: candidate.source.as_str().to_string(),
+                    evidence: evidence_names(&candidate.evidence),
+                },
+            );
+        }
+        push_budgeted_type_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            TypeWritebackMutation {
+                kind: TypeWritebackMutationKind::VarType,
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: Some(candidate.name.clone()),
+                name: Some(candidate.name.clone()),
+                reg: candidate.reg.clone(),
+                type_name: Some(candidate.var_type.clone()),
+                text: None,
+                addr: None,
+                size: Some(candidate.size as u64),
+                delta: Some(candidate.delta),
+                var_kind: Some(candidate.kind.clone()),
+                is_arg: Some(candidate.isarg),
+                confidence: candidate.confidence,
+                source: candidate.source.as_str().to_string(),
+                evidence: evidence_names(&candidate.evidence),
+            },
+        );
+    }
+
+    for candidate in &plan.var_rename_candidates {
+        push_budgeted_type_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            TypeWritebackMutation {
+                kind: TypeWritebackMutationKind::VarRename,
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: Some(candidate.name.clone()),
+                name: Some(candidate.target_name.clone()),
+                reg: None,
+                type_name: None,
+                text: None,
+                addr: None,
+                size: None,
+                delta: None,
+                var_kind: None,
+                is_arg: None,
+                confidence: candidate.confidence,
+                source: candidate.source.as_str().to_string(),
+                evidence: evidence_names(&candidate.evidence),
+            },
+        );
+    }
+
+    for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
+        push_budgeted_type_mutation(
+            &mut mutations,
+            &mut diagnostics,
+            &mut emitted_budgeted,
+            &mut skipped_budgeted,
+            budget,
+            TypeWritebackMutation {
+                kind: TypeWritebackMutationKind::TypeLink,
+                signature: None,
+                ret_type: None,
+                params: Vec::new(),
+                callconv: None,
+                old_name: None,
+                name: None,
+                reg: None,
+                type_name: Some(candidate.target_type.clone()),
+                text: None,
+                addr: Some(candidate.addr),
+                size: None,
+                delta: None,
+                var_kind: None,
+                is_arg: None,
+                confidence: candidate.confidence,
+                source: candidate.source.as_str().to_string(),
+                evidence: vec!["global-type-link".to_string()],
+            },
+        );
+    }
+    if plan.global_type_links.len() > budget.global_max_links {
+        diagnostics.push(format!(
+            "global type-link mutation plan truncated from {} to {} item(s)",
+            plan.global_type_links.len(),
+            budget.global_max_links
+        ));
+    }
+
+    TypeWritebackMutationPlan {
+        mutations,
+        diagnostics,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeWritebackAnalysis {
     pub signature: InferredSignature,
@@ -219,6 +640,24 @@ pub struct TypeWritebackAnalysisInput<'a> {
 pub struct TypeWritebackSemanticInputs<'a> {
     pub artifact: &'a r2sym::SemanticArtifact,
     pub local_field_accesses: &'a [LocalFieldAccessFact],
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn type_writeback_mutation_budget_is_never_zero() {
+        let budget = TypeWritebackMutationBudget::new(
+            kani::any::<usize>(),
+            kani::any::<usize>(),
+            kani::any::<usize>(),
+        );
+
+        assert!(budget.global_max_links >= 1);
+        assert!(budget.max_type_decls >= 1);
+        assert!(budget.max_mutations >= 1);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7780,6 +8219,561 @@ fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn test_signature_spec(param_name: &str, param_bits: u32) -> FunctionSignatureSpec {
+        FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }),
+            params: vec![FunctionParamSpec {
+                name: param_name.to_string(),
+                ty: Some(CTypeLike::Int {
+                    bits: param_bits,
+                    signedness: Signedness::Signed,
+                }),
+            }],
+        }
+    }
+
+    fn inferred_test_signature(function_name: &str, param_name: &str) -> InferredSignature {
+        InferredSignature {
+            function_name: function_name.to_string(),
+            signature: format!("int32_t {function_name}(int32_t {param_name});"),
+            ret_type: "int32_t".to_string(),
+            params: vec![InferredSignatureParam {
+                name: param_name.to_string(),
+                param_type: "int32_t".to_string(),
+            }],
+            callconv: "amd64".to_string(),
+            arch: "x86-64".to_string(),
+            confidence: 96,
+            callconv_confidence: 90,
+        }
+    }
+
+    fn empty_writeback_plan(function_name: &str) -> TypeWritebackPlan {
+        TypeWritebackPlan {
+            signature: inferred_test_signature(function_name, "value"),
+            var_type_candidates: Vec::new(),
+            var_rename_candidates: Vec::new(),
+            struct_decls: Vec::new(),
+            global_type_links: Vec::new(),
+            diagnostics: TypeWritebackDiagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn inferred_signature_to_type_facts_preserves_merged_signature() {
+        let inferred = inferred_test_signature("dbg.typed", "value");
+
+        let type_facts = inferred_signature_to_function_type_facts(&inferred, 64);
+        let merged = type_facts
+            .merged_signature
+            .as_ref()
+            .expect("inferred signature should materialize merged signature");
+
+        assert_eq!(merged.params.len(), 1);
+        assert_eq!(merged.params[0].name, "value");
+        assert!(matches!(
+            merged.ret_type,
+            Some(CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed
+            })
+        ));
+    }
+
+    #[test]
+    fn phi_scalar_pointer_value_preserves_max_confidence() {
+        let block_addr = 0x401000;
+        let dst = SSAVar::new("phi_ptr", 1, 8);
+        let left = SSAVar::new("left_ptr", 1, 8);
+        let right = SSAVar::new("right_ptr", 1, 8);
+        let parsed_context = ParsedExternalContext::default();
+        let pointer_arg_slot_map = HashMap::new();
+        let mut pointer_values = HashMap::new();
+        let pointer_value_names = HashMap::new();
+        let array_addr_exprs = HashMap::new();
+        let array_addr_expr_names = HashMap::new();
+        let stack_addr_offsets = HashMap::new();
+        let stack_addr_offset_names = HashMap::new();
+        let block_ops = HashMap::new();
+        let value_ops = HashMap::new();
+
+        let low = ScalarPointerValue {
+            slot: 0,
+            base: ArrayIndexBase::Param { index: 0 },
+            element_stride: 8,
+            confidence: 20,
+        };
+        let high = ScalarPointerValue {
+            confidence: 88,
+            ..low.clone()
+        };
+        pointer_values.insert(ssa_var_block_key(block_addr, &left), low);
+        pointer_values.insert(ssa_var_block_key(block_addr, &right), high);
+        let ctx = ScalarArrayInferenceCtx {
+            parsed_context: &parsed_context,
+            merged_signature: None,
+            ptr_bits: 64,
+            pointer_arg_slot_map: &pointer_arg_slot_map,
+            pointer_values: &pointer_values,
+            pointer_value_names: &pointer_value_names,
+            array_addr_exprs: &array_addr_exprs,
+            array_addr_expr_names: &array_addr_expr_names,
+            stack_addr_offsets: &stack_addr_offsets,
+            stack_addr_offset_names: &stack_addr_offset_names,
+            block_ops: &block_ops,
+            value_ops: &value_ops,
+        };
+
+        let selected = phi_scalar_pointer_value(block_addr, &dst, &[left, right], &ctx)
+            .expect("same-base phi should preserve pointer value");
+
+        assert_eq!(selected.confidence, 88);
+    }
+
+    #[test]
+    fn phi_scalar_array_addr_expr_preserves_max_confidence() {
+        let block_addr = 0x401000;
+        let left = SSAVar::new("left_expr", 1, 8);
+        let right = SSAVar::new("right_expr", 1, 8);
+        let mut array_addr_exprs = HashMap::new();
+        let array_addr_expr_names = HashMap::new();
+        let pointer = ScalarPointerValue {
+            slot: 0,
+            base: ArrayIndexBase::Param { index: 0 },
+            element_stride: 8,
+            confidence: 80,
+        };
+        let low = ScalarArrayAddrExpr {
+            pointer: pointer.clone(),
+            field_offset: 0x10,
+            confidence: 30,
+        };
+        let high = ScalarArrayAddrExpr {
+            confidence: 91,
+            ..low.clone()
+        };
+        array_addr_exprs.insert(ssa_var_block_key(block_addr, &left), low);
+        array_addr_exprs.insert(ssa_var_block_key(block_addr, &right), high);
+
+        let selected = phi_scalar_array_addr_expr(
+            block_addr,
+            &[left, right],
+            &array_addr_exprs,
+            &array_addr_expr_names,
+        )
+        .expect("same-base phi should preserve array address expression");
+
+        assert_eq!(selected.confidence, 91);
+    }
+
+    #[test]
+    fn mutation_plan_materializes_typed_writeback_kinds_in_order() {
+        let signature_spec = test_signature_spec("a", 32);
+        let signature_certificate = SignatureCertificate::from_signature(
+            &signature_spec,
+            [SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external signature should be certifiable");
+        let type_facts = FunctionTypeFacts {
+            merged_signature: Some(signature_spec),
+            signature_certificate: Some(signature_certificate),
+            ..FunctionTypeFacts::default()
+        };
+        let mut plan = empty_writeback_plan("dbg.sum");
+        plan.signature = inferred_test_signature("dbg.sum", "a");
+        plan.var_type_candidates.push(VarTypeCandidate {
+            name: "var_8h".to_string(),
+            kind: "b".to_string(),
+            delta: -8,
+            var_type: "int32_t".to_string(),
+            isarg: false,
+            reg: None,
+            size: 4,
+            confidence: MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE,
+            source: WritebackSource::ExternalTypeDb,
+            evidence: vec![WritebackEvidence::ExternalStackAnnotation],
+        });
+        plan.var_rename_candidates.push(VarRenameCandidate {
+            name: "arg1".to_string(),
+            target_name: "a".to_string(),
+            confidence: 96,
+            source: WritebackSource::ExistingState,
+            evidence: vec![WritebackEvidence::ExternalParamName],
+        });
+
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(usize::MAX, usize::MAX, usize::MAX),
+            &type_facts,
+        );
+        let kinds = mutation_plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.kind)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec![
+                TypeWritebackMutationKind::Signature,
+                TypeWritebackMutationKind::Callconv,
+                TypeWritebackMutationKind::Var,
+                TypeWritebackMutationKind::VarType,
+                TypeWritebackMutationKind::VarRename,
+            ]
+        );
+        assert_eq!(
+            mutation_plan.mutations[0].signature.as_deref(),
+            Some("int32_t dbg.sum(int32_t a);")
+        );
+        assert_eq!(
+            mutation_plan.mutations[3].type_name.as_deref(),
+            Some("int32_t")
+        );
+        assert_eq!(mutation_plan.mutations[4].old_name.as_deref(), Some("arg1"));
+        assert_eq!(
+            mutation_plan.mutations[0].evidence,
+            vec!["signature-certificate:external_context".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_only_signature_certificate_is_not_writeback_authority() {
+        let signature_spec = test_signature_spec("value", 32);
+        let signature_certificate = SignatureCertificate::from_signature(
+            &signature_spec,
+            [SignatureCertificateSource::LocalInference],
+        )
+        .expect("exact local signature should be recorded");
+        let type_facts = FunctionTypeFacts {
+            merged_signature: Some(signature_spec),
+            signature_certificate: Some(signature_certificate),
+            ..FunctionTypeFacts::default()
+        };
+        let plan = empty_writeback_plan("dbg.local");
+
+        let decision = signature_writeback_decision(&type_facts);
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(64, usize::MAX, usize::MAX),
+            &type_facts,
+        );
+
+        assert!(!decision.authorized);
+        assert_eq!(decision.sources, vec!["local_inference".to_string()]);
+        assert!(
+            decision
+                .refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("certificate sources are not authoritative"))
+        );
+        assert!(
+            mutation_plan.mutations.iter().all(|mutation| {
+                !matches!(
+                    mutation.kind,
+                    TypeWritebackMutationKind::Signature | TypeWritebackMutationKind::Callconv
+                )
+            }),
+            "{:?}",
+            mutation_plan.mutations
+        );
+        assert!(
+            mutation_plan
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("certificate sources are not authoritative"))
+        );
+    }
+
+    #[test]
+    fn stale_signature_certificate_is_not_writeback_authority() {
+        let current_signature = test_signature_spec("value", 32);
+        let stale_signature = test_signature_spec("old_value", 64);
+        let signature_certificate = SignatureCertificate::from_signature(
+            &stale_signature,
+            [SignatureCertificateSource::ExternalContext],
+        )
+        .expect("external signature should be certifiable");
+        let type_facts = FunctionTypeFacts {
+            merged_signature: Some(current_signature),
+            signature_certificate: Some(signature_certificate),
+            ..FunctionTypeFacts::default()
+        };
+        let plan = empty_writeback_plan("dbg.stale");
+
+        let decision = signature_writeback_decision(&type_facts);
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(64, usize::MAX, usize::MAX),
+            &type_facts,
+        );
+
+        assert!(!decision.authorized);
+        assert!(decision.refusal.as_deref().is_some_and(|reason| {
+            reason.contains("SignatureCertificate does not match current merged signature")
+        }));
+        assert!(
+            mutation_plan.mutations.iter().all(|mutation| {
+                !matches!(
+                    mutation.kind,
+                    TypeWritebackMutationKind::Signature | TypeWritebackMutationKind::Callconv
+                )
+            }),
+            "{:?}",
+            mutation_plan.mutations
+        );
+        assert!(
+            mutation_plan.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("does not match current merged signature")
+            })
+        );
+    }
+
+    #[test]
+    fn mutation_plan_respects_global_type_link_budget() {
+        let mut plan = empty_writeback_plan("dbg.links");
+        plan.global_type_links = vec![
+            GlobalTypeLinkCandidate {
+                addr: 0x404000,
+                target_type: "struct a *".to_string(),
+                confidence: 90,
+                source: WritebackSource::ExternalTypeDb,
+            },
+            GlobalTypeLinkCandidate {
+                addr: 0x404008,
+                target_type: "struct b *".to_string(),
+                confidence: 90,
+                source: WritebackSource::ExternalTypeDb,
+            },
+        ];
+
+        let limited = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(1, usize::MAX, usize::MAX),
+            &FunctionTypeFacts::default(),
+        );
+        let all = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(2, usize::MAX, usize::MAX),
+            &FunctionTypeFacts::default(),
+        );
+
+        assert_eq!(
+            limited
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.kind == TypeWritebackMutationKind::TypeLink)
+                .count(),
+            1
+        );
+        assert_eq!(
+            all.mutations
+                .iter()
+                .filter(|mutation| mutation.kind == TypeWritebackMutationKind::TypeLink)
+                .count(),
+            2
+        );
+        assert!(
+            all.diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("global type-link mutation plan truncated")),
+            "{:?}",
+            all.diagnostics
+        );
+        assert!(limited.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "global type-link mutation plan truncated from 2 to 1 item(s)"
+        }));
+    }
+
+    #[test]
+    fn mutation_plan_exact_type_decl_budget_does_not_report_truncation() {
+        let mut plan = empty_writeback_plan("dbg.types_exact");
+        plan.struct_decls = vec![
+            StructDeclCandidate {
+                name: "struct a".to_string(),
+                decl: "typedef struct a { int x; } a;".to_string(),
+                confidence: 90,
+                source: StructDeclSource::ExternalTypeDb,
+                fields: Vec::new(),
+            },
+            StructDeclCandidate {
+                name: "struct b".to_string(),
+                decl: "typedef struct b { int y; } b;".to_string(),
+                confidence: 90,
+                source: StructDeclSource::ExternalTypeDb,
+                fields: Vec::new(),
+            },
+        ];
+
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(64, 2, usize::MAX),
+            &FunctionTypeFacts::default(),
+        );
+
+        assert_eq!(
+            mutation_plan
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.kind == TypeWritebackMutationKind::TypeDecl)
+                .count(),
+            2
+        );
+        assert!(
+            mutation_plan
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("type declaration mutation plan truncated")),
+            "{:?}",
+            mutation_plan.diagnostics
+        );
+    }
+
+    #[test]
+    fn mutation_plan_truncates_declarations_and_budgeted_mutations() {
+        let mut plan = empty_writeback_plan("dbg.types");
+        plan.struct_decls = vec![
+            StructDeclCandidate {
+                name: "struct a".to_string(),
+                decl: "typedef struct a { int x; } a;".to_string(),
+                confidence: 90,
+                source: StructDeclSource::ExternalTypeDb,
+                fields: Vec::new(),
+            },
+            StructDeclCandidate {
+                name: "struct b".to_string(),
+                decl: "typedef struct b { int y; } b;".to_string(),
+                confidence: 90,
+                source: StructDeclSource::ExternalTypeDb,
+                fields: Vec::new(),
+            },
+        ];
+        plan.var_type_candidates.push(VarTypeCandidate {
+            name: "var_8h".to_string(),
+            kind: "b".to_string(),
+            delta: -8,
+            var_type: "int32_t".to_string(),
+            isarg: false,
+            reg: None,
+            size: 4,
+            confidence: MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE,
+            source: WritebackSource::ExternalTypeDb,
+            evidence: vec![WritebackEvidence::ExternalStackAnnotation],
+        });
+
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(64, 1, 1),
+            &FunctionTypeFacts::default(),
+        );
+
+        assert_eq!(
+            mutation_plan
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.kind == TypeWritebackMutationKind::TypeDecl)
+                .count(),
+            1
+        );
+        assert!(mutation_plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "type declaration mutation plan truncated from 2 to 1 item(s)"
+        }));
+        assert!(mutation_plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "non-signature mutation plan truncated to 1 item(s)"
+        }));
+    }
+
+    #[test]
+    fn mutation_plan_first_budget_overflow_reports_single_skip() {
+        let mut plan = empty_writeback_plan("dbg.one_skip");
+        plan.struct_decls = vec![
+            StructDeclCandidate {
+                name: "struct a".to_string(),
+                decl: "typedef struct a { int x; } a;".to_string(),
+                confidence: 90,
+                source: StructDeclSource::ExternalTypeDb,
+                fields: Vec::new(),
+            },
+            StructDeclCandidate {
+                name: "struct b".to_string(),
+                decl: "typedef struct b { int y; } b;".to_string(),
+                confidence: 90,
+                source: StructDeclSource::ExternalTypeDb,
+                fields: Vec::new(),
+            },
+        ];
+
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(64, 2, 1),
+            &FunctionTypeFacts::default(),
+        );
+
+        assert_eq!(
+            mutation_plan
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.kind == TypeWritebackMutationKind::TypeDecl)
+                .count(),
+            1
+        );
+        assert_eq!(
+            mutation_plan
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.as_str() == "non-signature mutation plan truncated to 1 item(s)"
+                })
+                .count(),
+            1,
+            "{:?}",
+            mutation_plan.diagnostics
+        );
+    }
+
+    #[test]
+    fn materialized_var_mutation_requires_high_confidence() {
+        let mut plan = empty_writeback_plan("dbg.var");
+        plan.var_type_candidates.push(VarTypeCandidate {
+            name: "var_8h".to_string(),
+            kind: "b".to_string(),
+            delta: -8,
+            var_type: "int32_t".to_string(),
+            isarg: false,
+            reg: None,
+            size: 4,
+            confidence: MATERIALIZED_VAR_MUTATION_MIN_CONFIDENCE - 1,
+            source: WritebackSource::ExternalTypeDb,
+            evidence: vec![WritebackEvidence::ExternalStackAnnotation],
+        });
+
+        let mutation_plan = type_writeback_mutation_plan(
+            &plan,
+            TypeWritebackMutationBudget::new(64, usize::MAX, usize::MAX),
+            &FunctionTypeFacts::default(),
+        );
+
+        assert!(
+            mutation_plan
+                .mutations
+                .iter()
+                .all(|mutation| mutation.kind != TypeWritebackMutationKind::Var),
+            "{:?}",
+            mutation_plan.mutations
+        );
+        assert!(
+            mutation_plan
+                .mutations
+                .iter()
+                .any(|mutation| mutation.kind == TypeWritebackMutationKind::VarType),
+            "{:?}",
+            mutation_plan.mutations
+        );
+    }
 
     #[test]
     fn signature_type_parser_preserves_source_width_typedefs() {

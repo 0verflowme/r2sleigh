@@ -3925,16 +3925,10 @@ struct InferredTypeWritebackJson {
     semantics: Option<r2sym::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
-    mutation_plan: SessionMutationPlanJson,
+    mutation_plan: r2types::TypeWritebackMutationPlan,
     diagnostics: TypeWritebackDiagnosticsJson,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     phase_timings: Vec<PhaseTimingJson>,
-}
-
-#[derive(Debug, serde::Serialize, Default)]
-struct SessionMutationPlanJson {
-    mutations: Vec<SessionMutationJson>,
-    diagnostics: Vec<String>,
 }
 
 const R2SLEIGH_MUTATION_SIGNATURE: u32 = 0;
@@ -4807,42 +4801,6 @@ struct FunctionAnalysisSessionReport {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct SessionMutationJson {
-    kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signature: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ret_type: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    params: Vec<InferredParamJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    callconv: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    old_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reg: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
-    type_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    addr: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    delta: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    var_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    is_arg: Option<bool>,
-    confidence: u8,
-    source: String,
-    evidence: Vec<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
 struct CfgRiskSummaryJson {
     block_count: usize,
     loop_count: usize,
@@ -5029,340 +4987,20 @@ fn struct_fields_json(fields: &[r2types::StructFieldCandidate]) -> Vec<StructFie
         .collect()
 }
 
-#[derive(Clone, Copy)]
-struct TypeOutputBudget {
-    global_max_links: usize,
-    max_type_decls: usize,
-    max_mutations: usize,
-}
+type TypeOutputBudget = r2types::TypeWritebackMutationBudget;
 
-impl TypeOutputBudget {
-    fn new(global_max_links: usize, max_type_decls: usize, max_mutations: usize) -> Self {
-        Self {
-            global_max_links: global_max_links.max(1),
-            max_type_decls: max_type_decls.max(1),
-            max_mutations: max_mutations.max(1),
-        }
-    }
-}
-
-fn push_budgeted_mutation(
-    mutations: &mut Vec<SessionMutationJson>,
-    diagnostics: &mut Vec<String>,
-    emitted: &mut usize,
-    skipped: &mut usize,
-    budget: TypeOutputBudget,
-    mutation: SessionMutationJson,
-) {
-    if *emitted < budget.max_mutations {
-        mutations.push(mutation);
-        *emitted += 1;
-    } else {
-        *skipped += 1;
-        if *skipped == 1 {
-            diagnostics.push(format!(
-                "non-signature mutation plan truncated to {} item(s)",
-                budget.max_mutations
-            ));
-        }
-    }
-}
-
-fn signature_certificate_sources_json(
-    certificate: Option<&r2types::SignatureCertificate>,
-) -> Vec<String> {
-    certificate
-        .map(|certificate| {
-            certificate
-                .sources
-                .iter()
-                .map(|source| source.as_str().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn signature_writeback_refusal(type_facts: &r2types::FunctionTypeFacts) -> Option<String> {
-    let Some(certificate) = type_facts.signature_certificate.as_ref() else {
-        return Some("signature mutation refused: missing exact SignatureCertificate".to_string());
-    };
-    let Some(signature) = type_facts.merged_signature.as_ref() else {
-        return Some("signature mutation refused: missing current merged signature".to_string());
-    };
-    if certificate.signature != *signature {
-        return Some(
-            "signature mutation refused: SignatureCertificate does not match current merged signature"
-                .to_string(),
-        );
-    }
-    if !certificate.authorizes_signature_writeback() {
-        return Some(format!(
-            "signature mutation refused: certificate sources are not authoritative for writeback ({})",
-            certificate
-                .sources
-                .iter()
-                .map(|source| source.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    None
-}
-
-fn mutation_plan_from_writeback(
-    plan: &r2types::TypeWritebackPlan,
-    budget: TypeOutputBudget,
-    type_facts: &r2types::FunctionTypeFacts,
-) -> SessionMutationPlanJson {
-    let mut mutations = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut emitted_budgeted = 0usize;
-    let mut skipped_budgeted = 0usize;
-
-    if let Some(refusal) = signature_writeback_refusal(type_facts) {
-        diagnostics.push(refusal);
-    } else {
-        let signature_sources =
-            signature_certificate_sources_json(type_facts.signature_certificate.as_ref());
-        mutations.push(SessionMutationJson {
-            kind: "signature".to_string(),
-            signature: Some(plan.signature.signature.clone()),
-            ret_type: Some(plan.signature.ret_type.clone()),
-            params: plan
-                .signature
-                .params
-                .iter()
-                .map(|param| InferredParamJson {
-                    name: param.name.clone(),
-                    param_type: param.param_type.clone(),
-                })
-                .collect(),
-            callconv: Some(plan.signature.callconv.clone()),
-            old_name: None,
-            name: Some(plan.signature.function_name.clone()),
-            reg: None,
-            type_name: None,
-            text: None,
-            addr: None,
-            size: None,
-            delta: None,
-            var_kind: None,
-            is_arg: None,
-            confidence: plan.signature.confidence,
-            source: "function_facts".to_string(),
-            evidence: signature_sources
-                .iter()
-                .map(|source| format!("signature-certificate:{source}"))
-                .collect(),
-        });
-
-        mutations.push(SessionMutationJson {
-            kind: "callconv".to_string(),
-            signature: None,
-            ret_type: None,
-            params: Vec::new(),
-            callconv: Some(plan.signature.callconv.clone()),
-            old_name: None,
-            name: Some(plan.signature.function_name.clone()),
-            reg: None,
-            type_name: None,
-            text: None,
-            addr: None,
-            size: None,
-            delta: None,
-            var_kind: None,
-            is_arg: None,
-            confidence: plan.signature.callconv_confidence,
-            source: "function_facts".to_string(),
-            evidence: signature_sources
-                .iter()
-                .map(|source| format!("signature-certificate:{source}"))
-                .collect(),
-        });
-    }
-
-    for decl in plan.struct_decls.iter().take(budget.max_type_decls) {
-        push_budgeted_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
-            budget,
-            SessionMutationJson {
-                kind: "type_decl".to_string(),
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: None,
-                name: Some(decl.name.clone()),
-                reg: None,
-                type_name: None,
-                text: Some(decl.decl.clone()),
-                addr: None,
-                size: None,
-                delta: None,
-                var_kind: None,
-                is_arg: None,
-                confidence: decl.confidence,
-                source: decl.source.as_str().to_string(),
-                evidence: vec!["struct-declaration".to_string()],
-            },
-        );
-    }
-    if plan.struct_decls.len() > budget.max_type_decls {
-        diagnostics.push(format!(
-            "type declaration mutation plan truncated from {} to {} item(s)",
-            plan.struct_decls.len(),
-            budget.max_type_decls
-        ));
-    }
-
-    for candidate in &plan.var_type_candidates {
-        if candidate.confidence >= 95 {
-            push_budgeted_mutation(
-                &mut mutations,
-                &mut diagnostics,
-                &mut emitted_budgeted,
-                &mut skipped_budgeted,
-                budget,
-                SessionMutationJson {
-                    kind: "var".to_string(),
-                    signature: None,
-                    ret_type: None,
-                    params: Vec::new(),
-                    callconv: None,
-                    old_name: None,
-                    name: Some(candidate.name.clone()),
-                    reg: candidate.reg.clone(),
-                    type_name: Some(candidate.var_type.clone()),
-                    text: None,
-                    addr: None,
-                    size: Some(candidate.size as u64),
-                    delta: Some(candidate.delta),
-                    var_kind: Some(candidate.kind.clone()),
-                    is_arg: Some(candidate.isarg),
-                    confidence: candidate.confidence,
-                    source: candidate.source.as_str().to_string(),
-                    evidence: evidence_json(&candidate.evidence),
-                },
-            );
-        }
-        push_budgeted_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
-            budget,
-            SessionMutationJson {
-                kind: "var_type".to_string(),
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: Some(candidate.name.clone()),
-                name: Some(candidate.name.clone()),
-                reg: candidate.reg.clone(),
-                type_name: Some(candidate.var_type.clone()),
-                text: None,
-                addr: None,
-                size: Some(candidate.size as u64),
-                delta: Some(candidate.delta),
-                var_kind: Some(candidate.kind.clone()),
-                is_arg: Some(candidate.isarg),
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: evidence_json(&candidate.evidence),
-            },
-        );
-    }
-
-    for candidate in &plan.var_rename_candidates {
-        push_budgeted_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
-            budget,
-            SessionMutationJson {
-                kind: "var_rename".to_string(),
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: Some(candidate.name.clone()),
-                name: Some(candidate.target_name.clone()),
-                reg: None,
-                type_name: None,
-                text: None,
-                addr: None,
-                size: None,
-                delta: None,
-                var_kind: None,
-                is_arg: None,
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: evidence_json(&candidate.evidence),
-            },
-        );
-    }
-
-    for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
-        push_budgeted_mutation(
-            &mut mutations,
-            &mut diagnostics,
-            &mut emitted_budgeted,
-            &mut skipped_budgeted,
-            budget,
-            SessionMutationJson {
-                kind: "type_link".to_string(),
-                signature: None,
-                ret_type: None,
-                params: Vec::new(),
-                callconv: None,
-                old_name: None,
-                name: None,
-                reg: None,
-                type_name: Some(candidate.target_type.clone()),
-                text: None,
-                addr: Some(candidate.addr),
-                size: None,
-                delta: None,
-                var_kind: None,
-                is_arg: None,
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: vec!["global-type-link".to_string()],
-            },
-        );
-    }
-    if plan.global_type_links.len() > budget.global_max_links {
-        diagnostics.push(format!(
-            "global type-link mutation plan truncated from {} to {} item(s)",
-            plan.global_type_links.len(),
-            budget.global_max_links
-        ));
-    }
-
-    SessionMutationPlanJson {
-        mutations,
-        diagnostics,
-    }
-}
-
-fn session_mutation_kind_id(kind: &str) -> Option<u32> {
+fn session_mutation_kind_id(kind: r2types::TypeWritebackMutationKind) -> u32 {
     match kind {
-        "signature" => Some(R2SLEIGH_MUTATION_SIGNATURE),
-        "callconv" => Some(R2SLEIGH_MUTATION_CALLCONV),
-        "var" => Some(R2SLEIGH_MUTATION_VAR),
-        "var_rename" => Some(R2SLEIGH_MUTATION_VAR_RENAME),
-        "var_type" => Some(R2SLEIGH_MUTATION_VAR_TYPE),
-        "xref" => Some(R2SLEIGH_MUTATION_XREF),
-        "comment" => Some(R2SLEIGH_MUTATION_COMMENT),
-        "flag" => Some(R2SLEIGH_MUTATION_FLAG),
-        "type_decl" => Some(R2SLEIGH_MUTATION_TYPE_DECL),
-        "type_link" => Some(R2SLEIGH_MUTATION_TYPE_LINK),
-        _ => None,
+        r2types::TypeWritebackMutationKind::Signature => R2SLEIGH_MUTATION_SIGNATURE,
+        r2types::TypeWritebackMutationKind::Callconv => R2SLEIGH_MUTATION_CALLCONV,
+        r2types::TypeWritebackMutationKind::Var => R2SLEIGH_MUTATION_VAR,
+        r2types::TypeWritebackMutationKind::VarRename => R2SLEIGH_MUTATION_VAR_RENAME,
+        r2types::TypeWritebackMutationKind::VarType => R2SLEIGH_MUTATION_VAR_TYPE,
+        r2types::TypeWritebackMutationKind::Xref => R2SLEIGH_MUTATION_XREF,
+        r2types::TypeWritebackMutationKind::Comment => R2SLEIGH_MUTATION_COMMENT,
+        r2types::TypeWritebackMutationKind::Flag => R2SLEIGH_MUTATION_FLAG,
+        r2types::TypeWritebackMutationKind::TypeDecl => R2SLEIGH_MUTATION_TYPE_DECL,
+        r2types::TypeWritebackMutationKind::TypeLink => R2SLEIGH_MUTATION_TYPE_LINK,
     }
 }
 
@@ -5379,15 +5017,13 @@ fn push_session_cstring(strings: &mut Vec<CString>, value: Option<&str>) -> *con
 }
 
 fn ffi_mutations_from_session_plan(
-    plan: &SessionMutationPlanJson,
+    plan: &r2types::TypeWritebackMutationPlan,
 ) -> (Vec<R2SleighMutation>, Vec<CString>) {
     let mut strings = Vec::new();
     let mut mutations = Vec::new();
 
     for mutation in &plan.mutations {
-        let Some(kind) = session_mutation_kind_id(&mutation.kind) else {
-            continue;
-        };
+        let kind = session_mutation_kind_id(mutation.kind);
         let var_kind = mutation
             .var_kind
             .as_deref()
@@ -5465,15 +5101,12 @@ fn writeback_plan_json(
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     budget: TypeOutputBudget,
 ) -> InferredTypeWritebackJson {
-    let mutation_plan = mutation_plan_from_writeback(&plan, budget, &function_facts.types);
+    let mutation_plan = r2types::type_writeback_mutation_plan(&plan, budget, &function_facts.types);
+    let signature_writeback = r2types::signature_writeback_decision(&function_facts.types);
     let signature_render_authorized = function_facts.types.render_authorized_signature().is_some();
-    let signature_writeback_authorized = function_facts
-        .types
-        .writeback_authorized_signature()
-        .is_some();
-    let signature_writeback_refusal = signature_writeback_refusal(&function_facts.types);
-    let signature_certificate_sources =
-        signature_certificate_sources_json(function_facts.types.signature_certificate.as_ref());
+    let signature_writeback_authorized = signature_writeback.authorized;
+    let signature_writeback_refusal = signature_writeback.refusal;
+    let signature_certificate_sources = signature_writeback.sources;
     let mut warnings = plan.diagnostics.warnings;
     if plan.struct_decls.len() > budget.max_type_decls {
         warnings.push(format!(
@@ -5739,21 +5372,16 @@ fn semantic_type_fallback_payload(
         input.apply_artifact_signature_hint,
     );
     let mutation_plan =
-        mutation_plan_from_writeback(&plan, input.budget, &input.function_facts.types);
+        r2types::type_writeback_mutation_plan(&plan, input.budget, &input.function_facts.types);
+    let signature_writeback = r2types::signature_writeback_decision(&input.function_facts.types);
     let signature_render_authorized = input
         .function_facts
         .types
         .render_authorized_signature()
         .is_some();
-    let signature_writeback_authorized = input
-        .function_facts
-        .types
-        .writeback_authorized_signature()
-        .is_some();
-    let signature_writeback_refusal = signature_writeback_refusal(&input.function_facts.types);
-    let signature_certificate_sources = signature_certificate_sources_json(
-        input.function_facts.types.signature_certificate.as_ref(),
-    );
+    let signature_writeback_authorized = signature_writeback.authorized;
+    let signature_writeback_refusal = signature_writeback.refusal;
+    let signature_certificate_sources = signature_writeback.sources;
     let mut warnings = plan.diagnostics.warnings;
     if plan.struct_decls.len() > input.budget.max_type_decls {
         warnings.push(format!(
@@ -10726,7 +10354,7 @@ mod tests {
             diagnostics: r2types::TypeWritebackDiagnostics::default(),
         };
 
-        let mutation_plan = mutation_plan_from_writeback(
+        let mutation_plan = r2types::type_writeback_mutation_plan(
             &plan,
             TypeOutputBudget::new(usize::MAX, usize::MAX, usize::MAX),
             &function_facts.types,
@@ -10880,13 +10508,13 @@ mod tests {
             payload.signature_certificate_sources,
             vec!["local_inference".to_string()]
         );
-        assert!(
-            payload
-                .mutation_plan
-                .mutations
-                .iter()
-                .all(|mutation| mutation.kind != "signature" && mutation.kind != "callconv")
-        );
+        assert!(payload.mutation_plan.mutations.iter().all(|mutation| {
+            !matches!(
+                mutation.kind,
+                r2types::TypeWritebackMutationKind::Signature
+                    | r2types::TypeWritebackMutationKind::Callconv
+            )
+        }));
         assert!(payload.mutation_plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("certificate sources are not authoritative")
         }));
@@ -10985,13 +10613,13 @@ mod tests {
                 .is_some_and(|reason| reason
                     .contains("SignatureCertificate does not match current merged signature"))
         );
-        assert!(
-            payload
-                .mutation_plan
-                .mutations
-                .iter()
-                .all(|mutation| mutation.kind != "signature" && mutation.kind != "callconv")
-        );
+        assert!(payload.mutation_plan.mutations.iter().all(|mutation| {
+            !matches!(
+                mutation.kind,
+                r2types::TypeWritebackMutationKind::Signature
+                    | r2types::TypeWritebackMutationKind::Callconv
+            )
+        }));
         assert!(
             payload.mutation_plan.diagnostics.iter().any(|diagnostic| {
                 diagnostic.contains("does not match current merged signature")
@@ -11038,12 +10666,12 @@ mod tests {
         };
 
         let type_facts = r2types::FunctionTypeFacts::default();
-        let limited = mutation_plan_from_writeback(
+        let limited = r2types::type_writeback_mutation_plan(
             &plan,
             TypeOutputBudget::new(1, usize::MAX, usize::MAX),
             &type_facts,
         );
-        let all = mutation_plan_from_writeback(
+        let all = r2types::type_writeback_mutation_plan(
             &plan,
             TypeOutputBudget::new(2, usize::MAX, usize::MAX),
             &type_facts,
@@ -11053,14 +10681,18 @@ mod tests {
             limited
                 .mutations
                 .iter()
-                .filter(|mutation| mutation.kind == "type_link")
+                .filter(|mutation| {
+                    mutation.kind == r2types::TypeWritebackMutationKind::TypeLink
+                })
                 .count(),
             1
         );
         assert_eq!(
             all.mutations
                 .iter()
-                .filter(|mutation| mutation.kind == "type_link")
+                .filter(|mutation| {
+                    mutation.kind == r2types::TypeWritebackMutationKind::TypeLink
+                })
                 .count(),
             2
         );
@@ -11106,12 +10738,14 @@ mod tests {
 
         let budget = TypeOutputBudget::new(64, 1, 1);
         let type_facts = r2types::FunctionTypeFacts::default();
-        let mutation_plan = mutation_plan_from_writeback(&plan, budget, &type_facts);
+        let mutation_plan = r2types::type_writeback_mutation_plan(&plan, budget, &type_facts);
         assert_eq!(
             mutation_plan
                 .mutations
                 .iter()
-                .filter(|mutation| mutation.kind == "type_decl")
+                .filter(|mutation| {
+                    mutation.kind == r2types::TypeWritebackMutationKind::TypeDecl
+                })
                 .count(),
             1
         );
