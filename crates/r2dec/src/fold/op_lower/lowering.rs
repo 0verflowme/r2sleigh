@@ -58,7 +58,11 @@ impl<'a> FoldingContext<'a> {
                                 ));
                             };
                             let mut args = certified_args.args;
-                            if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
+                            if let Some(max_arity) = self.non_variadic_call_arity_for_site(
+                                frame.block_addr,
+                                frame.op_idx,
+                                &func_expr,
+                            ) {
                                 args.truncate(max_arity);
                                 certified_args.values.truncate(max_arity);
                             }
@@ -113,7 +117,11 @@ impl<'a> FoldingContext<'a> {
                                 ));
                             };
                             let mut args = certified_args.args;
-                            if let Some(max_arity) = self.non_variadic_call_arity(&func_expr) {
+                            if let Some(max_arity) = self.non_variadic_call_arity_for_site(
+                                frame.block_addr,
+                                frame.op_idx,
+                                &func_expr,
+                            ) {
                                 args.truncate(max_arity);
                                 certified_args.values.truncate(max_arity);
                             }

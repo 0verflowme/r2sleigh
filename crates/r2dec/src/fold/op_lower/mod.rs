@@ -10015,6 +10015,16 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|identity| identity.is_imported_name_hint())
     }
 
+    fn is_imported_call_target_for_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        callee: &CExpr,
+    ) -> bool {
+        self.callee_identity_for_callsite_or_expr(block_addr, op_idx, callee)
+            .is_some_and(|identity| identity.is_imported_name_hint())
+    }
+
     fn call_arg_contains_stack_placeholder(&self, expr: &CExpr, depth: u32) -> bool {
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return false;

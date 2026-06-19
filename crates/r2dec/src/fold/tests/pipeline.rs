@@ -820,6 +820,150 @@ mod tests {
     }
 
     #[test]
+    fn callsite_identity_controls_policy_when_rendered_callee_is_poisoned() {
+        let mut ctx = FoldingContext::new(64);
+        let typed_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures: HashMap<String, r2types::FunctionType> = HashMap::from([(
+            "sym.imp.one_arg".to_string(),
+            FunctionType {
+                return_type: CType::Void,
+                params: vec![CType::Int(32)],
+                variadic: false,
+            }
+            .into(),
+        )]);
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                r2types::CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            },
+        );
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+
+        let poisoned_callee = CExpr::Var("sym.local_two_arg".to_string());
+        assert!(
+            !ctx.is_imported_call_target(&poisoned_callee),
+            "expression-only fallback should not classify the poisoned local name as imported"
+        );
+        assert!(
+            ctx.is_imported_call_target_for_site(0x1000, 0, &poisoned_callee),
+            "callsite identity should classify the target from typed resolution"
+        );
+        assert!(
+            !ctx.is_imported_call_target_for_site(0x2000, 0, &poisoned_callee),
+            "unresolved callsites must not inherit imported policy from unrelated sites"
+        );
+        assert_eq!(ctx.non_variadic_call_arity(&poisoned_callee), None);
+        assert_eq!(
+            ctx.non_variadic_call_arity_for_site(0x1000, 0, &poisoned_callee),
+            Some(1)
+        );
+        assert_eq!(
+            ctx.normalize_prepared_call_args_for_site(
+                0x1000,
+                0,
+                &poisoned_callee,
+                vec![CExpr::IntLit(7), CExpr::IntLit(9)],
+            ),
+            vec![CExpr::IntLit(7)]
+        );
+    }
+
+    #[test]
+    fn callsite_identity_controls_printf_variadic_clamp_when_rendered_callee_is_poisoned() {
+        let mut ctx = FoldingContext::new(64);
+        let typed_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures: HashMap<String, r2types::FunctionType> = HashMap::from([(
+            "sym.imp.printf".to_string(),
+            FunctionType {
+                return_type: CType::Int(32),
+                params: vec![CType::ptr(CType::Int(8))],
+                variadic: true,
+            }
+            .into(),
+        )]);
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                r2types::CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            },
+        );
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+
+        let poisoned_callee = CExpr::Var("sym.local_logger".to_string());
+        assert_eq!(
+            ctx.printf_literal_variadic_arity(&poisoned_callee, &[CExpr::StringLit(
+                "value=%d\n".to_string()
+            )]),
+            None,
+            "expression-only printf policy must not trust a poisoned rendered name"
+        );
+        assert_eq!(
+            ctx.normalize_prepared_call_args_for_site(
+                0x1000,
+                0,
+                &poisoned_callee,
+                vec![
+                    CExpr::StringLit("value=%d\n".to_string()),
+                    CExpr::Var("x".to_string()),
+                    CExpr::Var("garbage".to_string()),
+                ],
+            ),
+            vec![
+                CExpr::StringLit("value=%d\n".to_string()),
+                CExpr::Var("x".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn final_normalizer_clamps_expression_owned_printf_literal_args() {
+        let ctx = FoldingContext::new(64);
+        let stmt = ctx.normalize_final_stmt_calls(CStmt::Expr(CExpr::call(
+            CExpr::Var("sym.imp.printf".to_string()),
+            vec![
+                CExpr::StringLit("value=%d\n".to_string()),
+                CExpr::Var("x".to_string()),
+                CExpr::Var("garbage".to_string()),
+            ],
+        )));
+
+        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
+            panic!("expected call expression");
+        };
+        assert_eq!(
+            args,
+            vec![
+                CExpr::StringLit("value=%d\n".to_string()),
+                CExpr::Var("x".to_string()),
+            ],
+            "expression-owned final printf normalization must still clamp literal placeholder count"
+        );
+    }
+
+    #[test]
     fn modeled_call_target_uses_typed_resolution_without_fact_scan() {
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.imp.memcpy".to_string())]);
@@ -845,9 +989,19 @@ mod tests {
         ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
         ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
 
-        assert!(ctx.is_modeled_call_target(&CExpr::Var(
-            "sym.imp.memcpy".to_string()
-        )));
+        let poisoned_callee = CExpr::Var("sym.local_copy".to_string());
+        assert!(
+            !ctx.is_modeled_call_target(&poisoned_callee),
+            "expression-only fallback should not classify the poisoned local name as modeled"
+        );
+        assert!(
+            ctx.is_modeled_call_target_for_site(0x1000, 0, &poisoned_callee),
+            "callsite identity should classify the modeled target from typed resolution"
+        );
+        assert!(
+            !ctx.is_modeled_call_target_for_site(0x2000, 0, &poisoned_callee),
+            "unresolved callsites must not inherit modeled policy from unrelated sites"
+        );
     }
 
     #[test]
@@ -946,6 +1100,34 @@ mod tests {
                 CExpr::Var("x".to_string()),
             ],
             "printf with a literal format string should clamp trailing garbage args, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn indirect_call_lowering_preserves_site_arguments() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.state.analysis_ctx.use_info.call_args.insert(
+            (0x1000, 0),
+            vec![call_arg(CExpr::Var("arg0".to_string()))],
+        );
+
+        let stmt = ctx
+            .op_to_stmt_with_args(
+                &SSAOp::CallInd {
+                    target: make_var("call_target", 0, 8),
+                },
+                0x1000,
+                0,
+            )
+            .expect("indirect call should emit statement");
+
+        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
+            panic!("expected indirect call expression");
+        };
+        assert_eq!(
+            args,
+            vec![CExpr::Var("arg0".to_string())],
+            "indirect call lowering must consume site call arguments"
         );
     }
 

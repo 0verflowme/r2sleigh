@@ -59,6 +59,32 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
+    pub(super) fn callee_identity_for_callsite_or_expr(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        callee: &CExpr,
+    ) -> Option<CalleeIdentity> {
+        if let Some(identity) = self
+            .prepared_call_view_for_site(block_addr, op_idx)
+            .and_then(|view| view.callee_identity.clone())
+        {
+            return Some(identity);
+        }
+        if let Some(identity) = self.inputs.callee_resolution.and_then(|facts| {
+            facts.identity_for_callsite(r2types::CallsiteKey {
+                block_addr,
+                op_index: op_idx,
+            })
+        }) {
+            return Some(identity.clone());
+        }
+        if let Some(addr) = self.prepared_direct_call_target(block_addr, op_idx) {
+            return Some(self.callee_identity_for_direct_target(addr));
+        }
+        self.callee_identity_for_expr(callee)
+    }
+
     pub(super) fn resolve_call_target_for_site(
         &self,
         block_addr: u64,
@@ -83,6 +109,7 @@ impl<'a> FoldingContext<'a> {
         self.resolve_call_target(target)
     }
 
+    #[cfg(test)]
     pub(super) fn render_call_args_for_callee(
         &self,
         callee: &CExpr,
@@ -112,6 +139,43 @@ impl<'a> FoldingContext<'a> {
         rendered
     }
 
+    pub(super) fn render_call_args_for_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        callee: &CExpr,
+        raw_args: Vec<analysis::CallArgBinding>,
+    ) -> Vec<CExpr> {
+        let imported_or_modeled = self.is_imported_call_target_for_site(block_addr, op_idx, callee)
+            || self.is_modeled_call_target_for_site(block_addr, op_idx, callee);
+        if imported_or_modeled {
+            let mut rendered = raw_args
+                .iter()
+                .cloned()
+                .map(|binding| self.render_imported_call_arg(binding))
+                .collect::<Vec<_>>();
+            if let Some(max_arity) =
+                self.non_variadic_call_arity_for_site(block_addr, op_idx, callee)
+            {
+                rendered.truncate(max_arity);
+            } else if let Some(max_arity) =
+                self.printf_literal_variadic_arity_for_site(block_addr, op_idx, callee, &rendered)
+            {
+                rendered.truncate(max_arity);
+            }
+            return rendered;
+        }
+
+        let mut rendered = raw_args
+            .into_iter()
+            .map(|binding| self.render_call_arg_for_callee(callee, binding))
+            .collect::<Vec<_>>();
+        if let Some(max_arity) = self.non_variadic_call_arity_for_site(block_addr, op_idx, callee) {
+            rendered.truncate(max_arity);
+        }
+        rendered
+    }
+
     pub(super) fn prepared_call_args_for_site(
         &self,
         block_addr: u64,
@@ -125,8 +189,12 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
 
-        let args =
-            self.normalize_prepared_call_args_for_callee(callee, view.authoritative_args.clone());
+        let args = self.normalize_prepared_call_args_for_site(
+            block_addr,
+            op_idx,
+            callee,
+            view.authoritative_args.clone(),
+        );
         let values = view
             .authoritative_arg_values
             .iter()
@@ -136,13 +204,15 @@ impl<'a> FoldingContext<'a> {
         (values.len() == args.len()).then_some(PreparedCallArgs { args, values })
     }
 
-    pub(super) fn normalize_prepared_call_args_for_callee(
+    pub(super) fn normalize_prepared_call_args_for_site(
         &self,
+        block_addr: u64,
+        op_idx: usize,
         callee: &CExpr,
         args: Vec<CExpr>,
     ) -> Vec<CExpr> {
-        let imported_or_modeled =
-            self.is_imported_call_target(callee) || self.is_modeled_call_target(callee);
+        let imported_or_modeled = self.is_imported_call_target_for_site(block_addr, op_idx, callee)
+            || self.is_modeled_call_target_for_site(block_addr, op_idx, callee);
         let mut normalized = if imported_or_modeled {
             args.into_iter()
                 .map(|arg| self.normalize_imported_call_arg_expr(arg, true, false, true))
@@ -152,10 +222,11 @@ impl<'a> FoldingContext<'a> {
                 .map(|arg| self.normalize_call_arg_expr_for_callee(callee, arg))
                 .collect::<Vec<_>>()
         };
-        if let Some(max_arity) = self.non_variadic_call_arity(callee) {
+        if let Some(max_arity) = self.non_variadic_call_arity_for_site(block_addr, op_idx, callee) {
             normalized.truncate(max_arity);
         } else if imported_or_modeled
-            && let Some(max_arity) = self.printf_literal_variadic_arity(callee, &normalized)
+            && let Some(max_arity) =
+                self.printf_literal_variadic_arity_for_site(block_addr, op_idx, callee, &normalized)
         {
             normalized.truncate(max_arity);
         }
@@ -171,7 +242,7 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<CertifiedCallArgs> {
         if !self.requires_certified_rendering() {
             return Some(CertifiedCallArgs {
-                args: self.render_call_args_for_callee(callee, raw_args),
+                args: self.render_call_args_for_site(block_addr, op_idx, callee, raw_args),
                 values: Vec::new(),
             });
         }
@@ -215,7 +286,7 @@ impl<'a> FoldingContext<'a> {
                 });
         }
 
-        let args = self.render_call_args_for_callee(callee, raw_args.clone());
+        let args = self.render_call_args_for_site(block_addr, op_idx, callee, raw_args.clone());
         let values = raw_args
             .iter()
             .take(args.len())
@@ -278,6 +349,20 @@ impl<'a> FoldingContext<'a> {
 
     pub(super) fn non_variadic_call_arity(&self, callee: &CExpr) -> Option<usize> {
         let identity = self.callee_identity_for_expr(callee)?;
+        self.non_variadic_call_arity_for_identity(&identity)
+    }
+
+    pub(super) fn non_variadic_call_arity_for_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        callee: &CExpr,
+    ) -> Option<usize> {
+        let identity = self.callee_identity_for_callsite_or_expr(block_addr, op_idx, callee)?;
+        self.non_variadic_call_arity_for_identity(&identity)
+    }
+
+    fn non_variadic_call_arity_for_identity(&self, identity: &CalleeIdentity) -> Option<usize> {
         let cache_key = identity.primary_key();
         if let Some(cached) = self
             .non_variadic_call_arity_cache
@@ -330,7 +415,23 @@ impl<'a> FoldingContext<'a> {
         let Some(identity) = self.callee_identity_for_expr(callee) else {
             return false;
         };
+        self.is_modeled_callee_identity(&identity)
+    }
 
+    pub(super) fn is_modeled_call_target_for_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        callee: &CExpr,
+    ) -> bool {
+        let Some(identity) = self.callee_identity_for_callsite_or_expr(block_addr, op_idx, callee)
+        else {
+            return false;
+        };
+        self.is_modeled_callee_identity(&identity)
+    }
+
+    fn is_modeled_callee_identity(&self, identity: &CalleeIdentity) -> bool {
         if identity
             .aliases
             .iter()
@@ -339,7 +440,7 @@ impl<'a> FoldingContext<'a> {
             return true;
         }
 
-        self.modeled_callee_addr_for_identity(&identity)
+        self.modeled_callee_addr_for_identity(identity)
             .is_some_and(|addr| self.inputs.callee_facts.contains_key(&addr))
     }
 
@@ -843,6 +944,25 @@ impl<'a> FoldingContext<'a> {
         rendered_args: &[CExpr],
     ) -> Option<usize> {
         let identity = self.callee_identity_for_expr(callee)?;
+        self.printf_literal_variadic_arity_for_identity(&identity, rendered_args)
+    }
+
+    pub(super) fn printf_literal_variadic_arity_for_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        callee: &CExpr,
+        rendered_args: &[CExpr],
+    ) -> Option<usize> {
+        let identity = self.callee_identity_for_callsite_or_expr(block_addr, op_idx, callee)?;
+        self.printf_literal_variadic_arity_for_identity(&identity, rendered_args)
+    }
+
+    fn printf_literal_variadic_arity_for_identity(
+        &self,
+        identity: &r2types::CalleeIdentity,
+        rendered_args: &[CExpr],
+    ) -> Option<usize> {
         if !identity.matches_normalized_name("printf") {
             return None;
         }
