@@ -870,6 +870,18 @@ mod kani_proofs {
             type_min_confidence.clamp(1, 100)
         );
     }
+
+    #[kani::proof]
+    fn generated_var_decimal_suffix_accepts_only_ascii_digits() {
+        let suffix = kani::any::<[u8; 4]>();
+        if ascii_suffix_is_nonempty_decimal(&suffix) {
+            for byte in suffix {
+                assert!(byte.is_ascii_digit());
+            }
+        }
+
+        assert!(!ascii_suffix_is_nonempty_decimal(&[]));
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -8286,12 +8298,14 @@ fn build_struct_decl(
     Some(format!("struct {struct_name} {{\n{body}\n}};"))
 }
 
-fn is_opaque_placeholder_type_name(name: &str) -> bool {
+pub fn writeback_type_name_is_opaque_placeholder(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     let stripped = lower
         .trim_start_matches("struct ")
         .trim_start_matches("union ")
-        .trim_start_matches("enum ");
+        .trim_start_matches("enum ")
+        .trim_end_matches('*')
+        .trim_end();
     stripped.starts_with("anon_") || stripped.starts_with("type_0x") || lower.contains(" type_0x")
 }
 
@@ -8302,7 +8316,7 @@ fn is_generated_local_struct_name(name: &str) -> bool {
         .starts_with("sla_struct_")
 }
 
-fn is_generic_type_string(ty: &str) -> bool {
+pub fn writeback_type_name_is_generic(ty: &str) -> bool {
     let normalized = normalize_external_type_name(ty);
     let lower = normalized.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -8311,7 +8325,7 @@ fn is_generic_type_string(ty: &str) -> bool {
     if lower.starts_with("byte[") {
         return true;
     }
-    if is_opaque_placeholder_type_name(&lower) {
+    if writeback_type_name_is_opaque_placeholder(&lower) {
         return true;
     }
     matches!(
@@ -8332,6 +8346,99 @@ fn is_generic_type_string(ty: &str) -> bool {
             | "long"
             | "unsigned long"
     )
+}
+
+pub fn writeback_apply_type_name_is_opaque_placeholder(type_name: &str) -> bool {
+    if type_name.is_empty() {
+        return false;
+    }
+    normalize_writeback_apply_compare_string(type_name).contains("type_0x")
+}
+
+pub fn writeback_apply_type_name_is_generic(type_name: &str) -> bool {
+    if type_name.is_empty() {
+        return true;
+    }
+    if writeback_apply_type_name_is_opaque_placeholder(type_name) {
+        return true;
+    }
+    let normalized = normalize_writeback_apply_compare_string(type_name);
+    normalized == "void*"
+        || normalized == "char*"
+        || normalized == "int"
+        || normalized == "unsigned"
+        || normalized == "long"
+        || normalized == "unsignedlong"
+        || normalized == "unknown"
+        || normalized.starts_with("int")
+        || normalized.starts_with("uint")
+        || normalized.starts_with("byte[")
+}
+
+pub fn canonicalize_writeback_apply_type_name(type_name: &str) -> Option<String> {
+    let mut canonical = type_name.trim().to_string();
+    if canonical.is_empty() {
+        None
+    } else {
+        while canonical.starts_with("type.") {
+            canonical.drain(..5);
+        }
+        for (dotted, spaced) in [
+            ("struct.", "struct "),
+            ("union.", "union "),
+            ("enum.", "enum "),
+            ("struct type.", "struct "),
+            ("union type.", "union "),
+            ("enum type.", "enum "),
+        ] {
+            if let Some(rest) = canonical.strip_prefix(dotted) {
+                canonical = format!("{spaced}{rest}");
+                break;
+            }
+        }
+        if let Some(star_idx) = canonical.find('*')
+            && star_idx > 0
+            && canonical.as_bytes()[star_idx - 1] != b' '
+        {
+            canonical.insert(star_idx, ' ');
+        }
+        Some(canonical)
+    }
+}
+
+pub fn writeback_var_name_is_generated(name: &str) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    if let Some(suffix) = name.strip_prefix("arg")
+        && ascii_suffix_is_nonempty_decimal(suffix.as_bytes())
+    {
+        return true;
+    }
+    name.starts_with("var_")
+        || name.starts_with("local_")
+        || name.starts_with("stack_")
+        || name.starts_with("arg_")
+}
+
+fn normalize_writeback_apply_compare_string(type_name: &str) -> String {
+    type_name
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != ';')
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn ascii_suffix_is_nonempty_decimal(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
+}
+
+fn is_opaque_placeholder_type_name(name: &str) -> bool {
+    writeback_type_name_is_opaque_placeholder(name)
+}
+
+fn is_generic_type_string(ty: &str) -> bool {
+    writeback_type_name_is_generic(ty)
 }
 
 fn is_low_signal_storage_scalar_type(ty: &str, ptr_bits: u32) -> bool {
@@ -8473,6 +8580,109 @@ mod tests {
             global_type_links: Vec::new(),
             diagnostics: TypeWritebackDiagnostics::default(),
         }
+    }
+
+    #[test]
+    fn writeback_generated_var_name_policy_matches_apply_guard() {
+        for generated in [
+            "", "arg0", "arg12", "arg_8", "var_10h", "local_20", "stack_18",
+        ] {
+            assert!(
+                writeback_var_name_is_generated(generated),
+                "{generated:?} should be replaceable generated storage"
+            );
+        }
+
+        for user_name in ["arg", "argc", "value", "count", "user_var_10"] {
+            assert!(
+                !writeback_var_name_is_generated(user_name),
+                "{user_name:?} should be preserved as user/current identity"
+            );
+        }
+    }
+
+    #[test]
+    fn writeback_apply_type_name_policy_matches_executor_guard() {
+        for generic in [
+            "",
+            "void *",
+            "char*",
+            "int",
+            "unsigned",
+            "long",
+            "unsigned long",
+            "uint32_t",
+            "unknown",
+            "byte[16]",
+            "struct type_0x1234 *",
+        ] {
+            assert!(
+                writeback_apply_type_name_is_generic(generic),
+                "{generic:?} should remain a weak apply-time type"
+            );
+        }
+
+        assert!(writeback_apply_type_name_is_opaque_placeholder(
+            "struct type_0x1234 *"
+        ));
+        assert!(!writeback_apply_type_name_is_opaque_placeholder(
+            "struct real_type *"
+        ));
+        assert!(!writeback_apply_type_name_is_generic("struct real_type *"));
+    }
+
+    #[test]
+    fn writeback_type_name_policy_matches_planner_guard() {
+        assert!(writeback_type_name_is_opaque_placeholder(
+            "struct type_0x1234 *"
+        ));
+        assert!(writeback_type_name_is_opaque_placeholder(
+            "struct anon_field"
+        ));
+        assert!(!writeback_type_name_is_opaque_placeholder(
+            "struct real_type *"
+        ));
+
+        for generic in ["void *", "const char *", "unsigned char*", "unsigned long"] {
+            assert!(
+                writeback_type_name_is_generic(generic),
+                "{generic:?} should stay a weak planner type"
+            );
+        }
+        assert!(!writeback_type_name_is_generic("struct real_type *"));
+    }
+
+    #[test]
+    fn writeback_private_compat_wrappers_route_to_public_policy() {
+        assert!(is_opaque_placeholder_type_name("union type_0xabcd"));
+        assert!(!is_opaque_placeholder_type_name("union concrete"));
+        assert!(is_generic_type_string("char *"));
+        assert!(!is_generic_type_string("struct concrete *"));
+    }
+
+    #[test]
+    fn writeback_apply_type_name_canonicalization_matches_legacy_executor_spelling() {
+        assert_eq!(
+            canonicalize_writeback_apply_type_name(" type.int* "),
+            Some("int *".to_string())
+        );
+        assert_eq!(
+            canonicalize_writeback_apply_type_name("struct.sla_example *"),
+            Some("struct sla_example *".to_string())
+        );
+        assert_eq!(
+            canonicalize_writeback_apply_type_name("struct type.foo_bar*"),
+            Some("struct foo_bar *".to_string())
+        );
+        assert_eq!(
+            canonicalize_writeback_apply_type_name("type.IOCPU_VTable.setCPUNumber"),
+            Some("IOCPU_VTable.setCPUNumber".to_string())
+        );
+        assert_eq!(
+            canonicalize_writeback_apply_type_name("*already_pointer"),
+            Some("*already_pointer".to_string())
+        );
+        assert_eq!(canonicalize_writeback_apply_type_name("   "), None);
     }
 
     fn certified_signature_facts(param_name: &str, param_bits: u32) -> FunctionTypeFacts {

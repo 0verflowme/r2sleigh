@@ -84,6 +84,10 @@ extern char *r2sleigh_decompile_render_cache_stats_json(void);
 extern void r2sleigh_decompile_render_cache_stats_reset(void);
 extern char *r2sleigh_engine_cache_stats_json(void);
 extern void r2sleigh_engine_cache_stats_reset(void);
+extern int r2sleigh_writeback_var_name_is_generated(const char *name);
+extern int r2sleigh_writeback_apply_type_name_is_generic(const char *type_name);
+extern int r2sleigh_writeback_apply_type_name_is_opaque_placeholder(const char *type_name);
+extern char *r2sleigh_writeback_apply_type_name_canonicalize(const char *type_name);
 
 /* Typed analysis */
 extern char *r2il_block_regs_read(const R2ILContext *ctx, const R2ILBlock *block);
@@ -9406,74 +9410,15 @@ typedef struct {
 } TypeWritebackCounters;
 
 static bool is_opaque_placeholder_type_name(const char *type_name) {
-	char *normalized;
-	bool opaque = false;
-
-	if (!type_name || !*type_name) {
-		return false;
-	}
-	normalized = normalize_compare_string (type_name);
-	if (!normalized) {
-		return false;
-	}
-	if (strstr (normalized, "type_0x")) {
-		opaque = true;
-	}
-	free (normalized);
-	return opaque;
+	return r2sleigh_writeback_apply_type_name_is_opaque_placeholder (type_name) != 0;
 }
 
 static bool is_generic_type_name(const char *type_name) {
-	char *normalized;
-	bool generic;
-
-	if (!type_name || !*type_name) {
-		return true;
-	}
-	if (is_opaque_placeholder_type_name (type_name)) {
-		return true;
-	}
-	normalized = normalize_compare_string (type_name);
-	if (!normalized) {
-		return true;
-	}
-	generic = !strcmp (normalized, "void*")
-		|| !strcmp (normalized, "char*")
-		|| !strcmp (normalized, "int")
-		|| !strcmp (normalized, "unsigned")
-		|| !strcmp (normalized, "long")
-		|| !strcmp (normalized, "unsignedlong")
-		|| !strcmp (normalized, "unknown")
-		|| !strncmp (normalized, "int", 3)
-		|| !strncmp (normalized, "uint", 4)
-		|| !strncmp (normalized, "byte[", 5);
-	free (normalized);
-	return generic;
+	return r2sleigh_writeback_apply_type_name_is_generic (type_name) != 0;
 }
 
 static bool is_generated_var_name(const char *name) {
-	const char *p;
-	if (!name || !*name) {
-		return true;
-	}
-	if (!strncmp (name, "arg", 3)) {
-		p = name + 3;
-		if (*p) {
-			while (*p) {
-				if (!isdigit ((unsigned char)*p)) {
-					break;
-				}
-				p++;
-			}
-			if (!*p) {
-				return true;
-			}
-		}
-	}
-	return !strncmp (name, "var_", 4)
-		|| !strncmp (name, "local_", 6)
-		|| !strncmp (name, "stack_", 6)
-		|| !strncmp (name, "arg_", 4);
+	return r2sleigh_writeback_var_name_is_generated (name) != 0;
 }
 
 static int resolve_reg_index(RAnal *anal, const char *reg_name) {
@@ -9668,62 +9613,18 @@ static bool type_name_is_materialized(RAnal *anal, const char *type_name) {
 }
 
 static const char *canonicalize_type_name_for_apply(const char *type_name, char *buf, size_t buf_sz) {
-	const char *trim_start;
-	const char *trim_end;
-	size_t len;
-	char *star;
+	char *canonical;
 
 	if (!type_name || !buf || buf_sz < 8) {
 		return type_name;
 	}
-	trim_start = type_name;
-	while (*trim_start && isspace ((unsigned char)*trim_start)) {
-		trim_start++;
-	}
-	trim_end = trim_start + strlen (trim_start);
-	while (trim_end > trim_start && isspace ((unsigned char)trim_end[-1])) {
-		trim_end--;
-	}
-	len = (size_t)(trim_end - trim_start);
-	if (len >= buf_sz) {
-		len = buf_sz - 1;
-	}
-	memcpy (buf, trim_start, len);
-	buf[len] = '\0';
-	if (!buf[0]) {
+	canonical = r2sleigh_writeback_apply_type_name_canonicalize (type_name);
+	if (!canonical || !*canonical) {
+		r2il_string_free (canonical);
 		return type_name;
 	}
-	while (!strncmp (buf, "type.", 5)) {
-		memmove (buf, buf + 5, strlen (buf + 5) + 1);
-	}
-	if (!strncmp (buf, "struct.", 7)) {
-		memmove (buf + strlen ("struct "), buf + 7, strlen (buf + 7) + 1);
-		memcpy (buf, "struct ", strlen ("struct "));
-	} else if (!strncmp (buf, "union.", 6)) {
-		memmove (buf + strlen ("union "), buf + 6, strlen (buf + 6) + 1);
-		memcpy (buf, "union ", strlen ("union "));
-	} else if (!strncmp (buf, "enum.", 5)) {
-		memmove (buf + strlen ("enum "), buf + 5, strlen (buf + 5) + 1);
-		memcpy (buf, "enum ", strlen ("enum "));
-	}
-	if (!strncmp (buf, "struct type.", 12)) {
-		memmove (buf + strlen ("struct "), buf + 12, strlen (buf + 12) + 1);
-		memcpy (buf, "struct ", strlen ("struct "));
-	} else if (!strncmp (buf, "union type.", 11)) {
-		memmove (buf + strlen ("union "), buf + 11, strlen (buf + 11) + 1);
-		memcpy (buf, "union ", strlen ("union "));
-	} else if (!strncmp (buf, "enum type.", 10)) {
-		memmove (buf + strlen ("enum "), buf + 10, strlen (buf + 10) + 1);
-		memcpy (buf, "enum ", strlen ("enum "));
-	}
-	star = strchr (buf, '*');
-	if (star && star > buf && star[-1] != ' ') {
-		size_t prefix = (size_t)(star - buf);
-		if (prefix + 2 < buf_sz) {
-			memmove (star + 1, star, strlen (star) + 1);
-			star[0] = ' ';
-		}
-	}
+	snprintf (buf, buf_sz, "%s", canonical);
+	r2il_string_free (canonical);
 	return buf;
 }
 

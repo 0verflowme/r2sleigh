@@ -963,6 +963,59 @@ pub extern "C" fn r2il_string_free(s: *mut c_char) {
     }
 }
 
+fn raw_cstr_lossy(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_writeback_var_name_is_generated(name: *const c_char) -> i32 {
+    let Some(name) = raw_cstr_lossy(name) else {
+        return 1;
+    };
+    i32::from(r2types::writeback_var_name_is_generated(&name))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_writeback_apply_type_name_is_generic(type_name: *const c_char) -> i32 {
+    let Some(type_name) = raw_cstr_lossy(type_name) else {
+        return 1;
+    };
+    i32::from(r2types::writeback_apply_type_name_is_generic(&type_name))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_writeback_apply_type_name_is_opaque_placeholder(
+    type_name: *const c_char,
+) -> i32 {
+    let Some(type_name) = raw_cstr_lossy(type_name) else {
+        return 0;
+    };
+    i32::from(r2types::writeback_apply_type_name_is_opaque_placeholder(
+        &type_name,
+    ))
+}
+
+/// Caller must free the returned string with r2il_string_free().
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_writeback_apply_type_name_canonicalize(
+    type_name: *const c_char,
+) -> *mut c_char {
+    let Some(type_name) = raw_cstr_lossy(type_name) else {
+        return ptr::null_mut();
+    };
+    r2types::canonicalize_writeback_apply_type_name(&type_name)
+        .and_then(|canonical| CString::new(canonical).ok())
+        .map_or(ptr::null_mut(), |c| c.into_raw())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r2dec_highlight_c_ansi(source: *const c_char) -> *mut c_char {
     if source.is_null() {
@@ -9205,6 +9258,40 @@ mod tests {
             normalize_external_type_name("type.IOCPU_VTable.setCPUNumber"),
             "void *"
         );
+    }
+
+    #[test]
+    fn test_writeback_apply_policy_ffi_routes_to_r2types() {
+        let generated = CString::new("arg12").unwrap();
+        let user_name = CString::new("argc").unwrap();
+        assert_eq!(
+            r2sleigh_writeback_var_name_is_generated(generated.as_ptr()),
+            1
+        );
+        assert_eq!(
+            r2sleigh_writeback_var_name_is_generated(user_name.as_ptr()),
+            0
+        );
+
+        let generic = CString::new("uint32_t").unwrap();
+        let concrete = CString::new("struct real_type *").unwrap();
+        assert_eq!(
+            r2sleigh_writeback_apply_type_name_is_generic(generic.as_ptr()),
+            1
+        );
+        assert_eq!(
+            r2sleigh_writeback_apply_type_name_is_generic(concrete.as_ptr()),
+            0
+        );
+
+        let dotted = CString::new("struct type.foo_bar*").unwrap();
+        let canonical = r2sleigh_writeback_apply_type_name_canonicalize(dotted.as_ptr());
+        assert!(!canonical.is_null());
+        let canonical_text = unsafe { CStr::from_ptr(canonical) }
+            .to_string_lossy()
+            .into_owned();
+        r2il_string_free(canonical);
+        assert_eq!(canonical_text, "struct foo_bar *");
     }
 
     #[test]
