@@ -1656,12 +1656,7 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
                 inputs.ret_reg_name,
             );
         }
-        let max_arity = call_site.direct_target.and_then(|target| {
-            inputs
-                .interproc_summary_set
-                .and_then(|set| set.summaries.get(&r2ssa::InterprocFunctionId(target)))
-                .and_then(|summary| summary.arg_count_hint)
-        });
+        let max_arity = prepared_call_max_arity(inputs, &call_view);
         let mut authoritative_args = infer_call_authoritative_args(
             site,
             inputs.prepared.function(),
@@ -1695,6 +1690,24 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             .collect();
         view.call_view_by_site.insert(site, call_view);
     }
+}
+
+fn prepared_call_max_arity(
+    inputs: &PreparedSemanticViewInputs<'_>,
+    call_view: &PreparedCallView,
+) -> Option<usize> {
+    call_view
+        .callee_identity
+        .as_ref()
+        .and_then(CalleeIdentity::non_variadic_known_arity)
+        .or_else(|| {
+            call_view.direct_target.and_then(|target| {
+                inputs
+                    .interproc_summary_set
+                    .and_then(|set| set.summaries.get(&r2ssa::InterprocFunctionId(target)))
+                    .and_then(|summary| summary.arg_count_hint)
+            })
+        })
 }
 
 fn infer_call_authoritative_args(
@@ -3666,7 +3679,7 @@ fn param_alias_for_name(name: &str, env: &PassEnv<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{R2ILBlock, R2ILOp, Varnode};
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
 
     fn test_var(name: &str, version: u32, size: u32) -> SSAVar {
         SSAVar::new(name, version, size)
@@ -3689,6 +3702,34 @@ mod tests {
             target: Varnode::constant(0, 8),
         });
         SsaArtifact::from_blocks(&[block], None).expect("prepared call SSA artifact")
+    }
+
+    fn test_x86_64_arg_arch() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RDI", 0x10, 8));
+        arch.add_register(RegisterDef::new("RSI", 0x18, 8));
+        arch
+    }
+
+    fn test_prepared_two_arg_call_artifact() -> SsaArtifact {
+        let arch = test_x86_64_arg_arch();
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x18, 8),
+            src: Varnode::constant(9, 8),
+        });
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x401000, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("prepared two-arg call SSA artifact")
     }
 
     #[test]
@@ -3889,6 +3930,121 @@ mod tests {
         assert_eq!(identity.primary_key(), "printf");
         assert!(identity.is_imported_name_hint());
         assert_eq!(call_view.callee_name.as_deref(), Some("sym.imp.printf"));
+    }
+
+    #[test]
+    fn prepared_call_arity_prefers_typed_callee_signature_over_summary_hint() {
+        let prepared = test_prepared_two_arg_call_artifact();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let typed_function_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
+        let fallback_function_names = HashMap::from([(0x401000, "sym.local_two_arg".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::from([(
+            "sym.imp.one_arg".to_string(),
+            FunctionType {
+                return_type: r2types::CTypeLike::Void,
+                params: vec![r2types::CTypeLike::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }],
+                variadic: false,
+            },
+        )]);
+        let resolution_ctx = CalleeIdentityContext {
+            function_names: &typed_function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            known_function_signatures: &known_function_signatures,
+        };
+        let callee_resolution = CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 2,
+                },
+                0x401000,
+            )],
+            &resolution_ctx,
+        );
+        let mut summaries = InterprocSummarySet::default();
+        let summary_id = r2ssa::InterprocFunctionId(0x401000);
+        let mut summary =
+            r2ssa::FunctionSemanticSummary::unknown(summary_id, Some("sym.local_two_arg".into()));
+        summary.arg_count_hint = Some(2);
+        summaries.summaries.insert(summary_id, summary);
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            interproc_summary_set: Some(&summaries),
+            abi_arg_regs: &abi_arg_regs,
+            ret_reg_name: "rax",
+            function_names: &fallback_function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&callee_resolution),
+            known_function_signatures: &known_function_signatures,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 2))
+            .expect("direct callsite should have prepared call view");
+        assert_eq!(
+            call_view
+                .callee_identity
+                .as_ref()
+                .and_then(CalleeIdentity::non_variadic_known_arity),
+            Some(1)
+        );
+        assert_eq!(call_view.authoritative_args, vec![CExpr::IntLit(7)]);
+    }
+
+    #[test]
+    fn prepared_call_arity_uses_summary_hint_when_typed_signature_is_absent() {
+        let prepared = test_prepared_two_arg_call_artifact();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let function_names = HashMap::from([(0x401000, "sym.local_two_arg".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::new();
+        let mut summaries = InterprocSummarySet::default();
+        let summary_id = r2ssa::InterprocFunctionId(0x401000);
+        let mut summary =
+            r2ssa::FunctionSemanticSummary::unknown(summary_id, Some("sym.local_two_arg".into()));
+        summary.arg_count_hint = Some(2);
+        summaries.summaries.insert(summary_id, summary);
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            interproc_summary_set: Some(&summaries),
+            abi_arg_regs: &abi_arg_regs,
+            ret_reg_name: "rax",
+            function_names: &function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            callee_resolution: None,
+            known_function_signatures: &known_function_signatures,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 2))
+            .expect("direct callsite should have prepared call view");
+        assert_eq!(
+            call_view.authoritative_args,
+            vec![CExpr::IntLit(7), CExpr::IntLit(9)]
+        );
     }
 
     #[test]
