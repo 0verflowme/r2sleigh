@@ -6,8 +6,9 @@ use r2ssa::{
     SsaArtifact, ValueId,
 };
 use r2types::{
-    CalleeFact, CalleeIdentity, CalleeIdentityContext, ExternalStackSlotRole,
-    ExternalStackSlotSpec, FunctionType, StackSlotKey, VisibleBinding, VisibleBindingKind,
+    CalleeFact, CalleeIdentity, CalleeIdentityContext, CalleeResolutionFacts, CallsiteKey,
+    ExternalStackSlotRole, ExternalStackSlotSpec, FunctionType, StackSlotKey, VisibleBinding,
+    VisibleBindingKind,
 };
 
 use super::lower::LowerCtx;
@@ -68,6 +69,7 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) function_names: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
+    pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
@@ -1619,9 +1621,7 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
         };
         let mut call_view = PreparedCallView {
             direct_target: call_site.direct_target,
-            callee_identity: call_site
-                .direct_target
-                .map(|addr| lookup_callee_identity(inputs, addr)),
+            callee_identity: lookup_callee_identity_for_site(inputs, site, call_site.direct_target),
             callee_name: None,
             authoritative_args: Vec::new(),
             authoritative_arg_values: Vec::new(),
@@ -2179,6 +2179,22 @@ fn lookup_callee_identity(inputs: &PreparedSemanticViewInputs<'_>, addr: u64) ->
             known_function_signatures: inputs.known_function_signatures,
         },
     )
+}
+
+fn lookup_callee_identity_for_site(
+    inputs: &PreparedSemanticViewInputs<'_>,
+    site: (u64, usize),
+    direct_target: Option<u64>,
+) -> Option<CalleeIdentity> {
+    let callsite = CallsiteKey {
+        block_addr: site.0,
+        op_index: site.1,
+    };
+    inputs
+        .callee_resolution
+        .and_then(|facts| facts.identity_for_callsite(callsite))
+        .cloned()
+        .or_else(|| direct_target.map(|addr| lookup_callee_identity(inputs, addr)))
 }
 
 fn scalar_owner_expr_for_value(
@@ -3658,6 +3674,17 @@ mod tests {
         SsaArtifact::from_blocks(&[block], None).expect("prepared SSA artifact")
     }
 
+    fn test_prepared_call_artifact() -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x1000, 5);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x401000, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        SsaArtifact::from_blocks(&[block], None).expect("prepared call SSA artifact")
+    }
+
     #[test]
     fn prepared_call_expr_requires_argument_value_bijection() {
         let unproved = PreparedCallView {
@@ -3788,6 +3815,7 @@ mod tests {
             function_names: &function_names,
             symbols: &symbols,
             callee_facts: &callee_facts,
+            callee_resolution: None,
             known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
@@ -3797,6 +3825,64 @@ mod tests {
         assert_eq!(view.param_alias_by_reg, param_register_aliases);
         assert_eq!(view.param_rank_by_alias.get("argc"), Some(&0));
         assert_eq!(view.param_rank_by_alias.get("argv"), Some(&1));
+    }
+
+    #[test]
+    fn prepared_view_prefers_typed_callee_resolution_over_raw_name_maps() {
+        let prepared = test_prepared_call_artifact();
+        let summaries = InterprocSummarySet::default();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let fallback_function_names = HashMap::from([(0x401000, "sym.local_helper".to_string())]);
+        let resolution_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_function_signatures = HashMap::new();
+        let resolution_ctx = CalleeIdentityContext {
+            function_names: &resolution_function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            known_function_signatures: &known_function_signatures,
+        };
+        let callee_resolution = CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &resolution_ctx,
+        );
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            interproc_summary_set: Some(&summaries),
+            abi_arg_regs: &abi_arg_regs,
+            ret_reg_name: "rax",
+            function_names: &fallback_function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&callee_resolution),
+            known_function_signatures: &known_function_signatures,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 0))
+            .expect("direct callsite should have prepared call view");
+        let identity = call_view
+            .callee_identity
+            .as_ref()
+            .expect("direct callsite should have typed callee identity");
+        assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
+        assert_eq!(identity.primary_key(), "printf");
+        assert!(identity.is_imported_name_hint());
+        assert_eq!(call_view.callee_name.as_deref(), Some("sym.imp.printf"));
     }
 
     #[test]

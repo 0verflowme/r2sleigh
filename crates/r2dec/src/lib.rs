@@ -4351,6 +4351,32 @@ impl Decompiler {
             .iter()
             .map(|(name, ty)| (normalize_callee_name(name), ty.clone()))
             .collect::<std::collections::HashMap<_, _>>();
+        let callee_resolution = prepared.map(|artifact| {
+            let ctx = r2types::CalleeIdentityContext {
+                function_names: &self.context.function_names,
+                symbols: &self.context.symbols,
+                callee_facts: &self.context.type_facts().callee_facts,
+                known_function_signatures: &known_function_signatures,
+            };
+            r2types::CalleeResolutionFacts::from_direct_call_targets(
+                artifact
+                    .call_sites()
+                    .by_id
+                    .values()
+                    .filter_map(|call_site| {
+                        let direct_target = call_site.direct_target?;
+                        let (block_addr, op_index) = artifact.inst_op_site(call_site.at)?;
+                        Some((
+                            r2types::CallsiteKey {
+                                block_addr,
+                                op_index,
+                            },
+                            direct_target,
+                        ))
+                    }),
+                &ctx,
+            )
+        });
 
         let recovered_param_infos: Vec<_> = var_recovery
             .parameters()
@@ -4438,6 +4464,7 @@ impl Decompiler {
                 function_names: &self.context.function_names,
                 symbols: &self.context.symbols,
                 callee_facts: &self.context.type_facts().callee_facts,
+                callee_resolution: callee_resolution.as_ref(),
                 known_function_signatures: &known_function_signatures,
                 stack_slots: &self.context.type_facts().stack_slots,
                 visible_bindings: &self.context.type_facts().visible_bindings,
@@ -4451,6 +4478,7 @@ impl Decompiler {
             symbols: &self.context.symbols,
             known_function_signatures: &known_function_signatures,
             callee_facts: &self.context.type_facts().callee_facts,
+            callee_resolution: callee_resolution.as_ref(),
             stack_slots: &self.context.type_facts().stack_slots,
             #[cfg(test)]
             external_stack_vars: &self.context.type_facts().external_stack_vars,
@@ -9617,6 +9645,7 @@ mod tests {
             symbols: &decompiler.context.symbols,
             known_function_signatures: &known_function_signatures,
             callee_facts: &decompiler.context.type_facts().callee_facts,
+            callee_resolution: None,
             stack_slots: &decompiler.context.type_facts().stack_slots,
             #[cfg(test)]
             external_stack_vars: &decompiler.context.type_facts().external_stack_vars,

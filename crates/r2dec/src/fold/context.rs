@@ -11,8 +11,8 @@ use r2ssa::{
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
 use r2types::{
-    CalleeFact, ExternalStackSlotSpec, ExternalTypeDb, FunctionType, InterprocSummaryView,
-    SignatureRegistry, StackSlotKey, TypeOracle, VisibleBinding,
+    CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb, FunctionType,
+    InterprocSummaryView, SignatureRegistry, StackSlotKey, TypeOracle, VisibleBinding,
 };
 
 pub(crate) type SSABlock = FunctionSSABlock;
@@ -81,6 +81,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
     pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
+    pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
@@ -345,6 +346,7 @@ impl<'a> FoldingContext<'a> {
             symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             known_function_signatures: EMPTY_STRING_FNTY.get_or_init(HashMap::new),
             callee_facts: EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new),
+            callee_resolution: None,
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
             #[cfg(test)]
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),

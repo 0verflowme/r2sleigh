@@ -66,6 +66,134 @@ pub struct CalleeIdentity {
     pub evidence: BTreeSet<CalleeIdentityEvidence>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CalleeResolutionFacts {
+    pub by_key: BTreeMap<CalleeIdentityKey, CalleeIdentity>,
+    pub by_direct_addr: BTreeMap<u64, CalleeIdentityKey>,
+    pub by_callsite: BTreeMap<CallsiteKey, CalleeIdentityKey>,
+    pub by_name: BTreeMap<String, CalleeIdentityKey>,
+}
+
+impl CalleeResolutionFacts {
+    pub fn from_direct_call_targets<I>(targets: I, ctx: &CalleeIdentityContext<'_>) -> Self
+    where
+        I: IntoIterator<Item = (CallsiteKey, u64)>,
+    {
+        let mut facts = Self::default();
+        for (callsite, addr) in targets {
+            let _ = facts.insert_direct_callsite(callsite, addr, ctx);
+        }
+        facts
+    }
+
+    pub fn insert_direct_callsite(
+        &mut self,
+        callsite: CallsiteKey,
+        addr: u64,
+        ctx: &CalleeIdentityContext<'_>,
+    ) -> Option<&CalleeIdentity> {
+        let key = CalleeIdentityKey::DirectAddress(addr);
+        if let Some(existing) = self.by_callsite.get(&callsite)
+            && existing != &key
+        {
+            return None;
+        }
+        let key = self.ensure_direct_identity(addr, ctx);
+        if !self.bind_callsite(callsite, key.clone()) {
+            return None;
+        }
+        self.by_key.get(&key)
+    }
+
+    pub fn identity_for_callsite(&self, callsite: CallsiteKey) -> Option<&CalleeIdentity> {
+        self.by_callsite
+            .get(&callsite)
+            .and_then(|key| self.by_key.get(key))
+    }
+
+    pub fn identity_for_direct_addr(&self, addr: u64) -> Option<&CalleeIdentity> {
+        self.by_direct_addr
+            .get(&addr)
+            .and_then(|key| self.by_key.get(key))
+    }
+
+    pub fn identity_for_name(&self, name: &str) -> Option<&CalleeIdentity> {
+        let raw = name.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        self.by_name
+            .get(raw)
+            .or_else(|| {
+                let normalized = normalize_callee_name(raw);
+                self.by_name.get(&normalized)
+            })
+            .and_then(|key| self.by_key.get(key))
+    }
+
+    pub fn key_for_callsite(&self, callsite: CallsiteKey) -> Option<&CalleeIdentityKey> {
+        self.by_callsite.get(&callsite)
+    }
+
+    fn ensure_direct_identity(
+        &mut self,
+        addr: u64,
+        ctx: &CalleeIdentityContext<'_>,
+    ) -> CalleeIdentityKey {
+        let key = CalleeIdentityKey::DirectAddress(addr);
+        if self.by_key.contains_key(&key) {
+            return key;
+        }
+
+        let identity = CalleeIdentity::from_direct_target(addr, ctx);
+        self.index_identity_aliases(&key, &identity);
+        self.by_direct_addr.insert(addr, key.clone());
+        self.by_key.insert(key.clone(), identity);
+        key
+    }
+
+    fn bind_callsite(&mut self, callsite: CallsiteKey, key: CalleeIdentityKey) -> bool {
+        match self.by_callsite.get(&callsite) {
+            Some(existing) => existing == &key,
+            None => {
+                self.by_callsite.insert(callsite, key);
+                true
+            }
+        }
+    }
+
+    fn index_identity_aliases(&mut self, key: &CalleeIdentityKey, identity: &CalleeIdentity) {
+        for alias in identity.aliases.iter() {
+            self.insert_name_alias(alias, key);
+        }
+        if let Some(name) = &identity.raw_name {
+            self.insert_name_alias(name, key);
+        }
+        if let Some(name) = &identity.display_name {
+            self.insert_name_alias(name, key);
+        }
+        if let Some(name) = &identity.normalized_name {
+            self.insert_name_alias(name, key);
+        }
+    }
+
+    fn insert_name_alias(&mut self, name: &str, key: &CalleeIdentityKey) {
+        let raw = name.trim();
+        if raw.is_empty() {
+            return;
+        }
+        self.by_name
+            .entry(raw.to_string())
+            .or_insert_with(|| key.clone());
+        let normalized = normalize_callee_name(raw);
+        if !normalized.is_empty() {
+            self.by_name
+                .entry(normalized)
+                .or_insert_with(|| key.clone());
+        }
+    }
+}
+
 impl CalleeIdentity {
     pub fn from_name(name: &str) -> Self {
         let lower = name.trim().to_ascii_lowercase();
@@ -741,6 +869,96 @@ mod tests {
         );
         assert!(identity.aliases.contains("addr:401050"));
         assert!(identity.aliases.contains("sub_401050"));
+    }
+
+    #[test]
+    fn callee_resolution_facts_index_direct_call_targets_deterministically() {
+        let function_names = HashMap::from([(0x401000, "sym.function_name".to_string())]);
+        let symbols = HashMap::from([(0x401000, "sym.symbol_name".to_string())]);
+        let callee_facts = BTreeMap::from([(0x401000, callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::from([("printf".to_string(), non_variadic_signature(2))]);
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let callsite = CallsiteKey {
+            block_addr: 0x402000,
+            op_index: 4,
+        };
+
+        let facts = CalleeResolutionFacts::from_direct_call_targets([(callsite, 0x401000)], &ctx);
+
+        assert_eq!(
+            facts.key_for_callsite(callsite),
+            Some(&CalleeIdentityKey::DirectAddress(0x401000))
+        );
+        let by_site = facts
+            .identity_for_callsite(callsite)
+            .expect("callsite identity should be indexed");
+        assert_eq!(by_site.display_name.as_deref(), Some("sym.imp.printf"));
+        assert_eq!(by_site.primary_key(), "printf");
+        assert_eq!(by_site.non_variadic_known_arity(), Some(2));
+        assert!(by_site.is_imported_name_hint());
+
+        let by_addr = facts
+            .identity_for_direct_addr(0x401000)
+            .expect("direct address identity should be indexed");
+        assert_eq!(by_addr, by_site);
+        assert_eq!(facts.identity_for_name("printf"), Some(by_site));
+        assert_eq!(facts.identity_for_name("sym.imp.printf@plt"), Some(by_site));
+        assert_eq!(facts.identity_for_name("sym.function_name"), Some(by_site));
+    }
+
+    #[test]
+    fn callee_resolution_facts_reject_conflicting_callsite_owner() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let callsite = CallsiteKey {
+            block_addr: 0x402000,
+            op_index: 4,
+        };
+        let mut facts = CalleeResolutionFacts::default();
+
+        assert!(
+            facts
+                .insert_direct_callsite(callsite, 0x401000, &ctx)
+                .is_some()
+        );
+        assert!(
+            facts
+                .insert_direct_callsite(callsite, 0x401000, &ctx)
+                .is_some()
+        );
+        assert!(
+            facts
+                .insert_direct_callsite(callsite, 0x401010, &ctx)
+                .is_none()
+        );
+
+        assert_eq!(
+            facts.key_for_callsite(callsite),
+            Some(&CalleeIdentityKey::DirectAddress(0x401000))
+        );
+        assert!(facts.identity_for_direct_addr(0x401010).is_none());
+        assert_eq!(
+            facts
+                .identity_for_callsite(callsite)
+                .map(CalleeIdentity::primary_key),
+            Some("addr:401000".to_string())
+        );
+    }
+
+    #[test]
+    fn callee_resolution_facts_index_normalized_aliases() {
+        let mut facts = CalleeResolutionFacts::default();
+        let key = CalleeIdentityKey::DirectAddress(0x401000);
+
+        facts.insert_name_alias("sym.imp.printf@plt", &key);
+
+        assert_eq!(facts.by_name.get("printf"), Some(&key));
+        assert_eq!(facts.by_name.get("sym.imp.printf@plt"), Some(&key));
     }
 
     #[test]
