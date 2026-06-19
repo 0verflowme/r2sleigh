@@ -445,14 +445,6 @@ pub fn should_use_direct_named_native_worker_decompile(function_name: &str) -> b
     direct_named_worker_summary_applicability_for_name(0, function_name).is_some()
 }
 
-pub(super) fn direct_named_worker_summary_applicability_for_identity(
-    identity: &EngineFunctionIdentity,
-) -> Option<r2sym::NativeWorkerSummaryApplicability> {
-    identity.name_candidates().find_map(|name| {
-        direct_named_worker_summary_applicability_for_name(identity.function_addr, name)
-    })
-}
-
 fn direct_named_worker_summary_applicability_for_name(
     function_addr: u64,
     function_name: &str,

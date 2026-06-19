@@ -107,18 +107,8 @@ pub(crate) fn render_direct_named_native_worker_summary(
     arch: Option<&r2il::ArchSpec>,
     ptr_bits: u32,
 ) -> Option<String> {
-    let (_, _, config) = r2dec::DecompilerConfig::for_arch(arch);
-    let parsed_context = r2types::ParsedExternalContext::default();
-    crate::types::engine_session()
-        .decompile_direct_named_worker_summary(r2engine::EngineDirectNamedWorkerDecompileRequest {
-            function_addr,
-            function_name,
-            arch,
-            ptr_bits,
-            parsed_context: &parsed_context,
-            config,
-        })
-        .map(|response| response.output)
+    let _ = (function_addr, function_name, arch, ptr_bits);
+    None
 }
 
 pub(crate) fn run_engine_decompile_on_large_stack(

@@ -12,8 +12,8 @@ use std::time::Duration;
 use r2il::R2ILBlock;
 use r2ssa::{CFGRiskSummary, SsaArtifact};
 use r2types::{
-    FunctionFacts, FunctionSignatureProjection, FunctionTypeFactInputs, FunctionTypeFacts,
-    SignatureCertificateSource, TypeWritebackPlan,
+    CalleeResolutionFacts, FunctionFacts, FunctionSignatureProjection, FunctionTypeFactInputs,
+    FunctionTypeFacts, SignatureCertificateSource, TypeWritebackPlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,6 @@ pub use route::{
     type_cfg_prefers_bounded_plan, type_route_decision,
 };
 use route::{
-    direct_named_worker_summary_applicability_for_identity,
     has_renderable_native_linear_worker_summary, native_body_has_renderable_worker_summary,
     prefers_standard_native_for_summary_only_worker, proof_coverage_from_type_facts,
     raw_cfg_risk_summary_for_preprobe, should_prefer_full_decompile_for_named_worker,
@@ -333,6 +332,7 @@ pub struct DecompileRenderCacheKeyInput<'a> {
     pub arch: Option<&'a r2il::ArchSpec>,
     pub ptr_bits: u32,
     pub function_facts: &'a FunctionFacts,
+    pub callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub func_names_payload: &'a str,
     pub strings_payload: &'a str,
     pub symbols_payload: &'a str,
@@ -350,10 +350,14 @@ pub fn decompile_render_cache_key(input: DecompileRenderCacheKeyInput<'_>) -> Re
     );
     let artifact = ArtifactCacheKey::from_hashes(analysis, 0, 0);
     let render_payload_hash = stable_fnv1a_hash(&(
-        "decompile-render-payload-v1",
+        "decompile-render-payload-v2",
         stable_fnv1a_hash(input.func_names_payload),
         stable_fnv1a_hash(input.strings_payload),
         stable_fnv1a_hash(input.symbols_payload),
+        input
+            .callee_resolution
+            .map(stable_fnv1a_debug_hash)
+            .unwrap_or(0),
     ));
     let render_config_hash = stable_fnv1a_hash(&(
         "decompile-render-config-v1",
@@ -363,6 +367,48 @@ pub fn decompile_render_cache_key(input: DecompileRenderCacheKeyInput<'_>) -> Re
         r2sym::PROOF_COVERAGE_SCHEMA_VERSION,
     ));
     RenderCacheKey::from_artifact(artifact, render_payload_hash, render_config_hash)
+}
+
+pub fn decompile_callee_resolution_facts(
+    prepared: &SsaArtifact,
+    function_facts: &FunctionFacts,
+    function_names: &HashMap<u64, String>,
+    symbols: &HashMap<u64, String>,
+    ptr_bits: u32,
+) -> CalleeResolutionFacts {
+    let mut type_facts = function_facts.types.clone().canonicalized();
+    r2types::enrich_known_function_signatures_from_names(&mut type_facts, function_names, ptr_bits);
+    r2types::enrich_known_function_signatures_from_names(&mut type_facts, symbols, ptr_bits);
+    let known_function_signatures = type_facts
+        .known_function_signatures
+        .iter()
+        .map(|(name, ty)| (r2types::normalize_callee_name(name), ty.clone()))
+        .collect::<HashMap<_, _>>();
+    let ctx = r2types::CalleeIdentityContext {
+        function_names,
+        symbols,
+        callee_facts: &type_facts.callee_facts,
+        known_function_signatures: &known_function_signatures,
+    };
+
+    CalleeResolutionFacts::from_direct_call_targets(
+        prepared
+            .call_sites()
+            .by_id
+            .values()
+            .filter_map(|call_site| {
+                let direct_target = call_site.direct_target?;
+                let (block_addr, op_index) = prepared.inst_op_site(call_site.at)?;
+                Some((
+                    r2types::CallsiteKey {
+                        block_addr,
+                        op_index,
+                    },
+                    direct_target,
+                ))
+            }),
+        &ctx,
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -497,6 +543,7 @@ pub struct EngineDecompileRequest {
     pub function_name: String,
     pub prepared_ssa: SsaArtifact,
     pub function_facts: FunctionFacts,
+    pub callee_resolution: Option<CalleeResolutionFacts>,
     pub function_names: HashMap<u64, String>,
     pub strings: HashMap<u64, String>,
     pub symbols: HashMap<u64, String>,
@@ -680,15 +727,6 @@ pub struct EngineSummaryPreprobeRequest<'a> {
     pub strings_payload: &'a str,
     pub symbols_payload: &'a str,
     pub fallback_if_guarded_without_summary: bool,
-}
-
-pub struct EngineDirectNamedWorkerDecompileRequest<'a> {
-    pub function_addr: u64,
-    pub function_name: &'a str,
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub ptr_bits: u32,
-    pub parsed_context: &'a r2types::ParsedExternalContext,
-    pub config: r2dec::DecompilerConfig,
 }
 
 pub struct EngineTypePreprobeRequest<'a> {
@@ -1238,12 +1276,20 @@ impl EngineSession {
                 type_override.signature_certificate;
         }
 
+        let callee_resolution = decompile_callee_resolution_facts(
+            &artifact.ssa_func,
+            &artifact.function_facts,
+            &function_names,
+            &symbols,
+            analysis_request.ptr_bits,
+        );
         let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
             blocks: &analysis_request.blocks,
             function_name: &display_name,
             arch: analysis_request.arch.as_ref(),
             ptr_bits: analysis_request.ptr_bits,
             function_facts: &artifact.function_facts,
+            callee_resolution: Some(&callee_resolution),
             func_names_payload: &func_names_payload,
             strings_payload: &strings_payload,
             symbols_payload: &symbols_payload,
@@ -1263,6 +1309,7 @@ impl EngineSession {
             function_name: display_name,
             prepared_ssa: artifact.ssa_func,
             function_facts: artifact.function_facts,
+            callee_resolution: Some(callee_resolution),
             function_names,
             strings,
             symbols,
@@ -1482,6 +1529,7 @@ impl EngineSession {
             arch: request.arch,
             ptr_bits: request.ptr_bits,
             function_facts: &function_facts,
+            callee_resolution: None,
             func_names_payload: request.func_names_payload,
             strings_payload: request.strings_payload,
             symbols_payload: request.symbols_payload,
@@ -1495,51 +1543,6 @@ impl EngineSession {
             config: request.config,
             render_cache_key: Some(render_cache_key),
             fallback_comment,
-        })
-    }
-
-    pub fn decompile_direct_named_worker_summary(
-        &self,
-        request: EngineDirectNamedWorkerDecompileRequest<'_>,
-    ) -> Option<EngineDecompileResponse> {
-        let identity =
-            EngineFunctionIdentity::from_name(request.function_addr, request.function_name);
-        let _applicability = direct_named_worker_summary_applicability_for_identity(&identity)?;
-
-        let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
-        let projection = native_worker_type_projection_for_identity(
-            &identity,
-            &arch_name,
-            request.ptr_bits,
-            request.parsed_context,
-            true,
-        )?;
-        let cfg_summary = CFGRiskSummary {
-            block_count: 0,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
-            blocks: &[],
-            function_name: identity.primary_name(),
-            arch: request.arch,
-            ptr_bits: request.ptr_bits,
-            function_facts: &projection.function_facts,
-            func_names_payload: "direct-named-worker-summary-v1",
-            strings_payload: "",
-            symbols_payload: "",
-        });
-
-        self.decompile_summary(EngineSummaryDecompileRequest {
-            function_name: identity.primary_name().to_string(),
-            cfg_summary,
-            function_facts: projection.function_facts,
-            named_worker_guarded: true,
-            config: request.config,
-            render_cache_key: Some(render_cache_key),
-            fallback_comment: None,
         })
     }
 
@@ -2002,7 +2005,8 @@ fn render_engine_decompile_request(
         request.strings.clone(),
         request.symbols.clone(),
         request.ptr_bits,
-    );
+    )
+    .with_callee_resolution(request.callee_resolution.clone());
     let context = decompiler_context_with_route_decision(context, decision);
     let input = r2dec::DecompilerInput::new(request.prepared_ssa.clone(), context);
     let output = r2dec::Decompiler::new(request.config.clone()).decompile_input(&input);
@@ -3628,6 +3632,31 @@ mod tests {
         vec![block]
     }
 
+    fn direct_call_return_blocks(addr: u64, target: u64) -> Vec<R2ILBlock> {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(target, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        vec![block]
+    }
+
+    fn guarded_loop_blocks(addr: u64, count: usize) -> Vec<R2ILBlock> {
+        (0..count)
+            .map(|idx| {
+                let block_addr = addr + (idx as u64 * 0x10);
+                let mut block = R2ILBlock::new(block_addr, 4);
+                block.push(r2il::R2ILOp::CBranch {
+                    target: r2il::Varnode::constant(block_addr, 8),
+                    cond: r2il::Varnode::constant(1, 1),
+                });
+                block
+            })
+            .collect()
+    }
+
     const VM_TEST_RAX: u64 = 0;
     const VM_TEST_RBP: u64 = 8;
 
@@ -4542,6 +4571,7 @@ mod tests {
             function_name: "sym.zero".to_string(),
             prepared_ssa: prepared,
             function_facts: FunctionFacts::default(),
+            callee_resolution: None,
             function_names: HashMap::new(),
             strings: HashMap::new(),
             symbols: HashMap::new(),
@@ -4562,6 +4592,71 @@ mod tests {
         assert_eq!(metrics.renders.hits, 1);
         assert_eq!(metrics.renders.misses, 1);
         assert_eq!(metrics.renders.insertions, 1);
+    }
+
+    #[test]
+    fn decompile_render_cache_key_hashes_canonical_callee_resolution() {
+        let blocks = direct_call_return_blocks(0x401000, 0x5000);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None)
+            .expect("prepared")
+            .with_name("sym.caller");
+        let function_facts = FunctionFacts::default();
+        let printf_names = HashMap::from([(0x5000, "sym.imp.printf".to_string())]);
+        let memcpy_names = HashMap::from([(0x5000, "sym.imp.memcpy".to_string())]);
+        let printf_resolution = decompile_callee_resolution_facts(
+            &prepared,
+            &function_facts,
+            &printf_names,
+            &HashMap::new(),
+            64,
+        );
+        let memcpy_resolution = decompile_callee_resolution_facts(
+            &prepared,
+            &function_facts,
+            &memcpy_names,
+            &HashMap::new(),
+            64,
+        );
+
+        assert!(printf_resolution.identity_for_name("printf").is_some());
+        assert!(memcpy_resolution.identity_for_name("memcpy").is_some());
+
+        let printf_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
+            blocks: &blocks,
+            function_name: "sym.caller",
+            arch: None,
+            ptr_bits: 64,
+            function_facts: &function_facts,
+            callee_resolution: Some(&printf_resolution),
+            func_names_payload: "{}",
+            strings_payload: "{}",
+            symbols_payload: "{}",
+        });
+        let memcpy_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
+            blocks: &blocks,
+            function_name: "sym.caller",
+            arch: None,
+            ptr_bits: 64,
+            function_facts: &function_facts,
+            callee_resolution: Some(&memcpy_resolution),
+            func_names_payload: "{}",
+            strings_payload: "{}",
+            symbols_payload: "{}",
+        });
+        let missing_resolution_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
+            blocks: &blocks,
+            function_name: "sym.caller",
+            arch: None,
+            ptr_bits: 64,
+            function_facts: &function_facts,
+            callee_resolution: None,
+            func_names_payload: "{}",
+            strings_payload: "{}",
+            symbols_payload: "{}",
+        });
+
+        assert_ne!(printf_key, memcpy_key);
+        assert_ne!(printf_key, missing_resolution_key);
     }
 
     #[test]
@@ -5141,42 +5236,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_named_worker_decompile_summary_rejects_name_only_workers() {
-        let (_, ptr_bits, config) = r2dec::DecompilerConfig::for_arch(None);
-        let parsed_context = r2types::ParsedExternalContext::default();
-        let response = EngineSession::new(4).decompile_direct_named_worker_summary(
-            EngineDirectNamedWorkerDecompileRequest {
-                function_addr: 0x8b50,
-                function_name: "dbg.init_node",
-                arch: None,
-                ptr_bits,
-                parsed_context: &parsed_context,
-                config,
-            },
-        );
-
-        assert!(response.is_none());
-    }
-
-    #[test]
-    fn direct_named_worker_decompile_summary_rejects_full_route_names() {
-        let (_, ptr_bits, config) = r2dec::DecompilerConfig::for_arch(None);
-        let parsed_context = r2types::ParsedExternalContext::default();
-        let response = EngineSession::new(4).decompile_direct_named_worker_summary(
-            EngineDirectNamedWorkerDecompileRequest {
-                function_addr: 0x401000,
-                function_name: "sym.diagnose",
-                arch: None,
-                ptr_bits,
-                parsed_context: &parsed_context,
-                config,
-            },
-        );
-
-        assert!(response.is_none());
-    }
-
-    #[test]
     fn semantic_compile_does_not_prefer_name_only_worker_seed_before_full_semantics() {
         let blocks = const_return_blocks(0x8b50, 0);
         let ssa_func = r2ssa::SsaArtifact::for_decompile(&blocks, None)
@@ -5726,6 +5785,38 @@ mod tests {
             response.decision.route,
             r2dec::SemanticRoutePlan::SummaryIslands { .. }
         ));
+    }
+
+    #[test]
+    fn summary_preprobe_returns_guarded_fallback_response() {
+        let blocks = guarded_loop_blocks(0x401000, 201);
+        let parsed_context = r2types::parse_external_context_json("{}", 64);
+        let session = EngineSession::new(8);
+        let response = session
+            .decompile_summary_preprobe(EngineSummaryPreprobeRequest {
+                blocks: &blocks,
+                function_addr: 0x401000,
+                canonical_name: "dbg.init_node",
+                display_name: "init_node",
+                arch: None,
+                ptr_bits: 64,
+                parsed_context: &parsed_context,
+                symbolic_scope: None,
+                type_seed: Some(r2types::FunctionTypeFacts::default()),
+                config: r2dec::DecompilerConfig::default(),
+                func_names_payload: "{}",
+                strings_payload: "{}",
+                symbols_payload: "{}",
+                fallback_if_guarded_without_summary: true,
+            })
+            .expect("guarded summary preprobe should produce a refusal response");
+
+        assert!(!response.output.trim().is_empty());
+        assert!(
+            response.output.contains("init_node") && response.output.contains("r2dec fallback"),
+            "unexpected guarded preprobe output: {}",
+            response.output
+        );
     }
 
     #[test]

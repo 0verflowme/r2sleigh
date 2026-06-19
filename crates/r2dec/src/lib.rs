@@ -64,9 +64,9 @@ use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
-    CTypeLike, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts, FunctionSignatureSpec,
-    FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding,
-    VisibleBindingKind, normalize_callee_name,
+    CTypeLike, CalleeResolutionFacts, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts,
+    FunctionSignatureSpec, FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference,
+    TypeOracle, VisibleBinding, VisibleBindingKind, normalize_callee_name,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -3554,6 +3554,10 @@ pub struct DecompilerContext {
     /// Optional engine-owned decision for whether prepared semantic facts should
     /// be used during folding.
     pub use_prepared_semantic_view: Option<bool>,
+    /// Engine-owned typed call-target identity index. Direct r2dec callers may
+    /// leave this empty; engine callers should provide it so rendering does not
+    /// reconstruct call ownership from raw maps.
+    pub callee_resolution: Option<CalleeResolutionFacts>,
     /// Engine-selected permission for the selected route. Missing means legacy
     /// direct r2dec callers still use local certifying gates.
     pub render_permission: Option<r2sym::RenderPermission>,
@@ -3599,6 +3603,7 @@ impl DecompilerContext {
             semantic_route: None,
             skip_runtime_type_inference: None,
             use_prepared_semantic_view: None,
+            callee_resolution: None,
             render_permission: None,
         }
     }
@@ -3628,6 +3633,7 @@ impl DecompilerContext {
             semantic_route: None,
             skip_runtime_type_inference: None,
             use_prepared_semantic_view: None,
+            callee_resolution: None,
             render_permission: None,
         }
     }
@@ -3681,6 +3687,11 @@ impl DecompilerContext {
 
     pub fn with_prepared_semantic_view_policy(mut self, use_view: Option<bool>) -> Self {
         self.use_prepared_semantic_view = use_view;
+        self
+    }
+
+    pub fn with_callee_resolution(mut self, facts: Option<CalleeResolutionFacts>) -> Self {
+        self.callee_resolution = facts;
         self
     }
 
@@ -4351,32 +4362,39 @@ impl Decompiler {
             .iter()
             .map(|(name, ty)| (normalize_callee_name(name), ty.clone()))
             .collect::<std::collections::HashMap<_, _>>();
-        let callee_resolution = prepared.map(|artifact| {
-            let ctx = r2types::CalleeIdentityContext {
-                function_names: &self.context.function_names,
-                symbols: &self.context.symbols,
-                callee_facts: &self.context.type_facts().callee_facts,
-                known_function_signatures: &known_function_signatures,
-            };
-            r2types::CalleeResolutionFacts::from_direct_call_targets(
-                artifact
-                    .call_sites()
-                    .by_id
-                    .values()
-                    .filter_map(|call_site| {
-                        let direct_target = call_site.direct_target?;
-                        let (block_addr, op_index) = artifact.inst_op_site(call_site.at)?;
-                        Some((
-                            r2types::CallsiteKey {
-                                block_addr,
-                                op_index,
-                            },
-                            direct_target,
-                        ))
-                    }),
-                &ctx,
-            )
+        let fallback_callee_resolution = self.context.callee_resolution.is_none().then(|| {
+            prepared.map(|artifact| {
+                let ctx = r2types::CalleeIdentityContext {
+                    function_names: &self.context.function_names,
+                    symbols: &self.context.symbols,
+                    callee_facts: &self.context.type_facts().callee_facts,
+                    known_function_signatures: &known_function_signatures,
+                };
+                r2types::CalleeResolutionFacts::from_direct_call_targets(
+                    artifact
+                        .call_sites()
+                        .by_id
+                        .values()
+                        .filter_map(|call_site| {
+                            let direct_target = call_site.direct_target?;
+                            let (block_addr, op_index) = artifact.inst_op_site(call_site.at)?;
+                            Some((
+                                r2types::CallsiteKey {
+                                    block_addr,
+                                    op_index,
+                                },
+                                direct_target,
+                            ))
+                        }),
+                    &ctx,
+                )
+            })
         });
+        let callee_resolution = self
+            .context
+            .callee_resolution
+            .as_ref()
+            .or_else(|| fallback_callee_resolution.as_ref().and_then(Option::as_ref));
 
         let recovered_param_infos: Vec<_> = var_recovery
             .parameters()
@@ -4464,7 +4482,7 @@ impl Decompiler {
                 function_names: &self.context.function_names,
                 symbols: &self.context.symbols,
                 callee_facts: &self.context.type_facts().callee_facts,
-                callee_resolution: callee_resolution.as_ref(),
+                callee_resolution,
                 known_function_signatures: &known_function_signatures,
                 stack_slots: &self.context.type_facts().stack_slots,
                 visible_bindings: &self.context.type_facts().visible_bindings,
@@ -4478,7 +4496,7 @@ impl Decompiler {
             symbols: &self.context.symbols,
             known_function_signatures: &known_function_signatures,
             callee_facts: &self.context.type_facts().callee_facts,
-            callee_resolution: callee_resolution.as_ref(),
+            callee_resolution,
             stack_slots: &self.context.type_facts().stack_slots,
             #[cfg(test)]
             external_stack_vars: &self.context.type_facts().external_stack_vars,
