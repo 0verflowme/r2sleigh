@@ -36,7 +36,6 @@ pub(crate) struct StackAliasView {
 pub(crate) struct PreparedCallView {
     pub(crate) direct_target: Option<u64>,
     pub(crate) callee_identity: Option<CalleeIdentity>,
-    pub(crate) callee_name: Option<String>,
     pub(crate) authoritative_args: Vec<CExpr>,
     pub(crate) authoritative_arg_values: Vec<ValueId>,
     pub(crate) result_owner: Option<CExpr>,
@@ -1619,27 +1618,30 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
         let Some(site) = prepared_call_site_tuple(inputs.prepared, call_site.at) else {
             continue;
         };
+        let mut callee_identity =
+            lookup_callee_identity_for_site(inputs, site, call_site.direct_target);
+        if inputs
+            .prepared
+            .structured()
+            .recursive_calls
+            .contains_key(&call_site.id)
+        {
+            if let Some(identity) = callee_identity.as_mut() {
+                identity.is_recursive = true;
+            } else if let Some(name) = inputs.prepared.function().name.as_deref() {
+                let mut identity = CalleeIdentity::from_name(name)
+                    .with_known_signature(inputs.known_function_signatures);
+                identity.is_recursive = true;
+                callee_identity = Some(identity);
+            }
+        }
         let mut call_view = PreparedCallView {
             direct_target: call_site.direct_target,
-            callee_identity: lookup_callee_identity_for_site(inputs, site, call_site.direct_target),
-            callee_name: None,
+            callee_identity,
             authoritative_args: Vec::new(),
             authoritative_arg_values: Vec::new(),
             result_owner: None,
         };
-        call_view.callee_name = call_view
-            .callee_identity
-            .as_ref()
-            .and_then(|identity| identity.display_name.clone());
-        if call_view.callee_name.is_none()
-            && inputs
-                .prepared
-                .structured()
-                .recursive_calls
-                .contains_key(&call_site.id)
-        {
-            call_view.callee_name = inputs.prepared.function().name.clone();
-        }
         call_view.result_owner = infer_call_result_owner(
             site,
             inputs.prepared,
@@ -3283,12 +3285,6 @@ fn prepared_call_callee_expr(call_view: &PreparedCallView) -> Option<CExpr> {
         })
         .or_else(|| {
             call_view
-                .callee_name
-                .as_ref()
-                .map(|name| CExpr::Var(name.clone()))
-        })
-        .or_else(|| {
-            call_view
                 .direct_target
                 .map(|addr| CExpr::Var(format!("sub_{addr:x}")))
         })
@@ -3735,7 +3731,7 @@ mod tests {
     #[test]
     fn prepared_call_expr_requires_argument_value_bijection() {
         let unproved = PreparedCallView {
-            callee_name: Some("sym.helper".to_string()),
+            callee_identity: Some(CalleeIdentity::from_name("sym.helper")),
             authoritative_args: vec![CExpr::IntLit(7)],
             authoritative_arg_values: Vec::new(),
             ..PreparedCallView::default()
@@ -3746,7 +3742,7 @@ mod tests {
         );
 
         let proved = PreparedCallView {
-            callee_name: Some("sym.helper".to_string()),
+            callee_identity: Some(CalleeIdentity::from_name("sym.helper")),
             authoritative_args: vec![CExpr::IntLit(7)],
             authoritative_arg_values: vec![ValueId(7)],
             ..PreparedCallView::default()
@@ -3929,7 +3925,6 @@ mod tests {
         assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
         assert_eq!(identity.primary_key(), "printf");
         assert!(identity.is_imported_name_hint());
-        assert_eq!(call_view.callee_name.as_deref(), Some("sym.imp.printf"));
     }
 
     #[test]

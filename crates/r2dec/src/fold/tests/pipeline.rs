@@ -18613,7 +18613,6 @@ mod tests {
         assert_eq!(identity.primary_key(), "fact_helper");
         assert!(identity.aliases.contains("sym.function_name"));
         assert!(identity.aliases.contains("sym.symbol_name"));
-        assert_eq!(call_view.callee_name.as_deref(), Some("sym.imp.fact_helper"));
 
         assert_eq!(
             ctx.resolve_call_target_for_site(block.addr, 1, target),
@@ -18698,8 +18697,7 @@ mod tests {
                 (0x1000, 2),
                 crate::analysis::PreparedCallView {
                     direct_target: Some(0x401050),
-                    callee_identity: None,
-                    callee_name: Some("sym.helper".to_string()),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.target],
                     result_owner: None,
@@ -18750,8 +18748,7 @@ mod tests {
                 (0x1000, 2),
                 crate::analysis::PreparedCallView {
                     direct_target: Some(0x401050),
-                    callee_identity: None,
-                    callee_name: Some("sym.helper".to_string()),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.target],
                     result_owner: None,
@@ -18795,8 +18792,7 @@ mod tests {
                 (0x1000, 2),
                 crate::analysis::PreparedCallView {
                     direct_target: Some(0x401050),
-                    callee_identity: None,
-                    callee_name: Some("sym.helper".to_string()),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.argument_values[0]],
                     result_owner: None,

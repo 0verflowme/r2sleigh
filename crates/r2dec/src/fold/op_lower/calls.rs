@@ -65,11 +65,15 @@ impl<'a> FoldingContext<'a> {
         op_idx: usize,
         target: &SSAVar,
     ) -> CExpr {
-        if let Some(name) = self
+        if let Some(identity) = self
             .prepared_call_view_for_site(block_addr, op_idx)
-            .and_then(|view| view.callee_name.clone())
+            .and_then(|view| view.callee_identity.as_ref())
         {
-            return CExpr::Var(name);
+            return identity
+                .display_name
+                .clone()
+                .map(CExpr::Var)
+                .unwrap_or_else(|| CExpr::Var(identity.primary_key()));
         }
         if let Some(addr) = self.prepared_direct_call_target(block_addr, op_idx)
             && let Some(name) = self.callee_identity_for_direct_target(addr).display_name
