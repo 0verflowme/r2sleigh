@@ -1,0 +1,70 @@
+warning: r2dec must not derive call-result owners from matching rendered call expressions
+  --> $DIR/call_result_source_expr_owner.rs:10:5
+   |
+LL | /     fn fallback_owned_call_result_register_name_from_matching_source_call(
+LL | |         &self,
+LL | |         source_expr: &CExpr,
+LL | |         definition_expr: &CExpr,
+...  |
+LL | |         None
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2dec_call_result_source_expr_owner_fallback)]` on by default
+
+warning: r2dec must consume prepared call-result ownership instead of matching rendered call expressions
+  --> $DIR/call_result_source_expr_owner.rs:15:12
+   |
+LL |         if self.raw_call_exprs_match_for_source_owner_definition(source_expr, definition_expr) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must not derive call-result owners from matching rendered call expressions
+  --> $DIR/call_result_source_expr_owner.rs:21:5
+   |
+LL | /     fn fallback_owned_call_result_register_name_from_matching_definition(
+LL | |         &self,
+LL | |         source_expr: &CExpr,
+LL | |         definition_expr: &CExpr,
+...  |
+LL | |     }
+   | |_____^
+
+warning: r2dec must consume prepared call-result ownership instead of matching rendered call expressions
+  --> $DIR/call_result_source_expr_owner.rs:26:9
+   |
+LL | /         self.fallback_owned_call_result_register_name_from_matching_source_call(
+LL | |             source_expr,
+LL | |             definition_expr,
+LL | |         )
+   | |_________^
+
+warning: r2dec must not derive call-result owners from matching rendered call expressions
+  --> $DIR/call_result_source_expr_owner.rs:32:5
+   |
+LL | /     fn materializable_call_result_expr_for_call_expr(
+LL | |         &self,
+LL | |         source_expr: &CExpr,
+LL | |         definition_expr: &CExpr,
+LL | |     ) -> bool {
+LL | |         self.raw_call_exprs_match_for_source_owner_definition(source_expr, definition_expr)
+LL | |     }
+   | |_____^
+
+warning: r2dec must consume prepared call-result ownership instead of matching rendered call expressions
+  --> $DIR/call_result_source_expr_owner.rs:37:9
+   |
+LL |         self.raw_call_exprs_match_for_source_owner_definition(source_expr, definition_expr)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must consume prepared call-result ownership instead of matching rendered call expressions
+  --> $DIR/call_result_source_expr_owner.rs:45:13
+   |
+LL |       let _ = ctx.fallback_owned_call_result_register_name_from_matching_definition(
+   |  _____________^
+LL | |         &source_expr,
+LL | |         &definition_expr,
+LL | |     );
+   | |_____^
+
+warning: 7 warnings emitted
+

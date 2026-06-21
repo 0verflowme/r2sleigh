@@ -6980,65 +6980,6 @@ impl<'a> FoldingContext<'a> {
         best_name.or(fallback_register_name)
     }
 
-    fn fallback_owned_call_result_register_name_from_matching_source_call(
-        &self,
-        source_call: (u64, usize),
-        source_expr: &CExpr,
-    ) -> Option<String> {
-        let mut definitions = std::collections::BTreeMap::new();
-        for (name, expr) in self.definitions_map() {
-            definitions.insert(name.clone(), expr.clone());
-        }
-        for (name, expr) in self.formatted_defs_map() {
-            definitions
-                .entry(name.clone())
-                .or_insert_with(|| expr.clone());
-        }
-
-        let mut best_name: Option<String> = None;
-        let mut best_expr: Option<CExpr> = None;
-        for (name, expr) in definitions {
-            if !matches!(expr, CExpr::Call { .. })
-                || !self.raw_call_exprs_match_for_source_owner_definition(
-                    Some(source_call),
-                    source_expr,
-                    &expr,
-                )
-            {
-                continue;
-            }
-            let Some(rendered) = self.fallback_owned_call_result_register_name_for_alias(&name)
-            else {
-                continue;
-            };
-            let candidate_expr = CExpr::Var(rendered.clone());
-            let replace = match &best_expr {
-                None => true,
-                Some(current) => self.prefers_visible_expr(current, &candidate_expr),
-            };
-            if replace {
-                best_name = Some(rendered);
-                best_expr = Some(candidate_expr);
-            }
-        }
-
-        best_name
-    }
-
-    fn fallback_owned_call_result_register_name_from_matching_definition(
-        &self,
-        source_call: (u64, usize),
-    ) -> Option<String> {
-        self.call_result_exprs_map()
-            .get(&source_call)
-            .and_then(|source_expr| {
-                self.fallback_owned_call_result_register_name_from_matching_source_call(
-                    source_call,
-                    source_expr,
-                )
-            })
-    }
-
     pub(crate) fn should_materialize_call_result_at_source(
         &self,
         source_call: (u64, usize),
@@ -7063,9 +7004,6 @@ impl<'a> FoldingContext<'a> {
                                     .is_some_and(|name| name.eq_ignore_ascii_case(&owner_name))))
                 })
             });
-        let definition_owner = self
-            .fallback_owned_call_result_register_name_from_matching_definition(source_call)
-            .is_some_and(|name| name.eq_ignore_ascii_case(&owner_name));
         let observable_owner = {
             let candidate_names = self.call_result_candidate_names(source_call, &owner_name);
             self.call_result_candidate_names_have_observable_use(&candidate_names)
@@ -7074,25 +7012,18 @@ impl<'a> FoldingContext<'a> {
             || self
                 .stack_offset_for_visible_storage_name(&owner_name)
                 .is_some();
-        (alias_owner || definition_owner || observable_owner || named_stack_owner)
-            .then_some(CExpr::Var(owner_name))
+        (alias_owner || observable_owner || named_stack_owner).then_some(CExpr::Var(owner_name))
     }
 
     pub(crate) fn materializable_call_result_expr_for_call_expr(
         &self,
         source_call: (u64, usize),
-        call: &CExpr,
+        _call: &CExpr,
     ) -> Option<CExpr> {
         if let Some(owner) = self.should_materialize_call_result_at_source(source_call) {
             return Some(owner);
         }
-
-        if self.call_result_exprs_map().contains_key(&source_call) {
-            return None;
-        }
-
-        self.fallback_owned_call_result_register_name_from_matching_source_call(source_call, call)
-            .map(CExpr::Var)
+        None
     }
 
     fn should_skip_unused_transient_call_result_owner(
@@ -7292,9 +7223,7 @@ impl<'a> FoldingContext<'a> {
             .call_result_aliases_map()
             .get(&source_call)
             .and_then(|aliases| self.derive_stable_owned_call_result_name_for_source(aliases));
-        let fallback_name = self
-            .fallback_owned_call_result_register_name_from_matching_definition(source_call)
-            .or_else(|| self.fallback_owned_call_result_return_name_for_source(source_call));
+        let fallback_name = self.fallback_owned_call_result_return_name_for_source(source_call);
 
         let mut best = ownership_name;
         for candidate in [prepared_name, dynamic_name, fallback_name]

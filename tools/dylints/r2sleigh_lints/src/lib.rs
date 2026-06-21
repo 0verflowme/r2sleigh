@@ -377,6 +377,34 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when production `r2dec` call-result ownership logic derives a
+    /// stable owner from rendered call-expression matching.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Two rendered calls that look equivalent are not proof that one register
+    /// owns the other callsite result. Call-result ownership must come from
+    /// prepared SSA/semantic evidence, explicit aliases, or an exact
+    /// unambiguous source proof; otherwise the decompiler can turn replayed or
+    /// guessed call text into confident source-shaped C.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// fallback_owned_call_result_register_name_from_matching_definition(source);
+    /// ```
+    ///
+    /// Use instead prepared semantic ownership, such as
+    /// `PreparedCallView::result_owner`, or render a residual when ownership is
+    /// not proven.
+    pub R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
+    Warn,
+    "r2dec must not derive call-result owners from matching rendered call expressions"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2plugin` code directly reconstructs type
     /// signature writeback authority instead of consuming a typed `r2types`
     /// decision.
@@ -681,6 +709,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_ROUTE_POLICY_OWNERSHIP,
     R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
     R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
+    R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
     R2PLUGIN_RAW_DIRECT_CALL_TARGET,
     R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
     R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
@@ -711,6 +740,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_ROUTE_POLICY_OWNERSHIP,
         R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
         R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
+        R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
         R2PLUGIN_RAW_DIRECT_CALL_TARGET,
         R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
         R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
@@ -788,6 +818,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
                 item.span,
                 "r2dec must not derive call-result owners from stack-local fallback logic",
+            );
+        }
+
+        if is_r2dec_span(cx, item.span)
+            && !impl_item_is_test_only(cx, item)
+            && r2dec_call_result_source_expr_owner_fallback_item(cx, item.span)
+        {
+            span_lint(
+                cx,
+                R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
+                item.span,
+                "r2dec must not derive call-result owners from matching rendered call expressions",
             );
         }
     }
@@ -927,6 +969,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
                 expr.span,
                 "r2dec must consume prepared call-result ownership instead of deriving stack-local owners in op-lowering",
+            );
+        }
+
+        if is_r2dec_op_lower_path(cx, expr)
+            && !is_inside_test_item(cx, expr)
+            && r2dec_call_result_source_expr_owner_fallback_expr(cx, expr)
+        {
+            span_lint(
+                cx,
+                R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
+                expr.span,
+                "r2dec must consume prepared call-result ownership instead of matching rendered call expressions",
             );
         }
 
@@ -1300,6 +1354,68 @@ fn r2dec_call_result_stack_owner_fallback_expr(
     }
 }
 
+fn r2dec_call_result_source_expr_owner_fallback_item(
+    cx: &LateContext<'_>,
+    span: rustc_span::Span,
+) -> bool {
+    cx.sess()
+        .source_map()
+        .span_to_snippet(span)
+        .is_ok_and(|snippet| {
+            [
+                "fn fallback_owned_call_result_register_name_from_matching_source_call",
+                "fn fallback_owned_call_result_register_name_from_matching_definition",
+            ]
+            .iter()
+            .any(|needle| snippet.contains(needle))
+                || (snippet.contains("raw_call_exprs_match_for_source_owner_definition")
+                    && [
+                        "stable_owned_call_result_name_for_source",
+                        "should_materialize_call_result_at_source",
+                        "materializable_call_result_expr_for_call_expr",
+                    ]
+                    .iter()
+                    .any(|needle| snippet.contains(needle)))
+        })
+}
+
+fn r2dec_call_result_source_expr_owner_fallback_expr(
+    cx: &LateContext<'_>,
+    expr: &Expr<'_>,
+) -> bool {
+    match expr.kind {
+        ExprKind::Call(callee, _) => [
+            "fallback_owned_call_result_register_name_from_matching_source_call",
+            "fallback_owned_call_result_register_name_from_matching_definition",
+        ]
+        .iter()
+        .any(|name| expr_path_last_segment_is(callee, name)),
+        ExprKind::MethodCall(method, _, _, _) => {
+            let method = method.ident.as_str();
+            matches!(
+                method,
+                "fallback_owned_call_result_register_name_from_matching_source_call"
+                    | "fallback_owned_call_result_register_name_from_matching_definition"
+            ) || (method == "raw_call_exprs_match_for_source_owner_definition"
+                && enclosing_item_name(cx, expr)
+                    .as_deref()
+                    .is_some_and(is_call_result_source_expr_owner_boundary_name))
+        }
+        _ => false,
+    }
+}
+
+fn is_call_result_source_expr_owner_boundary_name(name: &str) -> bool {
+    matches!(
+        name,
+        "stable_owned_call_result_name_for_source"
+            | "should_materialize_call_result_at_source"
+            | "materializable_call_result_expr_for_call_expr"
+            | "fallback_owned_call_result_register_name_from_matching_source_call"
+            | "fallback_owned_call_result_register_name_from_matching_definition"
+    )
+}
+
 fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     cx.sess()
         .source_map()
@@ -1460,6 +1576,13 @@ fn r2types_role_name_signature_hint_expr(expr: &Expr<'_>) -> bool {
 }
 
 fn item_is_test_only(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
+    cx.sess()
+        .source_map()
+        .span_to_snippet(item.span)
+        .is_ok_and(|snippet| snippet.contains("#[cfg(test)]") || snippet.contains("#[test]"))
+}
+
+fn impl_item_is_test_only(cx: &LateContext<'_>, item: &ImplItem<'_>) -> bool {
     cx.sess()
         .source_map()
         .span_to_snippet(item.span)

@@ -12354,7 +12354,7 @@ mod tests {
         );
     }
 
-    fn source_backed_matching_definition_owner(
+    fn source_backed_matching_definition_without_certificate(
         source_arg: CExpr,
         definition_arg: CExpr,
     ) -> Option<CExpr> {
@@ -12384,9 +12384,9 @@ mod tests {
     #[test]
     fn call_owner_lookup_requires_argument_match() {
         assert_eq!(
-            source_backed_matching_definition_owner(CExpr::IntLit(1), CExpr::IntLit(2)),
+            source_backed_matching_definition_without_certificate(CExpr::IntLit(1), CExpr::IntLit(2)),
             None,
-            "source-backed owner recovery must reject definitions with mismatched call arguments"
+            "source-expression similarity must not authorize result ownership"
         );
     }
 
@@ -12426,19 +12426,19 @@ mod tests {
     }
 
     #[test]
-    fn call_owner_lookup_matches_temporary_public_value_alias_args() {
+    fn call_owner_lookup_rejects_temporary_public_value_alias_args_without_certificate() {
         assert_eq!(
-            source_backed_matching_definition_owner(
+            source_backed_matching_definition_without_certificate(
                 CExpr::Var("value_2a000".to_string()),
                 CExpr::Var("tmp:2a000".to_string()),
             ),
-            Some(CExpr::Var("x20_1".to_string())),
-            "temporary SSA call args may match their public value carrier only inside explicit source-backed owner recovery"
+            None,
+            "temporary SSA/public value equivalence is not call-result owner evidence"
         );
     }
 
     #[test]
-    fn call_owner_lookup_matches_binary_args_by_operator_and_both_operands() {
+    fn call_owner_lookup_rejects_binary_arg_matching_without_certificate() {
         let source_arg = CExpr::binary(
             BinaryOp::Add,
             CExpr::Var("value_2a000".to_string()),
@@ -12450,9 +12450,9 @@ mod tests {
             CExpr::IntLit(1),
         );
         assert_eq!(
-            source_backed_matching_definition_owner(source_arg.clone(), matching_arg),
-            Some(CExpr::Var("x20_1".to_string())),
-            "binary call args should match through source-backed operand normalization"
+            source_backed_matching_definition_without_certificate(source_arg.clone(), matching_arg),
+            None,
+            "binary call-arg equivalence must not manufacture result ownership"
         );
 
         let wrong_operator = CExpr::binary(
@@ -12461,9 +12461,12 @@ mod tests {
             CExpr::IntLit(1),
         );
         assert_eq!(
-            source_backed_matching_definition_owner(source_arg.clone(), wrong_operator),
+            source_backed_matching_definition_without_certificate(
+                source_arg.clone(),
+                wrong_operator,
+            ),
             None,
-            "binary call arg matching must reject a different operator"
+            "binary call-arg text does not authorize result ownership"
         );
 
         let wrong_left = CExpr::binary(
@@ -12472,9 +12475,9 @@ mod tests {
             CExpr::IntLit(1),
         );
         assert_eq!(
-            source_backed_matching_definition_owner(source_arg.clone(), wrong_left),
+            source_backed_matching_definition_without_certificate(source_arg.clone(), wrong_left),
             None,
-            "binary call arg matching must require the left operand"
+            "binary call-arg text does not authorize result ownership"
         );
 
         let wrong_right = CExpr::binary(
@@ -12483,34 +12486,34 @@ mod tests {
             CExpr::IntLit(2),
         );
         assert_eq!(
-            source_backed_matching_definition_owner(source_arg, wrong_right),
+            source_backed_matching_definition_without_certificate(source_arg, wrong_right),
             None,
-            "binary call arg matching must require the right operand"
+            "binary call-arg text does not authorize result ownership"
         );
     }
 
     #[test]
-    fn call_owner_lookup_treats_cast_and_paren_call_args_as_transparent() {
+    fn call_owner_lookup_rejects_cast_and_paren_call_args_without_certificate() {
         assert_eq!(
-            source_backed_matching_definition_owner(
+            source_backed_matching_definition_without_certificate(
                 CExpr::Var("value_2a000".to_string()),
                 CExpr::cast(CType::Int(64), CExpr::Var("tmp:2a000".to_string())),
             ),
-            Some(CExpr::Var("x20_1".to_string())),
-            "casts around source-backed call args should not hide a matching value"
+            None,
+            "casts around matching call args are not ownership evidence"
         );
         assert_eq!(
-            source_backed_matching_definition_owner(
+            source_backed_matching_definition_without_certificate(
                 CExpr::Var("value_2a000".to_string()),
                 CExpr::Paren(Box::new(CExpr::Var("tmp:2a000".to_string()))),
             ),
-            Some(CExpr::Var("x20_1".to_string())),
-            "parens around source-backed call args should not hide a matching value"
+            None,
+            "parens around matching call args are not ownership evidence"
         );
     }
 
     #[test]
-    fn call_owner_lookup_allows_source_backed_matching_register_definition() {
+    fn call_owner_lookup_rejects_source_backed_matching_register_definition_without_certificate() {
         let mut ctx = make_aarch64_ctx();
         let source_call = (0x1000, 0);
         let helper_call = CExpr::call(
@@ -12535,13 +12538,13 @@ mod tests {
 
         assert_eq!(
             ctx.stable_owned_call_result_expr_for_source(source_call),
-            Some(CExpr::Var("x20_1".to_string())),
-            "source-keyed definition matching can still recover a register owner"
+            None,
+            "source-keyed rendered definition matching must not recover a register owner"
         );
         assert_eq!(
             ctx.materializable_call_result_expr_for_call_expr(source_call, &helper_call),
-            Some(CExpr::Var("x20_1".to_string())),
-            "materialization may use matching definitions only when the source call is explicit"
+            None,
+            "materialization must require canonical owner evidence, not matching rendered calls"
         );
     }
 
