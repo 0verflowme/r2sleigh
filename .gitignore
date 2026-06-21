@@ -19,6 +19,10 @@ com.apple.kernel
 # Generated files
 *.r2il
 *.dSYM/
+mutants.out/
+mutants.out.old/
+**/mutants.out/
+**/mutants.out.old/
 r2sleigh-kernel-smoke*.json
 r2sleigh-reversing-benchmark*.json
 r2sleigh-corpora*/
