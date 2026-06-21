@@ -41,11 +41,18 @@ mod r2dec {
     pub fn render_semantic_worker_linearization() -> String {
         String::new()
     }
+
+    pub fn render_direct_named_native_worker_summary() -> Option<String> {
+        None
+    }
 }
 
 mod r2sym {
     pub fn function_semantic_summary_seed_for_name() {}
     pub fn function_semantic_summary_seed_for_name_with_linkage() {}
+    pub fn has_native_worker_summary_family() -> bool {
+        true
+    }
     pub fn compile_summary_dense_worker_artifact_from_interproc_summary() {}
     pub fn compile_semantic_artifact_default_with_scope() {}
     pub fn augment_semantic_artifact_with_interproc_summary() {}
@@ -53,6 +60,16 @@ mod r2sym {
 
 mod r2types {
     pub fn build_semantic_type_fallback_plan() {}
+}
+
+mod r2engine {
+    pub fn should_use_direct_named_native_worker_decompile() -> bool {
+        false
+    }
+
+    pub fn should_use_direct_named_native_worker_type_projection() -> bool {
+        false
+    }
 }
 
 mod benign {
@@ -93,12 +110,16 @@ fn main() {
         benign_glue.fallback_comment,
     );
     let _ = r2dec::render_semantic_worker_linearization();
+    let _ = r2dec::render_direct_named_native_worker_summary();
     r2sym::function_semantic_summary_seed_for_name();
     r2sym::function_semantic_summary_seed_for_name_with_linkage();
+    let _ = r2sym::has_native_worker_summary_family();
     r2sym::compile_summary_dense_worker_artifact_from_interproc_summary();
     r2sym::compile_semantic_artifact_default_with_scope();
     r2sym::augment_semantic_artifact_with_interproc_summary();
     r2types::build_semantic_type_fallback_plan();
+    let _ = r2engine::should_use_direct_named_native_worker_decompile();
+    let _ = r2engine::should_use_direct_named_native_worker_type_projection();
     let session = EngineSession;
     session.decompile_summary(EngineSummaryDecompileRequest::guarded_worker_summary());
     let _ = EngineSemanticMode::Full;

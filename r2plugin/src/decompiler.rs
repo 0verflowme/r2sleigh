@@ -95,16 +95,6 @@ pub(crate) fn render_named_native_worker_summary(
         .map(|response| response.output)
 }
 
-pub(crate) fn render_direct_named_native_worker_summary(
-    function_addr: u64,
-    function_name: &str,
-    arch: Option<&r2il::ArchSpec>,
-    ptr_bits: u32,
-) -> Option<String> {
-    let _ = (function_addr, function_name, arch, ptr_bits);
-    None
-}
-
 pub(crate) fn run_engine_decompile_on_large_stack(
     request: r2engine::EngineFunctionDecompileRequest,
 ) -> String {
@@ -129,8 +119,6 @@ pub(crate) fn run_engine_decompile_on_large_stack(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn nontrivial_program_orchestrators_use_summary_guard() {
         assert!(!r2engine::should_guard_program_orchestrator_decompile(
@@ -140,15 +128,5 @@ mod tests {
         assert!(r2engine::should_guard_program_orchestrator_decompile(
             2, 128
         ));
-    }
-
-    #[test]
-    fn direct_named_worker_summary_refuses_name_only_blocks() {
-        let output = render_direct_named_native_worker_summary(0x401000, "dbg.init_node", None, 64);
-
-        assert!(
-            output.is_none(),
-            "direct native-worker rendering must not trust a symbol name without structural evidence"
-        );
     }
 }

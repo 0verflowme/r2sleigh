@@ -1443,6 +1443,10 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
                 "guarded_worker_summary",
                 "function_semantic_summary_seed_for_name",
                 "function_semantic_summary_seed_for_name_with_linkage",
+                "has_native_worker_summary_family",
+                "render_direct_named_native_worker_summary",
+                "should_use_direct_named_native_worker_decompile",
+                "should_use_direct_named_native_worker_type_projection",
             ]
             .iter()
             .any(|name| expr_path_last_segment_is(callee, name))

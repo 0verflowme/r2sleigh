@@ -23,7 +23,7 @@ LL | | }
    | |_^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:77:13
+  --> $DIR/engine_policy_ownership.rs:94:13
    |
 LL |       let _ = EngineTypeAnalysisRequest {
    |  _____________^
@@ -32,7 +32,7 @@ LL | |     };
    | |_____^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:80:13
+  --> $DIR/engine_policy_ownership.rs:97:13
    |
 LL |       let _ = EngineSummaryDecompileRequest {
    |  _____________^
@@ -41,70 +41,94 @@ LL | |     };
    | |_____^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:95:13
+  --> $DIR/engine_policy_ownership.rs:112:13
    |
 LL |     let _ = r2dec::render_semantic_worker_linearization();
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:96:5
+  --> $DIR/engine_policy_ownership.rs:113:13
+   |
+LL |     let _ = r2dec::render_direct_named_native_worker_summary();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
+  --> $DIR/engine_policy_ownership.rs:114:5
    |
 LL |     r2sym::function_semantic_summary_seed_for_name();
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:97:5
+  --> $DIR/engine_policy_ownership.rs:115:5
    |
 LL |     r2sym::function_semantic_summary_seed_for_name_with_linkage();
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:98:5
+  --> $DIR/engine_policy_ownership.rs:116:13
+   |
+LL |     let _ = r2sym::has_native_worker_summary_family();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
+  --> $DIR/engine_policy_ownership.rs:117:5
    |
 LL |     r2sym::compile_summary_dense_worker_artifact_from_interproc_summary();
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:99:5
+  --> $DIR/engine_policy_ownership.rs:118:5
    |
 LL |     r2sym::compile_semantic_artifact_default_with_scope();
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:100:5
+  --> $DIR/engine_policy_ownership.rs:119:5
    |
 LL |     r2sym::augment_semantic_artifact_with_interproc_summary();
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:101:5
+  --> $DIR/engine_policy_ownership.rs:120:5
    |
 LL |     r2types::build_semantic_type_fallback_plan();
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:103:5
+  --> $DIR/engine_policy_ownership.rs:121:13
+   |
+LL |     let _ = r2engine::should_use_direct_named_native_worker_decompile();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
+  --> $DIR/engine_policy_ownership.rs:122:13
+   |
+LL |     let _ = r2engine::should_use_direct_named_native_worker_type_projection();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
+  --> $DIR/engine_policy_ownership.rs:124:5
    |
 LL |     session.decompile_summary(EngineSummaryDecompileRequest::guarded_worker_summary());
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:103:31
+  --> $DIR/engine_policy_ownership.rs:124:31
    |
 LL |     session.decompile_summary(EngineSummaryDecompileRequest::guarded_worker_summary());
    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:104:13
+  --> $DIR/engine_policy_ownership.rs:125:13
    |
 LL |     let _ = EngineSemanticMode::Full;
    |             ^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/cache/session/fallback decisions to r2engine
-  --> $DIR/engine_policy_ownership.rs:105:13
+  --> $DIR/engine_policy_ownership.rs:126:13
    |
 LL |     let _ = EngineSemanticMode::Optional;
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-warning: 16 warnings emitted
+warning: 20 warnings emitted
 

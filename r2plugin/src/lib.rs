@@ -1177,39 +1177,6 @@ pub extern "C" fn r2dec_highlight_c_ansi(source: *const c_char) -> *mut c_char {
     CString::new(r2dec::highlight_c_ansi(source)).map_or(ptr::null_mut(), |c| c.into_raw())
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_has_native_worker_summary_family_ffi(name: *const c_char) -> bool {
-    if name.is_null() {
-        return false;
-    }
-    let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
-        return false;
-    };
-    r2sym::has_native_worker_summary_family(name)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_direct_named_worker_decompile_ffi(name: *const c_char) -> bool {
-    if name.is_null() {
-        return false;
-    }
-    let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
-        return false;
-    };
-    r2engine::should_use_direct_named_native_worker_decompile(name)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_direct_named_worker_type_projection_ffi(name: *const c_char) -> bool {
-    if name.is_null() {
-        return false;
-    }
-    let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
-        return false;
-    };
-    r2engine::should_use_direct_named_native_worker_type_projection(name)
-}
-
 // ========== Typed Analysis FFI ==========
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -3791,50 +3758,6 @@ pub extern "C" fn r2dec_named_native_worker_summary(
     let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
     let output = decompiler::render_named_native_worker_summary(
         block_slice.into_inner(),
-        &function_name,
-        ctx_view.arch,
-        ptr_bits,
-    );
-    output
-        .and_then(|output| CString::new(output).ok())
-        .map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_direct_named_worker_decompile_summary_ffi(
-    ctx: *const R2ILContext,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-) -> *mut c_char {
-    let Some(ctx_view) = context::require_ctx_view(ctx) else {
-        return ptr::null_mut();
-    };
-    let function_name = helpers::resolve_function_name(fcn_addr, fcn_name);
-    let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
-    let output = decompiler::render_direct_named_native_worker_summary(
-        fcn_addr,
-        &function_name,
-        ctx_view.arch,
-        ptr_bits,
-    );
-    output
-        .and_then(|output| CString::new(output).ok())
-        .map_or(ptr::null_mut(), |c| c.into_raw())
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn r2dec_named_native_worker_summary_direct(
-    ctx: *const R2ILContext,
-    fcn_addr: u64,
-    fcn_name: *const c_char,
-) -> *mut c_char {
-    let Some(ctx_view) = context::require_ctx_view(ctx) else {
-        return ptr::null_mut();
-    };
-    let function_name = helpers::resolve_function_name(fcn_addr, fcn_name);
-    let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
-    let output = decompiler::render_direct_named_native_worker_summary(
-        fcn_addr,
         &function_name,
         ctx_view.arch,
         ptr_bits,

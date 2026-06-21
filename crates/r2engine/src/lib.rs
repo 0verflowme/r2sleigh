@@ -39,15 +39,14 @@ pub use route::{
     semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
     semantic_route_from_artifact_plan, semantic_route_plan, semantic_route_plan_from_context,
     semantic_route_reason, should_guard_program_orchestrator_decompile,
-    should_skip_runtime_type_inference, should_use_direct_named_native_worker_decompile,
-    should_use_direct_named_native_worker_type_projection, should_use_prepared_semantic_view,
+    should_skip_runtime_type_inference, should_use_prepared_semantic_view,
     type_cfg_allows_semantic_plan, type_cfg_bounded_reason, type_cfg_forces_bounded_plan,
     type_cfg_prefers_bounded_plan, type_route_decision,
 };
 use route::{
     decompiler_context_with_route_decision, has_renderable_native_linear_worker_summary,
     native_body_has_renderable_worker_summary, proof_coverage_from_type_facts,
-    raw_cfg_risk_summary_for_preprobe, should_prefer_full_decompile_for_named_worker,
+    raw_cfg_risk_summary_for_preprobe,
 };
 pub use stable_hash::{
     stable_blocks_hash, stable_fnv1a_bytes, stable_fnv1a_debug_hash, stable_fnv1a_hash,
@@ -2513,9 +2512,7 @@ impl EngineSession {
         let artifact_key = function_artifact_cache_key(&analysis_request);
         let cached = self.cached_analyze_with_key(&artifact_key, Duration::default());
 
-        if cached.is_none()
-            || should_prefer_full_decompile_for_named_worker(&probe.summary_probe_name)
-        {
+        if cached.is_none() {
             let type_seed = r2types::function_type_facts_from_parsed_context(
                 &display_name,
                 &analysis_request.parsed_context,
@@ -7194,164 +7191,8 @@ mod tests {
             ["dbg.init_node"],
         );
 
-        assert!(identity.name_candidates().all(|name| {
-            !r2sym::native_worker_summary_applicability_for_name(identity.function_addr, name)
-                .is_supported()
-        }));
-        assert!(
-            !identity
-                .name_candidates()
-                .any(should_use_direct_named_native_worker_decompile)
-        );
+        assert!(!identity.has_summary_family());
         assert_eq!(identity.summary_probe_name(), "fcn.00008b50");
-    }
-
-    #[test]
-    fn name_only_worker_families_do_not_select_direct_decompile() {
-        for name in [
-            "dbg.init_node",
-            "sym.rpl_nanosleep",
-            "dbg.xnanosleep",
-            "dbg.mergefiles",
-            "dbg.xnrealloc",
-            "dbg.xnmalloc",
-            "dbg.xinmalloc",
-            "dbg.init_node.isra.0",
-            "dbg.cycle_check",
-            "dbg.file_prefixlen",
-            "sym.operand_matches",
-            "dbg.xstrcoll_df_version",
-            "dbg.rev_strcmp_df_mtime",
-            "entry0",
-            "sym.register_tm_clones",
-            "dbg.save_token",
-            "dbg.filename_unescape",
-            "sym.compare",
-            "dbg.close_stream",
-            "dbg.rpl_fseeko",
-            "dbg.reap",
-            "dbg.record_file",
-            "dbg.quotearg_free",
-            "dbg.num_processors_via_affinity_mask",
-            "sym.format_user_or_group",
-            "entry.fini0",
-            "sym.xmalloc",
-            "dbg.rpl_reallocarray",
-            "dbg.hash_clear",
-            "sym.hash_get_max_bucket_length",
-            "sym.hash_lookup",
-            "dbg.hash_get_entries",
-            "dbg.hash_do_for_each",
-            "dbg.heap_insert",
-            "sym.version_etc_va",
-            "dbg.mdir_name",
-            "dbg.last_component",
-            "dbg.restore_initial_cwd",
-            "sym.cwd_advance_fd",
-            "dbg.parse_field_count",
-            "dbg.yesno",
-            "dbg.get_root_dev_ino",
-            "dbg.getuser",
-            "dbg.getgroup",
-            "dbg.open_safer",
-            "sym.calc_req_mask",
-            "dbg.clear_files",
-            "dbg.fts_sort",
-            "dbg.write_bytes",
-            "dbg.is_utf8_charset",
-            "dbg.mcel_tocmp",
-            "dbg.re_string_reconstruct",
-            "dbg.parse_datetime_body",
-            "dbg.posixtime",
-            "dbg.randperm_new",
-            "dbg.readtoken",
-            "dbg.readtokens",
-            "dbg.re_search_internal",
-            "dbg.re_compile_internal",
-            "dbg.parse_expression",
-            "dbg.build_trtable",
-            "dbg.update_cur_sifted_state",
-            "dbg.transit_state_bkref",
-            "dbg.build_charclass",
-            "dbg.check_arrival",
-            "dbg.peek_token",
-            "dbg.build_wcs_upper_buffer",
-            "dbg.yyparse",
-            "dbg.install_file_in_file",
-            "dbg.chown_files",
-            "dbg.read_utmp",
-            "dbg.dopass",
-            "sym.factor_up.part.0.constprop.0",
-            "dbg.mp_factor_using_pollard_rho",
-            "dbg.seq_fast",
-            "dbg.tsort",
-            "dbg.error_tail",
-            "dbg.argmatch_to_argument",
-            "dbg.opendirat",
-            "dbg.fd_safer",
-            "dbg.emit_verbose",
-            "dbg.posix2_version",
-        ] {
-            let applicability = r2sym::native_worker_summary_applicability_for_name(0, name);
-            assert!(
-                !applicability.is_supported(),
-                "name-only worker families must not create applicability for {name}: {applicability:?}"
-            );
-            assert!(
-                !should_use_direct_named_native_worker_decompile(name),
-                "name-only hint must not select direct decompile for {name}"
-            );
-        }
-
-        assert!(!should_use_direct_named_native_worker_decompile(
-            "dbg.key_to_opts"
-        ));
-        assert!(!should_use_direct_named_native_worker_decompile(
-            "dbg.hash_initialize"
-        ));
-        assert!(!should_use_direct_named_native_worker_decompile(
-            "dbg.canonicalize_filename_mode"
-        ));
-        for name in [
-            "sym.blake2b_compress",
-            "sym.sm3_process_block",
-            "sym.sha256_process_block",
-        ] {
-            let applicability = r2sym::native_worker_summary_applicability_for_name(0, name);
-            assert!(
-                !applicability.is_supported(),
-                "crypto/hash names alone must not create worker applicability for {name}: {applicability:?}"
-            );
-            assert!(
-                !should_use_direct_named_native_worker_decompile(name),
-                "unsupported hash name must not select direct decompile for {name}"
-            );
-        }
-        assert!(!should_prefer_full_decompile_for_named_worker(
-            "sym.diagnose"
-        ));
-    }
-
-    #[test]
-    fn direct_named_worker_type_projection_rejects_program_orchestrator_name_hints() {
-        assert!(!should_use_direct_named_native_worker_type_projection(
-            "dbg.main"
-        ));
-        for name in [
-            "dbg.xnmalloc",
-            "randread",
-            "sym.sha256_process_block",
-            "sym.blake2b_compress",
-            "dbg.posixtime",
-            "dbg.randperm_new",
-            "dbg.readtoken",
-            "dbg.readtokens",
-        ] {
-            assert!(
-                !should_use_direct_named_native_worker_type_projection(name),
-                "name-only hint must not select type projection for {name}"
-            );
-        }
     }
 
     #[test]

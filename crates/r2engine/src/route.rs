@@ -474,25 +474,6 @@ pub fn decompile_probe_decision_for_identity(
     }
 }
 
-pub fn should_use_direct_named_native_worker_decompile(function_name: &str) -> bool {
-    direct_named_worker_summary_applicability_for_name(0, function_name).is_some()
-}
-
-fn direct_named_worker_summary_applicability_for_name(
-    function_addr: u64,
-    function_name: &str,
-) -> Option<r2sym::NativeWorkerSummaryApplicability> {
-    r2sym::direct_native_worker_summary_applicability_for_name(function_addr, function_name)
-}
-
-pub(super) fn should_prefer_full_decompile_for_named_worker(function_name: &str) -> bool {
-    r2sym::native_worker_summary_route_policy_for_name(0, function_name).should_prefer_full()
-}
-
-pub fn should_use_direct_named_native_worker_type_projection(function_name: &str) -> bool {
-    should_use_direct_named_native_worker_decompile(function_name)
-}
-
 pub fn should_guard_program_orchestrator_decompile(block_count: usize, op_count: usize) -> bool {
     block_count > 4 || op_count > 96
 }

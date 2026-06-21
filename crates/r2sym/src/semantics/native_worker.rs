@@ -766,7 +766,7 @@ pub fn function_semantic_summary_seed_for_name_with_linkage(
     })
 }
 
-pub fn native_worker_summary_applicability_for_name(
+fn native_worker_summary_applicability_for_name(
     function_addr: u64,
     name: &str,
 ) -> NativeWorkerSummaryApplicability {
@@ -784,7 +784,7 @@ pub fn native_worker_summary_applicability_for_name(
     native_worker_summary_applicability_for_summary(function_addr, &summary)
 }
 
-pub fn native_worker_summary_route_policy_for_name(
+fn native_worker_summary_route_policy_for_name(
     function_addr: u64,
     name: &str,
 ) -> NativeWorkerSummaryRoutePolicy {
@@ -1078,16 +1078,6 @@ fn summary_route_claim_source(
     } else {
         SemanticClaimSource::Summary
     }
-}
-
-pub fn direct_native_worker_summary_applicability_for_name(
-    function_addr: u64,
-    name: &str,
-) -> Option<NativeWorkerSummaryApplicability> {
-    let policy = native_worker_summary_route_policy_for_name(function_addr, name);
-    policy
-        .should_use_direct_summary()
-        .then_some(policy.applicability)
 }
 
 fn native_worker_summary_route_registry_entry(
@@ -5199,6 +5189,70 @@ fn semantic_family_worker_summaries(
         _ => Vec::new(),
     };
     mark_name_hint_summaries(summaries)
+        .into_iter()
+        .filter(|worker| summary_has_direct_worker_kind_evidence(summary, worker.kind))
+        .collect()
+}
+
+fn summary_has_direct_worker_kind_evidence(
+    summary: &FunctionSemanticSummary,
+    kind: NativeWorkerSummaryKind,
+) -> bool {
+    match kind {
+        NativeWorkerSummaryKind::Allocation => {
+            !summary.allocation_effects.is_empty()
+                || matches!(summary.return_relation, SummaryReturnRelation::HeapAlloc)
+        }
+        NativeWorkerSummaryKind::MemoryTransfer | NativeWorkerSummaryKind::FileTransfer => {
+            !summary.transfer_effects.is_empty()
+        }
+        NativeWorkerSummaryKind::MemoryRead => summary
+            .memory_effects
+            .iter()
+            .any(|effect| matches!(effect.kind, SummaryMemoryEffectKind::Read)),
+        NativeWorkerSummaryKind::MemoryWrite => summary
+            .memory_effects
+            .iter()
+            .any(|effect| matches!(effect.kind, SummaryMemoryEffectKind::Write)),
+        NativeWorkerSummaryKind::MemoryEscape => summary
+            .memory_effects
+            .iter()
+            .any(|effect| matches!(effect.kind, SummaryMemoryEffectKind::Escape)),
+        NativeWorkerSummaryKind::MemoryFree => {
+            summary
+                .memory_effects
+                .iter()
+                .any(|effect| matches!(effect.kind, SummaryMemoryEffectKind::Free))
+                || summary.arg_effects.values().any(|effect| effect.free)
+        }
+        NativeWorkerSummaryKind::Lifetime => {
+            !summary.lifetime_effects.is_empty()
+                || summary
+                    .memory_effects
+                    .iter()
+                    .any(|effect| matches!(effect.kind, SummaryMemoryEffectKind::Free))
+                || summary.arg_effects.values().any(|effect| effect.free)
+        }
+        NativeWorkerSummaryKind::Synchronization => !summary.sync_effects.is_empty(),
+        NativeWorkerSummaryKind::Atomic => !summary.atomic_effects.is_empty(),
+        NativeWorkerSummaryKind::Unknown
+        | NativeWorkerSummaryKind::StringScan
+        | NativeWorkerSummaryKind::HashFold
+        | NativeWorkerSummaryKind::TableWalk
+        | NativeWorkerSummaryKind::Parser
+        | NativeWorkerSummaryKind::PathWalk
+        | NativeWorkerSummaryKind::DirectoryTraversal
+        | NativeWorkerSummaryKind::RecordStream
+        | NativeWorkerSummaryKind::FieldSelection
+        | NativeWorkerSummaryKind::OutputStream
+        | NativeWorkerSummaryKind::FormatRender
+        | NativeWorkerSummaryKind::FormatArgumentFetch
+        | NativeWorkerSummaryKind::MetadataProbe
+        | NativeWorkerSummaryKind::SortMerge
+        | NativeWorkerSummaryKind::ProgramOrchestrator
+        | NativeWorkerSummaryKind::NumericTransform
+        | NativeWorkerSummaryKind::DiagnosticWrapper => false,
+    }
 }
 
 fn summary_has_semantic_role_evidence(summary: &FunctionSemanticSummary) -> bool {
@@ -11907,7 +11961,8 @@ mod tests {
         assert_eq!(policy.kind, NativeWorkerSummaryRouteKind::Standard);
         assert!(!policy.should_prefer_full());
         assert!(!policy.should_use_direct_summary());
-        assert!(policy.applicability.has_route_evidence());
+        assert!(!policy.applicability.has_route_evidence());
+        assert!(!policy.applicability.is_supported());
         assert!(
             policy.certificate.is_none(),
             "void return evidence alone is not compatible diagnostic route evidence"
@@ -12035,6 +12090,19 @@ mod tests {
         assert!(
             policy.certificate.is_none(),
             "unrelated structural evidence must not certify the error_tail route"
+        );
+        let summaries = summaries_from_interproc_summary_unbounded(0x401000, &summary);
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !matches!(summary.kind, NativeWorkerSummaryKind::DiagnosticWrapper)),
+            "unrelated evidence must not let a name-family table create diagnostic worker semantics: {summaries:?}"
+        );
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !summary.has_name_hint_evidence()),
+            "unrelated evidence must not emit name-hint worker summaries: {summaries:?}"
         );
     }
 
