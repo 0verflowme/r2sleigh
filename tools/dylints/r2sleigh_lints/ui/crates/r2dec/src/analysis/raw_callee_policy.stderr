@@ -1,0 +1,40 @@
+warning: r2dec analysis must consume CalleeResolutionFacts target resolution/policy, not reconstruct callee import/model policy
+  --> $DIR/raw_callee_policy.rs:35:13
+   |
+LL |     let _ = facts.identity_for_callsite();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_raw_callee_import_policy)]` on by default
+
+warning: r2dec analysis must consume CalleeResolutionFacts target resolution/policy, not reconstruct callee import/model policy
+  --> $DIR/raw_callee_policy.rs:36:13
+   |
+LL |     let _ = facts.identity_for_direct_addr();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec analysis must consume CalleeResolutionFacts target resolution/policy, not reconstruct callee import/model policy
+  --> $DIR/raw_callee_policy.rs:37:13
+   |
+LL |     let _ = facts.target_policy_for_callsite_or_identity();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec analysis must consume CalleeResolutionFacts target resolution/policy, not reconstruct callee import/model policy
+  --> $DIR/raw_callee_policy.rs:38:13
+   |
+LL |     let _ = identity.is_import_policy_authorized();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec analysis must consume CalleeResolutionFacts target resolution/policy, not reconstruct callee import/model policy
+  --> $DIR/raw_callee_policy.rs:39:13
+   |
+LL |     let _ = Identity::from_direct_target();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec analysis must consume CalleeResolutionFacts target resolution/policy, not reconstruct callee import/model policy
+  --> $DIR/raw_callee_policy.rs:40:13
+   |
+LL |     let _ = callee_name_is_import_like("sym.imp.printf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 6 warnings emitted
+

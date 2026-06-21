@@ -32,10 +32,11 @@ use r2ssa::{
 use r2types::StackSlotKey;
 #[cfg(test)]
 use r2types::TypeOracle;
+#[cfg(test)]
+use r2types::normalize_callee_name;
 use r2types::{
-    CTypeLike, CalleeIdentity, CalleeIdentityContext, ExternalField, ExternalStackBase,
-    ExternalStackSlotRole, ExternalStruct, ExternalUnion, TypeArena, normalize_callee_name,
-    normalize_external_type_name, parse_type_like_spec,
+    CTypeLike, CalleeIdentity, ExternalField, ExternalStackBase, ExternalStackSlotRole,
+    ExternalStruct, ExternalUnion, normalize_external_type_name, parse_type_like_spec,
 };
 
 use crate::address::parse_address_from_var_name;
@@ -43,13 +44,21 @@ use crate::analysis;
 use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
 use crate::registers::register_family_name;
 
-use super::context::{EffectRenderProofKind, FoldingContext, SSABlock};
+use super::SSABlock;
+use super::context::{EffectRenderProofKind, FoldingContext};
 use super::context::{ResolutionGuardKey, ResolutionPhase};
 use super::flags::is_cpu_flag;
 use super::{
     MAX_ALIAS_REWRITE_DEPTH, MAX_PREDICATE_OPERAND_DEPTH, MAX_RETURN_EXPR_DEPTH,
     MAX_RETURN_INLINE_CANDIDATE_DEPTH, MAX_RETURN_INLINE_DEPTH, MAX_SIMPLE_EXPR_DEPTH,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallExprSourceProof {
+    Exact((u64, usize)),
+    ContradictedOrAmbiguous,
+    None,
+}
 
 fn is_visible_external_stack_name_role(role: ExternalStackSlotRole) -> bool {
     matches!(
@@ -519,6 +528,28 @@ enum FinalExprNormalizeContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalExprNormalizeScope {
+    context: FinalExprNormalizeContext,
+    source_call: Option<(u64, usize)>,
+}
+
+impl FinalExprNormalizeScope {
+    fn new(context: FinalExprNormalizeContext) -> Self {
+        Self {
+            context,
+            source_call: None,
+        }
+    }
+
+    fn for_source_call(context: FinalExprNormalizeContext, source_call: (u64, usize)) -> Self {
+        Self {
+            context,
+            source_call: Some(source_call),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicExprSanitizeMode {
     Generic,
     CallArg,
@@ -780,13 +811,6 @@ impl<'a> FoldingContext<'a> {
         self.inputs.summary_view
     }
 
-    pub(crate) fn summary_helper_view_for_name(
-        &self,
-        name: &str,
-    ) -> Option<&r2types::SummaryHelperView> {
-        self.summary_view()?.helper_view_for_name(name)
-    }
-
     pub(crate) fn prepared_semantic_view(&self) -> Option<&analysis::PreparedSemanticView> {
         if let Some(view) = self.inputs.prepared_semantic_view {
             return Some(view);
@@ -801,11 +825,8 @@ impl<'a> FoldingContext<'a> {
         let view = self.prepared_semantic_view_cache.get_or_init(|| {
             analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
                 prepared,
-                interproc_summary_set: self.inputs.interproc_summary_set,
                 abi_arg_regs: &self.inputs.arch.arg_regs,
-                ret_reg_name: &self.inputs.arch.ret_reg_name,
                 callee_resolution: self.inputs.callee_resolution,
-                known_function_signatures: self.inputs.known_function_signatures,
                 stack_slots: self.inputs.stack_slots,
                 visible_bindings: self.inputs.visible_bindings,
                 param_register_aliases: self.inputs.param_register_aliases,
@@ -1005,23 +1026,25 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn call_args_map(&self) -> &HashMap<(u64, usize), Vec<analysis::CallArgBinding>> {
         &self.use_info().call_args
     }
-    pub(crate) fn callee_identity_context(&self) -> CalleeIdentityContext<'_> {
-        CalleeIdentityContext {
+    fn callee_identity_context_without_known_signatures<'b>(
+        &'b self,
+        known_function_signatures: &'b HashMap<String, r2types::FunctionType>,
+    ) -> r2types::CalleeIdentityContext<'b> {
+        r2types::CalleeIdentityContext {
             function_names: self.inputs.function_names,
             symbols: self.inputs.symbols,
             callee_facts: self.inputs.callee_facts,
-            known_function_signatures: self.inputs.known_function_signatures,
+            known_function_signatures,
         }
     }
     pub(crate) fn callee_identity_for_direct_target(&self, addr: u64) -> CalleeIdentity {
-        if let Some(identity) = self
-            .inputs
-            .callee_resolution
-            .and_then(|facts| facts.identity_for_direct_addr(addr))
-        {
-            return identity.clone();
-        }
-        CalleeIdentity::from_direct_target(addr, &self.callee_identity_context())
+        let known_function_signatures = HashMap::new();
+        let ctx = self.callee_identity_context_without_known_signatures(&known_function_signatures);
+        r2types::CalleeResolutionFacts::identity_for_direct_target_in_context(
+            self.inputs.callee_resolution,
+            addr,
+            &ctx,
+        )
     }
     pub(crate) fn callee_identity_for_name(&self, name: &str) -> CalleeIdentity {
         if let Some(addr) = parse_address_from_var_name(name) {
@@ -1034,28 +1057,37 @@ impl<'a> FoldingContext<'a> {
         {
             return identity.clone();
         }
-        CalleeIdentity::from_name(name).with_known_signature(self.inputs.known_function_signatures)
+        let known_function_signatures = HashMap::new();
+        let ctx = self.callee_identity_context_without_known_signatures(&known_function_signatures);
+        if let Some(identity) =
+            r2types::CalleeResolutionFacts::identity_for_name_in_context(name, &ctx)
+        {
+            return identity;
+        }
+        CalleeIdentity::from_name(name)
     }
     pub(crate) fn callee_identity_for_expr(&self, expr: &CExpr) -> Option<CalleeIdentity> {
         call_arg_callee_name(expr).map(|name| self.callee_identity_for_name(name))
     }
-    pub(crate) fn modeled_callee_addr_for_identity(
+
+    #[cfg(test)]
+    pub(crate) fn direct_target_addr_from_callee_expr(&self, expr: &CExpr) -> Option<u64> {
+        match expr {
+            CExpr::Var(name) => parse_address_from_var_name(name),
+            CExpr::Paren(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
+                self.direct_target_addr_from_callee_expr(inner)
+            }
+            CExpr::Cast { expr: inner, .. } => self.direct_target_addr_from_callee_expr(inner),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn callee_target_policy_for_identity(
         &self,
         identity: &CalleeIdentity,
-    ) -> Option<u64> {
-        if let Some(addr) = identity.target_addr
-            && self.inputs.callee_facts.contains_key(&addr)
-        {
-            return Some(addr);
-        }
-
-        let facts = self.inputs.callee_resolution?;
-        identity
-            .aliases
-            .iter()
-            .find_map(|alias| facts.identity_for_name(alias))
-            .and_then(|identity| identity.target_addr)
-            .filter(|addr| self.inputs.callee_facts.contains_key(addr))
+    ) -> r2types::CalleeTargetPolicyDecision {
+        identity.target_policy_decision(self.inputs.callee_resolution, self.inputs.callee_facts)
     }
     pub(crate) fn call_result_aliases_map(
         &self,
@@ -1106,7 +1138,9 @@ impl<'a> FoldingContext<'a> {
             function_names: self.inputs.function_names,
             strings: self.inputs.strings,
             symbols: self.inputs.symbols,
+            callee_facts: self.inputs.callee_facts,
             callee_resolution: self.inputs.callee_resolution,
+            summary_view: self.inputs.summary_view,
             arg_regs: &self.inputs.arch.arg_regs,
             param_register_aliases: self.inputs.param_register_aliases,
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,
@@ -1134,7 +1168,15 @@ impl<'a> FoldingContext<'a> {
             .into_iter()
             .map(|(name, sig)| (normalize_callee_name(&name), sig.into()))
             .collect::<HashMap<_, _>>();
-        self.inputs.known_function_signatures = Box::leak(Box::new(normalized));
+        let ctx = r2types::CalleeIdentityContext {
+            function_names: self.inputs.function_names,
+            symbols: self.inputs.symbols,
+            callee_facts: self.inputs.callee_facts,
+            known_function_signatures: &normalized,
+        };
+        let mut resolution = self.inputs.callee_resolution.cloned().unwrap_or_default();
+        resolution.index_context(&ctx);
+        self.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
     }
 
     #[cfg(test)]
@@ -1330,7 +1372,9 @@ impl<'a> FoldingContext<'a> {
             function_names: self.inputs.function_names,
             strings: self.inputs.strings,
             symbols: self.inputs.symbols,
+            callee_facts: self.inputs.callee_facts,
             callee_resolution: self.inputs.callee_resolution,
+            summary_view: self.inputs.summary_view,
             arg_regs: &self.inputs.arch.arg_regs,
             param_register_aliases: self.inputs.param_register_aliases,
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,
@@ -1905,11 +1949,8 @@ impl<'a> FoldingContext<'a> {
             let prepared_view = self.prepared_semantic_view().cloned().unwrap_or_else(|| {
                 analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
                     prepared,
-                    interproc_summary_set: self.inputs.interproc_summary_set,
                     abi_arg_regs: &self.inputs.arch.arg_regs,
-                    ret_reg_name: &self.inputs.arch.ret_reg_name,
                     callee_resolution: self.inputs.callee_resolution,
-                    known_function_signatures: self.inputs.known_function_signatures,
                     stack_slots: self.inputs.stack_slots,
                     visible_bindings: self.inputs.visible_bindings,
                     param_register_aliases: self.inputs.param_register_aliases,
@@ -2044,7 +2085,6 @@ impl<'a> FoldingContext<'a> {
 
     fn clear_semantic_ownership_caches(&self) {
         self.call_result_owner_name_cache.borrow_mut().clear();
-        self.call_result_owner_expr_cache.borrow_mut().clear();
         self.authoritative_source_args_cache.borrow_mut().clear();
         *self.owned_call_visible_names_cache.borrow_mut() = None;
     }
@@ -2060,7 +2100,6 @@ impl<'a> FoldingContext<'a> {
         for (source_call, aliases) in call_sources {
             let source_id = analysis::CallSiteId::from(source_call);
             let mut direct_aliases = BTreeSet::new();
-            let mut call_expr_keys = BTreeSet::new();
 
             for alias in &aliases {
                 facts.alias_sources.insert(alias.clone(), source_id);
@@ -2070,44 +2109,32 @@ impl<'a> FoldingContext<'a> {
                 if self.direct_call_result_aliases_set().contains(alias) {
                     direct_aliases.insert(alias.clone());
                 }
-                let candidate = self
-                    .direct_definition_expr(alias)
-                    .or_else(|| self.lookup_definition_raw(alias))
-                    .or_else(|| self.lookup_definition(alias));
-                if let Some(expr @ CExpr::Call { .. }) = candidate {
-                    call_expr_keys.insert(call_expr_cache_key(&expr));
-                }
             }
 
-            let owner = self
-                .derive_stable_owned_call_result_name_for_source(aliases.iter())
-                .or_else(|| {
-                    self.fallback_owned_call_result_stack_local_name_for_source(
-                        source_call,
-                        &aliases,
-                    )
-                })
-                .map(|visible_name| {
-                    let kind = self.classify_call_owner_kind(&visible_name);
-                    facts
-                        .visible_owner_sources
-                        .insert(visible_name.clone(), source_id);
-                    facts
-                        .visible_owner_sources
-                        .insert(visible_name.to_ascii_lowercase(), source_id);
-                    facts
-                        .visible_owned_names
-                        .insert(visible_name.to_ascii_lowercase());
-                    analysis::CallOwner { visible_name, kind }
+            let prepared_owner = self
+                .prepared_semantic_view()
+                .and_then(|view| view.call_view_for_site(source_call))
+                .and_then(|view| view.result_owner.as_ref())
+                .and_then(Self::prepared_owned_result_name)
+                .filter(|name| {
+                    !is_generic_arg_name(name) && !self.inputs.arch.is_return_register_name(name)
                 });
-
-            for key in &call_expr_keys {
+            let dynamic_owner = self
+                .derive_stable_owned_call_result_name_for_source(aliases.iter())
+                .filter(|name| !self.call_result_owner_candidate_is_stack_storage(name));
+            let owner = prepared_owner.or(dynamic_owner).map(|visible_name| {
+                let kind = self.classify_call_owner_kind(&visible_name);
                 facts
-                    .call_expr_sources
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(source_id);
-            }
+                    .visible_owner_sources
+                    .insert(visible_name.clone(), source_id);
+                facts
+                    .visible_owner_sources
+                    .insert(visible_name.to_ascii_lowercase(), source_id);
+                facts
+                    .visible_owned_names
+                    .insert(visible_name.to_ascii_lowercase());
+                analysis::CallOwner { visible_name, kind }
+            });
 
             facts.call_ownership.insert(
                 source_id,
@@ -2116,65 +2143,11 @@ impl<'a> FoldingContext<'a> {
                     owner,
                     aliases,
                     direct_aliases,
-                    call_expr_keys,
                 },
             );
         }
 
         facts
-    }
-
-    fn fallback_owned_call_result_stack_local_name_for_source(
-        &self,
-        source_call: (u64, usize),
-        aliases: &BTreeSet<String>,
-    ) -> Option<String> {
-        let func = self
-            .inputs
-            .prepared_ssa
-            .map(|prepared| prepared.function())?;
-        let block = func.get_block(source_call.0)?;
-
-        for op in block.ops.iter().skip(source_call.1 + 1) {
-            match op {
-                SSAOp::Store { addr, val, .. } => {
-                    let val_name = val.display_name();
-                    let source_matches = aliases.contains(&val_name)
-                        || self
-                            .use_info()
-                            .call_result_source_by_alias
-                            .get(&val_name)
-                            .copied()
-                            == Some(source_call)
-                        || self
-                            .use_info()
-                            .call_result_source_by_alias
-                            .get(&val_name.to_ascii_lowercase())
-                            .copied()
-                            == Some(source_call)
-                        || self.local_post_call_source_for_ssa_name_in_block(block, &val_name, 0)
-                            == Some(source_call);
-                    if !source_matches {
-                        continue;
-                    }
-
-                    let Some(offset) = self.stack_slot_offset_for_var(addr) else {
-                        continue;
-                    };
-                    if offset >= 0 {
-                        continue;
-                    }
-
-                    if let Some(name) = self.resolve_stack_var(offset) {
-                        return Some(name);
-                    }
-                }
-                SSAOp::Call { .. } | SSAOp::CallInd { .. } => break,
-                _ => {}
-            }
-        }
-
-        None
     }
 
     fn classify_call_owner_kind(&self, visible_name: &str) -> analysis::CallOwnerKind {
@@ -2210,7 +2183,8 @@ impl<'a> FoldingContext<'a> {
             .get(&source_call)
             .cloned()
             .map(|expr| {
-                self.normalize_final_call_expr_in_context(
+                self.normalize_call_expr_for_source_call(
+                    source_call,
                     expr,
                     FinalExprNormalizeContext::DefinitionRoot,
                 )
@@ -2225,7 +2199,8 @@ impl<'a> FoldingContext<'a> {
                             .or_else(|| self.lookup_definition_raw(alias))
                             .filter(|expr| matches!(expr, CExpr::Call { .. }))
                             .map(|expr| {
-                                self.normalize_final_call_expr_in_context(
+                                self.normalize_call_expr_for_source_call(
+                                    source_call,
                                     expr,
                                     FinalExprNormalizeContext::DefinitionRoot,
                                 )
@@ -2239,6 +2214,14 @@ impl<'a> FoldingContext<'a> {
         self.ownership()
             .source_for_visible_owner_name(visible_name)
             .map(Into::into)
+            .or_else(|| {
+                self.ownership().call_ownership.values().find_map(|fact| {
+                    fact.owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.visible_name.eq_ignore_ascii_case(visible_name))
+                        .then_some(fact.source.into())
+                })
+            })
             .or_else(|| {
                 self.stack_offset_for_visible_storage_name(visible_name)
                     .and_then(|wanted_offset| {
@@ -2262,24 +2245,8 @@ impl<'a> FoldingContext<'a> {
         &self,
         source_call: (u64, usize),
     ) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return self
-                .certified_synthesized_call_expr_for_source_call(source_call)
-                .map(|call| call.expr);
-        }
-
-        let (block_addr, op_idx) = source_call;
-        let call_site = self.prepared_call_site_for_op(block_addr, op_idx)?;
-        let func = self.resolve_call_target_for_site(
-            block_addr,
-            op_idx,
-            self.prepared_var_for_value_id(call_site.target)?,
-        );
-        let args = self.render_authoritative_source_args_for_call(source_call);
-        Some(self.normalize_final_call_expr_in_context(
-            CExpr::call(func, args),
-            FinalExprNormalizeContext::DefinitionRoot,
-        ))
+        self.certified_synthesized_call_expr_for_source_call(source_call)
+            .map(|call| call.expr)
     }
 
     pub(super) fn certified_synthesized_call_expr_for_source_call(
@@ -2293,7 +2260,9 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
         let proof = self.certified_render_context()?;
-        if !proof.expression_is_renderable(cert.target) {
+        let target_is_certified = proof.expression_is_renderable(cert.target)
+            || proof.prepared.resolved_call_target(call_site).is_some();
+        if !target_is_certified {
             return None;
         }
         let func = self.resolve_call_target_for_site(
@@ -2308,7 +2277,8 @@ impl<'a> FoldingContext<'a> {
             .unwrap_or_default();
         let certified_args =
             self.certified_call_args_for_site(block_addr, op_idx, &func, raw_args)?;
-        let expr = self.normalize_final_call_expr_in_context(
+        let expr = self.normalize_call_expr_for_source_call(
+            source_call,
             CExpr::call(func, certified_args.args),
             FinalExprNormalizeContext::DefinitionRoot,
         );
@@ -2320,12 +2290,24 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn record_certified_call_render_proofs_for_stmt(&self, stmt: &CStmt) -> Option<()> {
+        self.record_certified_call_render_proofs_for_stmt_with_current(stmt, None)
+    }
+
+    pub(super) fn record_certified_call_render_proofs_for_stmt_with_current(
+        &self,
+        stmt: &CStmt,
+        current_source_call: Option<(u64, usize)>,
+    ) -> Option<()> {
         if !self.requires_certified_rendering() {
             return Some(());
         }
 
         let mut sources = BTreeSet::new();
-        self.collect_rendered_call_sources_for_stmt(stmt, &mut sources);
+        self.collect_certified_rendered_call_sources_for_stmt(
+            stmt,
+            current_source_call,
+            &mut sources,
+        )?;
         let proofs = sources
             .into_iter()
             .map(|source_call| {
@@ -2343,6 +2325,25 @@ impl<'a> FoldingContext<'a> {
                 values,
             );
         }
+        Some(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_certified_call_render_proof_for_source_call(
+        &self,
+        source_call: (u64, usize),
+    ) -> Option<()> {
+        if !self.requires_certified_rendering() {
+            return Some(());
+        }
+        let call = self.certified_synthesized_call_expr_for_source_call(source_call)?;
+        self.record_effect_render_proof_for_values(
+            EffectRenderProofKind::Call,
+            source_call.0,
+            source_call.1,
+            Some(call.target),
+            call.values,
+        );
         Some(())
     }
 
@@ -2370,41 +2371,200 @@ impl<'a> FoldingContext<'a> {
         });
     }
 
-    fn collect_rendered_call_sources_for_stmt(
+    pub(crate) fn prune_duplicate_call_statements_by_source(&self, body: &mut Vec<CStmt>) {
+        let mut seen_sources = BTreeSet::new();
+        body.retain(|stmt| {
+            let CStmt::Expr(expr @ CExpr::Call { .. }) = stmt else {
+                return true;
+            };
+            let mut expr_sources = BTreeSet::new();
+            self.collect_rendered_call_sources_for_expr(expr, &mut expr_sources);
+            if expr_sources.is_empty() {
+                return true;
+            }
+            let duplicate = expr_sources
+                .iter()
+                .all(|source| seen_sources.contains(source));
+            seen_sources.extend(expr_sources);
+            !duplicate
+        });
+    }
+
+    fn collect_certified_rendered_call_sources_for_stmt(
         &self,
         stmt: &CStmt,
+        current_source_call: Option<(u64, usize)>,
         out: &mut BTreeSet<(u64, usize)>,
-    ) {
+    ) -> Option<()> {
         match stmt {
-            CStmt::Expr(expr)
-            | CStmt::Return(Some(expr))
-            | CStmt::While { cond: expr, .. }
-            | CStmt::DoWhile { cond: expr, .. } => {
-                self.collect_rendered_call_sources_for_expr(expr, out)
+            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => self
+                .collect_certified_rendered_call_sources_for_expr(expr, current_source_call, out),
+            CStmt::While { cond, body } => {
+                self.collect_certified_rendered_call_sources_for_expr(
+                    cond,
+                    current_source_call,
+                    out,
+                )?;
+                self.collect_certified_rendered_call_sources_for_stmt(
+                    body,
+                    current_source_call,
+                    out,
+                )
+            }
+            CStmt::DoWhile { body, cond } => {
+                self.collect_certified_rendered_call_sources_for_stmt(
+                    body,
+                    current_source_call,
+                    out,
+                )?;
+                self.collect_certified_rendered_call_sources_for_expr(
+                    cond,
+                    current_source_call,
+                    out,
+                )
+            }
+            CStmt::Block(stmts) => {
+                for stmt in stmts {
+                    self.collect_certified_rendered_call_sources_for_stmt(
+                        stmt,
+                        current_source_call,
+                        out,
+                    )?;
+                }
+                Some(())
             }
             CStmt::Decl {
                 init: Some(expr), ..
-            } => self.collect_rendered_call_sources_for_expr(expr, out),
-            CStmt::If { cond, .. } => self.collect_rendered_call_sources_for_expr(cond, out),
+            } => self.collect_certified_rendered_call_sources_for_expr(
+                expr,
+                current_source_call,
+                out,
+            ),
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                self.collect_certified_rendered_call_sources_for_expr(
+                    cond,
+                    current_source_call,
+                    out,
+                )?;
+                self.collect_certified_rendered_call_sources_for_stmt(
+                    then_body,
+                    current_source_call,
+                    out,
+                )?;
+                if let Some(else_body) = else_body {
+                    self.collect_certified_rendered_call_sources_for_stmt(
+                        else_body,
+                        current_source_call,
+                        out,
+                    )?;
+                }
+                Some(())
+            }
             CStmt::For {
                 cond: Some(expr),
                 update: Some(update),
+                body,
                 ..
             } => {
-                self.collect_rendered_call_sources_for_expr(expr, out);
-                self.collect_rendered_call_sources_for_expr(update, out);
+                self.collect_certified_rendered_call_sources_for_expr(
+                    expr,
+                    current_source_call,
+                    out,
+                )?;
+                self.collect_certified_rendered_call_sources_for_expr(
+                    update,
+                    current_source_call,
+                    out,
+                )?;
+                self.collect_certified_rendered_call_sources_for_stmt(
+                    body,
+                    current_source_call,
+                    out,
+                )
             }
             CStmt::For {
                 cond: Some(expr),
+                body,
                 update: None,
                 ..
+            } => {
+                self.collect_certified_rendered_call_sources_for_expr(
+                    expr,
+                    current_source_call,
+                    out,
+                )?;
+                self.collect_certified_rendered_call_sources_for_stmt(
+                    body,
+                    current_source_call,
+                    out,
+                )
             }
-            | CStmt::For {
+            CStmt::For {
                 cond: None,
                 update: Some(expr),
+                body,
                 ..
-            } => self.collect_rendered_call_sources_for_expr(expr, out),
-            CStmt::Switch { expr, .. } => self.collect_rendered_call_sources_for_expr(expr, out),
+            } => {
+                self.collect_certified_rendered_call_sources_for_expr(
+                    expr,
+                    current_source_call,
+                    out,
+                )?;
+                self.collect_certified_rendered_call_sources_for_stmt(
+                    body,
+                    current_source_call,
+                    out,
+                )
+            }
+            CStmt::For {
+                cond: None,
+                update: None,
+                body,
+                ..
+            } => self.collect_certified_rendered_call_sources_for_stmt(
+                body,
+                current_source_call,
+                out,
+            ),
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                self.collect_certified_rendered_call_sources_for_expr(
+                    expr,
+                    current_source_call,
+                    out,
+                )?;
+                for case in cases {
+                    self.collect_certified_rendered_call_sources_for_expr(
+                        &case.value,
+                        current_source_call,
+                        out,
+                    )?;
+                    for stmt in &case.body {
+                        self.collect_certified_rendered_call_sources_for_stmt(
+                            stmt,
+                            current_source_call,
+                            out,
+                        )?;
+                    }
+                }
+                if let Some(default) = default {
+                    for stmt in default {
+                        self.collect_certified_rendered_call_sources_for_stmt(
+                            stmt,
+                            current_source_call,
+                            out,
+                        )?;
+                    }
+                }
+                Some(())
+            }
             CStmt::Return(None)
             | CStmt::Decl { init: None, .. }
             | CStmt::Break
@@ -2412,14 +2572,37 @@ impl<'a> FoldingContext<'a> {
             | CStmt::Goto(_)
             | CStmt::Label(_)
             | CStmt::Comment(_)
-            | CStmt::Empty
-            | CStmt::Block(_)
-            | CStmt::For {
-                cond: None,
-                update: None,
-                ..
-            } => {}
+            | CStmt::Empty => Some(()),
         }
+    }
+
+    fn collect_certified_rendered_call_sources_for_expr(
+        &self,
+        expr: &CExpr,
+        current_source_call: Option<(u64, usize)>,
+        out: &mut BTreeSet<(u64, usize)>,
+    ) -> Option<()> {
+        let mut certified = true;
+        expr.visit(&mut |node| {
+            if let CExpr::Call { .. } = node {
+                if let Some(source_call) =
+                    self.certified_source_for_rendered_call_expr(node, current_source_call)
+                {
+                    out.insert(source_call);
+                } else {
+                    certified = false;
+                }
+            }
+            if let CExpr::Var(name) = node
+                && let Some(source) = self
+                    .call_result_source_for_ssa_name(name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .or_else(|| self.materialized_call_result_source_for_visible_name(name))
+            {
+                out.insert(source);
+            }
+        });
+        certified.then_some(())
     }
 
     fn collect_rendered_call_sources_for_expr(
@@ -2428,10 +2611,16 @@ impl<'a> FoldingContext<'a> {
         out: &mut BTreeSet<(u64, usize)>,
     ) {
         expr.visit(&mut |node| {
-            if let CExpr::Call { .. } = node
+            if let CExpr::Call { .. } = node {
+                for source_call in self.source_matches_for_call_expr(node).0 {
+                    out.insert(source_call);
+                }
+            }
+            if let CExpr::Var(name) = node
                 && let Some(source) = self
-                    .source_call_for_call_expr(node)
-                    .or_else(|| self.source_call_for_loose_internal_call_expr(node))
+                    .call_result_source_for_ssa_name(name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .or_else(|| self.materialized_call_result_source_for_visible_name(name))
             {
                 out.insert(source);
             }
@@ -2445,11 +2634,12 @@ impl<'a> FoldingContext<'a> {
             return false;
         }
 
-        if self.direct_call_result_aliases_set().contains(&var_name)
-            && self
-                .call_result_source_for_ssa_name(&var_name)
-                .and_then(|source| self.stable_owned_call_result_name_for_source(source))
-                .is_some()
+        if self
+            .call_result_source_for_ssa_name(&var_name)
+            .or_else(|| self.local_post_call_source_for_ssa_name(&var_name))
+            .or_else(|| self.source_call_for_visible_owner_name(&self.var_name(var)))
+            .and_then(|source| self.stable_owned_call_result_name_for_source(source))
+            .is_some()
         {
             return false;
         }
@@ -2637,7 +2827,7 @@ impl<'a> FoldingContext<'a> {
 
         // Resolve ram:address references to known names
         if var.is_memory()
-            && let Some(addr) = extract_call_address(&var.name)
+            && let Some(addr) = parse_address_from_var_name(&var.name)
         {
             if let Some(name) = self.lookup_function(addr) {
                 return CExpr::Var(name.clone());
@@ -2691,6 +2881,9 @@ impl<'a> FoldingContext<'a> {
             return CExpr::Var(name);
         }
         if let Some(owner) = self.stable_owned_call_result_expr_for_name(&key, true) {
+            return owner;
+        }
+        if let Some(owner) = self.preserved_owned_call_result_var_for_name(&key) {
             return owner;
         }
         if (self.is_low_signal_visible_name(&self.var_name(var))
@@ -2824,8 +3017,18 @@ impl<'a> FoldingContext<'a> {
         right: CExpr,
         width_bytes: Option<u32>,
     ) -> CExpr {
+        if let Some(value) = self.literal_binary_value(op, &left, &right) {
+            return CExpr::IntLit(value);
+        }
         match op {
             BinaryOp::Sub if self.is_literal_zero_expr(&right) => left,
+            BinaryOp::Sub => {
+                if let Some(expr) = self.simplify_linear_subtraction(&left, &right) {
+                    expr
+                } else {
+                    CExpr::binary(op, left, right)
+                }
+            }
             BinaryOp::Add => {
                 if self.is_literal_zero_expr(&right) {
                     left
@@ -2853,6 +3056,14 @@ impl<'a> FoldingContext<'a> {
                     left
                 } else if self.is_one_expr(&left) {
                     right
+                } else if let Some(coeff) = self.literal_to_i64(&right)
+                    && let Some(expr) = self.simplify_linear_scale(&left, coeff)
+                {
+                    expr
+                } else if let Some(coeff) = self.literal_to_i64(&left)
+                    && let Some(expr) = self.simplify_linear_scale(&right, coeff)
+                {
+                    expr
                 } else {
                     CExpr::binary(op, left, right)
                 }
@@ -2875,8 +3086,64 @@ impl<'a> FoldingContext<'a> {
                 }
                 CExpr::binary(op, left, right)
             }
+            BinaryOp::Shl => {
+                if self.is_literal_zero_expr(&right) {
+                    left
+                } else if let Some(shift) = self.literal_to_i64(&right)
+                    && (0..=62).contains(&shift)
+                    && let Some(expr) = self.simplify_linear_scale(&left, 1i64 << shift)
+                {
+                    expr
+                } else {
+                    CExpr::binary(op, left, right)
+                }
+            }
+            BinaryOp::Shr if self.is_literal_zero_expr(&right) => left,
             _ => CExpr::binary(op, left, right),
         }
+    }
+
+    fn literal_binary_value(&self, op: BinaryOp, left: &CExpr, right: &CExpr) -> Option<i64> {
+        let left = self.literal_to_i64(left)?;
+        let right = self.literal_to_i64(right)?;
+        match op {
+            BinaryOp::Add => left.checked_add(right),
+            BinaryOp::Sub => left.checked_sub(right),
+            BinaryOp::Mul => left.checked_mul(right),
+            BinaryOp::Div => (right != 0).then(|| left.checked_div(right)).flatten(),
+            BinaryOp::Mod => (right != 0).then(|| left.checked_rem(right)).flatten(),
+            BinaryOp::BitAnd => Some(left & right),
+            BinaryOp::BitOr => Some(left | right),
+            BinaryOp::BitXor => Some(left ^ right),
+            BinaryOp::Shl => {
+                if !(0..=62).contains(&right) {
+                    return None;
+                }
+                left.checked_mul(1i64 << right)
+            }
+            BinaryOp::Shr => {
+                if !(0..=62).contains(&right) {
+                    return None;
+                }
+                Some(left >> right)
+            }
+            _ => None,
+        }
+    }
+
+    fn simplify_linear_subtraction(&self, left: &CExpr, right: &CExpr) -> Option<CExpr> {
+        let mut terms = Vec::new();
+        let mut constant = 0i64;
+        self.collect_linear_add_terms(left, 1, &mut terms, &mut constant)?;
+        self.collect_linear_add_terms(right, -1, &mut terms, &mut constant)?;
+        self.linear_expr_from_terms(terms, constant)
+    }
+
+    fn simplify_linear_scale(&self, expr: &CExpr, scale: i64) -> Option<CExpr> {
+        let mut terms = Vec::new();
+        let mut constant = 0i64;
+        self.collect_linear_add_terms(expr, scale, &mut terms, &mut constant)?;
+        self.linear_expr_from_terms(terms, constant)
     }
 
     fn simplify_linear_addition(&self, left: &CExpr, right: &CExpr) -> Option<CExpr> {
@@ -2884,6 +3151,10 @@ impl<'a> FoldingContext<'a> {
         let mut constant = 0i64;
         self.collect_linear_add_terms(left, 1, &mut terms, &mut constant)?;
         self.collect_linear_add_terms(right, 1, &mut terms, &mut constant)?;
+        self.linear_expr_from_terms(terms, constant)
+    }
+
+    fn linear_expr_from_terms(&self, mut terms: Vec<(CExpr, i64)>, constant: i64) -> Option<CExpr> {
         terms.retain(|(_, coeff)| *coeff != 0);
         terms.sort_by_key(|(term, _)| self.linear_term_order_key(term));
 
@@ -2917,6 +3188,14 @@ impl<'a> FoldingContext<'a> {
                 self.collect_linear_add_terms(right, scale, terms, constant)
             }
             CExpr::Binary {
+                op: BinaryOp::Sub,
+                left,
+                right,
+            } => {
+                self.collect_linear_add_terms(left, scale, terms, constant)?;
+                self.collect_linear_add_terms(right, scale.checked_neg()?, terms, constant)
+            }
+            CExpr::Binary {
                 op: BinaryOp::Mul,
                 left,
                 right,
@@ -2932,6 +3211,22 @@ impl<'a> FoldingContext<'a> {
                     return push_linear_term(terms, term, scale.checked_mul(coeff)?);
                 }
                 None
+            }
+            CExpr::Binary {
+                op: BinaryOp::Shl,
+                left,
+                right,
+            } => {
+                let shift = self.literal_to_i64(right)?;
+                if !(0..=62).contains(&shift) {
+                    return None;
+                }
+                self.collect_linear_add_terms(
+                    left,
+                    scale.checked_mul(1i64 << shift)?,
+                    terms,
+                    constant,
+                )
             }
             CExpr::IntLit(value) => {
                 *constant = constant.checked_add(scale.checked_mul(*value)?)?;
@@ -3696,6 +3991,9 @@ impl<'a> FoldingContext<'a> {
                 })
             }
             analysis::BaseRef::Raw(expr) => {
+                if let Some(owner) = self.stable_owned_call_result_expr_for_raw_call(expr) {
+                    return Some(owner);
+                }
                 let normalized = self.normalize_final_call_expr_in_context(
                     expr.clone(),
                     FinalExprNormalizeContext::Generic,
@@ -3706,6 +4004,15 @@ impl<'a> FoldingContext<'a> {
                     Some(expr.clone())
                 }
             }
+        }
+    }
+
+    fn stable_owned_call_result_expr_for_raw_call(&self, expr: &CExpr) -> Option<CExpr> {
+        match self.source_proof_for_call_expr(expr) {
+            CallExprSourceProof::Exact(source_call) => {
+                self.stable_owned_call_result_expr_for_source(source_call)
+            }
+            CallExprSourceProof::ContradictedOrAmbiguous | CallExprSourceProof::None => None,
         }
     }
 
@@ -3741,7 +4048,7 @@ impl<'a> FoldingContext<'a> {
             analysis::BaseRef::Value(value) => {
                 if value.var.is_const() {
                     parse_const_value(&value.var.name)?
-                } else if let Some(addr) = extract_call_address(&value.var.name) {
+                } else if let Some(addr) = parse_address_from_var_name(&value.var.name) {
                     addr
                 } else {
                     let rendered = self
@@ -4680,6 +4987,14 @@ impl<'a> FoldingContext<'a> {
         };
 
         if let Some(exact) = self.exact_named_object_expr_for_addr(addr) {
+            if !matches!(addr.base, analysis::BaseRef::StackSlot(_))
+                && addr.index.is_none()
+                && let Some(field) = self
+                    .oracle_field_name_for_addr(addr, Some(elem_size))
+                    .or_else(|| self.oracle_member_name(None, &exact, addr.offset_bytes))
+            {
+                return Some(self.member_access_expr(exact, field));
+            }
             return Some(exact);
         }
 
@@ -4803,6 +5118,15 @@ impl<'a> FoldingContext<'a> {
                         .checked_add(effective_addr.offset_bytes)?;
                     self.oracle_field_name_for_addr(&normalized, Some(elem_size))
                 })
+                .or_else(|| {
+                    self.expr_type_hint(&base_expr).and_then(|ty| {
+                        self.field_name_from_type_hint(
+                            &ty,
+                            effective_addr.offset_bytes as u64,
+                            Some(elem_size),
+                        )
+                    })
+                })
                 .or_else(|| self.oracle_member_name(None, &base_expr, effective_addr.offset_bytes))
         };
 
@@ -4856,6 +5180,7 @@ impl<'a> FoldingContext<'a> {
             && effective_addr.offset_bytes != 0
             && field_name.is_none()
             && !matches!(effective_addr.base, analysis::BaseRef::StackSlot(_))
+            && Self::expr_is_simple_constant_offset_base(&base_expr)
         {
             let elem_ty = self.infer_elem_type_from_base_ref(&effective_addr.base, elem_size);
             let elem_bytes = elem_ty
@@ -4898,6 +5223,42 @@ impl<'a> FoldingContext<'a> {
         }
 
         None
+    }
+
+    fn expr_is_simple_constant_offset_base(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Var(_) => true,
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::expr_is_simple_constant_offset_base(inner)
+            }
+            _ => false,
+        }
+    }
+
+    fn rewrite_pointer_arithmetic_subscript(&self, expr: CExpr) -> CExpr {
+        let CExpr::Subscript { base, index } = expr else {
+            return expr;
+        };
+        if self.literal_to_i64(&index).is_some()
+            && Self::expr_is_composite_pointer_arithmetic_base(&base)
+        {
+            let addr = self.identity_simplify_binary(BinaryOp::Add, *base, *index, None);
+            return CExpr::Deref(Box::new(addr));
+        }
+        CExpr::Subscript { base, index }
+    }
+
+    fn expr_is_composite_pointer_arithmetic_base(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub,
+                ..
+            } => true,
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                Self::expr_is_composite_pointer_arithmetic_base(inner)
+            }
+            _ => false,
+        }
     }
 
     fn can_render_constant_offset_as_subscript(&self, elem_ty: &CType) -> bool {
@@ -5794,6 +6155,29 @@ impl<'a> FoldingContext<'a> {
                         return Some(field.to_string());
                     }
                 }
+
+                if let Some(def) = self
+                    .lookup_definition(name)
+                    .or_else(|| self.definition_for_name(name).cloned())
+                    .or_else(|| self.best_visible_definition(name))
+                    && !matches!(&def, CExpr::Var(inner) if inner.eq_ignore_ascii_case(name))
+                    && let Some(field) =
+                        self.visible_pointer_root_field_name(&def, offset, access_size, depth + 1)
+                {
+                    return Some(field);
+                }
+
+                let root_name = self.resolve_copy_root_name_in_fold(name);
+                if !root_name.eq_ignore_ascii_case(name)
+                    && let Some(field) = self.visible_pointer_root_field_name(
+                        &CExpr::Var(root_name),
+                        offset,
+                        access_size,
+                        depth + 1,
+                    )
+                {
+                    return Some(field);
+                }
                 None
             }
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
@@ -6027,28 +6411,54 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn is_semantic_index_expr(&self, expr: &CExpr) -> bool {
+        self.is_semantic_index_expr_with_depth(expr, 0, &mut HashSet::new())
+    }
+
+    fn is_semantic_index_expr_with_depth(
+        &self,
+        expr: &CExpr,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if depth > MAX_SIMPLE_EXPR_DEPTH {
+            return false;
+        }
         match expr {
-            CExpr::Var(name) => self
-                .lookup_definition(name)
-                .map(|inner| self.is_semantic_index_expr(&inner))
-                .unwrap_or_else(|| {
-                    let lower = name.to_ascii_lowercase();
-                    let name_kind = SSAVarNameKind::classify(name);
-                    let stack_placeholder =
-                        lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
-                    !name_kind.is_constant()
-                        && !name_kind.is_memory()
-                        && (!stack_placeholder
-                            && (self.stack_slot_provenance_for_name(name).is_none()
-                                || lower.starts_with("local_")
-                                || lower.starts_with("arg")))
-                }),
-            CExpr::Unary { operand, .. } => self.is_semantic_index_expr(operand),
+            CExpr::Var(name) => {
+                let visit_key = format!("index:{}", name.to_ascii_lowercase());
+                if !visited.insert(visit_key.clone()) {
+                    return false;
+                }
+                if let Some(inner) = self.direct_definition_expr(name)
+                    && inner != *expr
+                    && self.is_semantic_index_expr_with_depth(&inner, depth + 1, visited)
+                {
+                    visited.remove(&visit_key);
+                    return true;
+                }
+                let lower = name.to_ascii_lowercase();
+                let name_kind = SSAVarNameKind::classify(name);
+                let stack_placeholder =
+                    lower == "stack" || lower == "saved_fp" || lower.starts_with("stack_");
+                let result = !name_kind.is_constant()
+                    && !name_kind.is_memory()
+                    && !stack_placeholder
+                    && (self.is_static_param_home_alias_name(name)
+                        || self.stack_slot_provenance_for_name(name).is_none()
+                        || lower.starts_with("local_")
+                        || lower.starts_with("arg"));
+                visited.remove(&visit_key);
+                result
+            }
+            CExpr::Unary { operand, .. } => {
+                self.is_semantic_index_expr_with_depth(operand, depth + 1, visited)
+            }
             CExpr::Binary { left, right, .. } => {
-                self.is_semantic_index_expr(left) || self.is_semantic_index_expr(right)
+                self.is_semantic_index_expr_with_depth(left, depth + 1, visited)
+                    || self.is_semantic_index_expr_with_depth(right, depth + 1, visited)
             }
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                self.is_semantic_index_expr(inner)
+                self.is_semantic_index_expr_with_depth(inner, depth + 1, visited)
             }
             _ => false,
         }
@@ -6077,6 +6487,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn member_access_expr(&self, base_expr: CExpr, member: String) -> CExpr {
+        let base_expr = self.canonical_member_base_expr(base_expr);
         match base_expr {
             CExpr::Subscript { .. } | CExpr::Member { .. } => CExpr::Member {
                 base: Box::new(base_expr),
@@ -6086,6 +6497,37 @@ impl<'a> FoldingContext<'a> {
                 base: Box::new(base_expr),
                 member,
             },
+        }
+    }
+
+    fn canonical_member_base_expr(&self, base_expr: CExpr) -> CExpr {
+        match base_expr {
+            CExpr::Var(name) => {
+                let (base, version) = Self::ssa_name_parts(&name);
+                if version > 0
+                    && !base.is_empty()
+                    && let Some(base_ty) = self.lookup_type_hint(base)
+                    && matches!(
+                        base_ty,
+                        CType::Pointer(_) | CType::Array(_, _) | CType::Struct(_) | CType::Union(_)
+                    )
+                    && self
+                        .expr_type_hint(&CExpr::Var(name.clone()))
+                        .is_some_and(|ty| {
+                            matches!(
+                                ty,
+                                CType::Pointer(_)
+                                    | CType::Array(_, _)
+                                    | CType::Struct(_)
+                                    | CType::Union(_)
+                            )
+                        })
+                {
+                    return CExpr::Var(base.to_string());
+                }
+                CExpr::Var(name)
+            }
+            other => other,
         }
     }
 
@@ -6100,6 +6542,12 @@ impl<'a> FoldingContext<'a> {
     fn type_hint_for_var(&self, var: &SSAVar) -> Option<CType> {
         let display = var.display_name();
         if let Some(ty) = self.lookup_type_hint(&display) {
+            return Some(ty.clone());
+        }
+
+        if var.version > 0
+            && let Some(ty) = self.lookup_type_hint(&var.name)
+        {
             return Some(ty.clone());
         }
 
@@ -6222,6 +6670,94 @@ impl<'a> FoldingContext<'a> {
             || has_hexish_suffix("var_")
     }
 
+    fn static_param_home_alias_for_stack_offset(&self, offset: i64) -> Option<String> {
+        self.inputs
+            .stack_slots
+            .iter()
+            .find(|(slot_key, slot)| {
+                matches!(slot.role, ExternalStackSlotRole::ParamHome)
+                    && (slot_key.offset == offset
+                        || (matches!(slot_key.base, ExternalStackBase::FramePointer)
+                            && -slot_key.offset == offset))
+            })
+            .and_then(|(_, slot)| {
+                slot.param_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        slot.source_reg
+                            .as_deref()
+                            .and_then(|reg| self.arg_alias_for_register_name(reg))
+                    })
+            })
+            .filter(|alias| !alias.trim().is_empty() && !is_generic_stack_placeholder_alias(alias))
+    }
+
+    fn is_static_param_home_alias_name(&self, name: &str) -> bool {
+        let normalized = name.trim();
+        !normalized.is_empty()
+            && self.inputs.stack_slots.iter().any(|(_, slot)| {
+                matches!(slot.role, ExternalStackSlotRole::ParamHome)
+                    && (slot
+                        .param_name
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|param_name| param_name.eq_ignore_ascii_case(normalized))
+                        || slot
+                            .source_reg
+                            .as_deref()
+                            .and_then(|reg| self.arg_alias_for_register_name(reg))
+                            .is_some_and(|alias| alias.eq_ignore_ascii_case(normalized)))
+            })
+    }
+
+    fn autogenerated_stack_home_offset(name: &str) -> Option<i64> {
+        let lower = name.to_ascii_lowercase();
+        if lower == "saved_fp" {
+            return Some(0);
+        }
+        let parse_hex = |raw: &str| {
+            let suffix = raw.strip_suffix('h').unwrap_or(raw);
+            (!suffix.is_empty())
+                .then(|| i64::from_str_radix(suffix, 16).ok())
+                .flatten()
+        };
+        if let Some(suffix) = lower.strip_prefix("local_") {
+            return parse_hex(suffix).map(|offset| -offset);
+        }
+        if let Some(suffix) = lower.strip_prefix("var_") {
+            return parse_hex(suffix).map(|offset| -offset);
+        }
+        if let Some(suffix) = lower.strip_prefix("arg_") {
+            return parse_hex(suffix).map(|offset| -offset);
+        }
+        if let Some(suffix) = lower.strip_prefix("stack_") {
+            return parse_hex(suffix);
+        }
+        None
+    }
+
+    fn rewrite_top_level_param_home_subscript_index(&self, expr: CExpr) -> CExpr {
+        match expr {
+            CExpr::Subscript { base, index } => {
+                let index = match *index {
+                    CExpr::Var(name) => Self::autogenerated_stack_home_offset(&name)
+                        .and_then(|offset| self.static_param_home_alias_for_stack_offset(offset))
+                        .map(CExpr::Var)
+                        .unwrap_or(CExpr::Var(name)),
+                    other => other,
+                };
+                CExpr::Subscript {
+                    base,
+                    index: Box::new(index),
+                }
+            }
+            other => other,
+        }
+    }
+
     fn expr_is_autogenerated_stack_home_expr(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Var(name) => self.is_autogenerated_stack_home_name(name),
@@ -6280,34 +6816,21 @@ impl<'a> FoldingContext<'a> {
             if let Some(name) = Self::meaningful_tmp_call_owner_name(alias) {
                 candidates.push(name);
             }
-            if let Some(raw_alias) = self.var_aliases_map().get(alias) {
+            if let Some(raw_alias) = self.var_aliases_map().get(alias)
+                && !self.call_result_owner_candidate_is_stack_storage(raw_alias)
+            {
                 candidates.push(raw_alias.clone());
             }
-            candidates.push(self.rendered_visible_name_for_ssa_name(alias));
+            if !self.call_result_alias_is_stack_derived(alias) {
+                candidates.push(self.rendered_visible_name_for_ssa_name(alias));
+            }
         }
 
-        if let Some(slot_name) = self
-            .stack_slot_provenance_for_name(alias)
-            .and_then(|slot| self.resolve_stack_var(slot.offset))
-        {
-            candidates.push(slot_name);
-        }
-
-        if let Some(slot_name) = self
-            .forwarded_value_for_name(alias)
-            .and_then(|prov| prov.stack_slot)
-            .and_then(|offset| self.resolve_stack_var(offset))
-        {
-            candidates.push(slot_name);
-        }
-
-        if let Some(slot_name) = self.semantic_stack_owner_name_for_alias(alias) {
-            candidates.push(slot_name);
-        }
-
-        let mut fallback_stack_local = None;
         for candidate in candidates {
             if candidate.is_empty() {
+                continue;
+            }
+            if self.call_result_owner_candidate_is_stack_storage(&candidate) {
                 continue;
             }
             if !self.is_low_signal_visible_name(&candidate)
@@ -6318,13 +6841,23 @@ impl<'a> FoldingContext<'a> {
             {
                 return Some(candidate);
             }
-            if fallback_stack_local.is_none() && self.is_generic_stack_local_owner_name(&candidate)
-            {
-                fallback_stack_local = Some(candidate);
-            }
         }
 
-        fallback_stack_local
+        None
+    }
+
+    fn call_result_owner_candidate_is_stack_storage(&self, name: &str) -> bool {
+        self.stack_slot_provenance_for_name(name).is_some()
+            || self.stack_offset_for_visible_storage_name(name).is_some()
+            || self.canonicalize_stack_name(name).is_some()
+            || self.is_generic_stack_local_owner_name(name)
+    }
+
+    fn call_result_alias_is_stack_derived(&self, alias: &str) -> bool {
+        self.call_result_owner_candidate_is_stack_storage(alias)
+            || self.var_aliases_map().get(alias).is_some_and(|raw_alias| {
+                self.call_result_owner_candidate_is_stack_storage(raw_alias)
+            })
     }
 
     fn meaningful_tmp_call_owner_name(alias: &str) -> Option<String> {
@@ -6447,8 +6980,9 @@ impl<'a> FoldingContext<'a> {
         best_name.or(fallback_register_name)
     }
 
-    fn fallback_owned_call_result_register_name_from_matching_call_expr(
+    fn fallback_owned_call_result_register_name_from_matching_source_call(
         &self,
+        source_call: (u64, usize),
         source_expr: &CExpr,
     ) -> Option<String> {
         let mut definitions = std::collections::BTreeMap::new();
@@ -6465,7 +6999,11 @@ impl<'a> FoldingContext<'a> {
         let mut best_expr: Option<CExpr> = None;
         for (name, expr) in definitions {
             if !matches!(expr, CExpr::Call { .. })
-                || !self.raw_call_exprs_match_for_owner_definition(&expr, source_expr)
+                || !self.raw_call_exprs_match_for_source_owner_definition(
+                    Some(source_call),
+                    source_expr,
+                    &expr,
+                )
             {
                 continue;
             }
@@ -6494,7 +7032,10 @@ impl<'a> FoldingContext<'a> {
         self.call_result_exprs_map()
             .get(&source_call)
             .and_then(|source_expr| {
-                self.fallback_owned_call_result_register_name_from_matching_call_expr(source_expr)
+                self.fallback_owned_call_result_register_name_from_matching_source_call(
+                    source_call,
+                    source_expr,
+                )
             })
     }
 
@@ -6546,14 +7087,11 @@ impl<'a> FoldingContext<'a> {
             return Some(owner);
         }
 
-        let known_source = self
-            .source_call_for_call_expr(call)
-            .or_else(|| self.source_call_for_loose_internal_call_expr(call));
-        if known_source.is_some() {
+        if self.call_result_exprs_map().contains_key(&source_call) {
             return None;
         }
 
-        self.fallback_owned_call_result_register_name_from_matching_call_expr(call)
+        self.fallback_owned_call_result_register_name_from_matching_source_call(source_call, call)
             .map(CExpr::Var)
     }
 
@@ -6679,10 +7217,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn source_call_allows_return_register_owner(&self, source_call: (u64, usize)) -> bool {
-        let Some(CExpr::Call { func, .. }) = self.call_result_exprs_map().get(&source_call) else {
+        let Some(CExpr::Call { .. }) = self.call_result_exprs_map().get(&source_call) else {
             return false;
         };
-        let Some(identity) = self.callee_identity_for_expr(func) else {
+        let Some(identity) = self.callee_identity_for_callsite(source_call.0, source_call.1) else {
             return false;
         };
         if identity.is_raw_storage_target() {
@@ -6755,18 +7293,11 @@ impl<'a> FoldingContext<'a> {
             .get(&source_call)
             .and_then(|aliases| self.derive_stable_owned_call_result_name_for_source(aliases));
         let fallback_name = self
-            .call_result_aliases_map()
-            .get(&source_call)
-            .and_then(|aliases| {
-                self.fallback_owned_call_result_stack_local_name_for_source(source_call, aliases)
-            })
-            .or_else(|| {
-                self.fallback_owned_call_result_register_name_from_matching_definition(source_call)
-            })
+            .fallback_owned_call_result_register_name_from_matching_definition(source_call)
             .or_else(|| self.fallback_owned_call_result_return_name_for_source(source_call));
 
         let mut best = ownership_name;
-        for candidate in [dynamic_name, prepared_name, fallback_name]
+        for candidate in [prepared_name, dynamic_name, fallback_name]
             .into_iter()
             .flatten()
         {
@@ -6822,47 +7353,12 @@ impl<'a> FoldingContext<'a> {
         Some(selected)
     }
 
-    pub(super) fn stable_owned_call_result_expr_for_call_expr(
+    fn raw_call_exprs_match_for_source_owner_definition(
         &self,
+        candidate_source_call: Option<(u64, usize)>,
+        candidate: &CExpr,
         expr: &CExpr,
-    ) -> Option<CExpr> {
-        let CExpr::Call { .. } = expr else {
-            return None;
-        };
-
-        let cache_key = call_expr_cache_key(expr);
-        if let Some(cached) = self
-            .call_result_owner_expr_cache
-            .borrow()
-            .get(&cache_key)
-            .cloned()
-        {
-            return cached;
-        }
-        self.call_result_owner_expr_cache
-            .borrow_mut()
-            .insert(cache_key.clone(), None);
-
-        let result = self
-            .source_call_for_call_expr(expr)
-            .or_else(|| self.source_call_for_loose_internal_call_expr(expr))
-            .and_then(|source_call| self.stable_owned_call_result_expr_for_source(source_call))
-            .or_else(|| {
-                (self.call_expr_source_candidates(expr).len() <= 1)
-                    .then(|| {
-                        self.fallback_owned_call_result_register_name_from_matching_call_expr(expr)
-                            .map(CExpr::Var)
-                    })
-                    .flatten()
-            });
-
-        self.call_result_owner_expr_cache
-            .borrow_mut()
-            .insert(cache_key, result.clone());
-        result
-    }
-
-    fn raw_call_exprs_match_for_owner_definition(&self, candidate: &CExpr, expr: &CExpr) -> bool {
+    ) -> bool {
         match (candidate, expr) {
             (
                 CExpr::Call {
@@ -6871,8 +7367,19 @@ impl<'a> FoldingContext<'a> {
                 },
                 CExpr::Call { func, args },
             ) => {
-                self.call_target_identity(candidate_func.as_ref())
-                    == self.call_target_identity(func.as_ref())
+                let candidate_identity = candidate_source_call
+                    .and_then(|(block_addr, op_idx)| {
+                        self.callee_identity_for_callsite(block_addr, op_idx)
+                    })
+                    .map(|identity| identity.primary_key())
+                    .or_else(|| self.call_target_identity(candidate_func.as_ref()));
+                let expr_identity = self.call_target_identity(func.as_ref());
+                let target_matches = match (candidate_identity, expr_identity) {
+                    (Some(candidate), Some(observed)) => candidate == observed,
+                    (None, None) => candidate_func == func,
+                    _ => false,
+                };
+                target_matches
                     && candidate_args.len() == args.len()
                     && candidate_args
                         .iter()
@@ -6883,11 +7390,86 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    fn source_proof_for_call_expr(&self, expr: &CExpr) -> CallExprSourceProof {
+        let (matches, contradicted) = self.source_matches_for_call_expr(expr);
+        let mut matches = matches.into_iter();
+        let Some(source_call) = matches.next() else {
+            return if contradicted {
+                CallExprSourceProof::ContradictedOrAmbiguous
+            } else {
+                CallExprSourceProof::None
+            };
+        };
+        if matches.next().is_some() || contradicted {
+            CallExprSourceProof::ContradictedOrAmbiguous
+        } else {
+            CallExprSourceProof::Exact(source_call)
+        }
+    }
+
+    fn source_matches_for_call_expr(&self, expr: &CExpr) -> (BTreeSet<(u64, usize)>, bool) {
+        if !matches!(expr, CExpr::Call { .. }) {
+            return (BTreeSet::new(), false);
+        }
+        let mut matches = BTreeSet::new();
+        let mut contradicted = false;
+        for (source_call, source_expr) in self.call_result_exprs_map() {
+            if self.raw_call_exprs_match_for_source_owner_definition(
+                Some(*source_call),
+                source_expr,
+                expr,
+            ) {
+                matches.insert(*source_call);
+                continue;
+            }
+            if self.raw_call_exprs_match_for_source_owner_definition(None, source_expr, expr) {
+                contradicted = true;
+            }
+        }
+        (matches, contradicted)
+    }
+
+    fn certified_source_for_rendered_call_expr(
+        &self,
+        expr: &CExpr,
+        current_source_call: Option<(u64, usize)>,
+    ) -> Option<(u64, usize)> {
+        if !self.requires_certified_rendering() || !matches!(expr, CExpr::Call { .. }) {
+            return None;
+        }
+        if let Some(source_call) = current_source_call
+            && let Some(certified) =
+                self.certified_synthesized_call_expr_for_source_call(source_call)
+            && self.raw_call_exprs_match_for_source_owner_definition(
+                Some(source_call),
+                &certified.expr,
+                expr,
+            )
+        {
+            return Some(source_call);
+        }
+        let CallExprSourceProof::Exact(source_call) = self.source_proof_for_call_expr(expr) else {
+            return None;
+        };
+        let certified = self.certified_synthesized_call_expr_for_source_call(source_call)?;
+        self.raw_call_exprs_match_for_source_owner_definition(
+            Some(source_call),
+            &certified.expr,
+            expr,
+        )
+        .then_some(source_call)
+    }
+
     fn call_owner_definition_args_match(&self, left: &CExpr, right: &CExpr) -> bool {
         if left == right {
             return true;
         }
         match (left, right) {
+            (CExpr::StringLit(text), other) | (other, CExpr::StringLit(text)) => {
+                Self::literal_addr_for_expr(other)
+                    .and_then(|addr| self.inputs.strings.get(&addr))
+                    .is_some_and(|known| known == text)
+            }
             (CExpr::Var(left), CExpr::Var(right)) => {
                 if self.visible_names_share_stack_slot(left, right) {
                     return true;
@@ -6921,6 +7503,15 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    fn literal_addr_for_expr(expr: &CExpr) -> Option<u64> {
+        match expr {
+            CExpr::UIntLit(value) => Some(*value),
+            CExpr::IntLit(value) => u64::try_from(*value).ok(),
+            CExpr::Cast { expr, .. } | CExpr::Paren(expr) => Self::literal_addr_for_expr(expr),
+            _ => None,
+        }
+    }
+
     fn normalized_call_owner_definition_var_arg(&self, name: &str) -> String {
         let mut normalized = if Self::is_opaque_public_call_arg_name(name) {
             Self::opaque_public_call_arg_display_name(name)
@@ -6947,152 +7538,30 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    pub(crate) fn source_call_for_call_expr(&self, expr: &CExpr) -> Option<(u64, usize)> {
-        let CExpr::Call { .. } = expr else {
-            return None;
+    fn canonicalize_call_expr_for_source_call(
+        &self,
+        source_call: (u64, usize),
+        expr: CExpr,
+    ) -> CExpr {
+        let CExpr::Call { func, args } = expr else {
+            return expr;
         };
-
-        self.unique_call_expr_source(expr)
+        let func = self
+            .resolved_callee_identity_expr_for_site(source_call.0, source_call.1)
+            .unwrap_or(*func);
+        CExpr::call(func, args)
     }
 
-    fn unique_call_expr_source(&self, expr: &CExpr) -> Option<(u64, usize)> {
-        let sources = self.call_expr_source_candidates(expr);
-        let mut iter = sources.into_iter();
-        let source = iter.next()?;
-        iter.next().is_none().then_some(source)
-    }
-
-    fn call_expr_source_candidates(&self, expr: &CExpr) -> BTreeSet<(u64, usize)> {
-        let mut sources = BTreeSet::new();
-        let cache_key = call_expr_cache_key(expr);
-        if let Some(key_sources) = self.ownership().sources_for_call_expr_key(&cache_key) {
-            sources.extend(
-                key_sources
-                    .iter()
-                    .map(|source| (source.block_addr, source.op_idx)),
-            );
-        }
-
-        sources.extend(self.call_result_exprs_map().iter().filter_map(
-            |(source_call, candidate)| {
-                self.raw_call_exprs_match_for_owner_definition(candidate, expr)
-                    .then_some(*source_call)
-            },
-        ));
-
-        sources.extend(self.call_result_aliases_map().iter().filter_map(
-            |(source_call, aliases)| {
-                aliases
-                    .iter()
-                    .any(|alias| {
-                        self.direct_definition_expr(alias)
-                            .or_else(|| self.lookup_definition_raw(alias))
-                            .or_else(|| self.lookup_definition(alias))
-                            .as_ref()
-                            .is_some_and(|candidate| {
-                                self.raw_call_exprs_match_for_owner_definition(candidate, expr)
-                            })
-                    })
-                    .then_some(*source_call)
-            },
-        ));
-
-        sources.extend(
-            self.call_result_aliases_map()
-                .keys()
-                .filter_map(|source_call| {
-                    self.synthesized_call_expr_for_source_call(*source_call)
-                        .filter(|candidate| {
-                            self.raw_call_exprs_match_for_owner_definition(candidate, expr)
-                        })
-                        .map(|_| *source_call)
-                }),
-        );
-
-        sources
-    }
-
-    fn source_call_for_loose_internal_call_expr(&self, expr: &CExpr) -> Option<(u64, usize)> {
-        let CExpr::Call { .. } = expr else {
-            return None;
-        };
-        self.call_result_exprs_map()
-            .iter()
-            .find_map(|(source_call, candidate)| {
-                (self.source_call_allows_return_register_owner(*source_call)
-                    && self.loose_internal_call_exprs_match(candidate, expr))
-                .then_some(*source_call)
-            })
-    }
-
-    fn loose_internal_call_exprs_match(&self, candidate: &CExpr, expr: &CExpr) -> bool {
-        match (candidate, expr) {
-            (
-                CExpr::Call {
-                    func: candidate_func,
-                    args: candidate_args,
-                },
-                CExpr::Call { func, args },
-            ) => {
-                if self.call_target_identity(candidate_func.as_ref())
-                    != self.call_target_identity(func.as_ref())
-                    || candidate_args.len() != args.len()
-                {
-                    return false;
-                }
-
-                let mut stable_arg_matches = 0usize;
-                for (left, right) in candidate_args.iter().zip(args.iter()) {
-                    if self.call_owner_definition_args_match(left, right) {
-                        stable_arg_matches += 1;
-                        continue;
-                    }
-                    if !Self::unstable_internal_call_arg_pair(left, right) {
-                        return false;
-                    }
-                }
-
-                stable_arg_matches >= candidate_args.len().min(2)
-            }
-            _ => false,
-        }
-    }
-
-    fn unstable_internal_call_arg_pair(left: &CExpr, right: &CExpr) -> bool {
-        (Self::opaque_internal_call_arg(left) && Self::opaque_internal_call_arg(right))
-            || (Self::class_std_call_arg(left) && Self::zero_call_arg(right))
-            || (Self::zero_call_arg(left) && Self::class_std_call_arg(right))
-    }
-
-    fn opaque_internal_call_arg(expr: &CExpr) -> bool {
-        match expr {
-            CExpr::Var(name) => {
-                let lower = name.to_ascii_lowercase();
-                Self::is_opaque_public_call_arg_name(&lower)
-                    || lower.starts_with("unk_")
-                    || lower.starts_with("value_")
-            }
-            CExpr::Cast { expr, .. } | CExpr::Paren(expr) => Self::opaque_internal_call_arg(expr),
-            _ => false,
-        }
-    }
-
-    fn class_std_call_arg(expr: &CExpr) -> bool {
-        match expr {
-            CExpr::Member { base, member } if member.eq_ignore_ascii_case("std") => {
-                matches!(base.as_ref(), CExpr::Var(name) if name.eq_ignore_ascii_case("class"))
-            }
-            CExpr::Cast { expr, .. } | CExpr::Paren(expr) => Self::class_std_call_arg(expr),
-            _ => false,
-        }
-    }
-
-    fn zero_call_arg(expr: &CExpr) -> bool {
-        match expr {
-            CExpr::IntLit(0) | CExpr::UIntLit(0) => true,
-            CExpr::Cast { expr, .. } | CExpr::Paren(expr) => Self::zero_call_arg(expr),
-            _ => false,
-        }
+    fn normalize_call_expr_for_source_call(
+        &self,
+        source_call: (u64, usize),
+        expr: CExpr,
+        context: FinalExprNormalizeContext,
+    ) -> CExpr {
+        self.normalize_final_call_expr_in_scope(
+            self.canonicalize_call_expr_for_source_call(source_call, expr),
+            FinalExprNormalizeScope::for_source_call(context, source_call),
+        )
     }
 
     fn source_call_for_compare_temp_expr(&self, expr: &CExpr) -> Option<(u64, usize)> {
@@ -7100,7 +7569,7 @@ impl<'a> FoldingContext<'a> {
             CExpr::Var(name) => self
                 .call_result_source_for_ssa_name(name)
                 .or_else(|| self.local_post_call_source_for_ssa_name(name)),
-            CExpr::Call { .. } => self.source_call_for_call_expr(expr),
+            CExpr::Call { .. } => None,
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
                 self.source_call_for_compare_temp_expr(inner)
             }
@@ -7152,11 +7621,11 @@ impl<'a> FoldingContext<'a> {
                 }
                 _ => None,
             })?;
-        let rhs =
-            self.truncate_root_non_variadic_call_expr(self.normalize_final_call_expr_in_context(
-                call_expr,
-                FinalExprNormalizeContext::DefinitionRoot,
-            ));
+        let rhs = self.normalize_call_expr_for_source_call(
+            source_call,
+            call_expr,
+            FinalExprNormalizeContext::DefinitionRoot,
+        );
         Some(CExpr::assign(CExpr::Var(owner_name), rhs))
     }
 
@@ -7184,10 +7653,15 @@ impl<'a> FoldingContext<'a> {
                 return self.recovered_owned_call_result_definition_rhs(lhs_name, inner);
             }
             CExpr::Call { .. } => {
-                let owner = self.stable_owned_call_result_expr_for_call_expr(original_rhs)?;
+                let source_call = self
+                    .call_result_source_for_ssa_name(lhs_name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(lhs_name))
+                    .or_else(|| self.source_call_for_visible_owner_name(lhs_name))?;
+                let owner = self.stable_owned_call_result_expr_for_source(source_call)?;
                 match owner {
                     CExpr::Var(owner_name) if owner_name.eq_ignore_ascii_case(lhs_name) => {
-                        return Some(self.normalize_final_call_expr_in_context(
+                        return Some(self.normalize_call_expr_for_source_call(
+                            source_call,
                             original_rhs.clone(),
                             FinalExprNormalizeContext::DefinitionRoot,
                         ));
@@ -7204,7 +7678,8 @@ impl<'a> FoldingContext<'a> {
         }
 
         if let Some(expr) = self.call_result_exprs_map().get(&source_call) {
-            return Some(self.normalize_final_call_expr_in_context(
+            return Some(self.normalize_call_expr_for_source_call(
+                source_call,
                 expr.clone(),
                 FinalExprNormalizeContext::DefinitionRoot,
             ));
@@ -7220,7 +7695,8 @@ impl<'a> FoldingContext<'a> {
                     .or_else(|| self.lookup_definition_raw(alias))
                     .or_else(|| self.lookup_definition(alias))?;
                 matches!(definition, CExpr::Call { .. }).then_some(
-                    self.normalize_final_call_expr_in_context(
+                    self.normalize_call_expr_for_source_call(
+                        source_call,
                         definition,
                         FinalExprNormalizeContext::DefinitionRoot,
                     ),
@@ -7286,34 +7762,6 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
-    fn call_result_source_for_matching_call_definition_name(
-        &self,
-        name: &str,
-    ) -> Option<(u64, usize)> {
-        self.direct_definition_expr(name)
-            .or_else(|| self.lookup_definition_raw(name))
-            .and_then(|definition| {
-                let cache_key = call_expr_cache_key(&definition);
-                let mut sources = BTreeSet::new();
-                if let Some(key_sources) = self.ownership().sources_for_call_expr_key(&cache_key) {
-                    sources.extend(
-                        key_sources
-                            .iter()
-                            .map(|source| (source.block_addr, source.op_idx)),
-                    );
-                }
-                sources.extend(self.call_result_exprs_map().iter().filter_map(
-                    |(source_call, candidate)| {
-                        self.raw_call_exprs_match_for_owner_definition(candidate, &definition)
-                            .then_some(*source_call)
-                    },
-                ));
-                let mut iter = sources.into_iter();
-                let source = iter.next()?;
-                iter.next().is_none().then_some(source)
-            })
-    }
-
     pub(super) fn local_post_call_source_for_ssa_name(
         &self,
         ssa_name: &str,
@@ -7327,7 +7775,7 @@ impl<'a> FoldingContext<'a> {
         self.local_post_call_source_for_ssa_name_in_block(block, ssa_name, 0)
     }
 
-    fn local_post_call_source_for_ssa_name_in_block(
+    pub(super) fn local_post_call_source_for_ssa_name_in_block(
         &self,
         block: &SSABlock,
         ssa_name: &str,
@@ -7405,16 +7853,10 @@ impl<'a> FoldingContext<'a> {
         let source_call = self
             .call_result_source_for_ssa_name(name)
             .or_else(|| self.local_post_call_source_for_ssa_name(name))
-            .or_else(|| self.call_result_source_for_matching_call_definition_name(name))
             .or_else(|| {
                 (!resolved_name.eq_ignore_ascii_case(name)).then(|| {
                     self.call_result_source_for_ssa_name(&resolved_name)
                         .or_else(|| self.local_post_call_source_for_ssa_name(&resolved_name))
-                        .or_else(|| {
-                            self.call_result_source_for_matching_call_definition_name(
-                                &resolved_name,
-                            )
-                        })
                 })?
             })?;
         let owner = self.stable_owned_call_result_expr_for_source(source_call)?;
@@ -7442,7 +7884,12 @@ impl<'a> FoldingContext<'a> {
                 .forwarded_value_for_name(&resolved_name)
                 .and_then(|prov| prov.stack_slot)
                 .is_some();
-        if !is_direct_alias && !has_stack_owner_provenance {
+        let owner_has_named_stack_provenance =
+            self.stack_slot_provenance_for_name(owner_name).is_some()
+                || self
+                    .stack_offset_for_visible_storage_name(owner_name)
+                    .is_some();
+        if !is_direct_alias && !has_stack_owner_provenance && !owner_has_named_stack_provenance {
             return None;
         }
         if owner_name.eq_ignore_ascii_case(name) || owner_name.eq_ignore_ascii_case(&resolved_name)
@@ -7453,6 +7900,47 @@ impl<'a> FoldingContext<'a> {
             return None;
         }
         Some(owner)
+    }
+
+    fn preserved_owned_call_result_var_for_name(&self, name: &str) -> Option<CExpr> {
+        let rendered_name = self.rendered_visible_name_for_ssa_name(name);
+        let source_call = self
+            .call_result_source_for_ssa_name(name)
+            .or_else(|| self.local_post_call_source_for_ssa_name(name))
+            .or_else(|| self.source_call_for_visible_owner_name(name))
+            .or_else(|| self.source_call_for_visible_owner_name(&rendered_name))?;
+        let owner_name = self.stable_owned_call_result_name_for_source(source_call)?;
+        (owner_name.eq_ignore_ascii_case(name) || owner_name.eq_ignore_ascii_case(&rendered_name))
+            .then_some(CExpr::Var(owner_name))
+    }
+
+    pub(super) fn predicate_owned_call_result_expr_for_source(
+        &self,
+        source_call: (u64, usize),
+    ) -> Option<CExpr> {
+        let owner = self
+            .stable_owned_call_result_name_for_source(source_call)
+            .map(CExpr::Var)
+            .or_else(|| self.stable_owned_call_result_expr_for_source(source_call))?;
+        let CExpr::Var(owner_name) = owner else {
+            return None;
+        };
+        (!is_generic_arg_name(&owner_name)
+            && !self.inputs.arch.is_return_register_name(&owner_name)
+            && !self.is_low_signal_visible_name(&owner_name)
+            && !self.is_transient_visible_name(&owner_name)
+            && !owner_name.ends_with("_home")
+            && !owner_name.starts_with("var_")
+            && !owner_name.starts_with("local_")
+            && !owner_name.starts_with("stack_")
+            && !owner_name.starts_with("arg_"))
+        .then_some(CExpr::Var(owner_name))
+    }
+
+    pub(super) fn predicate_owned_call_result_expr_for_name(&self, name: &str) -> Option<CExpr> {
+        self.call_result_source_for_ssa_name(name)
+            .or_else(|| self.local_post_call_source_for_ssa_name(name))
+            .and_then(|source| self.predicate_owned_call_result_expr_for_source(source))
     }
 
     fn semantic_stack_owner_name_for_alias(&self, alias: &str) -> Option<String> {
@@ -7481,27 +7969,12 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn should_suppress_shadow_call_result_assignment(&self, dst: &SSAVar) -> bool {
-        let source_call = match self
-            .call_result_source_for_ssa_name(&dst.display_name())
-            .or_else(|| {
-                self.call_result_source_for_matching_call_definition_name(&dst.display_name())
-            }) {
+        let source_call = match self.call_result_source_for_ssa_name(&dst.display_name()) {
             Some(source_call) => source_call,
             None => return false,
         };
         let rendered = self.var_name(dst);
-        let owner_name = self
-            .stable_owned_call_result_name_for_source(source_call)
-            .or_else(|| {
-                self.call_result_aliases_map()
-                    .get(&source_call)
-                    .and_then(|aliases| {
-                        self.fallback_owned_call_result_stack_local_name_for_source(
-                            source_call,
-                            aliases,
-                        )
-                    })
-            });
+        let owner_name = self.stable_owned_call_result_name_for_source(source_call);
         let Some(owner_name) = owner_name else {
             return self
                 .direct_call_result_aliases_set()
@@ -8035,13 +8508,32 @@ impl<'a> FoldingContext<'a> {
 
     fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
         match expr {
-            CExpr::Var(name) => self.lookup_type_hint(name).cloned(),
+            CExpr::Var(name) => self.lookup_type_hint(name).cloned().or_else(|| {
+                self.find_ssa_name_for_rendered_alias(name)
+                    .and_then(|ssa_name| self.guess_ssa_var_from_name(&ssa_name))
+                    .and_then(|var| self.type_hint_for_var(&var))
+            }),
             CExpr::Call { func, .. } => self
                 .known_signature_for_callee_expr(func)
                 .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
             CExpr::Cast { ty, .. } => Some(ty.clone()),
             CExpr::Paren(inner) => self.expr_type_hint(inner),
             _ => None,
+        }
+    }
+
+    fn expr_type_hint_for_source_call(
+        &self,
+        source_call: (u64, usize),
+        expr: &CExpr,
+    ) -> Option<CType> {
+        match expr {
+            CExpr::Call { .. } => self
+                .known_signature_for_site(source_call.0, source_call.1)
+                .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
+            CExpr::Cast { ty, .. } => Some(ty.clone()),
+            CExpr::Paren(inner) => self.expr_type_hint_for_source_call(source_call, inner),
+            _ => self.expr_type_hint(expr),
         }
     }
 
@@ -8325,20 +8817,7 @@ impl<'a> FoldingContext<'a> {
         if delta == 0 {
             return CExpr::Var(lhs_name.clone());
         }
-        let max_delta = self
-            .lookup_type_hint(lhs_name)
-            .and_then(|ty| c_type_size_bytes(ty, self.inputs.arch.ptr_size))
-            .unwrap_or(1)
-            .max(1);
-        if delta.unsigned_abs() > max_delta {
-            return rhs;
-        }
-        let op = if delta < 0 {
-            BinaryOp::Sub
-        } else {
-            BinaryOp::Add
-        };
-        CExpr::binary(op, CExpr::Var(lhs_name.clone()), CExpr::IntLit(delta.abs()))
+        rhs
     }
 
     fn producer_for_value(&self, value: &SSAVar) -> Option<&SSAOp> {
@@ -8708,13 +9187,51 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn normalize_final_return_candidate(&self, expr: CExpr) -> CExpr {
+        if self.is_certified_rendered_call_expr(&expr) {
+            return self
+                .stable_owner_for_certified_rendered_call_expr(&expr)
+                .unwrap_or(expr);
+        }
         let rewritten = self.rewrite_stack_expr(expr);
+        if self.is_certified_rendered_call_expr(&rewritten) {
+            return self
+                .stable_owner_for_certified_rendered_call_expr(&rewritten)
+                .unwrap_or(rewritten);
+        }
         let mut semantic_visited = HashSet::new();
         let semanticized = self.semanticize_visible_expr(&rewritten, 0, &mut semantic_visited);
         if self.is_predicate_like_expr(&semanticized) {
             self.simplify_condition_expr(semanticized)
         } else {
             semanticized
+        }
+    }
+
+    fn is_certified_rendered_call_expr(&self, expr: &CExpr) -> bool {
+        self.certified_source_for_rendered_call_expr(expr, None)
+            .is_some()
+    }
+
+    pub(super) fn stable_owner_for_certified_rendered_call_expr(
+        &self,
+        expr: &CExpr,
+    ) -> Option<CExpr> {
+        let source = self.certified_source_for_rendered_call_expr(expr, None)?;
+        let owner = self.stable_owned_call_result_expr_for_source(source)?;
+        match &owner {
+            CExpr::Var(name)
+                if !self
+                    .inputs
+                    .arch
+                    .is_return_register_name(&name.to_ascii_lowercase())
+                    && !self.is_transient_visible_name(name)
+                    && !self.is_low_signal_visible_name(name)
+                    && !is_generic_stack_placeholder_alias(name) =>
+            {
+                Some(owner)
+            }
+            CExpr::Var(_) => None,
+            _ => Some(owner),
         }
     }
 
@@ -8870,6 +9387,14 @@ impl<'a> FoldingContext<'a> {
                 visited.remove(&visit_key);
                 return self.direct_definition_expr(name);
             }
+        }
+
+        if let Some(owner) = self.preserved_owned_call_result_var_for_name(name) {
+            visited.remove(&visit_key);
+            self.definition_lookup_in_progress
+                .borrow_mut()
+                .remove(&in_progress_key);
+            return Some(owner);
         }
 
         let mut best = self.value_id_for_name(name).and_then(|value_id| {
@@ -9244,6 +9769,11 @@ impl<'a> FoldingContext<'a> {
                 if self.should_preserve_owned_call_result_visible_name(name) {
                     return expr.clone();
                 }
+                if let Some(owner) = self.stable_owned_call_result_expr_for_name(name, true)
+                    && !matches!(&owner, CExpr::Var(owner_name) if owner_name.eq_ignore_ascii_case(name))
+                {
+                    return owner;
+                }
                 if let Some(semantic) = self
                     .render_semantic_value_by_name(name, depth + 1, visited)
                     .map(|candidate| {
@@ -9363,11 +9893,34 @@ impl<'a> FoldingContext<'a> {
                 *op,
                 self.semanticize_visible_expr(operand, depth + 1, visited),
             ),
-            CExpr::Binary { op, left, right } => CExpr::binary(
-                *op,
-                self.semanticize_visible_expr(left, depth + 1, visited),
-                self.semanticize_visible_expr(right, depth + 1, visited),
-            ),
+            CExpr::Binary { op, left, right } => {
+                if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr)
+                    && let (Some(left_source), Some(right_source)) = (
+                        self.call_result_source_for_idempotent_operand(left),
+                        self.call_result_source_for_idempotent_operand(right),
+                    )
+                    && left_source == right_source
+                    && let Some(call_expr) = self
+                        .call_result_exprs_map()
+                        .get(&left_source)
+                        .cloned()
+                        .map(|expr| {
+                            self.normalize_call_expr_for_source_call(
+                                left_source,
+                                expr,
+                                FinalExprNormalizeContext::Generic,
+                            )
+                        })
+                        .or_else(|| self.synthesized_call_expr_for_source_call(left_source))
+                {
+                    return call_expr;
+                }
+                CExpr::binary(
+                    *op,
+                    self.semanticize_visible_expr(left, depth + 1, visited),
+                    self.semanticize_visible_expr(right, depth + 1, visited),
+                )
+            }
             CExpr::Ternary {
                 cond,
                 then_expr,
@@ -9481,6 +10034,18 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn debug_semanticize_visible_expr(&self, expr: &CExpr) -> CExpr {
         let mut visited = HashSet::new();
         self.semanticize_visible_expr(expr, 0, &mut visited)
+    }
+
+    fn call_result_source_for_idempotent_operand(&self, expr: &CExpr) -> Option<(u64, usize)> {
+        match expr {
+            CExpr::Var(name) => self
+                .call_result_source_for_ssa_name(name)
+                .or_else(|| self.local_post_call_source_for_ssa_name(name)),
+            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
+                self.call_result_source_for_idempotent_operand(inner)
+            }
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -9692,30 +10257,61 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn resolve_literalish_call_arg_expr(&self, expr: &CExpr) -> Option<CExpr> {
+        let mut visited = HashSet::new();
+        self.resolve_literalish_call_arg_expr_with_visited(expr, &mut visited)
+    }
+
+    fn resolve_literalish_call_arg_expr_with_visited(
+        &self,
+        expr: &CExpr,
+        visited: &mut HashSet<String>,
+    ) -> Option<CExpr> {
         if let CExpr::Var(name) = expr {
-            if let Some(resolved) = self.resolve_literalish_rendered_alias_expr(name) {
+            let visit_key = format!("rendered:{}", name.to_ascii_lowercase());
+            if !visited.insert(visit_key.clone()) {
+                return None;
+            }
+
+            if let Some(resolved) =
+                self.resolve_literalish_rendered_alias_expr_with_visited(name, visited)
+            {
+                visited.remove(&visit_key);
                 return Some(resolved);
             }
 
             if let Some(ssa_name) = self.find_ssa_name_for_rendered_alias(name)
                 && ssa_name != *name
-                && let Some(def) = self
-                    .lookup_definition_raw(&ssa_name)
-                    .or_else(|| self.best_visible_definition(&ssa_name))
-                && def != *expr
-                && let Some(resolved) = self.resolve_literalish_call_arg_expr(&def)
             {
-                return Some(resolved);
+                let ssa_key = format!("ssa:{}", ssa_name.to_ascii_lowercase());
+                if visited.insert(ssa_key.clone()) {
+                    let resolved = if let Some(def) = self
+                        .lookup_definition_raw(&ssa_name)
+                        .or_else(|| self.best_visible_definition(&ssa_name))
+                        && def != *expr
+                    {
+                        self.resolve_literalish_call_arg_expr_with_visited(&def, visited)
+                    } else {
+                        None
+                    };
+                    visited.remove(&ssa_key);
+                    if let Some(resolved) = resolved {
+                        visited.remove(&visit_key);
+                        return Some(resolved);
+                    }
+                }
             }
 
             if let Some(def) = self
                 .lookup_definition_raw(name)
                 .or_else(|| self.best_visible_definition(name))
                 && def != *expr
-                && let Some(resolved) = self.resolve_literalish_call_arg_expr(&def)
+                && let Some(resolved) =
+                    self.resolve_literalish_call_arg_expr_with_visited(&def, visited)
             {
+                visited.remove(&visit_key);
                 return Some(resolved);
             }
+            visited.remove(&visit_key);
         }
 
         let direct_addr = self.evaluate_constish_call_arg_expr(expr, 0);
@@ -9728,7 +10324,16 @@ impl<'a> FoldingContext<'a> {
         self.literalish_call_arg_expr_for_addr(alt_addr)
     }
 
-    fn resolve_literalish_rendered_alias_expr(&self, name: &str) -> Option<CExpr> {
+    fn resolve_literalish_rendered_alias_expr_with_visited(
+        &self,
+        name: &str,
+        visited: &mut HashSet<String>,
+    ) -> Option<CExpr> {
+        let alias_key = format!("alias:{}", name.to_ascii_lowercase());
+        if !visited.insert(alias_key.clone()) {
+            return None;
+        }
+
         let mut matches = self
             .var_aliases_map()
             .iter()
@@ -9749,15 +10354,26 @@ impl<'a> FoldingContext<'a> {
         matches.dedup();
 
         for ssa_name in matches {
-            if let Some(def) = self
+            let ssa_key = format!("ssa:{}", ssa_name.to_ascii_lowercase());
+            if !visited.insert(ssa_key.clone()) {
+                continue;
+            }
+            let resolved = if let Some(def) = self
                 .lookup_definition_raw(&ssa_name)
                 .or_else(|| self.best_visible_definition(&ssa_name))
-                && let Some(resolved) = self.resolve_literalish_call_arg_expr(&def)
             {
-                return Some(resolved);
+                self.resolve_literalish_call_arg_expr_with_visited(&def, visited)
+            } else {
+                None
+            };
+            visited.remove(&ssa_key);
+            if resolved.is_some() {
+                visited.remove(&alias_key);
+                return resolved;
             }
         }
 
+        visited.remove(&alias_key);
         None
     }
 
@@ -10004,19 +10620,16 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    #[cfg(test)]
     fn is_imported_call_target(&self, callee: &CExpr) -> bool {
-        self.callee_identity_for_expr(callee)
-            .is_some_and(|identity| identity.is_imported_name_hint())
+        self.resolved_callee_target_for_optional_site(None, callee)
+            .is_some_and(|target| target.policy.imported)
     }
 
-    fn is_imported_call_target_for_site(
-        &self,
-        block_addr: u64,
-        op_idx: usize,
-        callee: &CExpr,
-    ) -> bool {
-        self.callee_identity_for_callsite_or_expr(block_addr, op_idx, callee)
-            .is_some_and(|identity| identity.is_imported_name_hint())
+    #[cfg(test)]
+    fn is_imported_call_target_for_site(&self, block_addr: u64, op_idx: usize) -> bool {
+        self.resolved_callee_target_for_site(block_addr, op_idx)
+            .is_some_and(|target| target.policy.imported)
     }
 
     fn call_arg_contains_stack_placeholder(&self, expr: &CExpr, depth: u32) -> bool {
@@ -10541,13 +11154,10 @@ impl<'a> FoldingContext<'a> {
             },
             CExpr::Call { func, args } => {
                 let resolved_func = self.resolve_imported_call_arg_expr(func, depth + 1, visited);
-                let mut resolved_args = args
+                let resolved_args = args
                     .iter()
                     .map(|arg| self.resolve_imported_call_arg_expr(arg, depth + 1, visited))
                     .collect::<Vec<_>>();
-                if let Some(max_arity) = self.non_variadic_call_arity(&resolved_func) {
-                    resolved_args.truncate(max_arity);
-                }
                 CExpr::Call {
                     func: Box::new(resolved_func),
                     args: resolved_args,
@@ -10825,8 +11435,17 @@ impl<'a> FoldingContext<'a> {
         best
     }
 
+    #[cfg(test)]
     pub(super) fn normalize_call_arg_expr_for_callee(&self, callee: &CExpr, expr: CExpr) -> CExpr {
         let imported = self.is_imported_call_target(callee);
+        self.normalize_call_arg_expr_with_import_policy(expr, imported)
+    }
+
+    pub(super) fn normalize_call_arg_expr_with_import_policy(
+        &self,
+        expr: CExpr,
+        imported: bool,
+    ) -> CExpr {
         let raw = expr.clone();
         let rewritten = self.rewrite_stack_expr(expr);
         let initial = if imported {
@@ -10905,6 +11524,33 @@ impl<'a> FoldingContext<'a> {
         self.sanitize_public_expr(expr, PublicExprSanitizeMode::CallArg)
     }
 
+    fn proven_source_for_public_call_arg_call(&self, expr: &CExpr) -> Option<(u64, usize)> {
+        self.requires_certified_rendering()
+            .then(|| self.certified_source_for_rendered_call_expr(expr, None))
+            .flatten()
+    }
+
+    fn sanitize_public_call_arg_call_expr(&self, expr: CExpr) -> CExpr {
+        let Some(source_call) = self.proven_source_for_public_call_arg_call(&expr) else {
+            return Self::unresolved_call_arg_expr();
+        };
+        let normalized = self.normalize_call_expr_for_source_call(
+            source_call,
+            expr,
+            FinalExprNormalizeContext::DefinitionRoot,
+        );
+        let CExpr::Call { func, args } = normalized else {
+            return self.sanitize_public_expr(normalized, PublicExprSanitizeMode::CallArg);
+        };
+        CExpr::Call {
+            func: Box::new(self.sanitize_public_expr(*func, PublicExprSanitizeMode::Generic)),
+            args: args
+                .into_iter()
+                .map(|arg| self.sanitize_public_expr(arg, PublicExprSanitizeMode::CallArg))
+                .collect(),
+        }
+    }
+
     fn sanitize_public_expr(&self, expr: CExpr, mode: PublicExprSanitizeMode) -> CExpr {
         match expr {
             CExpr::Var(name) if Self::is_opaque_public_call_arg_name(&name) => {
@@ -10913,7 +11559,15 @@ impl<'a> FoldingContext<'a> {
             CExpr::Var(name) if matches!(mode, PublicExprSanitizeMode::CallArg) => self
                 .canonical_stack_owner_display_name(&name)
                 .map(CExpr::Var)
-                .unwrap_or(CExpr::Var(name)),
+                .unwrap_or_else(|| {
+                    if self.is_raw_register_public_call_arg_name(&name)
+                        || self.is_transient_visible_name(&name)
+                    {
+                        Self::unresolved_call_arg_expr()
+                    } else {
+                        CExpr::Var(name)
+                    }
+                }),
             CExpr::Deref(inner) => CExpr::Deref(Box::new(self.sanitize_public_expr(*inner, mode))),
             CExpr::AddrOf(inner) => {
                 CExpr::AddrOf(Box::new(self.sanitize_public_expr(*inner, mode)))
@@ -10930,15 +11584,19 @@ impl<'a> FoldingContext<'a> {
             CExpr::Sizeof(inner) => {
                 CExpr::Sizeof(Box::new(self.sanitize_public_expr(*inner, mode)))
             }
-            CExpr::Binary { op, left, right } => CExpr::Binary {
-                op,
-                left: Box::new(self.sanitize_public_expr(*left, mode)),
-                right: Box::new(self.sanitize_public_expr(*right, mode)),
-            },
-            CExpr::Subscript { base, index } => CExpr::Subscript {
-                base: Box::new(self.sanitize_public_expr(*base, mode)),
-                index: Box::new(self.sanitize_public_expr(*index, mode)),
-            },
+            CExpr::Binary { op, left, right } => {
+                let left = self.sanitize_public_expr(*left, mode);
+                let right = self.sanitize_public_expr(*right, mode);
+                self.identity_simplify_binary(op, left, right, None)
+            }
+            CExpr::Subscript { base, index } => {
+                let base = self.sanitize_public_expr(*base, mode);
+                let index = self.sanitize_public_expr(*index, mode);
+                self.rewrite_pointer_arithmetic_subscript(CExpr::Subscript {
+                    base: Box::new(base),
+                    index: Box::new(index),
+                })
+            }
             CExpr::Member { base, member } => CExpr::Member {
                 base: Box::new(self.sanitize_public_expr(*base, mode)),
                 member,
@@ -10947,6 +11605,9 @@ impl<'a> FoldingContext<'a> {
                 base: Box::new(self.sanitize_public_expr(*base, mode)),
                 member,
             },
+            CExpr::Call { func, args } if matches!(mode, PublicExprSanitizeMode::CallArg) => {
+                self.sanitize_public_call_arg_call_expr(CExpr::Call { func, args })
+            }
             CExpr::Call { func, args } => CExpr::Call {
                 func: Box::new(self.sanitize_public_expr(*func, PublicExprSanitizeMode::Generic)),
                 args: args
@@ -10976,6 +11637,16 @@ impl<'a> FoldingContext<'a> {
     fn is_opaque_public_call_arg_name(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         SSAVarNameKind::classify(&lower).is_temporary()
+    }
+
+    fn is_raw_register_public_call_arg_name(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        let base = lower
+            .rsplit_once('_')
+            .filter(|(_, version)| version.chars().all(|ch| ch.is_ascii_digit()))
+            .map(|(base, _)| base)
+            .unwrap_or(lower.as_str());
+        self.inputs.arch.is_register_like_base_name(base) && !Self::is_semantic_binding_name(base)
     }
 
     fn opaque_public_call_arg_display_name(name: &str) -> String {
@@ -11017,52 +11688,107 @@ impl<'a> FoldingContext<'a> {
         expr: CExpr,
         context: FinalExprNormalizeContext,
     ) -> CExpr {
+        self.normalize_final_call_expr_in_scope(expr, FinalExprNormalizeScope::new(context))
+    }
+
+    fn final_child_normalize_scope(
+        &self,
+        _expr: &CExpr,
+        context: FinalExprNormalizeContext,
+    ) -> FinalExprNormalizeScope {
+        FinalExprNormalizeScope {
+            context,
+            source_call: None,
+        }
+    }
+
+    fn normalize_final_call_expr_in_scope(
+        &self,
+        expr: CExpr,
+        scope: FinalExprNormalizeScope,
+    ) -> CExpr {
         match expr {
             CExpr::Binary {
                 op: BinaryOp::Assign,
                 left,
                 right,
-            } => CExpr::assign(
-                self.normalize_final_call_expr_in_context(
-                    *left,
-                    FinalExprNormalizeContext::Generic,
-                ),
-                self.normalize_final_call_expr_in_context(
-                    *right,
-                    FinalExprNormalizeContext::DefinitionRoot,
-                ),
-            ),
+            } => {
+                let left = *left;
+                let left_scope =
+                    self.final_child_normalize_scope(&left, FinalExprNormalizeContext::Generic);
+                let right = *right;
+                let right_scope = self
+                    .final_child_normalize_scope(&right, FinalExprNormalizeContext::DefinitionRoot);
+                CExpr::assign(
+                    self.normalize_final_call_expr_in_scope(left, left_scope),
+                    self.normalize_final_call_expr_in_scope(right, right_scope),
+                )
+            }
             CExpr::Call { func, args } => {
-                let func = self.normalize_final_call_expr_in_context(
-                    *func,
-                    FinalExprNormalizeContext::Generic,
-                );
-                let imported = self.is_imported_call_target(&func);
-                let mut args: Vec<CExpr> = if imported {
+                let func = scope
+                    .source_call
+                    .and_then(|(block_addr, op_idx)| {
+                        self.resolved_callee_identity_expr_for_site(block_addr, op_idx)
+                    })
+                    .unwrap_or(*func);
+                let func_scope =
+                    self.final_child_normalize_scope(&func, FinalExprNormalizeContext::Generic);
+                let func = self.normalize_final_call_expr_in_scope(func, func_scope);
+                let imported_or_modeled =
+                    self.imported_or_modeled_call_target_for_optional_site(scope.source_call);
+                let mut args: Vec<CExpr> = if imported_or_modeled {
                     args.into_iter()
                         .map(|arg| {
-                            let normalized = self.normalize_final_call_expr_in_context(
-                                arg,
+                            let original_param_home = match &arg {
+                                CExpr::Var(name) if self.is_static_param_home_alias_name(name) => {
+                                    Some(name.clone())
+                                }
+                                _ => None,
+                            };
+                            let arg_scope = self.final_child_normalize_scope(
+                                &arg,
                                 FinalExprNormalizeContext::Generic,
                             );
-                            self.normalize_imported_call_arg_expr(normalized, true, true, true)
+                            let normalized =
+                                self.normalize_final_call_expr_in_scope(arg, arg_scope);
+                            let normalized =
+                                self.normalize_imported_call_arg_expr(normalized, true, true, true);
+                            if let Some(name) = original_param_home
+                                && matches!(&normalized, CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(inner_name) if inner_name.eq_ignore_ascii_case(&name)))
+                            {
+                                return CExpr::Var(name);
+                            }
+                            normalized
                         })
                         .collect()
                 } else {
                     args.into_iter()
                         .map(|arg| {
-                            let normalized = self.normalize_final_call_expr_in_context(
-                                arg,
+                            let original_param_home = match &arg {
+                                CExpr::Var(name) if self.is_static_param_home_alias_name(name) => {
+                                    Some(name.clone())
+                                }
+                                _ => None,
+                            };
+                            let arg_scope = self.final_child_normalize_scope(
+                                &arg,
                                 FinalExprNormalizeContext::Generic,
                             );
-                            self.normalize_call_arg_expr_for_callee(&func, normalized)
+                            let normalized =
+                                self.normalize_final_call_expr_in_scope(arg, arg_scope);
+                            let normalized =
+                                self.normalize_call_arg_expr_with_import_policy(normalized, false);
+                            if let Some(name) = original_param_home
+                                && matches!(&normalized, CExpr::Deref(inner) if matches!(inner.as_ref(), CExpr::Var(inner_name) if inner_name.eq_ignore_ascii_case(&name)))
+                            {
+                                return CExpr::Var(name);
+                            }
+                            normalized
                         })
                         .collect()
                 };
-                if imported && let Some(max_arity) = self.non_variadic_call_arity(&func) {
-                    args.truncate(max_arity);
-                } else if imported
-                    && let Some(max_arity) = self.printf_literal_variadic_arity(&func, &args)
+                if let Some(max_arity) =
+                    self.non_variadic_call_arity_for_optional_site(scope.source_call)
                 {
                     args.truncate(max_arity);
                 }
@@ -11071,20 +11797,21 @@ impl<'a> FoldingContext<'a> {
                     args,
                 };
                 if !matches!(
-                    context,
+                    scope.context,
                     FinalExprNormalizeContext::DefinitionRoot
                         | FinalExprNormalizeContext::StatementRoot
-                ) && let Some(owner) = self.stable_owned_call_result_expr_for_call_expr(&call)
-                {
+                ) && let Some(owner) = scope.source_call.and_then(|source_call| {
+                    self.stable_owned_call_result_expr_for_source(source_call)
+                }) {
                     return owner;
                 }
                 call
             }
             CExpr::Deref(inner) => {
-                let inner = self.normalize_final_call_expr_in_context(
-                    *inner,
-                    FinalExprNormalizeContext::Generic,
-                );
+                let inner = *inner;
+                let inner_scope =
+                    self.final_child_normalize_scope(&inner, FinalExprNormalizeContext::Generic);
+                let inner = self.normalize_final_call_expr_in_scope(inner, inner_scope);
                 if let Some(addr) = self.normalized_addr_from_visible_expr(&inner, 0)
                     && let Some(access) =
                         self.render_access_expr_from_addr(&addr, 0, 0, &mut HashSet::new())
@@ -11094,31 +11821,61 @@ impl<'a> FoldingContext<'a> {
                 CExpr::Deref(Box::new(inner))
             }
             CExpr::Subscript { base, index } => {
-                let mut base = self.normalize_final_call_expr_in_context(
-                    *base,
-                    FinalExprNormalizeContext::Generic,
-                );
-                let mut index = self.normalize_final_call_expr_in_context(
-                    *index,
-                    FinalExprNormalizeContext::Generic,
-                );
+                let base = *base;
+                let base_scope =
+                    self.final_child_normalize_scope(&base, FinalExprNormalizeContext::Generic);
+                let mut base = self.normalize_final_call_expr_in_scope(base, base_scope);
+                let index = *index;
+                let index_scope =
+                    self.final_child_normalize_scope(&index, FinalExprNormalizeContext::Generic);
+                let mut index = self.normalize_final_call_expr_in_scope(index, index_scope);
                 if self.should_swap_indexed_access_base(&base, &index) {
                     std::mem::swap(&mut base, &mut index);
                 }
-                CExpr::Subscript {
+                self.rewrite_pointer_arithmetic_subscript(CExpr::Subscript {
                     base: Box::new(base),
                     index: Box::new(index),
-                }
+                })
             }
-            CExpr::Cast { ty, expr: inner } => CExpr::cast(
-                ty,
-                self.normalize_final_call_expr_in_context(*inner, context),
-            ),
-            CExpr::Paren(inner) => CExpr::Paren(Box::new(
-                self.normalize_final_call_expr_in_context(*inner, context),
-            )),
+            CExpr::Cast { ty, expr: inner } => {
+                let inner = *inner;
+                let inner_scope = FinalExprNormalizeScope {
+                    context: scope.context,
+                    source_call: scope.source_call,
+                };
+                CExpr::cast(
+                    ty,
+                    self.normalize_final_call_expr_in_scope(inner, inner_scope),
+                )
+            }
+            CExpr::Paren(inner) => {
+                let inner = *inner;
+                let inner_scope = FinalExprNormalizeScope {
+                    context: scope.context,
+                    source_call: scope.source_call,
+                };
+                CExpr::Paren(Box::new(
+                    self.normalize_final_call_expr_in_scope(inner, inner_scope),
+                ))
+            }
+            CExpr::Binary { op, left, right } => {
+                let left = *left;
+                let left_scope =
+                    self.final_child_normalize_scope(&left, FinalExprNormalizeContext::Generic);
+                let right = *right;
+                let right_scope =
+                    self.final_child_normalize_scope(&right, FinalExprNormalizeContext::Generic);
+                self.identity_simplify_binary(
+                    op,
+                    self.normalize_final_call_expr_in_scope(left, left_scope),
+                    self.normalize_final_call_expr_in_scope(right, right_scope),
+                    None,
+                )
+            }
             other => other.map_children(&mut |child| {
-                self.normalize_final_call_expr_in_context(child, FinalExprNormalizeContext::Generic)
+                let child_scope =
+                    self.final_child_normalize_scope(&child, FinalExprNormalizeContext::Generic);
+                self.normalize_final_call_expr_in_scope(child, child_scope)
             }),
         }
     }
@@ -11293,8 +12050,8 @@ impl<'a> FoldingContext<'a> {
                 {
                     rhs = self.normalize_final_return_expr_candidate(rhs);
                 }
-                rhs = self.truncate_root_non_variadic_call_expr(rhs);
-                CExpr::assign(*left, rhs)
+                let left = self.rewrite_top_level_param_home_subscript_index(*left);
+                CExpr::assign(left, rhs)
             }
             (normalized, _) => normalized,
         }
@@ -11303,19 +12060,8 @@ impl<'a> FoldingContext<'a> {
     fn normalize_final_return_expr_candidate(&self, expr: CExpr) -> CExpr {
         let normalized = self.normalize_final_call_expr(expr);
         let normalized = self.collapse_scalar_stack_addr_artifact(normalized);
-        let normalized = self.truncate_root_non_variadic_call_expr(normalized);
         let resolved = self.resolve_return_candidate(&normalized);
         self.sanitize_final_return_expr(resolved, normalized)
-    }
-
-    fn truncate_root_non_variadic_call_expr(&self, expr: CExpr) -> CExpr {
-        let CExpr::Call { func, mut args } = expr else {
-            return expr;
-        };
-        if let Some(max_arity) = self.non_variadic_call_arity(&func) {
-            args.truncate(max_arity);
-        }
-        CExpr::Call { func, args }
     }
 
     fn prune_redundant_assign_return_pairs(&self, stmts: Vec<CStmt>) -> Vec<CStmt> {
@@ -11508,13 +12254,20 @@ impl<'a> FoldingContext<'a> {
                             let mut visited = HashSet::new();
                             let raw = self.op_to_expr(op);
                             let expanded = self.expand_return_expr(&raw, 0, &mut visited);
-                            let mut semantic_visited = HashSet::new();
-                            let semanticized =
-                                self.semanticize_visible_expr(&expanded, 0, &mut semantic_visited);
-                            let final_expr = if self.is_predicate_like_expr(&semanticized) {
-                                self.simplify_condition_expr(semanticized)
+                            let final_expr = if self.is_certified_rendered_call_expr(&expanded) {
+                                expanded.clone()
                             } else {
-                                semanticized
+                                let mut semantic_visited = HashSet::new();
+                                let semanticized = self.semanticize_visible_expr(
+                                    &expanded,
+                                    0,
+                                    &mut semantic_visited,
+                                );
+                                if self.is_predicate_like_expr(&semanticized) {
+                                    self.simplify_condition_expr(semanticized)
+                                } else {
+                                    semanticized
+                                }
                             };
                             last_ret_value = Some(final_expr);
                             last_ret_value_op_idx = self
@@ -11826,6 +12579,37 @@ impl<'a> FoldingContext<'a> {
         false
     }
 
+    fn is_materialized_call_result_stack_home_store(&self, addr: &SSAVar, val: &SSAVar) -> bool {
+        let Some(offset) = self.stack_slot_offset_for_var(addr) else {
+            return false;
+        };
+        if offset >= 0 {
+            return false;
+        }
+        let val_name = val.display_name();
+        let Some(source_call) = self
+            .call_result_source_for_ssa_name(&val_name)
+            .or_else(|| self.local_post_call_source_for_ssa_name(&val_name))
+        else {
+            return false;
+        };
+        let Some(CExpr::Var(owner_name)) =
+            self.should_materialize_call_result_at_source(source_call)
+        else {
+            return false;
+        };
+        if self
+            .stack_offset_for_visible_storage_name(&owner_name)
+            .is_some_and(|owner_offset| owner_offset == offset)
+        {
+            return true;
+        }
+        self.resolve_stack_var(offset).is_some_and(|slot_name| {
+            owner_name.eq_ignore_ascii_case(&slot_name)
+                || self.visible_names_share_stack_slot(&owner_name, &slot_name)
+        })
+    }
+
     fn op_to_stmt_impl(&self, op: &SSAOp) -> Option<CStmt> {
         match op {
             SSAOp::Copy { dst, src } => {
@@ -11941,6 +12725,9 @@ impl<'a> FoldingContext<'a> {
                 if self.is_entry_arg_alias_store(addr, val) {
                     return None;
                 }
+                if self.is_materialized_call_result_stack_home_store(addr, val) {
+                    return None;
+                }
                 if self.requires_certified_rendering()
                     && self.certified_memory_access_for_current_op(true).is_none()
                 {
@@ -11975,7 +12762,8 @@ impl<'a> FoldingContext<'a> {
                         .get(&source_call)
                         .cloned()
                         .map(|expr| {
-                            self.normalize_final_call_expr_in_context(
+                            self.normalize_call_expr_for_source_call(
+                                source_call,
                                 expr,
                                 FinalExprNormalizeContext::DefinitionRoot,
                             )
@@ -11990,7 +12778,8 @@ impl<'a> FoldingContext<'a> {
                                         .or_else(|| self.lookup_definition_raw(alias))
                                         .filter(|expr| matches!(expr, CExpr::Call { .. }))
                                         .map(|expr| {
-                                            self.normalize_final_call_expr_in_context(
+                                            self.normalize_call_expr_for_source_call(
+                                                source_call,
                                                 expr,
                                                 FinalExprNormalizeContext::DefinitionRoot,
                                             )
@@ -12015,7 +12804,8 @@ impl<'a> FoldingContext<'a> {
                                 .or_else(|| self.lookup_definition_raw(&val.display_name()))
                                 .filter(|expr| matches!(expr, CExpr::Call { .. }))
                                 .map(|expr| {
-                                    self.normalize_final_call_expr_in_context(
+                                    self.normalize_call_expr_for_source_call(
+                                        source_call,
                                         expr,
                                         FinalExprNormalizeContext::DefinitionRoot,
                                     )
@@ -12339,14 +13129,23 @@ impl<'a> FoldingContext<'a> {
             SSAOp::Call { target } => {
                 // Note: Call arguments are handled by op_to_stmt_with_args().
                 // This fallback emits the call without args when called directly.
-                let func_expr = self.resolve_call_target(target);
+                let func_expr = match (self.current_block_addr.get(), self.current_op_idx.get()) {
+                    (Some(block_addr), Some(op_idx)) => {
+                        self.resolve_call_target_for_site(block_addr, op_idx, target)
+                    }
+                    _ => self.resolve_call_target(target),
+                };
                 let call = CExpr::call(func_expr, vec![]);
                 Some(CStmt::Expr(call))
             }
             SSAOp::CallInd { target } => {
                 // Note: Call arguments are handled by op_to_stmt_with_args().
-                let target_expr = self.get_expr(target);
-                let func_expr = CExpr::Deref(Box::new(target_expr));
+                let func_expr = match (self.current_block_addr.get(), self.current_op_idx.get()) {
+                    (Some(block_addr), Some(op_idx)) => self
+                        .resolved_callee_identity_expr_for_site(block_addr, op_idx)
+                        .unwrap_or_else(|| CExpr::Deref(Box::new(self.get_expr(target)))),
+                    _ => CExpr::Deref(Box::new(self.get_expr(target))),
+                };
                 let call = CExpr::call(func_expr, vec![]);
                 Some(CStmt::Expr(call))
             }
@@ -12438,6 +13237,30 @@ impl<'a> FoldingContext<'a> {
         operand_ty: Option<CType>,
     ) -> Option<CStmt> {
         let lhs = self.assignment_lhs_expr(dst);
+        if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr)
+            && let (Some(left_source), Some(right_source)) = (
+                self.call_result_source_for_ssa_name(&a.display_name())
+                    .or_else(|| self.local_post_call_source_for_ssa_name(&a.display_name())),
+                self.call_result_source_for_ssa_name(&b.display_name())
+                    .or_else(|| self.local_post_call_source_for_ssa_name(&b.display_name())),
+            )
+            && left_source == right_source
+            && let Some(call_expr) = self
+                .call_result_exprs_map()
+                .get(&left_source)
+                .cloned()
+                .map(|expr| {
+                    self.normalize_call_expr_for_source_call(
+                        left_source,
+                        expr,
+                        FinalExprNormalizeContext::DefinitionRoot,
+                    )
+                })
+                .or_else(|| self.synthesized_call_expr_for_source_call(left_source))
+        {
+            let rhs = self.assignment_rhs_with_type_policy(dst, None, call_expr);
+            return self.assign_stmt(lhs, rhs);
+        }
         let mut lhs_expr = self.get_expr(a);
         let mut rhs_expr = self.get_expr(b);
         if let Some(ty) = operand_ty {
@@ -12604,15 +13427,7 @@ fn const_value_may_equal(name: &str, expected: u64) -> bool {
     if parse_const_value(name) == Some(expected) {
         return true;
     }
-    let Some(raw) = name.strip_prefix("const:") else {
-        return false;
-    };
-    let raw = raw.split('_').next().unwrap_or(raw);
-    let raw = raw
-        .strip_prefix("0x")
-        .or_else(|| raw.strip_prefix("0X"))
-        .unwrap_or(raw);
-    u64::from_str_radix(raw, 16) == Ok(expected)
+    parse_address_from_var_name(name) == Some(expected)
 }
 
 fn push_linear_term(terms: &mut Vec<(CExpr, i64)>, term: CExpr, coeff: i64) -> Option<()> {
@@ -12664,12 +13479,7 @@ pub(crate) fn should_replace_preserved_stack_alias(existing: &str) -> bool {
 }
 
 pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
-    let normalized = existing.trim_start_matches('&');
-    normalized == "stack"
-        || normalized.starts_with("stack_")
-        || normalized == "slot"
-        || normalized.starts_with("slot_")
-        || normalized == "saved_fp"
+    analysis::utils::is_generic_stack_placeholder_alias(existing)
 }
 
 fn should_replace_preserved_stack_expr(existing: &CExpr, preserved: &CExpr) -> bool {
@@ -12712,70 +13522,6 @@ fn normalize_stack_definition_overrides(stack_info: &mut analysis::StackInfo) {
     }
 }
 
-fn call_expr_cache_key(expr: &CExpr) -> String {
-    match expr {
-        CExpr::Call { func, args } => {
-            let func_key = match func.as_ref() {
-                CExpr::Var(name) => normalize_callee_name(name),
-                other => call_expr_cache_key(other),
-            };
-            let arg_keys = args
-                .iter()
-                .map(call_expr_cache_key)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("call:{func_key}({arg_keys})")
-        }
-        CExpr::Var(name) => format!("var:{name}"),
-        CExpr::IntLit(value) => format!("i:{value}"),
-        CExpr::UIntLit(value) => format!("u:{value}"),
-        CExpr::FloatLit(value) => format!("f:{:x}", value.to_bits()),
-        CExpr::StringLit(value) => format!("s:{value:?}"),
-        CExpr::CharLit(value) => format!("c:{value:?}"),
-        CExpr::Unary { op, operand } => format!("uop:{op:?}({})", call_expr_cache_key(operand)),
-        CExpr::Binary { op, left, right } => format!(
-            "bop:{op:?}({},{})",
-            call_expr_cache_key(left),
-            call_expr_cache_key(right)
-        ),
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => format!(
-            "tern({},{},{})",
-            call_expr_cache_key(cond),
-            call_expr_cache_key(then_expr),
-            call_expr_cache_key(else_expr)
-        ),
-        CExpr::Cast { ty, expr } => format!("cast:{ty}({})", call_expr_cache_key(expr)),
-        CExpr::Subscript { base, index } => {
-            format!(
-                "sub({},{})",
-                call_expr_cache_key(base),
-                call_expr_cache_key(index)
-            )
-        }
-        CExpr::Member { base, member } => format!("mem:{}.{member}", call_expr_cache_key(base)),
-        CExpr::PtrMember { base, member } => {
-            format!("ptrmem:{}->{member}", call_expr_cache_key(base))
-        }
-        CExpr::Sizeof(inner) => format!("sizeof({})", call_expr_cache_key(inner)),
-        CExpr::SizeofType(ty) => format!("sizeof_ty:{ty}"),
-        CExpr::AddrOf(inner) => format!("addr({})", call_expr_cache_key(inner)),
-        CExpr::Deref(inner) => format!("deref({})", call_expr_cache_key(inner)),
-        CExpr::Comma(items) => format!(
-            "comma({})",
-            items
-                .iter()
-                .map(call_expr_cache_key)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        CExpr::Paren(inner) => format!("paren({})", call_expr_cache_key(inner)),
-    }
-}
-
 fn call_arg_callee_name(expr: &CExpr) -> Option<&str> {
     match expr {
         CExpr::Var(name) => Some(name.as_str()),
@@ -12785,36 +13531,6 @@ fn call_arg_callee_name(expr: &CExpr) -> Option<&str> {
         CExpr::Cast { expr: inner, .. } => call_arg_callee_name(inner),
         _ => None,
     }
-}
-
-/// Extract address from a call target name like "ram:401110_0" or "const:401110".
-fn extract_call_address(name: &str) -> Option<u64> {
-    // Try ram:address_version format (e.g., "ram:401110_0")
-    if let Some(rest) = name.strip_prefix("ram:") {
-        let addr_str = rest.split('_').next().unwrap_or(rest);
-        return u64::from_str_radix(addr_str, 16).ok();
-    }
-
-    // Try const:address format
-    if let Some(rest) = name.strip_prefix("const:") {
-        let addr_str = rest.split('_').next().unwrap_or(rest);
-        if let Some(dec) = addr_str
-            .strip_prefix("0d")
-            .or_else(|| addr_str.strip_prefix("0D"))
-        {
-            return dec.parse().ok();
-        }
-        if let Some(hex) = addr_str
-            .strip_prefix("0x")
-            .or_else(|| addr_str.strip_prefix("0X"))
-        {
-            return u64::from_str_radix(hex, 16).ok();
-        }
-        // Plain const payloads are interpreted as addresses in hex form.
-        return u64::from_str_radix(addr_str, 16).ok();
-    }
-
-    None
 }
 
 /// Check if a string looks like a hex number.

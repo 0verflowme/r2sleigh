@@ -561,10 +561,24 @@ pub fn native_worker_summary_applicability_for_summary(
 }
 
 pub fn function_semantic_summary_seed_for_name(
+    _id: InterprocFunctionId,
+    _name: &str,
+) -> Option<FunctionSemanticSummary> {
+    None
+}
+
+pub fn function_semantic_summary_seed_for_name_with_linkage(
     id: InterprocFunctionId,
     name: &str,
+    linkage: r2ssa::FunctionSemanticLinkage,
 ) -> Option<FunctionSemanticSummary> {
-    let normalized = normalize_semantic_summary_seed_name(name)?;
+    if linkage != r2ssa::FunctionSemanticLinkage::Imported {
+        return None;
+    }
+    let normalized = normalize_semantic_summary_seed_name(name)
+        .map(str::to_string)
+        .or_else(|| normalize_semantic_summary_name(name))?;
+    let normalized = normalized.as_str();
     let mut arg_effects = BTreeMap::new();
     let mut effect = |idx: usize, read: bool, write: bool, escape: bool, free: bool| {
         arg_effects.insert(
@@ -727,6 +741,7 @@ pub fn function_semantic_summary_seed_for_name(
     Some(FunctionSemanticSummary {
         id,
         name: Some(normalized.to_string()),
+        linkage,
         arg_count_hint: Some(match normalized {
             "malloc" | "free" | "strlen" | "puts" | "printf" | "exit" | "retain" | "release"
             | "lock" | "unlock" => 1,
@@ -5197,6 +5212,18 @@ fn summary_has_semantic_role_evidence(summary: &FunctionSemanticSummary) -> bool
         || !summary.atomic_effects.is_empty()
 }
 
+pub fn semantic_summary_has_modeled_evidence(summary: &FunctionSemanticSummary) -> bool {
+    summary_has_semantic_role_evidence(summary)
+}
+
+pub fn semantic_summary_has_runtime_copy_role(summary: &FunctionSemanticSummary) -> bool {
+    summary.transfer_effects.iter().any(|effect| {
+        matches!(effect.dst.region, SummaryMemoryRegion::Arg { index: 0 })
+            && matches!(effect.src.region, SummaryMemoryRegion::Arg { index: 1 })
+            && matches!(effect.len, SummaryTransferLength::Arg(2))
+    })
+}
+
 fn structural_worker_summaries_from_interproc_summary(
     anchor: u64,
     summary: &FunctionSemanticSummary,
@@ -8906,10 +8933,29 @@ mod tests {
     }
 
     #[test]
-    fn function_semantic_summary_seed_models_known_imports_in_r2sym() {
-        let malloc =
+    fn function_semantic_summary_seed_requires_typed_import_linkage() {
+        assert!(
             function_semantic_summary_seed_for_name(InterprocFunctionId(1), "sym.imp.malloc")
-                .expect("malloc seed");
+                .is_none(),
+            "raw import-shaped names must not seed semantic effects"
+        );
+        assert!(
+            function_semantic_summary_seed_for_name(InterprocFunctionId(2), "sym.imp.memcpy")
+                .is_none(),
+            "raw import-shaped names must not seed semantic effects"
+        );
+        assert!(
+            function_semantic_summary_seed_for_name(InterprocFunctionId(3), "memcpy").is_none(),
+            "plain names must not seed semantic effects"
+        );
+
+        let malloc = function_semantic_summary_seed_for_name_with_linkage(
+            InterprocFunctionId(1),
+            "sym.imp.malloc",
+            r2ssa::FunctionSemanticLinkage::Imported,
+        )
+        .expect("typed malloc seed");
+        assert_eq!(malloc.linkage, r2ssa::FunctionSemanticLinkage::Imported);
         assert_eq!(malloc.return_relation, SummaryReturnRelation::HeapAlloc);
         assert_eq!(
             malloc.allocation_effects,
@@ -8919,25 +8965,35 @@ mod tests {
             }]
         );
 
-        assert!(
-            function_semantic_summary_seed_for_name(InterprocFunctionId(2), "memcpy").is_none(),
-            "raw names without import/PLT evidence must not seed semantics"
-        );
-
-        let memcpy =
-            function_semantic_summary_seed_for_name(InterprocFunctionId(2), "sym.imp.memcpy")
-                .expect("memcpy seed");
-        assert_eq!(memcpy.return_relation, SummaryReturnRelation::Arg(0));
-        assert!(memcpy.arg_effects.get(&0).expect("dst").write);
-        assert!(memcpy.arg_effects.get(&1).expect("src").read);
+        let typed_memcpy = function_semantic_summary_seed_for_name_with_linkage(
+            InterprocFunctionId(2),
+            "memcpy",
+            r2ssa::FunctionSemanticLinkage::Imported,
+        )
+        .expect("typed memcpy seed");
         assert_eq!(
-            memcpy.transfer_effects,
+            typed_memcpy.linkage,
+            r2ssa::FunctionSemanticLinkage::Imported,
+            "only the typed seed API should carry import linkage"
+        );
+        assert_eq!(typed_memcpy.return_relation, SummaryReturnRelation::Arg(0));
+        assert!(typed_memcpy.arg_effects.get(&0).expect("dst").write);
+        assert!(typed_memcpy.arg_effects.get(&1).expect("src").read);
+        assert_eq!(
+            typed_memcpy.transfer_effects,
             vec![SummaryTransferEffect {
                 dst: arg_location(0),
                 src: arg_location(1),
                 len: SummaryTransferLength::Arg(2),
             }]
         );
+        assert!(semantic_summary_has_modeled_evidence(&typed_memcpy));
+        assert!(semantic_summary_has_runtime_copy_role(&typed_memcpy));
+        assert!(semantic_summary_has_modeled_evidence(&malloc));
+        assert!(!semantic_summary_has_runtime_copy_role(&malloc));
+        assert!(!semantic_summary_has_modeled_evidence(
+            &FunctionSemanticSummary::unknown(InterprocFunctionId(3), Some("local".to_string()))
+        ));
     }
 
     #[test]
@@ -11675,20 +11731,32 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_summary_applicability_marks_structural_seed_evidence() {
+    fn native_worker_summary_applicability_rejects_raw_import_name_evidence() {
         let applicability =
             native_worker_summary_applicability_for_name(0x401000, "sym.imp.malloc");
 
-        assert!(applicability.is_supported());
-        assert!(!applicability.is_name_hint_only());
-        assert!(applicability.has_non_name_evidence());
+        assert!(!applicability.is_supported());
+        assert!(applicability.worker_kinds.is_empty());
+        assert!(applicability.sources.is_empty());
+
+        let summary = function_semantic_summary_seed_for_name_with_linkage(
+            InterprocFunctionId(0x401000),
+            "malloc",
+            r2ssa::FunctionSemanticLinkage::Imported,
+        )
+        .expect("typed imported summary");
+        let typed_applicability =
+            native_worker_summary_applicability_for_summary(0x401000, &summary);
+        assert!(typed_applicability.is_supported());
+        assert!(!typed_applicability.is_name_hint_only());
+        assert!(typed_applicability.has_non_name_evidence());
         assert!(
-            applicability
+            typed_applicability
                 .worker_kinds
                 .contains(&NativeWorkerSummaryKind::Allocation)
         );
         assert!(
-            applicability
+            typed_applicability
                 .sources
                 .contains(&NativeWorkerSummaryApplicabilitySource::AllocationEffect)
         );
@@ -11746,7 +11814,7 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_name_route_facts_aggregate_candidate_route_evidence() {
+    fn native_worker_name_route_facts_reject_raw_import_candidate_evidence() {
         let facts = NativeWorkerNameRouteFacts::for_candidates(
             0x401000,
             "sym.imp.memcpy",
@@ -11755,9 +11823,9 @@ mod tests {
             "sym.imp.memcpy",
         );
 
-        assert!(facts.display_summary_family);
-        assert!(facts.canonical_summary_family);
-        assert!(facts.summary_family);
+        assert!(!facts.display_summary_family);
+        assert!(!facts.canonical_summary_family);
+        assert!(!facts.summary_family);
         assert_eq!(facts.summary_probe_name, "sym.imp.memcpy");
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -559,10 +559,34 @@ pub enum CalleeReturnRelation {
     Global(u64),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CalleeLinkage {
+    #[default]
+    Unknown,
+    Internal,
+    Imported,
+}
+
+impl CalleeLinkage {
+    pub fn authorizes_import_policy(self) -> bool {
+        matches!(self, Self::Imported)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CalleeModelPolicyEvidence {
+    InterprocSummary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalleeFact {
     pub function_id: u64,
     pub name: Option<String>,
+    pub linkage: CalleeLinkage,
+    pub signature: Option<FunctionType>,
+    pub signature_callconv: Option<String>,
+    pub signature_noreturn: bool,
+    pub model_policy_evidence: BTreeSet<CalleeModelPolicyEvidence>,
     pub direct_callees: Vec<u64>,
     pub callsite_count: usize,
     pub has_unknown_calls: bool,
@@ -581,6 +605,16 @@ pub struct CalleeFact {
     pub touches_unknown_memory: bool,
 }
 
+pub(crate) const fn model_policy_authorized_from_evidence_count(evidence_count: usize) -> bool {
+    evidence_count > 0
+}
+
+impl CalleeFact {
+    pub fn authorizes_model_policy(&self) -> bool {
+        model_policy_authorized_from_evidence_count(self.model_policy_evidence.len())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InterprocFactDiagnostics {
     pub iterations: usize,
@@ -594,6 +628,8 @@ pub struct InterprocFactDiagnostics {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionTypeFacts {
     pub merged_signature: Option<FunctionSignatureSpec>,
+    pub callconv: Option<String>,
+    pub noreturn: bool,
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
@@ -615,6 +651,8 @@ pub struct FunctionTypeFacts {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionTypeFactInputs {
     pub merged_signature: Option<FunctionSignatureSpec>,
+    pub callconv: Option<String>,
+    pub noreturn: bool,
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
@@ -641,6 +679,8 @@ pub struct FunctionTypeFactsBuilder {
 impl FunctionTypeFacts {
     pub fn is_empty(&self) -> bool {
         self.merged_signature.is_none()
+            && self.callconv.is_none()
+            && !self.noreturn
             && self.known_function_signatures.is_empty()
             && self.register_params.is_empty()
             && self.stack_slots.is_empty()
@@ -665,6 +705,8 @@ impl FunctionTypeFacts {
     pub fn canonicalized(self) -> Self {
         FunctionTypeFacts::builder(FunctionTypeFactInputs {
             merged_signature: self.merged_signature,
+            callconv: self.callconv,
+            noreturn: self.noreturn,
             known_function_signatures: self.known_function_signatures,
             register_params: self.register_params,
             stack_slots: self.stack_slots,
@@ -1243,6 +1285,8 @@ impl FunctionTypeFactsBuilder {
 
         let FunctionTypeFactInputs {
             merged_signature,
+            callconv,
+            noreturn,
             known_function_signatures,
             register_params,
             mut stack_slots,
@@ -1274,6 +1318,8 @@ impl FunctionTypeFactsBuilder {
 
         FunctionTypeFacts {
             merged_signature,
+            callconv,
+            noreturn,
             known_function_signatures,
             register_params,
             stack_slots,

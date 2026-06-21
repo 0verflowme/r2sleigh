@@ -213,8 +213,14 @@ run cargo kani --manifest-path crates/r2il/Cargo.toml \
 run cargo kani --manifest-path crates/r2ssa/Cargo.toml \
     --harness next_version_is_checked_and_monotonic \
     --output-format terse
+run cargo kani --manifest-path crates/r2ssa/Cargo.toml \
+    --harness data_ref_mask_to_bits_is_total_and_bounded \
+    --output-format terse
 run cargo kani --manifest-path crates/r2types/Cargo.toml \
     --harness integer_meet_shape_is_sound \
+    --output-format terse
+run cargo kani --manifest-path crates/r2types/Cargo.toml \
+    --harness rendered_expression_policy_authority_is_fail_closed_for_unresolved_callsites \
     --output-format terse
 
 phase "Targeted cargo mutants for r2ssa var"

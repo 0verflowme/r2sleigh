@@ -2,17 +2,18 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 use r2ssa::{SSAFunction, SSAOp, SSAVar, SSAVarNameKind, ValueId};
-use r2types::CallsiteKey;
+use r2types::{
+    CalleeCallArgPolicy, CalleeResolutionFacts, CalleeTargetIdentityRequest,
+    CalleeTargetPolicyDecision, CalleeTargetResolutionRequest, CallsiteKey,
+};
 
 use super::{
     BaseRef, CallArgBinding, CallArgRole, FrameObjectFieldKey, FrameSlotMergeSummary,
-    NormalizedAddr, PassEnv, ScalarValue, SemanticCallArg, SemanticValue, StackSlotProvenance,
-    StackSlotValueKind, UseInfo, UseInfoAnalysisMode, ValueProvenance, ValueRef, lower::LowerCtx,
-    utils,
+    NormalizedAddr, PassEnv, PtrArith, SSABlock, ScalarValue, SemanticCallArg, SemanticValue,
+    StackSlotProvenance, StackSlotValueKind, UseInfo, UseInfoAnalysisMode, ValueProvenance,
+    ValueRef, lower::LowerCtx, utils,
 };
 use crate::ast::{BinaryOp, CExpr, CType};
-use crate::fold::op_lower::parse_const_value;
-use crate::fold::{PtrArith, SSABlock};
 use crate::registers::register_family_name;
 
 #[derive(Debug, Default)]
@@ -356,6 +357,20 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
         }
     }
 
+    for (key, expr) in &baseline.definitions {
+        let should_replace = info
+            .definitions
+            .get(key)
+            .is_some_and(|current| expr_contains_call(current) && !expr_contains_call(expr));
+        if should_replace {
+            info.definitions.insert(key.clone(), expr.clone());
+            info.formatted_defs.insert(key.clone(), expr.clone());
+            if let Some(value_id) = info.value_id_for_name(key) {
+                info.definitions_by_value.insert(value_id, expr.clone());
+            }
+        }
+    }
+
     for (key, args) in &baseline.call_args {
         let should_replace = match info.call_args.get(key) {
             None => true,
@@ -383,6 +398,31 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
     for (alias, source_call) in &baseline.call_result_source_by_alias {
         if !info.call_result_source_by_alias.contains_key(alias) {
             info.insert_call_result_source_alias(alias, *source_call);
+        }
+    }
+    for aliases in baseline.call_result_aliases.values() {
+        for alias in aliases {
+            if baseline.direct_call_result_aliases.contains(alias) {
+                continue;
+            }
+            info.direct_call_result_aliases.remove(alias);
+            info.direct_call_result_aliases
+                .remove(&alias.to_ascii_lowercase());
+            info.direct_call_result_aliases
+                .remove(&alias.to_ascii_uppercase());
+            if let Some(expr) = baseline
+                .definitions
+                .get(alias)
+                .or_else(|| baseline.definitions.get(&alias.to_ascii_lowercase()))
+                .or_else(|| baseline.definitions.get(&alias.to_ascii_uppercase()))
+                .cloned()
+            {
+                info.definitions.insert(alias.clone(), expr.clone());
+                info.formatted_defs.insert(alias.clone(), expr.clone());
+                if let Some(value_id) = info.value_id_for_name(alias) {
+                    info.definitions_by_value.insert(value_id, expr);
+                }
+            }
         }
     }
     info.direct_call_result_aliases
@@ -438,6 +478,30 @@ pub(crate) fn preserve_authoritative_facts(info: &mut UseInfo, baseline: &UseInf
     }
 }
 
+fn expr_contains_call(expr: &CExpr) -> bool {
+    let mut contains = false;
+    expr.visit(&mut |node| {
+        if matches!(node, CExpr::Call { .. }) {
+            contains = true;
+        }
+    });
+    contains
+}
+
+fn semantic_value_contains_call(value: &SemanticValue) -> bool {
+    match value {
+        SemanticValue::Scalar(ScalarValue::Expr(expr)) => expr_contains_call(expr),
+        SemanticValue::Address(addr) | SemanticValue::Load { addr, .. } => {
+            normalized_addr_contains_call(addr)
+        }
+        SemanticValue::Scalar(ScalarValue::Root(_)) | SemanticValue::Unknown => false,
+    }
+}
+
+fn normalized_addr_contains_call(addr: &NormalizedAddr) -> bool {
+    matches!(&addr.base, BaseRef::Raw(expr) if expr_contains_call(expr))
+}
+
 fn record_call_result_alias(info: &mut UseInfo, source_call: (u64, usize), alias: &str) {
     if alias.is_empty() {
         return;
@@ -471,6 +535,12 @@ fn preserve_semantic_fact_map<K>(
     for (key, value) in baseline {
         let should_replace = match current.get(key) {
             None => true,
+            Some(existing)
+                if semantic_value_contains_call(existing)
+                    && !semantic_value_contains_call(value) =>
+            {
+                true
+            }
             Some(existing) => {
                 semantic_value_preservation_score(value)
                     > semantic_value_preservation_score(existing)
@@ -1558,7 +1628,7 @@ fn block_value_is_scalar_or_predicate(
 }
 
 fn var_is_zero_constant(var: &SSAVar) -> bool {
-    parse_const_value(&var.name).is_some_and(|value| value == 0)
+    utils::parse_const_value(&var.name).is_some_and(|value| value == 0)
 }
 
 fn stack_slot_value_kind_from_return_slot_stores(
@@ -4503,21 +4573,7 @@ fn is_register_candidate_var(var: &r2ssa::SSAVar, env: &PassEnv<'_>) -> bool {
 }
 
 fn parse_target_addr(target: &r2ssa::SSAVar) -> Option<u64> {
-    let raw = target.name.as_str();
-    let candidate = if let Some(rest) = raw.strip_prefix("ram:") {
-        rest
-    } else if let Some(rest) = raw.strip_prefix("const:") {
-        rest
-    } else if let Some(rest) = raw.strip_prefix("0x") {
-        return u64::from_str_radix(rest, 16).ok();
-    } else {
-        raw
-    };
-
-    if let Ok(v) = u64::from_str_radix(candidate, 16) {
-        return Some(v);
-    }
-    candidate.parse::<u64>().ok()
+    crate::address::parse_address_from_var_name(&target.name)
 }
 
 fn infer_successors(
@@ -5225,7 +5281,8 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
 
             let mut args = Vec::new();
             let mut consumed_keys = Vec::new();
-            let imported_call_target = call_target_is_imported(block.addr, call_idx, op, env);
+            let imported_like_call_target =
+                call_target_uses_imported_like_args(block.addr, call_idx, op, env);
             scratch
                 .info
                 .inlined_call_results
@@ -5266,7 +5323,7 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 .info
                 .inlined_call_results
                 .extend(inlined_call_results);
-            if imported_call_target
+            if imported_like_call_target
                 || should_append_unknown_stack_args(&scratch.info, &args, &stack_args, env)
             {
                 for (_, arg, value_key, addr_key) in &stack_args {
@@ -5928,7 +5985,7 @@ fn normalize_call_arg_var_for_definition(
         return Some(CExpr::Var(name));
     }
 
-    let rendered = if parse_const_value(&name).is_some()
+    let rendered = if utils::parse_const_value(&name).is_some()
         || crate::address::parse_address_from_var_name(&name).is_some()
     {
         Some(lower.expr_for_ssa_name(&name))
@@ -6011,29 +6068,49 @@ fn rewrite_call_result_binding(
     })
 }
 
+#[cfg(test)]
 fn call_target_is_imported(
     block_addr: u64,
     op_index: usize,
     op: &SSAOp,
     env: &PassEnv<'_>,
 ) -> bool {
-    let target = match op {
-        SSAOp::Call { target } | SSAOp::CallInd { target } => target,
-        _ => return false,
-    };
-    let callsite = CallsiteKey {
-        block_addr,
-        op_index,
-    };
-    let Some(facts) = env.callee_resolution else {
-        return false;
-    };
-    if let Some(identity) = facts.identity_for_callsite(callsite) {
-        return identity.is_imported_name_hint();
+    call_target_policy_decision(block_addr, op_index, op, env).is_some_and(|policy| policy.imported)
+}
+
+fn call_target_uses_imported_like_args(
+    block_addr: u64,
+    op_index: usize,
+    op: &SSAOp,
+    env: &PassEnv<'_>,
+) -> bool {
+    call_target_policy_decision(block_addr, op_index, op, env)
+        .is_some_and(|policy| policy.arg_policy() == CalleeCallArgPolicy::ImportedLike)
+}
+
+fn call_target_policy_decision(
+    block_addr: u64,
+    op_index: usize,
+    op: &SSAOp,
+    env: &PassEnv<'_>,
+) -> Option<CalleeTargetPolicyDecision> {
+    if !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
+        return None;
     }
-    parse_target_addr(target)
-        .and_then(|addr| facts.identity_for_direct_addr(addr))
-        .is_some_and(|identity| identity.is_imported_name_hint())
+    CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+        identity: CalleeTargetIdentityRequest {
+            resolution: env.callee_resolution,
+            callsite: Some(CallsiteKey {
+                block_addr,
+                op_index,
+            }),
+            prepared_identity: None,
+            prepared_direct_target: None,
+            direct_target_context: None,
+        },
+        callee_facts: env.callee_facts,
+    })
+    .map(|resolved| resolved.policy)
 }
 
 fn should_append_unknown_stack_args(
@@ -7589,7 +7666,7 @@ fn semantic_call_arg_string_addr_inner(
     }
 
     if var.is_const()
-        && let Some(addr) = parse_const_value(&var.name)
+        && let Some(addr) = utils::parse_const_value(&var.name)
         && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
     {
         return Some(addr);
@@ -7672,7 +7749,7 @@ fn semantic_call_arg_addr_from_expr(
 
     match expr {
         CExpr::Var(name) => {
-            if let Some(addr) = parse_const_value(name)
+            if let Some(addr) = utils::parse_const_value(name)
                 && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
             {
                 return Some(addr);
@@ -8444,6 +8521,8 @@ mod tests {
         function_names: HashMap<u64, String>,
         strings: HashMap<u64, String>,
         symbols: HashMap<u64, String>,
+        callee_facts: BTreeMap<u64, r2types::CalleeFact>,
+        summary_view: Option<r2types::InterprocSummaryView>,
         arg_regs: Vec<String>,
         caller_saved_regs: HashSet<String>,
         type_hints: HashMap<String, CType>,
@@ -8458,6 +8537,8 @@ mod tests {
                 function_names: HashMap::new(),
                 strings: HashMap::new(),
                 symbols: HashMap::new(),
+                callee_facts: BTreeMap::new(),
+                summary_view: None,
                 arg_regs: Vec::new(),
                 caller_saved_regs: HashSet::new(),
                 type_hints: HashMap::new(),
@@ -8492,7 +8573,9 @@ mod tests {
                 function_names: &self.function_names,
                 strings: &self.strings,
                 symbols: &self.symbols,
+                callee_facts: &self.callee_facts,
                 callee_resolution: None,
+                summary_view: self.summary_view.as_ref(),
                 arg_regs: &self.arg_regs,
                 param_register_aliases: &self.param_register_aliases,
                 caller_saved_regs: &self.caller_saved_regs,
@@ -8580,9 +8663,22 @@ mod tests {
     }
 
     fn minimal_callee_fact(addr: u64, name: &str) -> r2types::CalleeFact {
+        minimal_callee_fact_with_linkage(addr, name, r2types::CalleeLinkage::Unknown)
+    }
+
+    fn minimal_callee_fact_with_linkage(
+        addr: u64,
+        name: &str,
+        linkage: r2types::CalleeLinkage,
+    ) -> r2types::CalleeFact {
         r2types::CalleeFact {
             function_id: addr,
             name: Some(name.to_string()),
+            linkage,
+            signature: None,
+            signature_callconv: None,
+            signature_noreturn: false,
+            model_policy_evidence: BTreeSet::new(),
             direct_callees: Vec::new(),
             callsite_count: 0,
             has_unknown_calls: false,
@@ -8600,6 +8696,10 @@ mod tests {
             writes_global_memory: false,
             touches_unknown_memory: false,
         }
+    }
+
+    fn imported_callee_fact(addr: u64, name: &str) -> r2types::CalleeFact {
+        minimal_callee_fact_with_linkage(addr, name, r2types::CalleeLinkage::Imported)
     }
 
     #[test]
@@ -8689,15 +8789,19 @@ mod tests {
         };
         let base_env = fixture.env();
         let env = PassEnv {
+            callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
         };
-        assert!(call_target_is_imported(0x1000, 0, &op, &env));
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "typed function names remain import hints until callee facts certify import linkage"
+        );
 
         let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
         let typed_function_names = HashMap::new();
         let callee_facts =
-            BTreeMap::from([(0x401000, minimal_callee_fact(0x401000, "sym.imp.printf"))]);
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
         let known_function_signatures = HashMap::new();
         let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
             [(
@@ -8720,12 +8824,55 @@ mod tests {
         };
         let base_env = fixture.env();
         let env = PassEnv {
+            callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
         };
         assert!(
             call_target_is_imported(0x1000, 0, &op, &env),
             "callee facts can certify import policy only through typed resolution"
+        );
+
+        let fallback_function_names = HashMap::from([(0x401000, "sym.helper".to_string())]);
+        let typed_function_names = HashMap::new();
+        let mut modeled_fact = minimal_callee_fact(0x401000, "sym.imp.printf");
+        modeled_fact
+            .model_policy_evidence
+            .insert(r2types::CalleeModelPolicyEvidence::InterprocSummary);
+        let callee_facts = BTreeMap::from([(0x401000, modeled_fact)]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(
+                CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                0x401000,
+            )],
+            &r2types::CalleeIdentityContext {
+                function_names: &typed_function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture {
+            function_names: fallback_function_names,
+            ..TestEnvFixture::default()
+        };
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "import-looking callee fact names need explicit import linkage evidence"
+        );
+        assert!(
+            call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "modeled callee facts use imported-like argument collection without import linkage"
         );
 
         let fallback_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
@@ -8753,10 +8900,128 @@ mod tests {
         };
         let base_env = fixture.env();
         let env = PassEnv {
+            callee_facts: &callee_facts,
             callee_resolution: Some(&resolution),
             ..base_env
         };
         assert!(!call_target_is_imported(0x1000, 0, &op, &env));
+    }
+
+    #[test]
+    fn call_target_import_policy_requires_callsite_resolution_not_raw_direct_address() {
+        let op = SSAOp::Call {
+            target: mk("ram:402000", 0, 8),
+        };
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x402000, imported_callee_fact(0x402000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution =
+            r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            });
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "stale direct-address identity must not authorize import policy without a callsite binding"
+        );
+        assert!(
+            !call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "stale direct-address identity must not authorize imported-like argument collection"
+        );
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_callsite_resolution_over_raw_import_address() {
+        let op = SSAOp::Call {
+            target: mk("ram:402000", 0, 8),
+        };
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let function_names = HashMap::from([(0x401000, "sym.local_helper".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x402000, imported_callee_fact(0x402000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(callsite, 0x401000)],
+            &r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            !call_target_is_imported(0x1000, 0, &op, &env),
+            "engine callsite identity should reject import policy when the rendered target names a different imported address"
+        );
+        assert!(
+            !call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "engine callsite identity should reject imported-like argument collection for a conflicting raw import address"
+        );
+    }
+
+    #[test]
+    fn call_target_import_policy_uses_callsite_resolution_over_raw_local_address() {
+        let op = SSAOp::Call {
+            target: mk("ram:402000", 0, 8),
+        };
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let function_names = HashMap::from([(0x402000, "sym.local_raw_target".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(callsite, 0x401000)],
+            &r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
+        let fixture = TestEnvFixture::default();
+        let base_env = fixture.env();
+        let env = PassEnv {
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
+            ..base_env
+        };
+
+        assert!(
+            call_target_is_imported(0x1000, 0, &op, &env),
+            "engine callsite identity should authorize import policy even when the rendered target names a different local address"
+        );
+        assert!(
+            call_target_uses_imported_like_args(0x1000, 0, &op, &env),
+            "engine callsite identity should drive imported-like argument collection"
+        );
     }
 
     #[test]
@@ -8772,7 +9037,7 @@ mod tests {
         let mut resolution = r2types::CalleeResolutionFacts::default();
         resolution.by_key.insert(
             key.clone(),
-            r2types::CalleeIdentity::from_name("sym.imp.printf"),
+            r2types::CalleeIdentity::from_name("sym.imp.printf").with_import_linkage_evidence(),
         );
         resolution.by_callsite.insert(callsite, key);
 

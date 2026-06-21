@@ -9,31 +9,22 @@ pub(crate) struct RoutedBody {
 pub(crate) fn primary_body_for_semantic_route<'a, 'o, F>(
     route: &crate::SemanticRoutePlan,
     structurer: &mut crate::ControlFlowStructurer<'a, 'o>,
-    mut linearize: F,
+    _linearize: F,
 ) -> RoutedBody
 where
     F: FnMut() -> Vec<CStmt>,
 {
     match route {
-        crate::SemanticRoutePlan::StructuredWorker { reason } => {
-            match structurer.structure_semantic_worker_islands(6) {
-                Some(structured) => RoutedBody {
-                    body_stmt: semantic_worker_structured_body(reason, structured),
-                    use_conservative_locals: true,
-                    is_linear_fallback: false,
-                },
-                None => RoutedBody {
-                    body_stmt: semantic_worker_linear_body(reason, linearize()),
-                    use_conservative_locals: true,
-                    is_linear_fallback: true,
-                },
-            }
-        }
+        crate::SemanticRoutePlan::StructuredWorker { reason } => RoutedBody {
+            body_stmt: semantic_worker_comment_only_body("structured_worker", reason),
+            use_conservative_locals: true,
+            is_linear_fallback: false,
+        },
         crate::SemanticRoutePlan::LinearWorker { reason }
         | crate::SemanticRoutePlan::SummaryIslands { reason } => RoutedBody {
-            body_stmt: semantic_worker_linear_body(reason, linearize()),
+            body_stmt: semantic_worker_comment_only_body("summary_route", reason),
             use_conservative_locals: true,
-            is_linear_fallback: true,
+            is_linear_fallback: false,
         },
         crate::SemanticRoutePlan::VmSummary { .. }
         | crate::SemanticRoutePlan::FallbackComment { .. }
@@ -43,13 +34,6 @@ where
             is_linear_fallback: false,
         },
     }
-}
-
-pub(crate) fn semantic_worker_structured_body(reason: &str, structured: CStmt) -> CStmt {
-    CStmt::Block(vec![
-        CStmt::comment(format!("r2dec semantic worker structuring for {}", reason)),
-        structured,
-    ])
 }
 
 pub(crate) fn semantic_worker_linear_body(reason: &str, mut linear_stmts: Vec<CStmt>) -> CStmt {
@@ -67,4 +51,17 @@ pub(crate) fn semantic_worker_linear_body(reason: &str, mut linear_stmts: Vec<CS
         )),
     );
     CStmt::Block(linear_stmts)
+}
+
+pub(crate) fn semantic_worker_comment_only_body(route: &str, reason: &str) -> CStmt {
+    CStmt::Block(vec![
+        CStmt::comment(format!(
+            "r2dec summary: {} for {}",
+            route,
+            crate::sanitize_comment_text(reason)
+        )),
+        CStmt::comment(
+            "render contract: summary facts only; no executable native C reconstructed".to_string(),
+        ),
+    ])
 }

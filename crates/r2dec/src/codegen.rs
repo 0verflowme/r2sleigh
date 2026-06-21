@@ -445,6 +445,14 @@ impl CodeGenerator {
                     self.output.push_str(render_op.as_str());
                     self.output.push(' ');
                     self.emit_positive_literal_magnitude(magnitude);
+                } else if let Some((render_op, positive_rhs)) =
+                    additive_negative_product_rhs_rewrite(*op, right)
+                {
+                    self.emit_expr(left, my_prec);
+                    self.output.push(' ');
+                    self.output.push_str(render_op.as_str());
+                    self.output.push(' ');
+                    self.emit_expr(&positive_rhs, my_prec + 1);
                 } else {
                     self.emit_expr(left, my_prec);
                     self.output.push(' ');
@@ -1069,6 +1077,47 @@ fn negative_literal_magnitude(expr: &CExpr) -> Option<PositiveLiteralMagnitude> 
     }
 }
 
+fn additive_negative_product_rhs_rewrite(op: BinaryOp, rhs: &CExpr) -> Option<(BinaryOp, CExpr)> {
+    let positive_rhs = negative_product_positive_rhs(rhs)?;
+    match op {
+        BinaryOp::Add => Some((BinaryOp::Sub, positive_rhs)),
+        BinaryOp::Sub => Some((BinaryOp::Add, positive_rhs)),
+        _ => None,
+    }
+}
+
+fn negative_product_positive_rhs(expr: &CExpr) -> Option<CExpr> {
+    match expr {
+        CExpr::Binary {
+            op: BinaryOp::Mul,
+            left,
+            right,
+        } => {
+            if let Some(magnitude) = negative_literal_magnitude(right) {
+                return positive_product_expr((**left).clone(), magnitude);
+            }
+            if let Some(magnitude) = negative_literal_magnitude(left) {
+                return positive_product_expr((**right).clone(), magnitude);
+            }
+            None
+        }
+        CExpr::Paren(inner) => negative_product_positive_rhs(inner),
+        _ => None,
+    }
+}
+
+fn positive_product_expr(term: CExpr, magnitude: PositiveLiteralMagnitude) -> Option<CExpr> {
+    if magnitude.value == 1 {
+        return Some(term);
+    }
+    let literal = if magnitude.prefer_hex {
+        CExpr::UIntLit(magnitude.value)
+    } else {
+        CExpr::IntLit(i64::try_from(magnitude.value).ok()?)
+    };
+    Some(CExpr::binary(BinaryOp::Mul, term, literal))
+}
+
 fn sanitize_comment_text(text: &str) -> String {
     text.replace("*/", "* /").replace(['\r', '\n'], " ")
 }
@@ -1217,6 +1266,25 @@ mod tests {
             CExpr::uint(0xffffffffffffffb8),
         );
         assert_eq!(codegen.generate_expr(&expr), "rsp + 0x48");
+    }
+
+    #[test]
+    fn test_additive_negative_linear_terms_render_as_subtraction() {
+        let mut codegen = CodeGenerator::new(CodeGenConfig::default());
+
+        let expr = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::var("a"),
+            CExpr::binary(BinaryOp::Mul, CExpr::var("b"), CExpr::int(-1)),
+        );
+        assert_eq!(codegen.generate_expr(&expr), "a - b");
+
+        let expr = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::var("a"),
+            CExpr::binary(BinaryOp::Mul, CExpr::var("b"), CExpr::int(-4)),
+        );
+        assert_eq!(codegen.generate_expr(&expr), "a - b * 4");
     }
 
     #[test]

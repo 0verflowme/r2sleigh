@@ -1,0 +1,10 @@
+warning: r2dec must not synthesize CalleeResolutionFacts from raw call targets; pass the r2engine-owned resolution contract
+  --> $DIR/lib.rs:10:13
+   |
+LL |     let _ = CalleeResolutionFacts::from_direct_call_targets();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_callee_resolution_fallback_ownership)]` on by default
+
+warning: 1 warning emitted
+

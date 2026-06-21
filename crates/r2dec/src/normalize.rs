@@ -1,5 +1,5 @@
+use crate::analysis::PredicateAnalysisView;
 use crate::ast::CExpr;
-use crate::fold::FoldingContext;
 use r2ssa::{SSAFunction, SSAOp};
 use std::collections::{HashMap, HashSet};
 
@@ -10,9 +10,13 @@ pub(crate) enum NormalizeMode {
     Predicate,
 }
 
-pub(crate) fn normalize_expr(ctx: &FoldingContext, expr: CExpr, mode: NormalizeMode) -> CExpr {
+pub(crate) fn normalize_expr(
+    view: &(impl PredicateAnalysisView + ?Sized),
+    expr: CExpr,
+    mode: NormalizeMode,
+) -> CExpr {
     match mode {
-        NormalizeMode::General | NormalizeMode::Predicate => ctx.simplify_predicate_expr(expr),
+        NormalizeMode::General | NormalizeMode::Predicate => view.simplify_predicate_expr(expr),
     }
 }
 
@@ -245,6 +249,7 @@ fn can_materialize_loop_backedge_phi(
 mod tests {
     use super::*;
     use crate::ast::{BinaryOp, UnaryOp};
+    use crate::fold::FoldingContext;
     use r2il::{R2ILBlock, R2ILOp, Varnode};
     use r2ssa::{PhiNode, SSAFunction, SSAVar};
 

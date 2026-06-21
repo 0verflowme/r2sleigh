@@ -122,47 +122,36 @@ fn render_vm_signature(type_facts: &FunctionTypeFacts, func_name: &str) -> Strin
     format!("{ret_ty} {func_name}({params})")
 }
 
-fn render_vm_case_block(
-    out: &mut String,
-    vm_step: &r2sym::VmStepSummary,
-    target: u64,
-    default_emitted: &mut bool,
-) {
+fn render_vm_handler_comment_block(out: &mut String, vm_step: &r2sym::VmStepSummary, target: u64) {
     let case_values = vm_step
         .case_values_by_target
         .get(&target)
         .cloned()
         .unwrap_or_default();
-    if case_values.is_empty() && vm_step.default_target == Some(target) {
-        let _ = writeln!(out, "    default:");
-        *default_emitted = true;
-    } else if case_values.is_empty() {
-        if !*default_emitted {
-            let _ = writeln!(out, "    default:");
-            *default_emitted = true;
-        } else {
-            let _ = writeln!(
-                out,
-                "    /* unlabeled handler 0x{:x} omitted from switch surface */",
-                target
-            );
-            return;
-        }
-    } else {
-        for value in case_values {
-            let _ = writeln!(out, "    case 0x{value:x}:");
-        }
-    }
-
     let region_blocks = vm_step
         .handler_regions
         .get(&target)
         .map(|blocks| crate::format_vm_target_list(blocks))
         .unwrap_or_else(|| "[]".to_string());
+    let labels = if case_values.is_empty() {
+        "unlabeled".to_string()
+    } else {
+        format!(
+            "[{}]",
+            case_values
+                .iter()
+                .map(|value| format!("0x{value:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let _ = writeln!(
         out,
-        "        /* handler 0x{:x} blocks={} */",
-        target, region_blocks
+        "    /* handler 0x{:x}: labels={} default={} blocks={} */",
+        target,
+        labels,
+        vm_step.default_target == Some(target),
+        region_blocks
     );
 
     let mut emitted_body = false;
@@ -173,7 +162,7 @@ fn render_vm_case_block(
     {
         let _ = writeln!(
             out,
-            "        /* transfer exits={} guards={} updates={} reads={} writes={} confidence={:?} */",
+            "    /* transfer exits={} guards={} updates={} reads={} writes={} confidence={:?} */",
             transfer.exit_targets.len(),
             transfer.exit_guards.len(),
             transfer.state_updates.len() + usize::from(transfer.selector_update.is_some()),
@@ -183,27 +172,26 @@ fn render_vm_case_block(
         );
         emitted_body = true;
         if transfer.selector_update.is_some() {
-            let _ = writeln!(out, "        /* selector updated */");
+            let _ = writeln!(out, "    /* selector updated */");
             emitted_body = true;
         }
         if transfer.redispatch {
-            let _ = writeln!(out, "        /* redispatch */");
+            let _ = writeln!(out, "    /* redispatch */");
             emitted_body = true;
         }
         if transfer.may_return {
-            let _ = writeln!(out, "        /* may return */");
+            let _ = writeln!(out, "    /* may return */");
             emitted_body = true;
         }
         if transfer.truncated {
-            let _ = writeln!(out, "        /* truncated handler summary */");
+            let _ = writeln!(out, "    /* truncated handler summary */");
             emitted_body = true;
         }
     }
 
     if !emitted_body {
-        let _ = writeln!(out, "        /* no exact handler body recovered */");
+        let _ = writeln!(out, "    /* no exact handler body recovered */");
     }
-    let _ = writeln!(out, "        break;");
 }
 
 pub(crate) fn render_vm_semantic_summary(
@@ -225,21 +213,17 @@ pub(crate) fn render_vm_semantic_summary(
         "    /* {} */",
         vm_summary_stats_comment(func_name, vm_step)
     );
-    let _ = writeln!(out, "    switch ({selector}) {{");
-    let mut default_emitted = false;
+    let _ = writeln!(out, "    /* selector: {selector} */");
     for target in &vm_step.dispatch_targets {
-        render_vm_case_block(&mut out, vm_step, *target, &mut default_emitted);
+        render_vm_handler_comment_block(&mut out, vm_step, *target);
     }
-    if !default_emitted {
-        let _ = writeln!(out, "    default:");
-        if let Some(default_target) = vm_step.default_target {
-            let _ = writeln!(out, "        /* default_target=0x{:x} */", default_target);
-        } else {
-            let _ = writeln!(out, "        /* no default target recovered */");
-        }
-        let _ = writeln!(out, "        break;");
+    if let Some(default_target) = vm_step.default_target
+        && !vm_step.dispatch_targets.contains(&default_target)
+    {
+        let _ = writeln!(out, "    /* default_target=0x{:x} */", default_target);
+    } else if vm_step.default_target.is_none() {
+        let _ = writeln!(out, "    /* no default target recovered */");
     }
-    let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "}}");
     Some(out)
 }

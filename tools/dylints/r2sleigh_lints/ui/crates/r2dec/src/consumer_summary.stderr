@@ -1,0 +1,22 @@
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_summary.rs:24:29
+   |
+LL |     let trusted_signature = type_facts.render_authorized_signature();
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_summary_route_executable_c)]` on by default
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_summary.rs:25:22
+   |
+LL |     let mut params = merge_params_with_external_signature(Vec::new(), trusted_signature);
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: summary route rendering must stay comment/fact-only until native CFG/control/dataflow proof exists
+  --> $DIR/consumer_summary.rs:27:23
+   |
+LL |         params.extend(type_facts.register_params.iter().copied());
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 3 warnings emitted
+

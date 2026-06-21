@@ -79,6 +79,15 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     }
 }
 
+pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
+    let normalized = existing.trim_start_matches('&');
+    normalized == "stack"
+        || normalized.starts_with("stack_")
+        || normalized == "slot"
+        || normalized.starts_with("slot_")
+        || normalized == "saved_fp"
+}
+
 pub(crate) fn parse_compare_const_value_with_width(
     var: &SSAVar,
     _compare_width: u32,
@@ -605,6 +614,28 @@ mod tests {
         assert_eq!(parse_const_value("const:100"), Some(0x100));
         assert_eq!(parse_const_value("const:0x100"), Some(0x100));
         assert_eq!(parse_const_value("const:0d100"), Some(100));
+    }
+
+    #[test]
+    fn generic_stack_placeholder_alias_covers_all_generic_forms() {
+        for name in ["stack", "stack_10", "slot", "slot_20", "saved_fp"] {
+            assert!(
+                is_generic_stack_placeholder_alias(name),
+                "{name} should be classified as a generic stack placeholder"
+            );
+            let addr_name = format!("&{name}");
+            assert!(
+                is_generic_stack_placeholder_alias(&addr_name),
+                "{addr_name} should be classified after address-of trimming"
+            );
+        }
+
+        for name in ["local_10", "arg0", "real_slot_name", "saved_lr"] {
+            assert!(
+                !is_generic_stack_placeholder_alias(name),
+                "{name} should not be treated as a generic stack placeholder"
+            );
+        }
     }
 
     #[test]

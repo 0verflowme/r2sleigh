@@ -387,36 +387,11 @@ impl<'a> FoldingContext<'a> {
             return expr;
         }
 
-        let owner_name_for_source = |ctx: &FoldingContext<'_>, source: (u64, usize)| {
-            let materialized_owner = ctx
-                .should_materialize_call_result_at_source(source)
-                .and_then(|expr| match expr {
-                    CExpr::Var(name) => Some(name),
-                    _ => None,
-                });
-            ctx.stable_owned_call_result_name_for_source(source)
-                .filter(|name| {
-                    !is_generic_arg_name(name)
-                        && !ctx.inputs.arch.is_return_register_name(name)
-                        && (materialized_owner
-                            .as_ref()
-                            .is_some_and(|owner| owner.eq_ignore_ascii_case(name))
-                            || (!ctx.is_low_signal_visible_name(name)
-                                && !ctx.is_transient_visible_name(name)
-                                && !name.ends_with("_home")
-                                && !name.starts_with("var_")
-                                && !name.starts_with("local_")
-                                && !name.starts_with("stack_")
-                                && !name.starts_with("arg_")))
-                })
-        };
-
         match expr {
             CExpr::Var(name) => self
                 .call_result_source_for_ssa_name(&name)
                 .or_else(|| self.local_post_call_source_for_ssa_name(&name))
-                .and_then(|source| owner_name_for_source(self, source))
-                .map(CExpr::Var)
+                .and_then(|source| self.predicate_owned_call_result_expr_for_source(source))
                 .unwrap_or(CExpr::Var(name)),
             CExpr::Deref(inner)
                 if matches!(
@@ -426,15 +401,9 @@ impl<'a> FoldingContext<'a> {
             {
                 *inner
             }
-            call @ CExpr::Call { .. } => self
-                .source_call_for_call_expr(&call)
-                .and_then(|source| owner_name_for_source(self, source))
-                .map(CExpr::Var)
-                .unwrap_or_else(|| {
-                    call.map_children(&mut |child| {
-                        self.rewrite_call_result_predicate_owners(child, depth + 1)
-                    })
-                }),
+            call @ CExpr::Call { .. } => call.map_children(&mut |child| {
+                self.rewrite_call_result_predicate_owners(child, depth + 1)
+            }),
             other => other.map_children(&mut |child| {
                 self.rewrite_call_result_predicate_owners(child, depth + 1)
             }),
@@ -768,7 +737,7 @@ impl<'a> FoldingContext<'a> {
             let finalized = self.finalize_condition_expr(expr);
             (!self.is_degenerate_constant_condition(&finalized)
                 && !self.prepared_candidate_needs_legacy_compare_help(&finalized))
-            .then(|| self.normalize_call_result_owners_in_compare(finalized))
+            .then_some(finalized)
         });
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
@@ -848,9 +817,7 @@ impl<'a> FoldingContext<'a> {
             consider(prepared_var_candidate);
         }
         if result.is_some() && !allow_legacy_flag_provenance {
-            let result = result.map(|expr| {
-                self.normalize_call_result_owners_in_compare(self.finalize_condition_expr(expr))
-            });
+            let result = result.map(|expr| self.finalize_condition_expr(expr));
             self.current_block_addr.set(prev_block_addr);
             self.current_op_idx.set(prev_op_idx);
             return result;
@@ -903,9 +870,7 @@ impl<'a> FoldingContext<'a> {
             }
             None => Some(fallback),
         };
-        let result = result.map(|expr| {
-            self.normalize_call_result_owners_in_compare(self.finalize_condition_expr(expr))
-        });
+        let result = result.map(|expr| self.finalize_condition_expr(expr));
 
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
@@ -967,37 +932,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn normalize_assignment_predicate_rhs(&self, rhs: CExpr) -> CExpr {
-        let rhs = if self.is_assignment_predicate_expr(&rhs) {
+        if self.is_assignment_predicate_expr(&rhs) {
             self.finalize_condition_expr(rhs)
         } else {
             rhs
-        };
-
-        self.normalize_call_result_owners_in_compare(rhs)
-    }
-
-    fn normalize_call_result_owners_in_compare(&self, rhs: CExpr) -> CExpr {
-        match rhs {
-            CExpr::Binary { op, left, right }
-                if matches!(
-                    op,
-                    BinaryOp::Eq
-                        | BinaryOp::Ne
-                        | BinaryOp::Lt
-                        | BinaryOp::Le
-                        | BinaryOp::Gt
-                        | BinaryOp::Ge
-                ) =>
-            {
-                let left = self
-                    .stable_owned_call_result_expr_for_call_expr(&left)
-                    .unwrap_or(*left);
-                let right = self
-                    .stable_owned_call_result_expr_for_call_expr(&right)
-                    .unwrap_or(*right);
-                CExpr::binary(op, left, right)
-            }
-            other => other,
         }
     }
 
@@ -1244,15 +1182,8 @@ impl<'a> FoldingContext<'a> {
             {
                 best = self.choose_preferred_scalar_predicate_expr(best, Some(CExpr::Var(alias)));
             }
-            if let Some(call_result_candidate) = self
-                .call_result_source_for_ssa_name(&candidate_name)
-                .or_else(|| self.local_post_call_source_for_ssa_name(&candidate_name))
-                .and_then(|source| {
-                    self.stable_owned_call_result_name_for_source(source)
-                        .map(CExpr::Var)
-                        .or_else(|| self.stable_owned_call_result_expr_for_source(source))
-                        .or_else(|| self.synthesized_call_expr_for_source_call(source))
-                })
+            if let Some(call_result_candidate) =
+                self.predicate_owned_call_result_expr_for_name(&candidate_name)
             {
                 best =
                     self.choose_preferred_scalar_predicate_expr(best, Some(call_result_candidate));
@@ -1532,17 +1463,23 @@ impl<'a> FoldingContext<'a> {
             return Some(CExpr::Var(lower_name));
         }
 
-        if var.version != 0
-            && let Some(owner) =
-                self.stable_owned_call_result_expr_for_name(&var.display_name(), true)
-        {
-            return Some(owner);
+        if var.version != 0 {
+            let var_name = var.display_name();
+            if let Some(source) = self
+                .call_result_source_for_ssa_name(&var_name)
+                .or_else(|| self.local_post_call_source_for_ssa_name_in_block(block, &var_name, 0))
+            {
+                return self.predicate_owned_call_result_expr_for_source(source);
+            }
         }
 
         if depth > 0
             && self.inputs.arch.is_return_register_name(&lower_name)
             && self.local_return_register_chain_is_call_result(block, before_idx, var, 0)
         {
+            if self.requires_certified_rendering() {
+                return None;
+            }
             if let Some(call_expr) = self
                 .lookup_definition(&var.display_name())
                 .filter(|expr| matches!(expr, CExpr::Call { .. }))
@@ -2753,19 +2690,15 @@ impl<'a> FoldingContext<'a> {
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
                 }
-                if let Some(source) = self
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(name) {
+                    return owner;
+                }
+                if self
                     .call_result_source_for_ssa_name(name)
                     .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .is_some()
                 {
-                    if let Some(inner @ CExpr::Call { .. }) = self
-                        .lookup_definition(name)
-                        .or_else(|| self.formatted_defs_map().get(name).cloned())
-                    {
-                        return inner;
-                    }
-                    if let Some(inner) = self.synthesized_call_expr_for_source_call(source) {
-                        return inner;
-                    }
+                    return CExpr::Var(name.clone());
                 }
                 if let Some(inner) = self.lookup_predicate_expr(name)
                     && inner != CExpr::Var(name.clone())
@@ -3726,22 +3659,15 @@ impl<'a> FoldingContext<'a> {
                 {
                     return CExpr::Var(alias.clone());
                 }
-                if let Some(owner) = self.stable_owned_call_result_expr_for_name(name, true) {
+                if let Some(owner) = self.predicate_owned_call_result_expr_for_name(name) {
                     return owner;
                 }
-                if let Some(source) = self
+                if self
                     .call_result_source_for_ssa_name(name)
                     .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .is_some()
                 {
-                    if let Some(inner @ CExpr::Call { .. }) = self
-                        .lookup_definition(name)
-                        .or_else(|| self.formatted_defs_map().get(name).cloned())
-                    {
-                        return inner;
-                    }
-                    if let Some(inner) = self.synthesized_call_expr_for_source_call(source) {
-                        return inner;
-                    }
+                    return CExpr::Var(name.clone());
                 }
                 if let Some(alias) = self.arg_alias_for_rendered_name(name) {
                     return CExpr::Var(alias);
@@ -4189,6 +4115,25 @@ impl<'a> FoldingContext<'a> {
             )),
             FlagCompareKind::Overflow => None,
         }
+    }
+}
+
+impl<'o> analysis::PredicateAnalysisView for FoldingContext<'o> {
+    fn expand_predicate_vars(
+        &self,
+        expr: &CExpr,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> CExpr {
+        FoldingContext::expand_predicate_vars(self, expr, depth, visited)
+    }
+
+    fn try_reconstruct_condition(&self, expr: &CExpr) -> Option<CExpr> {
+        FoldingContext::try_reconstruct_condition(self, expr)
+    }
+
+    fn simplify_predicate_expr(&self, expr: CExpr) -> CExpr {
+        FoldingContext::simplify_predicate_expr(self, expr)
     }
 }
 

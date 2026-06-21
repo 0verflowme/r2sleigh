@@ -9,12 +9,11 @@ use super::utils::{
     is_temporary_name, is_temporary_or_constant_name, parse_const_value, ssa_render_base_name,
 };
 use super::{
-    BaseRef, NormalizedAddr, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
+    BaseRef, NormalizedAddr, PtrArith, ScalarValue, SemanticValue, StackSlotProvenance, UseInfo,
     ValueProvenance, ValueRef,
 };
 use crate::address::parse_address_from_var_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
-use crate::fold::PtrArith;
 
 pub(crate) struct LowerCtx<'a> {
     pub(crate) use_info: Option<&'a UseInfo>,

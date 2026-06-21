@@ -1,0 +1,10 @@
+warning: r2plugin must use SsaArtifact::resolved_call_target so copied-constant call targets are exported
+  --> $DIR/raw_direct_call_target.rs:18:13
+   |
+LL |     let _ = call.direct_target;
+   |             ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_raw_direct_call_target)]` on by default
+
+warning: 1 warning emitted
+

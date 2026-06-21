@@ -25,9 +25,10 @@ use crate::rename::{
     rename_function_with_names_and_call_boundaries,
 };
 use crate::semantic::{
-    CallSiteFacts, CallsiteCertificate, MemoryAccessCertificate, MemoryDefFact, MemorySSAFacts,
-    MemoryUseFact, ObjectId, ObjectModel, PredicateFacts, PreparedFunctionFacts,
-    ReturnValueCertificate, StructuredDataflowFacts,
+    CallResultCertificate, CallSiteFacts, CallSiteId, CallsiteCertificate, MemoryAccessCertificate,
+    MemoryDefFact, MemorySSAFacts, MemoryUseFact, ObjectId, ObjectModel, PredicateFacts,
+    PreparedFunctionFacts, ReturnValueCertificate, StackReloadSourceCertificate,
+    StructuredDataflowFacts,
 };
 use crate::var::{SSAVar, SSAVarNameKind};
 
@@ -246,6 +247,54 @@ impl SsaArtifact {
             .find(|cert| cert.is_write == is_write)
     }
 
+    pub fn stack_reload_certificate_for_value(
+        &self,
+        value_id: crate::graph::ValueId,
+    ) -> Option<&StackReloadSourceCertificate> {
+        self.facts.certificates.stack_reloads.get(&value_id)
+    }
+
+    pub fn stack_reload_certificate_for_op(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<&StackReloadSourceCertificate> {
+        let inst = self.graph.inst_id_for_op_site(block_addr, op_idx)?;
+        let value = self.graph.inst(inst)?.output?;
+        self.facts.certificates.stack_reloads.get(&value)
+    }
+
+    pub fn call_result_certificate_for_value(
+        &self,
+        value_id: crate::graph::ValueId,
+    ) -> Option<&CallResultCertificate> {
+        self.facts.certificates.call_results.get(&value_id)
+    }
+
+    pub fn call_result_certificate_for_op(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<&CallResultCertificate> {
+        let inst = self.graph.inst_id_for_op_site(block_addr, op_idx)?;
+        let value = self.facts.certificates.call_results_by_inst.get(&inst)?;
+        self.facts.certificates.call_results.get(value)
+    }
+
+    pub fn call_result_certificates_for_callsite(
+        &self,
+        call_site: CallSiteId,
+    ) -> Vec<&CallResultCertificate> {
+        self.facts
+            .certificates
+            .call_results_by_callsite
+            .get(&call_site)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| self.facts.certificates.call_results.get(value))
+            .collect()
+    }
+
     pub fn return_certificate_for_op(
         &self,
         block_addr: u64,
@@ -366,7 +415,7 @@ fn parse_literal_value_name(name: &str) -> Option<u64> {
     {
         return u64::from_str_radix(hex, 16).ok();
     }
-    value_str.parse().ok()
+    u64::from_str_radix(value_str, 16).ok()
 }
 
 impl Deref for SsaArtifact {
@@ -2655,7 +2704,7 @@ impl SSABlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::{CallArgumentLocation, ReturnCarrier};
+    use crate::semantic::{CallArgumentLocation, ReturnCarrier, ValueOwner};
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
@@ -3215,6 +3264,9 @@ mod tests {
 
         let prepared =
             SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let call = prepared
+            .callsite_certificate_for_op(0x1400, 1)
+            .expect("callsite certificate");
         let ops = &prepared.get_block(0x1400).expect("entry block").ops;
         let post_call_x0 = ops
             .iter()
@@ -3241,6 +3293,58 @@ mod tests {
             SSAVar::constant(0, 8),
             "call result must not fold back to the pre-call literal"
         );
+
+        let x0_value = prepared
+            .graph()
+            .value_id_for_var(&post_call_x0)
+            .expect("post-call x0 value");
+        let x0_cert = prepared
+            .call_result_certificate_for_value(x0_value)
+            .expect("x0 call-result certificate");
+        assert_eq!(x0_cert.block_addr, 0x1400);
+        assert_eq!(x0_cert.call_site, call.call_site);
+        assert_eq!(
+            x0_cert.carrier,
+            ReturnCarrier::Register {
+                name: "x0".to_string()
+            }
+        );
+
+        let copied_x8_dst = ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Copy { dst, src } if dst.name == "x8" && src == &post_call_x0 => {
+                    Some(dst.clone())
+                }
+                _ => None,
+            })
+            .expect("expected x8 alias of the certified call result");
+        let copied_x8_value = prepared
+            .graph()
+            .value_id_for_var(&copied_x8_dst)
+            .expect("copied x8 value");
+        let copied_x8_cert = prepared
+            .call_result_certificate_for_value(copied_x8_value)
+            .expect("x8 alias certificate");
+        assert_eq!(copied_x8_cert.call_site, call.call_site);
+        assert_eq!(copied_x8_cert.owner, Some(ValueOwner::Value(x0_value)));
+
+        for op in ops {
+            if let SSAOp::CallDefine { dst } = op
+                && dst.name == "x8"
+            {
+                let x8_call_define_value = prepared
+                    .graph()
+                    .value_id_for_var(dst)
+                    .expect("x8 call-define value");
+                assert!(
+                    prepared
+                        .call_result_certificate_for_value(x8_call_define_value)
+                        .is_none(),
+                    "caller-saved x8 clobber must not be certified as a return value"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3320,6 +3424,48 @@ mod tests {
             .expect("call site fact");
         assert_eq!(call.direct_target, Some(0x1400a6010));
         assert_eq!(call.fallthrough, Some(0x1314));
+    }
+
+    #[test]
+    fn resolved_call_target_uses_canonical_copied_const_root_when_fact_is_unresolved() {
+        let tmp = Varnode {
+            space: SpaceId::Unique,
+            offset: 0x10,
+            size: 8,
+            meta: None,
+        };
+        let blocks = vec![R2ILBlock {
+            addr: 0x1310,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: tmp.clone(),
+                    src: make_const(0x401050, 8),
+                },
+                R2ILOp::CallInd { target: tmp },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let prepared =
+            SsaArtifact::for_symbolic(&blocks, None).expect("symbolic prepared SSA should build");
+        let call = prepared
+            .call_sites()
+            .by_id
+            .values()
+            .next()
+            .expect("call site fact");
+        assert_eq!(call.direct_target, Some(0x401050));
+        assert_eq!(prepared.resolved_call_target(call), Some(0x401050));
+
+        let mut unresolved_fact = call.clone();
+        unresolved_fact.direct_target = None;
+        assert_eq!(
+            prepared.resolved_call_target(&unresolved_fact),
+            Some(0x401050),
+            "resolved call target must use the prepared canonical copied const root"
+        );
     }
 
     #[test]
@@ -3564,6 +3710,258 @@ mod tests {
         assert_eq!(ret.block_addr, 0x1600);
         assert_eq!(ret.op_index, return_idx);
         assert_eq!(ret.width, 8);
+
+        let result = prepared
+            .function()
+            .get_block(0x1600)
+            .and_then(|block| {
+                block
+                    .ops
+                    .iter()
+                    .enumerate()
+                    .find_map(|(op_idx, op)| match op {
+                        SSAOp::CallDefine { dst } if dst.name == "x0" => Some((op_idx, dst)),
+                        _ => None,
+                    })
+            })
+            .expect("post-call result op");
+        let result_cert = prepared
+            .call_result_certificate_for_op(0x1600, result.0)
+            .expect("call-result certificate by op");
+        assert_eq!(result_cert.call_site, call.call_site);
+        assert_eq!(
+            result_cert.carrier,
+            ReturnCarrier::Register {
+                name: "x0".to_string()
+            }
+        );
+        let by_callsite = prepared.call_result_certificates_for_callsite(call.call_site);
+        assert!(
+            by_callsite
+                .iter()
+                .any(|cert| cert.value == result_cert.value),
+            "callsite index should contain the direct result value"
+        );
+    }
+
+    #[test]
+    fn prepared_call_result_certificates_stop_at_next_call_and_are_stable() {
+        let arch = make_x86_64_prep_arch();
+        let blocks = vec![R2ILBlock {
+            addr: 0x1680,
+            size: 4,
+            ops: vec![
+                R2ILOp::Call {
+                    target: make_const(0x401000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_unique(0x20, 8),
+                    src: make_reg(0, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x402000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_unique(0x30, 8),
+                    src: make_reg(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let first = SsaArtifact::for_decompile(&blocks, Some(&arch))
+            .expect("first prepared SSA should build");
+        let second = SsaArtifact::for_decompile(&blocks, Some(&arch))
+            .expect("second prepared SSA should build");
+        assert_eq!(
+            first.certificates().call_results,
+            second.certificates().call_results,
+            "call-result certificates must be deterministic"
+        );
+
+        let first_call = first
+            .call_sites()
+            .by_id
+            .values()
+            .find(|call| call.direct_target == Some(0x401000))
+            .expect("first call");
+        let second_call = first
+            .call_sites()
+            .by_id
+            .values()
+            .find(|call| call.direct_target == Some(0x402000))
+            .expect("second call");
+        let aliases = first
+            .function()
+            .get_block(0x1680)
+            .expect("entry block")
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::Copy { dst, .. } if dst.name_kind().is_temporary() => first
+                    .graph()
+                    .value_id_for_var(dst)
+                    .map(|value| (dst.name.clone(), value)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let first_alias = *aliases.get("tmp:20").expect("first call alias");
+        let second_alias = *aliases.get("tmp:30").expect("second call alias");
+
+        let first_values = first
+            .certificates()
+            .call_results_by_callsite
+            .get(&first_call.id)
+            .expect("first call result values");
+        assert!(first_values.contains(&first_alias));
+        assert!(
+            !first_values.contains(&second_alias),
+            "first call certificate scan must stop at the second call"
+        );
+        let second_values = first
+            .certificates()
+            .call_results_by_callsite
+            .get(&second_call.id)
+            .expect("second call result values");
+        assert!(second_values.contains(&second_alias));
+    }
+
+    #[test]
+    fn prepared_call_result_certifies_stack_store_reload_owner() {
+        let arch = make_x86_64_prep_arch();
+        let slot = make_unique(0x1780, 8);
+        let stored = make_unique(0x1788, 8);
+        let loaded = make_unique(0x1790, 8);
+        let alias = make_unique(0x1798, 8);
+        let blocks = vec![R2ILBlock {
+            addr: 0x1780,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntAdd {
+                    dst: slot.clone(),
+                    a: make_reg(24, 8),
+                    b: make_const(u64::MAX - 7, 8),
+                },
+                R2ILOp::Call {
+                    target: make_const(0x401000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: stored.clone(),
+                    src: make_reg(0, 8),
+                },
+                R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: slot.clone(),
+                    val: stored,
+                },
+                R2ILOp::Load {
+                    dst: loaded.clone(),
+                    space: SpaceId::Ram,
+                    addr: slot,
+                },
+                R2ILOp::Copy {
+                    dst: alias.clone(),
+                    src: loaded,
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let alias_var = prepared
+            .function()
+            .get_block(0x1780)
+            .and_then(|block| {
+                block.ops.iter().find_map(|op| match op {
+                    SSAOp::Copy { dst, .. } if dst.name == "tmp:1798" => Some(dst.clone()),
+                    _ => None,
+                })
+            })
+            .expect("reloaded alias");
+        let alias_value = prepared
+            .graph()
+            .value_id_for_var(&alias_var)
+            .expect("alias value");
+        let cert = prepared
+            .call_result_certificate_for_value(alias_value)
+            .expect("reloaded alias should have call-result certificate");
+        assert!(
+            matches!(cert.owner, Some(ValueOwner::StackSlot { offset: -8, .. })),
+            "reloaded call result should be owned by the frame slot, got {cert:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_stack_reload_certifies_param_home_source_through_extension() {
+        let mut arch = make_x86_64_prep_arch();
+        arch.add_register(RegisterDef::new("rsi", 32, 8));
+        arch.add_register(RegisterDef::new("esi", 32, 4));
+
+        let slot = make_unique(0x1820, 8);
+        let loaded = make_unique(0x1828, 4);
+        let extended = make_unique(0x1830, 8);
+        let blocks = vec![R2ILBlock {
+            addr: 0x1820,
+            size: 4,
+            ops: vec![
+                R2ILOp::IntAdd {
+                    dst: slot.clone(),
+                    a: make_reg(24, 8),
+                    b: make_const(0xffffffffffffffe0, 8),
+                },
+                R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: slot.clone(),
+                    val: make_reg(32, 4),
+                },
+                R2ILOp::Load {
+                    dst: loaded.clone(),
+                    space: SpaceId::Ram,
+                    addr: slot,
+                },
+                R2ILOp::IntSExt {
+                    dst: extended.clone(),
+                    src: loaded,
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let source_value = prepared
+            .graph()
+            .value_id_for_var(&SSAVar::new("esi", 0, 4))
+            .expect("entry esi value");
+        let load_cert = prepared
+            .stack_reload_certificate_for_op(0x1820, 2)
+            .expect("direct stack reload certificate");
+        assert_eq!(load_cert.source, source_value);
+        assert_eq!(load_cert.canonical_source, source_value);
+        assert_eq!(load_cert.base, StackAddressBase::FramePointer);
+        assert_eq!(load_cert.offset, -32);
+        assert_eq!(load_cert.value_width, 4);
+        assert_eq!(load_cert.memory_width, 4);
+
+        let extended_value = prepared
+            .graph()
+            .value_id_for_var(&SSAVar::new("tmp:1830", 1, 8))
+            .expect("extended index value");
+        let extended_cert = prepared
+            .stack_reload_certificate_for_value(extended_value)
+            .expect("extension should carry stack reload source");
+        assert_eq!(extended_cert.reload, load_cert.value);
+        assert_eq!(extended_cert.source, source_value);
+        assert_eq!(extended_cert.canonical_source, source_value);
+        assert_eq!(extended_cert.offset, -32);
+        assert_eq!(extended_cert.value_width, 8);
+        assert_eq!(extended_cert.memory_width, 4);
+        assert_eq!(extended_cert.store_access, load_cert.store_access);
+        assert_eq!(extended_cert.load_access, load_cert.load_access);
     }
 
     #[test]

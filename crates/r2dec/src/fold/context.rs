@@ -4,18 +4,13 @@ use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::CType;
-use r2ssa::{
-    CallSiteFacts, FunctionSSABlock, InterprocSummarySet, MemorySSAFacts, ObjectModel,
-    PredicateFacts, SSAVar, SsaArtifact, ValueId,
-};
+use r2ssa::{CallSiteFacts, MemorySSAFacts, ObjectModel, PredicateFacts, SsaArtifact, ValueId};
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
 use r2types::{
-    CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb, FunctionType,
-    InterprocSummaryView, SignatureRegistry, StackSlotKey, TypeOracle, VisibleBinding,
+    CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb, InterprocSummaryView,
+    SignatureRegistry, StackSlotKey, TypeOracle, VisibleBinding,
 };
-
-pub(crate) type SSABlock = FunctionSSABlock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ResolutionPhase {
@@ -55,14 +50,6 @@ pub(crate) struct EffectRenderProof {
     pub(crate) materialized_phi_copy: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PtrArith {
-    pub(crate) base: SSAVar,
-    pub(crate) index: SSAVar,
-    pub(crate) element_size: u32,
-    pub(crate) is_sub: bool,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct FoldArchConfig {
     pub(crate) ptr_size: u32,
@@ -79,7 +66,6 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) function_names: &'a HashMap<u64, String>,
     pub(crate) strings: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
-    pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
     pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
@@ -93,7 +79,6 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
-    pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
     pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
     pub(crate) prepared_objects: Option<&'a ObjectModel>,
@@ -125,9 +110,6 @@ pub struct FoldingContext<'a> {
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
     pub(crate) call_result_owner_name_cache:
         std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
-    pub(crate) call_result_owner_expr_cache:
-        std::cell::RefCell<HashMap<String, Option<crate::ast::CExpr>>>,
-    pub(crate) non_variadic_call_arity_cache: std::cell::RefCell<HashMap<String, Option<usize>>>,
     pub(crate) authoritative_source_args_cache:
         std::cell::RefCell<BTreeMap<(u64, usize), Vec<crate::ast::CExpr>>>,
     pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
@@ -209,8 +191,6 @@ impl<'a> FoldingContext<'a> {
             preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
             call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
-            call_result_owner_expr_cache: std::cell::RefCell::new(HashMap::new()),
-            non_variadic_call_arity_cache: std::cell::RefCell::new(HashMap::new()),
             authoritative_source_args_cache: std::cell::RefCell::new(BTreeMap::new()),
             owned_call_visible_names_cache: std::cell::RefCell::new(None),
             prepared_semantic_view_cache: OnceCell::new(),
@@ -327,7 +307,6 @@ impl<'a> FoldingContext<'a> {
         static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
         static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
         static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
-        static EMPTY_STRING_FNTY: OnceLock<HashMap<String, FunctionType>> = OnceLock::new();
         static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
         static EMPTY_STRING_CTYPE: OnceLock<HashMap<String, CType>> = OnceLock::new();
         static ARCH64: OnceLock<FoldArchConfig> = OnceLock::new();
@@ -344,7 +323,6 @@ impl<'a> FoldingContext<'a> {
             function_names: EMPTY_U64_STRING.get_or_init(HashMap::new),
             strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
             symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
-            known_function_signatures: EMPTY_STRING_FNTY.get_or_init(HashMap::new),
             callee_facts: EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new),
             callee_resolution: None,
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
@@ -358,7 +336,6 @@ impl<'a> FoldingContext<'a> {
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
-            interproc_summary_set: None,
             summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,

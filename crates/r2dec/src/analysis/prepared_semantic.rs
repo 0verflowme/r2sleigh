@@ -2,27 +2,26 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::function::DefLocation;
 use r2ssa::{
-    CompareKind, InterprocSummarySet, MemoryLocation, ObjectKind, SSAOp, SSAVar, SSAVarNameKind,
-    SsaArtifact, ValueId,
+    CompareKind, MemoryLocation, ObjectKind, ReturnCarrier, SSAOp, SSAVar, SSAVarNameKind,
+    SsaArtifact, ValueId, ValueOwner,
 };
 use r2types::{
-    CalleeIdentity, CalleeResolutionFacts, CallsiteKey, ExternalStackSlotRole,
-    ExternalStackSlotSpec, FunctionType, StackSlotKey, VisibleBinding, VisibleBindingKind,
+    CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
+    ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
 
 use super::lower::LowerCtx;
 use super::{
-    BaseRef, CallArgBinding, DecompilerFacts, FlagInfo, NormalizedAddr, PassEnv, ScalarValue,
-    SemanticCallArg, SemanticOwnershipFacts, SemanticValue, StackInfo, StackSlotProvenance,
-    StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
+    BaseRef, CallArgBinding, DecompilerFacts, FlagInfo, NormalizedAddr, PassEnv, SSABlock,
+    ScalarValue, SemanticCallArg, SemanticOwnershipFacts, SemanticValue, StackInfo,
+    StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
 };
 use crate::analysis::utils::{
     compare_const_to_expr, compare_const_to_expr_with_width, is_cpu_flag,
-    is_temporary_constant_or_memory_name, is_temporary_or_memory_name, parse_const_value,
+    is_generic_stack_placeholder_alias, is_temporary_constant_or_memory_name,
+    is_temporary_or_memory_name, parse_const_value,
 };
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
-use crate::fold::SSABlock;
-use crate::fold::op_lower::is_generic_stack_placeholder_alias;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StackAliasView {
@@ -61,11 +60,8 @@ pub(crate) struct PreparedSemanticView {
 
 pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) prepared: &'a SsaArtifact,
-    pub(crate) interproc_summary_set: Option<&'a InterprocSummarySet>,
     pub(crate) abi_arg_regs: &'a [String],
-    pub(crate) ret_reg_name: &'a str,
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
-    pub(crate) known_function_signatures: &'a HashMap<String, FunctionType>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -90,7 +86,7 @@ impl PreparedSemanticView {
         populate_stack_offsets(&mut view, inputs.prepared);
         overlay_param_home_stack_aliases(&mut view, &inputs);
         populate_owner_exprs(&mut view, inputs.prepared);
-        populate_call_result_sources(&mut view, inputs.prepared, inputs.ret_reg_name);
+        populate_call_result_sources(&mut view, inputs.prepared);
         populate_calls(&mut view, &inputs);
         populate_predicates(&mut view, &inputs);
         populate_switches(&mut view, &inputs);
@@ -206,12 +202,6 @@ impl PreparedSemanticView {
     fn insert_predicate_expr(&mut self, var: &SSAVar, expr: CExpr) {
         if let Some(value_id) = self.value_id_for_var(var) {
             self.predicate_expr_by_value.insert(value_id, expr);
-        }
-    }
-
-    fn insert_call_result_source(&mut self, var: &SSAVar, site: (u64, usize)) {
-        if let Some(value_id) = self.value_id_for_var(var) {
-            self.call_result_source_by_value.insert(value_id, site);
         }
     }
 
@@ -1221,78 +1211,12 @@ fn prepared_load_access_expr_from_visible_addr(expr: CExpr, elem_size: u32) -> O
     }
 }
 
-fn record_call_result_source_alias(
-    view: &mut PreparedSemanticView,
-    var: &SSAVar,
-    site: (u64, usize),
-) {
-    view.insert_call_result_source(var, site);
-}
-
-fn var_matches_return_register_family(var: &SSAVar, ret_reg_name: &str) -> bool {
-    let Some(ret_family) = crate::registers::register_family_name(ret_reg_name) else {
-        return false;
-    };
-    crate::registers::register_family_name(&var.name).as_deref() == Some(ret_family.as_str())
-}
-
-fn populate_call_result_sources(
-    view: &mut PreparedSemanticView,
-    prepared: &SsaArtifact,
-    ret_reg_name: &str,
-) {
-    for call_site in prepared.call_sites().by_id.values() {
-        let Some((block_addr, op_idx)) = prepared_call_site_tuple(prepared, call_site.at) else {
+fn populate_call_result_sources(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
+    for cert in prepared.certificates().call_results.values() {
+        let Some(site) = call_result_source_site(prepared, cert.call_site) else {
             continue;
         };
-        let Some(block) = prepared.function().get_block(block_addr) else {
-            continue;
-        };
-        let site = (block_addr, op_idx);
-        let mut tracked = HashSet::new();
-        let mut saw_call_define = false;
-        for op in block.ops.iter().skip(op_idx + 1) {
-            match op {
-                SSAOp::CallDefine { dst } => {
-                    saw_call_define = true;
-                    tracked.insert(dst.clone());
-                    record_call_result_source_alias(view, dst, site);
-                }
-                SSAOp::Copy { dst, src }
-                | SSAOp::IntZExt { dst, src }
-                | SSAOp::IntSExt { dst, src }
-                | SSAOp::Trunc { dst, src }
-                | SSAOp::Cast { dst, src, .. }
-                | SSAOp::Subpiece { dst, src, .. } => {
-                    if !saw_call_define
-                        && tracked.is_empty()
-                        && var_matches_return_register_family(src, ret_reg_name)
-                    {
-                        tracked.insert(src.clone());
-                        record_call_result_source_alias(view, src, site);
-                    }
-                    if tracked.contains(src) {
-                        tracked.insert(dst.clone());
-                        record_call_result_source_alias(view, dst, site);
-                    }
-                }
-                SSAOp::Store { val, .. }
-                    if !saw_call_define
-                        && tracked.is_empty()
-                        && var_matches_return_register_family(val, ret_reg_name) =>
-                {
-                    tracked.insert(val.clone());
-                    record_call_result_source_alias(view, val, site);
-                }
-                SSAOp::Call { .. } | SSAOp::CallInd { .. } if saw_call_define => break,
-                SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. }
-                    if saw_call_define =>
-                {
-                    break;
-                }
-                _ => {}
-            }
-        }
+        view.call_result_source_by_value.insert(cert.value, site);
     }
 }
 
@@ -1621,15 +1545,9 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             .structured()
             .recursive_calls
             .contains_key(&call_site.id)
+            && let Some(identity) = callee_identity.as_mut()
         {
-            if let Some(identity) = callee_identity.as_mut() {
-                identity.is_recursive = true;
-            } else if let Some(name) = inputs.prepared.function().name.as_deref() {
-                let mut identity = CalleeIdentity::from_name(name)
-                    .with_known_signature(inputs.known_function_signatures);
-                identity.is_recursive = true;
-                callee_identity = Some(identity);
-            }
+            identity.is_recursive = true;
         }
         let mut call_view = PreparedCallView {
             direct_target: call_site.direct_target,
@@ -1638,21 +1556,9 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             authoritative_arg_values: Vec::new(),
             result_owner: None,
         };
-        call_view.result_owner = infer_call_result_owner(
-            site,
-            inputs.prepared,
-            inputs.prepared.function(),
-            view,
-            inputs.ret_reg_name,
-        );
+        call_view.result_owner = certified_call_result_owner(call_site.id, inputs.prepared, view);
         if let Some(owner) = call_view.result_owner.clone() {
-            assign_call_result_owner(
-                site,
-                inputs.prepared.function(),
-                view,
-                &owner,
-                inputs.ret_reg_name,
-            );
+            assign_certified_call_result_owner(call_site.id, inputs.prepared, view, &owner);
         }
         let max_arity = prepared_call_max_arity(inputs, &call_view);
         let mut authoritative_args = infer_call_authoritative_args(
@@ -1691,21 +1597,13 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
 }
 
 fn prepared_call_max_arity(
-    inputs: &PreparedSemanticViewInputs<'_>,
+    _inputs: &PreparedSemanticViewInputs<'_>,
     call_view: &PreparedCallView,
 ) -> Option<usize> {
     call_view
         .callee_identity
         .as_ref()
         .and_then(CalleeIdentity::non_variadic_known_arity)
-        .or_else(|| {
-            call_view.direct_target.and_then(|target| {
-                inputs
-                    .interproc_summary_set
-                    .and_then(|set| set.summaries.get(&r2ssa::InterprocFunctionId(target)))
-                    .and_then(|summary| summary.arg_count_hint)
-            })
-        })
 }
 
 fn infer_call_authoritative_args(
@@ -1899,116 +1797,76 @@ fn prepared_result_expr_for_var(view: &PreparedSemanticView, var: &SSAVar) -> Op
         .or_else(|| prepared_call_expr_from_view(call_view))
 }
 
-fn infer_call_result_owner(
-    site: (u64, usize),
+fn call_result_source_site(
     prepared: &SsaArtifact,
-    function: &r2ssa::SSAFunction,
-    view: &PreparedSemanticView,
-    ret_reg_name: &str,
-) -> Option<CExpr> {
-    let (block_addr, op_idx) = site;
-    let block = function.get_block(block_addr)?;
-    let mut tracked = HashSet::new();
-    let mut saw_call_define = false;
-    let mut next_idx = op_idx + 1;
-    while let Some(op) = block.ops.get(next_idx) {
-        match op {
-            SSAOp::CallDefine { dst } => {
-                saw_call_define = true;
-                tracked.insert(dst.clone());
-                if let Some(owner) = view.owner_expr_for_var(dst) {
-                    return Some(owner.clone());
-                }
-            }
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Trunc { dst, src }
-            | SSAOp::Subpiece { dst, src, .. }
-            | SSAOp::Cast { dst, src, .. } => {
-                if !saw_call_define
-                    && tracked.is_empty()
-                    && var_matches_return_register_family(src, ret_reg_name)
-                {
-                    tracked.insert(src.clone());
-                }
-                if tracked.contains(src) {
-                    tracked.insert(dst.clone());
-                    if let Some(owner) = view.owner_expr_for_var(dst) {
-                        return Some(owner.clone());
-                    }
-                }
-            }
-            SSAOp::Store { addr, val, .. } if tracked.contains(val) => {
-                if let Some(offset) = view
-                    .stack_offset_for_var(addr)
-                    .or_else(|| stack_offset_for_value(prepared, addr))
-                    && let Some(alias) = preferred_stack_alias_name(view, offset)
-                {
-                    return Some(CExpr::Var(alias));
-                }
-            }
-            SSAOp::Call { .. } if saw_call_define => break,
-            SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. } => break,
-            _ if saw_call_define => {}
-            _ => {}
-        }
-        next_idx += 1;
-    }
-    None
+    call_site: r2ssa::CallSiteId,
+) -> Option<(u64, usize)> {
+    prepared
+        .certificates()
+        .callsites
+        .get(&call_site)
+        .map(|cert| (cert.block_addr, cert.op_index))
 }
 
-fn assign_call_result_owner(
-    site: (u64, usize),
-    function: &r2ssa::SSAFunction,
+fn certified_call_result_owner(
+    call_site: r2ssa::CallSiteId,
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+) -> Option<CExpr> {
+    prepared
+        .certificates()
+        .call_results_by_callsite
+        .get(&call_site)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| prepared.certificates().call_results.get(value))
+        .filter_map(|cert| certified_call_result_owner_expr(cert, prepared, view))
+        .next()
+}
+
+fn certified_call_result_owner_expr(
+    cert: &r2ssa::CallResultCertificate,
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+) -> Option<CExpr> {
+    match cert.owner.as_ref() {
+        Some(ValueOwner::StackSlot { offset, .. }) => {
+            preferred_stack_alias_name(view, *offset).map(CExpr::Var)
+        }
+        Some(ValueOwner::Value(value)) if *value != cert.value => {
+            let var = prepared.value_var(*value)?;
+            (!var.is_register()).then(|| CExpr::Var(var.display_name()))
+        }
+        Some(ValueOwner::Value(_)) | None => None,
+    }
+}
+
+fn assign_certified_call_result_owner(
+    call_site: r2ssa::CallSiteId,
+    prepared: &SsaArtifact,
     view: &mut PreparedSemanticView,
     owner: &CExpr,
-    ret_reg_name: &str,
 ) {
-    let (block_addr, op_idx) = site;
-    let Some(block) = function.get_block(block_addr) else {
+    let Some(values) = prepared
+        .certificates()
+        .call_results_by_callsite
+        .get(&call_site)
+    else {
         return;
     };
-    let mut tracked = HashSet::new();
-    let mut saw_call_define = false;
-    let mut next_idx = op_idx + 1;
-    while let Some(op) = block.ops.get(next_idx) {
-        match op {
-            SSAOp::CallDefine { dst } => {
-                saw_call_define = true;
-                tracked.insert(dst.clone());
-                if view.owner_expr_for_var(dst).is_none() {
-                    view.insert_owner_expr(dst, owner.clone());
-                }
-            }
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Trunc { dst, src }
-            | SSAOp::Subpiece { dst, src, .. }
-            | SSAOp::Cast { dst, src, .. } => {
-                if !saw_call_define
-                    && tracked.is_empty()
-                    && var_matches_return_register_family(src, ret_reg_name)
-                {
-                    tracked.insert(src.clone());
-                    if view.owner_expr_for_var(src).is_none() {
-                        view.insert_owner_expr(src, owner.clone());
-                    }
-                }
-                if tracked.contains(src) {
-                    tracked.insert(dst.clone());
-                    if view.owner_expr_for_var(dst).is_none() {
-                        view.insert_owner_expr(dst, owner.clone());
-                    }
-                }
-            }
-            SSAOp::Call { .. } if saw_call_define => break,
-            SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. } => break,
-            _ if saw_call_define => {}
-            _ => {}
+    for value in values {
+        let Some(cert) = prepared.certificates().call_results.get(value) else {
+            continue;
+        };
+        if !matches!(cert.owner.as_ref(), Some(ValueOwner::StackSlot { .. })) {
+            continue;
         }
-        next_idx += 1;
+        let Some(var) = prepared.value_var(cert.value) else {
+            continue;
+        };
+        if view.owner_expr_for_var(var).is_none() {
+            view.insert_owner_expr(var, owner.clone());
+        }
     }
 }
 
@@ -2038,6 +1896,19 @@ fn stack_offset_for_object_kind(kind: &ObjectKind) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+fn prepared_stack_reload_param_alias_expr(
+    prepared: &SsaArtifact,
+    env: &PassEnv<'_>,
+    value_id: ValueId,
+) -> Option<CExpr> {
+    let cert = prepared.stack_reload_certificate_for_value(value_id)?;
+    [cert.canonical_source, cert.source]
+        .into_iter()
+        .filter_map(|source| prepared.value_var(source))
+        .find_map(|var| param_alias_for_var(env.param_register_aliases, var))
+        .map(CExpr::Var)
 }
 
 fn expr_for_compare_operand(
@@ -2180,30 +2051,22 @@ fn param_alias_for_var(
         .cloned()
 }
 
-fn lookup_callee_identity(
-    inputs: &PreparedSemanticViewInputs<'_>,
-    addr: u64,
-) -> Option<CalleeIdentity> {
-    inputs
-        .callee_resolution
-        .and_then(|facts| facts.identity_for_direct_addr(addr))
-        .cloned()
-}
-
 fn lookup_callee_identity_for_site(
     inputs: &PreparedSemanticViewInputs<'_>,
     site: (u64, usize),
     direct_target: Option<u64>,
 ) -> Option<CalleeIdentity> {
-    let callsite = CallsiteKey {
-        block_addr: site.0,
-        op_index: site.1,
-    };
-    inputs
-        .callee_resolution
-        .and_then(|facts| facts.identity_for_callsite(callsite))
-        .cloned()
-        .or_else(|| direct_target.and_then(|addr| lookup_callee_identity(inputs, addr)))
+    CalleeResolutionFacts::resolve_target_identity(CalleeTargetIdentityRequest {
+        resolution: inputs.callee_resolution,
+        callsite: Some(CallsiteKey {
+            block_addr: site.0,
+            op_index: site.1,
+        }),
+        prepared_identity: None,
+        prepared_direct_target: direct_target,
+        direct_target_context: None,
+    })
+    .map(|target| target.identity)
 }
 
 fn scalar_owner_expr_for_value(
@@ -2965,25 +2828,30 @@ fn collect_prepared_runtime_facts(
                         continue;
                     };
                     let key = dst.display_name();
+                    let reload_value = view.value_id_for_var(dst);
                     let provenance = StackSlotProvenance {
                         offset,
                         predicate_carrier: false,
                         return_carrier: false,
                         value_kind: StackSlotValueKind::Scalar,
                     };
-                    merge_prepared_stack_slot(
-                        use_info,
-                        &key,
-                        view.value_id_for_var(dst),
-                        provenance,
-                    );
-                    if let Some(alias) = preferred_stack_alias_name(view, offset) {
-                        let expr = CExpr::Var(alias.clone());
+                    merge_prepared_stack_slot(use_info, &key, reload_value, provenance);
+                    let reload_param_expr = reload_value.and_then(|value_id| {
+                        prepared_stack_reload_param_alias_expr(prepared, env, value_id)
+                    });
+                    let stack_alias_expr = preferred_stack_alias_name(view, offset).map(CExpr::Var);
+                    if let Some(expr) = reload_param_expr.or(stack_alias_expr) {
+                        if let CExpr::Var(alias) = &expr {
+                            use_info
+                                .var_aliases
+                                .entry(key.clone())
+                                .or_insert_with(|| alias.clone());
+                        }
                         use_info
                             .definitions
                             .entry(key.clone())
                             .or_insert_with(|| expr.clone());
-                        if let Some(value_id) = view.value_id_for_var(dst) {
+                        if let Some(value_id) = reload_value {
                             use_info
                                 .definitions_by_value
                                 .entry(value_id)
@@ -2996,7 +2864,7 @@ fn collect_prepared_runtime_facts(
                         use_info.semantic_values.entry(key).or_insert_with(|| {
                             SemanticValue::Scalar(ScalarValue::Expr(expr.clone()))
                         });
-                        if let Some(value_id) = view.value_id_for_var(dst) {
+                        if let Some(value_id) = reload_value {
                             use_info
                                 .semantic_values_by_value
                                 .entry(value_id)
@@ -3009,7 +2877,7 @@ fn collect_prepared_runtime_facts(
                                 .stable_stack_values
                                 .entry(offset)
                                 .or_insert_with(|| {
-                                    SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(alias)))
+                                    SemanticValue::Scalar(ScalarValue::Expr(expr.clone()))
                                 });
                         }
                     }
@@ -3055,7 +2923,7 @@ fn populate_prepared_call_runtime_facts(
                 use_info.call_result_exprs.insert(site, call_expr.clone());
                 record_prepared_consumed_by_call(use_info, block, op_idx, env, prepared, view);
                 record_prepared_call_result_aliases(
-                    use_info, block, op_idx, prepared, view, env, &call_expr,
+                    use_info, block, op_idx, prepared, view, &call_expr,
                 );
             }
         }
@@ -3271,11 +3139,6 @@ fn prepared_call_callee_expr(call_view: &PreparedCallView) -> Option<CExpr> {
                 .as_ref()
                 .map(|identity| CExpr::Var(identity.primary_key()))
         })
-        .or_else(|| {
-            call_view
-                .direct_target
-                .map(|addr| CExpr::Var(format!("sub_{addr:x}")))
-        })
 }
 
 fn prepared_call_expr_from_view(call_view: &PreparedCallView) -> Option<CExpr> {
@@ -3350,101 +3213,66 @@ fn record_prepared_call_result_aliases(
     call_idx: usize,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
-    env: &PassEnv<'_>,
     call_expr: &CExpr,
 ) {
-    let mut tracked = HashSet::new();
-    let mut saw_call_define = false;
     let site = (block.addr, call_idx);
-    let mut next_idx = call_idx + 1;
+    let Some(call) = prepared.callsite_certificate_for_op(block.addr, call_idx) else {
+        return;
+    };
 
-    while let Some(op) = block.ops.get(next_idx) {
-        match op {
-            SSAOp::CallDefine { dst } => {
-                saw_call_define = true;
-                tracked.insert(dst.clone());
-                record_prepared_call_alias(use_info, site, &dst.display_name(), true);
-                use_info
-                    .definitions
-                    .insert(dst.display_name(), call_expr.clone());
-                use_info
-                    .formatted_defs
-                    .insert(dst.display_name(), call_expr.clone());
-            }
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Trunc { dst, src }
-            | SSAOp::Subpiece { dst, src, .. }
-            | SSAOp::Cast { dst, src, .. } => {
-                if !saw_call_define
-                    && tracked.is_empty()
-                    && var_matches_return_register_family(src, env.ret_reg_name)
-                {
-                    tracked.insert(src.clone());
-                    record_prepared_call_alias(use_info, site, &src.display_name(), true);
-                    use_info
-                        .definitions
-                        .entry(src.display_name())
-                        .or_insert_with(|| call_expr.clone());
-                    use_info
-                        .formatted_defs
-                        .entry(src.display_name())
-                        .or_insert_with(|| call_expr.clone());
-                }
-                if tracked.contains(src) {
-                    tracked.insert(dst.clone());
-                    record_prepared_call_alias(use_info, site, &dst.display_name(), true);
-                    use_info
-                        .definitions
-                        .entry(dst.display_name())
-                        .or_insert_with(|| call_expr.clone());
-                    use_info
-                        .formatted_defs
-                        .entry(dst.display_name())
-                        .or_insert_with(|| call_expr.clone());
-                }
-            }
-            SSAOp::Store { val, .. }
-                if !saw_call_define
-                    && tracked.is_empty()
-                    && var_matches_return_register_family(val, env.ret_reg_name) =>
-            {
-                tracked.insert(val.clone());
-                record_prepared_call_alias(use_info, site, &val.display_name(), true);
-                use_info
-                    .definitions
-                    .entry(val.display_name())
-                    .or_insert_with(|| call_expr.clone());
-                use_info
-                    .formatted_defs
-                    .entry(val.display_name())
-                    .or_insert_with(|| call_expr.clone());
-            }
-            SSAOp::Store { addr, val, .. } if tracked.contains(val) => {
-                if let Some(offset) = view
-                    .stack_offset_for_var(addr)
-                    .or_else(|| stack_offset_for_value(prepared, addr))
-                    && let Some(alias) = preferred_stack_alias_name(view, offset)
-                {
-                    record_prepared_call_alias(use_info, site, &alias, false);
-                    if offset < 0 {
-                        use_info
-                            .stable_stack_values
-                            .entry(offset)
-                            .or_insert_with(|| {
-                                SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(alias.clone())))
-                            });
-                    }
-                }
-            }
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } if saw_call_define => break,
-            SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::Return { .. } => break,
-            _ if saw_call_define => {}
-            _ => {}
+    for cert in prepared.call_result_certificates_for_callsite(call.call_site) {
+        let Some(var) = prepared.value_var(cert.value) else {
+            continue;
+        };
+        let direct = matches!(cert.owner.as_ref(), Some(ValueOwner::Value(_)))
+            && matches!(&cert.carrier, ReturnCarrier::Register { .. });
+        let alias = var.display_name();
+        let visible_aliases = prepared_visible_aliases_for_call_result(use_info, &alias);
+        record_prepared_call_alias(use_info, site, &alias, direct);
+        for visible_alias in visible_aliases {
+            record_prepared_call_alias(use_info, site, &visible_alias, false);
         }
-        next_idx += 1;
+        if direct {
+            use_info
+                .definitions
+                .entry(alias.clone())
+                .or_insert_with(|| call_expr.clone());
+            use_info
+                .formatted_defs
+                .entry(alias)
+                .or_insert_with(|| call_expr.clone());
+        }
+        if let Some(ValueOwner::StackSlot { offset, .. }) = cert.owner.as_ref()
+            && let Some(alias) = preferred_stack_alias_name(view, *offset)
+        {
+            record_prepared_call_alias(use_info, site, &alias, false);
+            if *offset < 0 {
+                use_info
+                    .stable_stack_values
+                    .entry(*offset)
+                    .or_insert_with(|| {
+                        SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(alias.clone())))
+                    });
+            }
+        }
     }
+}
+
+fn prepared_visible_aliases_for_call_result(use_info: &UseInfo, alias: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for key in [
+        alias,
+        &alias.to_ascii_lowercase(),
+        &alias.to_ascii_uppercase(),
+    ] {
+        if let Some(visible) = use_info.var_aliases.get(key)
+            && visible != alias
+            && !aliases.iter().any(|existing| existing == visible)
+        {
+            aliases.push(visible.clone());
+        }
+    }
+    aliases
 }
 
 fn record_prepared_call_alias(
@@ -3664,6 +3492,7 @@ fn param_alias_for_name(name: &str, env: &PassEnv<'_>) -> Option<String> {
 mod tests {
     use super::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use r2ssa::InterprocSummarySet;
 
     fn test_var(name: &str, version: u32, size: u32) -> SSAVar {
         SSAVar::new(name, version, size)
@@ -3686,6 +3515,19 @@ mod tests {
             target: Varnode::constant(0, 8),
         });
         SsaArtifact::from_blocks(&[block], None).expect("prepared call SSA artifact")
+    }
+
+    fn test_prepared_recursive_call_artifact() -> SsaArtifact {
+        let mut block = R2ILBlock::new(0x1500, 8);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x1500, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        SsaArtifact::raw(&[block], None)
+            .expect("prepared recursive call SSA artifact")
+            .with_name("sym.self")
     }
 
     fn test_x86_64_arg_arch() -> ArchSpec {
@@ -3825,9 +3667,7 @@ mod tests {
     #[test]
     fn prepared_view_build_preserves_param_alias_contract() {
         let prepared = test_prepared_artifact();
-        let summaries = InterprocSummarySet::default();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
-        let known_function_signatures = HashMap::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::from([
@@ -3837,11 +3677,8 @@ mod tests {
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
-            interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
-            ret_reg_name: "rax",
             callee_resolution: None,
-            known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3855,7 +3692,6 @@ mod tests {
     #[test]
     fn prepared_view_prefers_typed_callee_resolution_over_raw_name_maps() {
         let prepared = test_prepared_call_artifact();
-        let summaries = InterprocSummarySet::default();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let resolution_function_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
         let symbols = HashMap::new();
@@ -3883,11 +3719,8 @@ mod tests {
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
-            interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
-            ret_reg_name: "rax",
             callee_resolution: Some(&callee_resolution),
-            known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3903,12 +3736,27 @@ mod tests {
         assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
         assert_eq!(identity.primary_key(), "printf");
         assert!(identity.is_imported_name_hint());
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(r2types::CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: Some(&callee_resolution),
+                    callsite: None,
+                    prepared_identity: Some(identity),
+                    prepared_direct_target: None,
+                    direct_target_context: None,
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("typed callee identity should resolve policy");
+        assert!(
+            !resolved.policy.imported,
+            "typed function names alone must not authorize imported-call policy"
+        );
     }
 
     #[test]
     fn prepared_view_uses_typed_direct_addr_identity_without_callsite_binding() {
         let prepared = test_prepared_call_artifact();
-        let summaries = InterprocSummarySet::default();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
         let mut callee_resolution = CalleeResolutionFacts::default();
@@ -3918,18 +3766,15 @@ mod tests {
         callee_resolution
             .by_key
             .insert(key, CalleeIdentity::from_name("sym.imp.printf"));
-        let known_function_signatures = HashMap::new();
+        let callee_facts = BTreeMap::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
-            interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
-            ret_reg_name: "rax",
             callee_resolution: Some(&callee_resolution),
-            known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3944,25 +3789,36 @@ mod tests {
             .expect("direct-address identity should be used without callsite binding");
         assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
         assert!(identity.is_imported_name_hint());
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(r2types::CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: Some(&callee_resolution),
+                    callsite: None,
+                    prepared_identity: Some(identity),
+                    prepared_direct_target: None,
+                    direct_target_context: None,
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("direct-address callee identity should resolve policy");
+        assert!(
+            !resolved.policy.imported,
+            "direct-address identities built from raw names remain import hints only"
+        );
     }
 
     #[test]
     fn prepared_view_refuses_raw_callee_identity_without_typed_resolution() {
         let prepared = test_prepared_call_artifact();
-        let summaries = InterprocSummarySet::default();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
-        let known_function_signatures = HashMap::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
-            interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
-            ret_reg_name: "rax",
             callee_resolution: None,
-            known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3975,6 +3831,41 @@ mod tests {
             call_view.callee_identity.is_none(),
             "prepared semantic view must not certify raw callee names without typed resolution"
         );
+        assert!(
+            prepared_call_expr_from_view(call_view).is_none(),
+            "prepared calls must not fall back to fabricated sub_<addr> expressions"
+        );
+    }
+
+    #[test]
+    fn prepared_view_refuses_recursive_name_identity_without_typed_resolution() {
+        let prepared = test_prepared_recursive_call_artifact();
+        assert_eq!(
+            prepared.structured().recursive_calls.len(),
+            1,
+            "fixture should expose a structural recursive call"
+        );
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            callee_resolution: None,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1500, 0))
+            .expect("recursive direct callsite should have prepared call view");
+        assert!(
+            call_view.callee_identity.is_none(),
+            "recursive function names are not callee identity evidence"
+        );
     }
 
     #[test]
@@ -3986,7 +3877,7 @@ mod tests {
         let callee_facts = BTreeMap::new();
         let known_function_signatures = HashMap::from([(
             "sym.imp.one_arg".to_string(),
-            FunctionType {
+            r2types::FunctionType {
                 return_type: r2types::CTypeLike::Void,
                 params: vec![r2types::CTypeLike::Int {
                     bits: 32,
@@ -4023,11 +3914,8 @@ mod tests {
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
-            interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
-            ret_reg_name: "rax",
             callee_resolution: Some(&callee_resolution),
-            known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4047,15 +3935,14 @@ mod tests {
     }
 
     #[test]
-    fn prepared_call_arity_uses_summary_hint_when_typed_signature_is_absent() {
+    fn prepared_call_arity_rejects_summary_hint_when_typed_signature_is_absent() {
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
-        let known_function_signatures = HashMap::new();
         let mut summaries = InterprocSummarySet::default();
         let summary_id = r2ssa::InterprocFunctionId(0x401000);
         let mut summary =
             r2ssa::FunctionSemanticSummary::unknown(summary_id, Some("sym.local_two_arg".into()));
-        summary.arg_count_hint = Some(2);
+        summary.arg_count_hint = Some(1);
         summaries.summaries.insert(summary_id, summary);
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
@@ -4063,11 +3950,8 @@ mod tests {
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
-            interproc_summary_set: Some(&summaries),
             abi_arg_regs: &abi_arg_regs,
-            ret_reg_name: "rax",
             callee_resolution: None,
-            known_function_signatures: &known_function_signatures,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4102,7 +3986,9 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
+            summary_view: None,
             arg_regs: &arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,
@@ -4132,7 +4018,9 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_facts: crate::analysis::empty_callee_facts(),
             callee_resolution: None,
+            summary_view: None,
             arg_regs: &arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,

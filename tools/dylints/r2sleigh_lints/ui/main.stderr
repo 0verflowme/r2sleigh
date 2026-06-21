@@ -7,7 +7,7 @@ LL |     name.starts_with("tmp:")
    = note: `#[warn(string_prefix_semantic_classification)]` on by default
 
 warning: internal analysis must use typed radare2 collector APIs instead of JSON command strings
-  --> $DIR/main.rs:12:13
+  --> $DIR/main.rs:78:13
    |
 LL |     let _ = "afcfj";
    |             ^^^^^^^

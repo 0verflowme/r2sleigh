@@ -1,0 +1,10 @@
+warning: r2plugin must derive canonical arch targets through r2engine, then construct renderer config at the render boundary
+  --> $DIR/renderer_config_arch_target.rs:23:13
+   |
+LL |     let _ = r2dec::DecompilerConfig::for_arch(Some(&arch));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_renderer_config_arch_target_ownership)]` on by default
+
+warning: 1 warning emitted
+

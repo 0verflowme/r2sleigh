@@ -126,6 +126,13 @@ where
             .expect("engine cache counters write lock poisoned") = CacheCounters::default();
     }
 
+    pub fn clear_entries(&self) {
+        self.inner
+            .write()
+            .expect("engine cache write lock poisoned")
+            .clear();
+    }
+
     pub fn len(&self) -> usize {
         self.inner
             .read()
@@ -181,6 +188,12 @@ where
         let ticket = self.next_ticket;
         self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
         ticket
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.next_ticket = 1;
     }
 
     fn get(&mut self, key: &K) -> Option<Arc<V>> {

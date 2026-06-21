@@ -161,10 +161,22 @@ pub enum SummaryReturnRelation {
     Global(u64),
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum FunctionSemanticLinkage {
+    #[default]
+    Unknown,
+    Internal,
+    Imported,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionSemanticSummary {
     pub id: InterprocFunctionId,
     pub name: Option<String>,
+    #[serde(default)]
+    pub linkage: FunctionSemanticLinkage,
     #[serde(default)]
     pub arg_count_hint: Option<usize>,
     pub direct_callees: BTreeSet<u64>,
@@ -194,6 +206,7 @@ impl FunctionSemanticSummary {
         Self {
             id,
             name,
+            linkage: FunctionSemanticLinkage::Unknown,
             arg_count_hint: None,
             direct_callees: BTreeSet::new(),
             callsite_count: 0,
@@ -377,6 +390,7 @@ impl FunctionSemanticSummary {
         Some(Self {
             id,
             name: Some(normalized.to_string()),
+            linkage: FunctionSemanticLinkage::Unknown,
             arg_count_hint: Some(match normalized {
                 "malloc" | "free" | "strlen" | "puts" | "printf" | "exit" | "retain"
                 | "release" | "lock" | "unlock" => 1,
@@ -959,6 +973,7 @@ fn initial_summary(
     FunctionSemanticSummary {
         id,
         name,
+        linkage: FunctionSemanticLinkage::Unknown,
         arg_count_hint,
         direct_callees: local.direct_callees.clone(),
         callsite_count: local.callsite_count,
@@ -1045,6 +1060,7 @@ fn resolve_summary(
     FunctionSemanticSummary {
         id,
         name,
+        linkage: FunctionSemanticLinkage::Unknown,
         arg_count_hint,
         direct_callees: local.direct_callees.clone(),
         callsite_count: local.callsite_count,

@@ -58,15 +58,13 @@ pub use variable::VariableRecovery;
 
 use crate::fold::FoldingContext;
 use crate::fold::context::{EffectRenderProof, EffectRenderProofKind, FoldArchConfig, FoldInputs};
-#[cfg(test)]
-use r2il::R2ILBlock;
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, CalleeResolutionFacts, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts,
     FunctionSignatureSpec, FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference,
-    TypeOracle, VisibleBinding, VisibleBindingKind, normalize_callee_name,
+    TypeOracle, VisibleBinding, VisibleBindingKind,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -1147,72 +1145,6 @@ pub fn semantic_fallback_comment(
     consumer_fallback::semantic_fallback_comment(func_name, &function_facts)
 }
 
-#[cfg(test)]
-pub fn preferred_semantic_fallback_comment(
-    func_name: &str,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
-) -> Option<String> {
-    let function_facts = r2types::FunctionFacts::new(
-        r2types::FunctionTypeFacts::default(),
-        semantic_artifact.cloned(),
-    );
-    planner::preferred_semantic_fallback_comment(func_name, &function_facts)
-}
-
-#[cfg(test)]
-pub fn detached_semantic_linearization_reason(
-    func_name: &str,
-    blocks: &[R2ILBlock],
-    function_facts: &FunctionFacts,
-) -> Option<String> {
-    planner::detached_semantic_linearization_reason(func_name, blocks, function_facts)
-}
-
-#[cfg(test)]
-pub fn detached_semantic_route_plan(
-    func_name: &str,
-    blocks: &[R2ILBlock],
-    function_facts: &FunctionFacts,
-) -> Option<SemanticRoutePlan> {
-    planner::detached_semantic_route_plan(func_name, blocks, function_facts)
-}
-
-#[cfg(test)]
-fn preferred_semantic_linearization_reason(
-    func_name: &str,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-) -> Option<String> {
-    let function_facts = r2types::FunctionFacts::new(
-        r2types::FunctionTypeFacts::default(),
-        semantic_artifact.cloned(),
-    );
-    planner::preferred_semantic_linearization_reason(func_name, &function_facts, cfg_summary)
-}
-
-#[cfg(test)]
-fn preferred_semantic_structuring_reason(
-    func_name: &str,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
-    cfg_summary: &r2ssa::CFGRiskSummary,
-) -> Option<String> {
-    let function_facts = r2types::FunctionFacts::new(
-        r2types::FunctionTypeFacts::default(),
-        semantic_artifact.cloned(),
-    );
-    planner::preferred_semantic_structuring_reason(func_name, &function_facts, cfg_summary)
-}
-
-#[cfg(test)]
-pub fn cfg_guard_reason_from_summary(summary: &r2ssa::CFGRiskSummary) -> Option<String> {
-    planner::cfg_guard_reason_from_summary(summary)
-}
-
-#[cfg(test)]
-pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
-    planner::cfg_guard_reason(blocks)
-}
-
 pub fn block_guard_fallback_comment(func_name: &str, blocks: usize, max_blocks: usize) -> String {
     planner::block_guard_fallback_comment(func_name, blocks, max_blocks)
 }
@@ -1264,8 +1196,10 @@ fn append_summary_return_if_needed(
     if body.iter().any(summary_stmt_contains_return) {
         return;
     }
-    if let Some(expr) = semantic_summary_return_expr(function_facts, semantic_artifact) {
-        body.push(CStmt::Return(Some(expr)));
+    if semantic_summary_return_expr(function_facts, semantic_artifact).is_some() {
+        body.push(CStmt::comment(
+            "summary return value intentionally not reconstructed as executable C".to_string(),
+        ));
     } else {
         body.push(CStmt::comment(
             "summary return unresolved; value intentionally not reconstructed".to_string(),
@@ -1277,20 +1211,12 @@ fn append_semantic_summary_return_to_function_if_needed(
     func: &mut CFunction,
     function_facts: &FunctionFacts,
 ) {
-    append_semantic_summary_return_to_function_if_needed_with_mode(func, function_facts, true);
+    append_semantic_summary_return_comment_to_function_if_needed(func, function_facts);
 }
 
 fn append_semantic_summary_return_comment_to_function_if_needed(
     func: &mut CFunction,
     function_facts: &FunctionFacts,
-) {
-    append_semantic_summary_return_to_function_if_needed_with_mode(func, function_facts, false);
-}
-
-fn append_semantic_summary_return_to_function_if_needed_with_mode(
-    func: &mut CFunction,
-    function_facts: &FunctionFacts,
-    allow_executable_return: bool,
 ) {
     if matches!(func.ret_type, CType::Void | CType::Unknown) {
         return;
@@ -1301,10 +1227,10 @@ fn append_semantic_summary_return_to_function_if_needed_with_mode(
     let Some(semantic_artifact) = function_facts.semantic_artifact() else {
         return;
     };
-    if allow_executable_return
-        && let Some(expr) = semantic_summary_return_expr(function_facts, semantic_artifact)
-    {
-        func.body.push(CStmt::Return(Some(expr)));
+    if semantic_summary_return_expr(function_facts, semantic_artifact).is_some() {
+        func.body.push(CStmt::comment(
+            "summary return value intentionally not reconstructed as executable C".to_string(),
+        ));
     } else {
         func.body.push(CStmt::comment(
             "summary return unresolved; value intentionally not reconstructed".to_string(),
@@ -2186,6 +2112,25 @@ fn certified_effect_proof_counts(
     }
 }
 
+fn return_value_has_certified_call_result_effect(
+    prepared: &r2ssa::SsaArtifact,
+    effect_render_proofs: &[EffectRenderProof],
+    value: r2ssa::ValueId,
+) -> bool {
+    let certificates = prepared.certificates();
+    let Some(call_result) = certificates.call_results.get(&value) else {
+        return false;
+    };
+    let Some(callsite) = certificates.callsites.get(&call_result.call_site) else {
+        return false;
+    };
+    effect_render_proofs.iter().any(|proof| {
+        proof.kind == EffectRenderProofKind::Call
+            && proof.block_addr == callsite.block_addr
+            && proof.op_idx == callsite.op_index
+    })
+}
+
 #[cfg(test)]
 fn certified_standard_output_residual_reason(
     prepared: &r2ssa::SsaArtifact,
@@ -2377,6 +2322,15 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                             "rendered return proof at 0x{:x}:{} value proof {:?} disagrees with ReturnValueCertificate value {:?}",
                             proof.block_addr, proof.op_idx, proof.value, cert.value
                         ));
+                    }
+                    if proof.value.is_some_and(|value| {
+                        return_value_has_certified_call_result_effect(
+                            prepared,
+                            effect_render_proofs,
+                            value,
+                        )
+                    }) {
+                        continue;
                     }
                     match proof.value.and_then(|value| {
                         certificates
@@ -2943,12 +2897,68 @@ fn is_uncertified_render_var_name(name: &str) -> bool {
     let stripped = name.trim_start_matches('&');
     let lower = stripped.to_ascii_lowercase();
     crate::analysis::utils::is_temporary_name(stripped)
+        || stripped == "__r2dec_unresolved_call_arg"
         || lower.starts_with("tmp_")
         || lower.starts_with("unique_")
         || lower.starts_with("stack_")
         || lower.starts_with("local_")
         || lower.starts_with("var_")
+        || is_unversioned_raw_register_label(stripped)
         || is_ssa_versioned_register_label(stripped)
+}
+
+fn is_unversioned_raw_register_label(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "al" | "ah"
+            | "ax"
+            | "eax"
+            | "rax"
+            | "bl"
+            | "bh"
+            | "bx"
+            | "ebx"
+            | "rbx"
+            | "cl"
+            | "ch"
+            | "cx"
+            | "ecx"
+            | "rcx"
+            | "dl"
+            | "dh"
+            | "dx"
+            | "edx"
+            | "rdx"
+            | "si"
+            | "esi"
+            | "rsi"
+            | "di"
+            | "edi"
+            | "rdi"
+            | "sp"
+            | "esp"
+            | "rsp"
+            | "bp"
+            | "ebp"
+            | "rbp"
+            | "x0"
+            | "w0"
+            | "x1"
+            | "w1"
+            | "x2"
+            | "w2"
+            | "x3"
+            | "w3"
+            | "x8"
+            | "w8"
+            | "x9"
+            | "w9"
+            | "x10"
+            | "w10"
+            | "x20"
+            | "w20"
+    )
 }
 
 fn stmt_contains_loop_construct(stmt: &CStmt) -> bool {
@@ -3554,9 +3564,9 @@ pub struct DecompilerContext {
     /// Optional engine-owned decision for whether prepared semantic facts should
     /// be used during folding.
     pub use_prepared_semantic_view: Option<bool>,
-    /// Engine-owned typed call-target identity index. Direct r2dec callers may
-    /// leave this empty; engine callers should provide it so rendering does not
-    /// reconstruct call ownership from raw maps.
+    /// Engine-owned typed call-target identity index. When absent, r2dec must
+    /// not reconstruct call ownership from raw maps; callers that need typed
+    /// callee identity should pass the engine-owned resolution.
     pub callee_resolution: Option<CalleeResolutionFacts>,
     /// Engine-selected permission for the selected route. Missing means legacy
     /// direct r2dec callers still use local certifying gates.
@@ -3907,11 +3917,7 @@ impl Decompiler {
     /// Build a C function from a prepared function + typed context payload.
     pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction {
         let decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
-        decompiler.build_function_internal(
-            input.prepared_ssa.function(),
-            Some(&input.prepared_ssa),
-            input.interproc_summary_set.as_ref(),
-        )
+        decompiler.build_function_internal(input.prepared_ssa.function(), Some(&input.prepared_ssa))
     }
 
     pub(crate) fn stmt_has_content(stmt: &CStmt) -> bool {
@@ -4208,16 +4214,22 @@ impl Decompiler {
             BlockTerminator::ConditionalBranch {
                 true_target,
                 false_target,
-            } => {
-                let cond = fold_ctx
-                    .extract_condition_from_block(block)
-                    .unwrap_or(CExpr::IntLit(1));
-                Some(CStmt::if_stmt(
-                    cond,
-                    CStmt::Goto(Self::linear_block_label(*true_target)),
-                    Some(CStmt::Goto(Self::linear_block_label(*false_target))),
-                ))
-            }
+            } => fold_ctx
+                .extract_condition_from_block(block)
+                .map(|cond| {
+                    CStmt::if_stmt(
+                        cond,
+                        CStmt::Goto(Self::linear_block_label(*true_target)),
+                        Some(CStmt::Goto(Self::linear_block_label(*false_target))),
+                    )
+                })
+                .or_else(|| {
+                    Some(CStmt::comment(format!(
+                        "conditional branch condition unresolved; true_target={}, false_target={}",
+                        Self::linear_block_label(*true_target),
+                        Self::linear_block_label(*false_target)
+                    )))
+                }),
             BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
                 Some(CStmt::Goto(Self::linear_block_label(*target)))
             }
@@ -4258,14 +4270,13 @@ impl Decompiler {
 
     /// Build a C function from an SSA function.
     pub fn build_function(&self, func: &SSAFunction) -> CFunction {
-        self.build_function_internal(func, None, None)
+        self.build_function_internal(func, None)
     }
 
     fn build_function_internal(
         &self,
         func: &SSAFunction,
         prepared: Option<&r2ssa::SsaArtifact>,
-        interproc_summary_set: Option<&r2ssa::InterprocSummarySet>,
     ) -> CFunction {
         // Materialize phis on non-critical edges to reduce SSA artifacts in output.
         let normalized_func = normalize::materialize_phis(func);
@@ -4355,46 +4366,7 @@ impl Decompiler {
             .as_ref()
             .map(|oracle| oracle as &dyn TypeOracle);
 
-        let known_function_signatures = self
-            .context
-            .type_facts()
-            .known_function_signatures
-            .iter()
-            .map(|(name, ty)| (normalize_callee_name(name), ty.clone()))
-            .collect::<std::collections::HashMap<_, _>>();
-        let fallback_callee_resolution = self.context.callee_resolution.is_none().then(|| {
-            prepared.map(|artifact| {
-                let ctx = r2types::CalleeIdentityContext {
-                    function_names: &self.context.function_names,
-                    symbols: &self.context.symbols,
-                    callee_facts: &self.context.type_facts().callee_facts,
-                    known_function_signatures: &known_function_signatures,
-                };
-                r2types::CalleeResolutionFacts::from_direct_call_targets(
-                    artifact
-                        .call_sites()
-                        .by_id
-                        .values()
-                        .filter_map(|call_site| {
-                            let direct_target = call_site.direct_target?;
-                            let (block_addr, op_index) = artifact.inst_op_site(call_site.at)?;
-                            Some((
-                                r2types::CallsiteKey {
-                                    block_addr,
-                                    op_index,
-                                },
-                                direct_target,
-                            ))
-                        }),
-                    &ctx,
-                )
-            })
-        });
-        let callee_resolution = self
-            .context
-            .callee_resolution
-            .as_ref()
-            .or_else(|| fallback_callee_resolution.as_ref().and_then(Option::as_ref));
+        let callee_resolution = self.context.callee_resolution.as_ref();
 
         let recovered_param_infos: Vec<_> = var_recovery
             .parameters()
@@ -4476,11 +4448,8 @@ impl Decompiler {
         let prepared_semantic_view = use_prepared_semantic_view.then(|| {
             analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
                 prepared: prepared.expect("prepared semantic view requires prepared artifact"),
-                interproc_summary_set,
                 abi_arg_regs: &self.config.arg_regs,
-                ret_reg_name: &fold_arch.ret_reg_name,
                 callee_resolution,
-                known_function_signatures: &known_function_signatures,
                 stack_slots: &self.context.type_facts().stack_slots,
                 visible_bindings: &self.context.type_facts().visible_bindings,
                 param_register_aliases: &param_register_aliases,
@@ -4491,7 +4460,6 @@ impl Decompiler {
             function_names: &self.context.function_names,
             strings: &self.context.strings,
             symbols: &self.context.symbols,
-            known_function_signatures: &known_function_signatures,
             callee_facts: &self.context.type_facts().callee_facts,
             callee_resolution,
             stack_slots: &self.context.type_facts().stack_slots,
@@ -4505,7 +4473,6 @@ impl Decompiler {
             type_oracle,
             function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
             prepared_ssa: prepared,
-            interproc_summary_set,
             summary_view: Some(&self.context.function_facts.summary_view),
             prepared_semantic_view: prepared_semantic_view.as_ref(),
             prepared_objects: prepared.map(|artifact| artifact.objects()),
@@ -4557,33 +4524,22 @@ impl Decompiler {
             && matches!(semantic_route, planner::SemanticRoutePlan::Standard)
             && !Self::stmt_has_content(&body_stmt)
         {
-            if let Some(semantic_body) = structurer.structure_semantic_worker_islands(6) {
-                body_stmt = consumer_structured::semantic_worker_structured_body(
-                    "semantic control islands",
-                    semantic_body,
-                );
-                control_render_proofs.clear();
-                effect_render_proofs.clear();
-                use_conservative_locals = true;
-                is_linear_fallback = false;
-            } else {
-                let folded_reason = structurer
-                    .safety_reason()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "folded structuring produced empty output".to_string());
-                let empty_fallback = consumer_fallback::recover_empty_structuring(
-                    func,
-                    &fold_ctx,
-                    folded_reason,
-                    None,
-                    || self.linearize_function_body(func, &fold_ctx),
-                );
-                use_conservative_locals = empty_fallback.use_conservative_locals;
-                is_linear_fallback = empty_fallback.is_linear_fallback;
-                body_stmt = empty_fallback.body_stmt;
-                control_render_proofs.clear();
-                effect_render_proofs.clear();
-            }
+            let folded_reason = structurer
+                .safety_reason()
+                .map(str::to_string)
+                .unwrap_or_else(|| "folded structuring produced empty output".to_string());
+            let empty_fallback = consumer_fallback::recover_empty_structuring(
+                func,
+                &fold_ctx,
+                folded_reason,
+                None,
+                || self.linearize_function_body(func, &fold_ctx),
+            );
+            use_conservative_locals = empty_fallback.use_conservative_locals;
+            is_linear_fallback = empty_fallback.is_linear_fallback;
+            body_stmt = empty_fallback.body_stmt;
+            control_render_proofs.clear();
+            effect_render_proofs.clear();
         }
 
         if !certified_standard_mode
@@ -4701,17 +4657,22 @@ impl Decompiler {
             locals,
             body,
         };
-        let appended_stack_return = if !matches!(c_function.ret_type, CType::Void | CType::Unknown)
-            && !c_function.body.iter().any(summary_stmt_contains_return)
-            && let Some(expr) = fold_ctx.unique_scalar_stack_return_expr()
-        {
-            c_function.body.push(CStmt::Return(Some(expr)));
-            true
-        } else {
-            false
-        };
+        let appended_stack_return =
+            if matches!(semantic_route, planner::SemanticRoutePlan::Standard)
+                && !matches!(c_function.ret_type, CType::Void | CType::Unknown)
+                && !c_function.body.iter().any(summary_stmt_contains_return)
+                && let Some(expr) = fold_ctx.unique_scalar_stack_return_expr()
+            {
+                c_function.body.push(CStmt::Return(Some(expr)));
+                true
+            } else {
+                false
+            };
         if appended_stack_return && certified_standard_mode {
             effect_render_proofs = fold_ctx.effect_render_proofs();
+        }
+        if prepared.is_some() && matches!(semantic_route, planner::SemanticRoutePlan::Standard) {
+            fold_ctx.prune_duplicate_call_statements_by_source(&mut c_function.body);
         }
         if certified_standard_mode {
             fold_ctx.prune_duplicate_tail_call_statements(&mut c_function.body);
@@ -6023,7 +5984,9 @@ pub fn infer_local_struct_field_accesses(
         function_names: &function_names,
         strings: &strings,
         symbols: &symbols,
+        callee_facts: analysis::empty_callee_facts(),
         callee_resolution: None,
+        summary_view: None,
         arg_regs: &config.arg_regs,
         param_register_aliases: &param_register_aliases,
         caller_saved_regs: &config.caller_saved_regs,
@@ -6180,6 +6143,95 @@ mod tests {
         SSAFunction::from_blocks_with_arch(&[block], Some(arch))
             .expect("SSA function should build")
             .with_name("stable_demo")
+    }
+
+    fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
+        let arch = Box::leak(Box::new(FoldArchConfig {
+            ptr_size: 8,
+            sp_name: "rsp".to_string(),
+            fp_name: "rbp".to_string(),
+            ret_reg_name: "rax".to_string(),
+            arg_regs: vec![
+                "rdi".to_string(),
+                "rsi".to_string(),
+                "rdx".to_string(),
+                "rcx".to_string(),
+                "r8".to_string(),
+                "r9".to_string(),
+            ],
+            caller_saved_regs: HashSet::new(),
+        }));
+        FoldingContext::from_inputs(FoldInputs {
+            arch,
+            function_names: Box::leak(Box::new(HashMap::new())),
+            strings: Box::leak(Box::new(HashMap::new())),
+            symbols: Box::leak(Box::new(HashMap::new())),
+            callee_facts: Box::leak(Box::new(BTreeMap::new())),
+            callee_resolution: None,
+            stack_slots: Box::leak(Box::new(BTreeMap::new())),
+            external_stack_vars: Box::leak(Box::new(HashMap::new())),
+            visible_bindings: Box::leak(Box::new(Vec::new())),
+            external_type_db: Box::leak(Box::new(ExternalTypeDb::default())),
+            semantic_artifact: None,
+            param_register_aliases: Box::leak(Box::new(HashMap::new())),
+            type_hints: Box::leak(Box::new(HashMap::new())),
+            type_oracle: None,
+            function_return_type: None,
+            prepared_ssa: None,
+            summary_view: None,
+            prepared_semantic_view: None,
+            prepared_objects: None,
+            prepared_memory: None,
+            prepared_predicates: None,
+            prepared_call_sites: None,
+        })
+    }
+
+    #[test]
+    fn linearized_conditional_branch_without_predicate_is_residual_comment() {
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1000,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: Varnode::constant(0x2000, 8),
+                    cond: Varnode::constant(1, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1004,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: Varnode::constant(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x2000,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: Varnode::constant(1, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA function");
+        func.get_block_mut(0x1000).expect("entry block").ops.clear();
+        let block = func.get_block(0x1000).expect("entry block");
+        let fold_ctx = empty_fold_context_for_linearization();
+
+        let stmt = Decompiler::linearized_terminator_stmt(&func, &fold_ctx, block)
+            .expect("linearized residual terminator");
+        let CStmt::Comment(comment) = stmt else {
+            panic!("unresolved conditional branch must not fabricate executable control: {stmt:?}");
+        };
+        assert!(comment.contains("conditional branch condition unresolved"));
+        assert!(comment.contains("true_target=loc_2000"));
+        assert!(comment.contains("false_target=loc_1004"));
     }
 
     #[test]
@@ -7458,21 +7510,47 @@ mod tests {
         );
 
         let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let built_first = decompiler.build_function(&func);
+        let built_second = decompiler.build_function(&func);
         let first = decompiler.decompile(&func);
         let second = decompiler.decompile(&func);
 
         assert_eq!(first, second, "predicate-heavy text should be byte-stable");
+        assert_eq!(
+            built_first.body, built_second.body,
+            "predicate-heavy AST should be stable across builds"
+        );
+        let return_expr = built_first
+            .body
+            .iter()
+            .find_map(|stmt| match stmt {
+                CStmt::Return(Some(expr)) => Some(expr),
+                _ => None,
+            })
+            .expect("predicate-heavy function should end in a value return");
+        fn peel_predicate_wrapper(expr: &CExpr) -> &CExpr {
+            match expr {
+                CExpr::Cast { expr, .. } | CExpr::Paren(expr) => peel_predicate_wrapper(expr),
+                other => other,
+            }
+        }
+        let predicate = peel_predicate_wrapper(return_expr);
         assert!(
-            first.contains("return (int64_t)(arg1 !=") || first.contains("return arg1 != 19;"),
-            "decompiled predicate should use a direct comparison, got:\n{first}"
+            matches!(
+                predicate,
+                CExpr::Binary {
+                    op: BinaryOp::Ne,
+                    left,
+                    right,
+                } if matches!(left.as_ref(), CExpr::Var(name) if name == "arg1")
+                    && matches!(right.as_ref(), CExpr::IntLit(19))
+            ),
+            "decompiled predicate should lower to arg1 != 19, got {return_expr:?}"
         );
         assert!(
-            !first.contains("0 != 0"),
-            "decompiled predicate must not collapse into a dead boolean"
-        );
-        assert!(
-            !first.contains("zf_"),
-            "decompiled predicate should not leak flag temporaries"
+            !format!("{:?}", built_first.body).contains("zf_"),
+            "decompiled predicate AST should not leak flag temporaries: {:?}",
+            built_first.body
         );
     }
 
@@ -7547,6 +7625,53 @@ mod tests {
     }
 
     #[test]
+    fn decompile_input_nonstandard_summary_routes_are_comment_only() {
+        let arch = test_arch_for_decompile();
+        for route in [
+            SemanticRoutePlan::StructuredWorker {
+                reason: "engine-selected structured summary route".to_string(),
+            },
+            SemanticRoutePlan::LinearWorker {
+                reason: "engine-selected linear summary route".to_string(),
+            },
+            SemanticRoutePlan::SummaryIslands {
+                reason: "engine-selected island summary route".to_string(),
+            },
+        ] {
+            let prepared = prepared_from_ops(
+                vec![R2ILOp::Return {
+                    target: Varnode::constant(0, 8),
+                }],
+                &arch,
+            );
+            let signature = signature_spec(Some(CType::Int(32)), Vec::new());
+            let context = DecompilerContext::default()
+                .with_type_facts(FunctionTypeFacts {
+                    signature_certificate: external_signature_certificate(&signature),
+                    merged_signature: Some(signature),
+                    ..FunctionTypeFacts::default()
+                })
+                .with_semantic_route(Some(route.clone()));
+            let input = DecompilerInput::new(prepared, context);
+
+            let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+
+            assert!(
+                output.contains(
+                    "render contract: summary facts only; no executable native C reconstructed"
+                ),
+                "summary route builder path must state the render contract for {route:?}, got:\n{output}"
+            );
+            assert!(
+                !output.contains("return 0;")
+                    && !output.contains("switch (")
+                    && !output.contains("case 0x"),
+                "summary route builder path must not emit executable C for {route:?}, got:\n{output}"
+            );
+        }
+    }
+
+    #[test]
     fn decompile_input_honors_engine_render_permission_residual() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
@@ -7612,6 +7737,9 @@ mod tests {
         assert_eq!(summary_accumulator_label("unique:12_0"), "accumulator");
         assert_eq!(summary_accumulator_label("sha_state"), "sha_state");
         assert!(is_uncertified_render_var_name("&TMP:_2"));
+        assert!(is_uncertified_render_var_name("EAX"));
+        assert!(is_uncertified_render_var_name("RAX"));
+        assert!(is_uncertified_render_var_name("x0"));
         assert!(!is_uncertified_render_var_name("sha_state"));
 
         let arch = test_arch_for_decompile();
@@ -8878,7 +9006,9 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
+            summary_view: None,
             arg_regs: &config.arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &config.caller_saved_regs,
@@ -9042,7 +9172,9 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
+            summary_view: None,
             arg_regs: &config.arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &config.caller_saved_regs,
@@ -9261,7 +9393,9 @@ mod tests {
             function_names: &function_names,
             strings: &strings,
             symbols: &symbols,
+            callee_facts: analysis::empty_callee_facts(),
             callee_resolution: None,
+            summary_view: None,
             arg_regs: &config.arg_regs,
             param_register_aliases: &param_register_aliases,
             caller_saved_regs: &config.caller_saved_regs,
@@ -9637,7 +9771,6 @@ mod tests {
                 .or_insert_with(|| param.ty.clone());
         }
 
-        let known_function_signatures = HashMap::new();
         let fold_arch = FoldArchConfig {
             ptr_size: config.ptr_size,
             sp_name: config.sp_name.clone(),
@@ -9662,7 +9795,6 @@ mod tests {
             function_names: &decompiler.context.function_names,
             strings: &decompiler.context.strings,
             symbols: &decompiler.context.symbols,
-            known_function_signatures: &known_function_signatures,
             callee_facts: &decompiler.context.type_facts().callee_facts,
             callee_resolution: None,
             stack_slots: &decompiler.context.type_facts().stack_slots,
@@ -9678,7 +9810,6 @@ mod tests {
                 .map(|oracle| oracle as &dyn TypeOracle),
             function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
             prepared_ssa: None,
-            interproc_summary_set: None,
             summary_view: Some(&decompiler.context.function_facts.summary_view),
             prepared_semantic_view: None,
             prepared_objects: None,
@@ -10022,6 +10153,7 @@ mod tests {
             ..FunctionTypeFacts::default()
         });
 
+        let built = decompiler.build_function(&func);
         let output = decompiler.decompile(&func);
         assert!(
             output.contains("[arg2].f_8"),
@@ -10031,11 +10163,31 @@ mod tests {
             output.contains("[arg2].f_34"),
             "indexed-member path should preserve field 0x34, got:\n{output}"
         );
+        let return_expr = built
+            .body
+            .iter()
+            .find_map(|stmt| match stmt {
+                CStmt::Return(Some(expr)) => Some(expr),
+                _ => None,
+            })
+            .expect("observed arm64 struct-array path should have a value return");
+        fn expr_contains_member(expr: &CExpr, expected: &str) -> bool {
+            let mut found = false;
+            expr.visit(&mut |node| match node {
+                CExpr::Member { member, .. } | CExpr::PtrMember { member, .. } => {
+                    found |= member == expected;
+                }
+                _ => {}
+            });
+            found
+        }
         assert!(
-            output.contains("return")
-                && !output.contains("*(arg1 +")
-                && !output.contains("arg2 * 38"),
-            "observed arm64 struct-array return path should stay semantic, got:\n{output}"
+            expr_contains_member(return_expr, "f_8") && expr_contains_member(return_expr, "f_34"),
+            "observed arm64 struct-array return should keep semantic member loads, got {return_expr:?}"
+        );
+        assert!(
+            !format!("{return_expr:?}").contains("arg2 * 38"),
+            "observed arm64 struct-array return should not expose scaled raw-index arithmetic, got {return_expr:?}"
         );
     }
 
@@ -10238,106 +10390,22 @@ mod tests {
             "normal VM rendering should not expose debug-scale internals, got:\n{output}"
         );
         assert!(
-            output.contains("switch (vm.sel)")
-                && output.contains("case 0x1:")
+            output.contains("selector: vm.sel")
                 && output.contains("handler 0x1004")
+                && output.contains("labels=[0x1, 0x2]")
                 && output.contains("transfer exits=1 guards=1 updates=2 reads=1 writes=1")
                 && output.contains("selector updated")
+                && output.contains(
+                    "handler 0x1008: labels=[0x3] default=false blocks=[] */\n    /* no exact handler body recovered */"
+                )
+                && output.contains("default_target=0x1010")
+                && !output.contains("switch (")
+                && !output.contains("case 0x")
+                && !output.contains("break;")
                 && !output.contains("state = state + 1;")
                 && !output.contains("read ram:0x2000"),
-            "expected structured VM summary rendering, got:\n{output}"
+            "expected comment-only VM summary rendering, got:\n{output}"
         );
-    }
-
-    #[test]
-    fn preferred_semantic_fallback_comment_allows_ready_large_worker_decompile() {
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                None,
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::Exact,
-                    1,
-                    1,
-                    Vec::new(),
-                )),
-                r2sym::SemanticEvidence::exact(),
-            )],
-            Vec::new(),
-        );
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Residual,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region],
-        );
-        assert!(
-            preferred_semantic_fallback_comment("fcn.401000", Some(&semantic_artifact)).is_none(),
-            "expected semantically ready autogenerated large worker to keep decompilation path"
-        );
-        assert!(
-            preferred_semantic_fallback_comment("named_worker", Some(&semantic_artifact)).is_none(),
-            "expected named function to keep full decompilation path"
-        );
-    }
-
-    #[test]
-    fn preferred_semantic_linearization_reason_allows_ready_large_worker_linear_path() {
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            Vec::new(),
-            Vec::new(),
-        );
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 107,
-            loop_count: 16,
-            back_edge_count: 16,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Residual,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region],
-        );
-        let reason = preferred_semantic_linearization_reason(
-            "fcn.401000",
-            Some(&semantic_artifact),
-            &summary,
-        )
-        .expect("ready large worker should prefer linearized decompile path");
-        assert!(reason.contains("complex loop graph"));
-    }
-
-    #[test]
-    fn preferred_semantic_linearization_reason_honors_named_worker_native_linear_plan() {
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            Vec::new(),
-            Vec::new(),
-        );
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 8,
-            loop_count: 0,
-            back_edge_count: 0,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let semantic_artifact =
-            large_cfg_worker_artifact(r2sym::RefinementStage::Residual, Vec::new(), vec![region]);
-        let reason = preferred_semantic_linearization_reason(
-            "sym._usage",
-            Some(&semantic_artifact),
-            &summary,
-        )
-        .expect("named native worker with a linear decompile plan should avoid full structuring");
-        assert_eq!(reason, "guarded structuring unavailable");
     }
 
     #[test]
@@ -10414,8 +10482,12 @@ mod tests {
         let output = Decompiler::new(DecompilerConfig::default()).decompile_input(&input);
 
         assert!(
-            output.contains("void stable_demo(int32_t status)"),
-            "expected signature-preserving summary output, got:\n{output}"
+            output.starts_with("void stable_demo(void)"),
+            "summary routes must not present typed signatures as native C headers, got:\n{output}"
+        );
+        assert!(
+            !output.contains("int32_t status"),
+            "summary route leaked ABI-looking header params, got:\n{output}"
         );
         assert!(
             output.contains(
@@ -10571,6 +10643,44 @@ mod tests {
     }
 
     #[test]
+    fn semantic_worker_summary_handles_structured_worker_comment_only() {
+        let semantic_artifact =
+            large_cfg_worker_artifact(r2sym::RefinementStage::Compiled, Vec::new(), Vec::new());
+        let signature = signature_spec(Some(CType::Int(32)), Vec::new());
+        let function_facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                signature_certificate: external_signature_certificate(&signature),
+                merged_signature: Some(signature),
+                ..FunctionTypeFacts::default()
+            },
+            Some(semantic_artifact),
+        );
+        let output = render_semantic_worker_summary(
+            "sym.structured_worker",
+            &function_facts,
+            &SemanticRoutePlan::StructuredWorker {
+                reason: "engine-selected structured summary route".to_string(),
+            },
+            DecompilerConfig::default(),
+        )
+        .expect("structured worker summary route should render");
+
+        assert!(output.contains("semantic route: structured_worker_summary"));
+        assert!(output.contains("render contract: summary facts only"));
+        assert!(
+            output.starts_with("void sym.structured_worker(void)"),
+            "summary routes must use a non-authoritative void wrapper, got:\n{output}"
+        );
+        assert!(
+            !output.contains("int sym.structured_worker")
+                && !output.contains("return 0;")
+                && !output.contains("if (")
+                && !output.contains("switch ("),
+            "structured summary route must not emit executable C, got:\n{output}"
+        );
+    }
+
+    #[test]
     fn semantic_worker_summary_does_not_invent_header_params_for_extra_summary_operands() {
         let mut semantic_artifact = large_cfg_worker_artifact(
             r2sym::RefinementStage::Residual,
@@ -10630,11 +10740,11 @@ mod tests {
         .expect("worker summary should render");
 
         assert!(
-            output.starts_with("void sym.copy_worker(void* dst, void* src)"),
-            "expected canonical signature arity to be preserved, got:\n{output}"
+            output.starts_with("void sym.copy_worker(void)"),
+            "summary routes must not present canonical signatures as native C headers, got:\n{output}"
         );
-        assert!(!output.contains("(arg2"));
-        assert!(!output.contains(", arg2"));
+        assert!(!output.contains("(void* dst"));
+        assert!(!output.contains(", void* src"));
         assert!(!output.contains("=arg2"));
         assert!(output.contains("summary_input2"));
     }
@@ -10767,8 +10877,12 @@ mod tests {
         .expect("worker summary should render");
 
         assert!(
-            output.starts_with("bool or(void)"),
-            "expected empty merged signature to suppress register params, got:\n{output}"
+            output.starts_with("void or(void)"),
+            "summary routes must use a non-authoritative void wrapper, got:\n{output}"
+        );
+        assert!(
+            !output.lines().next().unwrap_or_default().contains("arg"),
+            "summary-only headers must not expose register params, got:\n{output}"
         );
     }
 
@@ -10825,8 +10939,12 @@ mod tests {
         let header = output.lines().next().unwrap_or_default();
 
         assert!(
-            header.starts_with("/* unknown */ fcn.00004129(int64_t summary_input1)"),
-            "uncertified merged signatures must not drive summary headers, got:\n{output}"
+            header.starts_with("void fcn.00004129(void)"),
+            "summary routes must not use uncertified merged signatures for headers, got:\n{output}"
+        );
+        assert!(
+            !header.contains("summary_input") && !header.contains("int64_t"),
+            "summary-only headers must not synthesize ABI-looking params, got:\n{output}"
         );
     }
 
@@ -10889,11 +11007,13 @@ mod tests {
         let header = output.lines().next().unwrap_or_default();
 
         assert!(
-            header.contains("summary_input1") && header.contains("summary_input2"),
-            "expected summary header to avoid generic arg labels, got:\n{output}"
+            header.starts_with("void fcn.00004129(void)"),
+            "summary routes must use a non-authoritative void wrapper, got:\n{output}"
         );
         assert!(
-            !header.contains(" arg1") && !header.contains(" arg2"),
+            !header.contains("summary_input")
+                && !header.contains(" arg1")
+                && !header.contains(" arg2"),
             "summary-only headers must not leak generic arg labels, got:\n{output}"
         );
     }
@@ -11093,7 +11213,11 @@ mod tests {
         )
         .expect("program orchestrator summary should render");
 
-        assert!(output.contains("int main(int argc"));
+        assert!(
+            output.starts_with("void main(void)"),
+            "summary-only role evidence must not become a native main signature, got:\n{output}"
+        );
+        assert!(!output.contains("int main(int argc"));
         assert!(output.contains("worker summary: program_orchestrator"));
         assert!(!output.contains("run_program_orchestrator("));
         assert!(output.contains("orchestrate program phases"));
@@ -11465,9 +11589,10 @@ mod tests {
         .expect("metadata summary should render");
 
         assert!(
-            output.starts_with("void fcn.000068f0(uint64_t size)"),
-            "expected canonical void return to be preserved, got:\n{output}"
+            output.starts_with("void fcn.000068f0(void)"),
+            "summary routes must not present typed params as native C headers, got:\n{output}"
         );
+        assert!(!output.contains("uint64_t size"));
         assert!(!output.contains("return metadata_result;"));
         assert!(!output.contains("probe_file_metadata("));
         assert!(
@@ -12684,731 +12809,10 @@ mod tests {
     }
 
     #[test]
-    fn summary_dense_meaningful_native_structured_worker_routes_to_summary_islands() {
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401000, 0x401020]),
-            vec![test_control_fact(
-                0x401020,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                Some(true),
-                Some("cursor != end"),
-                Some(compiled_summary(
-                    "cursor != end",
-                    r2sym::BackwardConditionPrecision::OverApprox,
-                    1,
-                    1,
-                    Vec::new(),
-                )),
-                r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage),
-            )],
-            Vec::new(),
-        );
-        let mut semantic_artifact = test_native_semantic_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::ArtifactGranularity::Regioned,
-            r2sym::SliceClass::Worker,
-            false,
-            Vec::new(),
-            vec![region],
-        );
-        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
-            panic!("expected native artifact");
-        };
-        let summary_template = r2sym::NativeRegionSummary {
-            stable_id: 0x401010,
-            anchor: 0x401010,
-            kind: r2sym::NativeWorkerSummaryKind::StringScan,
-            blocks: BTreeSet::from([0x401010]),
-            entries: BTreeSet::from([0x401010]),
-            exits: BTreeSet::new(),
-            memory_accesses: vec![r2sym::NativeMemoryAccessSummary {
-                kind: r2sym::NativeMemoryAccessKind::Read,
-                location: Some(r2ssa::SummaryMemoryLocation {
-                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                    range: None,
-                }),
-                dst: None,
-                src: None,
-                len: None,
-                width: Some(1),
-            }],
-            loop_summary: Some(r2sym::NativeLoopSummary {
-                header: 0x401010,
-                body: BTreeSet::from([0x401010]),
-                entries: BTreeSet::from([0x401010]),
-                exits: BTreeSet::new(),
-                iterations: None,
-                length_arg: None,
-                stride: Some(1),
-                terminator: Some(r2sym::NativeWorkerTerminator::ZeroByte),
-            }),
-            reductions: Vec::new(),
-            parser: None,
-            residual_reasons: Vec::new(),
-            confidence: r2sym::SemanticConfidence::Likely,
-            evidence: r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::SummaryBudget),
-        };
-        for idx in 0..16 {
-            let mut summary = summary_template.clone();
-            summary.stable_id += idx;
-            summary.anchor += idx;
-            native.summary.region_summaries.push(summary);
-        }
-
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
-        let cfg_summary = r2ssa::CFGRiskSummary {
-            block_count: 17,
-            loop_count: 2,
-            back_edge_count: 2,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-
-        let route = planner::semantic_route_plan("dbg.worker", &function_facts, &cfg_summary);
-        assert_eq!(
-            route,
-            planner::SemanticRoutePlan::SummaryIslands {
-                reason: "summary-dense semantic worker islands".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn generic_summary_dense_native_linear_worker_uses_standard_route() {
-        let mut semantic_artifact = test_native_semantic_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::ArtifactGranularity::SummaryOnly,
-            r2sym::SliceClass::Worker,
-            false,
-            Vec::new(),
-            Vec::new(),
-        );
-        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
-            panic!("expected native artifact");
-        };
-        for idx in 0..16 {
-            native
-                .summary
-                .worker_summaries
-                .push(r2sym::NativeWorkerSummary {
-                    anchor: 0x401000 + idx,
-                    kind: r2sym::NativeWorkerSummaryKind::MemoryRead,
-                    dst: None,
-                    src: None,
-                    memory: Some(r2ssa::SummaryMemoryLocation {
-                        region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                        range: Some(r2ssa::SummaryMemoryRange {
-                            offset_lo: idx as i64,
-                            offset_hi: idx as i64,
-                            width: Some(1),
-                        }),
-                    }),
-                    len: None,
-                    allocation: None,
-                    lifetime: None,
-                    sync: None,
-                    atomic: None,
-                    parser: None,
-                    loop_summary: None,
-                    evidence: r2sym::SemanticEvidence::likely(
-                        r2sym::SemanticEvidenceReason::SummaryBudget,
-                    ),
-                });
-        }
-
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
-        let cfg_summary = r2ssa::CFGRiskSummary {
-            block_count: 17,
-            loop_count: 2,
-            back_edge_count: 2,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-
-        let route = planner::semantic_route_plan("dbg.worker", &function_facts, &cfg_summary);
-        assert_eq!(route, planner::SemanticRoutePlan::Standard);
-    }
-
-    #[test]
-    fn dense_summary_only_memory_worker_routes_to_summary_rendering() {
-        let mut semantic_artifact = test_native_semantic_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::ArtifactGranularity::SummaryOnly,
-            r2sym::SliceClass::Worker,
-            false,
-            Vec::new(),
-            Vec::new(),
-        );
-        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
-            panic!("expected native artifact");
-        };
-        for idx in 0..24 {
-            for kind in [
-                r2sym::NativeWorkerSummaryKind::MemoryRead,
-                r2sym::NativeWorkerSummaryKind::MemoryWrite,
-            ] {
-                native
-                    .summary
-                    .worker_summaries
-                    .push(r2sym::NativeWorkerSummary {
-                        anchor: 0x401000 + idx,
-                        kind,
-                        dst: None,
-                        src: None,
-                        memory: Some(r2ssa::SummaryMemoryLocation {
-                            region: r2ssa::SummaryMemoryRegion::Unknown,
-                            range: Some(r2ssa::SummaryMemoryRange {
-                                offset_lo: idx as i64,
-                                offset_hi: idx as i64,
-                                width: Some(1),
-                            }),
-                        }),
-                        len: None,
-                        allocation: None,
-                        lifetime: None,
-                        sync: None,
-                        atomic: None,
-                        parser: None,
-                        loop_summary: None,
-                        evidence: r2sym::SemanticEvidence::likely(
-                            r2sym::SemanticEvidenceReason::SummaryBudget,
-                        ),
-                    });
-            }
-        }
-
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
-        let cfg_summary = r2ssa::CFGRiskSummary {
-            block_count: 17,
-            loop_count: 2,
-            back_edge_count: 2,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-
-        let route =
-            planner::semantic_route_plan("dbg.readlinebuffer_delim", &function_facts, &cfg_summary);
-        assert_eq!(
-            route,
-            planner::SemanticRoutePlan::SummaryIslands {
-                reason: "dense summary-only memory worker".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn primary_summary_only_native_linear_worker_routes_to_summary_rendering() {
-        let mut semantic_artifact = test_native_semantic_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::ArtifactGranularity::SummaryOnly,
-            r2sym::SliceClass::Worker,
-            false,
-            Vec::new(),
-            Vec::new(),
-        );
-        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
-            panic!("expected native artifact");
-        };
-        native
-            .summary
-            .worker_summaries
-            .push(r2sym::NativeWorkerSummary {
-                anchor: 0x401050,
-                kind: r2sym::NativeWorkerSummaryKind::FormatArgumentFetch,
-                dst: Some(r2ssa::SummaryMemoryLocation {
-                    region: r2ssa::SummaryMemoryRegion::Arg { index: 1 },
-                    range: None,
-                }),
-                src: Some(r2ssa::SummaryMemoryLocation {
-                    region: r2ssa::SummaryMemoryRegion::Arg { index: 0 },
-                    range: None,
-                }),
-                memory: None,
-                len: None,
-                allocation: None,
-                lifetime: None,
-                sync: None,
-                atomic: None,
-                parser: None,
-                loop_summary: None,
-                evidence: r2sym::SemanticEvidence::likely(
-                    r2sym::SemanticEvidenceReason::SummaryBudget,
-                ),
-            });
-
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
-        let cfg_summary = r2ssa::CFGRiskSummary {
-            block_count: 39,
-            loop_count: 2,
-            back_edge_count: 2,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-
-        let route =
-            planner::semantic_route_plan("sym.printf_fetchargs", &function_facts, &cfg_summary);
-        assert_eq!(
-            route,
-            planner::SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn large_memory_read_write_worker_routes_to_summary_islands() {
-        let mut semantic_artifact = test_native_semantic_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::ArtifactGranularity::Regioned,
-            r2sym::SliceClass::Worker,
-            true,
-            Vec::new(),
-            Vec::new(),
-        );
-        let r2sym::SemanticArtifactBody::Native(native) = &mut semantic_artifact.body else {
-            panic!("expected native artifact");
-        };
-        for (idx, (kind, access_kind)) in [
-            (
-                r2sym::NativeWorkerSummaryKind::MemoryRead,
-                r2sym::NativeMemoryAccessKind::Read,
-            ),
-            (
-                r2sym::NativeWorkerSummaryKind::MemoryWrite,
-                r2sym::NativeMemoryAccessKind::Write,
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            native
-                .summary
-                .region_summaries
-                .push(r2sym::NativeRegionSummary {
-                    stable_id: 0x401100 + idx as u64,
-                    anchor: 0x401100 + idx as u64,
-                    kind,
-                    blocks: BTreeSet::from([0x401100 + idx as u64]),
-                    entries: BTreeSet::from([0x401100 + idx as u64]),
-                    exits: BTreeSet::new(),
-                    memory_accesses: vec![r2sym::NativeMemoryAccessSummary {
-                        kind: access_kind,
-                        location: Some(r2ssa::SummaryMemoryLocation {
-                            region: r2ssa::SummaryMemoryRegion::Unknown,
-                            range: None,
-                        }),
-                        dst: None,
-                        src: None,
-                        len: None,
-                        width: Some(1),
-                    }],
-                    loop_summary: None,
-                    reductions: Vec::new(),
-                    parser: None,
-                    residual_reasons: Vec::new(),
-                    confidence: r2sym::SemanticConfidence::Likely,
-                    evidence: r2sym::SemanticEvidence::likely(
-                        r2sym::SemanticEvidenceReason::SummaryBudget,
-                    ),
-                });
-        }
-        let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
-        let cfg_summary = r2ssa::CFGRiskSummary {
-            block_count: 229,
-            loop_count: 4,
-            back_edge_count: 8,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-
-        let route = planner::semantic_route_plan(
-            "sym.gobble_file.constprop.0",
-            &function_facts,
-            &cfg_summary,
-        );
-        assert_eq!(
-            route,
-            planner::SemanticRoutePlan::SummaryIslands {
-                reason: "large native worker summarized as typed islands".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn preferred_semantic_structuring_reason_allows_strict_large_worker_structuring_path() {
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
-        let memory_term = arg_memory_term(0, 1, likely.clone(), Some("0x0:8"), true);
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                None,
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::OverApprox,
-                    1,
-                    2,
-                    vec![memory_term.clone()],
-                )),
-                likely.clone(),
-            )],
-            vec![test_memory_fact(memory_term, likely.clone())],
-        );
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 107,
-            loop_count: 16,
-            back_edge_count: 16,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Compiled,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region],
-        );
-        let reason =
-            preferred_semantic_structuring_reason("fcn.401000", Some(&semantic_artifact), &summary)
-                .expect("strict ready large worker should prefer structured semantic path");
-        assert!(reason.contains("complex loop graph"));
-        assert!(
-            preferred_semantic_linearization_reason(
-                "fcn.401000",
-                Some(&semantic_artifact),
-                &summary,
-            )
-            .is_none(),
-            "structured-ready worker should not fall back to linearization"
-        );
-    }
-
-    #[test]
-    fn preferred_semantic_structuring_reason_rejects_body_wide_memory_without_target_local_support()
-    {
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                None,
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::OverApprox,
-                    1,
-                    2,
-                    Vec::new(),
-                )),
-                likely.clone(),
-            )],
-            vec![test_memory_fact(
-                arg_memory_term(0, 1, likely.clone(), Some("0x0:8"), true),
-                likely.clone(),
-            )],
-        );
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 107,
-            loop_count: 16,
-            back_edge_count: 16,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Compiled,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region],
-        );
-        assert!(
-            preferred_semantic_structuring_reason("fcn.401000", Some(&semantic_artifact), &summary)
-                .is_none(),
-            "body-wide memory support should not overstate semantic structuring readiness"
-        );
-        assert!(
-            preferred_semantic_linearization_reason(
-                "fcn.401000",
-                Some(&semantic_artifact),
-                &summary,
-            )
-            .is_some(),
-            "large workers without target-local structuring support should fall back to linearization"
-        );
-    }
-
-    #[test]
-    fn preferred_semantic_structuring_reason_rejects_ambiguous_target_sources() {
-        let exact = r2sym::SemanticEvidence::exact();
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 107,
-            loop_count: 16,
-            back_edge_count: 16,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let region_a = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                Some(true),
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::Exact,
-                    1,
-                    1,
-                    vec![arg_memory_term(0, 1, exact.clone(), Some("0x2a"), true)],
-                )),
-                exact.clone(),
-            )],
-            vec![test_memory_fact(
-                arg_memory_term(0, 1, exact.clone(), Some("0x2a"), true),
-                exact.clone(),
-            )],
-        );
-        let region_b = test_semantic_region(
-            0x401004,
-            BTreeSet::from([0x401010, 0x401024]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                Some(true),
-                Some("y == 1"),
-                Some(compiled_summary(
-                    "y == 1",
-                    r2sym::BackwardConditionPrecision::OverApprox,
-                    1,
-                    2,
-                    vec![arg_memory_term(0, 1, likely.clone(), Some("0x2b"), true)],
-                )),
-                likely.clone(),
-            )],
-            vec![test_memory_fact(
-                arg_memory_term(0, 1, likely.clone(), Some("0x2b"), true),
-                likely.clone(),
-            )],
-        );
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Compiled,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region_a, region_b],
-        );
-        assert!(
-            semantic_artifact.target_has_ambiguous_sources(0x401010),
-            "same-target conflicting worker regions must surface explicit ambiguity"
-        );
-        assert!(
-            preferred_semantic_structuring_reason("fcn.401000", Some(&semantic_artifact), &summary)
-                .is_none(),
-            "ambiguous target sources must block semantic structuring"
-        );
-        assert!(
-            preferred_semantic_linearization_reason(
-                "fcn.401000",
-                Some(&semantic_artifact),
-                &summary,
-            )
-            .is_some(),
-            "ambiguous target sources should downgrade to linearization instead of structuring"
-        );
-    }
-
-    #[test]
-    fn preferred_semantic_structuring_reason_blocks_conflicting_assumptions_and_downgrades_linearization()
-     {
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
-        let memory_term = arg_memory_term(0, 1, likely.clone(), Some("0x0:8"), true);
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                None,
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::OverApprox,
-                    1,
-                    2,
-                    vec![memory_term.clone()],
-                )),
-                likely.clone(),
-            )],
-            vec![test_memory_fact(memory_term, likely.clone())],
-        );
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 107,
-            loop_count: 16,
-            back_edge_count: 16,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let semantic_artifact = large_cfg_worker_artifact(
-            r2sym::RefinementStage::Compiled,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region],
-        );
-        let mut assumption_usage = r2ssa::AssumptionUsageReport::default();
-        assumption_usage.mark_conflict(
-            &r2ssa::AnalysisAssumption {
-                id: Some("assumption_a".to_string()),
-                subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
-                value: r2ssa::AssumptionValue::TypeHint {
-                    ty: "int32_t".to_string(),
-                },
-                scope: r2ssa::AssumptionScope::Function,
-                provenance: r2ssa::AssumptionProvenance::User,
-            },
-            "parameter type conflict",
-        );
-        assumption_usage.mark_conflict(
-            &r2ssa::AnalysisAssumption {
-                id: Some("assumption_b".to_string()),
-                subject: r2ssa::AssumptionSubject::Register {
-                    name: "rax".to_string(),
-                },
-                value: r2ssa::AssumptionValue::TypeHint {
-                    ty: "int64_t".to_string(),
-                },
-                scope: r2ssa::AssumptionScope::Function,
-                provenance: r2ssa::AssumptionProvenance::User,
-            },
-            "register type conflict",
-        );
-        let function_facts = r2types::FunctionFacts::new(
-            r2types::FunctionTypeFacts::default(),
-            Some(semantic_artifact),
-        )
-        .with_assumption_usage(assumption_usage);
-        assert!(
-            crate::planner::preferred_semantic_structuring_reason(
-                "fcn.401000",
-                &function_facts,
-                &summary,
-            )
-            .is_none(),
-            "assumption conflicts must block semantic structuring"
-        );
-        let linear_reason = crate::planner::preferred_semantic_linearization_reason(
-            "fcn.401000",
-            &function_facts,
-            &summary,
-        )
-        .expect("assumption conflicts should downgrade to linearization");
-        assert!(linear_reason.contains("complex loop graph"));
-    }
-
-    #[test]
     fn autogenerated_name_detection_accepts_underscore_hex_labels() {
         assert!(is_autogenerated_function_name("_140010138"));
         assert!(is_autogenerated_function_name("_401000"));
         assert!(!is_autogenerated_function_name("_named_worker"));
-    }
-
-    #[test]
-    fn preferred_semantic_structuring_reason_uses_worker_label_when_cfg_is_benign() {
-        let exact = r2sym::SemanticEvidence::exact();
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                None,
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::Exact,
-                    1,
-                    1,
-                    vec![arg_memory_term(0, 1, exact.clone(), Some("0x0:8"), true)],
-                )),
-                exact.clone(),
-            )],
-            Vec::new(),
-        );
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 40,
-            loop_count: 1,
-            back_edge_count: 1,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let semantic_artifact =
-            large_cfg_worker_artifact(r2sym::RefinementStage::Compiled, Vec::new(), vec![region]);
-        assert_eq!(
-            preferred_semantic_structuring_reason("_140010138", Some(&semantic_artifact), &summary)
-                .as_deref(),
-            Some("semantic worker islands")
-        );
-    }
-
-    #[test]
-    fn preferred_semantic_structuring_reason_uses_control_only_worker_label_when_cfg_is_benign() {
-        let likely =
-            r2sym::SemanticEvidence::likely(r2sym::SemanticEvidenceReason::PartialPathCoverage);
-        let region = test_semantic_region(
-            0x401000,
-            BTreeSet::from([0x401010, 0x401020]),
-            vec![test_control_fact(
-                0x401010,
-                r2sym::SymbolicReachabilityStatus::Reachable,
-                None,
-                Some("x == 0"),
-                Some(compiled_summary(
-                    "x == 0",
-                    r2sym::BackwardConditionPrecision::OverApprox,
-                    1,
-                    2,
-                    Vec::new(),
-                )),
-                likely.clone(),
-            )],
-            Vec::new(),
-        );
-        let summary = r2ssa::CFGRiskSummary {
-            block_count: 40,
-            loop_count: 1,
-            back_edge_count: 1,
-            switch_block_count: 0,
-            max_switch_cases: 0,
-        };
-        let semantic_artifact =
-            large_cfg_worker_artifact(r2sym::RefinementStage::Compiled, Vec::new(), vec![region]);
-        assert_eq!(
-            preferred_semantic_structuring_reason(
-                "_140010138",
-                Some(&semantic_artifact),
-                &summary,
-            )
-            .as_deref(),
-            Some("semantic worker islands")
-        );
-        assert!(
-            preferred_semantic_linearization_reason(
-                "_140010138",
-                Some(&semantic_artifact),
-                &summary,
-            )
-            .is_none(),
-            "control-only guarded regions should use the structured semantic path"
-        );
     }
 
     #[test]

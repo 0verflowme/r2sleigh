@@ -617,13 +617,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         merge_block: Option<u64>,
     ) -> CStmt {
         let (switch_expr, switch_selector) = self.get_switch_expression(switch_block);
-        let case_display_bias = self.switch_case_display_bias(switch_block, cases);
         self.record_switch_render_proof(switch_block, switch_selector, cases, default);
 
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
             let value_expr = case_value
-                .map(|v| CExpr::IntLit(v.saturating_add_signed(case_display_bias) as i64))
+                .map(|v| CExpr::IntLit(v as i64))
                 .unwrap_or(CExpr::IntLit(0));
             let case_stmt = self.structure_region(case_region);
             switch_cases.push(crate::ast::SwitchCase {
@@ -696,174 +695,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .inputs
             .semantic_artifact?
             .actionable_reachable_target_for_block(cond_block)
-    }
-
-    fn region_supports_semantic_structuring(&self, region: &r2sym::SemanticRegion) -> bool {
-        let reachable_target = region
-            .exact_reachable_target()
-            .or_else(|| region.actionable_reachable_target());
-        if let Some(target) = reachable_target
-            && self
-                .fold_ctx
-                .inputs
-                .semantic_artifact
-                .is_some_and(|artifact| artifact.target_has_ambiguous_sources(target))
-        {
-            return false;
-        }
-        region.supports_guarded_structuring()
-    }
-
-    fn region_supporting_compiled_condition(
-        region: &r2sym::SemanticRegion,
-    ) -> Option<&r2sym::BackwardConditionSummary> {
-        let reachable_target = region
-            .exact_reachable_target()
-            .or_else(|| region.actionable_reachable_target())?;
-        region.actionable_compiled_condition_for_target(reachable_target)
-    }
-
-    fn branch_condition_for_reachable_target(
-        &mut self,
-        region: &r2sym::SemanticRegion,
-        reachable_target: u64,
-    ) -> CExpr {
-        let cond = self.get_branch_condition(region.anchor);
-        if region.branch_truth_for_target(reachable_target) == Some(false) {
-            return Self::negate_condition(cond);
-        }
-        if Self::region_supporting_compiled_condition(region).is_some() {
-            return cond;
-        }
-        if self
-            .resolve_conditional_targets(region.anchor)
-            .is_some_and(|(_, false_target)| false_target == reachable_target)
-        {
-            return Self::negate_condition(cond);
-        }
-        cond
-    }
-
-    fn structure_cfg_suffix_from_target(&mut self, target: u64) -> Option<CStmt> {
-        let mut stmts = Vec::new();
-        let mut current = target;
-        let mut seen = HashSet::new();
-
-        loop {
-            if !seen.insert(current) {
-                break;
-            }
-            Self::append_stmt_body_flat(&mut stmts, self.structure_block(current));
-            let cfg_block = self.func.cfg().get_block(current)?;
-            let next = match cfg_block.terminator {
-                BlockTerminator::Fallthrough { next }
-                | BlockTerminator::Branch { target: next } => Some(next),
-                _ => None,
-            };
-            let Some(next) = next else {
-                break;
-            };
-            if self.func.get_block(next).is_none() {
-                break;
-            }
-            current = next;
-        }
-
-        Some(if stmts.len() == 1 {
-            stmts.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(stmts)
-        })
-    }
-
-    fn structure_function_suffix_from_target(&mut self, target: u64) -> Option<CStmt> {
-        if self.region_analyzer.is_none() {
-            self.region_analyzer = Some(RegionAnalyzer::new(self.func));
-        }
-        let root_region = self.region_analyzer.as_mut()?.analyze();
-        let structured = self.structure_region_suffix_from_target(&root_region, target);
-        match structured {
-            Some(CStmt::Empty) | None => self.structure_cfg_suffix_from_target(target),
-            other => other,
-        }
-    }
-
-    fn structure_semantic_region(&mut self, region: &r2sym::SemanticRegion) -> Option<CStmt> {
-        if !self.region_supports_semantic_structuring(region) {
-            return None;
-        }
-        let reachable_target = region
-            .exact_reachable_target()
-            .or_else(|| region.actionable_reachable_target())?;
-        let cond = self.branch_condition_for_reachable_target(region, reachable_target);
-        let memory_terms = region.actionable_memory_terms_for_target(reachable_target);
-        let mut then_stmts = Vec::new();
-        if let Some(compiled) = Self::region_supporting_compiled_condition(region) {
-            then_stmts.push(CStmt::comment(format!(
-                "semantic worker branch: {}",
-                compiled.simplified
-            )));
-        }
-        for term in memory_terms.into_iter().take(2) {
-            then_stmts.push(CStmt::comment(format!(
-                "semantic memory: {} [{:?}]",
-                term.expr, term.evidence.tier
-            )));
-        }
-        if self.func.get_block(reachable_target).is_some() {
-            let reachable_stmt = self
-                .structure_function_suffix_from_target(reachable_target)
-                .unwrap_or_else(|| self.structure_block(reachable_target));
-            Self::append_stmt_body_flat(&mut then_stmts, reachable_stmt);
-        } else {
-            then_stmts.push(CStmt::comment(format!(
-                "semantic worker target: 0x{reachable_target:x}"
-            )));
-        }
-        let then_body = if then_stmts.len() == 1 {
-            then_stmts.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(then_stmts)
-        };
-        let mut prefix = self.structure_block_prefix_stmts(region.anchor);
-        prefix.push(CStmt::if_stmt(cond, then_body, None));
-        Some(if prefix.len() == 1 {
-            prefix.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(prefix)
-        })
-    }
-
-    pub fn structure_semantic_worker_islands(&mut self, limit: usize) -> Option<CStmt> {
-        let regions = self
-            .fold_ctx
-            .inputs
-            .semantic_artifact
-            .map(|artifact| artifact.actionable_regions())
-            .unwrap_or_default();
-        let mut stmts = Vec::new();
-        let mut seen_targets = HashSet::new();
-        for region in regions.into_iter().take(limit) {
-            let Some(target) = region
-                .exact_reachable_target()
-                .or_else(|| region.actionable_reachable_target())
-            else {
-                continue;
-            };
-            if !seen_targets.insert((region.anchor, target)) {
-                continue;
-            }
-            if let Some(stmt) = self.structure_semantic_region(region) {
-                Self::append_stmt_body_flat(&mut stmts, stmt);
-            }
-        }
-        if stmts.is_empty() {
-            None
-        } else if stmts.len() == 1 {
-            Some(stmts.into_iter().next().unwrap_or(CStmt::Empty))
-        } else {
-            Some(CStmt::Block(stmts))
-        }
     }
 
     fn structure_region_suffix_from_target(
@@ -1033,132 +864,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         } else {
             CStmt::Block(prefix)
         })
-    }
-
-    fn switch_case_display_bias(
-        &self,
-        switch_block: u64,
-        cases: &[(Option<u64>, Box<Region>)],
-    ) -> i64 {
-        let values = cases
-            .iter()
-            .filter_map(|(value, _)| *value)
-            .collect::<Vec<_>>();
-        if values.is_empty() || !values.contains(&0) {
-            return 0;
-        }
-        if let Some(bias) = values.iter().copied().max().and_then(|upper_bound| {
-            self.guarded_dense_zero_based_switch_bias(switch_block, values.len(), upper_bound)
-        }) {
-            return bias;
-        }
-
-        let mut search_blocks = vec![switch_block];
-        let mut seen = HashSet::from([switch_block]);
-        let mut queue = std::collections::VecDeque::from([(switch_block, 0usize)]);
-        for succ in self.func.successors(switch_block) {
-            if seen.insert(succ) {
-                search_blocks.push(succ);
-                queue.push_back((succ, 0usize));
-            }
-        }
-        while let Some((block, depth)) = queue.pop_front() {
-            if depth >= 8 {
-                continue;
-            }
-            for pred in self.func.predecessors(block) {
-                if seen.insert(pred) {
-                    search_blocks.push(pred);
-                    queue.push_back((pred, depth + 1));
-                }
-            }
-        }
-
-        let mut best_bias = 0i64;
-        for block_addr in search_blocks {
-            let Some(block) = self.func.get_block(block_addr) else {
-                continue;
-            };
-            for op in &block.ops {
-                if let r2ssa::SSAOp::IntSub { b, .. } = op
-                    && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
-                    && let Ok(bias) = i64::try_from(raw)
-                    && (1..=8).contains(&bias)
-                    && (best_bias == 0 || bias < best_bias)
-                {
-                    best_bias = bias;
-                }
-            }
-        }
-
-        if best_bias == 0 && values.len() >= 16 {
-            for block_addr in self.func.block_addrs() {
-                let Some(block) = self.func.get_block(*block_addr) else {
-                    continue;
-                };
-                for op in &block.ops {
-                    if let r2ssa::SSAOp::IntSub { b, .. } = op
-                        && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
-                        && let Ok(bias) = i64::try_from(raw)
-                        && (1..=8).contains(&bias)
-                        && (best_bias == 0 || bias < best_bias)
-                    {
-                        best_bias = bias;
-                    }
-                }
-            }
-        }
-
-        if best_bias == 0
-            && values.len() >= 32
-            && values
-                .iter()
-                .enumerate()
-                .all(|(idx, value)| *value == idx as u64)
-        {
-            return 1;
-        }
-
-        best_bias
-    }
-
-    fn guarded_dense_zero_based_switch_bias(
-        &self,
-        switch_block: u64,
-        case_count: usize,
-        upper_bound: u64,
-    ) -> Option<i64> {
-        if case_count < 4 {
-            return None;
-        }
-
-        for block_addr in std::iter::once(switch_block).chain(self.func.predecessors(switch_block))
-        {
-            let Some(block) = self.func.get_block(block_addr) else {
-                continue;
-            };
-            let mut best_bias = None;
-            let mut saw_upper_bound_guard = false;
-            for op in &block.ops {
-                if let r2ssa::SSAOp::IntSub { b, .. } = op
-                    && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
-                {
-                    if raw == upper_bound {
-                        saw_upper_bound_guard = true;
-                    }
-                    if let Ok(bias) = i64::try_from(raw)
-                        && (1..=8).contains(&bias)
-                    {
-                        best_bias = Some(best_bias.map_or(bias, |current: i64| current.min(bias)));
-                    }
-                }
-            }
-            if saw_upper_bound_guard && best_bias.is_some() {
-                return best_bias;
-            }
-        }
-
-        None
     }
 
     /// Structure a single basic block.
@@ -3897,6 +3602,35 @@ mod tests {
             .with_name("worker_region_demo")
     }
 
+    fn function_with_switch_block_and_unrelated_sub() -> SSAFunction {
+        let mut switch_block = R2ILBlock::new(0x1000, 4);
+        switch_block.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x20, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(1, 8),
+        });
+
+        let mut case_zero = R2ILBlock::new(0x1010, 4);
+        case_zero.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut case_one = R2ILBlock::new(0x1020, 4);
+        case_one.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+        let mut case_two = R2ILBlock::new(0x1030, 4);
+        case_two.push(R2ILOp::Return {
+            target: Varnode::constant(2, 8),
+        });
+
+        SSAFunction::from_blocks_with_arch(
+            &[switch_block, case_zero, case_one, case_two],
+            Some(&test_arch()),
+        )
+        .expect("ssa function")
+        .with_name("switch_unrelated_sub_demo")
+    }
+
     fn function_with_conditional_return_blocks(
         cond_block: u64,
         true_target: u64,
@@ -4116,16 +3850,99 @@ mod tests {
         }
     }
 
-    fn trailing_if_stmt(stmt: &CStmt) -> &CStmt {
+    fn stmt_contains_if(stmt: &CStmt) -> bool {
         match stmt {
-            CStmt::If { .. } => stmt,
-            CStmt::Block(stmts) => stmts
-                .iter()
-                .rev()
-                .find(|stmt| matches!(stmt, CStmt::If { .. }))
-                .expect("trailing if statement"),
-            _ => panic!("expected structured if statement, got {stmt:?}"),
+            CStmt::If { .. } => true,
+            CStmt::Block(stmts) => stmts.iter().any(stmt_contains_if),
+            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
+                stmt_contains_if(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|case| case.body.iter().any(stmt_contains_if))
+                    || default
+                        .as_ref()
+                        .is_some_and(|body| body.iter().any(stmt_contains_if))
+            }
+            _ => false,
         }
+    }
+
+    fn stmt_contains_comment(stmt: &CStmt, needle: &str) -> bool {
+        match stmt {
+            CStmt::Comment(text) => text.contains(needle),
+            CStmt::Block(stmts) => stmts.iter().any(|stmt| stmt_contains_comment(stmt, needle)),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stmt_contains_comment(then_body, needle)
+                    || else_body
+                        .as_deref()
+                        .is_some_and(|stmt| stmt_contains_comment(stmt, needle))
+            }
+            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
+                stmt_contains_comment(body, needle)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases.iter().any(|case| {
+                    case.body
+                        .iter()
+                        .any(|stmt| stmt_contains_comment(stmt, needle))
+                }) || default
+                    .as_ref()
+                    .is_some_and(|body| body.iter().any(|stmt| stmt_contains_comment(stmt, needle)))
+            }
+            _ => false,
+        }
+    }
+
+    fn first_switch_case_values(stmt: &CStmt) -> Option<Vec<i64>> {
+        match stmt {
+            CStmt::Switch { cases, .. } => Some(
+                cases
+                    .iter()
+                    .map(|case| match &case.value {
+                        CExpr::IntLit(value) => *value,
+                        other => panic!("expected literal switch case, got {other:?}"),
+                    })
+                    .collect(),
+            ),
+            CStmt::Block(stmts) => stmts.iter().find_map(first_switch_case_values),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => first_switch_case_values(then_body)
+                .or_else(|| else_body.as_deref().and_then(first_switch_case_values)),
+            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
+                first_switch_case_values(body)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn switch_render_keeps_canonical_case_values_despite_unrelated_sub() {
+        let func = function_with_switch_block_and_unrelated_sub();
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let cases = vec![
+            (Some(0), Box::new(Region::Block(0x1010))),
+            (Some(1), Box::new(Region::Block(0x1020))),
+            (Some(2), Box::new(Region::Block(0x1030))),
+        ];
+
+        let rendered = structurer.structure_switch_region(0x1000, &cases, None, None);
+        let values = first_switch_case_values(&rendered).expect("rendered switch");
+
+        assert_eq!(
+            values,
+            vec![0, 1, 2],
+            "switch rendering must not bias canonical case values from nearby arithmetic"
+        );
     }
 
     #[test]
@@ -5501,7 +5318,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_worker_island_structuring_builds_real_if_statement() {
+    fn structured_worker_route_refuses_executable_if_from_summary_region() {
         let func = function_with_conditional_return_blocks(0x2000, 0x2004, 0x2008);
         let mut ctx = FoldingContext::new(64);
         let region = r2sym::SemanticRegion {
@@ -5620,17 +5437,30 @@ mod tests {
         ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let rewritten = structurer
-            .structure_semantic_worker_islands(4)
-            .expect("semantic worker structuring");
+        let routed = crate::consumer_structured::primary_body_for_semantic_route(
+            &crate::SemanticRoutePlan::StructuredWorker {
+                reason: "large native worker summarized as typed islands".to_string(),
+            },
+            &mut structurer,
+            Vec::new,
+        );
         assert!(
-            matches!(rewritten, CStmt::If { .. } | CStmt::Block(_)),
-            "expected structured semantic worker output, got {rewritten:?}"
+            !stmt_contains_if(&routed.body_stmt),
+            "summary-permission route must not emit executable if statements, got {:?}",
+            routed.body_stmt
+        );
+        assert!(
+            stmt_contains_comment(
+                &routed.body_stmt,
+                "render contract: summary facts only; no executable native C reconstructed"
+            ),
+            "summary-permission route must state the render contract, got {:?}",
+            routed.body_stmt
         );
     }
 
     #[test]
-    fn semantic_worker_structuring_negates_false_reachable_branch() {
+    fn structured_worker_route_refuses_likely_false_branch_projection() {
         let func = function_with_conditional_return_blocks(0x2000, 0x2008, 0x2004);
         let mut ctx = FoldingContext::new(64);
         let likely =
@@ -5751,30 +5581,30 @@ mod tests {
         ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let rewritten = structurer
-            .structure_semantic_worker_islands(4)
-            .expect("semantic worker structuring");
-        let if_stmt = trailing_if_stmt(&rewritten);
-        let CStmt::If { cond, .. } = if_stmt else {
-            panic!("expected if statement, got {if_stmt:?}");
-        };
+        let routed = crate::consumer_structured::primary_body_for_semantic_route(
+            &crate::SemanticRoutePlan::StructuredWorker {
+                reason: "likely semantic worker reachability".to_string(),
+            },
+            &mut structurer,
+            Vec::new,
+        );
         assert!(
-            matches!(
-                cond,
-                CExpr::Binary {
-                    op: BinaryOp::Ne,
-                    ..
-                } | CExpr::Unary {
-                    op: UnaryOp::Not,
-                    ..
-                }
+            !stmt_contains_if(&routed.body_stmt),
+            "likely/actionable reachability must stay comment-only under summary permission, got {:?}",
+            routed.body_stmt
+        );
+        assert!(
+            stmt_contains_comment(
+                &routed.body_stmt,
+                "render contract: summary facts only; no executable native C reconstructed"
             ),
-            "reachable false successor must negate the branch condition, got {cond:?}"
+            "summary-permission route must state the render contract, got {:?}",
+            routed.body_stmt
         );
     }
 
     #[test]
-    fn semantic_worker_structuring_keeps_multi_block_target_suffix() {
+    fn structured_worker_route_refuses_multi_block_suffix_projection() {
         let func = function_with_multi_block_true_arm(0x2000, 0x2008, 0x200c, 0x2004);
         let mut ctx = FoldingContext::new(64);
         let region = r2sym::SemanticRegion {
@@ -5893,16 +5723,25 @@ mod tests {
         ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let rewritten = structurer
-            .structure_semantic_worker_islands(4)
-            .expect("semantic worker structuring");
-        let if_stmt = trailing_if_stmt(&rewritten);
-        let CStmt::If { then_body, .. } = if_stmt else {
-            panic!("expected if statement, got {if_stmt:?}");
-        };
+        let routed = crate::consumer_structured::primary_body_for_semantic_route(
+            &crate::SemanticRoutePlan::StructuredWorker {
+                reason: "semantic worker target suffix".to_string(),
+            },
+            &mut structurer,
+            Vec::new,
+        );
         assert!(
-            ControlFlowStructurer::stmt_guarantees_termination(then_body.as_ref()),
-            "structured semantic worker arm should keep the full target suffix, got {then_body:?}"
+            !stmt_contains_if(&routed.body_stmt),
+            "summary-permission route must not emit target suffix C, got {:?}",
+            routed.body_stmt
+        );
+        assert!(
+            stmt_contains_comment(
+                &routed.body_stmt,
+                "render contract: summary facts only; no executable native C reconstructed"
+            ),
+            "summary-permission route must state the render contract, got {:?}",
+            routed.body_stmt
         );
     }
 }

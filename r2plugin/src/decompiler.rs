@@ -1,24 +1,8 @@
-use crate::context::PluginCtxView;
 #[cfg(test)]
 use crate::types::FunctionAnalysisArtifact;
 use r2il::R2ILBlock;
 #[cfg(test)]
 use std::collections::HashMap;
-
-pub(crate) struct DecompilerEnv {
-    pub(crate) arch_name: String,
-    pub(crate) ptr_bits: u32,
-    pub(crate) cfg: r2dec::DecompilerConfig,
-}
-
-pub(crate) fn build_decompiler_env(ctx: &PluginCtxView<'_>) -> DecompilerEnv {
-    let (arch_name, ptr_bits, cfg) = r2dec::DecompilerConfig::for_arch(ctx.arch);
-    DecompilerEnv {
-        arch_name,
-        ptr_bits,
-        cfg,
-    }
-}
 
 #[cfg(test)]
 pub(crate) fn build_decompiler_context(
@@ -63,9 +47,21 @@ pub(crate) fn decompiler_input_from_artifact(
         &function_facts.types,
         &cfg_summary,
     );
+    let callee_resolution = r2engine::decompile_callee_resolution_facts(
+        &ssa_func,
+        &function_facts,
+        &function_names,
+        &symbols,
+        ptr_bits,
+    );
     let context =
-        build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits);
-    let context = r2engine::decompiler_context_with_route_decision(context, &route_decision);
+        build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits)
+            .with_callee_resolution(Some(callee_resolution));
+    let context = context
+        .with_semantic_route(Some(route_decision.route.to_decompiler_route()))
+        .with_render_permission(Some(route_decision.render_permission.clone()))
+        .with_runtime_type_inference_policy(Some(route_decision.skip_runtime_type_inference))
+        .with_prepared_semantic_view_policy(Some(route_decision.use_prepared_semantic_view));
     r2dec::DecompilerInput::new(ssa_func, context)
 }
 
@@ -75,7 +71,6 @@ pub(crate) fn render_named_native_worker_summary(
     arch: Option<&r2il::ArchSpec>,
     ptr_bits: u32,
 ) -> Option<String> {
-    let (_, _, config) = r2dec::DecompilerConfig::for_arch(arch);
     let parsed_context = r2types::ParsedExternalContext::default();
     let function_addr = r2il_blocks
         .first()
@@ -92,7 +87,6 @@ pub(crate) fn render_named_native_worker_summary(
             parsed_context: &parsed_context,
             symbolic_scope: None,
             type_seed: Some(r2types::FunctionTypeFacts::default()),
-            config,
             func_names_payload: "",
             strings_payload: "",
             symbols_payload: "",

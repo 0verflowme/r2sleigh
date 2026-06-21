@@ -5,15 +5,19 @@
 //! the session-level scheduler/cache boundary that decides which artifacts are
 //! needed for a request and how they are reused.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::OpenOptions;
 use std::hash::Hash;
+use std::io::Write;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use r2il::R2ILBlock;
 use r2ssa::{CFGRiskSummary, SsaArtifact};
 use r2types::{
-    CalleeResolutionFacts, FunctionFacts, FunctionSignatureProjection, FunctionTypeFactInputs,
-    FunctionTypeFacts, SignatureCertificateSource, TypeWritebackPlan,
+    CalleeResolutionFacts, FunctionFacts, FunctionSignatureProjection, FunctionTypeFacts,
+    MetadataScalarKind, SignatureCertificateSource, TypeHint, TypeWritebackPlan, merge_type_hint,
+    type_hint_from_value_metadata,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,13 +29,12 @@ pub use cache::{CacheCounters, EngineSessionCacheMetrics, SessionCache};
 pub use route::{
     DecompileProbeDecision, EngineDiagnostics, EngineFunctionIdentity, EnginePlan,
     EngineProfileRouteDecision, EngineProfileRouteKind, EngineRequestKind, EngineRequestPlan,
-    EngineRouteContext, EngineRouteDecision, EngineTypeRouteDecision, EngineTypeRouteKind,
-    EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
+    EngineRouteContext, EngineRouteDecision, EngineSemanticRoutePlan, EngineTypeRouteDecision,
+    EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
     decompile_probe_decision, decompile_probe_decision_for_identity, decompile_route_decision,
-    decompiler_context_with_route_decision, detached_semantic_linearization_reason,
-    detached_semantic_route_plan, has_primary_summary_only_native_worker,
-    has_renderable_primary_summary_only_native_worker, named_worker_summary_route,
-    plan_decompile_request, plan_profile_request, plan_type_request,
+    detached_semantic_linearization_reason, detached_semantic_route_plan,
+    has_primary_summary_only_native_worker, has_renderable_primary_summary_only_native_worker,
+    named_worker_summary_route, plan_decompile_request, plan_profile_request, plan_type_request,
     prefer_symbolic_large_worker_decompile, profile_route_decision, select_engine_plan,
     semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
     semantic_route_from_artifact_plan, semantic_route_plan, semantic_route_plan_from_context,
@@ -42,8 +45,8 @@ pub use route::{
     type_cfg_prefers_bounded_plan, type_route_decision,
 };
 use route::{
-    has_renderable_native_linear_worker_summary, native_body_has_renderable_worker_summary,
-    prefers_standard_native_for_summary_only_worker, proof_coverage_from_type_facts,
+    decompiler_context_with_route_decision, has_renderable_native_linear_worker_summary,
+    native_body_has_renderable_worker_summary, proof_coverage_from_type_facts,
     raw_cfg_risk_summary_for_preprobe, should_prefer_full_decompile_for_named_worker,
 };
 pub use stable_hash::{
@@ -59,6 +62,390 @@ pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_STATES: usize = 8;
 pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_DEPTH: usize = 32;
 pub const SYMBOLIC_PATHS_TIMEOUT_MS: u64 = 500;
 pub const SYMBOLIC_PATHS_SOLUTION_LIMIT: usize = 4;
+pub const RADARE2_ANALYSIS_DEPTH_BASIC: u32 = 1;
+pub const RADARE2_ANALYSIS_DEPTH_AGGRESSIVE: u32 = 3;
+pub const TYPE_WRITEBACK_CACHE_LIMIT: usize = 4096;
+pub const DATA_REF_CACHE_LIMIT: usize = 4096;
+pub const POST_ANALYSIS_FAST_BUDGET_USEC: u64 = 2 * 1_000_000;
+pub const POST_ANALYSIS_BALANCED_BUDGET_USEC: u64 = 10 * 1_000_000;
+pub const POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC: u64 = 30 * 1_000_000;
+pub const TAINT_GLOBAL_MAX_FUNCTIONS: usize = 128;
+pub const SIGNATURE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
+pub const TYPE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineAnalysisDepth {
+    Basic,
+    Default,
+    Aggressive,
+}
+
+impl EngineAnalysisDepth {
+    pub fn from_radare2_depth(depth: u32) -> Self {
+        match depth {
+            RADARE2_ANALYSIS_DEPTH_BASIC => Self::Basic,
+            RADARE2_ANALYSIS_DEPTH_AGGRESSIVE => Self::Aggressive,
+            _ => Self::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineAnalysisMode {
+    Fast,
+    Balanced,
+    Full,
+}
+
+impl EngineAnalysisMode {
+    pub const fn level(self) -> u8 {
+        match self {
+            Self::Fast => 0,
+            Self::Balanced => 1,
+            Self::Full => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineTypeWritebackMode {
+    Off,
+    Balanced,
+    Aggressive,
+}
+
+impl EngineTypeWritebackMode {
+    pub const fn level(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Balanced => 1,
+            Self::Aggressive => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineAnalysisPolicy {
+    pub mode: EngineAnalysisMode,
+    pub type_writeback_mode: EngineTypeWritebackMode,
+    pub type_interproc_max_iters: usize,
+    pub type_max_blocks: usize,
+    pub type_global_max_links: usize,
+    pub type_max_decls: usize,
+    pub type_max_mutations: usize,
+}
+
+pub fn analysis_policy_for_depth(depth: EngineAnalysisDepth) -> EngineAnalysisPolicy {
+    match depth {
+        EngineAnalysisDepth::Basic => EngineAnalysisPolicy {
+            mode: EngineAnalysisMode::Fast,
+            type_writeback_mode: EngineTypeWritebackMode::Off,
+            type_interproc_max_iters: 1,
+            type_max_blocks: 96,
+            type_global_max_links: 8,
+            type_max_decls: 8,
+            type_max_mutations: 32,
+        },
+        EngineAnalysisDepth::Default => EngineAnalysisPolicy {
+            mode: EngineAnalysisMode::Balanced,
+            type_writeback_mode: EngineTypeWritebackMode::Balanced,
+            type_interproc_max_iters: 4,
+            type_max_blocks: 200,
+            type_global_max_links: 32,
+            type_max_decls: 32,
+            type_max_mutations: 128,
+        },
+        EngineAnalysisDepth::Aggressive => EngineAnalysisPolicy {
+            mode: EngineAnalysisMode::Full,
+            type_writeback_mode: EngineTypeWritebackMode::Aggressive,
+            type_interproc_max_iters: 12,
+            type_max_blocks: 500,
+            type_global_max_links: 128,
+            type_max_decls: 64,
+            type_max_mutations: 512,
+        },
+    }
+}
+
+pub fn analysis_policy_for_radare2_depth(depth: u32) -> EngineAnalysisPolicy {
+    analysis_policy_for_depth(EngineAnalysisDepth::from_radare2_depth(depth))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnginePostAnalysisPlan {
+    pub policy: EngineAnalysisPolicy,
+    pub function_count: usize,
+    pub post_budget_us: u64,
+    pub xref_enabled: bool,
+    pub taint_enabled: bool,
+    pub signature_writeback_enabled: bool,
+    pub type_writeback_enabled: bool,
+    pub semantic_comments_enabled: bool,
+    pub signature_verify_enabled: bool,
+    pub balanced_focus_only: bool,
+    pub taint_focus_only: bool,
+    pub signature_writeback_focus_only: bool,
+    pub type_writeback_focus_only: bool,
+}
+
+pub fn post_analysis_plan_for_policy(
+    policy: EngineAnalysisPolicy,
+    function_count: usize,
+) -> EnginePostAnalysisPlan {
+    let post_budget_us = match policy.mode {
+        EngineAnalysisMode::Fast => POST_ANALYSIS_FAST_BUDGET_USEC,
+        EngineAnalysisMode::Balanced => POST_ANALYSIS_BALANCED_BUDGET_USEC,
+        EngineAnalysisMode::Full => POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC,
+    };
+    let xref_enabled = policy.mode.level() >= EngineAnalysisMode::Balanced.level();
+    let taint_enabled = policy.mode == EngineAnalysisMode::Full;
+    let signature_writeback_enabled = policy.mode.level() >= EngineAnalysisMode::Balanced.level();
+    let type_writeback_enabled =
+        signature_writeback_enabled && policy.type_writeback_mode != EngineTypeWritebackMode::Off;
+    let balanced_focus_only = policy.mode == EngineAnalysisMode::Balanced;
+
+    EnginePostAnalysisPlan {
+        policy,
+        function_count,
+        post_budget_us,
+        xref_enabled,
+        taint_enabled,
+        signature_writeback_enabled,
+        type_writeback_enabled,
+        semantic_comments_enabled: false,
+        signature_verify_enabled: false,
+        balanced_focus_only,
+        taint_focus_only: taint_enabled && function_count > TAINT_GLOBAL_MAX_FUNCTIONS,
+        signature_writeback_focus_only: signature_writeback_enabled
+            && (balanced_focus_only || function_count > SIGNATURE_WRITEBACK_GLOBAL_MAX_FUNCTIONS),
+        type_writeback_focus_only: type_writeback_enabled
+            && (balanced_focus_only || function_count > TYPE_WRITEBACK_GLOBAL_MAX_FUNCTIONS),
+    }
+}
+
+pub fn post_analysis_plan_for_radare2_depth(
+    depth: u32,
+    function_count: usize,
+) -> EnginePostAnalysisPlan {
+    post_analysis_plan_for_policy(analysis_policy_for_radare2_depth(depth), function_count)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineTypeWritebackCacheEntry {
+    pub key: u64,
+    pub dep_hash: u64,
+    pub payload_hash: u64,
+    pub applied_hash: u64,
+}
+
+static TYPE_WRITEBACK_CACHE: LazyLock<SessionCache<u64, EngineTypeWritebackCacheEntry>> =
+    LazyLock::new(|| SessionCache::new(TYPE_WRITEBACK_CACHE_LIMIT));
+
+pub fn engine_type_writeback_cache_clear() {
+    TYPE_WRITEBACK_CACHE.clear_entries();
+}
+
+pub fn engine_type_writeback_cache_len() -> usize {
+    TYPE_WRITEBACK_CACHE.len()
+}
+
+pub fn engine_type_writeback_cache_get(addr: u64) -> Option<EngineTypeWritebackCacheEntry> {
+    TYPE_WRITEBACK_CACHE.get_cloned(&addr)
+}
+
+pub fn engine_type_writeback_cache_put(addr: u64, entry: EngineTypeWritebackCacheEntry) {
+    TYPE_WRITEBACK_CACHE.insert(addr, entry);
+}
+
+fn engine_hash_mix(hash: u64, value: u64) -> u64 {
+    hash ^ value
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(hash.wrapping_shl(6))
+        .wrapping_add(hash >> 2)
+}
+
+pub fn engine_type_writeback_cache_key(
+    artifact_key: u64,
+    dep_hash: u64,
+    mode: EngineTypeWritebackMode,
+    max_iters: usize,
+    global_max_links: usize,
+    max_type_decls: usize,
+    max_mutations: usize,
+) -> u64 {
+    let mut key = artifact_key;
+    key ^= u64::from(mode.level()) << 56;
+    key ^= ((max_iters as u64) & 0xffff) << 40;
+    key = engine_hash_mix(key, (global_max_links as u64) & 0xffff);
+    key = engine_hash_mix(key, (max_type_decls as u64) & 0xffff);
+    key = engine_hash_mix(key, (max_mutations as u64) & 0xffff);
+    key ^ dep_hash
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineDataRefCacheEntry {
+    pub key: u64,
+    pub payload_hash: u64,
+    pub ref_count: i32,
+}
+
+static DATA_REF_CACHE: LazyLock<SessionCache<u64, EngineDataRefCacheEntry>> =
+    LazyLock::new(|| SessionCache::new(DATA_REF_CACHE_LIMIT));
+
+pub fn engine_data_ref_cache_clear() {
+    DATA_REF_CACHE.clear_entries();
+}
+
+pub fn engine_data_ref_cache_len() -> usize {
+    DATA_REF_CACHE.len()
+}
+
+pub fn engine_data_ref_cache_get(addr: u64) -> Option<EngineDataRefCacheEntry> {
+    DATA_REF_CACHE.get_cloned(&addr)
+}
+
+pub fn engine_data_ref_cache_put(addr: u64, entry: EngineDataRefCacheEntry) {
+    DATA_REF_CACHE.insert(addr, entry);
+}
+
+pub fn data_ref_cache_key(
+    function_addr: u64,
+    basic_block_count: usize,
+    linear_size: u64,
+    context_hash: u64,
+    blocks: &[R2ILBlock],
+    mode: EngineAnalysisMode,
+) -> u64 {
+    stable_fnv1a_hash(&(
+        "r2sleigh-data-ref-cache-key-v1",
+        function_addr,
+        basic_block_count,
+        linear_size,
+        context_hash,
+        stable_blocks_hash(blocks),
+        mode.level(),
+    ))
+}
+
+pub fn engine_normalized_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> {
+    let arch = arch?;
+    let lower = arch.name.to_ascii_lowercase();
+    if matches!(lower.as_str(), "x86-64" | "x86_64" | "x64" | "amd64") {
+        return Some("x86-64".to_string());
+    }
+    if matches!(lower.as_str(), "x86" | "x86-32" | "i386" | "i686") {
+        return Some("x86".to_string());
+    }
+    Some(arch.name.clone())
+}
+
+pub fn engine_arch_target(arch: Option<&r2il::ArchSpec>) -> (String, u32) {
+    let arch_name = engine_normalized_arch_name(arch).unwrap_or_else(|| "unknown".to_string());
+    let ptr_bits = arch.map(|spec| spec.addr_size * 8).unwrap_or(64);
+    (arch_name, ptr_bits)
+}
+
+fn metadata_scalar_kind_from_r2il(kind: r2il::ScalarKind) -> MetadataScalarKind {
+    match kind {
+        r2il::ScalarKind::Bool => MetadataScalarKind::Bool,
+        r2il::ScalarKind::SignedInt => MetadataScalarKind::SignedInt,
+        r2il::ScalarKind::UnsignedInt => MetadataScalarKind::UnsignedInt,
+        r2il::ScalarKind::Float => MetadataScalarKind::Float,
+        r2il::ScalarKind::Bitvector => MetadataScalarKind::Bitvector,
+        r2il::ScalarKind::Unknown => MetadataScalarKind::Unknown,
+    }
+}
+
+fn metadata_type_hint_for_varnode(vn: &r2il::Varnode) -> Option<TypeHint> {
+    let meta = vn.meta.as_ref()?;
+    let pointer_like = meta
+        .pointer_hint
+        .is_some_and(|hint| !matches!(hint, r2il::PointerHint::Unknown));
+    let scalar_kind = meta.scalar_kind.map(metadata_scalar_kind_from_r2il);
+
+    type_hint_from_value_metadata(pointer_like, scalar_kind, vn.size)
+}
+
+pub fn collect_register_type_hints_with_names<F>(
+    r2il_blocks: &[R2ILBlock],
+    mut register_name: F,
+) -> HashMap<String, TypeHint>
+where
+    F: FnMut(&r2il::Varnode) -> Option<String>,
+{
+    let mut hints = HashMap::new();
+
+    let mut visit = |vn: &r2il::Varnode| {
+        if !vn.is_register() {
+            return;
+        }
+        let Some(hint) = metadata_type_hint_for_varnode(vn) else {
+            return;
+        };
+        let Some(name) = register_name(vn) else {
+            return;
+        };
+
+        merge_type_hint(&mut hints, name.to_ascii_lowercase(), hint);
+    };
+
+    for block in r2il_blocks {
+        for op in &block.ops {
+            if let Some(vn) = op.output() {
+                visit(vn);
+            }
+            for vn in op.inputs() {
+                visit(vn);
+            }
+        }
+    }
+
+    hints
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EngineRenderTarget {
+    pub arch_name: String,
+    pub ptr_bits: u32,
+}
+
+impl Default for EngineRenderTarget {
+    fn default() -> Self {
+        Self::for_arch_name("x86-64", 64)
+    }
+}
+
+impl EngineRenderTarget {
+    pub fn for_arch_name(arch_name: &str, ptr_bits: u32) -> Self {
+        let arch_name = match (arch_name.to_ascii_lowercase().as_str(), ptr_bits) {
+            ("x86_64" | "x64" | "amd64", _) => "x86-64".to_string(),
+            ("x86-64", _) => "x86-64".to_string(),
+            ("x86-32" | "i386" | "i686", _) => "x86".to_string(),
+            ("x86", _) => "x86".to_string(),
+            _ => arch_name.to_string(),
+        };
+        Self {
+            arch_name,
+            ptr_bits,
+        }
+    }
+
+    pub fn for_arch(arch: Option<&r2il::ArchSpec>) -> (String, u32, Self) {
+        let (arch_name, ptr_bits) = engine_arch_target(arch);
+        let target = Self::for_arch_name(&arch_name, ptr_bits);
+        (arch_name, ptr_bits, target)
+    }
+
+    pub fn for_arch_with_ptr_bits(arch: Option<&r2il::ArchSpec>, ptr_bits: u32) -> (String, Self) {
+        let arch_name = engine_normalized_arch_name(arch).unwrap_or_else(|| "unknown".to_string());
+        let target = Self::for_arch_name(&arch_name, ptr_bits);
+        (arch_name, target)
+    }
+
+    fn to_decompiler_config(&self) -> r2dec::DecompilerConfig {
+        r2dec::DecompilerConfig::for_arch_name(&self.arch_name, self.ptr_bits)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AnalysisCacheKey {
@@ -397,7 +784,7 @@ pub fn decompile_callee_resolution_facts(
             .by_id
             .values()
             .filter_map(|call_site| {
-                let direct_target = call_site.direct_target?;
+                let direct_target = prepared.resolved_call_target(call_site)?;
                 let (block_addr, op_index) = prepared.inst_op_site(call_site.at)?;
                 Some((
                     r2types::CallsiteKey {
@@ -428,7 +815,7 @@ pub struct EngineArtifacts {
     pub semantic_artifact: Option<r2sym::SemanticArtifact>,
     pub function_facts: Option<FunctionFacts>,
     pub writeback_plan: Option<TypeWritebackPlan>,
-    pub route: Option<r2dec::SemanticRoutePlan>,
+    pub route: Option<EngineSemanticRoutePlan>,
     pub rendered: Option<String>,
     pub metrics: EngineMetrics,
     pub diagnostics: EngineDiagnostics,
@@ -438,6 +825,776 @@ pub struct EngineArtifacts {
 pub struct EngineAnalysis {
     pub ssa_func: SsaArtifact,
     pub pattern_ssa_func: SsaArtifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineRuntimeMaterializedSource {
+    pub addr: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineInterprocTargetSkipReason {
+    Imported,
+    SummaryModeled,
+    Unmaterialized,
+    OverBudget,
+}
+
+pub const ENGINE_INTERPROC_HELPER_MAX_BLOCKS: u32 = 64;
+pub const ENGINE_INTERPROC_HELPER_MAX_COST: u32 = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineInterprocTargetMetrics {
+    pub basic_block_count: u32,
+    pub cost: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineInterprocTargetInput {
+    pub direct_target: u64,
+    pub name: Option<String>,
+    pub linkage: r2ssa::FunctionSemanticLinkage,
+    pub semantic_summary: Option<r2ssa::FunctionSemanticSummary>,
+    pub resolved_target: Option<u64>,
+    pub target_materialized: bool,
+    pub target_metrics: Option<EngineInterprocTargetMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineInterprocTargetDecision {
+    pub direct_target: u64,
+    pub resolved_target: Option<u64>,
+    pub queued_targets: Vec<u64>,
+    pub registration_target: bool,
+    pub runtime_copy_target: bool,
+    pub skip_reason: Option<EngineInterprocTargetSkipReason>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineInterprocTargetPlan {
+    pub queued_targets: Vec<u64>,
+    pub registration_targets: Vec<u64>,
+    pub runtime_copy_targets: Vec<u64>,
+    pub decisions: Vec<EngineInterprocTargetDecision>,
+}
+
+fn engine_linkage_is_imported(linkage: r2ssa::FunctionSemanticLinkage) -> bool {
+    matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
+}
+
+fn target_name_is_import_authorized(
+    name: Option<&str>,
+    linkage: r2ssa::FunctionSemanticLinkage,
+) -> bool {
+    name.is_some_and(r2types::callee_name_is_import_like) && engine_linkage_is_imported(linkage)
+}
+
+fn imported_name_authorizes_runtime_role(
+    name: Option<&str>,
+    linkage: r2ssa::FunctionSemanticLinkage,
+    predicate: impl FnOnce(&str) -> bool,
+) -> bool {
+    engine_linkage_is_imported(linkage) && name.is_some_and(predicate)
+}
+
+fn interproc_target_skip_reason_from_evidence(
+    import_authorized: bool,
+    has_modeled_summary: bool,
+    target_materialized: bool,
+    metrics_within_budget: bool,
+) -> Option<EngineInterprocTargetSkipReason> {
+    if import_authorized {
+        Some(EngineInterprocTargetSkipReason::Imported)
+    } else if has_modeled_summary {
+        Some(EngineInterprocTargetSkipReason::SummaryModeled)
+    } else if !target_materialized {
+        Some(EngineInterprocTargetSkipReason::Unmaterialized)
+    } else if !metrics_within_budget {
+        Some(EngineInterprocTargetSkipReason::OverBudget)
+    } else {
+        None
+    }
+}
+
+fn interproc_target_metrics_within_budget(metrics: Option<&EngineInterprocTargetMetrics>) -> bool {
+    let Some(metrics) = metrics else {
+        return false;
+    };
+    metrics.basic_block_count <= ENGINE_INTERPROC_HELPER_MAX_BLOCKS
+        && metrics.cost <= ENGINE_INTERPROC_HELPER_MAX_COST
+}
+
+pub fn interproc_helper_scope_within_budget(basic_block_count: u32, cost: u32) -> bool {
+    interproc_target_metrics_within_budget(Some(&EngineInterprocTargetMetrics {
+        basic_block_count,
+        cost,
+    }))
+}
+
+fn interproc_target_queue_pair(
+    direct_target: u64,
+    resolved_target: Option<u64>,
+    skip_reason: Option<EngineInterprocTargetSkipReason>,
+) -> (Option<u64>, Option<u64>) {
+    if skip_reason.is_some() {
+        return (None, None);
+    }
+    let effective_target = resolved_target.unwrap_or(direct_target);
+    if effective_target != direct_target {
+        (Some(direct_target), Some(effective_target))
+    } else {
+        (Some(effective_target), None)
+    }
+}
+
+pub fn interproc_scope_target_plan<I>(targets: I) -> EngineInterprocTargetPlan
+where
+    I: IntoIterator<Item = EngineInterprocTargetInput>,
+{
+    let mut queued_targets = BTreeSet::new();
+    let mut registration_targets = BTreeSet::new();
+    let mut runtime_copy_targets = BTreeSet::new();
+    let mut decisions = Vec::new();
+
+    for target in targets {
+        let direct_target = target.direct_target;
+        let resolved_target = target.resolved_target.filter(|addr| *addr != 0);
+        let name = target.name.as_deref();
+        let semantic_summary = target.semantic_summary.as_ref();
+
+        let registration_target = imported_name_authorizes_runtime_role(
+            name,
+            target.linkage,
+            r2types::callee_name_is_windows_runtime_registration,
+        );
+        if registration_target {
+            registration_targets.insert(direct_target);
+        }
+
+        let runtime_copy_target = imported_name_authorizes_runtime_role(
+            name,
+            target.linkage,
+            r2types::callee_name_is_runtime_copy,
+        ) || semantic_summary
+            .is_some_and(r2sym::semantic_summary_has_runtime_copy_role);
+        if runtime_copy_target {
+            runtime_copy_targets.insert(direct_target);
+        }
+
+        let skip_reason = interproc_target_skip_reason_from_evidence(
+            target_name_is_import_authorized(name, target.linkage),
+            semantic_summary.is_some_and(r2sym::semantic_summary_has_modeled_evidence),
+            target.target_materialized,
+            interproc_target_metrics_within_budget(target.target_metrics.as_ref()),
+        );
+
+        let mut decision_queued_targets = Vec::new();
+        let (first_queue_target, second_queue_target) =
+            interproc_target_queue_pair(direct_target, resolved_target, skip_reason);
+        for target in [first_queue_target, second_queue_target]
+            .into_iter()
+            .flatten()
+        {
+            queued_targets.insert(target);
+            decision_queued_targets.push(target);
+        }
+        decision_queued_targets.sort_unstable();
+        decision_queued_targets.dedup();
+
+        decisions.push(EngineInterprocTargetDecision {
+            direct_target,
+            resolved_target,
+            queued_targets: decision_queued_targets,
+            registration_target,
+            runtime_copy_target,
+            skip_reason,
+        });
+    }
+
+    decisions.sort_by_key(|decision| decision.direct_target);
+
+    EngineInterprocTargetPlan {
+        queued_targets: queued_targets.into_iter().collect(),
+        registration_targets: registration_targets.into_iter().collect(),
+        runtime_copy_targets: runtime_copy_targets.into_iter().collect(),
+        decisions,
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn interproc_target_skip_reason_is_fail_closed_and_priority_ordered() {
+        let import_authorized: bool = kani::any();
+        let has_modeled_summary: bool = kani::any();
+        let target_materialized: bool = kani::any();
+        let metrics_within_budget: bool = kani::any();
+
+        let skip_reason = interproc_target_skip_reason_from_evidence(
+            import_authorized,
+            has_modeled_summary,
+            target_materialized,
+            metrics_within_budget,
+        );
+
+        if import_authorized {
+            assert_eq!(skip_reason, Some(EngineInterprocTargetSkipReason::Imported));
+        } else if has_modeled_summary {
+            assert_eq!(
+                skip_reason,
+                Some(EngineInterprocTargetSkipReason::SummaryModeled)
+            );
+        } else if !target_materialized {
+            assert_eq!(
+                skip_reason,
+                Some(EngineInterprocTargetSkipReason::Unmaterialized)
+            );
+        } else if !metrics_within_budget {
+            assert_eq!(
+                skip_reason,
+                Some(EngineInterprocTargetSkipReason::OverBudget)
+            );
+        } else {
+            assert_eq!(skip_reason, None);
+        }
+
+        if skip_reason.is_none() {
+            assert!(target_materialized);
+            assert!(metrics_within_budget);
+            assert!(!has_modeled_summary);
+            assert!(!import_authorized);
+        }
+    }
+
+    #[kani::proof]
+    fn imported_name_runtime_role_requires_imported_linkage() {
+        let name_matches_runtime_role: bool = kani::any();
+        let linkage = match kani::any::<u8>() % 3 {
+            0 => r2ssa::FunctionSemanticLinkage::Unknown,
+            1 => r2ssa::FunctionSemanticLinkage::Internal,
+            _ => r2ssa::FunctionSemanticLinkage::Imported,
+        };
+
+        let authorized =
+            imported_name_authorizes_runtime_role(Some("runtime_role"), linkage, |_| {
+                name_matches_runtime_role
+            });
+
+        assert_eq!(
+            authorized,
+            name_matches_runtime_role
+                && matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
+        );
+        if linkage != r2ssa::FunctionSemanticLinkage::Imported {
+            assert!(!authorized);
+        }
+    }
+
+    #[kani::proof]
+    fn interproc_target_metric_budget_is_owned_by_engine_thresholds() {
+        let basic_block_count: u32 = kani::any();
+        let cost: u32 = kani::any();
+        let metrics = EngineInterprocTargetMetrics {
+            basic_block_count,
+            cost,
+        };
+
+        let within_budget = interproc_target_metrics_within_budget(Some(&metrics));
+        assert_eq!(
+            within_budget,
+            basic_block_count <= ENGINE_INTERPROC_HELPER_MAX_BLOCKS
+                && cost <= ENGINE_INTERPROC_HELPER_MAX_COST
+        );
+        assert_eq!(
+            interproc_helper_scope_within_budget(basic_block_count, cost),
+            within_budget
+        );
+        assert!(!interproc_target_metrics_within_budget(None));
+    }
+
+    #[kani::proof]
+    fn interproc_target_queue_pair_queues_only_unskipped_targets() {
+        let direct_target = 0x1000 + u64::from(kani::any::<u16>());
+        let resolved_offset = u64::from(kani::any::<u8>() % 4);
+        let has_resolved_target: bool = kani::any();
+        let skipped: bool = kani::any();
+        let resolved_target = has_resolved_target.then_some(direct_target + resolved_offset);
+
+        let skip_reason = skipped.then_some(EngineInterprocTargetSkipReason::OverBudget);
+        let (first, second) =
+            interproc_target_queue_pair(direct_target, resolved_target, skip_reason);
+
+        if skipped {
+            assert_eq!(first, None);
+            assert_eq!(second, None);
+        } else {
+            let effective_target = resolved_target.unwrap_or(direct_target);
+            if effective_target != direct_target {
+                assert_eq!(first, Some(direct_target));
+                assert_eq!(second, Some(effective_target));
+            } else {
+                assert_eq!(first, Some(effective_target));
+                assert_eq!(second, None);
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn analysis_policy_depths_have_nonzero_monotonic_budgets() {
+        let depth = kani::any::<u32>();
+        let selected = analysis_policy_for_radare2_depth(depth);
+        assert!(selected.type_interproc_max_iters > 0);
+        assert!(selected.type_max_blocks > 0);
+        assert!(selected.type_global_max_links > 0);
+        assert!(selected.type_max_decls > 0);
+        assert!(selected.type_max_mutations > 0);
+
+        let basic = analysis_policy_for_depth(EngineAnalysisDepth::Basic);
+        let balanced = analysis_policy_for_depth(EngineAnalysisDepth::Default);
+        let aggressive = analysis_policy_for_depth(EngineAnalysisDepth::Aggressive);
+
+        assert!(basic.mode.level() < balanced.mode.level());
+        assert!(balanced.mode.level() < aggressive.mode.level());
+        assert!(basic.type_writeback_mode.level() < balanced.type_writeback_mode.level());
+        assert!(balanced.type_writeback_mode.level() < aggressive.type_writeback_mode.level());
+        assert!(basic.type_interproc_max_iters < balanced.type_interproc_max_iters);
+        assert!(balanced.type_interproc_max_iters < aggressive.type_interproc_max_iters);
+        assert!(basic.type_max_blocks < balanced.type_max_blocks);
+        assert!(balanced.type_max_blocks < aggressive.type_max_blocks);
+        assert!(basic.type_global_max_links < balanced.type_global_max_links);
+        assert!(balanced.type_global_max_links < aggressive.type_global_max_links);
+        assert!(basic.type_max_decls < balanced.type_max_decls);
+        assert!(balanced.type_max_decls < aggressive.type_max_decls);
+        assert!(basic.type_max_mutations < balanced.type_max_mutations);
+        assert!(balanced.type_max_mutations < aggressive.type_max_mutations);
+    }
+
+    #[kani::proof]
+    fn post_analysis_plan_focus_policy_matches_engine_thresholds() {
+        let depth = kani::any::<u32>();
+        let function_count = usize::from(kani::any::<u16>());
+        let plan = post_analysis_plan_for_radare2_depth(depth, function_count);
+
+        assert_eq!(
+            plan.xref_enabled,
+            plan.policy.mode.level() >= EngineAnalysisMode::Balanced.level()
+        );
+        assert_eq!(
+            plan.taint_enabled,
+            plan.policy.mode == EngineAnalysisMode::Full
+        );
+        assert_eq!(
+            plan.signature_writeback_enabled,
+            plan.policy.mode.level() >= EngineAnalysisMode::Balanced.level()
+        );
+        assert_eq!(
+            plan.type_writeback_enabled,
+            plan.signature_writeback_enabled
+                && plan.policy.type_writeback_mode != EngineTypeWritebackMode::Off
+        );
+        assert_eq!(
+            plan.balanced_focus_only,
+            plan.policy.mode == EngineAnalysisMode::Balanced
+        );
+        assert_eq!(
+            plan.taint_focus_only,
+            plan.taint_enabled && function_count > TAINT_GLOBAL_MAX_FUNCTIONS
+        );
+        assert_eq!(
+            plan.signature_writeback_focus_only,
+            plan.signature_writeback_enabled
+                && (plan.balanced_focus_only
+                    || function_count > SIGNATURE_WRITEBACK_GLOBAL_MAX_FUNCTIONS)
+        );
+        assert_eq!(
+            plan.type_writeback_focus_only,
+            plan.type_writeback_enabled
+                && (plan.balanced_focus_only
+                    || function_count > TYPE_WRITEBACK_GLOBAL_MAX_FUNCTIONS)
+        );
+    }
+
+    #[kani::proof]
+    fn bounded_type_plan_budget_policy_is_fail_closed() {
+        let interproc_max_iters = kani::any::<usize>();
+        let interproc_converged: bool = kani::any();
+        let prefers_bounded =
+            type_analysis_interproc_prefers_bounded_plan(interproc_max_iters, interproc_converged);
+
+        assert_eq!(
+            prefers_bounded,
+            interproc_max_iters <= 1 && !interproc_converged
+        );
+        if interproc_converged || interproc_max_iters > 1 {
+            assert!(!prefers_bounded);
+        }
+    }
+
+    #[kani::proof]
+    fn cache_plan_layers_are_owned_by_request_kind_and_profile_fails_closed() {
+        let request = match kani::any::<u8>() % 5 {
+            0 => EngineRequestKind::Decompile,
+            1 => EngineRequestKind::Types,
+            2 => EngineRequestKind::SymbolicQuery,
+            3 => EngineRequestKind::DebugFacts,
+            _ => EngineRequestKind::Profile,
+        };
+
+        let plan = EngineCachePlan::for_request(request);
+
+        assert_eq!(plan.request, request);
+        match request {
+            EngineRequestKind::Decompile => {
+                assert_eq!(plan.layer, EngineCacheLayer::Render);
+                assert!(plan.lookup);
+                assert!(plan.store_on_miss);
+            }
+            EngineRequestKind::Types | EngineRequestKind::SymbolicQuery => {
+                assert_eq!(plan.layer, EngineCacheLayer::Artifact);
+                assert!(plan.lookup);
+                assert!(plan.store_on_miss);
+            }
+            EngineRequestKind::DebugFacts => {
+                assert_eq!(plan.layer, EngineCacheLayer::Analysis);
+                assert!(plan.lookup);
+                assert!(plan.store_on_miss);
+            }
+            EngineRequestKind::Profile => {
+                assert_eq!(plan.layer, EngineCacheLayer::MetricsSnapshot);
+                assert!(!plan.lookup);
+                assert!(!plan.store_on_miss);
+            }
+        }
+
+        if !plan.lookup || !plan.store_on_miss {
+            assert_eq!(request, EngineRequestKind::Profile);
+        }
+    }
+
+    #[kani::proof]
+    fn analysis_cache_key_changes_when_semantic_inputs_change() {
+        let function_addr = kani::any::<u64>();
+        let function_name_hash = kani::any::<u64>();
+        let arch_hash = kani::any::<u64>();
+        let blocks_hash = kani::any::<u64>();
+        let typed_context_hash = kani::any::<u64>();
+        let assumptions_hash = kani::any::<u64>();
+        let analysis_depth_hash = kani::any::<u64>();
+
+        let base = AnalysisCacheKey::from_hashes(
+            function_addr,
+            function_name_hash,
+            arch_hash,
+            blocks_hash,
+            typed_context_hash,
+            assumptions_hash,
+            analysis_depth_hash,
+        );
+
+        assert!(
+            base != AnalysisCacheKey::from_hashes(
+                function_addr.wrapping_add(1),
+                function_name_hash,
+                arch_hash,
+                blocks_hash,
+                typed_context_hash,
+                assumptions_hash,
+                analysis_depth_hash,
+            )
+        );
+        assert!(
+            base != AnalysisCacheKey::from_hashes(
+                function_addr,
+                function_name_hash.wrapping_add(1),
+                arch_hash,
+                blocks_hash,
+                typed_context_hash,
+                assumptions_hash,
+                analysis_depth_hash,
+            )
+        );
+        assert!(
+            base != AnalysisCacheKey::from_hashes(
+                function_addr,
+                function_name_hash,
+                arch_hash.wrapping_add(1),
+                blocks_hash,
+                typed_context_hash,
+                assumptions_hash,
+                analysis_depth_hash,
+            )
+        );
+        assert!(
+            base != AnalysisCacheKey::from_hashes(
+                function_addr,
+                function_name_hash,
+                arch_hash,
+                blocks_hash.wrapping_add(1),
+                typed_context_hash,
+                assumptions_hash,
+                analysis_depth_hash,
+            )
+        );
+        assert!(
+            base != AnalysisCacheKey::from_hashes(
+                function_addr,
+                function_name_hash,
+                arch_hash,
+                blocks_hash,
+                typed_context_hash.wrapping_add(1),
+                assumptions_hash,
+                analysis_depth_hash,
+            )
+        );
+        assert!(
+            base != AnalysisCacheKey::from_hashes(
+                function_addr,
+                function_name_hash,
+                arch_hash,
+                blocks_hash,
+                typed_context_hash,
+                assumptions_hash.wrapping_add(1),
+                analysis_depth_hash,
+            )
+        );
+        assert!(
+            base != AnalysisCacheKey::from_hashes(
+                function_addr,
+                function_name_hash,
+                arch_hash,
+                blocks_hash,
+                typed_context_hash,
+                assumptions_hash,
+                analysis_depth_hash.wrapping_add(1),
+            )
+        );
+    }
+
+    #[kani::proof]
+    fn artifact_and_render_cache_keys_include_orchestration_and_render_payloads() {
+        let analysis = AnalysisCacheKey::from_hashes(
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
+        let interproc_budget_hash = kani::any::<u64>();
+        let symbolic_scope_hash = kani::any::<u64>();
+        let render_payload_hash = kani::any::<u64>();
+        let render_config_hash = kani::any::<u64>();
+
+        let artifact = ArtifactCacheKey::from_hashes(
+            analysis.clone(),
+            interproc_budget_hash,
+            symbolic_scope_hash,
+        );
+        assert!(
+            artifact
+                != ArtifactCacheKey::from_hashes(
+                    AnalysisCacheKey::from_hashes(
+                        analysis.function_addr.wrapping_add(1),
+                        analysis.function_name_hash,
+                        analysis.arch_hash,
+                        analysis.blocks_hash,
+                        analysis.typed_context_hash,
+                        analysis.assumptions_hash,
+                        analysis.analysis_depth_hash,
+                    ),
+                    interproc_budget_hash,
+                    symbolic_scope_hash,
+                )
+        );
+        assert!(
+            artifact
+                != ArtifactCacheKey::from_hashes(
+                    analysis.clone(),
+                    interproc_budget_hash.wrapping_add(1),
+                    symbolic_scope_hash,
+                )
+        );
+        assert!(
+            artifact
+                != ArtifactCacheKey::from_hashes(
+                    analysis,
+                    interproc_budget_hash,
+                    symbolic_scope_hash.wrapping_add(1),
+                )
+        );
+
+        let render = RenderCacheKey::from_artifact(
+            artifact.clone(),
+            render_payload_hash,
+            render_config_hash,
+        );
+        assert!(
+            render
+                != RenderCacheKey::from_artifact(
+                    artifact.clone(),
+                    render_payload_hash.wrapping_add(1),
+                    render_config_hash,
+                )
+        );
+        assert!(
+            render
+                != RenderCacheKey::from_artifact(
+                    artifact.clone(),
+                    render_payload_hash,
+                    render_config_hash.wrapping_add(1),
+                )
+        );
+        assert!(
+            render
+                != RenderCacheKey::from_artifact(
+                    ArtifactCacheKey::from_hashes(
+                        artifact.analysis,
+                        artifact.interproc_budget_hash.wrapping_add(1),
+                        artifact.symbolic_scope_hash,
+                    ),
+                    render_payload_hash,
+                    render_config_hash,
+                )
+        );
+    }
+}
+
+pub fn interproc_direct_call_targets(analysis: &EngineAnalysis) -> Vec<u64> {
+    let mut targets = BTreeSet::new();
+    for call in analysis.ssa_func.call_sites().by_id.values() {
+        if let Some(target) = analysis.ssa_func.resolved_call_target(call) {
+            targets.insert(target);
+        }
+    }
+    targets.into_iter().collect()
+}
+
+fn debug_runtime_scope_enabled() -> bool {
+    std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_TARGETS").is_some()
+}
+
+fn debug_runtime_scope_log(message: &str) {
+    if !debug_runtime_scope_enabled() {
+        return;
+    }
+    let path = std::env::var("R2SLEIGH_DEBUG_RUNTIME_TARGETS_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_runtime_targets.log".to_string());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn arch_supports_windows_x64_runtime_scope(arch: Option<&r2il::ArchSpec>) -> bool {
+    let Some(arch) = arch else {
+        return false;
+    };
+    let lower_name = arch.name.to_ascii_lowercase();
+    (lower_name.contains("x86") || matches!(lower_name.as_str(), "x64" | "amd64"))
+        && (arch.addr_size == 8 || lower_name.contains("64"))
+}
+
+pub fn interproc_runtime_registration_targets(
+    analysis: &EngineAnalysis,
+    arch: Option<&r2il::ArchSpec>,
+    registration_call_targets: &[u64],
+) -> Vec<u64> {
+    if !arch_supports_windows_x64_runtime_scope(arch) || registration_call_targets.is_empty() {
+        debug_runtime_scope_log(&format!(
+            "skip supports_windows_x64={} arch={:?} registrations={}",
+            arch_supports_windows_x64_runtime_scope(arch),
+            arch.map(|arch| arch.name.as_str()),
+            registration_call_targets.len()
+        ));
+        return Vec::new();
+    }
+
+    let registrations = registration_call_targets
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let observations =
+        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
+    let mut targets = BTreeSet::new();
+    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
+        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
+            debug_runtime_scope_log(&format!("call_id={call_id:?} unresolved_target"));
+            continue;
+        };
+        if !registrations.contains(&target) {
+            debug_runtime_scope_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} not_registration"
+            ));
+            continue;
+        }
+        let Some(args) = observations.get(call_id) else {
+            debug_runtime_scope_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} missing_args"
+            ));
+            continue;
+        };
+        let Some(r2ssa::CallArgObservation::Const(handler)) = args.get(1) else {
+            debug_runtime_scope_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} handler_arg={:?}",
+                args.get(1)
+            ));
+            continue;
+        };
+        if *handler >= 0x1000 {
+            debug_runtime_scope_log(&format!(
+                "call_id={call_id:?} target=0x{target:x} handler=0x{handler:x}"
+            ));
+            targets.insert(*handler);
+        }
+    }
+    targets.into_iter().collect()
+}
+
+pub fn interproc_runtime_materialized_sources(
+    analysis: &EngineAnalysis,
+    arch: Option<&r2il::ArchSpec>,
+    copy_call_targets: &[u64],
+) -> Vec<EngineRuntimeMaterializedSource> {
+    if !arch_supports_windows_x64_runtime_scope(arch) || copy_call_targets.is_empty() {
+        return Vec::new();
+    }
+
+    let copy_targets = copy_call_targets.iter().copied().collect::<BTreeSet<_>>();
+    let observations =
+        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
+    let mut sources = BTreeMap::<u64, u64>::new();
+    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
+        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
+            continue;
+        };
+        if !copy_targets.contains(&target) {
+            continue;
+        }
+        let Some(args) = observations.get(call_id) else {
+            continue;
+        };
+        let (
+            Some(r2ssa::CallArgObservation::Const(source)),
+            Some(r2ssa::CallArgObservation::Const(size)),
+        ) = (args.get(1), args.get(2))
+        else {
+            continue;
+        };
+        if *source >= 0x1000 && *size > 0 {
+            sources
+                .entry(*source)
+                .and_modify(|existing| *existing = (*existing).max(*size))
+                .or_insert(*size);
+        }
+    }
+
+    sources
+        .into_iter()
+        .map(|(addr, size)| EngineRuntimeMaterializedSource { addr, size })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -479,22 +1636,61 @@ impl InterprocScopeFacts {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterprocSeedEntry {
+    pub id: u64,
+    pub name: Option<String>,
+    pub arg_count_hint: Option<usize>,
+    pub linkage: r2ssa::FunctionSemanticLinkage,
+}
+
+impl InterprocSeedEntry {
+    pub fn unknown(id: u64, name: Option<String>, arg_count_hint: Option<usize>) -> Self {
+        Self {
+            id,
+            name,
+            arg_count_hint,
+            linkage: r2ssa::FunctionSemanticLinkage::Unknown,
+        }
+    }
+}
+
 pub fn interproc_scope_facts_from_seed_entries<I>(entries: I) -> InterprocScopeFacts
 where
     I: IntoIterator<Item = (u64, Option<String>, Option<usize>)>,
 {
+    interproc_scope_facts_from_typed_seed_entries(
+        entries.into_iter().map(|(id, name, arg_count_hint)| {
+            InterprocSeedEntry::unknown(id, name, arg_count_hint)
+        }),
+    )
+}
+
+pub fn interproc_scope_facts_from_typed_seed_entries<I>(entries: I) -> InterprocScopeFacts
+where
+    I: IntoIterator<Item = InterprocSeedEntry>,
+{
     let mut summaries = BTreeMap::new();
-    for (addr, name, arg_count_hint) in entries {
+    for entry in entries {
+        let InterprocSeedEntry {
+            id: addr,
+            name,
+            arg_count_hint,
+            linkage,
+        } = entry;
         let id = r2ssa::InterprocFunctionId(addr);
         let Some(mut summary) = name
             .as_deref()
-            .and_then(|name| r2sym::function_semantic_summary_seed_for_name(id, name))
+            .and_then(|name| {
+                r2sym::function_semantic_summary_seed_for_name_with_linkage(id, name, linkage)
+            })
             .or_else(|| {
                 arg_count_hint.map(|_| r2ssa::FunctionSemanticSummary::unknown(id, name.clone()))
             })
         else {
             continue;
         };
+        summary.linkage = linkage;
         if arg_count_hint.is_some() {
             summary.arg_count_hint = arg_count_hint;
         }
@@ -529,6 +1725,62 @@ pub struct EngineAnalyzeRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct EngineAnalyzeRequestParts {
+    pub function_name: String,
+    pub function_addr: u64,
+    pub blocks: Vec<R2ILBlock>,
+    pub arch: Option<r2il::ArchSpec>,
+    pub ptr_bits: u32,
+    pub semantic_metadata_enabled: bool,
+    pub reg_type_hints: HashMap<String, r2types::TypeHint>,
+    pub parsed_context: r2types::ParsedExternalContext,
+    pub external_context_fallback_hash: u64,
+    pub scope_facts: InterprocScopeFacts,
+    pub interproc_max_iterations: usize,
+    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
+    pub precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
+    pub include_interproc_summary_set: bool,
+}
+
+impl EngineAnalyzeRequest {
+    pub fn full_semantics(parts: EngineAnalyzeRequestParts) -> Self {
+        Self::from_parts(parts, EngineSemanticMode::Full)
+    }
+
+    pub fn from_compile_missing_semantics(
+        parts: EngineAnalyzeRequestParts,
+        compile_missing_semantics: bool,
+    ) -> Self {
+        let semantic_mode = if compile_missing_semantics {
+            EngineSemanticMode::Full
+        } else {
+            EngineSemanticMode::Optional
+        };
+        Self::from_parts(parts, semantic_mode)
+    }
+
+    fn from_parts(parts: EngineAnalyzeRequestParts, semantic_mode: EngineSemanticMode) -> Self {
+        Self {
+            function_name: parts.function_name,
+            function_addr: parts.function_addr,
+            blocks: parts.blocks,
+            arch: parts.arch,
+            ptr_bits: parts.ptr_bits,
+            semantic_metadata_enabled: parts.semantic_metadata_enabled,
+            reg_type_hints: parts.reg_type_hints,
+            parsed_context: parts.parsed_context,
+            external_context_fallback_hash: parts.external_context_fallback_hash,
+            scope_facts: parts.scope_facts,
+            interproc_max_iterations: parts.interproc_max_iterations,
+            symbolic_scope: parts.symbolic_scope,
+            precomputed_semantic_artifact: parts.precomputed_semantic_artifact,
+            semantic_mode,
+            include_interproc_summary_set: parts.include_interproc_summary_set,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct EngineAnalyzeResponse {
     pub artifact: EngineAnalysisArtifact,
     pub analysis_cache_hit: bool,
@@ -548,7 +1800,7 @@ pub struct EngineDecompileRequest {
     pub strings: HashMap<u64, String>,
     pub symbols: HashMap<u64, String>,
     pub ptr_bits: u32,
-    pub config: r2dec::DecompilerConfig,
+    pub render_target: EngineRenderTarget,
     pub render_cache_key: Option<RenderCacheKey>,
     pub fallback_comment: Option<String>,
 }
@@ -560,10 +1812,18 @@ pub struct EngineFunctionDecompileRequest {
     pub function_names: HashMap<u64, String>,
     pub strings: HashMap<u64, String>,
     pub symbols: HashMap<u64, String>,
-    pub config: r2dec::DecompilerConfig,
     pub func_names_payload: String,
     pub strings_payload: String,
     pub symbols_payload: String,
+}
+
+pub struct EngineSignatureInferenceRequest<'a> {
+    pub function_name: &'a str,
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub ptr_bits: u32,
+    pub semantic_metadata_enabled: bool,
+    pub reg_type_hints: &'a HashMap<String, r2types::TypeHint>,
+    pub analysis: &'a EngineAnalysis,
 }
 
 pub struct EngineTargetQueryRouteRequest<'ctx, 'a> {
@@ -707,9 +1967,45 @@ pub struct EngineSummaryDecompileRequest {
     pub cfg_summary: CFGRiskSummary,
     pub function_facts: FunctionFacts,
     pub named_worker_guarded: bool,
-    pub config: r2dec::DecompilerConfig,
+    pub render_target: EngineRenderTarget,
     pub render_cache_key: Option<RenderCacheKey>,
     pub fallback_comment: Option<String>,
+}
+
+impl EngineSummaryDecompileRequest {
+    pub fn guarded_worker_summary(
+        function_name: String,
+        cfg_summary: CFGRiskSummary,
+        function_facts: FunctionFacts,
+        render_target: EngineRenderTarget,
+        render_cache_key: Option<RenderCacheKey>,
+    ) -> Self {
+        let fallback_comment = engine_summary_worker_fallback_comment(
+            &function_name,
+            &cfg_summary,
+            &function_facts,
+            &render_target,
+        );
+        Self {
+            function_name,
+            cfg_summary,
+            function_facts,
+            named_worker_guarded: true,
+            render_target,
+            render_cache_key,
+            fallback_comment,
+        }
+    }
+}
+
+pub struct EngineDetachedSemanticWorkerSummaryRequest<'a> {
+    pub function_name: String,
+    pub function_addr: u64,
+    pub blocks: &'a [R2ILBlock],
+    pub arch: Option<&'a r2il::ArchSpec>,
+    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    pub cfg_summary: CFGRiskSummary,
+    pub render_cache_key: Option<RenderCacheKey>,
 }
 
 pub struct EngineSummaryPreprobeRequest<'a> {
@@ -722,7 +2018,6 @@ pub struct EngineSummaryPreprobeRequest<'a> {
     pub parsed_context: &'a r2types::ParsedExternalContext,
     pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
     pub type_seed: Option<FunctionTypeFacts>,
-    pub config: r2dec::DecompilerConfig,
     pub func_names_payload: &'a str,
     pub strings_payload: &'a str,
     pub symbols_payload: &'a str,
@@ -755,13 +2050,36 @@ pub struct EngineTypeAnalysisRequest {
     pub caller_prefers_bounded_type_plan: bool,
 }
 
+impl EngineTypeAnalysisRequest {
+    pub fn from_interproc_budget(
+        analysis: EngineAnalyzeRequest,
+        interproc_max_iters: usize,
+        interproc_converged: bool,
+    ) -> Self {
+        Self {
+            analysis,
+            caller_prefers_bounded_type_plan: type_analysis_interproc_prefers_bounded_plan(
+                interproc_max_iters,
+                interproc_converged,
+            ),
+        }
+    }
+}
+
+pub fn type_analysis_interproc_prefers_bounded_plan(
+    interproc_max_iters: usize,
+    interproc_converged: bool,
+) -> bool {
+    interproc_max_iters <= 1 && !interproc_converged
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineTypeAnalysisResponse {
     pub cfg_summary: CFGRiskSummary,
     pub function_facts: FunctionFacts,
     pub writeback_plan: TypeWritebackPlan,
     pub route_decision: EngineTypeRouteDecision,
-    pub semantic_route: Option<r2dec::SemanticRoutePlan>,
+    pub semantic_route: Option<EngineSemanticRoutePlan>,
     pub callsite_count: usize,
     pub current_summary: Option<r2ssa::FunctionSemanticSummary>,
     pub artifact_cache_hit: bool,
@@ -1021,7 +2339,7 @@ impl EngineSession {
     ) -> Option<EngineTypeAnalysisResponse> {
         let started = std::time::Instant::now();
         let analysis_request = request.analysis;
-        let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(analysis_request.arch.as_ref());
+        let (arch_name, _, _) = EngineRenderTarget::for_arch(analysis_request.arch.as_ref());
         let type_seed = r2types::function_type_facts_from_parsed_context(
             &analysis_request.function_name,
             &analysis_request.parsed_context,
@@ -1051,7 +2369,6 @@ impl EngineSession {
                 function_name: &analysis_request.function_name,
                 arch_name: &arch_name,
                 ptr_bits: analysis_request.ptr_bits,
-                callconv: analysis_request.parsed_context.callconv.as_deref(),
                 function_facts: &preprobe.function_facts,
                 cfg_summary: &preprobe.cfg_summary,
                 route: &preprobe.route_decision,
@@ -1093,7 +2410,6 @@ impl EngineSession {
             function_name: &analysis_request.function_name,
             arch_name: &arch_name,
             ptr_bits: analysis_request.ptr_bits,
-            callconv: analysis_request.parsed_context.callconv.as_deref(),
             function_facts: &artifact.function_facts,
             cfg_summary: &cfg_summary,
             route: &route_decision,
@@ -1165,11 +2481,14 @@ impl EngineSession {
             function_names,
             strings,
             symbols,
-            config,
             func_names_payload,
             strings_payload,
             symbols_payload,
         } = request;
+        let (_, render_target) = EngineRenderTarget::for_arch_with_ptr_bits(
+            analysis_request.arch.as_ref(),
+            analysis_request.ptr_bits,
+        );
         let canonical_name = analysis_request.function_name.clone();
         let display_name = if display_name.trim().is_empty() {
             canonical_name.clone()
@@ -1211,7 +2530,6 @@ impl EngineSession {
                 parsed_context: &analysis_request.parsed_context,
                 symbolic_scope: analysis_request.symbolic_scope.as_ref(),
                 type_seed: Some(type_seed),
-                config: config.clone(),
                 func_names_payload: &func_names_payload,
                 strings_payload: &strings_payload,
                 symbols_payload: &symbols_payload,
@@ -1242,7 +2560,6 @@ impl EngineSession {
                 parsed_context: &analysis_request.parsed_context,
                 symbolic_scope: analysis_request.symbolic_scope.as_ref(),
                 type_seed: Some(type_seed),
-                config: config.clone(),
                 func_names_payload: &func_names_payload,
                 strings_payload: &strings_payload,
                 symbols_payload: &symbols_payload,
@@ -1314,7 +2631,7 @@ impl EngineSession {
             strings,
             symbols,
             ptr_bits: analysis_request.ptr_bits,
-            config,
+            render_target,
             render_cache_key: Some(render_cache_key),
             fallback_comment,
         })
@@ -1394,7 +2711,7 @@ impl EngineSession {
                 select_engine_plan(EngineRequestKind::Decompile, Some(&decision.route), None);
             decision.route_reason = semantic_route_reason(&decision.route);
             decision.refusal = match &decision.route {
-                r2dec::SemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+                EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
                 _ => None,
             };
         }
@@ -1405,12 +2722,8 @@ impl EngineSession {
         };
         let decision = *decision;
         let planning_time = started.elapsed();
-        if matches!(decision.route, r2dec::SemanticRoutePlan::Standard)
-            && (request.fallback_comment.is_none()
-                || prefers_standard_native_for_summary_only_worker(
-                    &request.function_facts,
-                    &request.cfg_summary,
-                ))
+        if matches!(decision.route, EngineSemanticRoutePlan::Standard)
+            && request.fallback_comment.is_none()
         {
             return None;
         }
@@ -1452,6 +2765,36 @@ impl EngineSession {
         })
     }
 
+    pub fn decompile_detached_semantic_worker_summary(
+        &self,
+        request: EngineDetachedSemanticWorkerSummaryRequest<'_>,
+    ) -> Option<EngineDecompileResponse> {
+        let analysis =
+            self.prepare_analysis(&request.function_name, request.blocks, request.arch)?;
+        let semantic_artifact = compile_semantic_artifact_for_analysis(
+            &analysis.ssa_func,
+            request.function_addr,
+            &request.function_name,
+            request.symbolic_scope,
+            request.arch,
+            None,
+        );
+        let render_target = EngineRenderTarget::for_arch(request.arch).2;
+        let function_facts = detached_semantic_worker_function_facts(
+            &request.function_name,
+            &render_target,
+            semantic_artifact,
+        );
+
+        self.decompile_summary(EngineSummaryDecompileRequest::guarded_worker_summary(
+            request.function_name,
+            request.cfg_summary,
+            function_facts,
+            render_target,
+            request.render_cache_key,
+        ))
+    }
+
     pub fn decompile_summary_preprobe(
         &self,
         request: EngineSummaryPreprobeRequest<'_>,
@@ -1474,10 +2817,13 @@ impl EngineSession {
             request.symbolic_scope,
             probe.summary_probe_skipped_large_cfg,
         );
-        let type_seed = request
-            .type_seed
-            .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
-        let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
+        let type_seed = request.type_seed.unwrap_or_else(|| {
+            r2types::function_type_facts_from_parsed_context(
+                request.display_name,
+                request.parsed_context,
+            )
+        });
+        let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch);
         let function_facts = if let Some(semantic_artifact) = semantic_artifact {
             let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
                 type_seed,
@@ -1540,7 +2886,11 @@ impl EngineSession {
             cfg_summary,
             function_facts,
             named_worker_guarded: probe.named_worker_guarded,
-            config: request.config,
+            render_target: EngineRenderTarget::for_arch_with_ptr_bits(
+                request.arch,
+                request.ptr_bits,
+            )
+            .1,
             render_cache_key: Some(render_cache_key),
             fallback_comment,
         })
@@ -1986,7 +3336,7 @@ fn render_engine_decompile_request(
         &request.function_name,
         &request.function_facts,
         &decision.route,
-        request.config.clone(),
+        &request.render_target,
     ) {
         return output;
     }
@@ -2009,7 +3359,8 @@ fn render_engine_decompile_request(
     .with_callee_resolution(request.callee_resolution.clone());
     let context = decompiler_context_with_route_decision(context, decision);
     let input = r2dec::DecompilerInput::new(request.prepared_ssa.clone(), context);
-    let output = r2dec::Decompiler::new(request.config.clone()).decompile_input(&input);
+    let output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
+        .decompile_input(&input);
     if !output.trim().is_empty() {
         return output;
     }
@@ -2027,10 +3378,10 @@ fn render_engine_decompile_request(
 }
 
 fn should_suppress_unrenderable_standard_summary_artifact(
-    route: &r2dec::SemanticRoutePlan,
+    route: &EngineSemanticRoutePlan,
     function_facts: &FunctionFacts,
 ) -> bool {
-    if !matches!(route, r2dec::SemanticRoutePlan::Standard) {
+    if !matches!(route, EngineSemanticRoutePlan::Standard) {
         return false;
     }
     let Some(artifact) = function_facts.semantic_artifact() else {
@@ -2063,7 +3414,7 @@ fn decompile_type_override(
         return Some(facts);
     }
 
-    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch.as_ref());
+    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch.as_ref());
     if let Some(projection) = native_worker_type_projection_for_identity(
         identity,
         &arch_name,
@@ -2100,7 +3451,7 @@ fn refused_decompile_response(
         decision: EngineRouteDecision {
             request: EngineRequestKind::Decompile,
             plan: EnginePlan::RefuseWithEvidence,
-            route: r2dec::SemanticRoutePlan::FallbackComment {
+            route: EngineSemanticRoutePlan::FallbackComment {
                 comment: output.clone(),
             },
             route_reason: Some(reason.to_string()),
@@ -2140,10 +3491,56 @@ fn render_engine_summary_decompile_request(
         &request.function_name,
         &request.function_facts,
         &decision.route,
-        request.config.clone(),
+        &request.render_target,
     )
     .or_else(|| request.fallback_comment.clone())
     .filter(|output| !output.trim().is_empty())
+}
+
+fn engine_summary_worker_fallback_comment(
+    function_name: &str,
+    cfg_summary: &CFGRiskSummary,
+    function_facts: &FunctionFacts,
+    render_target: &EngineRenderTarget,
+) -> Option<String> {
+    let semantic_artifact = function_facts.semantics.as_ref()?;
+    if !semantic_artifact
+        .native_body()
+        .is_some_and(|native| native.has_summary_islands())
+    {
+        return None;
+    }
+    let reason = cfg_guard_reason_from_summary(cfg_summary)
+        .unwrap_or_else(|| "semantic worker summary".to_string());
+    let plan = r2types::build_semantic_type_fallback_plan(
+        function_name,
+        &render_target.arch_name,
+        render_target.ptr_bits,
+        semantic_artifact,
+    );
+    Some(r2dec::render_semantic_worker_linearization(
+        &plan,
+        Some(semantic_artifact),
+        &reason,
+    ))
+}
+
+fn detached_semantic_worker_function_facts(
+    function_name: &str,
+    render_target: &EngineRenderTarget,
+    semantic_artifact: r2sym::SemanticArtifact,
+) -> FunctionFacts {
+    let type_plan = r2types::build_semantic_type_fallback_plan(
+        function_name,
+        &render_target.arch_name,
+        render_target.ptr_bits,
+        &semantic_artifact,
+    );
+    let type_facts = r2types::inferred_signature_to_function_type_facts(
+        &type_plan.signature,
+        render_target.ptr_bits,
+    );
+    FunctionFacts::new(type_facts, Some(semantic_artifact))
 }
 
 pub fn function_analysis_cache_key(
@@ -2395,7 +3792,7 @@ fn build_engine_analysis_artifact(
         }
     };
     let pattern_ssa_blocks = semantic_analysis.pattern_ssa_func.local_ssa_blocks();
-    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch.as_ref());
+    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch.as_ref());
     let signature = infer_signature_from_engine_analysis(
         &request.function_name,
         &arch_name,
@@ -2644,7 +4041,7 @@ fn infer_signature_from_engine_analysis(
     reg_type_hints: &HashMap<String, r2types::TypeHint>,
     analysis: &EngineAnalysis,
 ) -> Option<r2types::InferredSignature> {
-    let (_, _, cfg) = r2dec::DecompilerConfig::for_arch(arch);
+    let cfg = EngineRenderTarget::for_arch(arch).2.to_decompiler_config();
     let pattern_ssa_blocks = analysis.pattern_ssa_func.local_ssa_blocks();
     let mut var_recovery = r2dec::VariableRecovery::new(&cfg.sp_name, &cfg.fp_name, cfg.ptr_size);
     var_recovery.recover(&analysis.ssa_func);
@@ -2677,6 +4074,21 @@ fn infer_signature_from_engine_analysis(
         &recovered_params,
         &pointer_arg_slots,
     ))
+}
+
+pub fn infer_signature_from_analysis(
+    request: EngineSignatureInferenceRequest<'_>,
+) -> Option<r2types::InferredSignature> {
+    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch);
+    infer_signature_from_engine_analysis(
+        request.function_name,
+        &arch_name,
+        request.ptr_bits,
+        request.arch,
+        request.semantic_metadata_enabled,
+        request.reg_type_hints,
+        request.analysis,
+    )
 }
 
 fn parsed_context_has_layout_hints(parsed_context: &r2types::ParsedExternalContext) -> bool {
@@ -3204,33 +4616,6 @@ fn fast_program_orchestrator_summary_artifact(
     r2sym::compile_named_native_worker_summary_artifact(&summary, skipped_large_cfg)
 }
 
-pub fn type_facts_from_parsed_context(
-    parsed_context: &r2types::ParsedExternalContext,
-) -> FunctionTypeFacts {
-    let merged_signature = parsed_context
-        .merged_signature
-        .clone()
-        .or_else(|| parsed_context.current_signature.clone());
-    let signature_certificate = merged_signature.as_ref().and_then(|signature| {
-        r2types::SignatureCertificate::from_signature(
-            signature,
-            [r2types::SignatureCertificateSource::ExternalContext],
-        )
-    });
-    FunctionTypeFacts::builder(FunctionTypeFactInputs {
-        merged_signature,
-        signature_certificate,
-        known_function_signatures: parsed_context.known_function_signatures.clone(),
-        register_params: parsed_context.register_params.clone(),
-        stack_slots: parsed_context.stack_slots.clone(),
-        external_stack_vars: parsed_context.external_stack_vars.clone(),
-        external_type_db: parsed_context.external_type_db.clone(),
-        diagnostics: parsed_context.diagnostics.clone(),
-        ..FunctionTypeFactInputs::default()
-    })
-    .build()
-}
-
 pub fn native_worker_type_projection(
     function_addr: u64,
     function_name: &str,
@@ -3266,7 +4651,8 @@ pub fn native_worker_type_projection_for_identity(
     {
         return None;
     }
-    let type_facts = type_facts_from_parsed_context(parsed_context);
+    let type_facts =
+        r2types::function_type_facts_from_parsed_context(identity.primary_name(), parsed_context);
     let current_param_count = type_facts
         .render_authorized_signature()
         .map(|signature| signature.params.len())
@@ -3332,10 +4718,13 @@ pub fn type_summary_preprobe(
             probe.summary_probe_skipped_large_cfg,
         )
     });
-    let type_seed = request
-        .type_seed
-        .unwrap_or_else(|| type_facts_from_parsed_context(request.parsed_context));
-    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(request.arch);
+    let type_seed = request.type_seed.unwrap_or_else(|| {
+        r2types::function_type_facts_from_parsed_context(
+            request.display_name,
+            request.parsed_context,
+        )
+    });
+    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch);
     let function_facts = if let Some(semantic_artifact) = semantic_artifact {
         let type_facts = type_facts_with_summary_projection_for_candidates_with_options(
             type_seed,
@@ -3426,20 +4815,26 @@ fn summary_preprobe_type_payload_prefers_semantic_fallback(
 pub fn render_semantic_route(
     function_name: &str,
     function_facts: &FunctionFacts,
-    route: &r2dec::SemanticRoutePlan,
-    config: r2dec::DecompilerConfig,
+    route: &EngineSemanticRoutePlan,
+    config: &EngineRenderTarget,
 ) -> Option<String> {
     match route {
-        r2dec::SemanticRoutePlan::LinearWorker { .. }
-        | r2dec::SemanticRoutePlan::SummaryIslands { .. }
-        | r2dec::SemanticRoutePlan::StructuredWorker { .. } => {
-            r2dec::render_semantic_worker_summary(function_name, function_facts, route, config)
+        EngineSemanticRoutePlan::LinearWorker { .. }
+        | EngineSemanticRoutePlan::SummaryIslands { .. }
+        | EngineSemanticRoutePlan::StructuredWorker { .. } => {
+            let decompiler_route = route.to_decompiler_route();
+            r2dec::render_semantic_worker_summary(
+                function_name,
+                function_facts,
+                &decompiler_route,
+                config.to_decompiler_config(),
+            )
         }
-        r2dec::SemanticRoutePlan::VmSummary { .. } => {
+        EngineSemanticRoutePlan::VmSummary { .. } => {
             r2dec::render_vm_semantic_summary(function_name, function_facts)
         }
-        r2dec::SemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
-        r2dec::SemanticRoutePlan::Standard => None,
+        EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+        EngineSemanticRoutePlan::Standard => None,
     }
 }
 
@@ -3475,7 +4870,6 @@ pub fn signature_override_from_type_facts(
     function_name: &str,
     arch_name: &str,
     ptr_bits: u32,
-    callconv: Option<&str>,
     type_facts: &r2types::FunctionTypeFacts,
 ) -> Option<r2types::InferredSignature> {
     type_facts
@@ -3485,7 +4879,7 @@ pub fn signature_override_from_type_facts(
                 function_name,
                 arch_name,
                 ptr_bits,
-                callconv,
+                type_facts.callconv.as_deref(),
                 signature,
             )
         })
@@ -3495,7 +4889,6 @@ pub fn bounded_cfg_type_writeback_plan(
     function_name: &str,
     arch_name: &str,
     ptr_bits: u32,
-    callconv: Option<&str>,
     function_facts: &FunctionFacts,
     reason: String,
 ) -> TypeWritebackPlan {
@@ -3503,7 +4896,6 @@ pub fn bounded_cfg_type_writeback_plan(
         function_name,
         arch_name,
         ptr_bits,
-        callconv,
         &function_facts.types,
     )
     .unwrap_or_else(|| r2types::InferredSignature {
@@ -3533,7 +4925,6 @@ pub fn semantic_fallback_type_writeback_plan(
     function_name: &str,
     arch_name: &str,
     ptr_bits: u32,
-    callconv: Option<&str>,
     artifact: &r2sym::SemanticArtifact,
     function_facts: &FunctionFacts,
     apply_artifact_signature_hint: bool,
@@ -3544,7 +4935,6 @@ pub fn semantic_fallback_type_writeback_plan(
         function_name,
         arch_name,
         ptr_bits,
-        callconv,
         &function_facts.types,
     );
     if apply_artifact_signature_hint && let Some(signature) = signature_override.as_mut() {
@@ -3560,7 +4950,6 @@ struct TypeWritebackPlanRouteInput<'a> {
     function_name: &'a str,
     arch_name: &'a str,
     ptr_bits: u32,
-    callconv: Option<&'a str>,
     function_facts: &'a FunctionFacts,
     cfg_summary: &'a CFGRiskSummary,
     route: &'a EngineTypeRouteDecision,
@@ -3576,7 +4965,6 @@ fn type_writeback_plan_for_route(
             input.function_name,
             input.arch_name,
             input.ptr_bits,
-            input.callconv,
             input.function_facts,
             input
                 .route
@@ -3590,7 +4978,6 @@ fn type_writeback_plan_for_route(
                 input.function_name,
                 input.arch_name,
                 input.ptr_bits,
-                input.callconv,
                 artifact,
                 input.function_facts,
                 input.route.apply_artifact_signature_hint,
@@ -3623,6 +5010,9 @@ fn count_prepared_callsites(ssa_blocks: &[r2ssa::SSABlock]) -> usize {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::sync::{LazyLock, Mutex};
+
+    static TYPE_WRITEBACK_CACHE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn const_return_blocks(addr: u64, value: u64) -> Vec<R2ILBlock> {
         let mut block = R2ILBlock::new(addr, 4);
@@ -3641,6 +5031,556 @@ mod tests {
             target: r2il::Varnode::constant(0, 8),
         });
         vec![block]
+    }
+
+    #[test]
+    fn engine_render_target_canonicalizes_arch_without_renderer_config_type() {
+        let mut arch = r2il::ArchSpec::new("amd64");
+        arch.addr_size = 8;
+        let (arch_name, ptr_bits, target) = EngineRenderTarget::for_arch(Some(&arch));
+
+        assert_eq!(arch_name, "x86-64");
+        assert_eq!(ptr_bits, 64);
+        assert_eq!(
+            target,
+            EngineRenderTarget {
+                arch_name: "x86-64".to_string(),
+                ptr_bits: 64,
+            }
+        );
+
+        let x86 = EngineRenderTarget::for_arch_name("i386", 32);
+        assert_eq!(x86.arch_name, "x86");
+        assert_eq!(x86.ptr_bits, 32);
+
+        let (unknown_arch_name, unknown_target) =
+            EngineRenderTarget::for_arch_with_ptr_bits(None, 32);
+        assert_eq!(unknown_arch_name, "unknown");
+        assert_eq!(
+            unknown_target,
+            EngineRenderTarget {
+                arch_name: "unknown".to_string(),
+                ptr_bits: 32,
+            }
+        );
+
+        let riscv = EngineRenderTarget::for_arch_name("riscv32", 32).to_decompiler_config();
+        assert_eq!(riscv.ptr_size, 32);
+        assert_eq!(riscv.fp_name, "s0");
+        assert_eq!(riscv.arg_regs.first().map(String::as_str), Some("a0"));
+    }
+
+    #[test]
+    fn analysis_policy_tracks_radare2_analysis_depths() {
+        let basic = analysis_policy_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_BASIC);
+        assert_eq!(basic.mode, EngineAnalysisMode::Fast);
+        assert_eq!(basic.type_writeback_mode, EngineTypeWritebackMode::Off);
+        assert_eq!(basic.type_interproc_max_iters, 1);
+        assert_eq!(basic.type_max_blocks, 96);
+        assert_eq!(basic.type_global_max_links, 8);
+        assert_eq!(basic.type_max_decls, 8);
+        assert_eq!(basic.type_max_mutations, 32);
+
+        let balanced = analysis_policy_for_radare2_depth(0);
+        assert_eq!(balanced.mode, EngineAnalysisMode::Balanced);
+        assert_eq!(
+            balanced.type_writeback_mode,
+            EngineTypeWritebackMode::Balanced
+        );
+        assert_eq!(balanced.type_interproc_max_iters, 4);
+        assert_eq!(balanced.type_max_blocks, 200);
+        assert_eq!(balanced.type_global_max_links, 32);
+        assert_eq!(balanced.type_max_decls, 32);
+        assert_eq!(balanced.type_max_mutations, 128);
+
+        let aggressive = analysis_policy_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_AGGRESSIVE);
+        assert_eq!(aggressive.mode, EngineAnalysisMode::Full);
+        assert_eq!(
+            aggressive.type_writeback_mode,
+            EngineTypeWritebackMode::Aggressive
+        );
+        assert_eq!(aggressive.type_interproc_max_iters, 12);
+        assert_eq!(aggressive.type_max_blocks, 500);
+        assert_eq!(aggressive.type_global_max_links, 128);
+        assert_eq!(aggressive.type_max_decls, 64);
+        assert_eq!(aggressive.type_max_mutations, 512);
+    }
+
+    #[test]
+    fn analysis_policy_is_monotonic_from_basic_to_aggressive() {
+        let basic = analysis_policy_for_depth(EngineAnalysisDepth::Basic);
+        let balanced = analysis_policy_for_depth(EngineAnalysisDepth::Default);
+        let aggressive = analysis_policy_for_depth(EngineAnalysisDepth::Aggressive);
+
+        assert!(basic.mode.level() < balanced.mode.level());
+        assert!(balanced.mode.level() < aggressive.mode.level());
+        assert!(basic.type_writeback_mode.level() < balanced.type_writeback_mode.level());
+        assert!(balanced.type_writeback_mode.level() < aggressive.type_writeback_mode.level());
+        assert!(basic.type_interproc_max_iters < balanced.type_interproc_max_iters);
+        assert!(balanced.type_interproc_max_iters < aggressive.type_interproc_max_iters);
+        assert!(basic.type_max_blocks < balanced.type_max_blocks);
+        assert!(balanced.type_max_blocks < aggressive.type_max_blocks);
+        assert!(basic.type_global_max_links < balanced.type_global_max_links);
+        assert!(balanced.type_global_max_links < aggressive.type_global_max_links);
+        assert!(basic.type_max_decls < balanced.type_max_decls);
+        assert!(balanced.type_max_decls < aggressive.type_max_decls);
+        assert!(basic.type_max_mutations < balanced.type_max_mutations);
+        assert!(balanced.type_max_mutations < aggressive.type_max_mutations);
+    }
+
+    #[test]
+    fn post_analysis_plan_owns_mode_budgets_and_focus_thresholds() {
+        let fast = post_analysis_plan_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_BASIC, 512);
+        assert_eq!(fast.policy.mode, EngineAnalysisMode::Fast);
+        assert_eq!(fast.post_budget_us, POST_ANALYSIS_FAST_BUDGET_USEC);
+        assert!(!fast.xref_enabled);
+        assert!(!fast.taint_enabled);
+        assert!(!fast.signature_writeback_enabled);
+        assert!(!fast.type_writeback_enabled);
+        assert!(!fast.balanced_focus_only);
+        assert!(!fast.taint_focus_only);
+        assert!(!fast.signature_writeback_focus_only);
+        assert!(!fast.type_writeback_focus_only);
+
+        let balanced = post_analysis_plan_for_radare2_depth(0, 1);
+        assert_eq!(balanced.policy.mode, EngineAnalysisMode::Balanced);
+        assert_eq!(balanced.post_budget_us, POST_ANALYSIS_BALANCED_BUDGET_USEC);
+        assert!(balanced.xref_enabled);
+        assert!(!balanced.taint_enabled);
+        assert!(balanced.signature_writeback_enabled);
+        assert!(balanced.type_writeback_enabled);
+        assert!(balanced.balanced_focus_only);
+        assert!(!balanced.taint_focus_only);
+        assert!(balanced.signature_writeback_focus_only);
+        assert!(balanced.type_writeback_focus_only);
+
+        let full = post_analysis_plan_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_AGGRESSIVE, 129);
+        assert_eq!(full.policy.mode, EngineAnalysisMode::Full);
+        assert_eq!(full.post_budget_us, POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC);
+        assert!(full.xref_enabled);
+        assert!(full.taint_enabled);
+        assert!(full.signature_writeback_enabled);
+        assert!(full.type_writeback_enabled);
+        assert!(!full.balanced_focus_only);
+        assert!(full.taint_focus_only);
+        assert!(full.signature_writeback_focus_only);
+        assert!(full.type_writeback_focus_only);
+    }
+
+    #[test]
+    fn type_analysis_interproc_budget_policy_is_engine_owned() {
+        assert!(type_analysis_interproc_prefers_bounded_plan(0, false));
+        assert!(type_analysis_interproc_prefers_bounded_plan(1, false));
+        assert!(!type_analysis_interproc_prefers_bounded_plan(1, true));
+        assert!(!type_analysis_interproc_prefers_bounded_plan(2, false));
+    }
+
+    #[test]
+    fn analyze_request_builders_own_semantic_mode_selection() {
+        let parts = EngineAnalyzeRequestParts {
+            function_name: "sym.builder".to_string(),
+            function_addr: 0x401000,
+            blocks: const_return_blocks(0x401000, 0),
+            arch: None,
+            ptr_bits: 64,
+            semantic_metadata_enabled: false,
+            reg_type_hints: HashMap::new(),
+            parsed_context: r2types::parse_external_context_json("{}", 64),
+            external_context_fallback_hash: 0,
+            scope_facts: InterprocScopeFacts::empty(),
+            interproc_max_iterations: 1,
+            symbolic_scope: None,
+            precomputed_semantic_artifact: None,
+            include_interproc_summary_set: true,
+        };
+
+        let full = EngineAnalyzeRequest::full_semantics(parts.clone());
+        assert!(matches!(full.semantic_mode, EngineSemanticMode::Full));
+
+        let compile_missing =
+            EngineAnalyzeRequest::from_compile_missing_semantics(parts.clone(), true);
+        assert!(matches!(
+            compile_missing.semantic_mode,
+            EngineSemanticMode::Full
+        ));
+
+        let optional = EngineAnalyzeRequest::from_compile_missing_semantics(parts, false);
+        assert!(matches!(
+            optional.semantic_mode,
+            EngineSemanticMode::Optional
+        ));
+    }
+
+    #[test]
+    fn type_writeback_cache_is_engine_owned_and_address_keyed() {
+        let _guard = TYPE_WRITEBACK_CACHE_TEST_LOCK
+            .lock()
+            .expect("type writeback cache test lock poisoned");
+        engine_type_writeback_cache_clear();
+        assert_eq!(engine_type_writeback_cache_len(), 0);
+
+        let first = EngineTypeWritebackCacheEntry {
+            key: 1,
+            dep_hash: 2,
+            payload_hash: 3,
+            applied_hash: 4,
+        };
+        engine_type_writeback_cache_put(0x401000, first);
+        assert_eq!(engine_type_writeback_cache_len(), 1);
+        assert_eq!(engine_type_writeback_cache_get(0x401000), Some(first));
+
+        let replacement = EngineTypeWritebackCacheEntry {
+            key: 10,
+            dep_hash: 20,
+            payload_hash: 30,
+            applied_hash: 40,
+        };
+        engine_type_writeback_cache_put(0x401000, replacement);
+        assert_eq!(engine_type_writeback_cache_len(), 1);
+        assert_eq!(engine_type_writeback_cache_get(0x401000), Some(replacement));
+
+        engine_type_writeback_cache_clear();
+    }
+
+    #[test]
+    fn type_writeback_cache_key_includes_engine_policy_fields() {
+        let base = engine_type_writeback_cache_key(
+            0x1234_5678_9abc_def0,
+            0x0fed_cba9_8765_4321,
+            EngineTypeWritebackMode::Aggressive,
+            12,
+            128,
+            4096,
+            8192,
+        );
+        assert_eq!(base, 0x52d8_b88a_64ea_8d11);
+        assert_ne!(
+            base,
+            engine_type_writeback_cache_key(
+                0x1234_5678_9abc_def1,
+                0x0fed_cba9_8765_4321,
+                EngineTypeWritebackMode::Aggressive,
+                12,
+                128,
+                4096,
+                8192
+            )
+        );
+        assert_ne!(
+            base,
+            engine_type_writeback_cache_key(
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4320,
+                EngineTypeWritebackMode::Aggressive,
+                12,
+                128,
+                4096,
+                8192
+            )
+        );
+        assert_ne!(
+            base,
+            engine_type_writeback_cache_key(
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4321,
+                EngineTypeWritebackMode::Balanced,
+                12,
+                128,
+                4096,
+                8192
+            )
+        );
+        assert_ne!(
+            base,
+            engine_type_writeback_cache_key(
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4321,
+                EngineTypeWritebackMode::Aggressive,
+                13,
+                128,
+                4096,
+                8192
+            )
+        );
+        assert_ne!(
+            base,
+            engine_type_writeback_cache_key(
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4321,
+                EngineTypeWritebackMode::Aggressive,
+                12,
+                129,
+                4096,
+                8192
+            )
+        );
+        assert_ne!(
+            base,
+            engine_type_writeback_cache_key(
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4321,
+                EngineTypeWritebackMode::Aggressive,
+                12,
+                128,
+                4097,
+                8192
+            )
+        );
+        assert_ne!(
+            base,
+            engine_type_writeback_cache_key(
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4321,
+                EngineTypeWritebackMode::Aggressive,
+                12,
+                128,
+                4096,
+                8193
+            )
+        );
+    }
+
+    #[test]
+    fn type_writeback_cache_evicts_oldest_entry_deterministically() {
+        let _guard = TYPE_WRITEBACK_CACHE_TEST_LOCK
+            .lock()
+            .expect("type writeback cache test lock poisoned");
+        engine_type_writeback_cache_clear();
+
+        for idx in 0..TYPE_WRITEBACK_CACHE_LIMIT as u64 {
+            engine_type_writeback_cache_put(
+                0x500000 + idx,
+                EngineTypeWritebackCacheEntry {
+                    key: idx,
+                    dep_hash: idx + 1,
+                    payload_hash: idx + 2,
+                    applied_hash: idx + 3,
+                },
+            );
+        }
+        assert_eq!(
+            engine_type_writeback_cache_len(),
+            TYPE_WRITEBACK_CACHE_LIMIT
+        );
+
+        assert_eq!(
+            engine_type_writeback_cache_get(0x500000),
+            Some(EngineTypeWritebackCacheEntry {
+                key: 0,
+                dep_hash: 1,
+                payload_hash: 2,
+                applied_hash: 3,
+            })
+        );
+
+        let new_entry = EngineTypeWritebackCacheEntry {
+            key: 9,
+            dep_hash: 10,
+            payload_hash: 11,
+            applied_hash: 12,
+        };
+        engine_type_writeback_cache_put(0x600000, new_entry);
+        assert_eq!(
+            engine_type_writeback_cache_len(),
+            TYPE_WRITEBACK_CACHE_LIMIT
+        );
+        assert!(engine_type_writeback_cache_get(0x500000).is_some());
+        assert_eq!(engine_type_writeback_cache_get(0x500001), None);
+        assert_eq!(engine_type_writeback_cache_get(0x600000), Some(new_entry));
+
+        engine_type_writeback_cache_clear();
+    }
+
+    #[test]
+    fn data_ref_cache_is_engine_owned_and_address_keyed() {
+        let _guard = TYPE_WRITEBACK_CACHE_TEST_LOCK
+            .lock()
+            .expect("type writeback cache test lock poisoned");
+        engine_data_ref_cache_clear();
+        assert_eq!(engine_data_ref_cache_len(), 0);
+
+        let first = EngineDataRefCacheEntry {
+            key: 0xaa,
+            payload_hash: 0xbb,
+            ref_count: 3,
+        };
+        engine_data_ref_cache_put(0x401000, first);
+        assert_eq!(engine_data_ref_cache_len(), 1);
+        assert_eq!(engine_data_ref_cache_get(0x401000), Some(first));
+
+        let replacement = EngineDataRefCacheEntry {
+            key: 0xcc,
+            payload_hash: 0xdd,
+            ref_count: 5,
+        };
+        engine_data_ref_cache_put(0x401000, replacement);
+        assert_eq!(engine_data_ref_cache_len(), 1);
+        assert_eq!(engine_data_ref_cache_get(0x401000), Some(replacement));
+
+        engine_data_ref_cache_clear();
+    }
+
+    #[test]
+    fn data_ref_cache_evicts_oldest_entry_deterministically() {
+        let _guard = TYPE_WRITEBACK_CACHE_TEST_LOCK
+            .lock()
+            .expect("type writeback cache test lock poisoned");
+        engine_data_ref_cache_clear();
+
+        for idx in 0..DATA_REF_CACHE_LIMIT as u64 {
+            engine_data_ref_cache_put(
+                0x700000 + idx,
+                EngineDataRefCacheEntry {
+                    key: idx,
+                    payload_hash: idx + 1,
+                    ref_count: idx.min(i32::MAX as u64) as i32,
+                },
+            );
+        }
+        assert_eq!(engine_data_ref_cache_len(), DATA_REF_CACHE_LIMIT);
+
+        assert!(engine_data_ref_cache_get(0x700000).is_some());
+        let new_entry = EngineDataRefCacheEntry {
+            key: 9,
+            payload_hash: 10,
+            ref_count: 11,
+        };
+        engine_data_ref_cache_put(0x800000, new_entry);
+        assert_eq!(engine_data_ref_cache_len(), DATA_REF_CACHE_LIMIT);
+        assert!(engine_data_ref_cache_get(0x700000).is_some());
+        assert_eq!(engine_data_ref_cache_get(0x700001), None);
+        assert_eq!(engine_data_ref_cache_get(0x800000), Some(new_entry));
+
+        engine_data_ref_cache_clear();
+    }
+
+    #[test]
+    fn data_ref_cache_key_hashes_full_il_payload_not_only_block_shape() {
+        let mut first = R2ILBlock::new(0x401000, 4);
+        first.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::unique(0, 8),
+            src: r2il::Varnode::constant(0x10000, 8),
+        });
+        let mut second = R2ILBlock::new(0x401000, 4);
+        second.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::unique(0, 8),
+            src: r2il::Varnode::constant(0x20000, 8),
+        });
+
+        let first_key = data_ref_cache_key(
+            0x401000,
+            1,
+            4,
+            0xdead_beef,
+            &[first],
+            EngineAnalysisMode::Full,
+        );
+        let second_key = data_ref_cache_key(
+            0x401000,
+            1,
+            4,
+            0xdead_beef,
+            &[second],
+            EngineAnalysisMode::Full,
+        );
+
+        assert_ne!(first_key, second_key);
+    }
+
+    #[test]
+    fn signature_inference_is_engine_owned_and_canonicalizes_arch() {
+        let mut arch = r2il::ArchSpec::new("amd64");
+        arch.addr_size = 8;
+        let blocks = const_return_blocks(0x401000, 0);
+        let analysis =
+            build_engine_analysis_from_parts("sym.owner", &blocks, Some(&arch)).expect("analysis");
+
+        let signature = infer_signature_from_analysis(EngineSignatureInferenceRequest {
+            function_name: "sym.owner",
+            arch: Some(&arch),
+            ptr_bits: 64,
+            semantic_metadata_enabled: false,
+            reg_type_hints: &HashMap::new(),
+            analysis: &analysis,
+        })
+        .expect("signature");
+
+        assert_eq!(signature.function_name, "sym.owner");
+        assert_eq!(signature.arch, "x86-64");
+    }
+
+    #[test]
+    fn register_type_hint_collection_is_engine_owned() {
+        let ptr_reg = r2il::Varnode::register(0, 8).with_meta(r2il::VarnodeMetadata {
+            scalar_kind: Some(r2il::ScalarKind::UnsignedInt),
+            pointer_hint: Some(r2il::PointerHint::PointerLike),
+            ..Default::default()
+        });
+        let int_reg = r2il::Varnode::register(4, 4).with_meta(r2il::VarnodeMetadata {
+            scalar_kind: Some(r2il::ScalarKind::SignedInt),
+            ..Default::default()
+        });
+        let mut block = r2il::R2ILBlock::new(0x401000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: int_reg,
+            src: r2il::Varnode::constant(1, 4),
+        });
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(0, 8),
+            a: ptr_reg,
+            b: r2il::Varnode::constant(8, 8),
+        });
+
+        let hints = collect_register_type_hints_with_names(&[block], |vn| match vn.offset {
+            0 => Some("RDI".to_string()),
+            4 => Some("ESI".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(
+            hints.get("rdi").map(|hint| hint.ty.as_str()),
+            Some("void *")
+        );
+        assert_eq!(
+            hints.get("esi").map(|hint| hint.ty.as_str()),
+            Some("int32_t")
+        );
+        assert!(!hints.contains_key("RDI"));
+    }
+
+    fn windows_x64_runtime_scope_arch() -> r2il::ArchSpec {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rcx", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rdx", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("r8", 24, 8));
+        arch.add_register(r2il::RegisterDef::new("r9", 32, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 40, 8));
+        arch
+    }
+
+    fn x86_32_runtime_scope_arch() -> r2il::ArchSpec {
+        let mut arch = windows_x64_runtime_scope_arch();
+        arch.name = "x86".to_string();
+        arch.addr_size = 4;
+        arch
+    }
+
+    fn x86_64_generic_name_runtime_scope_arch() -> r2il::ArchSpec {
+        let mut arch = windows_x64_runtime_scope_arch();
+        arch.name = "x86".to_string();
+        arch.addr_size = 8;
+        arch
+    }
+
+    fn runtime_reg(offset: u64, size: u32) -> r2il::Varnode {
+        r2il::Varnode {
+            space: r2il::SpaceId::Register,
+            offset,
+            size,
+            meta: None,
+        }
     }
 
     fn guarded_loop_blocks(addr: u64, count: usize) -> Vec<R2ILBlock> {
@@ -4421,6 +6361,32 @@ mod tests {
     }
 
     #[test]
+    fn analyze_uncached_reports_planning_time() {
+        let session = EngineSession::new(4);
+        let response = session
+            .analyze(EngineAnalyzeRequest {
+                function_name: "sym.zero".to_string(),
+                function_addr: 0x401000,
+                blocks: const_return_blocks(0x401000, 0),
+                arch: None,
+                ptr_bits: 64,
+                semantic_metadata_enabled: false,
+                reg_type_hints: HashMap::new(),
+                parsed_context: r2types::ParsedExternalContext::default(),
+                external_context_fallback_hash: 0,
+                scope_facts: InterprocScopeFacts::empty(),
+                interproc_max_iterations: 1,
+                symbolic_scope: None,
+                precomputed_semantic_artifact: None,
+                semantic_mode: EngineSemanticMode::Full,
+                include_interproc_summary_set: true,
+            })
+            .expect("analysis should succeed");
+
+        assert!(response.metrics.planning_time > Duration::default());
+    }
+
+    #[test]
     fn cache_keys_partition_analysis_artifact_and_render_inputs() {
         let arch = r2il::ArchSpec::new("x86-64");
         let blocks = const_return_blocks(0x401000, 0);
@@ -4576,7 +6542,7 @@ mod tests {
             strings: HashMap::new(),
             symbols: HashMap::new(),
             ptr_bits: 64,
-            config: r2dec::DecompilerConfig::x86_64(),
+            render_target: EngineRenderTarget::default(),
             render_cache_key: Some(render),
             fallback_comment: None,
         };
@@ -4660,6 +6626,42 @@ mod tests {
     }
 
     #[test]
+    fn decompile_callee_resolution_uses_resolved_copied_call_targets() {
+        let tmp = r2il::Varnode::unique(0x10, 8);
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: tmp.clone(),
+            src: r2il::Varnode::constant(0x5000, 8),
+        });
+        block.push(r2il::R2ILOp::CallInd { target: tmp });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_symbolic(&[block], None)
+            .expect("prepared")
+            .with_name("sym.caller");
+        let function_facts = FunctionFacts::default();
+        let function_names = HashMap::from([(0x5000, "sym.helper".to_string())]);
+
+        let resolution = decompile_callee_resolution_facts(
+            &prepared,
+            &function_facts,
+            &function_names,
+            &HashMap::new(),
+            64,
+        );
+
+        let identity = resolution
+            .identity_for_callsite(r2types::CallsiteKey {
+                block_addr: 0x401000,
+                op_index: 1,
+            })
+            .expect("copied target callsite should resolve through r2ssa");
+        assert_eq!(identity.target_addr, Some(0x5000));
+        assert_eq!(identity.display_name.as_deref(), Some("sym.helper"));
+    }
+
+    #[test]
     fn decompile_route_decision_reports_prepared_proof_coverage() {
         let mut entry = R2ILBlock::new(0x401000, 4);
         entry.push(r2il::R2ILOp::CBranch {
@@ -4727,6 +6729,37 @@ mod tests {
             proof_coverage_from_type_facts(&type_facts).certified_out_params,
             1
         );
+    }
+
+    #[test]
+    fn type_fact_proof_coverage_counts_field_and_array_certificates() {
+        let type_facts = FunctionTypeFacts {
+            field_access_certificates: vec![
+                r2types::FieldAccessCertificate {
+                    slot: 0,
+                    field_offset: 0,
+                    field_name: "len".to_string(),
+                    field_type: Some("size_t".to_string()),
+                },
+                r2types::FieldAccessCertificate {
+                    slot: 1,
+                    field_offset: 8,
+                    field_name: "data".to_string(),
+                    field_type: Some("uint8_t *".to_string()),
+                },
+            ],
+            array_index_certificates: vec![r2types::ArrayIndexCertificate {
+                slot: 1,
+                base: Some(r2types::ArrayIndexBase::Param { index: 0 }),
+                field_offset: 8,
+                element_stride: 1,
+            }],
+            ..FunctionTypeFacts::default()
+        };
+
+        let coverage = proof_coverage_from_type_facts(&type_facts);
+        assert_eq!(coverage.certified_field_accesses, 2);
+        assert_eq!(coverage.certified_array_indexes, 1);
     }
 
     #[test]
@@ -4817,7 +6850,7 @@ mod tests {
             cfg_summary: prepared.function().cfg_risk_summary(),
             function_facts: FunctionFacts::default(),
             named_worker_guarded: false,
-            config: r2dec::DecompilerConfig::x86_64(),
+            render_target: EngineRenderTarget::default(),
             render_cache_key: Some(render),
             fallback_comment: Some("/* summary fallback */".to_string()),
         };
@@ -4836,7 +6869,76 @@ mod tests {
     }
 
     #[test]
-    fn summary_preprobe_standard_exact_worker_defers_to_full_native_decompile() {
+    fn guarded_summary_decompile_request_owns_fallback_comment() {
+        let blocks = const_return_blocks(0x402000, 0);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
+        let artifact = summary_only_table_walk_artifact();
+        let request = EngineSummaryDecompileRequest::guarded_worker_summary(
+            "dbg.table_walk".to_string(),
+            prepared.function().cfg_risk_summary(),
+            FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact)),
+            EngineRenderTarget::default(),
+            None,
+        );
+
+        assert!(request.named_worker_guarded);
+        let fallback = request.fallback_comment.expect("engine fallback comment");
+        assert!(fallback.contains("r2dec residual: semantic worker linearization"));
+        assert!(fallback.contains("render contract: summary facts only"));
+        assert!(fallback.contains("semantic worker summary"));
+        assert!(
+            !fallback.contains("void dbg.table_walk(void)") && !fallback.contains("{\n"),
+            "summary fallback must not render a native C wrapper:\n{fallback}"
+        );
+    }
+
+    #[test]
+    fn detached_semantic_worker_function_facts_owns_fallback_type_projection() {
+        let artifact = summary_only_table_walk_artifact();
+        let function_facts = detached_semantic_worker_function_facts(
+            "dbg.table_walk",
+            &EngineRenderTarget::default(),
+            artifact,
+        );
+
+        assert!(
+            function_facts
+                .semantics
+                .as_ref()
+                .and_then(r2sym::SemanticArtifact::native_body)
+                .is_some_and(|native| native.has_summary_islands())
+        );
+        assert!(
+            function_facts.types.merged_signature.is_some(),
+            "engine must project semantic fallback signatures before handing facts to rendering"
+        );
+    }
+
+    #[test]
+    fn detached_semantic_worker_summary_refuses_without_worker_evidence() {
+        let session = EngineSession::new(4);
+        let blocks = const_return_blocks(0x402000, 0);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
+        let request = EngineDetachedSemanticWorkerSummaryRequest {
+            function_name: "sym.not_a_worker".to_string(),
+            function_addr: 0x402000,
+            blocks: &blocks,
+            arch: None,
+            symbolic_scope: None,
+            cfg_summary: prepared.function().cfg_risk_summary(),
+            render_cache_key: None,
+        };
+
+        assert!(
+            session
+                .decompile_detached_semantic_worker_summary(request)
+                .is_none(),
+            "detached worker summary decompile must not fabricate output without semantic worker evidence"
+        );
+    }
+
+    #[test]
+    fn summary_preprobe_exact_worker_returns_comment_only_summary_route() {
         let session = EngineSession::new(4);
         let blocks = const_return_blocks(0x402000, 0);
         let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
@@ -4846,12 +6948,26 @@ mod tests {
             cfg_summary: prepared.function().cfg_risk_summary(),
             function_facts: FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact)),
             named_worker_guarded: false,
-            config: r2dec::DecompilerConfig::x86_64(),
+            render_target: EngineRenderTarget::default(),
             render_cache_key: None,
             fallback_comment: Some("/* summary fallback */".to_string()),
         };
 
-        assert!(session.decompile_summary(request).is_none());
+        let response = session
+            .decompile_summary(request)
+            .expect("summary preprobe should render comment-only summary output");
+        assert!(
+            response
+                .output
+                .contains("render contract: summary facts only")
+        );
+        assert!(
+            !response.output.contains("return ")
+                && !response.output.contains("if (")
+                && !response.output.contains("switch ("),
+            "summary preprobe must not emit executable native C:\n{}",
+            response.output
+        );
     }
 
     #[test]
@@ -5054,7 +7170,7 @@ mod tests {
     }
 
     #[test]
-    fn function_identity_reports_evidence_backed_summary_family() {
+    fn function_identity_rejects_raw_import_name_summary_family() {
         let identity = EngineFunctionIdentity::with_aliases(
             0x401000,
             "sym.imp.memcpy",
@@ -5062,7 +7178,10 @@ mod tests {
             ["fcn.00401000", "memcpy"],
         );
 
-        assert!(identity.has_summary_family());
+        assert!(
+            !identity.has_summary_family(),
+            "raw import aliases must not create evidence-backed summary-family applicability"
+        );
         assert_eq!(identity.summary_probe_name(), "sym.imp.memcpy");
     }
 
@@ -5481,11 +7600,441 @@ mod tests {
     }
 
     #[test]
-    fn libc_summary_seed_still_represents_known_import_semantics() {
-        let summary = native_worker_summary_seed(0x401000, "sym.imp.memcpy").expect("memcpy seed");
+    fn native_worker_summary_seed_rejects_raw_import_name_semantics() {
+        assert!(
+            native_worker_summary_seed(0x401000, "sym.imp.memcpy").is_none(),
+            "raw import-shaped names must not seed canonical helper semantics"
+        );
+    }
 
-        assert!(!summary.transfer_effects.is_empty());
-        assert_eq!(summary.arg_count_hint, Some(3));
+    #[test]
+    fn typed_interproc_seed_entry_is_the_linkage_authority() {
+        let name_only = interproc_scope_facts_from_seed_entries([(
+            0x2000,
+            Some("sym.imp.memcpy".to_string()),
+            None,
+        )]);
+        assert!(
+            name_only
+                .summaries()
+                .get(&r2ssa::InterprocFunctionId(0x2000))
+                .is_none(),
+            "legacy raw-name seeds must not materialize semantic summaries",
+        );
+
+        let typed = interproc_scope_facts_from_typed_seed_entries([InterprocSeedEntry {
+            id: 0x2000,
+            name: Some("memcpy".to_string()),
+            arg_count_hint: None,
+            linkage: r2ssa::FunctionSemanticLinkage::Imported,
+        }]);
+        let typed_summary = typed
+            .summaries()
+            .get(&r2ssa::InterprocFunctionId(0x2000))
+            .expect("typed summary");
+        assert_eq!(
+            typed_summary.linkage,
+            r2ssa::FunctionSemanticLinkage::Imported
+        );
+        assert_eq!(
+            typed_summary.return_relation,
+            r2ssa::SummaryReturnRelation::Arg(0)
+        );
+        assert_ne!(
+            name_only.identity_hash(),
+            typed.identity_hash(),
+            "summary linkage must participate in cache identity"
+        );
+    }
+
+    #[test]
+    fn engine_owns_interproc_direct_call_target_collection() {
+        let arch = windows_x64_runtime_scope_arch();
+        let analysis = build_engine_analysis_from_parts(
+            "sym.wrapper",
+            &direct_call_return_blocks(0x401000, 0x2000),
+            Some(&arch),
+        )
+        .expect("analysis");
+
+        assert_eq!(interproc_direct_call_targets(&analysis), vec![0x2000]);
+    }
+
+    fn small_interproc_target_metrics() -> EngineInterprocTargetMetrics {
+        EngineInterprocTargetMetrics {
+            basic_block_count: 1,
+            cost: 1,
+        }
+    }
+
+    fn oversized_interproc_target_metrics() -> EngineInterprocTargetMetrics {
+        EngineInterprocTargetMetrics {
+            basic_block_count: ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1,
+            cost: 1,
+        }
+    }
+
+    #[test]
+    fn interproc_helper_scope_budget_is_engine_owned() {
+        assert!(interproc_helper_scope_within_budget(
+            ENGINE_INTERPROC_HELPER_MAX_BLOCKS,
+            ENGINE_INTERPROC_HELPER_MAX_COST,
+        ));
+        assert!(!interproc_helper_scope_within_budget(
+            ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1,
+            ENGINE_INTERPROC_HELPER_MAX_COST,
+        ));
+        assert!(!interproc_helper_scope_within_budget(
+            ENGINE_INTERPROC_HELPER_MAX_BLOCKS,
+            ENGINE_INTERPROC_HELPER_MAX_COST + 1,
+        ));
+    }
+
+    #[test]
+    fn interproc_scope_target_plan_keeps_plugin_out_of_import_policy() {
+        let plan = interproc_scope_target_plan([
+            EngineInterprocTargetInput {
+                direct_target: 0x2000,
+                name: Some("sym.imp.printf".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Unknown,
+                semantic_summary: None,
+                resolved_target: Some(0x2000),
+                target_materialized: true,
+                target_metrics: Some(small_interproc_target_metrics()),
+            },
+            EngineInterprocTargetInput {
+                direct_target: 0x3000,
+                name: Some("sym.imp.memcpy".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Imported,
+                semantic_summary: None,
+                resolved_target: Some(0x3000),
+                target_materialized: true,
+                target_metrics: Some(small_interproc_target_metrics()),
+            },
+        ]);
+
+        assert_eq!(
+            plan.queued_targets,
+            vec![0x2000],
+            "import-shaped names must not skip helper scope without typed import linkage"
+        );
+        let imported = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.direct_target == 0x3000)
+            .expect("imported decision");
+        assert_eq!(
+            imported.skip_reason,
+            Some(EngineInterprocTargetSkipReason::Imported)
+        );
+        assert_eq!(
+            plan.runtime_copy_targets,
+            vec![0x3000],
+            "runtime-copy role is still reported for imported memcpy calls"
+        );
+    }
+
+    #[test]
+    fn interproc_scope_target_plan_reports_runtime_roles_and_thunks() {
+        let runtime_copy_summary = r2sym::function_semantic_summary_seed_for_name_with_linkage(
+            r2ssa::InterprocFunctionId(0x4200),
+            "memcpy",
+            r2ssa::FunctionSemanticLinkage::Imported,
+        )
+        .expect("typed memcpy summary");
+        let plan = interproc_scope_target_plan([
+            EngineInterprocTargetInput {
+                direct_target: 0x4100,
+                name: Some("sym.imp.AddVectoredExceptionHandler".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Imported,
+                semantic_summary: None,
+                resolved_target: Some(0x4100),
+                target_materialized: true,
+                target_metrics: Some(small_interproc_target_metrics()),
+            },
+            EngineInterprocTargetInput {
+                direct_target: 0x4200,
+                name: Some("sym.local_memcpy_thunk".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Internal,
+                semantic_summary: Some(runtime_copy_summary),
+                resolved_target: Some(0x4200),
+                target_materialized: true,
+                target_metrics: Some(small_interproc_target_metrics()),
+            },
+            EngineInterprocTargetInput {
+                direct_target: 0x4300,
+                name: Some("sym.local_thunk".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Internal,
+                semantic_summary: None,
+                resolved_target: Some(0x4310),
+                target_materialized: true,
+                target_metrics: Some(small_interproc_target_metrics()),
+            },
+        ]);
+
+        assert_eq!(plan.registration_targets, vec![0x4100]);
+        assert_eq!(plan.runtime_copy_targets, vec![0x4200]);
+        assert_eq!(
+            plan.queued_targets,
+            vec![0x4300, 0x4310],
+            "thunked direct targets queue both the direct wrapper and resolved target"
+        );
+        let summary = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.direct_target == 0x4200)
+            .expect("summary decision");
+        assert_eq!(
+            summary.skip_reason,
+            Some(EngineInterprocTargetSkipReason::SummaryModeled)
+        );
+    }
+
+    #[test]
+    fn interproc_scope_target_plan_rejects_name_only_runtime_roles() {
+        let plan = interproc_scope_target_plan([
+            EngineInterprocTargetInput {
+                direct_target: 0x4400,
+                name: Some("memcpy".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Internal,
+                semantic_summary: None,
+                resolved_target: Some(0x4400),
+                target_materialized: true,
+                target_metrics: Some(small_interproc_target_metrics()),
+            },
+            EngineInterprocTargetInput {
+                direct_target: 0x4500,
+                name: Some("sym.imp.AddVectoredExceptionHandler".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Unknown,
+                semantic_summary: None,
+                resolved_target: Some(0x4500),
+                target_materialized: true,
+                target_metrics: Some(small_interproc_target_metrics()),
+            },
+        ]);
+
+        assert!(
+            plan.registration_targets.is_empty(),
+            "runtime registration must require typed imported linkage"
+        );
+        assert!(
+            plan.runtime_copy_targets.is_empty(),
+            "runtime copy must require typed imported linkage or explicit modeled summary evidence"
+        );
+        assert_eq!(
+            plan.queued_targets,
+            vec![0x4400, 0x4500],
+            "name-only runtime-looking helpers should stay on the native helper queue"
+        );
+    }
+
+    #[test]
+    fn interproc_scope_target_plan_refuses_unmaterialized_and_over_budget_targets() {
+        let plan = interproc_scope_target_plan([
+            EngineInterprocTargetInput {
+                direct_target: 0x5000,
+                name: Some("sym.unmaterialized".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Internal,
+                semantic_summary: None,
+                resolved_target: None,
+                target_materialized: false,
+                target_metrics: None,
+            },
+            EngineInterprocTargetInput {
+                direct_target: 0x6000,
+                name: Some("sym.too_large".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Internal,
+                semantic_summary: None,
+                resolved_target: Some(0x6000),
+                target_materialized: true,
+                target_metrics: Some(oversized_interproc_target_metrics()),
+            },
+            EngineInterprocTargetInput {
+                direct_target: 0x7000,
+                name: Some("sym.unmeasured".to_string()),
+                linkage: r2ssa::FunctionSemanticLinkage::Internal,
+                semantic_summary: None,
+                resolved_target: Some(0x7000),
+                target_materialized: true,
+                target_metrics: None,
+            },
+        ]);
+
+        assert!(plan.queued_targets.is_empty());
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .map(|decision| decision.skip_reason)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(EngineInterprocTargetSkipReason::Unmaterialized),
+                Some(EngineInterprocTargetSkipReason::OverBudget),
+                Some(EngineInterprocTargetSkipReason::OverBudget),
+            ]
+        );
+    }
+
+    #[test]
+    fn engine_owns_windows_runtime_registration_scope_targets() {
+        let arch = windows_x64_runtime_scope_arch();
+        let mut block = R2ILBlock::new(0x5000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(8, 8),
+            src: r2il::Varnode::constant(1, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(16, 8),
+            src: r2il::Varnode::constant(0x1400_3d0f, 8),
+        });
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(0x1800_1000, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        let analysis = build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch))
+            .expect("analysis");
+
+        assert_eq!(
+            interproc_runtime_registration_targets(&analysis, Some(&arch), &[0x1800_1000]),
+            vec![0x1400_3d0f],
+            "handler comes from the canonical Windows x64 arg1 observation"
+        );
+        let generic_x86_64 = x86_64_generic_name_runtime_scope_arch();
+        assert_eq!(
+            interproc_runtime_registration_targets(
+                &analysis,
+                Some(&generic_x86_64),
+                &[0x1800_1000]
+            ),
+            vec![0x1400_3d0f],
+            "64-bit x86 should be accepted even when the arch name omits a 64 suffix"
+        );
+        assert!(
+            interproc_runtime_registration_targets(&analysis, Some(&arch), &[0x1800_2000])
+                .is_empty(),
+            "non-registration callees must not expand symbolic scope"
+        );
+    }
+
+    #[test]
+    fn runtime_registration_scope_is_gated_to_windows_x64() {
+        let arch = windows_x64_runtime_scope_arch();
+        let mut block = R2ILBlock::new(0x5000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(16, 8),
+            src: r2il::Varnode::constant(0x1400_3d0f, 8),
+        });
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(0x1800_1000, 8),
+        });
+        let analysis = build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch))
+            .expect("analysis");
+
+        assert!(
+            interproc_runtime_registration_targets(&analysis, None, &[0x1800_1000]).is_empty(),
+            "missing architecture must not enable Windows runtime scope expansion"
+        );
+        let x86_32 = x86_32_runtime_scope_arch();
+        assert!(
+            interproc_runtime_registration_targets(&analysis, Some(&x86_32), &[0x1800_1000])
+                .is_empty(),
+            "32-bit x86 must not enable Windows x64 runtime scope expansion"
+        );
+    }
+
+    #[test]
+    fn engine_owns_runtime_materialized_source_collection() {
+        let arch = windows_x64_runtime_scope_arch();
+        let mut block = R2ILBlock::new(0x6000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(8, 8),
+            src: r2il::Varnode::constant(0x7000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(16, 8),
+            src: r2il::Varnode::constant(0x9000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(24, 8),
+            src: r2il::Varnode::constant(0x20, 8),
+        });
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(0x1800_2000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(16, 8),
+            src: r2il::Varnode::constant(0x9000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(24, 8),
+            src: r2il::Varnode::constant(0x40, 8),
+        });
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(0x1800_2000, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        let analysis = build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch))
+            .expect("analysis");
+
+        assert_eq!(
+            interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000]),
+            vec![EngineRuntimeMaterializedSource {
+                addr: 0x9000,
+                size: 0x40
+            }],
+            "duplicate copy observations must collapse to the maximum materialized size"
+        );
+        let x86_32 = x86_32_runtime_scope_arch();
+        assert!(
+            interproc_runtime_materialized_sources(&analysis, Some(&x86_32), &[0x1800_2000])
+                .is_empty(),
+            "unsupported architectures must not report materialized runtime sources even when call args are otherwise valid"
+        );
+    }
+
+    #[test]
+    fn runtime_materialized_sources_reject_non_code_and_zero_size_inputs() {
+        let arch = windows_x64_runtime_scope_arch();
+        let mut block = R2ILBlock::new(0x6000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(16, 8),
+            src: r2il::Varnode::constant(0x900, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(24, 8),
+            src: r2il::Varnode::constant(0x20, 8),
+        });
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(0x1800_2000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(16, 8),
+            src: r2il::Varnode::constant(0x9000, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: runtime_reg(24, 8),
+            src: r2il::Varnode::constant(0, 8),
+        });
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(0x1800_2000, 8),
+        });
+        let analysis = build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch))
+            .expect("analysis");
+
+        assert!(
+            interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000])
+                .is_empty(),
+            "runtime materialization needs both a code-like source address and a nonzero size"
+        );
+        let x86_32 = x86_32_runtime_scope_arch();
+        assert!(
+            interproc_runtime_materialized_sources(&analysis, Some(&x86_32), &[0x1800_2000])
+                .is_empty(),
+            "32-bit x86 must not enable Windows x64 materialized-source collection"
+        );
     }
 
     #[test]
@@ -5571,6 +8120,7 @@ mod tests {
                 [r2types::SignatureCertificateSource::ExternalContext],
             ),
             merged_signature: Some(signature),
+            callconv: Some("amd64".to_string()),
             ..FunctionTypeFacts::default()
         };
         let function_facts = FunctionFacts::new(type_facts, None);
@@ -5578,7 +8128,6 @@ mod tests {
             "fcn.401000",
             "x86-64",
             64,
-            Some("amd64"),
             &function_facts,
             "bounded type plan for large CFG".to_string(),
         );
@@ -5742,6 +8291,7 @@ mod tests {
             response.route_decision.kind,
             EngineTypeRouteKind::SemanticFallback
         );
+        assert!(response.metrics.planning_time > Duration::default());
         assert_eq!(response.writeback_plan.signature.params[0].name, "argc");
         assert_eq!(response.writeback_plan.signature.params[1].name, "argv");
     }
@@ -5774,7 +8324,6 @@ mod tests {
             function_names: HashMap::new(),
             strings: HashMap::new(),
             symbols: HashMap::new(),
-            config: r2dec::DecompilerConfig::default(),
             func_names_payload: "{}".to_string(),
             strings_payload: "{}".to_string(),
             symbols_payload: "{}".to_string(),
@@ -5783,7 +8332,7 @@ mod tests {
         assert!(response.output.contains("init_node"));
         assert!(!matches!(
             response.decision.route,
-            r2dec::SemanticRoutePlan::SummaryIslands { .. }
+            EngineSemanticRoutePlan::SummaryIslands { .. }
         ));
     }
 
@@ -5803,7 +8352,6 @@ mod tests {
                 parsed_context: &parsed_context,
                 symbolic_scope: None,
                 type_seed: Some(r2types::FunctionTypeFacts::default()),
-                config: r2dec::DecompilerConfig::default(),
                 func_names_payload: "{}",
                 strings_payload: "{}",
                 symbols_payload: "{}",
@@ -5821,7 +8369,7 @@ mod tests {
 
     #[test]
     fn engine_plan_maps_routes_to_work_levels() {
-        let route = r2dec::SemanticRoutePlan::SummaryIslands {
+        let route = EngineSemanticRoutePlan::SummaryIslands {
             reason: "summary".to_string(),
         };
         assert_eq!(
@@ -5832,6 +8380,45 @@ mod tests {
             select_engine_plan(EngineRequestKind::Decompile, None, None),
             EnginePlan::FastLocal
         );
+    }
+
+    #[test]
+    fn semantic_route_reason_preserves_exact_engine_route_reason() {
+        for (route, expected) in [
+            (
+                EngineSemanticRoutePlan::StructuredWorker {
+                    reason: "structured proof".to_string(),
+                },
+                Some("structured proof".to_string()),
+            ),
+            (
+                EngineSemanticRoutePlan::SummaryIslands {
+                    reason: "summary islands".to_string(),
+                },
+                Some("summary islands".to_string()),
+            ),
+            (
+                EngineSemanticRoutePlan::LinearWorker {
+                    reason: "linear worker".to_string(),
+                },
+                Some("linear worker".to_string()),
+            ),
+            (
+                EngineSemanticRoutePlan::VmSummary {
+                    reason: "vm summary".to_string(),
+                },
+                Some("vm summary".to_string()),
+            ),
+            (
+                EngineSemanticRoutePlan::FallbackComment {
+                    comment: "fallback comment".to_string(),
+                },
+                Some("fallback comment".to_string()),
+            ),
+            (EngineSemanticRoutePlan::Standard, None),
+        ] {
+            assert_eq!(semantic_route_reason(&route), expected);
+        }
     }
 
     #[test]
@@ -6070,7 +8657,7 @@ mod tests {
     #[test]
     fn request_plan_preserves_refusal_diagnostics() {
         let comment = "/* r2dec fallback: semantic evidence unavailable */".to_string();
-        let route = r2dec::SemanticRoutePlan::FallbackComment {
+        let route = EngineSemanticRoutePlan::FallbackComment {
             comment: comment.clone(),
         };
         let decision = EngineRouteDecision {
@@ -6124,7 +8711,7 @@ mod tests {
             let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), Some(artifact));
 
             let route = semantic_route_plan("dbg.worker", &function_facts, &cfg_summary);
-            assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+            assert!(matches!(route, EngineSemanticRoutePlan::Standard));
             assert_eq!(
                 detached_semantic_route_plan("dbg.worker", &blocks, &function_facts),
                 Some(route)
@@ -6145,7 +8732,7 @@ mod tests {
 
         assert!(matches!(
             route,
-            r2dec::SemanticRoutePlan::LinearWorker { .. }
+            EngineSemanticRoutePlan::LinearWorker { .. }
         ));
     }
 
@@ -6162,7 +8749,7 @@ mod tests {
 
         assert!(matches!(
             route,
-            r2dec::SemanticRoutePlan::LinearWorker { .. }
+            EngineSemanticRoutePlan::LinearWorker { .. }
         ));
     }
 
@@ -6179,12 +8766,12 @@ mod tests {
 
         assert!(matches!(
             route,
-            r2dec::SemanticRoutePlan::SummaryIslands { .. }
+            EngineSemanticRoutePlan::SummaryIslands { .. }
         ));
     }
 
     #[test]
-    fn summary_only_exact_hash_fold_prefers_standard_native_render() {
+    fn summary_only_exact_hash_fold_does_not_select_standard_native_render() {
         let blocks = const_return_blocks(0x401000, 0);
         let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
             .expect("ssa")
@@ -6194,11 +8781,14 @@ mod tests {
 
         let route = semantic_route_plan("dbg.fnv_fold", &function_facts, &cfg_summary);
 
-        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+        assert!(
+            !matches!(route, EngineSemanticRoutePlan::Standard),
+            "summary-only hash-fold evidence must not authorize native C route: {route:?}"
+        );
     }
 
     #[test]
-    fn dense_summary_only_exact_hash_fold_still_prefers_standard_native_render() {
+    fn dense_summary_only_exact_hash_fold_does_not_select_standard_native_render() {
         let blocks = const_return_blocks(0x401000, 0);
         let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
             .expect("ssa")
@@ -6208,11 +8798,14 @@ mod tests {
 
         let route = semantic_route_plan("dbg.fnv_fold", &function_facts, &cfg_summary);
 
-        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+        assert!(
+            !matches!(route, EngineSemanticRoutePlan::Standard),
+            "dense summary-only hash-fold evidence must not authorize native C route: {route:?}"
+        );
     }
 
     #[test]
-    fn summary_only_complete_table_walk_prefers_standard_native_render() {
+    fn summary_only_complete_table_walk_does_not_select_standard_native_render() {
         let blocks = const_return_blocks(0x401000, 0);
         let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
             .expect("ssa")
@@ -6222,11 +8815,14 @@ mod tests {
 
         let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
 
-        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+        assert!(
+            !matches!(route, EngineSemanticRoutePlan::Standard),
+            "summary-only table-walk evidence must not authorize native C route: {route:?}"
+        );
     }
 
     #[test]
-    fn dense_summary_only_complete_table_walk_still_prefers_standard_native_render() {
+    fn dense_summary_only_complete_table_walk_does_not_select_standard_native_render() {
         let blocks = const_return_blocks(0x401000, 0);
         let cfg_summary = r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks)
             .expect("ssa")
@@ -6237,7 +8833,10 @@ mod tests {
 
         let route = semantic_route_plan("dbg.table_walk", &function_facts, &cfg_summary);
 
-        assert!(matches!(route, r2dec::SemanticRoutePlan::Standard));
+        assert!(
+            !matches!(route, EngineSemanticRoutePlan::Standard),
+            "dense summary-only table-walk evidence must not authorize native C route: {route:?}"
+        );
     }
 
     #[test]
@@ -6310,7 +8909,10 @@ mod tests {
         let context =
             decompiler_context_with_route_decision(r2dec::DecompilerContext::default(), &decision);
 
-        assert_eq!(context.semantic_route, Some(decision.route));
+        assert_eq!(
+            context.semantic_route,
+            Some(decision.route.to_decompiler_route())
+        );
         assert_eq!(
             context.skip_runtime_type_inference,
             Some(decision.skip_runtime_type_inference)

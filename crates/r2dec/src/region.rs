@@ -165,7 +165,6 @@ struct NormalizedSwitchInfo {
 
 #[derive(Debug, Clone)]
 struct SwitchInfoCandidate {
-    block: u64,
     cases: Vec<(u64, u64)>,
     default: Option<u64>,
 }
@@ -1055,13 +1054,7 @@ impl<'a> RegionAnalyzer<'a> {
     fn normalized_switch_info(&self, entry: u64) -> Option<NormalizedSwitchInfo> {
         if let Some((cases, default)) = self.func.switch_info(entry) {
             let (cases, default) = self.filter_local_switch_targets(cases, default)?;
-            let mut cases = self.filter_switch_case_outliers(&cases);
-            let bias = self.estimate_switch_case_bias(entry, entry, &cases);
-            if bias != 0 {
-                for (value, _) in &mut cases {
-                    *value = value.saturating_add_signed(bias);
-                }
-            }
+            let cases = self.canonical_switch_cases(&cases);
             return Some(NormalizedSwitchInfo { cases, default });
         }
 
@@ -1078,11 +1071,7 @@ impl<'a> RegionAnalyzer<'a> {
                     continue;
                 }
                 if let Some((cases, default)) = self.func.switch_info(succ) {
-                    let candidate = SwitchInfoCandidate {
-                        block: succ,
-                        cases,
-                        default,
-                    };
+                    let candidate = SwitchInfoCandidate { cases, default };
                     match best.as_ref() {
                         Some(current) if !self.is_better_switch_candidate(&candidate, current) => {}
                         _ => best = Some(candidate),
@@ -1094,13 +1083,7 @@ impl<'a> RegionAnalyzer<'a> {
 
         let best = best?;
         let (cases, default) = self.filter_local_switch_targets(best.cases, best.default)?;
-        let mut cases = self.filter_switch_case_outliers(&cases);
-        let bias = self.estimate_switch_case_bias(entry, best.block, &cases);
-        if bias != 0 {
-            for (value, _) in &mut cases {
-                *value = value.saturating_add_signed(bias);
-            }
-        }
+        let cases = self.canonical_switch_cases(&cases);
 
         Some(NormalizedSwitchInfo { cases, default })
     }
@@ -1315,153 +1298,11 @@ impl<'a> RegionAnalyzer<'a> {
         len
     }
 
-    fn filter_switch_case_outliers(&self, cases: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    fn canonical_switch_cases(&self, cases: &[(u64, u64)]) -> Vec<(u64, u64)> {
         let mut sorted = cases.to_vec();
         sorted.sort_unstable_by_key(|(value, target)| (*value, *target));
         sorted.dedup();
-
-        let values = self.normalized_switch_values(&sorted);
-        let contiguous_run = Self::leading_contiguous_run_len(&values);
-        if contiguous_run < 3 || contiguous_run >= values.len() {
-            return sorted;
-        }
-
-        let last_contiguous = values[contiguous_run - 1];
-        let next_value = values[contiguous_run];
-        if next_value <= last_contiguous.saturating_add(16) {
-            return sorted;
-        }
-
         sorted
-            .into_iter()
-            .filter(|(value, _)| *value <= last_contiguous)
-            .collect()
-    }
-
-    fn estimate_switch_case_bias(
-        &self,
-        entry: u64,
-        _candidate_block: u64,
-        cases: &[(u64, u64)],
-    ) -> i64 {
-        if !cases.iter().any(|(value, _)| *value == 0) {
-            return 0;
-        }
-        if let Some(bias) = cases
-            .iter()
-            .map(|(value, _)| *value)
-            .max()
-            .and_then(|upper_bound| {
-                self.guarded_dense_zero_based_switch_bias(
-                    _candidate_block,
-                    cases.len(),
-                    upper_bound,
-                )
-            })
-        {
-            return bias;
-        }
-
-        let mut search_blocks = vec![entry];
-        let mut seen = HashSet::from([entry]);
-        let mut queue = VecDeque::from([(entry, 0usize)]);
-        if seen.insert(_candidate_block) {
-            search_blocks.push(_candidate_block);
-            queue.push_back((_candidate_block, 0usize));
-        }
-        for (_, target) in cases {
-            if seen.insert(*target) {
-                search_blocks.push(*target);
-                queue.push_back((*target, 0usize));
-            }
-        }
-        while let Some((block, depth)) = queue.pop_front() {
-            if depth >= 8 {
-                continue;
-            }
-            for pred in self.func.predecessors(block) {
-                if seen.insert(pred) {
-                    search_blocks.push(pred);
-                    queue.push_back((pred, depth + 1));
-                }
-            }
-        }
-
-        let mut best_bias = 0i64;
-        for block_addr in search_blocks {
-            let Some(block) = self.func.get_block(block_addr) else {
-                continue;
-            };
-            for op in &block.ops {
-                if let r2ssa::SSAOp::IntSub { b, .. } = op
-                    && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
-                    && let Ok(bias) = i64::try_from(raw)
-                    && (1..=8).contains(&bias)
-                    && (best_bias == 0 || bias < best_bias)
-                {
-                    best_bias = bias;
-                }
-            }
-        }
-
-        if best_bias == 0 && cases.len() >= 16 {
-            for block_addr in self.func.block_addrs() {
-                let Some(block) = self.func.get_block(*block_addr) else {
-                    continue;
-                };
-                for op in &block.ops {
-                    if let r2ssa::SSAOp::IntSub { b, .. } = op
-                        && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
-                        && let Ok(bias) = i64::try_from(raw)
-                        && (1..=8).contains(&bias)
-                        && (best_bias == 0 || bias < best_bias)
-                    {
-                        best_bias = bias;
-                    }
-                }
-            }
-        }
-
-        best_bias
-    }
-
-    fn guarded_dense_zero_based_switch_bias(
-        &self,
-        switch_block: u64,
-        case_count: usize,
-        upper_bound: u64,
-    ) -> Option<i64> {
-        if case_count < 4 {
-            return None;
-        }
-
-        for block_addr in std::iter::once(switch_block).chain(self.func.predecessors(switch_block))
-        {
-            let Some(block) = self.func.get_block(block_addr) else {
-                continue;
-            };
-            let mut best_bias = None;
-            let mut saw_upper_bound_guard = false;
-            for op in &block.ops {
-                if let r2ssa::SSAOp::IntSub { b, .. } = op
-                    && let Some(raw) = crate::analysis::utils::parse_const_value(&b.name)
-                {
-                    if raw == upper_bound {
-                        saw_upper_bound_guard = true;
-                    }
-                    if let Ok(bias) = i64::try_from(raw)
-                        && (1..=8).contains(&bias)
-                    {
-                        best_bias = Some(best_bias.map_or(bias, |current: i64| current.min(bias)));
-                    }
-                }
-            }
-            if saw_upper_bound_guard && best_bias.is_some() {
-                return best_bias;
-            }
-        }
-
-        None
     }
 
     /// Find the merge point for switch targets.
@@ -3408,7 +3249,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_switch_info_prefers_dense_nested_cases_when_entry_has_no_switch_info() {
+    fn normalized_switch_info_keeps_dense_nested_cases_with_default_outlier_authoritative() {
         let func = build_nested_switch_cfg_without_entry_switch();
         let analyzer = RegionAnalyzer::new(&func);
 
@@ -3418,12 +3259,12 @@ mod tests {
         let values: Vec<u64> = info.cases.iter().map(|(value, _)| *value).collect();
         let targets: Vec<u64> = info.cases.iter().map(|(_, target)| *target).collect();
 
-        assert_eq!(values, vec![0, 1, 2]);
-        assert_eq!(targets, vec![0x1010, 0x1020, 0x1030]);
+        assert_eq!(values, vec![0, 1, 2, 408]);
+        assert_eq!(targets, vec![0x1010, 0x1020, 0x1030, 0x1040]);
         assert_eq!(info.default, Some(0x1040));
     }
 
-    fn build_entry_biased_switch_cfg() -> SSAFunction {
+    fn build_entry_switch_with_unrelated_sub_cfg() -> SSAFunction {
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::IntSub {
             dst: Varnode::unique(0x20, 8),
@@ -3461,15 +3302,15 @@ mod tests {
     }
 
     #[test]
-    fn normalized_switch_info_applies_entry_bias_for_zero_based_dense_cases() {
-        let func = build_entry_biased_switch_cfg();
+    fn normalized_switch_info_keeps_authoritative_cases_despite_unrelated_sub() {
+        let func = build_entry_switch_with_unrelated_sub_cfg();
         let analyzer = RegionAnalyzer::new(&func);
         let info = analyzer
             .normalized_switch_info(0x1000)
             .expect("normalized switch info");
         let values: Vec<u64> = info.cases.iter().map(|(value, _)| *value).collect();
 
-        assert_eq!(values, vec![1, 2, 3]);
+        assert_eq!(values, vec![0, 1, 2]);
         assert_eq!(info.default, Some(0x1040));
     }
 

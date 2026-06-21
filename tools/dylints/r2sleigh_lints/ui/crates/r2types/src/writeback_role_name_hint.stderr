@@ -1,0 +1,22 @@
+warning: r2types must project role signatures through evidence-backed role identity
+  --> $DIR/writeback_role_name_hint.rs:30:13
+   |
+LL |     let _ = role_registry::signature_hint_for_name_candidates([name], 0);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2types_role_name_signature_hint_ownership)]` on by default
+
+warning: r2types must project role signatures through evidence-backed role identity
+  --> $DIR/writeback_role_name_hint.rs:34:13
+   |
+LL |     let _ = role_registry::signature_hint_for_role_name(name, 0);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2types must project role signatures through evidence-backed role identity
+  --> $DIR/writeback_role_name_hint.rs:38:13
+   |
+LL |     let _ = role_registry::type_projection_for_name_candidates([name], 0);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 3 warnings emitted
+

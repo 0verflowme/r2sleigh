@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -9,8 +9,9 @@ use crate::external::{
     normalize_external_type_name,
 };
 use crate::facts::{
-    FunctionParamSpec, FunctionSignatureSpec, FunctionType, FunctionTypeFacts,
-    SignatureCertificate, SignatureCertificateSource, parse_type_like_spec,
+    CalleeFact, CalleeLinkage, CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec,
+    FunctionType, FunctionTypeFacts, SignatureCertificate, SignatureCertificateSource,
+    parse_type_like_spec,
 };
 use crate::signature_infer::render_signature_type;
 
@@ -48,6 +49,7 @@ pub struct ParsedExternalContext {
     // Legacy compatibility view derived from canonical stack_slots.
     pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
+    pub callee_facts: BTreeMap<u64, CalleeFact>,
     pub assumptions: r2ssa::AssumptionSet,
     pub diagnostics: Vec<String>,
     pub callconv: Option<String>,
@@ -218,6 +220,38 @@ pub struct KnownSignatureJson {
     pub variadic: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalCalleeLinkageJson {
+    #[default]
+    Unknown,
+    Internal,
+    Imported,
+}
+
+impl From<ExternalCalleeLinkageJson> for CalleeLinkage {
+    fn from(value: ExternalCalleeLinkageJson) -> Self {
+        match value {
+            ExternalCalleeLinkageJson::Unknown => Self::Unknown,
+            ExternalCalleeLinkageJson::Internal => Self::Internal,
+            ExternalCalleeLinkageJson::Imported => Self::Imported,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalCalleeJson {
+    #[serde(default)]
+    pub call_addr: Option<u64>,
+    pub addr: u64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub linkage: ExternalCalleeLinkageJson,
+    #[serde(default)]
+    pub signature: Option<ExternalSignatureJson>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalContextJson {
     #[serde(default)]
@@ -228,6 +262,8 @@ pub struct ExternalContextJson {
     pub vars: Vec<ExternalVarJson>,
     #[serde(default)]
     pub base_types: Vec<ExternalBaseTypeJson>,
+    #[serde(default)]
+    pub callees: Vec<ExternalCalleeJson>,
     #[serde(default)]
     pub known_signatures: Vec<KnownSignatureJson>,
     #[serde(default)]
@@ -426,12 +462,15 @@ pub fn function_type_facts_from_parsed_context(
     });
     FunctionTypeFacts {
         merged_signature,
+        callconv: parsed_context.callconv.clone(),
+        noreturn: parsed_context.noreturn,
         signature_certificate,
         known_function_signatures: parsed_context.known_function_signatures.clone(),
         register_params: parsed_context.register_params.clone(),
         stack_slots: parsed_context.stack_slots.clone(),
         external_stack_vars: parsed_context.external_stack_vars.clone(),
         external_type_db: parsed_context.external_type_db.clone(),
+        callee_facts: parsed_context.callee_facts.clone(),
         diagnostics: parsed_context.diagnostics.clone(),
         ..FunctionTypeFacts::default()
     }
@@ -489,6 +528,7 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
     }
 
     parsed.external_type_db = external_type_db_from_base_types(&raw.base_types, ptr_bits);
+    parsed.callee_facts = parse_external_callees(&raw.callees, ptr_bits);
     parsed.known_function_signatures = parse_known_signatures(&raw.known_signatures, ptr_bits);
     if parsed.current_signature.is_none()
         && let Some(signature) = raw.signature.as_ref()
@@ -532,6 +572,118 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
     );
 
     parsed
+}
+
+fn callee_linkage_rank(linkage: CalleeLinkage) -> u8 {
+    match linkage {
+        CalleeLinkage::Unknown => 0,
+        CalleeLinkage::Internal => 1,
+        CalleeLinkage::Imported => 2,
+    }
+}
+
+fn merge_callee_linkage(existing: CalleeLinkage, incoming: CalleeLinkage) -> CalleeLinkage {
+    if callee_linkage_rank(incoming) > callee_linkage_rank(existing) {
+        incoming
+    } else {
+        existing
+    }
+}
+
+fn parse_external_callees(
+    callees: &[ExternalCalleeJson],
+    ptr_bits: u32,
+) -> BTreeMap<u64, CalleeFact> {
+    let mut facts = BTreeMap::new();
+    let mut seen_call_addrs: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for callee in callees {
+        let name = callee
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
+        let linkage = CalleeLinkage::from(callee.linkage);
+        let entry = facts.entry(callee.addr).or_insert_with(|| CalleeFact {
+            function_id: callee.addr,
+            name: name.clone(),
+            linkage,
+            signature: None,
+            signature_callconv: None,
+            signature_noreturn: false,
+            model_policy_evidence: BTreeSet::new(),
+            direct_callees: Vec::new(),
+            callsite_count: 0,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: Vec::new(),
+            transfer_effects: Vec::new(),
+            allocation_effects: Vec::new(),
+            lifetime_effects: Vec::new(),
+            sync_effects: Vec::new(),
+            atomic_effects: Vec::new(),
+            param_type_hints: BTreeMap::new(),
+            return_type_hint: None,
+            return_relation: CalleeReturnRelation::Unknown,
+            reads_global_memory: false,
+            writes_global_memory: false,
+            touches_unknown_memory: false,
+        });
+        if entry.name.is_none() {
+            entry.name = name;
+        }
+        entry.linkage = merge_callee_linkage(entry.linkage, linkage);
+        if let Some(signature) = callee.signature.as_ref() {
+            if entry.signature.is_none() {
+                entry.signature = function_type_from_signature_json(signature, ptr_bits);
+            }
+            if entry.signature_callconv.is_none() {
+                entry.signature_callconv = signature
+                    .callconv
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|callconv| !callconv.is_empty())
+                    .map(ToOwned::to_owned);
+            }
+            entry.signature_noreturn |= signature.noreturn;
+        }
+        if let Some(call_addr) = callee.call_addr {
+            let seen = seen_call_addrs.entry(callee.addr).or_default();
+            if seen.insert(call_addr) {
+                entry.callsite_count = entry.callsite_count.saturating_add(1);
+            }
+        } else {
+            entry.callsite_count = entry.callsite_count.saturating_add(1);
+        }
+    }
+    facts
+}
+
+fn function_type_from_signature_json(
+    signature: &ExternalSignatureJson,
+    ptr_bits: u32,
+) -> Option<FunctionType> {
+    let return_type = signature
+        .ret_type
+        .as_deref()
+        .and_then(|raw| parse_context_type_spec(raw, ptr_bits))
+        .unwrap_or(CTypeLike::Unknown);
+    let params = signature
+        .params
+        .iter()
+        .map(|param| {
+            param
+                .ty
+                .as_deref()
+                .and_then(|raw| parse_context_type_spec(raw, ptr_bits))
+                .unwrap_or(CTypeLike::Unknown)
+        })
+        .collect::<Vec<_>>();
+    (return_type != CTypeLike::Unknown || !params.is_empty()).then_some(FunctionType {
+        return_type,
+        params,
+        variadic: false,
+    })
 }
 
 fn resolve_signature_aliases_from_type_db(
@@ -1592,6 +1744,148 @@ mod tests {
         let merged = ctx.merged_signature.expect("merged signature");
         assert_eq!(merged.ret_type, Some(CTypeLike::Void));
         assert!(merged.params.is_empty());
+    }
+
+    #[test]
+    fn function_type_facts_preserve_current_callconv_and_noreturn() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "signature":{
+                    "name":"sym.imp.__stack_chk_fail",
+                    "ret":"void",
+                    "callconv":"amd64",
+                    "noreturn":true,
+                    "params":[]
+                }
+            }"#,
+            64,
+        );
+
+        let facts = function_type_facts_from_parsed_context("sym.imp.__stack_chk_fail", &ctx);
+        assert_eq!(facts.callconv.as_deref(), Some("amd64"));
+        assert!(facts.noreturn);
+        assert_eq!(
+            facts
+                .render_authorized_signature()
+                .and_then(|signature| signature.ret_type.as_ref()),
+            Some(&CTypeLike::Void)
+        );
+    }
+
+    #[test]
+    fn parse_external_context_requires_typed_callee_linkage_for_import_policy() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "callees":[
+                    {"addr":4198752,"name":"sym.imp.setlocale"},
+                    {"addr":4198760,"name":"setlocale","linkage":"imported"}
+                ]
+            }"#,
+            64,
+        );
+
+        let raw_name_only = ctx
+            .callee_facts
+            .get(&4198752)
+            .expect("name-only callee fact");
+        assert_eq!(raw_name_only.name.as_deref(), Some("sym.imp.setlocale"));
+        assert_eq!(raw_name_only.linkage, CalleeLinkage::Unknown);
+        assert!(!raw_name_only.linkage.authorizes_import_policy());
+        assert!(!raw_name_only.authorizes_model_policy());
+
+        let imported = ctx
+            .callee_facts
+            .get(&4198760)
+            .expect("typed imported callee fact");
+        assert_eq!(imported.name.as_deref(), Some("setlocale"));
+        assert_eq!(imported.linkage, CalleeLinkage::Imported);
+        assert!(imported.linkage.authorizes_import_policy());
+        assert!(
+            !imported.authorizes_model_policy(),
+            "external callee presence/linkage is not modeled-summary evidence"
+        );
+
+        let facts = function_type_facts_from_parsed_context("dbg.wrapper", &ctx);
+        assert_eq!(
+            facts.callee_facts.get(&4198760).map(|fact| fact.linkage),
+            Some(CalleeLinkage::Imported)
+        );
+    }
+
+    #[test]
+    fn parse_external_context_counts_distinct_typed_callee_callsites() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "callees":[
+                    {"call_addr":4096,"addr":4198760,"name":"setlocale","linkage":"imported"},
+                    {"call_addr":4100,"addr":4198760,"name":"setlocale","linkage":"imported"},
+                    {"call_addr":4100,"addr":4198760,"name":"setlocale","linkage":"imported"}
+                ]
+            }"#,
+            64,
+        );
+
+        let imported = ctx
+            .callee_facts
+            .get(&4198760)
+            .expect("typed imported callee fact");
+        assert_eq!(imported.callsite_count, 2);
+        assert_eq!(imported.linkage, CalleeLinkage::Imported);
+    }
+
+    #[test]
+    fn parse_external_context_preserves_typed_callee_signature_facts() {
+        let ctx = parse_external_context_json(
+            r#"{
+                "callees":[{
+                    "call_addr":4096,
+                    "addr":4198760,
+                    "name":"setlocale",
+                    "linkage":"imported",
+                    "signature":{
+                        "name":"setlocale",
+                        "ret":"char *",
+                        "callconv":"amd64",
+                        "noreturn":true,
+                        "params":[
+                            {"name":"category","type":"int"},
+                            {"name":"locale","type":"char *"}
+                        ]
+                    }
+                }]
+            }"#,
+            64,
+        );
+
+        let imported = ctx
+            .callee_facts
+            .get(&4198760)
+            .expect("typed imported callee fact");
+        assert_eq!(imported.signature_callconv.as_deref(), Some("amd64"));
+        assert!(imported.signature_noreturn);
+        let signature = imported.signature.as_ref().expect("callee signature");
+        assert_eq!(
+            signature.return_type,
+            CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                bits: 8,
+                signedness: crate::Signedness::Signed,
+            }))
+        );
+        assert_eq!(signature.params.len(), 2);
+        assert_eq!(
+            signature.params[0],
+            CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            }
+        );
+        assert_eq!(
+            signature.params[1],
+            CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                bits: 8,
+                signedness: crate::Signedness::Signed,
+            }))
+        );
     }
 
     #[test]

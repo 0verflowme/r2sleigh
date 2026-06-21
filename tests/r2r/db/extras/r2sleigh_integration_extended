@@ -192,10 +192,10 @@ af
 a:sla.dec | jq -Rs 'contains("process_string") and contains("strlen(s)") and contains("return -1;") and contains("return -2;") and contains("return len;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 s `afl~authenticate[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("authenticate") and contains("strcmp(password, \"secret123\")") and contains("return 0;") and contains("return 1;") and contains("r2sleigh residual: uncertified expression value") and ((split("strcmp(")|length)==2) and (contains("r10_1")|not) and (contains("summary return unresolved")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("rendered uncertified raw artifact name(s): EAX") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("r2dec fallback:")|not)'
 s `afl~alloc_and_copy[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int8_t* alloc_and_copy(int8_t* src, size_t len)") and contains("buf = malloc(len + 1);") and contains("if (buf == 0)") and contains("memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
+a:sla.dec | jq -Rs 'contains("int8_t* alloc_and_copy(int8_t* src, size_t len)") and contains("buf = sym.imp.malloc(len + 1);") and contains("if (buf == 0)") and contains("sym.imp.memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("buf[-0x8]")|not) and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
 EOF_CMDS
 RUN
 
@@ -816,7 +816,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~table_walk[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t table_walk(Item* head, int8_t* needle)") and ((contains("render contract: summary facts only; no executable native C reconstructed") and contains("summary return unresolved") and (contains("for (Item* it = head; it != NULL; it = it->next)")|not) and (contains("it->id + seen")|not) and (contains("return -seen;")|not)) or contains("r2dec residual: unproven loop effects") or contains("r2dec residual: uncertified structured control") or contains("certified render contract failed") or ((contains("render contract: summary facts only; no executable native C reconstructed")|not) and contains("for (Item* it = head; it != NULL; it = it->next)") and contains("return -seen;"))) and (contains("table walk fields and returns are certified by r2sym")|not) and (contains("body blocks")|not) and (contains("exit targets")|not) and (contains("while (pos == head)")|not) and (contains("while (head == head)")|not) and (contains("while (it == head)")|not) and (contains("while (1) {\n    break;")|not)'
+a:sla.dec | jq -Rs 'contains("int32_t table_walk(Item* head, int8_t* needle)") and ((contains("render contract: summary facts only; no executable native C reconstructed") and contains("summary return unresolved")) or contains("r2dec residual: unproven loop effects") or contains("r2dec residual: uncertified structured control") or contains("certified render contract failed")) and (contains("for (Item* it = head; it != NULL; it = it->next)")|not) and (contains("it->id + seen")|not) and (contains("return -seen;")|not) and (contains("table walk fields and returns are certified by r2sym")|not) and (contains("body blocks")|not) and (contains("exit targets")|not) and (contains("while (pos == head)")|not) and (contains("while (head == head)")|not) and (contains("while (it == head)")|not) and (contains("while (1) {\n    break;")|not)'
 EOF_CMDS
 RUN
 

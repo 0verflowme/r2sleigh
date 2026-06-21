@@ -204,7 +204,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         if addr.is_memory()
-            && let Some(address) = extract_call_address(&addr.name)
+            && let Some(address) = parse_address_from_var_name(&addr.name)
         {
             if let Some(sym) = self.lookup_symbol(address) {
                 return CExpr::Var(sym.clone());
@@ -280,7 +280,7 @@ impl<'a> FoldingContext<'a> {
         }
 
         if addr.is_memory()
-            && let Some(address) = extract_call_address(&addr.name)
+            && let Some(address) = parse_address_from_var_name(&addr.name)
             && let Some(sym) = self.lookup_symbol(address)
         {
             return CExpr::Var(sym.clone());

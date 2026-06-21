@@ -1538,6 +1538,7 @@ mod tests {
         let summary = FunctionSemanticSummary {
             id: root,
             name: Some("sym.copy_worker".to_string()),
+            linkage: r2ssa::FunctionSemanticLinkage::Unknown,
             arg_count_hint: Some(1),
             direct_callees: BTreeSet::new(),
             callsite_count: 0,

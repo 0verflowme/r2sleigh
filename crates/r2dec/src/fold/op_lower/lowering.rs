@@ -36,6 +36,7 @@ impl<'a> FoldingContext<'a> {
                 if frame.with_call_args {
                     match op {
                         SSAOp::Call { target } => {
+                            let direct_target = parse_address_from_var_name(&target.name);
                             let func_expr = self.resolve_call_target_for_site(
                                 frame.block_addr,
                                 frame.op_idx,
@@ -46,23 +47,28 @@ impl<'a> FoldingContext<'a> {
                                 .get(&(frame.block_addr, frame.op_idx))
                                 .cloned()
                                 .unwrap_or_default();
-                            let Some(mut certified_args) = self.certified_call_args_for_site(
-                                frame.block_addr,
-                                frame.op_idx,
-                                &func_expr,
-                                raw_args,
-                            ) else {
+                            let Some(mut certified_args) = self
+                                .certified_call_args_for_site_with_direct_target(
+                                    frame.block_addr,
+                                    frame.op_idx,
+                                    &func_expr,
+                                    direct_target,
+                                    raw_args,
+                                )
+                            else {
                                 return LoweredOp::Comment(format!(
                                     "r2sleigh residual: uncertified callsite arguments at 0x{:x}:{}",
                                     frame.block_addr, frame.op_idx
                                 ));
                             };
                             let mut args = certified_args.args;
-                            if let Some(max_arity) = self.non_variadic_call_arity_for_site(
-                                frame.block_addr,
-                                frame.op_idx,
-                                &func_expr,
-                            ) {
+                            if let Some(max_arity) = self
+                                .non_variadic_call_arity_for_site_with_direct_target(
+                                    frame.block_addr,
+                                    frame.op_idx,
+                                    direct_target,
+                                )
+                            {
                                 args.truncate(max_arity);
                                 certified_args.values.truncate(max_arity);
                             }
@@ -117,11 +123,9 @@ impl<'a> FoldingContext<'a> {
                                 ));
                             };
                             let mut args = certified_args.args;
-                            if let Some(max_arity) = self.non_variadic_call_arity_for_site(
-                                frame.block_addr,
-                                frame.op_idx,
-                                &func_expr,
-                            ) {
+                            if let Some(max_arity) = self
+                                .non_variadic_call_arity_for_site(frame.block_addr, frame.op_idx)
+                            {
                                 args.truncate(max_arity);
                                 certified_args.values.truncate(max_arity);
                             }
@@ -188,7 +192,10 @@ impl<'a> FoldingContext<'a> {
         let stmt = self.lowered_to_stmt(self.lower_op(op, &mut frame))?;
         if self.requires_certified_rendering()
             && self
-                .record_certified_call_render_proofs_for_stmt(&stmt)
+                .record_certified_call_render_proofs_for_stmt_with_current(
+                    &stmt,
+                    Some((block_addr, op_idx)),
+                )
                 .is_none()
         {
             return Some(self.certified_residual_comment(format!(

@@ -35,6 +35,78 @@ impl TypeHint {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataScalarKind {
+    Bool,
+    SignedInt,
+    UnsignedInt,
+    Float,
+    Bitvector,
+    Unknown,
+}
+
+pub fn size_to_signed_int_type(size: u32) -> String {
+    match size {
+        1 => "int8_t".to_string(),
+        2 => "int16_t".to_string(),
+        4 => "int32_t".to_string(),
+        8 => "int64_t".to_string(),
+        _ => format!("int{}_t", size.saturating_mul(8)),
+    }
+}
+
+pub fn size_to_unsigned_int_type(size: u32) -> String {
+    match size {
+        1 => "uint8_t".to_string(),
+        2 => "uint16_t".to_string(),
+        4 => "uint32_t".to_string(),
+        8 => "uint64_t".to_string(),
+        _ => format!("uint{}_t", size.saturating_mul(8)),
+    }
+}
+
+pub fn scalar_metadata_type_hint(kind: MetadataScalarKind, size: u32) -> Option<TypeHint> {
+    match kind {
+        MetadataScalarKind::Bool => Some(TypeHint {
+            rank: TypeHintRank::Integer,
+            ty: "bool".to_string(),
+        }),
+        MetadataScalarKind::SignedInt => Some(TypeHint {
+            rank: TypeHintRank::Integer,
+            ty: size_to_signed_int_type(size),
+        }),
+        MetadataScalarKind::UnsignedInt => Some(TypeHint {
+            rank: TypeHintRank::Integer,
+            ty: size_to_unsigned_int_type(size),
+        }),
+        MetadataScalarKind::Float => {
+            let ty = match size {
+                4 => "float".to_string(),
+                8 => "double".to_string(),
+                16 => "long double".to_string(),
+                _ => "float".to_string(),
+            };
+            Some(TypeHint {
+                rank: TypeHintRank::Float,
+                ty,
+            })
+        }
+        MetadataScalarKind::Bitvector | MetadataScalarKind::Unknown => None,
+    }
+}
+
+pub fn type_hint_from_value_metadata(
+    pointer_like: bool,
+    scalar_kind: Option<MetadataScalarKind>,
+    size: u32,
+) -> Option<TypeHint> {
+    if pointer_like {
+        return Some(TypeHint::pointer());
+    }
+
+    scalar_metadata_type_hint(scalar_kind?, size)
+}
+
 pub type ArgAliasMap = &'static [(&'static str, &'static [&'static str])];
 pub type BaseRegList = &'static [&'static str];
 
@@ -1255,6 +1327,36 @@ fn infer_usage_register_type_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_scalar_type_hints_are_width_aware() {
+        assert_eq!(
+            scalar_metadata_type_hint(MetadataScalarKind::Bool, 1).map(|hint| hint.ty),
+            Some("bool".to_string())
+        );
+        assert_eq!(
+            scalar_metadata_type_hint(MetadataScalarKind::SignedInt, 4).map(|hint| hint.ty),
+            Some("int32_t".to_string())
+        );
+        assert_eq!(
+            scalar_metadata_type_hint(MetadataScalarKind::UnsignedInt, 8).map(|hint| hint.ty),
+            Some("uint64_t".to_string())
+        );
+        assert_eq!(
+            scalar_metadata_type_hint(MetadataScalarKind::Float, 8).map(|hint| hint.ty),
+            Some("double".to_string())
+        );
+        assert!(scalar_metadata_type_hint(MetadataScalarKind::Unknown, 8).is_none());
+    }
+
+    #[test]
+    fn value_metadata_pointer_hint_overrides_scalar_hint() {
+        let hint = type_hint_from_value_metadata(true, Some(MetadataScalarKind::UnsignedInt), 8)
+            .expect("pointer hint");
+
+        assert_eq!(hint.rank, TypeHintRank::Pointer);
+        assert_eq!(hint.ty, "void *");
+    }
 
     #[test]
     fn register_like_filter_rejects_non_register_ssa_names() {

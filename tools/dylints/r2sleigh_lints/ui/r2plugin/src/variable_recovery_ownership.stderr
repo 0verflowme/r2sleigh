@@ -1,0 +1,16 @@
+warning: r2plugin must request recovered signature evidence from r2engine instead of constructing r2dec::VariableRecovery
+  --> $DIR/variable_recovery_ownership.rs:22:13
+   |
+LL |     let _ = r2dec::VariableRecovery::new("rsp", "rbp", 8);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_variable_recovery_ownership)]` on by default
+
+warning: r2plugin must request recovered signature evidence from r2engine instead of constructing r2dec::VariableRecovery
+  --> $DIR/variable_recovery_ownership.rs:23:13
+   |
+LL |     let _ = r2dec::VariableRecovery::new_with_abi("rsp", "rbp", 8, Vec::new(), Vec::new());
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 2 warnings emitted
+

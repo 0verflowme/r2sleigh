@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> FoldingContext<'a> {
-    fn is_prunable_dead_binding_target(&self, name: &str) -> bool {
+    pub(super) fn is_prunable_dead_binding_target(&self, name: &str) -> bool {
         if self.state.return_stack_slots.iter().any(|offset| {
             self.resolve_stack_var(*offset)
                 .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
@@ -408,15 +408,6 @@ impl<'a> FoldingContext<'a> {
         contains_call
     }
 
-    fn ssa_base_name(name: &str) -> Option<&str> {
-        let (base, version) = name.rsplit_once('_')?;
-        if version.chars().all(|c| c.is_ascii_digit()) {
-            Some(base)
-        } else {
-            None
-        }
-    }
-
     pub(super) fn expr_is_pure(&self, expr: &CExpr) -> bool {
         let mut pure = true;
         expr.visit(&mut |node| {
@@ -449,6 +440,7 @@ impl<'a> FoldingContext<'a> {
         pure
     }
 
+    #[cfg(test)]
     pub(super) fn call_expr_returns_void(&self, expr: &CExpr) -> bool {
         let CExpr::Call { func, .. } = expr else {
             return false;
@@ -458,6 +450,18 @@ impl<'a> FoldingContext<'a> {
         };
         self.known_signature_for_callee_name(name)
             .is_some_and(|sig| matches!(sig.return_type, r2types::CTypeLike::Void))
+    }
+
+    pub(super) fn source_call_expr_returns_void(
+        &self,
+        source_call: (u64, usize),
+        expr: &CExpr,
+    ) -> bool {
+        let CExpr::Call { .. } = expr else {
+            return false;
+        };
+        self.expr_type_hint_for_source_call(source_call, expr)
+            .is_some_and(|ty| matches!(ty, CType::Void))
     }
 
     pub(super) fn collect_expr_reads(&self, expr: &CExpr, out: &mut HashSet<String>) {
@@ -596,32 +600,28 @@ impl<'a> FoldingContext<'a> {
                 let target_lower = target.to_ascii_lowercase();
                 let target_is_pinned =
                     self.pinned_set().contains(target) || self.pinned_set().contains(&target_lower);
-                let dead_sleigh_memory_artifact = self.is_sleigh_memory_temp_name(target)
-                    && !live.contains(target)
-                    && self.expr_contains_unresolved_memory(rhs);
                 let source_call_for_target = self
                     .call_result_source_for_ssa_name(target)
                     .or_else(|| self.local_post_call_source_for_ssa_name(target))
                     .or_else(|| self.source_call_for_visible_owner_name(target));
-                let observable_call_result_owner =
-                    source_call_for_target.is_some_and(|source_call| {
-                        let candidate_names = self.call_result_candidate_names(source_call, target);
-                        self.call_result_candidate_names_have_observable_use(&candidate_names)
+                let call_result_candidate_names = source_call_for_target
+                    .map(|source_call| self.call_result_candidate_names(source_call, target))
+                    .unwrap_or_default();
+                let target_has_live_use = live.contains(target)
+                    || call_result_candidate_names.iter().any(|candidate| {
+                        candidate.eq_ignore_ascii_case(target) && live.contains(candidate)
                     });
-                let replayed_call_result_has_live_owner =
-                    source_call_for_target.is_some_and(|source_call| {
-                        self.call_result_candidate_names(source_call, target)
-                            .into_iter()
-                            .any(|candidate| {
-                                !candidate.eq_ignore_ascii_case(target) && live.contains(&candidate)
-                            })
-                    });
-                let rhs_call_source = match rhs {
-                    CExpr::Call { .. } => self
-                        .source_call_for_call_expr(rhs)
-                        .or_else(|| self.source_call_for_loose_internal_call_expr(rhs)),
-                    _ => None,
-                };
+                let dead_sleigh_memory_artifact = self.is_sleigh_memory_temp_name(target)
+                    && !target_has_live_use
+                    && self.expr_contains_unresolved_memory(rhs);
+                let observable_call_result_owner = self
+                    .call_result_candidate_names_have_observable_use(&call_result_candidate_names);
+                let replayed_call_result_has_live_owner = call_result_candidate_names
+                    .iter()
+                    .any(|candidate| live.contains(candidate));
+                let rhs_call_source = matches!(rhs, CExpr::Call { .. })
+                    .then_some(source_call_for_target)
+                    .flatten();
                 let replayed_call_result_has_live_expr =
                     rhs_call_source.is_some_and(|source| live_call_sources.contains(&source));
                 let replayed_call_result_has_later_same_assignment =
@@ -646,9 +646,8 @@ impl<'a> FoldingContext<'a> {
                     .unwrap_or(target)
                     .to_ascii_lowercase();
                 let dead_return_register_owner = demote_dead_return_register_calls
-                    && !target_is_pinned
                     && self.inputs.arch.is_return_register_name(&target_base);
-                let dead_replayed_call_result = (((!live.contains(target)
+                let dead_replayed_call_result = (((!target_has_live_use
                     || replayed_call_result_reuses_target_as_input)
                     && replayed_call_result_has_live_expr)
                     || replayed_call_result_has_later_same_assignment)
@@ -656,41 +655,25 @@ impl<'a> FoldingContext<'a> {
                     && (replayed_call_result_has_later_same_assignment
                         || replayed_call_result_reuses_target_as_input
                         || self.is_low_signal_visible_name(target)
-                        || self.is_transient_visible_name(target)
                         || self.is_prunable_dead_binding_target(target));
-                let dead_transient_call_result = !live.contains(target)
+                let dead_transient_call_result = !target_has_live_use
+                    && !target_is_pinned
                     && (dead_return_register_owner
                         || !observable_call_result_owner
-                        || self.call_expr_returns_void(rhs))
+                        || rhs_call_source
+                            .is_some_and(|source| self.source_call_expr_returns_void(source, rhs)))
                     && matches!(rhs, CExpr::Call { .. })
                     && !protected_named_call_result_owner
                     && (self.is_low_signal_visible_name(target)
-                        || self.is_transient_visible_name(target)
                         || self.is_prunable_dead_binding_target(target));
                 let dead_replayed_call_result = dead_replayed_call_result
                     || (dead_transient_call_result && replayed_call_result_has_live_owner);
                 let dead_ephemeral = self.is_prunable_dead_binding_target(target)
                     && !target_is_pinned
-                    && !live.contains(target)
+                    && !target_has_live_use
                     && (self.expr_is_pure(rhs) || dead_sleigh_memory_artifact);
                 let dead_flag_artifact =
-                    is_cpu_flag(&target_lower) && !live.contains(target) && self.expr_is_pure(rhs);
-
-                let dead_phi_copy = if self.is_ephemeral_ssa_target(target) && !target_is_pinned {
-                    if let CExpr::Var(src) = rhs {
-                        let same_name = src == target;
-                        let same_base =
-                            match (Self::ssa_base_name(src), Self::ssa_base_name(target)) {
-                                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                                _ => false,
-                            };
-                        !live.contains(target) && (same_name || same_base)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+                    is_cpu_flag(&target_lower) && !target_has_live_use && self.expr_is_pure(rhs);
 
                 if dead_replayed_call_result {
                     true
@@ -699,7 +682,7 @@ impl<'a> FoldingContext<'a> {
                     (reads, def) = self.stmt_reads_and_def(&stmt);
                     false
                 } else {
-                    dead_ephemeral || dead_flag_artifact || dead_phi_copy
+                    dead_ephemeral || dead_flag_artifact
                 }
             } else {
                 false
@@ -787,16 +770,19 @@ impl<'a> FoldingContext<'a> {
 
     fn call_source_for_statement(&self, stmt: &CStmt) -> Option<(u64, usize)> {
         match stmt {
-            CStmt::Expr(expr @ CExpr::Call { .. }) => self
-                .source_call_for_call_expr(expr)
-                .or_else(|| self.source_call_for_loose_internal_call_expr(expr)),
             CStmt::Expr(CExpr::Binary {
                 op: BinaryOp::Assign,
+                left,
                 right,
                 ..
-            }) if matches!(right.as_ref(), CExpr::Call { .. }) => self
-                .source_call_for_call_expr(right)
-                .or_else(|| self.source_call_for_loose_internal_call_expr(right)),
+            }) if matches!(right.as_ref(), CExpr::Call { .. }) => {
+                let CExpr::Var(target) = left.as_ref() else {
+                    return None;
+                };
+                self.call_result_source_for_ssa_name(target)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(target))
+                    .or_else(|| self.source_call_for_visible_owner_name(target))
+            }
             _ => None,
         }
     }
@@ -849,10 +835,11 @@ impl<'a> FoldingContext<'a> {
 
     fn collect_call_sources_in_expr(&self, expr: &CExpr, out: &mut BTreeSet<(u64, usize)>) {
         expr.visit(&mut |node| {
-            if let CExpr::Call { .. } = node
+            if let CExpr::Var(name) = node
                 && let Some(source) = self
-                    .source_call_for_call_expr(node)
-                    .or_else(|| self.source_call_for_loose_internal_call_expr(node))
+                    .call_result_source_for_ssa_name(name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    .or_else(|| self.materialized_call_result_source_for_visible_name(name))
             {
                 out.insert(source);
             }
@@ -879,8 +866,9 @@ impl<'a> FoldingContext<'a> {
             return;
         }
         if let Some(source) = self
-            .source_call_for_call_expr(right)
-            .or_else(|| self.source_call_for_loose_internal_call_expr(right))
+            .call_result_source_for_ssa_name(target)
+            .or_else(|| self.local_post_call_source_for_ssa_name(target))
+            .or_else(|| self.source_call_for_visible_owner_name(target))
         {
             out.insert((source, target.to_ascii_lowercase()));
         }

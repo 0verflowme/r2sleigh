@@ -1,4 +1,4 @@
-use crate::ast::{self, CFunction, CStmt, CType};
+use crate::ast::{CFunction, CStmt, CType};
 use crate::codegen::{CodeGenConfig, CodeGenerator};
 use r2types::{CTypeLike, FunctionFacts, FunctionTypeFacts};
 use std::collections::BTreeSet;
@@ -116,15 +116,24 @@ pub(crate) fn render_for_route(
     route: &crate::planner::SemanticRoutePlan,
     codegen_config: CodeGenConfig,
 ) -> Option<String> {
-    let reason = match route {
-        crate::planner::SemanticRoutePlan::LinearWorker { reason }
-        | crate::planner::SemanticRoutePlan::SummaryIslands { reason } => reason,
+    let (reason, route_kind) = match route {
+        crate::planner::SemanticRoutePlan::StructuredWorker { reason } => {
+            (reason, "structured_worker_summary")
+        }
+        crate::planner::SemanticRoutePlan::LinearWorker { reason } => {
+            (reason, "native_linear_summary")
+        }
+        crate::planner::SemanticRoutePlan::SummaryIslands { reason } => (reason, "summary_islands"),
         _ => return None,
     };
     let semantic_artifact = function_facts.semantic_artifact()?;
     let is_summary_island_route = matches!(
         route,
         crate::planner::SemanticRoutePlan::SummaryIslands { .. }
+    );
+    let is_structured_worker_route = matches!(
+        route,
+        crate::planner::SemanticRoutePlan::StructuredWorker { .. }
     );
     let is_residual_route = !is_summary_island_route
         && (matches!(semantic_artifact.stage, r2sym::RefinementStage::Residual)
@@ -156,6 +165,22 @@ pub(crate) fn render_for_route(
         body.push(CStmt::comment(
             "render contract: summary facts only; no executable native C reconstructed".to_string(),
         ));
+    } else if is_structured_worker_route {
+        body.push(CStmt::comment(format!(
+            "r2dec summary: semantic worker structured summary for {}",
+            crate::sanitize_comment_text(reason)
+        )));
+        body.push(CStmt::comment(format!(
+            "semantic route: {route_kind}; source_mode={}; slice={}",
+            crate::semantic_mode_label(semantic_artifact),
+            semantic_artifact
+                .slice_class()
+                .map(crate::semantic_slice_class_label)
+                .unwrap_or("unknown")
+        )));
+        body.push(CStmt::comment(
+            "render contract: summary facts only; no executable native C reconstructed".to_string(),
+        ));
     } else if is_residual_route {
         body.push(CStmt::comment(format!(
             "r2dec residual: semantic worker summary for {}",
@@ -178,7 +203,7 @@ pub(crate) fn render_for_route(
             crate::sanitize_comment_text(reason)
         )));
         body.push(CStmt::comment(format!(
-            "semantic route: native_linear_summary; source_mode={}; slice={}",
+            "semantic route: {route_kind}; source_mode={}; slice={}",
             crate::semantic_mode_label(semantic_artifact),
             semantic_artifact
                 .slice_class()
@@ -368,7 +393,7 @@ pub(crate) fn render_for_route(
 
     crate::append_summary_return_if_needed(&mut body, function_facts, semantic_artifact);
 
-    let c_func = semantic_worker_summary_function(func_name, &function_facts.types, body);
+    let c_func = semantic_worker_summary_function(func_name, body);
     let mut codegen = CodeGenerator::new(codegen_config);
     Some(crate::rewrite_summary_arg_labels(
         codegen.generate_function(&c_func),
@@ -376,46 +401,11 @@ pub(crate) fn render_for_route(
     ))
 }
 
-fn semantic_worker_summary_function(
-    func_name: &str,
-    type_facts: &FunctionTypeFacts,
-    body: Vec<CStmt>,
-) -> CFunction {
-    let trusted_signature = type_facts.render_authorized_signature();
-    let ret_type = trusted_signature
-        .and_then(|sig| sig.ret_type.as_ref().map(crate::type_like_to_ctype))
-        .unwrap_or(CType::Unknown);
-    let has_merged_signature = trusted_signature.is_some();
-    let mut params = crate::merge_params_with_external_signature(Vec::new(), trusted_signature);
-    if params.is_empty() && !has_merged_signature {
-        params = type_facts
-            .register_params
-            .iter()
-            .enumerate()
-            .map(|(idx, param)| ast::CParam {
-                ty: param
-                    .ty
-                    .as_ref()
-                    .map(crate::type_like_to_ctype)
-                    .unwrap_or(CType::Unknown),
-                name: if crate::is_generic_arg_name(&param.name) || param.name.trim().is_empty() {
-                    format!("arg{}", idx + 1)
-                } else {
-                    param.name.clone()
-                },
-            })
-            .collect();
-    }
-    for (idx, param) in params.iter_mut().enumerate() {
-        if crate::is_generic_arg_name(&param.name) || param.name.trim().is_empty() {
-            param.name = format!("summary_input{}", idx + 1);
-        }
-    }
-
+fn semantic_worker_summary_function(func_name: &str, body: Vec<CStmt>) -> CFunction {
     CFunction {
         name: func_name.to_string(),
-        ret_type,
-        params,
+        ret_type: CType::Void,
+        params: Vec::new(),
         locals: Vec::new(),
         body,
     }

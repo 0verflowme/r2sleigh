@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
+#[cfg(feature = "dec")]
 use r2dec::{CStmt, CodeGenConfig, CodeGenerator, lower_ssa_ops_to_stmts};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId, Varnode, validate_block_full};
 use r2sleigh_lift::{Disassembler, format_op, op_to_esil_named};
@@ -102,7 +103,7 @@ pub fn export_instruction(
         InstructionAction::Lift => export_lift(input, format),
         InstructionAction::Ssa => export_ssa(input, format),
         InstructionAction::Defuse => export_defuse(input, format),
-        InstructionAction::Dec => export_dec(input, format),
+        InstructionAction::Dec => export_dec_action(input, format),
     }
 }
 
@@ -137,7 +138,16 @@ fn supported_formats(action: InstructionAction) -> &'static [ExportFormat] {
         InstructionAction::Lift => &[Json, Text, Esil, R2Cmd],
         InstructionAction::Ssa => &[Json, Text],
         InstructionAction::Defuse => &[Json, Text],
-        InstructionAction::Dec => &[CLike, Json, Text],
+        InstructionAction::Dec => {
+            #[cfg(feature = "dec")]
+            {
+                &[CLike, Json, Text]
+            }
+            #[cfg(not(feature = "dec"))]
+            {
+                &[]
+            }
+        }
     }
 }
 
@@ -291,6 +301,26 @@ fn export_defuse(
     }
 }
 
+fn export_dec_action(
+    input: &InstructionExportInput<'_>,
+    format: ExportFormat,
+) -> Result<String, ExportError> {
+    #[cfg(feature = "dec")]
+    {
+        export_dec(input, format)
+    }
+    #[cfg(not(feature = "dec"))]
+    {
+        let _ = input;
+        Err(ExportError::UnsupportedCombination {
+            action: InstructionAction::Dec,
+            format,
+            supported: String::new(),
+        })
+    }
+}
+
+#[cfg(feature = "dec")]
 fn export_dec(
     input: &InstructionExportInput<'_>,
     format: ExportFormat,
@@ -434,6 +464,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     const X86_BYTES_MINIMAL: &str = "4889c000000000000000000000000000";
+    #[cfg(feature = "dec")]
     const X86_BYTES_DEC: &str = "48ffc000000000000000000000000000";
 
     fn x86_disasm_and_spec() -> (Disassembler, ArchSpec) {
@@ -506,6 +537,7 @@ mod tests {
         lines.join("\n")
     }
 
+    #[cfg(feature = "dec")]
     fn normalize_c_like_output(output: &str) -> String {
         let text = output.replace("\r\n", "\n");
         let mut lines = Vec::new();
@@ -654,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dec")]
     fn dec_c_like_nonempty_for_simple_block() {
         let input = lift_input(X86_BYTES_DEC, 0x1000);
         let out = export_instruction(&input, InstructionAction::Dec, ExportFormat::CLike)
@@ -670,6 +703,90 @@ mod tests {
             matches!(err, ExportError::UnsupportedCombination { .. }),
             "unexpected error kind: {}",
             err
+        );
+    }
+
+    #[test]
+    fn ensure_supported_enforces_action_format_matrix() {
+        ensure_supported(InstructionAction::Lift, ExportFormat::Json)
+            .expect("lift json should be supported");
+        ensure_supported(InstructionAction::Defuse, ExportFormat::Text)
+            .expect("defuse text should be supported");
+
+        let err = ensure_supported(InstructionAction::Lift, ExportFormat::CLike)
+            .expect_err("lift must not accept c_like format");
+        assert!(
+            matches!(
+                err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Lift,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected support error kind: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "dec"))]
+    fn dec_action_is_typed_but_unsupported_without_dec_feature() {
+        let input = lift_input(X86_BYTES_MINIMAL, 0x1000);
+        let err = export_instruction(&input, InstructionAction::Dec, ExportFormat::CLike)
+            .expect_err("dec export must be feature-gated");
+        assert!(
+            matches!(
+                err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Dec,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected error kind: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "dec"))]
+    fn dec_feature_gate_rejects_at_support_and_execution_layers() {
+        let input = lift_input(X86_BYTES_MINIMAL, 0x1000);
+
+        assert!(
+            supported_formats(InstructionAction::Dec).is_empty(),
+            "dec must advertise no supported formats without the dec feature"
+        );
+
+        let support_err = ensure_supported(InstructionAction::Dec, ExportFormat::CLike)
+            .expect_err("dec support must be disabled without the dec feature");
+        assert!(
+            matches!(
+                support_err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Dec,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected support error kind: {}",
+            support_err
+        );
+
+        let execution_err = export_dec_action(&input, ExportFormat::CLike)
+            .expect_err("dec execution must be disabled without the dec feature");
+        assert!(
+            matches!(
+                execution_err,
+                ExportError::UnsupportedCombination {
+                    action: InstructionAction::Dec,
+                    format: ExportFormat::CLike,
+                    ..
+                }
+            ),
+            "unexpected execution error kind: {}",
+            execution_err
         );
     }
 
@@ -759,22 +876,25 @@ mod tests {
             );
         }
 
-        for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
-            let normalized = assert_export_deterministic(
-                X86_BYTES_DEC,
-                InstructionAction::Dec,
-                format,
-                match format {
-                    ExportFormat::CLike => normalize_c_like_output,
-                    ExportFormat::Json => normalize_json_output,
-                    ExportFormat::Text => normalize_text_output,
-                    _ => unreachable!("dec supports c_like/json/text"),
-                },
-            );
-            assert!(
-                !normalized.trim().is_empty(),
-                "dec output should be non-empty"
-            );
+        #[cfg(feature = "dec")]
+        {
+            for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
+                let normalized = assert_export_deterministic(
+                    X86_BYTES_DEC,
+                    InstructionAction::Dec,
+                    format,
+                    match format {
+                        ExportFormat::CLike => normalize_c_like_output,
+                        ExportFormat::Json => normalize_json_output,
+                        ExportFormat::Text => normalize_text_output,
+                        _ => unreachable!("dec supports c_like/json/text"),
+                    },
+                );
+                assert!(
+                    !normalized.trim().is_empty(),
+                    "dec output should be non-empty"
+                );
+            }
         }
     }
 
@@ -829,12 +949,15 @@ mod tests {
             "{\"inputs\":[],\"live\":[\"RAX_1\"],\"outputs\":[]}"
         );
 
-        let dec_json = assert_export_deterministic(
-            X86_BYTES_MINIMAL,
-            InstructionAction::Dec,
-            ExportFormat::Json,
-            normalize_json_output,
-        );
-        assert_eq!(dec_json, "[]");
+        #[cfg(feature = "dec")]
+        {
+            let dec_json = assert_export_deterministic(
+                X86_BYTES_MINIMAL,
+                InstructionAction::Dec,
+                ExportFormat::Json,
+                normalize_json_output,
+            );
+            assert_eq!(dec_json, "[]");
+        }
     }
 }

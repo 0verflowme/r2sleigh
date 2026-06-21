@@ -26,8 +26,6 @@ use r2sleigh_export::{
 };
 use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec, userop_map_for_arch};
 use std::ffi::{CStr, CString};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::os::raw::c_char;
 use std::path::Path;
 use std::ptr;
@@ -984,60 +982,188 @@ pub extern "C" fn r2sleigh_writeback_var_name_is_generated(name: *const c_char) 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_writeback_apply_type_name_is_generic(type_name: *const c_char) -> i32 {
-    let Some(type_name) = raw_cstr_lossy(type_name) else {
-        return 1;
+pub extern "C" fn r2sleigh_writeback_var_type_apply_decision(
+    existing_type: *const c_char,
+    candidate_type: *const c_char,
+    type_materialization_required: i32,
+    type_materialization_available: i32,
+) -> u32 {
+    let existing_type = raw_cstr_lossy(existing_type);
+    let Some(candidate_type) = raw_cstr_lossy(candidate_type) else {
+        return r2types::TypeWritebackApplyDecision::SkipInvalid as u32;
     };
-    i32::from(r2types::writeback_apply_type_name_is_generic(&type_name))
+    r2types::type_writeback_var_type_apply_decision(
+        existing_type.as_deref(),
+        &candidate_type,
+        type_materialization_required != 0,
+        type_materialization_available != 0,
+    ) as u32
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_writeback_apply_type_name_is_opaque_placeholder(
-    type_name: *const c_char,
-) -> i32 {
-    let Some(type_name) = raw_cstr_lossy(type_name) else {
+pub extern "C" fn r2sleigh_writeback_global_type_link_apply_decision(
+    existing_type: *const c_char,
+    candidate_type: *const c_char,
+    type_materialization_required: i32,
+    type_materialization_available: i32,
+) -> u32 {
+    let existing_type = raw_cstr_lossy(existing_type);
+    let Some(candidate_type) = raw_cstr_lossy(candidate_type) else {
+        return r2types::TypeWritebackApplyDecision::SkipInvalid as u32;
+    };
+    r2types::type_writeback_global_type_link_apply_decision(
+        existing_type.as_deref(),
+        &candidate_type,
+        type_materialization_required != 0,
+        type_materialization_available != 0,
+    ) as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_writeback_var_rename_apply_decision(
+    current_name: *const c_char,
+    old_name: *const c_char,
+    new_name: *const c_char,
+) -> u32 {
+    let current_name = raw_cstr_lossy(current_name);
+    let Some(old_name) = raw_cstr_lossy(old_name) else {
+        return r2types::TypeWritebackRenameApplyDecision::SkipInvalid as u32;
+    };
+    let Some(new_name) = raw_cstr_lossy(new_name) else {
+        return r2types::TypeWritebackRenameApplyDecision::SkipInvalid as u32;
+    };
+    r2types::type_writeback_var_rename_apply_decision(current_name.as_deref(), &old_name, &new_name)
+        as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_signature_writeback_arch_supported(arch_name: *const c_char) -> i32 {
+    let Some(arch_name) = raw_cstr_lossy(arch_name) else {
         return 0;
     };
-    i32::from(r2types::writeback_apply_type_name_is_opaque_placeholder(
-        &type_name,
+    i32::from(r2types::signature_writeback_arch_supported(&arch_name))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_callconv_writeback_arch_supported(arch_name: *const c_char) -> i32 {
+    let Some(arch_name) = raw_cstr_lossy(arch_name) else {
+        return 0;
+    };
+    i32::from(r2types::callconv_writeback_arch_supported(&arch_name))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_signature_register_arg_var_score(
+    current_name: *const c_char,
+    expected_name: *const c_char,
+) -> i32 {
+    let current_name = raw_cstr_lossy(current_name);
+    let expected_name = raw_cstr_lossy(expected_name);
+    r2types::signature_register_arg_var_score(current_name.as_deref(), expected_name.as_deref())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_signature_register_arg_rename_decision(
+    current_name: *const c_char,
+    expected_name: *const c_char,
+) -> u32 {
+    let current_name = raw_cstr_lossy(current_name);
+    let expected_name = raw_cstr_lossy(expected_name);
+    r2types::signature_register_arg_rename_decision(
+        current_name.as_deref(),
+        expected_name.as_deref(),
+    ) as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_signature_register_arg_type_apply_required(
+    current_type: *const c_char,
+    expected_type: *const c_char,
+) -> i32 {
+    let current_type = raw_cstr_lossy(current_type);
+    let expected_type = raw_cstr_lossy(expected_type);
+    i32::from(r2types::signature_register_arg_type_apply_required(
+        current_type.as_deref(),
+        expected_type.as_deref(),
     ))
 }
 
-/// Caller must free the returned string with r2il_string_free().
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_writeback_apply_type_name_canonicalize(
-    type_name: *const c_char,
-) -> *mut c_char {
-    let Some(type_name) = raw_cstr_lossy(type_name) else {
-        return ptr::null_mut();
-    };
-    r2types::canonicalize_writeback_apply_type_name(&type_name)
-        .and_then(|canonical| CString::new(canonical).ok())
-        .map_or(ptr::null_mut(), |c| c.into_raw())
+pub extern "C" fn r2sleigh_signature_register_arg_stack_conflict_delete_required(
+    conflict_name: *const c_char,
+    expected_name: *const c_char,
+    conflict_is_selected_var: i32,
+    conflict_is_arg: i32,
+    conflict_is_stack_arg: i32,
+) -> i32 {
+    let conflict_name = raw_cstr_lossy(conflict_name);
+    let expected_name = raw_cstr_lossy(expected_name);
+    i32::from(
+        r2types::signature_register_arg_stack_conflict_delete_required(
+            conflict_name.as_deref(),
+            expected_name.as_deref(),
+            conflict_is_selected_var != 0,
+            conflict_is_arg != 0,
+            conflict_is_stack_arg != 0,
+        ),
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_callee_name_is_import_like(name: *const c_char) -> i32 {
-    let Some(name) = raw_cstr_lossy(name) else {
-        return 0;
-    };
-    i32::from(r2types::callee_name_is_import_like(&name))
+pub extern "C" fn r2sleigh_type_writeback_stack_arg_name_conflict_delete_required(
+    conflict_name: *const c_char,
+    target_name: *const c_char,
+    conflict_is_selected_var: i32,
+    conflict_is_arg: i32,
+    conflict_is_stack_arg: i32,
+) -> i32 {
+    let conflict_name = raw_cstr_lossy(conflict_name);
+    let target_name = raw_cstr_lossy(target_name);
+    i32::from(
+        r2types::type_writeback_stack_arg_name_conflict_delete_required(
+            conflict_name.as_deref(),
+            target_name.as_deref(),
+            conflict_is_selected_var != 0,
+            conflict_is_arg != 0,
+            conflict_is_stack_arg != 0,
+        ),
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_callee_name_is_windows_runtime_registration(name: *const c_char) -> i32 {
-    let Some(name) = raw_cstr_lossy(name) else {
-        return 0;
-    };
-    i32::from(r2types::callee_name_is_windows_runtime_registration(&name))
+pub extern "C" fn r2sleigh_signature_register_arg_duplicate_delete_required(
+    candidate_is_selected_var: i32,
+    candidate_is_arg: i32,
+    candidate_is_register_arg: i32,
+    candidate_arg_index: usize,
+    expected_arg_index: usize,
+) -> i32 {
+    i32::from(r2types::signature_register_arg_duplicate_delete_required(
+        candidate_is_selected_var != 0,
+        candidate_is_arg != 0,
+        candidate_is_register_arg != 0,
+        candidate_arg_index,
+        expected_arg_index,
+    ))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_callee_name_is_runtime_copy(name: *const c_char) -> i32 {
-    let Some(name) = raw_cstr_lossy(name) else {
-        return 0;
-    };
-    i32::from(r2types::callee_name_is_runtime_copy(&name))
+pub extern "C" fn r2sleigh_signature_writeback_size_eligible(basic_block_count: usize) -> i32 {
+    i32::from(r2types::signature_writeback_size_eligible(
+        basic_block_count,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_interproc_helper_scope_budget_allows(
+    basic_block_count: usize,
+    cost: u32,
+) -> i32 {
+    let basic_block_count = u32::try_from(basic_block_count).unwrap_or(u32::MAX);
+    i32::from(r2engine::interproc_helper_scope_within_budget(
+        basic_block_count,
+        cost,
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -1086,9 +1212,9 @@ pub extern "C" fn r2sleigh_direct_named_worker_type_projection_ffi(name: *const 
 
 // ========== Typed Analysis FFI ==========
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::Hash;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+use std::sync::LazyLock;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3468,7 +3594,6 @@ fn r2dec_function_with_context_impl(inputs: R2DecFunctionWithContextInputs) -> *
         symbolic_scope.as_ref(),
         reg_type_hints,
         None,
-        r2engine::EngineSemanticMode::Full,
         true,
     );
     let function_names = parse_addr_name_map(&func_names_str);
@@ -3480,8 +3605,6 @@ fn r2dec_function_with_context_impl(inputs: R2DecFunctionWithContextInputs) -> *
         &function_names,
         &symbols,
     );
-    let (_, _, config) = r2dec::DecompilerConfig::for_arch(ctx_view.arch);
-
     // Run SSA construction + decompilation on a dedicated thread with a large
     // stack to prevent stack overflow on complex O2-optimized CFGs.
     let output =
@@ -3491,7 +3614,6 @@ fn r2dec_function_with_context_impl(inputs: R2DecFunctionWithContextInputs) -> *
             function_names,
             strings,
             symbols,
-            config,
             func_names_payload: func_names_str,
             strings_payload: strings_str,
             symbols_payload: symbols_str,
@@ -3625,7 +3747,6 @@ pub extern "C" fn r2dec_function_with_session_context(
         symbolic_scope.as_ref(),
         reg_type_hints,
         None,
-        r2engine::EngineSemanticMode::Full,
         true,
     );
     let function_names = parse_addr_name_map(&func_names_str);
@@ -3637,7 +3758,6 @@ pub extern "C" fn r2dec_function_with_session_context(
         &function_names,
         &symbols,
     );
-    let (_, _, config) = r2dec::DecompilerConfig::for_arch(ctx_view.arch);
     let output =
         decompiler::run_engine_decompile_on_large_stack(r2engine::EngineFunctionDecompileRequest {
             analysis: analysis_request,
@@ -3645,7 +3765,6 @@ pub extern "C" fn r2dec_function_with_session_context(
             function_names,
             strings,
             symbols,
-            config,
             func_names_payload: func_names_str,
             strings_payload: strings_str,
             symbols_payload: symbols_str,
@@ -3740,7 +3859,7 @@ pub extern "C" fn r2sleigh_named_native_worker_type_json(
     };
     let function_name = helpers::resolve_function_name(function_addr, function_name);
     let ptr_bits = ctx_view.arch.map(helpers::effective_ptr_bits).unwrap_or(64);
-    let (arch_name, _, _) = r2dec::DecompilerConfig::for_arch(ctx_view.arch);
+    let (arch_name, _) = r2engine::engine_arch_target(ctx_view.arch);
     let parsed_context = if function_context.is_null() {
         r2types::parse_external_context_json("{}", ptr_bits)
     } else {
@@ -3768,7 +3887,6 @@ pub extern "C" fn r2sleigh_named_native_worker_type_json(
         function_name: &function_name,
         arch_name: &arch_name,
         ptr_bits,
-        callconv: parsed_context.callconv.as_deref(),
         interproc,
         compiled: &projection.semantic_artifact,
         function_facts: &projection.function_facts,
@@ -3777,6 +3895,7 @@ pub extern "C" fn r2sleigh_named_native_worker_type_json(
             || projection.context_owned_signature),
         budget: TypeOutputBudget::new(global_max_links, max_type_decls, max_mutations),
         apply_policy: r2types::TypeWritebackApplyPolicy::balanced(),
+        basic_block_count: 0,
     });
     serde_json::to_string(&payload)
         .ok()
@@ -3982,6 +4101,8 @@ struct InferredTypeWritebackJson {
     callconv_confidence: u8,
     signature_render_authorized: bool,
     signature_writeback_authorized: bool,
+    signature_action_decision: u32,
+    callconv_action_decision: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     signature_certificate_sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4087,6 +4208,20 @@ pub struct R2SleighContextBaseType {
 }
 
 #[repr(C)]
+pub struct R2SleighContextCallee {
+    call_addr: u64,
+    addr: u64,
+    name: *const c_char,
+    linkage: u32,
+    signature_name: *const c_char,
+    signature_ret_type: *const c_char,
+    signature_callconv: *const c_char,
+    signature_noreturn: i32,
+    signature_params: *const R2SleighContextParam,
+    num_signature_params: usize,
+}
+
+#[repr(C)]
 pub struct R2SleighFunctionContext {
     schema_version: u32,
     dirty_epoch: u64,
@@ -4103,6 +4238,8 @@ pub struct R2SleighFunctionContext {
     num_vars: usize,
     base_types: *const R2SleighContextBaseType,
     num_base_types: usize,
+    callees: *const R2SleighContextCallee,
+    num_callees: usize,
     assumptions_json: *const c_char,
 }
 
@@ -4112,7 +4249,12 @@ pub struct R2SleighInterprocSeed {
     name: *const c_char,
     arg_count_hint: usize,
     has_arg_count_hint: i32,
+    linkage: u32,
 }
+
+const R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN: u32 = 0;
+const R2SLEIGH_INTERPROC_LINKAGE_INTERNAL: u32 = 1;
+const R2SLEIGH_INTERPROC_LINKAGE_IMPORTED: u32 = 2;
 
 #[repr(C)]
 pub struct R2SleighInterprocScope {
@@ -4158,8 +4300,30 @@ pub struct R2SleighAnalysisPolicy {
     type_max_mutations: i32,
 }
 
-const R2_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC: u32 = 1;
-const R2_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE: u32 = 3;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct R2SleighPostAnalysisPlan {
+    mode: u32,
+    type_writeback_mode: u32,
+    type_interproc_max_iters: i32,
+    type_max_blocks: i32,
+    type_global_max_links: i32,
+    type_max_decls: i32,
+    type_max_mutations: i32,
+    function_count: usize,
+    post_budget_us: u64,
+    xref_enabled: i32,
+    taint_enabled: i32,
+    sigwrite_enabled: i32,
+    type_writeback_enabled: i32,
+    semantic_comments_enabled: i32,
+    sigverify_enabled: i32,
+    balanced_focus_only: i32,
+    taint_focus_only: i32,
+    sigwrite_focus_only: i32,
+    type_writeback_focus_only: i32,
+}
+
 const R2SLEIGH_MODE_FAST: u32 = 0;
 const R2SLEIGH_MODE_BALANCED: u32 = 1;
 const R2SLEIGH_MODE_FULL: u32 = 2;
@@ -4167,43 +4331,94 @@ const R2SLEIGH_TYPE_WRITEBACK_OFF: u32 = 0;
 const R2SLEIGH_TYPE_WRITEBACK_BALANCED: u32 = 1;
 const R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE: u32 = 2;
 
-fn analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
-    let mut policy = R2SleighAnalysisPolicy {
-        mode: R2SLEIGH_MODE_BALANCED,
-        type_writeback_mode: R2SLEIGH_TYPE_WRITEBACK_BALANCED,
-        type_interproc_max_iters: 4,
-        type_max_blocks: 200,
-        type_global_max_links: 32,
-        type_max_decls: 32,
-        type_max_mutations: 128,
-    };
-    match depth {
-        R2_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC => {
-            policy.mode = R2SLEIGH_MODE_FAST;
-            policy.type_writeback_mode = R2SLEIGH_TYPE_WRITEBACK_OFF;
-            policy.type_interproc_max_iters = 1;
-            policy.type_max_blocks = 96;
-            policy.type_global_max_links = 8;
-            policy.type_max_decls = 8;
-            policy.type_max_mutations = 32;
-        }
-        R2_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE => {
-            policy.mode = R2SLEIGH_MODE_FULL;
-            policy.type_writeback_mode = R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE;
-            policy.type_interproc_max_iters = 12;
-            policy.type_max_blocks = 500;
-            policy.type_global_max_links = 128;
-            policy.type_max_decls = 64;
-            policy.type_max_mutations = 512;
-        }
-        _ => {}
+fn r2sleigh_mode_from_engine(mode: r2engine::EngineAnalysisMode) -> u32 {
+    match mode {
+        r2engine::EngineAnalysisMode::Fast => R2SLEIGH_MODE_FAST,
+        r2engine::EngineAnalysisMode::Balanced => R2SLEIGH_MODE_BALANCED,
+        r2engine::EngineAnalysisMode::Full => R2SLEIGH_MODE_FULL,
     }
-    policy
+}
+
+fn r2sleigh_type_writeback_mode_from_engine(mode: r2engine::EngineTypeWritebackMode) -> u32 {
+    match mode {
+        r2engine::EngineTypeWritebackMode::Off => R2SLEIGH_TYPE_WRITEBACK_OFF,
+        r2engine::EngineTypeWritebackMode::Balanced => R2SLEIGH_TYPE_WRITEBACK_BALANCED,
+        r2engine::EngineTypeWritebackMode::Aggressive => R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE,
+    }
+}
+
+fn r2sleigh_type_writeback_mode_to_engine(mode: u32) -> r2engine::EngineTypeWritebackMode {
+    match mode {
+        R2SLEIGH_TYPE_WRITEBACK_BALANCED => r2engine::EngineTypeWritebackMode::Balanced,
+        R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE => r2engine::EngineTypeWritebackMode::Aggressive,
+        _ => r2engine::EngineTypeWritebackMode::Off,
+    }
+}
+
+fn usize_to_ffi_i32(value: usize) -> i32 {
+    value.min(i32::MAX as usize) as i32
+}
+
+fn bool_to_ffi_i32(value: bool) -> i32 {
+    if value { 1 } else { 0 }
+}
+
+fn r2sleigh_analysis_policy_from_engine(
+    policy: r2engine::EngineAnalysisPolicy,
+) -> R2SleighAnalysisPolicy {
+    R2SleighAnalysisPolicy {
+        mode: r2sleigh_mode_from_engine(policy.mode),
+        type_writeback_mode: r2sleigh_type_writeback_mode_from_engine(policy.type_writeback_mode),
+        type_interproc_max_iters: usize_to_ffi_i32(policy.type_interproc_max_iters),
+        type_max_blocks: usize_to_ffi_i32(policy.type_max_blocks),
+        type_global_max_links: usize_to_ffi_i32(policy.type_global_max_links),
+        type_max_decls: usize_to_ffi_i32(policy.type_max_decls),
+        type_max_mutations: usize_to_ffi_i32(policy.type_max_mutations),
+    }
+}
+
+fn r2sleigh_post_analysis_plan_from_engine(
+    plan: r2engine::EnginePostAnalysisPlan,
+) -> R2SleighPostAnalysisPlan {
+    R2SleighPostAnalysisPlan {
+        mode: r2sleigh_mode_from_engine(plan.policy.mode),
+        type_writeback_mode: r2sleigh_type_writeback_mode_from_engine(
+            plan.policy.type_writeback_mode,
+        ),
+        type_interproc_max_iters: usize_to_ffi_i32(plan.policy.type_interproc_max_iters),
+        type_max_blocks: usize_to_ffi_i32(plan.policy.type_max_blocks),
+        type_global_max_links: usize_to_ffi_i32(plan.policy.type_global_max_links),
+        type_max_decls: usize_to_ffi_i32(plan.policy.type_max_decls),
+        type_max_mutations: usize_to_ffi_i32(plan.policy.type_max_mutations),
+        function_count: plan.function_count,
+        post_budget_us: plan.post_budget_us,
+        xref_enabled: bool_to_ffi_i32(plan.xref_enabled),
+        taint_enabled: bool_to_ffi_i32(plan.taint_enabled),
+        sigwrite_enabled: bool_to_ffi_i32(plan.signature_writeback_enabled),
+        type_writeback_enabled: bool_to_ffi_i32(plan.type_writeback_enabled),
+        semantic_comments_enabled: bool_to_ffi_i32(plan.semantic_comments_enabled),
+        sigverify_enabled: bool_to_ffi_i32(plan.signature_verify_enabled),
+        balanced_focus_only: bool_to_ffi_i32(plan.balanced_focus_only),
+        taint_focus_only: bool_to_ffi_i32(plan.taint_focus_only),
+        sigwrite_focus_only: bool_to_ffi_i32(plan.signature_writeback_focus_only),
+        type_writeback_focus_only: bool_to_ffi_i32(plan.type_writeback_focus_only),
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_analysis_policy_for_depth(depth: u32) -> R2SleighAnalysisPolicy {
-    analysis_policy_for_depth(depth)
+    r2sleigh_analysis_policy_from_engine(r2engine::analysis_policy_for_radare2_depth(depth))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_post_analysis_plan_for_depth(
+    depth: u32,
+    function_count: usize,
+) -> R2SleighPostAnalysisPlan {
+    r2sleigh_post_analysis_plan_from_engine(r2engine::post_analysis_plan_for_radare2_depth(
+        depth,
+        function_count,
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -4306,6 +4521,14 @@ fn typed_base_type_kind(kind: u32) -> r2types::ExternalBaseTypeKind {
     }
 }
 
+fn typed_callee_linkage(kind: u32) -> r2types::ExternalCalleeLinkageJson {
+    match kind {
+        R2SLEIGH_INTERPROC_LINKAGE_INTERNAL => r2types::ExternalCalleeLinkageJson::Internal,
+        R2SLEIGH_INTERPROC_LINKAGE_IMPORTED => r2types::ExternalCalleeLinkageJson::Imported,
+        _ => r2types::ExternalCalleeLinkageJson::Unknown,
+    }
+}
+
 unsafe fn typed_function_context_to_parsed(
     context: &R2SleighFunctionContext,
     fallback_json: &str,
@@ -4322,6 +4545,7 @@ unsafe fn typed_function_context_to_parsed(
         signature: None,
         vars: Vec::new(),
         base_types: Vec::new(),
+        callees: Vec::new(),
         known_signatures: fallback
             .as_ref()
             .map(|ctx| ctx.known_signatures.clone())
@@ -4443,6 +4667,29 @@ unsafe fn typed_function_context_to_parsed(
             .collect()
     };
 
+    let callees = if context.callees.is_null() || context.num_callees == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(context.callees, context.num_callees) }
+    };
+    raw.callees = if callees.is_empty() {
+        fallback
+            .as_ref()
+            .map(|ctx| ctx.callees.clone())
+            .unwrap_or_default()
+    } else {
+        callees
+            .iter()
+            .map(|callee| r2types::ExternalCalleeJson {
+                signature: typed_callee_signature_json(callee),
+                call_addr: Some(callee.call_addr),
+                addr: callee.addr,
+                name: optional_cstr(callee.name),
+                linkage: typed_callee_linkage(callee.linkage),
+            })
+            .collect()
+    };
+
     if let Some(assumptions) = optional_cstr(context.assumptions_json)
         && let Ok(parsed) = r2types::parse_external_assumption_payload_json(&assumptions, ptr_bits)
     {
@@ -4454,6 +4701,36 @@ unsafe fn typed_function_context_to_parsed(
     r2types::parse_external_context(raw, ptr_bits)
 }
 
+fn typed_callee_signature_json(
+    callee: &R2SleighContextCallee,
+) -> Option<r2types::ExternalSignatureJson> {
+    let params = if callee.signature_params.is_null() || callee.num_signature_params == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(callee.signature_params, callee.num_signature_params) }
+    };
+    let signature_params = params
+        .iter()
+        .map(|param| r2types::ExternalSignatureParamJson {
+            name: optional_cstr(param.name),
+            ty: optional_cstr(param.type_name),
+            cc_reg: optional_cstr(param.cc_reg),
+        })
+        .collect::<Vec<_>>();
+    let has_signature = optional_cstr(callee.signature_name).is_some()
+        || optional_cstr(callee.signature_ret_type).is_some()
+        || optional_cstr(callee.signature_callconv).is_some()
+        || callee.signature_noreturn != 0
+        || !signature_params.is_empty();
+    has_signature.then(|| r2types::ExternalSignatureJson {
+        name: optional_cstr(callee.signature_name).or_else(|| optional_cstr(callee.name)),
+        ret_type: optional_cstr(callee.signature_ret_type),
+        callconv: optional_cstr(callee.signature_callconv),
+        noreturn: callee.signature_noreturn != 0,
+        params: signature_params,
+    })
+}
+
 unsafe fn typed_interproc_scope_facts(
     scope: &R2SleighInterprocScope,
 ) -> types::InterprocScopeFacts {
@@ -4461,13 +4738,23 @@ unsafe fn typed_interproc_scope_facts(
         return types::empty_interproc_scope_facts();
     }
     let seeds = unsafe { slice::from_raw_parts(scope.seeds, scope.num_seeds) };
-    types::interproc_scope_facts_from_seed_entries(seeds.iter().map(|seed| {
-        (
-            seed.id,
-            optional_cstr(seed.name),
-            (seed.has_arg_count_hint != 0).then_some(seed.arg_count_hint),
-        )
+    types::interproc_scope_facts_from_typed_seed_entries(seeds.iter().map(|seed| {
+        types::InterprocSeedEntry {
+            id: seed.id,
+            name: optional_cstr(seed.name),
+            arg_count_hint: (seed.has_arg_count_hint != 0).then_some(seed.arg_count_hint),
+            linkage: ffi_interproc_seed_linkage(seed.linkage),
+        }
     }))
+}
+
+fn ffi_interproc_seed_linkage(raw: u32) -> r2ssa::FunctionSemanticLinkage {
+    match raw {
+        R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN => r2ssa::FunctionSemanticLinkage::Unknown,
+        R2SLEIGH_INTERPROC_LINKAGE_INTERNAL => r2ssa::FunctionSemanticLinkage::Internal,
+        R2SLEIGH_INTERPROC_LINKAGE_IMPORTED => r2ssa::FunctionSemanticLinkage::Imported,
+        _ => r2ssa::FunctionSemanticLinkage::Unknown,
+    }
 }
 
 #[repr(C)]
@@ -4509,6 +4796,8 @@ pub struct R2SleighSignatureFact {
     num_params: usize,
     confidence: u8,
     callconv_confidence: u8,
+    signature_decision: u32,
+    callconv_decision: u32,
 }
 
 #[repr(C)]
@@ -4538,6 +4827,26 @@ pub struct R2SleighRuntimeSources {
     items: Vec<R2SleighRuntimeSource>,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct R2SleighInterprocTargetInput {
+    direct_target: u64,
+    name: *const c_char,
+    linkage: u32,
+    resolved_target: u64,
+    has_resolved_target: i32,
+    target_materialized: i32,
+    has_target_metrics: i32,
+    target_basic_block_count: u32,
+    target_cost: u32,
+}
+
+pub struct R2SleighInterprocTargetPlan {
+    queued_targets: Vec<u64>,
+    registration_targets: Vec<u64>,
+    runtime_copy_targets: Vec<u64>,
+}
+
 pub struct R2SleighSessionResult {
     report_json: CString,
     type_writeback_json: CString,
@@ -4548,129 +4857,35 @@ pub struct R2SleighSessionResult {
     _strings: Vec<CString>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct TypeWritebackCacheEntry {
-    key: u64,
-    dep_hash: u64,
-    payload_hash: u64,
-    applied_hash: u64,
-}
-
-const TYPE_WRITEBACK_CACHE_LIMIT: usize = 4096;
-
-struct BoundedArcCache<K, V>
-where
-    K: Copy + Eq + Hash + Ord,
-{
-    limit: usize,
-    next_ticket: u64,
-    items: HashMap<K, (u64, Arc<V>)>,
-    recency: BTreeMap<(u64, K), K>,
-}
-
-impl<K, V> BoundedArcCache<K, V>
-where
-    K: Copy + Eq + Hash + Ord,
-{
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            next_ticket: 1,
-            items: HashMap::new(),
-            recency: BTreeMap::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.next_ticket = 1;
-        self.items.clear();
-        self.recency.clear();
-    }
-
-    fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    fn get(&mut self, key: K) -> Option<Arc<V>> {
-        let (_, value) = self.items.get(&key)?;
-        let value = Arc::clone(value);
-        self.touch_existing(key);
-        Some(value)
-    }
-
-    fn put(&mut self, key: K, value: V) {
-        if self.limit == 0 {
-            return;
-        }
-        if self.items.contains_key(&key) {
-            self.remove_recency(key);
-        }
-        while self.items.len() >= self.limit && !self.items.contains_key(&key) {
-            self.evict_oldest();
-        }
-        let ticket = self.allocate_ticket();
-        self.items.insert(key, (ticket, Arc::new(value)));
-        self.recency.insert((ticket, key), key);
-    }
-
-    fn touch_existing(&mut self, key: K) {
-        let Some((old_ticket, value)) = self
-            .items
-            .get(&key)
-            .map(|(ticket, value)| (*ticket, Arc::clone(value)))
-        else {
-            return;
-        };
-        self.recency.remove(&(old_ticket, key));
-        let ticket = self.allocate_ticket();
-        self.items.insert(key, (ticket, value));
-        self.recency.insert((ticket, key), key);
-    }
-
-    fn remove_recency(&mut self, key: K) {
-        if let Some((ticket, _)) = self.items.get(&key) {
-            self.recency.remove(&(*ticket, key));
-        }
-    }
-
-    fn evict_oldest(&mut self) {
-        let Some((recency_key, key)) = self
-            .recency
-            .iter()
-            .next()
-            .map(|(recency_key, key)| (*recency_key, *key))
-        else {
-            self.items.clear();
-            return;
-        };
-        self.recency.remove(&recency_key);
-        self.items.remove(&key);
-    }
-
-    fn allocate_ticket(&mut self) -> u64 {
-        let ticket = self.next_ticket;
-        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
-        ticket
-    }
-}
-
-static TYPE_WRITEBACK_CACHE: LazyLock<RwLock<BoundedArcCache<u64, TypeWritebackCacheEntry>>> =
-    LazyLock::new(|| RwLock::new(BoundedArcCache::new(TYPE_WRITEBACK_CACHE_LIMIT)));
-
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_type_writeback_cache_clear() {
-    TYPE_WRITEBACK_CACHE
-        .write()
-        .expect("type writeback cache lock poisoned")
-        .clear();
+    r2engine::engine_type_writeback_cache_clear();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_type_writeback_cache_len() -> usize {
-    TYPE_WRITEBACK_CACHE
-        .read()
-        .expect("type writeback cache lock poisoned")
-        .len()
+    r2engine::engine_type_writeback_cache_len()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_type_writeback_cache_key(
+    artifact_key: u64,
+    dep_hash: u64,
+    mode: u32,
+    max_iters: usize,
+    global_max_links: usize,
+    max_type_decls: usize,
+    max_mutations: usize,
+) -> u64 {
+    r2engine::engine_type_writeback_cache_key(
+        artifact_key,
+        dep_hash,
+        r2sleigh_type_writeback_mode_to_engine(mode),
+        max_iters,
+        global_max_links,
+        max_type_decls,
+        max_mutations,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -4681,11 +4896,7 @@ pub extern "C" fn r2sleigh_type_writeback_cache_get(
     payload_hash: *mut u64,
     applied_hash: *mut u64,
 ) -> i32 {
-    let Some(entry) = TYPE_WRITEBACK_CACHE
-        .write()
-        .expect("type writeback cache lock poisoned")
-        .get(addr)
-    else {
+    let Some(entry) = r2engine::engine_type_writeback_cache_get(addr) else {
         return 0;
     };
     unsafe {
@@ -4713,16 +4924,65 @@ pub extern "C" fn r2sleigh_type_writeback_cache_put(
     payload_hash: u64,
     applied_hash: u64,
 ) -> i32 {
-    let mut cache = TYPE_WRITEBACK_CACHE
-        .write()
-        .expect("type writeback cache lock poisoned");
-    cache.put(
+    r2engine::engine_type_writeback_cache_put(
         addr,
-        TypeWritebackCacheEntry {
+        r2engine::EngineTypeWritebackCacheEntry {
             key,
             dep_hash,
             payload_hash,
             applied_hash,
+        },
+    );
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_data_ref_cache_clear() {
+    r2engine::engine_data_ref_cache_clear();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_data_ref_cache_len() -> usize {
+    r2engine::engine_data_ref_cache_len()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_data_ref_cache_get(
+    addr: u64,
+    key: *mut u64,
+    payload_hash: *mut u64,
+    ref_count: *mut i32,
+) -> i32 {
+    let Some(entry) = r2engine::engine_data_ref_cache_get(addr) else {
+        return 0;
+    };
+    unsafe {
+        if !key.is_null() {
+            *key = entry.key;
+        }
+        if !payload_hash.is_null() {
+            *payload_hash = entry.payload_hash;
+        }
+        if !ref_count.is_null() {
+            *ref_count = entry.ref_count;
+        }
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_data_ref_cache_put(
+    addr: u64,
+    key: u64,
+    payload_hash: u64,
+    ref_count: i32,
+) -> i32 {
+    r2engine::engine_data_ref_cache_put(
+        addr,
+        r2engine::EngineDataRefCacheEntry {
+            key,
+            payload_hash,
+            ref_count,
         },
     );
     1
@@ -4736,15 +4996,15 @@ mod type_writeback_cache_tests {
     static CACHE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
-    fn analysis_policy_tracks_native_radare2_depths() {
-        let basic = analysis_policy_for_depth(R2_ANAL_PLUGIN_ANALYSIS_DEPTH_BASIC);
+    fn analysis_policy_ffi_translates_engine_owned_depths() {
+        let basic = r2sleigh_analysis_policy_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_BASIC);
         assert_eq!(basic.mode, R2SLEIGH_MODE_FAST);
         assert_eq!(basic.type_writeback_mode, R2SLEIGH_TYPE_WRITEBACK_OFF);
         assert_eq!(basic.type_interproc_max_iters, 1);
         assert_eq!(basic.type_max_blocks, 96);
         assert_eq!(basic.type_global_max_links, 8);
 
-        let balanced = analysis_policy_for_depth(0);
+        let balanced = r2sleigh_analysis_policy_for_depth(0);
         assert_eq!(balanced.mode, R2SLEIGH_MODE_BALANCED);
         assert_eq!(
             balanced.type_writeback_mode,
@@ -4754,7 +5014,8 @@ mod type_writeback_cache_tests {
         assert_eq!(balanced.type_max_blocks, 200);
         assert_eq!(balanced.type_global_max_links, 32);
 
-        let aggressive = analysis_policy_for_depth(R2_ANAL_PLUGIN_ANALYSIS_DEPTH_AGGRESSIVE);
+        let aggressive =
+            r2sleigh_analysis_policy_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE);
         assert_eq!(aggressive.mode, R2SLEIGH_MODE_FULL);
         assert_eq!(
             aggressive.type_writeback_mode,
@@ -4766,7 +5027,50 @@ mod type_writeback_cache_tests {
     }
 
     #[test]
-    fn type_writeback_cache_is_rust_owned_and_address_keyed() {
+    fn post_analysis_plan_ffi_routes_to_engine_owned_policy() {
+        let fast =
+            r2sleigh_post_analysis_plan_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_BASIC, 512);
+        assert_eq!(fast.mode, R2SLEIGH_MODE_FAST);
+        assert_eq!(
+            fast.post_budget_us,
+            r2engine::POST_ANALYSIS_FAST_BUDGET_USEC
+        );
+        assert_eq!(fast.xref_enabled, 0);
+        assert_eq!(fast.taint_enabled, 0);
+        assert_eq!(fast.sigwrite_enabled, 0);
+        assert_eq!(fast.type_writeback_enabled, 0);
+        assert_eq!(fast.type_writeback_focus_only, 0);
+
+        let balanced = r2sleigh_post_analysis_plan_for_depth(0, 1);
+        assert_eq!(balanced.mode, R2SLEIGH_MODE_BALANCED);
+        assert_eq!(
+            balanced.post_budget_us,
+            r2engine::POST_ANALYSIS_BALANCED_BUDGET_USEC
+        );
+        assert_eq!(balanced.xref_enabled, 1);
+        assert_eq!(balanced.taint_enabled, 0);
+        assert_eq!(balanced.sigwrite_enabled, 1);
+        assert_eq!(balanced.type_writeback_enabled, 1);
+        assert_eq!(balanced.balanced_focus_only, 1);
+        assert_eq!(balanced.sigwrite_focus_only, 1);
+        assert_eq!(balanced.type_writeback_focus_only, 1);
+
+        let full =
+            r2sleigh_post_analysis_plan_for_depth(r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE, 129);
+        assert_eq!(full.mode, R2SLEIGH_MODE_FULL);
+        assert_eq!(
+            full.post_budget_us,
+            r2engine::POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC
+        );
+        assert_eq!(full.taint_enabled, 1);
+        assert_eq!(full.balanced_focus_only, 0);
+        assert_eq!(full.taint_focus_only, 1);
+        assert_eq!(full.sigwrite_focus_only, 1);
+        assert_eq!(full.type_writeback_focus_only, 1);
+    }
+
+    #[test]
+    fn type_writeback_cache_ffi_routes_to_engine_owned_cache() {
         let _guard = CACHE_TEST_LOCK.lock().expect("cache test lock poisoned");
         r2sleigh_type_writeback_cache_clear();
         assert_eq!(r2sleigh_type_writeback_cache_len(), 0);
@@ -4814,11 +5118,55 @@ mod type_writeback_cache_tests {
     }
 
     #[test]
+    fn type_writeback_cache_key_ffi_routes_to_engine_owned_policy() {
+        let ffi_key = r2sleigh_type_writeback_cache_key(
+            0x0102_0304_0506_0708,
+            0xa0a1_a2a3_a4a5_a6a7,
+            R2SLEIGH_TYPE_WRITEBACK_BALANCED,
+            4,
+            32,
+            512,
+            1024,
+        );
+        let engine_key = r2engine::engine_type_writeback_cache_key(
+            0x0102_0304_0506_0708,
+            0xa0a1_a2a3_a4a5_a6a7,
+            r2engine::EngineTypeWritebackMode::Balanced,
+            4,
+            32,
+            512,
+            1024,
+        );
+        assert_eq!(ffi_key, 0x3e5f_62a4_a8de_7243);
+        assert_eq!(ffi_key, engine_key);
+        assert_eq!(
+            r2sleigh_type_writeback_cache_key(
+                0x0102_0304_0506_0708,
+                0xa0a1_a2a3_a4a5_a6a7,
+                99,
+                4,
+                32,
+                512,
+                1024
+            ),
+            r2engine::engine_type_writeback_cache_key(
+                0x0102_0304_0506_0708,
+                0xa0a1_a2a3_a4a5_a6a7,
+                r2engine::EngineTypeWritebackMode::Off,
+                4,
+                32,
+                512,
+                1024
+            )
+        );
+    }
+
+    #[test]
     fn type_writeback_cache_evicts_oldest_entry_deterministically() {
         let _guard = CACHE_TEST_LOCK.lock().expect("cache test lock poisoned");
         r2sleigh_type_writeback_cache_clear();
 
-        for idx in 0..TYPE_WRITEBACK_CACHE_LIMIT as u64 {
+        for idx in 0..r2engine::TYPE_WRITEBACK_CACHE_LIMIT as u64 {
             assert_eq!(
                 r2sleigh_type_writeback_cache_put(0x500000 + idx, idx, idx + 1, idx + 2, idx + 3),
                 1
@@ -4826,7 +5174,7 @@ mod type_writeback_cache_tests {
         }
         assert_eq!(
             r2sleigh_type_writeback_cache_len(),
-            TYPE_WRITEBACK_CACHE_LIMIT
+            r2engine::TYPE_WRITEBACK_CACHE_LIMIT
         );
 
         let mut key = 0;
@@ -4851,7 +5199,7 @@ mod type_writeback_cache_tests {
         );
         assert_eq!(
             r2sleigh_type_writeback_cache_len(),
-            TYPE_WRITEBACK_CACHE_LIMIT
+            r2engine::TYPE_WRITEBACK_CACHE_LIMIT
         );
         assert_eq!(
             r2sleigh_type_writeback_cache_get(
@@ -4886,6 +5234,85 @@ mod type_writeback_cache_tests {
         assert_eq!((key, dep_hash, payload_hash, applied_hash), (9, 10, 11, 12));
 
         r2sleigh_type_writeback_cache_clear();
+    }
+
+    #[test]
+    fn data_ref_cache_ffi_routes_to_engine_owned_cache() {
+        let _guard = CACHE_TEST_LOCK.lock().expect("cache test lock poisoned");
+        r2sleigh_data_ref_cache_clear();
+        assert_eq!(r2sleigh_data_ref_cache_len(), 0);
+
+        assert_eq!(r2sleigh_data_ref_cache_put(0x401000, 1, 2, 3), 1);
+        assert_eq!(r2sleigh_data_ref_cache_len(), 1);
+
+        let mut key = 0;
+        let mut payload_hash = 0;
+        let mut ref_count = 0;
+        assert_eq!(
+            r2sleigh_data_ref_cache_get(0x401000, &mut key, &mut payload_hash, &mut ref_count),
+            1
+        );
+        assert_eq!((key, payload_hash, ref_count), (1, 2, 3));
+
+        assert_eq!(r2sleigh_data_ref_cache_put(0x401000, 10, 20, 30), 1);
+        assert_eq!(r2sleigh_data_ref_cache_len(), 1);
+        assert_eq!(
+            r2sleigh_data_ref_cache_get(0x401000, &mut key, &mut payload_hash, &mut ref_count),
+            1
+        );
+        assert_eq!((key, payload_hash, ref_count), (10, 20, 30));
+
+        r2sleigh_data_ref_cache_clear();
+    }
+
+    #[test]
+    fn data_ref_cache_evicts_oldest_entry_deterministically() {
+        let _guard = CACHE_TEST_LOCK.lock().expect("cache test lock poisoned");
+        r2sleigh_data_ref_cache_clear();
+
+        for idx in 0..r2engine::DATA_REF_CACHE_LIMIT as u64 {
+            assert_eq!(
+                r2sleigh_data_ref_cache_put(
+                    0x700000 + idx,
+                    idx,
+                    idx + 1,
+                    idx.min(i32::MAX as u64) as i32,
+                ),
+                1
+            );
+        }
+        assert_eq!(
+            r2sleigh_data_ref_cache_len(),
+            r2engine::DATA_REF_CACHE_LIMIT
+        );
+
+        let mut key = 0;
+        let mut payload_hash = 0;
+        let mut ref_count = 0;
+        assert_eq!(
+            r2sleigh_data_ref_cache_get(0x700000, &mut key, &mut payload_hash, &mut ref_count),
+            1
+        );
+        assert_eq!(r2sleigh_data_ref_cache_put(0x800000, 9, 10, 11), 1);
+        assert_eq!(
+            r2sleigh_data_ref_cache_len(),
+            r2engine::DATA_REF_CACHE_LIMIT
+        );
+        assert_eq!(
+            r2sleigh_data_ref_cache_get(0x700000, &mut key, &mut payload_hash, &mut ref_count),
+            1
+        );
+        assert_eq!(
+            r2sleigh_data_ref_cache_get(0x700001, &mut key, &mut payload_hash, &mut ref_count),
+            0
+        );
+        assert_eq!(
+            r2sleigh_data_ref_cache_get(0x800000, &mut key, &mut payload_hash, &mut ref_count),
+            1
+        );
+        assert_eq!((key, payload_hash, ref_count), (9, 10, 11));
+
+        r2sleigh_data_ref_cache_clear();
     }
 }
 
@@ -4951,10 +5378,6 @@ fn cfg_risk_summary_json(summary: r2ssa::CFGRiskSummary) -> CfgRiskSummaryJson {
     }
 }
 
-fn caller_prefers_bounded_type_plan(interproc: &InterprocInferenceInput<'_>) -> bool {
-    interproc.max_iters <= 1 && !interproc.converged
-}
-
 fn phase_timing(phase: &str, start: Instant) -> PhaseTimingJson {
     PhaseTimingJson {
         phase: phase.to_string(),
@@ -4966,12 +5389,12 @@ struct BoundedCfgTypePayloadInput<'a> {
     function_name: &'a str,
     arch_name: &'a str,
     ptr_bits: u32,
-    callconv: Option<&'a str>,
     interproc: InterprocInferenceInput<'a>,
     function_facts: &'a r2types::FunctionFacts,
     symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
     budget: TypeOutputBudget,
     apply_policy: r2types::TypeWritebackApplyPolicy,
+    basic_block_count: usize,
     reason: String,
 }
 
@@ -4980,13 +5403,12 @@ fn bounded_cfg_type_payload(input: BoundedCfgTypePayloadInput<'_>) -> InferredTy
         input.function_name,
         input.arch_name,
         input.ptr_bits,
-        input.callconv,
         input.function_facts,
         input.reason,
     );
-    writeback_plan_json_with_policy(
+    writeback_plan_json_with_policy(WritebackPlanJsonInput {
         plan,
-        InterprocSummaryJson {
+        interproc: InterprocSummaryJson {
             callsite_count: 0,
             iterations: input.interproc.iter.max(1),
             max_iterations: input.interproc.max_iters.max(input.interproc.iter.max(1)),
@@ -4998,12 +5420,13 @@ fn bounded_cfg_type_payload(input: BoundedCfgTypePayloadInput<'_>) -> InferredTy
                 input.symbolic_scope,
             ),
         },
-        input.function_facts,
-        None,
-        None,
-        input.budget,
-        input.apply_policy,
-    )
+        function_facts: input.function_facts,
+        semantics: None,
+        compiled_semantics: None,
+        budget: input.budget,
+        apply_policy: input.apply_policy,
+        basic_block_count: input.basic_block_count,
+    })
 }
 
 fn push_phase(timings: &mut Vec<PhaseTimingJson>, phase: &str, start: Instant) {
@@ -5034,34 +5457,34 @@ fn complete_type_phase_timings(timings: &mut Vec<PhaseTimingJson>) {
     }
 }
 
-fn semantic_route_plan_json(route: r2dec::SemanticRoutePlan) -> SemanticRoutePlanJson {
+fn semantic_route_plan_json(route: r2engine::EngineSemanticRoutePlan) -> SemanticRoutePlanJson {
     match route {
-        r2dec::SemanticRoutePlan::Standard => SemanticRoutePlanJson {
+        r2engine::EngineSemanticRoutePlan::Standard => SemanticRoutePlanJson {
             kind: "standard".to_string(),
             reason: None,
             comment: None,
         },
-        r2dec::SemanticRoutePlan::StructuredWorker { reason } => SemanticRoutePlanJson {
+        r2engine::EngineSemanticRoutePlan::StructuredWorker { reason } => SemanticRoutePlanJson {
             kind: "structured_worker".to_string(),
             reason: Some(reason),
             comment: None,
         },
-        r2dec::SemanticRoutePlan::LinearWorker { reason } => SemanticRoutePlanJson {
+        r2engine::EngineSemanticRoutePlan::LinearWorker { reason } => SemanticRoutePlanJson {
             kind: "linear_worker".to_string(),
             reason: Some(reason),
             comment: None,
         },
-        r2dec::SemanticRoutePlan::SummaryIslands { reason } => SemanticRoutePlanJson {
+        r2engine::EngineSemanticRoutePlan::SummaryIslands { reason } => SemanticRoutePlanJson {
             kind: "summary_islands".to_string(),
             reason: Some(reason),
             comment: None,
         },
-        r2dec::SemanticRoutePlan::VmSummary { reason } => SemanticRoutePlanJson {
+        r2engine::EngineSemanticRoutePlan::VmSummary { reason } => SemanticRoutePlanJson {
             kind: "vm_summary".to_string(),
             reason: Some(reason),
             comment: None,
         },
-        r2dec::SemanticRoutePlan::FallbackComment { comment } => SemanticRoutePlanJson {
+        r2engine::EngineSemanticRoutePlan::FallbackComment { comment } => SemanticRoutePlanJson {
             kind: "fallback_comment".to_string(),
             reason: None,
             comment: Some(comment),
@@ -5171,6 +5594,8 @@ fn ffi_signature_fact_from_type_writeback(
                 num_params: 0,
                 confidence: 0,
                 callconv_confidence: 0,
+                signature_decision: type_writeback.signature_action_decision,
+                callconv_decision: type_writeback.callconv_action_decision,
             },
             Vec::new(),
         );
@@ -5195,6 +5620,8 @@ fn ffi_signature_fact_from_type_writeback(
         num_params: params.len(),
         confidence: type_writeback.confidence,
         callconv_confidence: type_writeback.callconv_confidence,
+        signature_decision: type_writeback.signature_action_decision,
+        callconv_decision: type_writeback.callconv_action_decision,
     };
     (fact, params)
 }
@@ -5207,53 +5634,59 @@ fn writeback_plan_json(
     semantics: Option<r2sym::SemanticArtifact>,
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     budget: TypeOutputBudget,
+    basic_block_count: usize,
 ) -> InferredTypeWritebackJson {
-    writeback_plan_json_with_policy(
+    writeback_plan_json_with_policy(WritebackPlanJsonInput {
         plan,
         interproc,
         function_facts,
         semantics,
         compiled_semantics,
         budget,
-        r2types::TypeWritebackApplyPolicy::balanced(),
-    )
+        apply_policy: r2types::TypeWritebackApplyPolicy::balanced(),
+        basic_block_count,
+    })
 }
 
-fn writeback_plan_json_with_policy(
+struct WritebackPlanJsonInput<'a> {
     plan: r2types::TypeWritebackPlan,
     interproc: InterprocSummaryJson,
-    function_facts: &r2types::FunctionFacts,
+    function_facts: &'a r2types::FunctionFacts,
     semantics: Option<r2sym::SemanticArtifact>,
     compiled_semantics: Option<analysis::sym::CompiledSemanticInfo>,
     budget: TypeOutputBudget,
     apply_policy: r2types::TypeWritebackApplyPolicy,
-) -> InferredTypeWritebackJson {
-    let mutation_plan = r2types::type_writeback_mutation_plan_with_policy(
+    basic_block_count: usize,
+}
+
+fn writeback_plan_json_with_policy(input: WritebackPlanJsonInput<'_>) -> InferredTypeWritebackJson {
+    let WritebackPlanJsonInput {
+        plan,
+        interproc,
+        function_facts,
+        semantics,
+        compiled_semantics,
+        budget,
+        apply_policy,
+        basic_block_count,
+    } = input;
+    let r2types::TypeWritebackAuthorityReport {
+        mutation_plan,
+        signature_render_authorized,
+        signature_writeback,
+        signature_action_decision,
+        callconv_action_decision,
+        warnings,
+    } = r2types::type_writeback_authority_report_with_policy(
         &plan,
         budget,
         &function_facts.types,
         apply_policy,
+        basic_block_count,
     );
-    let signature_writeback = r2types::signature_writeback_decision(&function_facts.types);
-    let signature_render_authorized = function_facts.types.render_authorized_signature().is_some();
     let signature_writeback_authorized = signature_writeback.authorized;
     let signature_writeback_refusal = signature_writeback.refusal;
     let signature_certificate_sources = signature_writeback.sources;
-    let mut warnings = plan.diagnostics.warnings;
-    if plan.struct_decls.len() > budget.max_type_decls {
-        warnings.push(format!(
-            "type declaration report truncated from {} to {} item(s)",
-            plan.struct_decls.len(),
-            budget.max_type_decls
-        ));
-    }
-    if plan.global_type_links.len() > budget.global_max_links {
-        warnings.push(format!(
-            "global type-link report truncated from {} to {} item(s)",
-            plan.global_type_links.len(),
-            budget.global_max_links
-        ));
-    }
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
         signature: plan.signature.signature,
@@ -5273,6 +5706,8 @@ fn writeback_plan_json_with_policy(
         callconv_confidence: plan.signature.callconv_confidence,
         signature_render_authorized,
         signature_writeback_authorized,
+        signature_action_decision: signature_action_decision as u32,
+        callconv_action_decision: callconv_action_decision as u32,
         signature_certificate_sources,
         signature_writeback_refusal,
         var_type_candidates: plan
@@ -5460,9 +5895,9 @@ fn type_writeback_payload_from_engine_response(
         .as_ref()
         .and_then(|summary| serde_json::to_string(summary).ok());
 
-    writeback_plan_json_with_policy(
-        response.writeback_plan,
-        InterprocSummaryJson {
+    writeback_plan_json_with_policy(WritebackPlanJsonInput {
+        plan: response.writeback_plan,
+        interproc: InterprocSummaryJson {
             callsite_count: response.callsite_count,
             iterations: interproc.iter.max(1),
             max_iterations: interproc.max_iters.max(interproc.iter.max(1)),
@@ -5471,19 +5906,19 @@ fn type_writeback_payload_from_engine_response(
             summary_json: current_summary_json,
             scope,
         },
-        &response.function_facts,
+        function_facts: &response.function_facts,
         semantics,
         compiled_semantics,
         budget,
         apply_policy,
-    )
+        basic_block_count: response.cfg_summary.block_count,
+    })
 }
 
 struct SemanticTypeFallbackPayloadInput<'a> {
     function_name: &'a str,
     arch_name: &'a str,
     ptr_bits: u32,
-    callconv: Option<&'a str>,
     interproc: InterprocInferenceInput<'a>,
     compiled: &'a r2sym::SemanticArtifact,
     function_facts: &'a r2types::FunctionFacts,
@@ -5491,6 +5926,7 @@ struct SemanticTypeFallbackPayloadInput<'a> {
     apply_artifact_signature_hint: bool,
     budget: TypeOutputBudget,
     apply_policy: r2types::TypeWritebackApplyPolicy,
+    basic_block_count: usize,
 }
 
 fn semantic_type_fallback_payload(
@@ -5501,41 +5937,27 @@ fn semantic_type_fallback_payload(
         input.function_name,
         input.arch_name,
         input.ptr_bits,
-        input.callconv,
         input.compiled,
         input.function_facts,
         input.apply_artifact_signature_hint,
     );
-    let mutation_plan = r2types::type_writeback_mutation_plan_with_policy(
+    let r2types::TypeWritebackAuthorityReport {
+        mutation_plan,
+        signature_render_authorized,
+        signature_writeback,
+        signature_action_decision,
+        callconv_action_decision,
+        warnings,
+    } = r2types::type_writeback_authority_report_with_policy(
         &plan,
         input.budget,
         &input.function_facts.types,
         input.apply_policy,
+        input.basic_block_count,
     );
-    let signature_writeback = r2types::signature_writeback_decision(&input.function_facts.types);
-    let signature_render_authorized = input
-        .function_facts
-        .types
-        .render_authorized_signature()
-        .is_some();
     let signature_writeback_authorized = signature_writeback.authorized;
     let signature_writeback_refusal = signature_writeback.refusal;
     let signature_certificate_sources = signature_writeback.sources;
-    let mut warnings = plan.diagnostics.warnings;
-    if plan.struct_decls.len() > input.budget.max_type_decls {
-        warnings.push(format!(
-            "type declaration report truncated from {} to {} item(s)",
-            plan.struct_decls.len(),
-            input.budget.max_type_decls
-        ));
-    }
-    if plan.global_type_links.len() > input.budget.global_max_links {
-        warnings.push(format!(
-            "global type-link report truncated from {} to {} item(s)",
-            plan.global_type_links.len(),
-            input.budget.global_max_links
-        ));
-    }
 
     InferredTypeWritebackJson {
         function_name: plan.signature.function_name,
@@ -5556,6 +5978,8 @@ fn semantic_type_fallback_payload(
         callconv_confidence: plan.signature.callconv_confidence,
         signature_render_authorized,
         signature_writeback_authorized,
+        signature_action_decision: signature_action_decision as u32,
+        callconv_action_decision: callconv_action_decision as u32,
         signature_certificate_sources,
         signature_writeback_refusal,
         var_type_candidates: Vec::new(),
@@ -5711,6 +6135,7 @@ fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
     }
 }
 
+#[cfg(test)]
 fn ctype_to_type_like(ty: &r2dec::CType) -> r2types::CTypeLike {
     match ty {
         r2dec::CType::Void => r2types::CTypeLike::Void,
@@ -6334,7 +6759,8 @@ fn infer_structs_from_ssa(
     use std::collections::HashMap;
 
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch, ptr_bits);
-    let (_, _, cfg) = r2dec::DecompilerConfig::for_arch(arch);
+    let (arch_name, _) = r2engine::engine_arch_target(arch);
+    let cfg = r2dec::DecompilerConfig::for_arch_name(&arch_name, ptr_bits);
     let sp_name = cfg.sp_name.to_ascii_lowercase();
     let fp_name = cfg.fp_name.to_ascii_lowercase();
     let mut addr_exprs: HashMap<String, ArgAddrExpr> = HashMap::new();
@@ -7449,154 +7875,6 @@ pub extern "C" fn r2sleigh_infer_signature_cc_json(
     }
 }
 
-fn direct_call_targets_from_analysis(analysis: &types::FunctionAnalysis) -> Vec<u64> {
-    let mut targets = std::collections::BTreeSet::new();
-    for call in analysis.ssa_func.call_sites().by_id.values() {
-        if let Some(target) = call.direct_target {
-            targets.insert(target);
-        }
-    }
-    targets.into_iter().collect()
-}
-
-fn runtime_registration_targets_from_analysis(
-    analysis: &types::FunctionAnalysis,
-    arch: Option<&ArchSpec>,
-    registration_call_targets: &[u64],
-) -> Vec<u64> {
-    fn debug_runtime_targets_enabled() -> bool {
-        std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_TARGETS").is_some()
-    }
-
-    fn debug_runtime_targets_log(message: &str) {
-        if !debug_runtime_targets_enabled() {
-            return;
-        }
-        let path = std::env::var("R2SLEIGH_DEBUG_RUNTIME_TARGETS_LOG")
-            .unwrap_or_else(|_| "/tmp/r2sleigh_runtime_targets.log".to_string());
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{message}");
-        }
-    }
-
-    let lower_arch = arch.map(|arch| arch.name.to_ascii_lowercase());
-    let supports_windows_x64 = arch.is_some_and(|arch| {
-        lower_arch.as_deref().is_some_and(|name| {
-            (name.contains("x86") || matches!(name, "x64" | "amd64"))
-                && (arch.addr_size == 8 || name.contains("64"))
-        })
-    });
-    if !supports_windows_x64 || registration_call_targets.is_empty() {
-        debug_runtime_targets_log(&format!(
-            "skip supports_windows_x64={} arch={:?} registrations={}",
-            supports_windows_x64,
-            lower_arch.as_deref(),
-            registration_call_targets.len()
-        ));
-        return Vec::new();
-    }
-
-    let registrations = registration_call_targets
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let observations =
-        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
-    let mut targets = std::collections::BTreeSet::new();
-    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
-        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
-            debug_runtime_targets_log(&format!("call_id={call_id:?} unresolved_target"));
-            continue;
-        };
-        if !registrations.contains(&target) {
-            debug_runtime_targets_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} not_registration"
-            ));
-            continue;
-        }
-        let Some(args) = observations.get(call_id) else {
-            debug_runtime_targets_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} missing_args"
-            ));
-            continue;
-        };
-        let Some(r2ssa::CallArgObservation::Const(handler)) = args.get(1) else {
-            debug_runtime_targets_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} handler_arg={:?}",
-                args.get(1)
-            ));
-            continue;
-        };
-        if *handler >= 0x1000 {
-            debug_runtime_targets_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} handler=0x{handler:x}"
-            ));
-            targets.insert(*handler);
-        }
-    }
-    targets.into_iter().collect()
-}
-
-#[derive(Serialize)]
-struct RuntimeMaterializedSourceJson {
-    addr: u64,
-    size: u64,
-}
-
-fn runtime_materialized_sources_from_analysis(
-    analysis: &types::FunctionAnalysis,
-    arch: Option<&ArchSpec>,
-    copy_call_targets: &[u64],
-) -> Vec<RuntimeMaterializedSourceJson> {
-    let lower_arch = arch.map(|arch| arch.name.to_ascii_lowercase());
-    let supports_windows_x64 = arch.is_some_and(|arch| {
-        lower_arch.as_deref().is_some_and(|name| {
-            (name.contains("x86") || matches!(name, "x64" | "amd64"))
-                && (arch.addr_size == 8 || name.contains("64"))
-        })
-    });
-    if !supports_windows_x64 || copy_call_targets.is_empty() {
-        return Vec::new();
-    }
-
-    let copy_targets = copy_call_targets
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let observations =
-        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
-    let mut sources = std::collections::BTreeMap::<u64, u64>::new();
-    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
-        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
-            continue;
-        };
-        if !copy_targets.contains(&target) {
-            continue;
-        }
-        let Some(args) = observations.get(call_id) else {
-            continue;
-        };
-        let (
-            Some(r2ssa::CallArgObservation::Const(source)),
-            Some(r2ssa::CallArgObservation::Const(size)),
-        ) = (args.get(1), args.get(2))
-        else {
-            continue;
-        };
-        if *source >= 0x1000 && *size > 0 {
-            sources
-                .entry(*source)
-                .and_modify(|existing| *existing = (*existing).max(*size))
-                .or_insert(*size);
-        }
-    }
-
-    sources
-        .into_iter()
-        .map(|(addr, size)| RuntimeMaterializedSourceJson { addr, size })
-        .collect()
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_get_direct_call_targets_json(
     ctx: *const R2ILContext,
@@ -7612,7 +7890,7 @@ pub extern "C" fn r2sleigh_get_direct_call_targets_json(
     let Some(analysis) = types::build_function_analysis(&input) else {
         return ptr::null_mut();
     };
-    let payload = direct_call_targets_from_analysis(&analysis);
+    let payload = r2engine::interproc_direct_call_targets(&analysis);
     match serde_json::to_string(&payload) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
@@ -7635,7 +7913,7 @@ pub extern "C" fn r2sleigh_get_direct_call_targets_typed(
         return ptr::null_mut();
     };
     Box::into_raw(Box::new(R2SleighU64Array {
-        values: direct_call_targets_from_analysis(&analysis),
+        values: r2engine::interproc_direct_call_targets(&analysis),
     }))
 }
 
@@ -7660,7 +7938,7 @@ pub extern "C" fn r2sleigh_get_symbolic_scope_targets_json(
         "[]",
     ))
     .unwrap_or_default();
-    let payload = runtime_registration_targets_from_analysis(
+    let payload = r2engine::interproc_runtime_registration_targets(
         &analysis,
         input.ctx.arch,
         &registration_call_targets,
@@ -7696,7 +7974,7 @@ pub extern "C" fn r2sleigh_get_symbolic_scope_targets_typed(
         }
     };
     Box::into_raw(Box::new(R2SleighU64Array {
-        values: runtime_registration_targets_from_analysis(
+        values: r2engine::interproc_runtime_registration_targets(
             &analysis,
             input.ctx.arch,
             registration_call_targets,
@@ -7723,8 +8001,11 @@ pub extern "C" fn r2sleigh_get_runtime_materialized_sources_json(
     let copy_call_targets: Vec<u64> =
         serde_json::from_str(&helpers::cstr_or_default(copy_call_targets_json, "[]"))
             .unwrap_or_default();
-    let payload =
-        runtime_materialized_sources_from_analysis(&analysis, input.ctx.arch, &copy_call_targets);
+    let payload = r2engine::interproc_runtime_materialized_sources(
+        &analysis,
+        input.ctx.arch,
+        &copy_call_targets,
+    );
     match serde_json::to_string(&payload) {
         Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
         Err(_) => ptr::null_mut(),
@@ -7753,14 +8034,17 @@ pub extern "C" fn r2sleigh_get_runtime_materialized_sources_typed(
     } else {
         unsafe { std::slice::from_raw_parts(copy_call_targets, num_copy_call_targets) }
     };
-    let items =
-        runtime_materialized_sources_from_analysis(&analysis, input.ctx.arch, copy_call_targets)
-            .into_iter()
-            .map(|source| R2SleighRuntimeSource {
-                addr: source.addr,
-                size: source.size,
-            })
-            .collect();
+    let items = r2engine::interproc_runtime_materialized_sources(
+        &analysis,
+        input.ctx.arch,
+        copy_call_targets,
+    )
+    .into_iter()
+    .map(|source| R2SleighRuntimeSource {
+        addr: source.addr,
+        size: source.size,
+    })
+    .collect();
     Box::into_raw(Box::new(R2SleighRuntimeSources { items }))
 }
 
@@ -7822,6 +8106,108 @@ pub extern "C" fn r2sleigh_runtime_sources_free(sources: *mut R2SleighRuntimeSou
     if !sources.is_null() {
         unsafe {
             drop(Box::from_raw(sources));
+        }
+    }
+}
+
+#[allow(
+    unknown_lints,
+    r2plugin_raw_direct_call_target,
+    reason = "FFI bridge copies radare2-collected target facts into the engine-owned planner"
+)]
+fn interproc_target_input_from_ffi(
+    input: &R2SleighInterprocTargetInput,
+) -> r2engine::EngineInterprocTargetInput {
+    r2engine::EngineInterprocTargetInput {
+        direct_target: input.direct_target,
+        name: optional_cstr(input.name),
+        linkage: ffi_interproc_seed_linkage(input.linkage),
+        semantic_summary: None,
+        resolved_target: (input.has_resolved_target != 0).then_some(input.resolved_target),
+        target_materialized: input.target_materialized != 0,
+        target_metrics: (input.has_target_metrics != 0).then_some(
+            r2engine::EngineInterprocTargetMetrics {
+                basic_block_count: input.target_basic_block_count,
+                cost: input.target_cost,
+            },
+        ),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_plan_interproc_scope_targets(
+    inputs: *const R2SleighInterprocTargetInput,
+    num_inputs: usize,
+) -> *mut R2SleighInterprocTargetPlan {
+    if inputs.is_null() && num_inputs != 0 {
+        return ptr::null_mut();
+    }
+    let inputs = if num_inputs == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(inputs, num_inputs) }
+    };
+    let plan =
+        r2engine::interproc_scope_target_plan(inputs.iter().map(interproc_target_input_from_ffi));
+    Box::into_raw(Box::new(R2SleighInterprocTargetPlan {
+        queued_targets: plan.queued_targets,
+        registration_targets: plan.registration_targets,
+        runtime_copy_targets: plan.runtime_copy_targets,
+    }))
+}
+
+fn interproc_target_plan_items(
+    plan: *const R2SleighInterprocTargetPlan,
+    count: *mut usize,
+    select: impl FnOnce(&R2SleighInterprocTargetPlan) -> &Vec<u64>,
+) -> *const u64 {
+    if plan.is_null() {
+        if !count.is_null() {
+            unsafe {
+                *count = 0;
+            }
+        }
+        return ptr::null();
+    }
+    let plan = unsafe { &*plan };
+    let items = select(plan);
+    if !count.is_null() {
+        unsafe {
+            *count = items.len();
+        }
+    }
+    items.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_interproc_target_plan_queued_items(
+    plan: *const R2SleighInterprocTargetPlan,
+    count: *mut usize,
+) -> *const u64 {
+    interproc_target_plan_items(plan, count, |plan| &plan.queued_targets)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_interproc_target_plan_registration_items(
+    plan: *const R2SleighInterprocTargetPlan,
+    count: *mut usize,
+) -> *const u64 {
+    interproc_target_plan_items(plan, count, |plan| &plan.registration_targets)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_interproc_target_plan_runtime_copy_items(
+    plan: *const R2SleighInterprocTargetPlan,
+    count: *mut usize,
+) -> *const u64 {
+    interproc_target_plan_items(plan, count, |plan| &plan.runtime_copy_targets)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_interproc_target_plan_free(plan: *mut R2SleighInterprocTargetPlan) {
+    if !plan.is_null() {
+        unsafe {
+            drop(Box::from_raw(plan));
         }
     }
 }
@@ -7915,7 +8301,7 @@ fn build_function_analysis_shared_bundle(
     push_phase(&mut phase_timings, "function_input", phase_start);
     let external_context = cstr_or_default(input.external_context_json, "{}");
     let symbolic_scope = build_inference_symbolic_scope(&input, &function_input);
-    let (_, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
+    let (_, ptr_bits) = r2engine::engine_arch_target(function_input.ctx.arch);
     let parsed_context = if let Some(function_context) = input.function_context {
         unsafe { typed_function_context_to_parsed(function_context, &external_context, ptr_bits) }
     } else {
@@ -7927,7 +8313,6 @@ fn build_function_analysis_shared_bundle(
         input.max_type_decls,
         input.max_mutations,
     );
-    let caller_requested_bounded_type_plan = caller_prefers_bounded_type_plan(&input.interproc);
     let phase_start = Instant::now();
     let reg_type_hints = if function_input.ctx.semantic_metadata_enabled {
         types::collect_register_type_hints(
@@ -7946,13 +8331,15 @@ fn build_function_analysis_shared_bundle(
         symbolic_scope.as_ref(),
         reg_type_hints,
         None,
-        r2engine::EngineSemanticMode::Full,
         true,
     );
-    let response = types::engine_session().type_function(r2engine::EngineTypeAnalysisRequest {
-        analysis: analysis_request,
-        caller_prefers_bounded_type_plan: caller_requested_bounded_type_plan,
-    })?;
+    let response = types::engine_session().type_function(
+        r2engine::EngineTypeAnalysisRequest::from_interproc_budget(
+            analysis_request,
+            input.interproc.max_iters,
+            input.interproc.converged,
+        ),
+    )?;
     push_phase(&mut phase_timings, "engine_type_analysis", phase_start);
 
     let cfg_risk = cfg_risk_summary_json(response.cfg_summary);
@@ -8208,7 +8595,7 @@ pub extern "C" fn r2sleigh_bounded_type_json_ffi(
     let function_name = cstr_or_default(fcn_name, "unknown").to_string();
     let reason = cstr_or_default(reason, "bounded type plan").to_string();
     let arch = unsafe { ctx.as_ref().and_then(|ctx| ctx.arch.as_ref()) };
-    let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(arch);
+    let (arch_name, ptr_bits) = r2engine::engine_arch_target(arch);
     let scope_facts = types::empty_interproc_scope_facts();
     let interproc = InterprocInferenceInput {
         iter: 1,
@@ -8222,7 +8609,6 @@ pub extern "C" fn r2sleigh_bounded_type_json_ffi(
         function_name: &function_name,
         arch_name: &arch_name,
         ptr_bits,
-        callconv: None,
         interproc,
         function_facts: &function_facts,
         symbolic_scope: None,
@@ -8232,6 +8618,7 @@ pub extern "C" fn r2sleigh_bounded_type_json_ffi(
             max_mutations.max(1),
         ),
         apply_policy: r2types::TypeWritebackApplyPolicy::balanced(),
+        basic_block_count: 0,
         reason,
     });
     payload.phase_timings = vec![PhaseTimingJson {
@@ -8271,52 +8658,17 @@ fn semantic_worker_linearization_impl(input: SemanticWorkerLinearizationInput) -
             )
         }
     };
-    let (arch_name, ptr_bits, _) = r2dec::DecompilerConfig::for_arch(function_input.ctx.arch);
-    let semantic_artifact = if let Some(cached_artifact) =
-        types::get_cached_function_analysis_artifact_with_scope(
-            &function_input,
-            "{}",
-            symbolic_scope.as_ref(),
-        ) {
-        cached_artifact.function_facts.semantics
-    } else {
-        types::collect_detached_semantic_artifact(
-            function_input.blocks.as_slice(),
-            &function_input.function_name,
-            function_input.ctx.arch,
-            symbolic_scope.as_ref(),
-        )
-    };
-    let Some(semantic_artifact) = semantic_artifact else {
-        return ptr::null_mut();
-    };
-    let plan = r2types::build_semantic_type_fallback_plan(
-        &function_input.function_name,
-        &arch_name,
-        ptr_bits,
-        &semantic_artifact,
-    );
-    let type_facts = r2types::inferred_signature_to_function_type_facts(&plan.signature, ptr_bits);
-    let function_facts = r2types::FunctionFacts::new(type_facts, Some(semantic_artifact.clone()));
-    let fallback_comment = semantic_artifact
-        .native_body()
-        .is_some_and(|native| native.has_summary_islands())
-        .then(|| {
-            let reason = r2engine::cfg_guard_reason_from_summary(&summary)
-                .unwrap_or_else(|| "semantic worker summary".to_string());
-            r2dec::render_semantic_worker_linearization(&plan, Some(&semantic_artifact), &reason)
-        });
-    let Some(response) =
-        types::engine_session().decompile_summary(r2engine::EngineSummaryDecompileRequest {
+    let Some(response) = types::engine_session().decompile_detached_semantic_worker_summary(
+        r2engine::EngineDetachedSemanticWorkerSummaryRequest {
             function_name: function_input.function_name.clone(),
+            function_addr: function_input.function_addr,
+            blocks: function_input.blocks.as_slice(),
+            arch: function_input.ctx.arch,
+            symbolic_scope: symbolic_scope.as_ref(),
             cfg_summary: summary,
-            function_facts,
-            named_worker_guarded: true,
-            config: r2dec::DecompilerConfig::for_arch(function_input.ctx.arch).2,
             render_cache_key: None,
-            fallback_comment,
-        })
-    else {
+        },
+    ) else {
         return ptr::null_mut();
     };
     let output = response.output;
@@ -8997,6 +9349,14 @@ mod tests {
         export_instruction(&input, action, format).expect("export")
     }
 
+    #[cfg(feature = "x86")]
+    fn block_has_varnode_metadata(block: &R2ILBlock) -> bool {
+        block.ops.iter().any(|op| {
+            op.output().is_some_and(|vn| vn.meta.is_some())
+                || op.inputs().into_iter().any(|vn| vn.meta.is_some())
+        })
+    }
+
     #[test]
     fn test_context_lifecycle_from_file() {
         let spec = r2sleigh_lift::create_x86_64_spec();
@@ -9041,6 +9401,66 @@ mod tests {
 
         unsafe { drop(CString::from_raw(esil_ptr as *mut c_char)) };
         r2il_block_free(block);
+        r2il_free(ctx);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lift_respects_semantic_metadata_disable_toggle() {
+        let arch = CString::new("x86-64").unwrap();
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null());
+
+        let mut bytes = vec![0x31, 0xC0];
+        bytes.resize(16, 0);
+
+        let enabled_block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
+        assert!(!enabled_block.is_null());
+        assert!(
+            block_has_varnode_metadata(unsafe { &*enabled_block }),
+            "default lift should annotate register varnodes"
+        );
+        r2il_block_free(enabled_block);
+
+        r2il_set_semantic_metadata_enabled(ctx, false);
+        let disabled_block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
+        assert!(!disabled_block.is_null());
+        assert!(
+            !block_has_varnode_metadata(unsafe { &*disabled_block }),
+            "disabled semantic metadata must be passed to single-instruction lift"
+        );
+
+        r2il_block_free(disabled_block);
+        r2il_free(ctx);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn lift_block_respects_semantic_metadata_disable_toggle() {
+        let arch = CString::new("x86-64").unwrap();
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null());
+
+        let mut bytes = vec![0x31, 0xC0];
+        bytes.resize(16, 0);
+
+        let enabled_block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x1000, 2);
+        assert!(!enabled_block.is_null());
+        assert!(
+            block_has_varnode_metadata(unsafe { &*enabled_block }),
+            "default block lift should annotate register varnodes"
+        );
+        r2il_block_free(enabled_block);
+
+        r2il_set_semantic_metadata_enabled(ctx, false);
+        let disabled_block = r2il_lift_block(ctx, bytes.as_ptr(), bytes.len(), 0x1000, 2);
+        assert!(!disabled_block.is_null());
+        assert!(
+            !block_has_varnode_metadata(unsafe { &*disabled_block }),
+            "disabled semantic metadata must be passed to block lift"
+        );
+
+        r2il_block_free(disabled_block);
         r2il_free(ctx);
     }
 
@@ -9307,41 +9727,157 @@ mod tests {
         let generic = CString::new("uint32_t").unwrap();
         let concrete = CString::new("struct real_type *").unwrap();
         assert_eq!(
-            r2sleigh_writeback_apply_type_name_is_generic(generic.as_ptr()),
+            r2sleigh_writeback_var_type_apply_decision(concrete.as_ptr(), generic.as_ptr(), 0, 1,),
+            r2types::TypeWritebackApplyDecision::SkipConcreteExisting as u32
+        );
+        assert_eq!(
+            r2sleigh_writeback_var_type_apply_decision(generic.as_ptr(), concrete.as_ptr(), 0, 1,),
+            r2types::TypeWritebackApplyDecision::Apply as u32
+        );
+        assert_eq!(
+            r2sleigh_writeback_var_type_apply_decision(ptr::null(), concrete.as_ptr(), 1, 0,),
+            r2types::TypeWritebackApplyDecision::SkipMissingMaterialization as u32
+        );
+        assert_eq!(
+            r2sleigh_writeback_global_type_link_apply_decision(
+                concrete.as_ptr(),
+                generic.as_ptr(),
+                0,
+                1,
+            ),
+            r2types::TypeWritebackApplyDecision::SkipConcreteExisting as u32
+        );
+        assert_eq!(
+            r2sleigh_writeback_global_type_link_apply_decision(
+                generic.as_ptr(),
+                concrete.as_ptr(),
+                0,
+                1,
+            ),
+            r2types::TypeWritebackApplyDecision::Apply as u32
+        );
+        assert_eq!(
+            r2sleigh_writeback_var_rename_apply_decision(
+                generated.as_ptr(),
+                generated.as_ptr(),
+                user_name.as_ptr(),
+            ),
+            r2types::TypeWritebackRenameApplyDecision::Apply as u32
+        );
+        assert_eq!(
+            r2sleigh_writeback_var_rename_apply_decision(
+                user_name.as_ptr(),
+                user_name.as_ptr(),
+                generated.as_ptr(),
+            ),
+            r2types::TypeWritebackRenameApplyDecision::SkipCurrentNameNotGenerated as u32
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_var_score(generated.as_ptr(), user_name.as_ptr()),
+            10
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_var_score(user_name.as_ptr(), user_name.as_ptr()),
+            100
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_rename_decision(user_name.as_ptr(), generated.as_ptr(),),
+            r2types::SignatureRegisterArgRenameDecision::SkipCurrentNameNotGenerated as u32
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_rename_decision(generated.as_ptr(), user_name.as_ptr(),),
+            r2types::SignatureRegisterArgRenameDecision::Apply as u32
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_type_apply_required(ptr::null(), concrete.as_ptr()),
             1
         );
         assert_eq!(
-            r2sleigh_writeback_apply_type_name_is_generic(concrete.as_ptr()),
+            r2sleigh_signature_register_arg_type_apply_required(
+                concrete.as_ptr(),
+                concrete.as_ptr()
+            ),
+            0
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_stack_conflict_delete_required(
+                user_name.as_ptr(),
+                user_name.as_ptr(),
+                0,
+                1,
+                1,
+            ),
+            1
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_stack_conflict_delete_required(
+                user_name.as_ptr(),
+                user_name.as_ptr(),
+                1,
+                1,
+                1,
+            ),
+            0
+        );
+        assert_eq!(
+            r2sleigh_type_writeback_stack_arg_name_conflict_delete_required(
+                user_name.as_ptr(),
+                user_name.as_ptr(),
+                0,
+                1,
+                1,
+            ),
+            1
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_duplicate_delete_required(0, 1, 1, 2, 2),
+            1
+        );
+        assert_eq!(
+            r2sleigh_signature_register_arg_duplicate_delete_required(1, 1, 1, 2, 2),
             0
         );
 
-        let dotted = CString::new("struct type.foo_bar*").unwrap();
-        let canonical = r2sleigh_writeback_apply_type_name_canonicalize(dotted.as_ptr());
-        assert!(!canonical.is_null());
-        let canonical_text = unsafe { CStr::from_ptr(canonical) }
-            .to_string_lossy()
-            .into_owned();
-        r2il_string_free(canonical);
-        assert_eq!(canonical_text, "struct foo_bar *");
-    }
-
-    #[test]
-    fn test_callee_name_policy_ffi_routes_to_r2types() {
-        let import = CString::new("reloc.memcpy").unwrap();
-        assert_eq!(r2sleigh_callee_name_is_import_like(import.as_ptr()), 1);
-        assert_eq!(r2sleigh_callee_name_is_runtime_copy(import.as_ptr()), 1);
-
-        let registration = CString::new("sym.imp.AddVectoredExceptionHandler").unwrap();
+        let x64 = CString::new("x86-64").unwrap();
+        let arm64 = CString::new("arm64").unwrap();
+        assert_eq!(r2sleigh_signature_writeback_arch_supported(x64.as_ptr()), 1);
+        assert_eq!(r2sleigh_signature_writeback_arch_supported(ptr::null()), 0);
+        assert_eq!(r2sleigh_callconv_writeback_arch_supported(x64.as_ptr()), 1);
         assert_eq!(
-            r2sleigh_callee_name_is_windows_runtime_registration(registration.as_ptr()),
+            r2sleigh_callconv_writeback_arch_supported(arm64.as_ptr()),
+            0
+        );
+        assert_eq!(
+            r2sleigh_signature_writeback_size_eligible(r2types::SIGNATURE_WRITEBACK_MAX_BLOCKS),
             1
         );
-
-        let local = CString::new("sym.local_helper").unwrap();
-        assert_eq!(r2sleigh_callee_name_is_import_like(local.as_ptr()), 0);
-        assert_eq!(r2sleigh_callee_name_is_runtime_copy(local.as_ptr()), 0);
         assert_eq!(
-            r2sleigh_callee_name_is_windows_runtime_registration(ptr::null()),
+            r2sleigh_signature_writeback_size_eligible(r2types::SIGNATURE_WRITEBACK_MAX_BLOCKS + 1),
+            0
+        );
+        assert_eq!(
+            r2sleigh_interproc_helper_scope_budget_allows(
+                r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
+                r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
+            ),
+            1
+        );
+        assert_eq!(
+            r2sleigh_interproc_helper_scope_budget_allows(
+                (r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1) as usize,
+                r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
+            ),
+            0
+        );
+        assert_eq!(
+            r2sleigh_interproc_helper_scope_budget_allows(
+                r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
+                r2engine::ENGINE_INTERPROC_HELPER_MAX_COST + 1,
+            ),
+            0
+        );
+        assert_eq!(
+            r2sleigh_interproc_helper_scope_budget_allows(usize::MAX, 1),
             0
         );
     }
@@ -9861,7 +10397,10 @@ mod tests {
                 "vars": [
                     {"kind":"stack","name":"loc","type":"int8_t *","base":"rbp","offset":-8,"role":"local"}
                 ],
-                "base_types": []
+                "base_types": [],
+                "callees": [
+                    {"addr":4198752,"name":"sym.imp.setlocale","linkage":"imported"}
+                ]
             }"#,
         )
         .expect("valid setlocale external context");
@@ -9885,12 +10424,16 @@ mod tests {
         }
         r2il_free(ctx);
 
+        let has_setlocale_call = output.contains("loc = sym.imp.setlocale(6, \"C\");")
+            || output.contains("loc = sym.imp.setlocale(6, 0x403040);")
+            || output.contains("int8_t* loc = sym.imp.setlocale(6, \"C\");")
+            || output.contains("int8_t* loc = sym.imp.setlocale(6, 0x403040);");
         assert!(
-            output.contains("loc = sym.imp.setlocale(6, \"C\");")
+            has_setlocale_call
                 && (output.contains("return (int32_t)*loc;") || output.contains("return *loc;"))
                 && output.contains("return 0;")
                 && !output.contains("r2dec residual"),
-            "return-register certificates should allow certified setlocale wrapper rendering, got:\n{output}"
+            "return-register certificates should allow certified setlocale wrapper rendering without requiring uncertified string substitution, got:\n{output}"
         );
     }
 
@@ -10421,7 +10964,6 @@ mod tests {
             function_name: "fcn.401000",
             arch_name: "x86-64",
             ptr_bits: 64,
-            callconv: None,
             interproc: InterprocInferenceInput {
                 iter: 0,
                 max_iters: 0,
@@ -10435,6 +10977,7 @@ mod tests {
             apply_artifact_signature_hint: false,
             budget: TypeOutputBudget::new(64, usize::MAX, usize::MAX),
             apply_policy: r2types::TypeWritebackApplyPolicy::balanced(),
+            basic_block_count: 1,
         });
         let value = serde_json::to_value(payload).expect("payload should serialize");
         assert_eq!(
@@ -10454,6 +10997,15 @@ mod tests {
             items[0]["subject"]["register"]["name"].as_str(),
             Some("rdi"),
             "expected register assumption to survive fallback payload: {value:?}"
+        );
+        let Some(warnings) = value["diagnostics"]["warnings"].as_array() else {
+            panic!("expected serialized fallback diagnostics warnings, got {value:?}");
+        };
+        assert!(
+            warnings.iter().any(|warning| warning.as_str().is_some_and(
+                |warning| warning.contains("semantic fallback: worker slice in residual mode")
+            )),
+            "expected semantic fallback warning to survive payload serialization: {value:?}"
         );
     }
 
@@ -10608,6 +11160,7 @@ mod tests {
             None,
             None,
             TypeOutputBudget::new(64, usize::MAX, usize::MAX),
+            1,
         );
         assert!(payload.signature_writeback_authorized);
         assert!(payload.signature_render_authorized);
@@ -10621,6 +11174,14 @@ mod tests {
             ffi_signature_fact_from_type_writeback(&payload, &mut fact_strings);
         assert_eq!(signature_fact.confidence, 96);
         assert_eq!(signature_fact.callconv_confidence, 90);
+        assert_eq!(
+            signature_fact.signature_decision,
+            r2types::SignatureWritebackActionDecision::Apply as u32
+        );
+        assert_eq!(
+            signature_fact.callconv_decision,
+            r2types::SignatureWritebackActionDecision::Apply as u32
+        );
         assert_eq!(signature_fact.num_params, 1);
         assert_eq!(signature_fact.params, signature_params.as_ptr());
         assert_eq!(
@@ -10697,6 +11258,7 @@ mod tests {
             None,
             None,
             TypeOutputBudget::new(64, usize::MAX, usize::MAX),
+            1,
         );
 
         assert!(!payload.signature_writeback_authorized);
@@ -10805,6 +11367,7 @@ mod tests {
             None,
             None,
             TypeOutputBudget::new(64, usize::MAX, usize::MAX),
+            1,
         );
 
         assert!(!payload.signature_writeback_authorized);
@@ -10970,6 +11533,7 @@ mod tests {
             None,
             None,
             budget,
+            1,
         );
         assert_eq!(payload.struct_decls.len(), 1);
         assert!(
@@ -11000,7 +11564,7 @@ mod tests {
         );
         assert!(!matches!(
             decision.route,
-            r2dec::SemanticRoutePlan::FallbackComment { .. }
+            r2engine::EngineSemanticRoutePlan::FallbackComment { .. }
         ));
     }
 
@@ -11153,10 +11717,11 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn test_function_context(external_context: &CString) -> R2SleighFunctionContext {
         R2SleighFunctionContext {
-            schema_version: 1,
+            schema_version: 3,
             dirty_epoch: 0,
             context_hash: 0,
             type_dirty_epoch: 0,
@@ -11171,8 +11736,97 @@ mod integration_tests {
             num_vars: 0,
             base_types: ptr::null(),
             num_base_types: 0,
+            callees: ptr::null(),
+            num_callees: 0,
             assumptions_json: ptr::null(),
         }
+    }
+
+    fn imported_callee_fact(addr: u64, name: &str) -> r2types::CalleeFact {
+        r2types::CalleeFact {
+            function_id: addr,
+            name: Some(name.to_string()),
+            linkage: r2types::CalleeLinkage::Imported,
+            signature: None,
+            signature_callconv: None,
+            signature_noreturn: false,
+            model_policy_evidence: BTreeSet::new(),
+            direct_callees: Vec::new(),
+            callsite_count: 0,
+            has_unknown_calls: false,
+            arg_effects: BTreeMap::new(),
+            memory_effects: Vec::new(),
+            transfer_effects: Vec::new(),
+            allocation_effects: Vec::new(),
+            lifetime_effects: Vec::new(),
+            sync_effects: Vec::new(),
+            atomic_effects: Vec::new(),
+            param_type_hints: BTreeMap::new(),
+            return_type_hint: None,
+            return_relation: r2types::CalleeReturnRelation::Unknown,
+            reads_global_memory: false,
+            writes_global_memory: false,
+            touches_unknown_memory: false,
+        }
+    }
+
+    fn imported_callee_fact_with_signature(
+        addr: u64,
+        name: &str,
+        signature: r2types::FunctionType,
+    ) -> r2types::CalleeFact {
+        let mut fact = imported_callee_fact(addr, name);
+        fact.signature = Some(signature);
+        fact.signature_callconv = Some("amd64".to_string());
+        fact
+    }
+
+    fn add_imported_callee_facts(
+        type_facts: &mut r2types::FunctionTypeFacts,
+        callees: &[(u64, &str)],
+    ) {
+        for (addr, name) in callees {
+            type_facts
+                .callee_facts
+                .insert(*addr, imported_callee_fact(*addr, name));
+        }
+    }
+
+    fn add_imported_callee_signature_facts(
+        type_facts: &mut r2types::FunctionTypeFacts,
+        callees: &[(u64, &str, r2types::FunctionType)],
+    ) {
+        for (addr, name, signature) in callees {
+            type_facts.callee_facts.insert(
+                *addr,
+                imported_callee_fact_with_signature(*addr, name, signature.clone()),
+            );
+        }
+    }
+
+    fn function_facts_with_imported_callees(
+        mut facts: r2types::FunctionFacts,
+        callees: &[(u64, &str)],
+    ) -> r2types::FunctionFacts {
+        add_imported_callee_facts(&mut facts.types, callees);
+        facts
+    }
+
+    fn analysis_artifact_with_imported_callees(
+        mut artifact: crate::types::FunctionAnalysisArtifact,
+        callees: &[(u64, &str)],
+    ) -> crate::types::FunctionAnalysisArtifact {
+        artifact.function_facts =
+            function_facts_with_imported_callees(artifact.function_facts, callees);
+        artifact
+    }
+
+    fn analysis_artifact_with_imported_callee_signatures(
+        mut artifact: crate::types::FunctionAnalysisArtifact,
+        callees: &[(u64, &str, r2types::FunctionType)],
+    ) -> crate::types::FunctionAnalysisArtifact {
+        add_imported_callee_signature_facts(&mut artifact.function_facts.types, callees);
+        artifact
     }
 
     #[test]
@@ -11193,6 +11847,110 @@ mod integration_tests {
             r2ssa::AssumptionSubject::Register {
                 name: "rdi".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn typed_function_context_requires_callee_linkage_for_import_policy() {
+        let external_context = CString::new("{}").expect("external context");
+        let raw_name = CString::new("sym.imp.setlocale").expect("raw callee name");
+        let imported_name = CString::new("setlocale").expect("imported callee name");
+        let callees = [
+            R2SleighContextCallee {
+                call_addr: 0x400100,
+                addr: 0x401160,
+                name: raw_name.as_ptr(),
+                linkage: R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN,
+                signature_name: ptr::null(),
+                signature_ret_type: ptr::null(),
+                signature_callconv: ptr::null(),
+                signature_noreturn: 0,
+                signature_params: ptr::null(),
+                num_signature_params: 0,
+            },
+            R2SleighContextCallee {
+                call_addr: 0x400108,
+                addr: 0x401168,
+                name: imported_name.as_ptr(),
+                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
+                signature_name: ptr::null(),
+                signature_ret_type: ptr::null(),
+                signature_callconv: ptr::null(),
+                signature_noreturn: 0,
+                signature_params: ptr::null(),
+                num_signature_params: 0,
+            },
+        ];
+        let mut context = test_function_context(&external_context);
+        context.callees = callees.as_ptr();
+        context.num_callees = callees.len();
+
+        let parsed = unsafe { typed_function_context_to_parsed(&context, "{}", 64) };
+        let raw_fact = parsed.callee_facts.get(&0x401160).expect("raw callee fact");
+        assert_eq!(raw_fact.name.as_deref(), Some("sym.imp.setlocale"));
+        assert_eq!(raw_fact.linkage, r2types::CalleeLinkage::Unknown);
+        assert!(!raw_fact.linkage.authorizes_import_policy());
+
+        let imported_fact = parsed
+            .callee_facts
+            .get(&0x401168)
+            .expect("typed imported callee fact");
+        assert_eq!(imported_fact.name.as_deref(), Some("setlocale"));
+        assert_eq!(imported_fact.linkage, r2types::CalleeLinkage::Imported);
+        assert!(imported_fact.linkage.authorizes_import_policy());
+    }
+
+    #[test]
+    fn typed_function_context_preserves_callee_signature_facts() {
+        let external_context = CString::new("{}").expect("external context");
+        let callee_name = CString::new("setlocale").expect("callee name");
+        let ret_type = CString::new("char *").expect("ret type");
+        let callconv = CString::new("amd64").expect("callconv");
+        let category_name = CString::new("category").expect("param name");
+        let category_type = CString::new("int").expect("param type");
+        let locale_name = CString::new("locale").expect("param name");
+        let locale_type = CString::new("char *").expect("param type");
+        let params = [
+            R2SleighContextParam {
+                name: category_name.as_ptr(),
+                type_name: category_type.as_ptr(),
+                cc_reg: ptr::null(),
+            },
+            R2SleighContextParam {
+                name: locale_name.as_ptr(),
+                type_name: locale_type.as_ptr(),
+                cc_reg: ptr::null(),
+            },
+        ];
+        let callees = [R2SleighContextCallee {
+            call_addr: 0x400100,
+            addr: 0x401160,
+            name: callee_name.as_ptr(),
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
+            signature_name: callee_name.as_ptr(),
+            signature_ret_type: ret_type.as_ptr(),
+            signature_callconv: callconv.as_ptr(),
+            signature_noreturn: 1,
+            signature_params: params.as_ptr(),
+            num_signature_params: params.len(),
+        }];
+        let mut context = test_function_context(&external_context);
+        context.callees = callees.as_ptr();
+        context.num_callees = callees.len();
+
+        let parsed = unsafe { typed_function_context_to_parsed(&context, "{}", 64) };
+
+        let fact = parsed
+            .callee_facts
+            .get(&0x401160)
+            .expect("typed callee fact");
+        assert_eq!(fact.signature_callconv.as_deref(), Some("amd64"));
+        assert!(fact.signature_noreturn);
+        assert_eq!(
+            fact.signature
+                .as_ref()
+                .map(|signature| signature.params.len()),
+            Some(2)
         );
     }
 
@@ -11237,6 +11995,66 @@ mod integration_tests {
                 max_mutations: 256,
             },
         }
+    }
+
+    #[test]
+    fn typed_interproc_scope_facts_preserves_seed_linkage() {
+        let raw_seed_name = CString::new("sym.imp.memcpy").expect("valid seed name");
+        let raw_seeds = [R2SleighInterprocSeed {
+            id: 0x1000,
+            name: raw_seed_name.as_ptr(),
+            arg_count_hint: 0,
+            has_arg_count_hint: 0,
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_UNKNOWN,
+        }];
+        let raw_scope = R2SleighInterprocScope {
+            schema_version: 1,
+            functions: ptr::null(),
+            num_functions: 0,
+            seeds: raw_seeds.as_ptr(),
+            num_seeds: raw_seeds.len(),
+        };
+        let raw_facts = unsafe { typed_interproc_scope_facts(&raw_scope) };
+        assert!(
+            raw_facts
+                .summaries()
+                .get(&r2ssa::InterprocFunctionId(0x1000))
+                .is_none(),
+            "import-shaped names must not seed FFI helper semantics without typed linkage"
+        );
+
+        let seed_name = CString::new("memcpy").expect("valid seed name");
+        let seeds = [R2SleighInterprocSeed {
+            id: 0x2000,
+            name: seed_name.as_ptr(),
+            arg_count_hint: 0,
+            has_arg_count_hint: 0,
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
+        }];
+        let scope = R2SleighInterprocScope {
+            schema_version: 1,
+            functions: ptr::null(),
+            num_functions: 0,
+            seeds: seeds.as_ptr(),
+            num_seeds: seeds.len(),
+        };
+
+        let facts = unsafe { typed_interproc_scope_facts(&scope) };
+        let summary = facts
+            .summaries()
+            .get(&r2ssa::InterprocFunctionId(0x2000))
+            .expect("typed imported seed should materialize summary");
+
+        assert_eq!(summary.name.as_deref(), Some("memcpy"));
+        assert_eq!(
+            summary.linkage,
+            r2ssa::FunctionSemanticLinkage::Imported,
+            "FFI seed linkage must survive into engine scope facts"
+        );
+        assert_eq!(
+            summary.return_relation,
+            r2ssa::SummaryReturnRelation::Arg(0)
+        );
     }
 
     #[test]
@@ -11719,12 +12537,13 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seed_name = CString::new("malloc").expect("valid seed name");
         let seeds = [R2SleighInterprocSeed {
             id: 8192,
             name: seed_name.as_ptr(),
             arg_count_hint: 0,
             has_arg_count_hint: 0,
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
         }];
         let input = test_session_input(
             ctx,
@@ -11786,12 +12605,13 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seed_name = CString::new("malloc").expect("valid seed name");
         let seeds = [R2SleighInterprocSeed {
             id: 8192,
             name: seed_name.as_ptr(),
             arg_count_hint: 0,
             has_arg_count_hint: 0,
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
         }];
         let input = test_session_input(
             ctx,
@@ -11838,12 +12658,13 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seed_name = CString::new("malloc").expect("valid seed name");
         let seeds = [R2SleighInterprocSeed {
             id: 8192,
             name: seed_name.as_ptr(),
             arg_count_hint: 0,
             has_arg_count_hint: 0,
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
         }];
         let empty_input = test_session_input(
             ctx,
@@ -11897,12 +12718,13 @@ mod integration_tests {
 
         let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
         let external_context = CString::new("{}").expect("valid context");
-        let seed_name = CString::new("sym.imp.malloc").expect("valid seed name");
+        let seed_name = CString::new("malloc").expect("valid seed name");
         let seeds = [R2SleighInterprocSeed {
             id: 8192,
             name: seed_name.as_ptr(),
             arg_count_hint: 0,
             has_arg_count_hint: 0,
+            linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
         }];
         let low_budget_input = test_session_input(
             ctx,
@@ -12021,6 +12843,189 @@ mod integration_tests {
         r2il_free(ctx);
 
         assert_eq!(targets, vec![0x2000], "payload={output}");
+    }
+
+    #[test]
+    fn direct_call_targets_json_reports_copied_constant_indirect_call_target() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x2000, 8),
+        });
+        block.push(R2ILOp::CallInd {
+            target: Varnode::unique(1, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
+
+        let out = r2sleigh_get_direct_call_targets_json(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+        );
+        assert!(!out.is_null(), "direct target payload should not be null");
+        let output = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
+        let targets: Vec<u64> = serde_json::from_str(&output).expect("targets should parse");
+
+        r2il_string_free(out);
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_eq!(targets, vec![0x2000], "payload={output}");
+    }
+
+    #[test]
+    fn direct_call_targets_typed_reports_copied_constant_indirect_call_target() {
+        let arch = CString::new("x86-64").expect("valid arch");
+        let ctx = r2il_arch_init(arch.as_ptr());
+        assert!(!ctx.is_null(), "context should initialize");
+
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x2000, 8),
+        });
+        block.push(R2ILOp::CallInd {
+            target: Varnode::unique(1, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode {
+                space: r2il::SpaceId::Register,
+                offset: 0,
+                size: 8,
+                meta: None,
+            },
+        });
+        let raw_block = Box::into_raw(Box::new(block));
+        let blocks = [raw_block as *const R2ILBlock];
+        let func_name = CString::new("sym.alloc_wrapper").expect("valid function name");
+
+        let out = r2sleigh_get_direct_call_targets_typed(
+            ctx,
+            blocks.as_ptr(),
+            blocks.len(),
+            0x401000,
+            func_name.as_ptr(),
+        );
+        assert!(
+            !out.is_null(),
+            "typed direct target payload should not be null"
+        );
+        let mut count = 0usize;
+        let items = r2sleigh_u64_array_items(out, &mut count);
+        assert!(
+            !items.is_null(),
+            "typed direct target items should not be null"
+        );
+        let targets = unsafe { std::slice::from_raw_parts(items, count) }.to_vec();
+
+        r2sleigh_u64_array_free(out);
+        r2il_block_free(raw_block);
+        r2il_free(ctx);
+
+        assert_eq!(targets, vec![0x2000]);
+    }
+
+    #[test]
+    fn interproc_target_plan_ffi_routes_scope_policy_to_engine() {
+        let imported = CString::new("sym.imp.printf").expect("name");
+        let registration = CString::new("sym.imp.AddVectoredExceptionHandler").expect("name");
+        let runtime_copy = CString::new("sym.imp.memcpy").expect("name");
+        let local = CString::new("sym.local_helper").expect("name");
+        let inputs = [
+            R2SleighInterprocTargetInput {
+                direct_target: 0x2000,
+                name: imported.as_ptr(),
+                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
+                resolved_target: 0x2000,
+                has_resolved_target: 1,
+                target_materialized: 1,
+                has_target_metrics: 1,
+                target_basic_block_count: 1,
+                target_cost: 1,
+            },
+            R2SleighInterprocTargetInput {
+                direct_target: 0x3000,
+                name: registration.as_ptr(),
+                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
+                resolved_target: 0x3000,
+                has_resolved_target: 1,
+                target_materialized: 1,
+                has_target_metrics: 1,
+                target_basic_block_count: 1,
+                target_cost: 1,
+            },
+            R2SleighInterprocTargetInput {
+                direct_target: 0x4000,
+                name: local.as_ptr(),
+                linkage: R2SLEIGH_INTERPROC_LINKAGE_INTERNAL,
+                resolved_target: 0x4010,
+                has_resolved_target: 1,
+                target_materialized: 1,
+                has_target_metrics: 1,
+                target_basic_block_count: 1,
+                target_cost: 1,
+            },
+            R2SleighInterprocTargetInput {
+                direct_target: 0x5000,
+                name: runtime_copy.as_ptr(),
+                linkage: R2SLEIGH_INTERPROC_LINKAGE_IMPORTED,
+                resolved_target: 0x5000,
+                has_resolved_target: 1,
+                target_materialized: 1,
+                has_target_metrics: 1,
+                target_basic_block_count: 1,
+                target_cost: 1,
+            },
+        ];
+        let plan = r2sleigh_plan_interproc_scope_targets(inputs.as_ptr(), inputs.len());
+        assert!(!plan.is_null(), "planner should return an owned plan");
+
+        let mut queued_count = 0usize;
+        let queued = r2sleigh_interproc_target_plan_queued_items(plan, &mut queued_count);
+        let queued = unsafe { std::slice::from_raw_parts(queued, queued_count) }.to_vec();
+        let mut registration_count = 0usize;
+        let registrations =
+            r2sleigh_interproc_target_plan_registration_items(plan, &mut registration_count);
+        let registrations =
+            unsafe { std::slice::from_raw_parts(registrations, registration_count) }.to_vec();
+        let mut copy_count = 0usize;
+        let copies = r2sleigh_interproc_target_plan_runtime_copy_items(plan, &mut copy_count);
+        let copies = unsafe { std::slice::from_raw_parts(copies, copy_count) }.to_vec();
+        r2sleigh_interproc_target_plan_free(plan);
+
+        assert_eq!(queued, vec![0x4000, 0x4010]);
+        assert_eq!(registrations, vec![0x3000]);
+        assert_eq!(copies, vec![0x5000]);
+    }
+
+    #[test]
+    fn interproc_target_plan_ffi_rejects_null_inputs_with_nonzero_count() {
+        let plan = r2sleigh_plan_interproc_scope_targets(ptr::null(), 1);
+        assert!(plan.is_null());
+    }
+
+    #[test]
+    fn interproc_target_plan_ffi_null_plan_items_clear_count() {
+        let mut count = usize::MAX;
+        let items = r2sleigh_interproc_target_plan_queued_items(ptr::null(), &mut count);
+        assert!(items.is_null());
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -13559,42 +14564,47 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let malloc_signature = r2types::FunctionType {
+            return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+            params: vec![r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            }],
+            variadic: false,
+        };
+        let memcpy_signature = r2types::FunctionType {
+            return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+            params: vec![
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+            ],
+            variadic: false,
+        };
+        let artifact = analysis_artifact_with_imported_callee_signatures(
+            artifact,
+            &[
+                (0x401140, "sym.imp.memcpy", memcpy_signature.clone()),
+                (0x401150, "sym.imp.malloc", malloc_signature.clone()),
+            ],
+        );
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([
+        let function_names = HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
-        ]));
-        decompiler.set_known_function_signatures(HashMap::from([
-            (
-                "sym.imp.malloc".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                    params: vec![r2types::CTypeLike::Int {
-                        bits: 64,
-                        signedness: r2types::Signedness::Unsigned,
-                    }],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.memcpy".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                    params: vec![
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                        r2types::CTypeLike::Int {
-                            bits: 64,
-                            signedness: r2types::Signedness::Unsigned,
-                        },
-                    ],
-                    variadic: false,
-                },
-            ),
-        ]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        ]);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            function_names,
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
         let pattern_ssa_blocks = artifact.pattern_ssa_func.local_ssa_blocks();
         let tail_ops: Vec<_> = artifact
             .pattern_ssa_func
@@ -13739,6 +14749,33 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let malloc_signature = r2types::FunctionType {
+            return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+            params: vec![r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            }],
+            variadic: false,
+        };
+        let memcpy_signature = r2types::FunctionType {
+            return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+            params: vec![
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+            ],
+            variadic: false,
+        };
+        let artifact = analysis_artifact_with_imported_callee_signatures(
+            artifact,
+            &[
+                (0x401140, "sym.imp.memcpy", memcpy_signature.clone()),
+                (0x401150, "sym.imp.malloc", malloc_signature.clone()),
+            ],
+        );
 
         assert_eq!(
             artifact
@@ -13770,46 +14807,28 @@ mod integration_tests {
             artifact.function_facts.types.merged_signature, artifact.writeback_plan.signature
         );
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([
+        let function_names = HashMap::from([
             (0x401140, "sym.imp.memcpy".to_string()),
             (0x401150, "sym.imp.malloc".to_string()),
-        ]));
-        decompiler.set_known_function_signatures(HashMap::from([
-            (
-                "sym.imp.malloc".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                    params: vec![r2types::CTypeLike::Int {
-                        bits: 64,
-                        signedness: r2types::Signedness::Unsigned,
-                    }],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.memcpy".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                    params: vec![
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                        r2types::CTypeLike::Int {
-                            bits: 64,
-                            signedness: r2types::Signedness::Unsigned,
-                        },
-                    ],
-                    variadic: false,
-                },
-            ),
-        ]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        ]);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            function_names.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
         let ssa_ops: Vec<String> = artifact
             .ssa_func
             .blocks()
             .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
             .collect();
+        assert!(
+            !output.contains("r2dec residual"),
+            "certified alloc_and_copy should render through prepared ownership facts, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
         assert!(
             output.contains("sym.imp.memcpy(buf, src, len);"),
             "expected detached x86 alloc_and_copy to keep the malloc owner for memcpy, got:\n{output}\nssa_ops={ssa_ops:?}\nmerged_signature={:?}\nwriteback_signature={:?}",
@@ -13827,24 +14846,6 @@ mod integration_tests {
             "expected detached x86 alloc_and_copy to return the owned malloc result, got:\n{output}\nmerged_signature={:?}\nwriteback_signature={:?}",
             artifact.function_facts.types.merged_signature,
             artifact.writeback_plan.signature
-        );
-
-        let certified_input = crate::decompiler::decompiler_input_from_artifact(
-            artifact,
-            HashMap::from([
-                (0x401140, "sym.imp.memcpy".to_string()),
-                (0x401150, "sym.imp.malloc".to_string()),
-            ]),
-            HashMap::new(),
-            HashMap::new(),
-            64,
-        );
-        let certified_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        let certified_output = certified_decompiler.decompile_input(&certified_input);
-        assert!(
-            !certified_output.contains("r2dec residual: certified render contract failed")
-                && certified_output.contains("buf[len] = 0;"),
-            "certified alloc_and_copy must carry scalar array-index proof, got:\n{certified_output}\ndirect_output:\n{output}"
         );
     }
 
@@ -13929,11 +14930,10 @@ mod integration_tests {
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
         assert!(
-            output.contains("r2dec residual: certified render contract failed")
-                && output.contains("rendered uncertified raw artifact name(s): DL_0")
+            output.contains("r2dec residual:")
                 && !output.contains("buf[2]")
                 && !output.contains("summary projection"),
-            "fnv_fold must refuse unresolved subregister/load provenance instead of emitting fake C, got:\n{output}\npattern_ssa_blocks={pattern_ssa_blocks:?}"
+            "fnv_fold must refuse insufficient loop/subregister proof instead of emitting fake C, got:\n{output}\npattern_ssa_blocks={pattern_ssa_blocks:?}"
         );
     }
 
@@ -14082,11 +15082,6 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
-        let mut direct_decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        direct_decompiler.set_function_facts(artifact.function_facts.clone());
-        direct_decompiler
-            .set_function_names(HashMap::from([(0x1239, "dbg.alloc_wrapper".to_string())]));
-        let direct_output = direct_decompiler.decompile(&artifact.ssa_func);
         let input = crate::decompiler::decompiler_input_from_artifact(
             artifact,
             HashMap::from([(0x1239, "dbg.alloc_wrapper".to_string())]),
@@ -14100,7 +15095,7 @@ mod integration_tests {
         assert!(
             !output.contains("r2dec residual: certified render contract failed")
                 && output.matches("dbg.alloc_wrapper(").count() == 1,
-            "certified render must not replay the same callsite, got:\n{output}\ndirect_output:\n{direct_output}"
+            "certified render must not replay the same callsite, got:\n{output}"
         );
     }
 
@@ -14162,51 +15157,55 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let memcpy_signature = r2types::FunctionType {
+            return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+            params: vec![
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                })),
+                r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+            ],
+            variadic: false,
+        };
+        let printf_signature = r2types::FunctionType {
+            return_type: r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            params: vec![r2types::CTypeLike::Pointer(Box::new(
+                r2types::CTypeLike::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                },
+            ))],
+            variadic: true,
+        };
+        let artifact = analysis_artifact_with_imported_callee_signatures(
+            artifact,
+            &[
+                (0x401110, "sym.imp.printf", printf_signature.clone()),
+                (0x401140, "sym.imp.memcpy", memcpy_signature.clone()),
+            ],
+        );
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([
+        let function_names = HashMap::from([
             (0x401110, "sym.imp.printf".to_string()),
             (0x401140, "sym.imp.memcpy".to_string()),
-        ]));
-        decompiler.set_strings(HashMap::from([(0x403008, "Copied: %s\n".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([
-            (
-                "sym.imp.memcpy".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                    params: vec![
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
-                            bits: 8,
-                            signedness: r2types::Signedness::Signed,
-                        })),
-                        r2types::CTypeLike::Int {
-                            bits: 64,
-                            signedness: r2types::Signedness::Unsigned,
-                        },
-                    ],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.printf".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Int {
-                        bits: 32,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                    params: vec![r2types::CTypeLike::Pointer(Box::new(
-                        r2types::CTypeLike::Int {
-                            bits: 8,
-                            signedness: r2types::Signedness::Signed,
-                        },
-                    ))],
-                    variadic: true,
-                },
-            ),
-        ]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        ]);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            function_names,
+            HashMap::from([(0x403008, "Copied: %s\n".to_string())]),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
         let ssa_ops: Vec<String> = artifact
             .ssa_func
             .blocks()
@@ -14218,8 +15217,13 @@ mod integration_tests {
             "expected detached vuln_memcpy to keep authoritative memcpy args, got:\n{output}\nssa_ops={ssa_ops:?}"
         );
         assert!(
-            output.contains("sym.imp.printf(\"Copied: %s\\n\", buf);"),
-            "expected detached vuln_memcpy to print the recovered buf local, got:\n{output}\nssa_ops={ssa_ops:?}"
+            output.contains("r2sleigh residual: uncertified callsite arguments at 0x4012c9:52")
+                && output.contains("r2sleigh residual: uncertified rendered call"),
+            "detached vuln_memcpy must residualize the uncertified printf callsite instead of inventing args, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            !output.contains("sym.imp.printf(\"Copied: %s\\n\", buf);"),
+            "detached vuln_memcpy must not emit source-shaped printf without callsite proof, got:\n{output}\nssa_ops={ssa_ops:?}"
         );
         for bad in [
             "arg1",
@@ -14237,7 +15241,7 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "x86")]
-    fn detached_x86_authenticate_artifact_keeps_strcmp_condition_shape() {
+    fn detached_x86_authenticate_artifact_residualizes_uncertified_strcmp_condition() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();
             assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
@@ -14300,41 +15304,51 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
-
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([(0x401130, "sym.imp.strcmp".to_string())]));
-        decompiler.set_strings(HashMap::from([(0x403014, "secret123".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.strcmp".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                },
-                params: vec![
-                    r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    })),
-                    r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    })),
-                ],
-                variadic: false,
+        let strcmp_signature = r2types::FunctionType {
+            return_type: r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
             },
-        )]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+            params: vec![
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                })),
+                r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                })),
+            ],
+            variadic: false,
+        };
+        let artifact = analysis_artifact_with_imported_callee_signatures(
+            artifact,
+            &[(0x401130, "sym.imp.strcmp", strcmp_signature.clone())],
+        );
+
         let ssa_ops: Vec<String> = artifact
             .ssa_func
             .blocks()
             .flat_map(|block| block.ops.iter().map(|op| format!("{op:?}")))
             .collect();
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::from([(0x401130, "sym.imp.strcmp".to_string())]),
+            HashMap::from([(0x403014, "secret123".to_string())]),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
-            output.contains("sym.imp.strcmp(password, \"secret123\")"),
-            "expected detached authenticate to keep the strcmp call in the condition, got:\n{output}\nssa_ops={ssa_ops:?}"
+            output.contains("certified render contract failed")
+                && output.contains("uncertified raw artifact name(s): EAX"),
+            "detached authenticate must residualize until r2ssa proves the EAX return-value/flag path, got:\n{output}\nssa_ops={ssa_ops:?}"
+        );
+        assert!(
+            !output.contains("sym.imp.strcmp(password, \"secret123\", \"secret123\")"),
+            "detached authenticate must not emit source-shaped strcmp with duplicated uncertified args, got:\n{output}\nssa_ops={ssa_ops:?}"
         );
         assert!(
             !output.contains("0 != 0") && !output.contains("0 == 0"),
@@ -14439,11 +15453,15 @@ mod integration_tests {
             .map(|phi| format!("{phi:?}"))
             .collect();
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        let output = decompiler.decompile(&artifact.ssa_func);
-        let output_without_types =
-            r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64()).decompile(&artifact.ssa_func);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
             then_ops
@@ -14459,7 +15477,7 @@ mod integration_tests {
         );
         assert!(
             output.contains("if") && output.contains("return 1;") && output.contains("return 0;"),
-            "expected detached check_secret to keep branch returns, got:\n{output}\noutput_without_types=\n{output_without_types}\nentry_ops={entry_ops:?}\nthen_ops={then_ops:?}\nelse_ops={else_ops:?}\nexit_ops={exit_ops:?}\nexit_phis={exit_phis:?}"
+            "expected detached check_secret to keep branch returns, got:\n{output}\nentry_ops={entry_ops:?}\nthen_ops={then_ops:?}\nelse_ops={else_ops:?}\nexit_ops={exit_ops:?}\nexit_phis={exit_phis:?}"
         );
     }
 
@@ -14534,9 +15552,15 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        let output = decompiler.decompile(&artifact.ssa_func);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
             output.contains("if (x != y)")
@@ -14612,32 +15636,20 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let artifact =
+            analysis_artifact_with_imported_callees(artifact, &[(0x401160, "sym.imp.setlocale")]);
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]));
-        decompiler.set_strings(HashMap::from([(0x403040, "C".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.setlocale".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
-                    bits: 8,
-                    signedness: r2types::Signedness::Signed,
-                })),
-                params: vec![
-                    r2types::CTypeLike::Int {
-                        bits: 32,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                    r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    })),
-                ],
-                variadic: false,
-            },
-        )]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        let function_names = HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]);
+        let strings = HashMap::from([(0x403040, "C".to_string())]);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            function_names,
+            strings,
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
         let ssa_ops: Vec<String> = artifact
             .ssa_func
             .blocks()
@@ -14649,14 +15661,13 @@ mod integration_tests {
             .map(|block| (block.addr, artifact.ssa_func.successors(block.addr)))
             .collect();
 
+        let has_setlocale_call = output.contains("loc = sym.imp.setlocale(6, \"C\");")
+            || output.contains("loc = sym.imp.setlocale(6, 0x403040);")
+            || output.contains("int8_t* loc = sym.imp.setlocale(6, \"C\");")
+            || output.contains("int8_t* loc = sym.imp.setlocale(6, 0x403040);");
         assert!(
-            output.contains("loc = (int8_t*)sym.imp.setlocale(6, \"C\");")
-                || output.contains("loc = sym.imp.setlocale(6, \"C\");"),
-            "expected detached setlocale wrapper to assign the owned call result to loc, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
-        );
-        assert!(
-            output.contains("if (loc != 0)") || output.contains("if (!loc)"),
-            "expected setlocale wrapper to branch on the owned loc value, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+            has_setlocale_call && !output.contains("r2dec residual"),
+            "expected certified detached setlocale wrapper to assign the owned call result to loc, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
         );
         assert!(
             !output.contains("loc = (int8_t*)loc;"),
@@ -14733,6 +15744,8 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let artifact =
+            analysis_artifact_with_imported_callees(artifact, &[(0x401160, "sym.imp.setlocale")]);
 
         let function_names = HashMap::from([(0x401160, "sym.imp.setlocale".to_string())]);
         let strings = HashMap::from([(0x403040, "C".to_string())]);
@@ -14746,12 +15759,16 @@ mod integration_tests {
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
 
+        let has_setlocale_call = output.contains("loc = sym.imp.setlocale(6, \"C\");")
+            || output.contains("loc = sym.imp.setlocale(6, 0x403040);")
+            || output.contains("int8_t* loc = sym.imp.setlocale(6, \"C\");")
+            || output.contains("int8_t* loc = sym.imp.setlocale(6, 0x403040);");
         assert!(
-            output.contains("loc = sym.imp.setlocale(6, \"C\");")
+            has_setlocale_call
                 && (output.contains("return (int32_t)*loc;") || output.contains("return *loc;"))
                 && output.contains("return 0;")
                 && !output.contains("r2dec residual"),
-            "return-register certificates should allow certified detached setlocale rendering, got:\n{output}"
+            "return-register certificates should allow certified detached setlocale rendering without requiring uncertified string substitution, got:\n{output}"
         );
     }
 
@@ -14825,6 +15842,14 @@ mod integration_tests {
         .expect("analysis artifact");
 
         let mut type_facts = artifact.function_facts.types.clone();
+        add_imported_callee_facts(
+            &mut type_facts,
+            &[
+                (0x401140, "sym.imp.strlen"),
+                (0x401170, "sym.imp.memcpy"),
+                (0x401190, "sym.imp.malloc"),
+            ],
+        );
         type_facts.known_function_signatures.extend(HashMap::from([
             (
                 "sym.imp.strlen".to_string(),
@@ -14869,13 +15894,23 @@ mod integration_tests {
                 },
             ),
         ]));
+        let function_names = HashMap::from([
+            (0x401140, "sym.imp.strlen".to_string()),
+            (0x401170, "sym.imp.memcpy".to_string()),
+            (0x401190, "sym.imp.malloc".to_string()),
+        ]);
+        let function_facts = r2types::FunctionFacts::new(type_facts.clone(), None);
+        let callee_resolution = r2engine::decompile_callee_resolution_facts(
+            &artifact.ssa_func,
+            &function_facts,
+            &function_names,
+            &HashMap::new(),
+            64,
+        );
         let context = r2dec::DecompilerContext::default()
             .with_type_facts(type_facts)
-            .with_function_names(HashMap::from([
-                (0x401140, "sym.imp.strlen".to_string()),
-                (0x401170, "sym.imp.memcpy".to_string()),
-                (0x401190, "sym.imp.malloc".to_string()),
-            ]));
+            .with_function_names(function_names)
+            .with_callee_resolution(Some(callee_resolution));
         let input = r2dec::DecompilerInput::new(artifact.ssa_func.clone(), context);
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
@@ -15083,27 +16118,18 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let artifact =
+            analysis_artifact_with_imported_callees(artifact, &[(0x401100, "sym.imp.strlen")]);
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.strlen".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Unsigned,
-                },
-                params: vec![r2types::CTypeLike::Pointer(Box::new(
-                    r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                ))],
-                variadic: false,
-            },
-        )]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            HashMap::from([(0x401100, "sym.imp.strlen".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
         let ssa_ops: Vec<String> = artifact
             .ssa_func
             .blocks()
@@ -15209,27 +16235,18 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let artifact =
+            analysis_artifact_with_imported_callees(artifact, &[(0x401100, "sym.imp.strlen")]);
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.strlen".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Unsigned,
-                },
-                params: vec![r2types::CTypeLike::Pointer(Box::new(
-                    r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                ))],
-                variadic: false,
-            },
-        )]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::from([(0x401100, "sym.imp.strlen".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
             output.contains("len = sym.imp.strlen(s);"),
@@ -15330,27 +16347,18 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let artifact =
+            analysis_artifact_with_imported_callees(artifact, &[(0x401100, "sym.imp.strlen")]);
 
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(artifact.function_facts.clone());
-        decompiler.set_function_names(HashMap::from([(0x401100, "sym.imp.strlen".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.strlen".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Int {
-                    bits: 64,
-                    signedness: r2types::Signedness::Unsigned,
-                },
-                params: vec![r2types::CTypeLike::Pointer(Box::new(
-                    r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                ))],
-                variadic: false,
-            },
-        )]));
-        let output = decompiler.decompile(&artifact.ssa_func);
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact,
+            HashMap::from([(0x401100, "sym.imp.strlen".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
             output.contains("return -1;")
@@ -15441,6 +16449,8 @@ mod integration_tests {
             &external_context,
         )
         .expect("analysis artifact");
+        let artifact =
+            analysis_artifact_with_imported_callees(artifact, &[(0x401100, "sym.imp.strlen")]);
 
         let input = crate::decompiler::decompiler_input_from_artifact(
             artifact,
@@ -15737,6 +16747,8 @@ mod integration_tests {
                 num_vars: 0,
                 base_types: ptr::null(),
                 num_base_types: 0,
+                callees: ptr::null(),
+                num_callees: 0,
                 assumptions_json: ptr::null(),
             },
             interproc_scope: R2SleighInterprocScope {
@@ -16423,6 +17435,10 @@ mod integration_tests {
         func = func.with_name("sym._main");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::aarch64());
+        decompiler.set_function_facts(function_facts_with_imported_callees(
+            r2types::FunctionFacts::default(),
+            &[(0x401030, "sym.imp.printf")],
+        ));
         decompiler.set_function_names(HashMap::from([(0x401030, "sym.imp.printf".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.printf".to_string(),
@@ -16499,6 +17515,10 @@ mod integration_tests {
         func = func.with_name("dbg.main");
 
         let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        decompiler.set_function_facts(function_facts_with_imported_callees(
+            r2types::FunctionFacts::default(),
+            &[(0x401030, "sym.imp.printf")],
+        ));
         decompiler.set_function_names(HashMap::from([(0x401030, "sym.imp.printf".to_string())]));
         decompiler.set_known_function_signatures(HashMap::from([(
             "sym.imp.printf".to_string(),

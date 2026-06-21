@@ -125,6 +125,7 @@ enum RunActionArg {
     Lift,
     Ssa,
     Defuse,
+    #[cfg(feature = "decompile")]
     Dec,
 }
 
@@ -135,6 +136,7 @@ impl From<RunActionArg> for InstructionAction {
             RunActionArg::Lift => InstructionAction::Lift,
             RunActionArg::Ssa => InstructionAction::Ssa,
             RunActionArg::Defuse => InstructionAction::Defuse,
+            #[cfg(feature = "decompile")]
             RunActionArg::Dec => InstructionAction::Dec,
         }
     }
@@ -146,6 +148,7 @@ enum RunFormatArg {
     Json,
     Text,
     Esil,
+    #[cfg(feature = "decompile")]
     #[value(name = "c_like")]
     CLike,
     #[value(name = "r2cmd")]
@@ -159,6 +162,7 @@ impl From<RunFormatArg> for ExportFormat {
             RunFormatArg::Json => ExportFormat::Json,
             RunFormatArg::Text => ExportFormat::Text,
             RunFormatArg::Esil => ExportFormat::Esil,
+            #[cfg(feature = "decompile")]
             RunFormatArg::CLike => ExportFormat::CLike,
             RunFormatArg::R2Cmd => ExportFormat::R2Cmd,
         }
@@ -896,6 +900,7 @@ mod tests {
         canonicalize_json(&parsed).to_string()
     }
 
+    #[cfg(feature = "decompile")]
     fn normalize_c_like_output(output: &str) -> String {
         let text = output.replace("\r\n", "\n");
         let mut lines = Vec::new();
@@ -1012,6 +1017,9 @@ mod tests {
     }
 
     fn run_matrix_for_arch(arch: &str, bytes_hex: &str, dec_bytes_hex: &str) {
+        #[cfg(not(feature = "decompile"))]
+        let _ = dec_bytes_hex;
+
         for format in [
             ExportFormat::Json,
             ExportFormat::Text,
@@ -1093,30 +1101,33 @@ mod tests {
             }
         }
 
-        for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
-            let normalized = assert_deterministic_output(
-                arch,
-                dec_bytes_hex,
-                InstructionAction::Dec,
-                format,
+        #[cfg(feature = "decompile")]
+        {
+            for format in [ExportFormat::CLike, ExportFormat::Json, ExportFormat::Text] {
+                let normalized = assert_deterministic_output(
+                    arch,
+                    dec_bytes_hex,
+                    InstructionAction::Dec,
+                    format,
+                    match format {
+                        ExportFormat::CLike => normalize_c_like_output,
+                        ExportFormat::Json => normalize_json_output,
+                        ExportFormat::Text => normalize_text_output,
+                        _ => unreachable!("dec supports c_like/json/text"),
+                    },
+                );
                 match format {
-                    ExportFormat::CLike => normalize_c_like_output,
-                    ExportFormat::Json => normalize_json_output,
-                    ExportFormat::Text => normalize_text_output,
+                    ExportFormat::Json => {
+                        assert_json_shape_for_action(InstructionAction::Dec, &normalized)
+                    }
+                    ExportFormat::CLike | ExportFormat::Text => {
+                        assert!(
+                            !normalized.trim().is_empty(),
+                            "dec output must be non-empty"
+                        )
+                    }
                     _ => unreachable!("dec supports c_like/json/text"),
-                },
-            );
-            match format {
-                ExportFormat::Json => {
-                    assert_json_shape_for_action(InstructionAction::Dec, &normalized)
                 }
-                ExportFormat::CLike | ExportFormat::Text => {
-                    assert!(
-                        !normalized.trim().is_empty(),
-                        "dec output must be non-empty"
-                    )
-                }
-                _ => unreachable!("dec supports c_like/json/text"),
             }
         }
     }
@@ -1372,6 +1383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "decompile")]
     fn run_dec_c_like_success() {
         let out = run_action_output(
             "x86-64",
@@ -1506,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "riscv")]
+    #[cfg(all(feature = "riscv", feature = "decompile"))]
     fn run_riscv64_dec_c_like_success() {
         let out = run_action_output(
             "riscv64",

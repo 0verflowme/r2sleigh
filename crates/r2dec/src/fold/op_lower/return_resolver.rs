@@ -883,6 +883,13 @@ impl<'a> FoldingContext<'a> {
                 if self.lookup_predicate_expr(name).is_some() {
                     return self.simplify_condition_expr(CExpr::Var(name.clone()));
                 }
+                if let Some(source_call) = self
+                    .call_result_source_for_ssa_name(name)
+                    .or_else(|| self.local_post_call_source_for_ssa_name(name))
+                    && let Some(candidate) = self.synthesized_call_expr_for_source_call(source_call)
+                {
+                    return candidate;
+                }
                 if let Some(candidate) = self
                     .scalar_context_root_candidate_for_name(name, VisibleExprContext::ScalarReturn)
                     .or_else(|| self.scalar_context_root_candidate_for_name(name, context))
@@ -1251,6 +1258,16 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn sanitize_final_return_expr(&self, expr: CExpr, fallback: CExpr) -> CExpr {
+        if self.is_certified_rendered_call_expr(&expr) {
+            return self
+                .stable_owner_for_certified_rendered_call_expr(&expr)
+                .unwrap_or(expr);
+        }
+        if self.is_certified_rendered_call_expr(&fallback) {
+            return self
+                .stable_owner_for_certified_rendered_call_expr(&fallback)
+                .unwrap_or(fallback);
+        }
         let context = self.return_context_for_candidates(Some(&expr), Some(&fallback));
         self.preferred_return_candidate_in_context(
             Some(self.resolve_return_candidate_in_context(&fallback, context)),
@@ -1293,7 +1310,7 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        if let Some(addr) = extract_call_address(&var.name) {
+        if let Some(addr) = parse_address_from_var_name(&var.name) {
             if let Some(sym) = self.lookup_symbol(addr) {
                 return sym.clone();
             }

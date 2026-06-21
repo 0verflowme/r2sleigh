@@ -1,0 +1,10 @@
+warning: r2plugin tests must render prepared artifacts through DecompilerInput
+  --> $DIR/unprepared_decompile_oracle.rs:26:13
+   |
+LL |     let _ = decompiler.decompile(&artifact.ssa_func);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_unprepared_decompile_oracle)]` on by default
+
+warning: 1 warning emitted
+

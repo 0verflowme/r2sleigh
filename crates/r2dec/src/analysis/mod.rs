@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::OnceLock,
+};
 
-use r2ssa::{SSAVar, ValueId};
-use r2types::{CalleeResolutionFacts, TypeOracle};
+use r2ssa::{FunctionSSABlock, SSAVar, ValueId};
+use r2types::{CalleeFact, CalleeResolutionFacts, InterprocSummaryView, TypeOracle};
 
 use crate::ast::{CExpr, CType};
-use crate::fold::{PtrArith, SSABlock};
+
+pub(crate) type SSABlock = FunctionSSABlock;
 
 // Pass dependency invariant:
 // UseInfo -> (FlagInfo, StackInfo) -> PredicateSimplifier -> statement emit.
@@ -20,11 +24,25 @@ pub(crate) mod utils;
 pub(crate) use ownership::{
     CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, SemanticOwnershipFacts,
 };
-pub(crate) use predicate::PredicateSimplifier;
+pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
     PreparedCallView, PreparedSemanticView, PreparedSemanticViewInputs,
     build_prepared_runtime_facts,
 };
+
+static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
+
+pub(crate) fn empty_callee_facts() -> &'static BTreeMap<u64, CalleeFact> {
+    EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PtrArith {
+    pub(crate) base: SSAVar,
+    pub(crate) index: SSAVar,
+    pub(crate) element_size: u32,
+    pub(crate) is_sub: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UseInfoAnalysisMode {
@@ -73,7 +91,9 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) function_names: &'a HashMap<u64, String>,
     pub(crate) strings: &'a HashMap<u64, String>,
     pub(crate) symbols: &'a HashMap<u64, String>,
+    pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
+    pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) arg_regs: &'a [String],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,

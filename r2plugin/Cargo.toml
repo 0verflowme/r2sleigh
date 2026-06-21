@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 r2il = { path = "../crates/r2il" }
 r2sleigh-lift = { path = "../crates/r2sleigh-lift" }
-r2sleigh-export = { path = "../crates/r2sleigh-export" }
+r2sleigh-export = { path = "../crates/r2sleigh-export", features = ["dec"] }
 r2ssa = { path = "../crates/r2ssa" }
 r2sym = { path = "../crates/r2sym" }
 r2types = { path = "../crates/r2types" }

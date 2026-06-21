@@ -1,16 +1,28 @@
 use std::collections::HashSet;
 
 use crate::ast::CExpr;
-use crate::fold::FoldingContext;
 use crate::normalize::{NormalizeMode, normalize_expr};
 
-pub(crate) struct PredicateSimplifier<'a, 'o> {
-    ctx: &'a FoldingContext<'o>,
+pub(crate) trait PredicateAnalysisView {
+    fn expand_predicate_vars(
+        &self,
+        expr: &CExpr,
+        depth: u32,
+        visited: &mut HashSet<String>,
+    ) -> CExpr;
+
+    fn try_reconstruct_condition(&self, expr: &CExpr) -> Option<CExpr>;
+
+    fn simplify_predicate_expr(&self, expr: CExpr) -> CExpr;
 }
 
-impl<'a, 'o> PredicateSimplifier<'a, 'o> {
-    pub(crate) fn new(ctx: &'a FoldingContext<'o>) -> Self {
-        Self { ctx }
+pub(crate) struct PredicateSimplifier<'a, V: ?Sized> {
+    view: &'a V,
+}
+
+impl<'a, V: PredicateAnalysisView + ?Sized> PredicateSimplifier<'a, V> {
+    pub(crate) fn new(view: &'a V) -> Self {
+        Self { view }
     }
 
     pub(crate) fn simplify_condition_expr(&self, expr: CExpr) -> CExpr {
@@ -30,16 +42,16 @@ impl<'a, 'o> PredicateSimplifier<'a, 'o> {
 
     fn simplify_condition_pass(&self, expr: CExpr) -> CExpr {
         let mut visited = HashSet::new();
-        let expanded = self.ctx.expand_predicate_vars(&expr, 0, &mut visited);
+        let expanded = self.view.expand_predicate_vars(&expr, 0, &mut visited);
         let reconstructed = self.reconstruct_condition_tree(expanded);
-        normalize_expr(self.ctx, reconstructed, NormalizeMode::Predicate)
+        normalize_expr(self.view, reconstructed, NormalizeMode::Predicate)
     }
 
     fn reconstruct_condition_tree(&self, expr: CExpr) -> CExpr {
         let mut recurse = |child: CExpr| self.reconstruct_condition_tree(child);
         let rewritten = expr.map_children(&mut recurse);
 
-        self.ctx
+        self.view
             .try_reconstruct_condition(&rewritten)
             .unwrap_or(rewritten)
     }
@@ -49,6 +61,33 @@ impl<'a, 'o> PredicateSimplifier<'a, 'o> {
 mod tests {
     use super::*;
     use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
+    use crate::fold::FoldingContext;
+    use std::collections::HashSet;
+
+    struct ChainedPredicateView;
+
+    impl PredicateAnalysisView for ChainedPredicateView {
+        fn expand_predicate_vars(
+            &self,
+            expr: &CExpr,
+            _depth: u32,
+            _visited: &mut HashSet<String>,
+        ) -> CExpr {
+            match expr {
+                CExpr::Var(name) if name == "stage0" => CExpr::Var("stage1".to_string()),
+                CExpr::Var(name) if name == "stage1" => CExpr::Var("done".to_string()),
+                other => other.clone(),
+            }
+        }
+
+        fn try_reconstruct_condition(&self, _expr: &CExpr) -> Option<CExpr> {
+            None
+        }
+
+        fn simplify_predicate_expr(&self, expr: CExpr) -> CExpr {
+            expr
+        }
+    }
 
     #[test]
     fn simplify_condition_expr_reaches_stable_fixed_point() {
@@ -67,6 +106,15 @@ mod tests {
             CExpr::binary(BinaryOp::Ne, CExpr::Var("x".to_string()), CExpr::IntLit(0))
         );
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn simplify_condition_expr_requires_multiple_passes_to_fixed_point() {
+        let view = ChainedPredicateView;
+        let simplifier = PredicateSimplifier::new(&view);
+
+        let simplified = simplifier.simplify_condition_expr(CExpr::Var("stage0".to_string()));
+        assert_eq!(simplified, CExpr::Var("done".to_string()));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use super::*;
 use crate::fold::FoldingContext;
 use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 fn make_test_arch_x86_64() -> ArchSpec {
     let mut arch = ArchSpec::new("x86-64");
@@ -39,7 +39,6 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
     let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
     let empty_visible = Box::leak(Box::new(Vec::new()));
     let empty_str = Box::leak(Box::new(HashMap::new()));
-    let empty_fn = Box::leak(Box::new(HashMap::new()));
     let empty_callee = Box::leak(Box::new(BTreeMap::new()));
     let empty_ty = Box::leak(Box::new(HashMap::new()));
 
@@ -48,7 +47,6 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
         function_names: empty_u64,
         strings: empty_u64,
         symbols: empty_u64,
-        known_function_signatures: empty_fn,
         callee_facts: empty_callee,
         callee_resolution: None,
         stack_slots: empty_stack_slots,
@@ -61,7 +59,6 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
         type_oracle: None,
         function_return_type: None,
         prepared_ssa: None,
-        interproc_summary_set: None,
         summary_view: None,
         prepared_semantic_view: None,
         prepared_objects: None,
@@ -71,6 +68,44 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
     });
     ctx.inputs.prepared_ssa = Some(prepared_ssa);
     ctx
+}
+
+fn install_call_owner(
+    ctx: &mut FoldingContext<'_>,
+    source_call: (u64, usize),
+    owner_name: &str,
+    alias: &str,
+) {
+    let source_id = analysis::CallSiteId::from(source_call);
+    ctx.state.analysis_ctx.ownership.call_ownership.insert(
+        source_id,
+        analysis::CallOwnershipFact {
+            source: source_id,
+            owner: Some(analysis::CallOwner {
+                visible_name: owner_name.to_string(),
+                kind: analysis::CallOwnerKind::StableLocal,
+            }),
+            aliases: BTreeSet::from([alias.to_string()]),
+            direct_aliases: BTreeSet::from([alias.to_string()]),
+        },
+    );
+    ctx.state
+        .analysis_ctx
+        .ownership
+        .alias_sources
+        .insert(alias.to_string(), source_id);
+    ctx.state
+        .analysis_ctx
+        .use_info
+        .call_result_source_by_alias
+        .insert(alias.to_string(), source_call);
+}
+
+fn wrap_parens(mut expr: CExpr, count: usize) -> CExpr {
+    for _ in 0..count {
+        expr = CExpr::Paren(Box::new(expr));
+    }
+    expr
 }
 
 #[test]
@@ -99,6 +134,35 @@ fn expr_contains_opaque_temp_uses_visit_over_nested_nodes() {
         CExpr::IntLit(0),
     );
     assert!(!ctx.expr_contains_opaque_temp(&clean));
+}
+
+#[test]
+fn call_result_predicate_owner_rewrite_depth_guard_is_inclusive() {
+    let mut ctx = FoldingContext::new(64);
+    install_call_owner(&mut ctx, (0x1000, 2), "loc", "rax_1");
+
+    let at_max = wrap_parens(
+        CExpr::Var("rax_1".to_string()),
+        MAX_PREDICATE_OPERAND_DEPTH as usize,
+    );
+    assert_eq!(
+        ctx.rewrite_call_result_predicate_owners(at_max, 0),
+        wrap_parens(
+            CExpr::Var("loc".to_string()),
+            MAX_PREDICATE_OPERAND_DEPTH as usize,
+        ),
+        "owner aliases at exactly MAX_PREDICATE_OPERAND_DEPTH must still rewrite"
+    );
+
+    let beyond_max = wrap_parens(
+        CExpr::Var("rax_1".to_string()),
+        MAX_PREDICATE_OPERAND_DEPTH as usize + 1,
+    );
+    assert_eq!(
+        ctx.rewrite_call_result_predicate_owners(beyond_max.clone(), 0),
+        beyond_max,
+        "owner aliases beyond MAX_PREDICATE_OPERAND_DEPTH must be left untouched"
+    );
 }
 
 #[test]

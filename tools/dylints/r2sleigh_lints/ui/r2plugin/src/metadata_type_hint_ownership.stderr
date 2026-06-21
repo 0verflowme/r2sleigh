@@ -1,0 +1,45 @@
+warning: r2plugin must delegate metadata-derived type hints to r2engine/r2types
+  --> $DIR/metadata_type_hint_ownership.rs:17:1
+   |
+LL | / fn size_to_signed_int_type(size: u32) -> String {
+LL | |     format!("int{}_t", size * 8)
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2plugin_metadata_type_hint_ownership)]` on by default
+
+warning: r2plugin must delegate metadata-derived type hints to r2engine/r2types
+  --> $DIR/metadata_type_hint_ownership.rs:21:1
+   |
+LL | / fn scalar_kind_to_type(kind: r2il::ScalarKind, size: u32) -> Option<TypeHint> {
+LL | |     match kind {
+LL | |         r2il::ScalarKind::SignedInt => {
+LL | |             let _ty = size_to_signed_int_type(size);
+...  |
+LL | | }
+   | |_^
+
+warning: r2plugin must delegate metadata-derived type hints to r2engine/r2types
+  --> $DIR/metadata_type_hint_ownership.rs:31:1
+   |
+LL | / fn metadata_type_hint(pointer_hint: r2il::PointerHint) -> Option<TypeHint> {
+LL | |     if matches!(pointer_hint, r2il::PointerHint::PointerLike) {
+LL | |         return Some(TypeHint);
+...  |
+LL | | }
+   | |_^
+
+warning: r2plugin must not interpret r2il ScalarKind/PointerHint into TypeHint policy
+  --> $DIR/metadata_type_hint_ownership.rs:39:33
+   |
+LL |     let _ = scalar_kind_to_type(r2il::ScalarKind::SignedInt, 8);
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin must not interpret r2il ScalarKind/PointerHint into TypeHint policy
+  --> $DIR/metadata_type_hint_ownership.rs:40:32
+   |
+LL |     let _ = metadata_type_hint(r2il::PointerHint::Unknown);
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 5 warnings emitted
+

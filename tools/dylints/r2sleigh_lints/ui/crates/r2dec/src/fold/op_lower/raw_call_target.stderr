@@ -1,0 +1,87 @@
+warning: r2dec op-lowering must use parse_address_from_var_name or CalleeResolutionFacts instead of local call-target address parsing
+  --> $DIR/raw_call_target.rs:71:13
+   |
+LL |     let _ = ctx.prepared_constish_target_addr();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_raw_call_target_address_parser)]` on by default
+
+warning: r2dec op-lowering must use parse_address_from_var_name or CalleeResolutionFacts instead of local call-target address parsing
+  --> $DIR/raw_call_target.rs:72:13
+   |
+LL |     let _ = extract_call_address(name);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:73:13
+   |
+LL |     let _ = is_modeled_callee_identity();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_call_target_policy_ownership)]` on by default
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:74:13
+   |
+LL |     let _ = modeled_callee_addr_for_identity();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:75:13
+   |
+LL |     let _ = ctx.is_import_policy_authorized();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:76:13
+   |
+LL |     let _ = ctx.identity_for_callsite();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:77:13
+   |
+LL |     let _ = ctx.summary_helper_view_for_name();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must use parse_address_from_var_name or CalleeResolutionFacts instead of local call-target address parsing
+  --> $DIR/raw_call_target.rs:78:13
+   |
+LL |     let _ = name.strip_prefix("ram:");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:80:13
+   |
+LL |     let _ = policy.callee_facts.contains_key("printf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:81:13
+   |
+LL |     let _ = policy.callee_facts.clone().contains_key("printf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:82:13
+   |
+LL |     let _ = (&policy.callee_facts).contains_key("printf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:84:13
+   |
+LL |     let _ = nested_policy.callee_facts.map.contains_key("scanf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec op-lowering must consume the typed callee target policy contract instead of recomputing imported/modeled policy
+  --> $DIR/raw_call_target.rs:85:13
+   |
+LL |       let _ = Request {
+   |  _____________^
+LL | |         direct_target_context: Some(&ctx),
+LL | |     };
+   | |_____^
+
+warning: 13 warnings emitted
+

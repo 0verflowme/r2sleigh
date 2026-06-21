@@ -21,11 +21,12 @@ serde_json = { workspace = true, optional = true }
 default = []
 # Enable specific architecture support for disasm command
 sleigh-config = ["dep:sleigh-config", "dep:r2sleigh-export", "dep:hex", "dep:serde_json"]
-x86 = ["sleigh-config", "dep:sleigh-config", "sleigh-config/x86"]
-arm = ["sleigh-config", "dep:sleigh-config", "sleigh-config/ARM", "sleigh-config/AARCH64"]
-mips = ["sleigh-config", "dep:sleigh-config", "sleigh-config/MIPS"]
-riscv = ["sleigh-config", "dep:sleigh-config", "sleigh-config/RISCV"]
-all-archs = ["x86", "arm", "mips", "riscv"]
+decompile = ["sleigh-config", "r2sleigh-export/dec"]
+x86 = ["sleigh-config", "sleigh-config/x86"]
+arm = ["sleigh-config", "sleigh-config/ARM", "sleigh-config/AARCH64"]
+mips = ["sleigh-config", "sleigh-config/MIPS"]
+riscv = ["sleigh-config", "sleigh-config/RISCV"]
+all-archs = ["x86", "arm", "mips", "riscv", "decompile"]
 
 [dependencies.sleigh-config]
 workspace = true

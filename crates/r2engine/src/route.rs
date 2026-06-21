@@ -116,6 +116,39 @@ pub enum EnginePlan {
     RefuseWithEvidence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineSemanticRoutePlan {
+    Standard,
+    StructuredWorker { reason: String },
+    SummaryIslands { reason: String },
+    LinearWorker { reason: String },
+    VmSummary { reason: String },
+    FallbackComment { comment: String },
+}
+
+impl EngineSemanticRoutePlan {
+    pub fn to_decompiler_route(&self) -> r2dec::SemanticRoutePlan {
+        match self {
+            Self::Standard => r2dec::SemanticRoutePlan::Standard,
+            Self::StructuredWorker { reason } => r2dec::SemanticRoutePlan::StructuredWorker {
+                reason: reason.clone(),
+            },
+            Self::SummaryIslands { reason } => r2dec::SemanticRoutePlan::SummaryIslands {
+                reason: reason.clone(),
+            },
+            Self::LinearWorker { reason } => r2dec::SemanticRoutePlan::LinearWorker {
+                reason: reason.clone(),
+            },
+            Self::VmSummary { reason } => r2dec::SemanticRoutePlan::VmSummary {
+                reason: reason.clone(),
+            },
+            Self::FallbackComment { comment } => r2dec::SemanticRoutePlan::FallbackComment {
+                comment: comment.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,
@@ -165,7 +198,7 @@ impl<'a> EngineRouteContext<'a> {
 pub struct EngineRouteDecision {
     pub request: EngineRequestKind,
     pub plan: EnginePlan,
-    pub route: r2dec::SemanticRoutePlan,
+    pub route: EngineSemanticRoutePlan,
     pub route_reason: Option<String>,
     pub skip_runtime_type_inference: bool,
     pub use_prepared_semantic_view: bool,
@@ -466,18 +499,18 @@ pub fn should_guard_program_orchestrator_decompile(block_count: usize, op_count:
 
 pub fn semantic_route_from_artifact_plan(
     semantic_artifact: &r2sym::SemanticArtifact,
-) -> Option<r2dec::SemanticRoutePlan> {
+) -> Option<EngineSemanticRoutePlan> {
     match semantic_artifact.decompile_plan() {
         r2sym::DecompilePlan::NativeLinear { reason }
             if native_linear_artifact_plan_allows_summary_route(semantic_artifact) =>
         {
-            Some(r2dec::SemanticRoutePlan::LinearWorker { reason })
+            Some(EngineSemanticRoutePlan::LinearWorker { reason })
         }
         r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
-            Some(r2dec::SemanticRoutePlan::SummaryIslands { reason })
+            Some(EngineSemanticRoutePlan::SummaryIslands { reason })
         }
         r2sym::DecompilePlan::VmSummaryOnly { reason } => {
-            Some(r2dec::SemanticRoutePlan::VmSummary { reason })
+            Some(EngineSemanticRoutePlan::VmSummary { reason })
         }
         _ => None,
     }
@@ -538,9 +571,9 @@ pub fn has_renderable_primary_summary_only_native_worker(function_facts: &Functi
 pub fn named_worker_summary_route(
     named_worker_guarded: bool,
     function_facts: &FunctionFacts,
-) -> Option<r2dec::SemanticRoutePlan> {
+) -> Option<EngineSemanticRoutePlan> {
     (named_worker_guarded && has_renderable_primary_summary_only_native_worker(function_facts))
-        .then(|| r2dec::SemanticRoutePlan::SummaryIslands {
+        .then(|| EngineSemanticRoutePlan::SummaryIslands {
             reason: "named native-worker summary projection".to_string(),
         })
 }
@@ -561,7 +594,7 @@ pub(super) fn proof_coverage_from_type_facts(
 
 pub fn select_engine_plan(
     request: EngineRequestKind,
-    route: Option<&r2dec::SemanticRoutePlan>,
+    route: Option<&EngineSemanticRoutePlan>,
     function_facts: Option<&FunctionFacts>,
 ) -> EnginePlan {
     match request {
@@ -578,14 +611,12 @@ pub fn select_engine_plan(
         EngineRequestKind::SymbolicQuery => EnginePlan::SemanticStructured,
         EngineRequestKind::Profile | EngineRequestKind::DebugFacts => EnginePlan::PreparedOnly,
         EngineRequestKind::Decompile => match route {
-            Some(r2dec::SemanticRoutePlan::Standard) | None => EnginePlan::FastLocal,
-            Some(r2dec::SemanticRoutePlan::FallbackComment { .. }) => {
-                EnginePlan::RefuseWithEvidence
-            }
-            Some(r2dec::SemanticRoutePlan::VmSummary { .. })
-            | Some(r2dec::SemanticRoutePlan::SummaryIslands { .. })
-            | Some(r2dec::SemanticRoutePlan::LinearWorker { .. }) => EnginePlan::SemanticSummary,
-            Some(r2dec::SemanticRoutePlan::StructuredWorker { .. }) => {
+            Some(EngineSemanticRoutePlan::Standard) | None => EnginePlan::FastLocal,
+            Some(EngineSemanticRoutePlan::FallbackComment { .. }) => EnginePlan::RefuseWithEvidence,
+            Some(EngineSemanticRoutePlan::VmSummary { .. })
+            | Some(EngineSemanticRoutePlan::SummaryIslands { .. })
+            | Some(EngineSemanticRoutePlan::LinearWorker { .. }) => EnginePlan::SemanticSummary,
+            Some(EngineSemanticRoutePlan::StructuredWorker { .. }) => {
                 EnginePlan::SemanticStructured
             }
         },
@@ -637,41 +668,40 @@ pub fn semantic_route_plan(
     func_name: &str,
     function_facts: &FunctionFacts,
     cfg_summary: &CFGRiskSummary,
-) -> r2dec::SemanticRoutePlan {
+) -> EngineSemanticRoutePlan {
     let context = EngineRouteContext::new(func_name, function_facts, cfg_summary);
     semantic_route_plan_from_context(&context)
 }
 
 pub fn semantic_route_plan_from_context(
     context: &EngineRouteContext<'_>,
-) -> r2dec::SemanticRoutePlan {
+) -> EngineSemanticRoutePlan {
     if let Some(reason) = preferred_vm_summary_reason(context.function_facts) {
-        return r2dec::SemanticRoutePlan::VmSummary { reason };
+        return EngineSemanticRoutePlan::VmSummary { reason };
     }
     if let Some(comment) =
         preferred_semantic_fallback_comment(context.func_name, context.function_facts)
     {
-        return r2dec::SemanticRoutePlan::FallbackComment { comment };
+        return EngineSemanticRoutePlan::FallbackComment { comment };
     }
     if let Some(reason) = preferred_semantic_summary_islands_reason(context) {
-        return r2dec::SemanticRoutePlan::SummaryIslands { reason };
+        return EngineSemanticRoutePlan::SummaryIslands { reason };
     }
     if let Some(reason) = preferred_semantic_structuring_reason(context) {
-        return r2dec::SemanticRoutePlan::StructuredWorker { reason };
+        return EngineSemanticRoutePlan::StructuredWorker { reason };
     }
     if let Some(reason) = preferred_semantic_linearization_reason(context) {
-        return r2dec::SemanticRoutePlan::LinearWorker { reason };
+        return EngineSemanticRoutePlan::LinearWorker { reason };
     }
-    if !prefers_standard_native_for_summary_only_worker(context.function_facts, context.cfg_summary)
-        && let Some(route) = context
-            .function_facts
-            .semantic_artifact()
-            .and_then(semantic_route_from_artifact_plan)
-            .filter(|_| context.has_renderable_semantic_claims())
+    if let Some(route) = context
+        .function_facts
+        .semantic_artifact()
+        .and_then(semantic_route_from_artifact_plan)
+        .filter(|_| context.has_renderable_semantic_claims())
     {
         return route;
     }
-    r2dec::SemanticRoutePlan::Standard
+    EngineSemanticRoutePlan::Standard
 }
 
 pub fn decompile_route_decision(
@@ -689,7 +719,7 @@ pub fn decompile_route_decision(
     );
     let route_reason = semantic_route_reason(&route);
     let refusal = match &route {
-        r2dec::SemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+        EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
         _ => None,
     };
     let proof_coverage = prepared
@@ -721,46 +751,46 @@ pub fn decompile_route_decision(
 }
 
 fn render_permission_for_decompile_route(
-    route: &r2dec::SemanticRoutePlan,
+    route: &EngineSemanticRoutePlan,
     cfg_summary: &CFGRiskSummary,
     proof_coverage: &r2sym::ProofCoverage,
     prepared_available: bool,
 ) -> r2sym::RenderPermission {
     match route {
-        r2dec::SemanticRoutePlan::Standard => {
+        EngineSemanticRoutePlan::Standard => {
             proof_coverage.standard_control_render_permission(cfg_summary, prepared_available)
         }
-        r2dec::SemanticRoutePlan::FallbackComment { comment } => {
+        EngineSemanticRoutePlan::FallbackComment { comment } => {
             r2sym::RenderPermission::refuse(r2sym::ProofOwner::R2engine, comment.clone())
         }
-        r2dec::SemanticRoutePlan::VmSummary { reason }
-        | r2dec::SemanticRoutePlan::SummaryIslands { reason }
-        | r2dec::SemanticRoutePlan::LinearWorker { reason }
-        | r2dec::SemanticRoutePlan::StructuredWorker { reason } => {
+        EngineSemanticRoutePlan::VmSummary { reason }
+        | EngineSemanticRoutePlan::SummaryIslands { reason }
+        | EngineSemanticRoutePlan::LinearWorker { reason }
+        | EngineSemanticRoutePlan::StructuredWorker { reason } => {
             r2sym::RenderPermission::summary(r2sym::ProofOwner::R2engine, reason.clone())
         }
     }
 }
 
-pub fn decompiler_context_with_route_decision(
+pub(crate) fn decompiler_context_with_route_decision(
     context: r2dec::DecompilerContext,
     decision: &EngineRouteDecision,
 ) -> r2dec::DecompilerContext {
     context
-        .with_semantic_route(Some(decision.route.clone()))
+        .with_semantic_route(Some(decision.route.to_decompiler_route()))
         .with_render_permission(Some(decision.render_permission.clone()))
         .with_runtime_type_inference_policy(Some(decision.skip_runtime_type_inference))
         .with_prepared_semantic_view_policy(Some(decision.use_prepared_semantic_view))
 }
 
-pub fn semantic_route_reason(route: &r2dec::SemanticRoutePlan) -> Option<String> {
+pub fn semantic_route_reason(route: &EngineSemanticRoutePlan) -> Option<String> {
     match route {
-        r2dec::SemanticRoutePlan::StructuredWorker { reason }
-        | r2dec::SemanticRoutePlan::SummaryIslands { reason }
-        | r2dec::SemanticRoutePlan::LinearWorker { reason }
-        | r2dec::SemanticRoutePlan::VmSummary { reason } => Some(reason.clone()),
-        r2dec::SemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
-        r2dec::SemanticRoutePlan::Standard => None,
+        EngineSemanticRoutePlan::StructuredWorker { reason }
+        | EngineSemanticRoutePlan::SummaryIslands { reason }
+        | EngineSemanticRoutePlan::LinearWorker { reason }
+        | EngineSemanticRoutePlan::VmSummary { reason } => Some(reason.clone()),
+        EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+        EngineSemanticRoutePlan::Standard => None,
     }
 }
 
@@ -768,7 +798,7 @@ pub fn detached_semantic_route_plan(
     func_name: &str,
     blocks: &[R2ILBlock],
     function_facts: &FunctionFacts,
-) -> Option<r2dec::SemanticRoutePlan> {
+) -> Option<EngineSemanticRoutePlan> {
     let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
     Some(semantic_route_plan(
         func_name,
@@ -783,8 +813,8 @@ pub fn detached_semantic_linearization_reason(
     function_facts: &FunctionFacts,
 ) -> Option<String> {
     match detached_semantic_route_plan(func_name, blocks, function_facts)? {
-        r2dec::SemanticRoutePlan::LinearWorker { reason }
-        | r2dec::SemanticRoutePlan::SummaryIslands { reason } => Some(reason),
+        EngineSemanticRoutePlan::LinearWorker { reason }
+        | EngineSemanticRoutePlan::SummaryIslands { reason } => Some(reason),
         _ => None,
     }
 }
@@ -993,10 +1023,7 @@ fn preferred_semantic_linearization_reason(context: &EngineRouteContext<'_>) -> 
     let function_facts = context.function_facts;
     let capability = function_facts.decompile_capability();
     let plan = capability.plan.as_ref()?;
-    let prefer_standard_native =
-        prefers_standard_native_for_summary_only_worker(function_facts, context.cfg_summary);
     let compact_renderable_worker = !capability.skipped_large_cfg
-        && !prefer_standard_native
         && has_renderable_native_linear_worker_summary(function_facts);
     if let r2sym::DecompilePlan::NativeLinear { reason } = plan
         && capability.has_native_regions
@@ -1048,9 +1075,6 @@ fn preferred_semantic_summary_islands_reason(context: &EngineRouteContext<'_>) -
     let function_facts = context.function_facts;
     let cfg_summary = context.cfg_summary;
     let capability = function_facts.decompile_capability();
-    if prefers_standard_native_for_summary_only_worker(function_facts, cfg_summary) {
-        return None;
-    }
     if has_weak_summary_arg_contract_conflict(function_facts) {
         return None;
     }
@@ -1244,70 +1268,6 @@ fn has_summary_only_scan_table_worker(function_facts: &FunctionFacts) -> bool {
             .worker_summaries
             .iter()
             .any(is_renderable_scan_table_worker_summary)
-    })
-}
-
-pub(super) fn prefers_standard_native_for_summary_only_worker(
-    function_facts: &FunctionFacts,
-    cfg_summary: &CFGRiskSummary,
-) -> bool {
-    if cfg_guard_reason_from_summary(cfg_summary).is_some() {
-        return false;
-    }
-    let Some(semantic_artifact) = function_facts.semantic_artifact() else {
-        return false;
-    };
-    if semantic_artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly
-        || semantic_artifact.diagnostics.skipped_large_cfg
-    {
-        return false;
-    }
-    semantic_artifact.native_body().is_some_and(|native| {
-        native.summary.worker_summaries.iter().any(|summary| {
-            exact_hash_fold_summary_ready_for_native_render(summary)
-                || complete_table_walk_summary_ready_for_native_render(summary)
-        })
-    })
-}
-
-fn exact_hash_fold_summary_ready_for_native_render(summary: &r2sym::NativeWorkerSummary) -> bool {
-    if summary.kind != r2sym::NativeWorkerSummaryKind::HashFold
-        || summary.has_name_hint_evidence()
-        || summary.memory.is_none()
-        || !worker_summary_has_known_length(summary)
-    {
-        return false;
-    }
-    summary.loop_summary.as_ref().is_some_and(|loop_summary| {
-        loop_summary.fold.as_ref().is_some_and(|fold| {
-            fold.operation == r2sym::NativeWorkerFoldOperation::Xor
-                && fold.init.is_some()
-                && fold.multiplier.is_some()
-        })
-    })
-}
-
-fn complete_table_walk_summary_ready_for_native_render(
-    summary: &r2sym::NativeWorkerSummary,
-) -> bool {
-    if summary.kind != r2sym::NativeWorkerSummaryKind::TableWalk
-        || summary.has_name_hint_evidence()
-        || summary.memory.is_none()
-    {
-        return false;
-    }
-    summary.loop_summary.as_ref().is_some_and(|loop_summary| {
-        let Some(detail) = loop_summary.table_walk.as_ref() else {
-            return false;
-        };
-        detail.needle_arg.is_some()
-            && detail.id_offset.is_some()
-            && detail.len_offset.is_some()
-            && detail.name_offset.is_some()
-            && detail.next_offset.is_some()
-            && detail.count_accumulator.is_some()
-            && detail.match_returns_field_plus_count
-            && detail.exhausted_returns_negative_count
     })
 }
 

@@ -1,0 +1,28 @@
+warning: r2dec must resolve function signatures through r2types::CalleeIdentity, not direct raw-map lookup
+  --> $DIR/known_signature_lookup.rs:40:13
+   |
+LL |     let _ = inputs.known_function_signatures.get("printf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_direct_known_signature_lookup)]` on by default
+
+warning: r2dec must resolve function signatures through r2types::CalleeIdentity, not direct raw-map lookup
+  --> $DIR/known_signature_lookup.rs:41:13
+   |
+LL |     let _ = inputs.known_function_signatures.clone().get("printf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must resolve function signatures through r2types::CalleeIdentity, not direct raw-map lookup
+  --> $DIR/known_signature_lookup.rs:42:13
+   |
+LL |     let _ = (&inputs.known_function_signatures).get("printf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must resolve function signatures through r2types::CalleeIdentity, not direct raw-map lookup
+  --> $DIR/known_signature_lookup.rs:44:13
+   |
+LL |     let _ = nested_inputs.known_function_signatures.inner.get("scanf");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 4 warnings emitted
+

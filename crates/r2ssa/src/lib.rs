@@ -19,6 +19,7 @@
 pub mod assumption;
 pub mod block;
 pub mod cfg;
+pub mod data_ref;
 pub mod defuse;
 pub mod domtree;
 pub mod function;
@@ -39,6 +40,10 @@ pub use assumption::{
 };
 pub use block::SSABlock;
 pub use cfg::{BasicBlock, BlockTerminator, CFG, CFGEdge};
+pub use data_ref::{
+    DataRefFact, DataRefKind, data_refs_from_blocks, data_refs_from_ssa_with_op_sources,
+    parse_const_value,
+};
 pub use defuse::{
     BackwardSlice, DefUseInfo, SliceOpRef, backward_slice_from_op, backward_slice_from_var, def_use,
 };
@@ -51,13 +56,14 @@ pub use graph::{
     BlockId, GraphBlock, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
 };
 pub use interproc::{
-    AbiProfile, CallArgObservation, FunctionSemanticSummary, InterprocFunctionId,
-    InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet,
-    SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryAtomicOp,
-    SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect,
-    SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion,
-    SummaryReturnRelation, SummarySyncEffect, SummarySyncOp, SummaryTransferEffect,
-    SummaryTransferLength, observe_call_arguments, solve_interproc_summary_set,
+    AbiProfile, CallArgObservation, FunctionSemanticLinkage, FunctionSemanticSummary,
+    InterprocFunctionId, InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics,
+    InterprocSummarySet, SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect,
+    SummaryAtomicOp, SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp,
+    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange,
+    SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect, SummarySyncOp,
+    SummaryTransferEffect, SummaryTransferLength, observe_call_arguments,
+    solve_interproc_summary_set,
 };
 pub use op::SSAOp;
 pub use optimize::{DecompilePrepConfig, OptimizationConfig, OptimizationStats, optimize_function};

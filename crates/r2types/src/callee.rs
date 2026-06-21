@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use r2ssa::SSAVarNameKind;
 
-use crate::{CalleeFact, FunctionType, SignatureCertificateSource};
+use crate::{
+    CalleeFact, CalleeLinkage, FunctionType, InterprocSummaryView, SignatureCertificateSource,
+    SignatureRegistry,
+};
 
 const CALLEE_IMPORT_PREFIXES: [&str; 3] = ["sym.imp.", "imp.", "reloc."];
 const CALLEE_NAMESPACE_PREFIXES: [&str; 6] = ["sym.imp.", "sym.", "imp.", "reloc.", "dbg.", "fcn."];
@@ -37,11 +40,96 @@ pub enum CalleeIdentityEvidence {
     RawMemoryName,
     RawConstantName,
     ImportedNameHint,
+    ImportLinkage,
     InternalNameHint,
     CalleeFactName,
     KnownSignature,
     FunctionName,
     SymbolName,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CalleeAritySource {
+    KnownSignature,
+    SummaryHint,
+    SignatureRegistry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CalleeArityDecision {
+    pub arity: usize,
+    pub source: CalleeAritySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CalleeTargetPolicySource {
+    ImportLinkage,
+    CalleeFact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CalleeCallArgPolicy {
+    Standard,
+    ImportedLike,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CalleeTargetResolutionSource {
+    PreparedIdentity,
+    CallsiteResolution,
+    PreparedDirectTarget,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CalleeTargetPolicyDecision {
+    pub imported: bool,
+    pub modeled: bool,
+    pub modeled_addr: Option<u64>,
+    pub sources: BTreeSet<CalleeTargetPolicySource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCalleeIdentity {
+    pub key: Option<CalleeIdentityKey>,
+    pub identity: CalleeIdentity,
+    pub source: CalleeTargetResolutionSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCalleeTarget {
+    pub key: Option<CalleeIdentityKey>,
+    pub identity: CalleeIdentity,
+    pub source: CalleeTargetResolutionSource,
+    pub policy: CalleeTargetPolicyDecision,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CalleeTargetIdentityRequest<'a> {
+    pub resolution: Option<&'a CalleeResolutionFacts>,
+    pub callsite: Option<CallsiteKey>,
+    pub prepared_identity: Option<&'a CalleeIdentity>,
+    pub prepared_direct_target: Option<u64>,
+    pub direct_target_context: Option<&'a CalleeIdentityContext<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CalleeTargetResolutionRequest<'a> {
+    pub identity: CalleeTargetIdentityRequest<'a>,
+    pub callee_facts: &'a BTreeMap<u64, CalleeFact>,
+}
+
+impl CalleeTargetPolicyDecision {
+    pub fn imported_or_modeled(&self) -> bool {
+        self.imported || self.modeled
+    }
+
+    pub fn arg_policy(&self) -> CalleeCallArgPolicy {
+        if self.imported_or_modeled() {
+            CalleeCallArgPolicy::ImportedLike
+        } else {
+            CalleeCallArgPolicy::Standard
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,16 +162,38 @@ pub struct CalleeResolutionFacts {
     pub by_name: BTreeMap<String, CalleeIdentityKey>,
 }
 
+fn import_policy_authorized_from_evidence(class: CalleeClass, has_import_linkage: bool) -> bool {
+    class == CalleeClass::Imported && has_import_linkage
+}
+
 impl CalleeResolutionFacts {
     pub fn from_direct_call_targets<I>(targets: I, ctx: &CalleeIdentityContext<'_>) -> Self
     where
         I: IntoIterator<Item = (CallsiteKey, u64)>,
     {
         let mut facts = Self::default();
+        facts.index_context(ctx);
         for (callsite, addr) in targets {
             let _ = facts.insert_direct_callsite(callsite, addr, ctx);
         }
         facts
+    }
+
+    pub fn from_context(ctx: &CalleeIdentityContext<'_>) -> Self {
+        let mut facts = Self::default();
+        facts.index_context(ctx);
+        facts
+    }
+
+    pub fn index_context(&mut self, ctx: &CalleeIdentityContext<'_>) {
+        let mut direct_addrs = BTreeSet::new();
+        direct_addrs.extend(ctx.callee_facts.keys().copied());
+        direct_addrs.extend(ctx.function_names.keys().copied());
+        direct_addrs.extend(ctx.symbols.keys().copied());
+        for addr in direct_addrs {
+            self.ensure_direct_identity(addr, ctx);
+        }
+        self.index_known_signatures(ctx.known_function_signatures);
     }
 
     pub fn insert_direct_callsite(
@@ -93,15 +203,11 @@ impl CalleeResolutionFacts {
         ctx: &CalleeIdentityContext<'_>,
     ) -> Option<&CalleeIdentity> {
         let key = CalleeIdentityKey::DirectAddress(addr);
-        if let Some(existing) = self.by_callsite.get(&callsite)
-            && existing != &key
-        {
+        if Self::callsite_binding_conflicts(self.by_callsite.get(&callsite), &key) {
             return None;
         }
         let key = self.ensure_direct_identity(addr, ctx);
-        if !self.bind_callsite(callsite, key.clone()) {
-            return None;
-        }
+        self.bind_callsite(callsite, key.clone());
         self.by_key.get(&key)
     }
 
@@ -115,6 +221,17 @@ impl CalleeResolutionFacts {
         self.by_direct_addr
             .get(&addr)
             .and_then(|key| self.by_key.get(key))
+    }
+
+    pub fn identity_for_direct_target_in_context(
+        resolution: Option<&Self>,
+        addr: u64,
+        ctx: &CalleeIdentityContext<'_>,
+    ) -> CalleeIdentity {
+        resolution
+            .and_then(|facts| facts.identity_for_direct_addr(addr))
+            .cloned()
+            .unwrap_or_else(|| CalleeIdentity::from_direct_target(addr, ctx))
     }
 
     pub fn identity_for_name(&self, name: &str) -> Option<&CalleeIdentity> {
@@ -131,8 +248,153 @@ impl CalleeResolutionFacts {
             .and_then(|key| self.by_key.get(key))
     }
 
+    pub fn identity_for_name_in_context(
+        name: &str,
+        ctx: &CalleeIdentityContext<'_>,
+    ) -> Option<CalleeIdentity> {
+        let raw = name.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let normalized = normalize_callee_name(raw);
+
+        let mut direct_addrs = BTreeSet::new();
+        direct_addrs.extend(ctx.callee_facts.keys().copied());
+        direct_addrs.extend(ctx.function_names.keys().copied());
+        direct_addrs.extend(ctx.symbols.keys().copied());
+        for addr in direct_addrs {
+            let identity = CalleeIdentity::from_direct_target(addr, ctx);
+            if Self::identity_matches_raw_or_normalized_name(&identity, raw, &normalized) {
+                return Some(identity);
+            }
+        }
+
+        let mut signature_names = ctx
+            .known_function_signatures
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        signature_names.sort_unstable();
+        for signature_name in signature_names {
+            let identity = CalleeIdentity::from_name(signature_name)
+                .with_known_signature(ctx.known_function_signatures);
+            if identity.has_known_signature()
+                && Self::identity_matches_raw_or_normalized_name(&identity, raw, &normalized)
+            {
+                return Some(identity);
+            }
+        }
+        None
+    }
+
+    pub fn target_resolution_source_for_presence(
+        has_prepared_identity: bool,
+        has_callsite_identity: bool,
+        has_prepared_direct_target_identity: bool,
+    ) -> Option<CalleeTargetResolutionSource> {
+        if has_prepared_identity {
+            Some(CalleeTargetResolutionSource::PreparedIdentity)
+        } else if has_callsite_identity {
+            Some(CalleeTargetResolutionSource::CallsiteResolution)
+        } else if has_prepared_direct_target_identity {
+            Some(CalleeTargetResolutionSource::PreparedDirectTarget)
+        } else {
+            None
+        }
+    }
+
+    fn key_for_prepared_identity(identity: &CalleeIdentity) -> Option<CalleeIdentityKey> {
+        identity
+            .target_addr
+            .map(CalleeIdentityKey::DirectAddress)
+            .or_else(|| {
+                let key = identity.primary_key();
+                (!key.trim().is_empty()).then_some(CalleeIdentityKey::Named(key))
+            })
+    }
+
+    fn direct_target_identity_from_request(
+        request: CalleeTargetIdentityRequest<'_>,
+    ) -> Option<(CalleeIdentityKey, CalleeIdentity)> {
+        let addr = request.prepared_direct_target?;
+        if let Some(identity) = request
+            .resolution
+            .and_then(|facts| facts.identity_for_direct_addr(addr))
+        {
+            return Some((CalleeIdentityKey::DirectAddress(addr), identity.clone()));
+        }
+        request.direct_target_context.map(|ctx| {
+            (
+                CalleeIdentityKey::DirectAddress(addr),
+                CalleeIdentity::from_direct_target(addr, ctx),
+            )
+        })
+    }
+
+    pub fn resolve_target_identity(
+        request: CalleeTargetIdentityRequest<'_>,
+    ) -> Option<ResolvedCalleeIdentity> {
+        let callsite_identity = request.callsite.and_then(|callsite| {
+            let facts = request.resolution?;
+            let key = facts.key_for_callsite(callsite)?.clone();
+            let identity = facts.by_key.get(&key)?.clone();
+            Some((key, identity))
+        });
+        let direct_target_identity = Self::direct_target_identity_from_request(request);
+        let source = Self::target_resolution_source_for_presence(
+            request.prepared_identity.is_some(),
+            callsite_identity.is_some(),
+            direct_target_identity.is_some(),
+        )?;
+        let (key, identity) = match source {
+            CalleeTargetResolutionSource::PreparedIdentity => {
+                let identity = request.prepared_identity?.clone();
+                (Self::key_for_prepared_identity(&identity), identity)
+            }
+            CalleeTargetResolutionSource::CallsiteResolution => {
+                let (key, identity) = callsite_identity?;
+                (Some(key), identity)
+            }
+            CalleeTargetResolutionSource::PreparedDirectTarget => {
+                let (key, identity) = direct_target_identity?;
+                (Some(key), identity)
+            }
+        };
+        Some(ResolvedCalleeIdentity {
+            key,
+            identity,
+            source,
+        })
+    }
+
+    pub fn resolve_target_policy(
+        request: CalleeTargetResolutionRequest<'_>,
+    ) -> Option<ResolvedCalleeTarget> {
+        let resolved = Self::resolve_target_identity(request.identity)?;
+        let policy = resolved
+            .identity
+            .target_policy_decision(request.identity.resolution, request.callee_facts);
+        Some(ResolvedCalleeTarget {
+            key: resolved.key,
+            identity: resolved.identity,
+            source: resolved.source,
+            policy,
+        })
+    }
+
     pub fn key_for_callsite(&self, callsite: CallsiteKey) -> Option<&CalleeIdentityKey> {
         self.by_callsite.get(&callsite)
+    }
+
+    fn identity_matches_raw_or_normalized_name(
+        identity: &CalleeIdentity,
+        raw: &str,
+        normalized: &str,
+    ) -> bool {
+        identity.aliases.contains(raw)
+            || identity.raw_name.as_deref() == Some(raw)
+            || identity.display_name.as_deref() == Some(raw)
+            || (!normalized.is_empty() && identity.matches_normalized_name(normalized))
     }
 
     fn ensure_direct_identity(
@@ -152,13 +414,41 @@ impl CalleeResolutionFacts {
         key
     }
 
-    fn bind_callsite(&mut self, callsite: CallsiteKey, key: CalleeIdentityKey) -> bool {
-        match self.by_callsite.get(&callsite) {
-            Some(existing) => existing == &key,
-            None => {
-                self.by_callsite.insert(callsite, key);
-                true
+    fn bind_callsite(&mut self, callsite: CallsiteKey, key: CalleeIdentityKey) {
+        self.by_callsite.entry(callsite).or_insert(key);
+    }
+
+    fn callsite_binding_conflicts(
+        existing: Option<&CalleeIdentityKey>,
+        key: &CalleeIdentityKey,
+    ) -> bool {
+        existing.is_some_and(|existing| existing != key)
+    }
+
+    fn index_known_signatures(&mut self, signatures: &HashMap<String, FunctionType>) {
+        let mut names = signatures.keys().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        for name in names {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+            let normalized = normalize_callee_name(trimmed);
+            let key_name = if normalized.is_empty() {
+                trimmed.to_string()
+            } else {
+                normalized
+            };
+            let key = CalleeIdentityKey::Named(key_name);
+            if self.by_key.contains_key(&key) {
+                continue;
+            }
+            let identity = CalleeIdentity::from_name(trimmed).with_known_signature(signatures);
+            if !identity.has_known_signature() {
+                continue;
+            }
+            self.index_identity_aliases(&key, &identity);
+            self.by_key.insert(key, identity);
         }
     }
 
@@ -234,9 +524,8 @@ impl CalleeIdentity {
 
     pub fn from_direct_target(addr: u64, ctx: &CalleeIdentityContext<'_>) -> Self {
         let mut evidence = BTreeSet::from([CalleeIdentityEvidence::DirectTarget]);
-        let fact_name = ctx
-            .callee_facts
-            .get(&addr)
+        let callee_fact = ctx.callee_facts.get(&addr);
+        let fact_name = callee_fact
             .and_then(|fact| fact.name.as_deref())
             .filter(|name| !name.trim().is_empty());
         let function_name = ctx
@@ -297,12 +586,36 @@ impl CalleeIdentity {
                 identity.class = CalleeClass::ExternalSymbol;
             }
         }
-        identity.attach_known_signature(ctx.known_function_signatures);
+        if callee_fact.is_some_and(|fact| fact.linkage.authorizes_import_policy()) {
+            identity = identity.with_import_linkage_evidence();
+        } else if callee_fact.is_some_and(|fact| fact.linkage == CalleeLinkage::Internal)
+            && identity.class == CalleeClass::Unknown
+        {
+            identity.class = CalleeClass::Internal;
+            identity
+                .evidence
+                .insert(CalleeIdentityEvidence::InternalNameHint);
+        }
+        if let Some(signature) = callee_fact.and_then(|fact| fact.signature.as_ref()) {
+            identity.signature = Some(signature.clone());
+            identity.signature_source = Some(SignatureCertificateSource::ExternalContext);
+            identity
+                .evidence
+                .insert(CalleeIdentityEvidence::KnownSignature);
+        } else {
+            identity.attach_known_signature(ctx.known_function_signatures);
+        }
         identity
     }
 
     pub fn with_known_signature(mut self, signatures: &HashMap<String, FunctionType>) -> Self {
         self.attach_known_signature(signatures);
+        self
+    }
+
+    pub fn with_import_linkage_evidence(mut self) -> Self {
+        self.class = CalleeClass::Imported;
+        self.evidence.insert(CalleeIdentityEvidence::ImportLinkage);
         self
     }
 
@@ -335,6 +648,14 @@ impl CalleeIdentity {
                 .contains(&CalleeIdentityEvidence::ImportedNameHint)
     }
 
+    pub fn is_import_policy_authorized(&self) -> bool {
+        import_policy_authorized_from_evidence(
+            self.class,
+            self.evidence
+                .contains(&CalleeIdentityEvidence::ImportLinkage),
+        )
+    }
+
     pub fn is_internal_name_hint(&self) -> bool {
         self.class == CalleeClass::Internal
             && self
@@ -358,6 +679,54 @@ impl CalleeIdentity {
     pub fn non_variadic_known_arity(&self) -> Option<usize> {
         self.known_signature()
             .and_then(|signature| (!signature.variadic).then_some(signature.params.len()))
+    }
+
+    pub fn non_variadic_arity_decision(
+        &self,
+        _summary_view: Option<&InterprocSummaryView>,
+        _signature_registry: &SignatureRegistry,
+        _ptr_bits: u32,
+    ) -> Option<CalleeArityDecision> {
+        self.non_variadic_known_arity()
+            .map(|arity| CalleeArityDecision {
+                arity,
+                source: CalleeAritySource::KnownSignature,
+            })
+    }
+
+    pub fn target_policy_decision(
+        &self,
+        _callee_resolution: Option<&CalleeResolutionFacts>,
+        callee_facts: &BTreeMap<u64, CalleeFact>,
+    ) -> CalleeTargetPolicyDecision {
+        let mut decision = CalleeTargetPolicyDecision::default();
+        if self.is_import_policy_authorized() {
+            decision.imported = true;
+            decision
+                .sources
+                .insert(CalleeTargetPolicySource::ImportLinkage);
+        }
+
+        if let Some(addr) = self.modeled_target_addr(callee_facts) {
+            decision.modeled = true;
+            decision.modeled_addr = Some(addr);
+            decision
+                .sources
+                .insert(CalleeTargetPolicySource::CalleeFact);
+        }
+
+        decision
+    }
+
+    pub fn modeled_target_addr(&self, callee_facts: &BTreeMap<u64, CalleeFact>) -> Option<u64> {
+        if let Some(addr) = self.target_addr
+            && callee_facts
+                .get(&addr)
+                .is_some_and(CalleeFact::authorizes_model_policy)
+        {
+            return Some(addr);
+        }
+        None
     }
 
     pub fn matches_normalized_name(&self, normalized: &str) -> bool {
@@ -575,10 +944,15 @@ mod tests {
         }
     }
 
-    fn callee_fact(addr: u64, name: &str) -> CalleeFact {
+    fn callee_fact_with_linkage(addr: u64, name: &str, linkage: CalleeLinkage) -> CalleeFact {
         CalleeFact {
             function_id: addr,
             name: Some(name.to_string()),
+            linkage,
+            signature: None,
+            signature_callconv: None,
+            signature_noreturn: false,
+            model_policy_evidence: BTreeSet::new(),
             direct_callees: Vec::new(),
             callsite_count: 0,
             has_unknown_calls: false,
@@ -596,6 +970,21 @@ mod tests {
             writes_global_memory: false,
             touches_unknown_memory: false,
         }
+    }
+
+    fn callee_fact(addr: u64, name: &str) -> CalleeFact {
+        callee_fact_with_linkage(addr, name, CalleeLinkage::Unknown)
+    }
+
+    fn imported_callee_fact(addr: u64, name: &str) -> CalleeFact {
+        callee_fact_with_linkage(addr, name, CalleeLinkage::Imported)
+    }
+
+    fn modeled_callee_fact(addr: u64, name: &str) -> CalleeFact {
+        let mut fact = callee_fact(addr, name);
+        fact.model_policy_evidence
+            .insert(crate::CalleeModelPolicyEvidence::InterprocSummary);
+        fact
     }
 
     fn test_signature() -> FunctionType {
@@ -668,6 +1057,10 @@ mod tests {
                 class == CalleeClass::Imported,
                 "{name}",
             );
+            assert!(
+                !identity.is_import_policy_authorized(),
+                "raw name hints must not authorize imported-call policy for {name}",
+            );
             assert_eq!(
                 identity.is_internal_name_hint(),
                 class == CalleeClass::Internal,
@@ -713,7 +1106,8 @@ mod tests {
     fn direct_target_identity_uses_callee_fact_before_function_and_symbol_names() {
         let function_names = HashMap::from([(0x401000, "sym.function_name".to_string())]);
         let symbols = HashMap::from([(0x401000, "sym.symbol_name".to_string())]);
-        let callee_facts = BTreeMap::from([(0x401000, callee_fact(0x401000, "sym.imp.printf"))]);
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
         let known_signatures = HashMap::new();
         let ctx =
             empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
@@ -734,9 +1128,126 @@ mod tests {
                 .evidence
                 .contains(&CalleeIdentityEvidence::CalleeFactName)
         );
+        assert!(
+            identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::ImportLinkage)
+        );
+        assert!(identity.is_import_policy_authorized());
         assert!(identity.aliases.contains("addr:401000"));
         assert!(identity.aliases.contains("sym.function_name"));
         assert!(identity.aliases.contains("sym.symbol_name"));
+    }
+
+    #[test]
+    fn import_looking_callee_fact_name_without_linkage_is_hint_only() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(0x401020, callee_fact(0x401020, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x401020, &ctx);
+
+        assert!(identity.is_imported_name_hint());
+        assert!(
+            !identity.is_import_policy_authorized(),
+            "import-looking callee-fact names are aliases until typed linkage certifies them",
+        );
+        assert!(
+            !identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::ImportLinkage),
+            "unknown linkage must not mint import-linkage evidence",
+        );
+    }
+
+    #[test]
+    fn explicit_import_linkage_authorizes_policy_without_import_name_shape() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(0x401028, imported_callee_fact(0x401028, "printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x401028, &ctx);
+
+        assert_eq!(identity.normalized_name(), "printf");
+        assert!(identity.is_import_policy_authorized());
+        assert!(
+            identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::ImportLinkage),
+            "explicit linkage must mint import-linkage evidence independent of name shape",
+        );
+    }
+
+    #[test]
+    fn internal_linkage_classifies_plain_callee_fact_as_internal() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(
+            0x40102c,
+            callee_fact_with_linkage(0x40102c, "helper", CalleeLinkage::Internal),
+        )]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x40102c, &ctx);
+
+        assert_eq!(identity.class(), CalleeClass::Internal);
+        assert!(identity.is_internal_name_hint());
+        assert!(!identity.is_import_policy_authorized());
+    }
+
+    #[test]
+    fn unknown_linkage_plain_callee_fact_remains_unknown() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(0x40102d, callee_fact(0x40102d, "helper"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x40102d, &ctx);
+
+        assert_eq!(identity.class(), CalleeClass::Unknown);
+        assert!(!identity.is_internal_name_hint());
+        assert!(!identity.is_import_policy_authorized());
+    }
+
+    #[test]
+    fn symbol_names_promote_only_unknown_callee_identities_to_external() {
+        let function_names = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::new();
+        let external_symbols = HashMap::from([(0x40102e, "external_helper".to_string())]);
+        let external_ctx = empty_identity_context(
+            &function_names,
+            &external_symbols,
+            &callee_facts,
+            &known_signatures,
+        );
+
+        let external = CalleeIdentity::from_direct_target(0x40102e, &external_ctx);
+
+        assert_eq!(external.class(), CalleeClass::ExternalSymbol);
+
+        let internal_symbols = HashMap::from([(0x40102f, "sym.helper".to_string())]);
+        let internal_ctx = empty_identity_context(
+            &function_names,
+            &internal_symbols,
+            &callee_facts,
+            &known_signatures,
+        );
+
+        let internal = CalleeIdentity::from_direct_target(0x40102f, &internal_ctx);
+
+        assert_eq!(internal.class(), CalleeClass::Internal);
+        assert!(internal.is_internal_name_hint());
     }
 
     #[test]
@@ -762,6 +1273,45 @@ mod tests {
         );
         assert_eq!(identity.primary_key(), "printf");
         assert!(identity.matches_identity(&CalleeIdentity::from_name("printf")));
+        assert!(
+            !identity.is_import_policy_authorized(),
+            "function-name imports are hints until a typed callee fact certifies import linkage"
+        );
+    }
+
+    #[test]
+    fn direct_target_identity_prefers_typed_callee_fact_signature() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let mut fact = callee_fact(0x401000, "sym.imp.printf");
+        fact.signature = Some(non_variadic_signature(2));
+        fact.signature_callconv = Some("amd64".to_string());
+        let callee_facts = BTreeMap::from([(0x401000, fact)]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeIdentity::from_direct_target(0x401000, &ctx);
+
+        assert_eq!(
+            identity
+                .known_signature()
+                .map(|signature| signature.params.len()),
+            Some(2)
+        );
+        assert_eq!(
+            identity.signature_source,
+            Some(SignatureCertificateSource::ExternalContext)
+        );
+        assert!(
+            identity
+                .evidence
+                .contains(&CalleeIdentityEvidence::KnownSignature)
+        );
+        assert!(
+            !identity.is_import_policy_authorized(),
+            "typed callee signatures do not imply imported-call policy"
+        );
     }
 
     #[test]
@@ -808,6 +1358,662 @@ mod tests {
         let identity = CalleeIdentity::from_direct_target(0x401040, &ctx);
 
         assert!(!identity.aliases.contains(""));
+    }
+
+    #[test]
+    fn callee_resolution_context_name_resolves_normalized_callee_fact_alias() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(0x401000, callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeResolutionFacts::identity_for_name_in_context("printf", &ctx)
+            .expect("normalized callee-fact alias should resolve");
+
+        assert_eq!(identity.target_addr, Some(0x401000));
+        assert_eq!(identity.normalized_name(), "printf");
+        assert!(
+            !identity.is_import_policy_authorized(),
+            "import-looking aliases are not import authority without typed linkage",
+        );
+    }
+
+    #[test]
+    fn callee_resolution_context_name_authorizes_explicit_import_linkage() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let identity = CalleeResolutionFacts::identity_for_name_in_context("printf", &ctx)
+            .expect("normalized imported callee-fact alias should resolve");
+
+        assert_eq!(identity.target_addr, Some(0x401000));
+        assert_eq!(identity.normalized_name(), "printf");
+        assert!(
+            identity.is_import_policy_authorized(),
+            "typed import linkage is the authority for imported-call policy",
+        );
+    }
+
+    #[test]
+    fn callee_resolution_context_name_rejects_empty_normalized_alias_collision() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "imp."))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        assert!(
+            CalleeResolutionFacts::identity_for_name_in_context("sym.imp.", &ctx).is_none(),
+            "empty normalized aliases must not bind unrelated import-looking callee facts",
+        );
+    }
+
+    #[test]
+    fn callee_resolution_context_name_rejects_unmatched_known_signatures() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::from([
+            ("aaa".to_string(), non_variadic_signature(1)),
+            ("bbb".to_string(), non_variadic_signature(2)),
+        ]);
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        assert!(
+            CalleeResolutionFacts::identity_for_name_in_context("missing", &ctx).is_none(),
+            "known signatures must not resolve unrelated names just because they are signed"
+        );
+    }
+
+    fn summary_view_with_helper_arity(name: &str, arity: usize) -> InterprocSummaryView {
+        let id = r2ssa::InterprocFunctionId(0x401000);
+        let mut summary = r2ssa::FunctionSemanticSummary::unknown(id, Some(name.to_string()));
+        summary.arg_count_hint = Some(arity);
+        let mut set = r2ssa::InterprocSummarySet::default();
+        set.summaries.insert(id, summary);
+        InterprocSummaryView::new(Some(set))
+    }
+
+    fn registry_with_non_variadic_arity(name: &str, arity: usize) -> SignatureRegistry {
+        let mut registry = SignatureRegistry::default();
+        registry.insert_raw(name, "void", vec!["int".to_string(); arity], false);
+        registry
+    }
+
+    #[test]
+    fn callee_arity_decision_prefers_known_signature_over_summary_and_registry() {
+        let known_signatures = HashMap::from([("helper".to_string(), non_variadic_signature(3))]);
+        let identity = CalleeIdentity::from_name("helper").with_known_signature(&known_signatures);
+        let summary_view = summary_view_with_helper_arity("helper", 1);
+        let registry = registry_with_non_variadic_arity("helper", 2);
+
+        assert_eq!(
+            identity.non_variadic_arity_decision(Some(&summary_view), &registry, 64),
+            Some(CalleeArityDecision {
+                arity: 3,
+                source: CalleeAritySource::KnownSignature,
+            }),
+        );
+    }
+
+    #[test]
+    fn callee_arity_decision_rejects_summary_hint_without_known_signature() {
+        let identity = CalleeIdentity::from_name("helper");
+        let summary_view = summary_view_with_helper_arity("helper", 4);
+        let registry = registry_with_non_variadic_arity("helper", 2);
+
+        assert_eq!(
+            identity.non_variadic_arity_decision(Some(&summary_view), &registry, 64),
+            None,
+        );
+    }
+
+    #[test]
+    fn callee_arity_decision_rejects_registry_without_known_signature() {
+        let identity = CalleeIdentity::from_name("helper");
+        let registry = registry_with_non_variadic_arity("helper", 2);
+
+        assert_eq!(
+            identity.non_variadic_arity_decision(None, &registry, 64),
+            None,
+        );
+    }
+
+    #[test]
+    fn callee_target_policy_does_not_import_from_name_hint_alone() {
+        let identity = CalleeIdentity::from_name("sym.imp.printf");
+        let callee_facts = BTreeMap::new();
+
+        let decision = identity.target_policy_decision(None, &callee_facts);
+
+        assert!(!decision.imported);
+        assert!(!decision.modeled);
+        assert!(
+            !decision.imported_or_modeled(),
+            "import-looking names are hints until typed linkage or modeled evidence exists",
+        );
+    }
+
+    #[test]
+    fn callee_target_policy_authorizes_import_from_typed_linkage() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let identity = CalleeIdentity::from_direct_target(0x401000, &ctx);
+
+        let decision = identity.target_policy_decision(None, &callee_facts);
+
+        assert!(decision.imported);
+        assert!(!decision.modeled);
+        assert_eq!(decision.modeled_addr, None);
+        assert!(decision.imported_or_modeled());
+        assert!(
+            decision
+                .sources
+                .contains(&CalleeTargetPolicySource::ImportLinkage)
+        );
+        assert!(
+            !decision
+                .sources
+                .contains(&CalleeTargetPolicySource::CalleeFact),
+            "typed import linkage is import-policy evidence, not model-policy evidence"
+        );
+    }
+
+    #[test]
+    fn callee_target_policy_does_not_model_from_summary_helper_name_without_resolution() {
+        let identity = CalleeIdentity::from_name("helper.summary");
+        let callee_facts = BTreeMap::new();
+
+        let decision = identity.target_policy_decision(None, &callee_facts);
+
+        assert!(!decision.imported);
+        assert!(
+            !decision.modeled,
+            "summary helper names must not authorize modeled policy without typed resolution"
+        );
+        assert_eq!(decision.modeled_addr, None);
+        assert!(!decision.imported_or_modeled());
+        assert!(decision.sources.is_empty());
+    }
+
+    #[test]
+    fn callee_target_policy_does_not_model_from_callee_fact_presence_without_evidence() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::from([(0x401000, callee_fact(0x401000, "sym.memcpy"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let resolution = CalleeResolutionFacts::from_context(&ctx);
+        let identity = CalleeIdentity::from_name("memcpy");
+
+        let decision = identity.target_policy_decision(Some(&resolution), &callee_facts);
+
+        assert!(!decision.imported);
+        assert!(!decision.modeled);
+        assert_eq!(decision.modeled_addr, None);
+        assert!(decision.sources.is_empty());
+    }
+
+    #[test]
+    fn callee_target_policy_models_from_explicit_callee_fact_evidence_through_resolution() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, modeled_callee_fact(0x401000, "sym.memcpy"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let identity = CalleeIdentity::from_direct_target(0x401000, &ctx);
+
+        let decision = identity.target_policy_decision(None, &callee_facts);
+
+        assert!(!decision.imported);
+        assert!(decision.modeled);
+        assert_eq!(decision.modeled_addr, Some(0x401000));
+        assert_eq!(
+            decision.sources,
+            BTreeSet::from([CalleeTargetPolicySource::CalleeFact]),
+        );
+    }
+
+    #[test]
+    fn callee_resolution_source_precedence_truth_table_is_exhaustive() {
+        for mask in 0u8..8 {
+            let has_prepared_identity = mask & 0b0001 != 0;
+            let has_callsite_identity = mask & 0b0010 != 0;
+            let has_prepared_direct_target = mask & 0b0100 != 0;
+
+            let expected = if has_prepared_identity {
+                Some(CalleeTargetResolutionSource::PreparedIdentity)
+            } else if has_callsite_identity {
+                Some(CalleeTargetResolutionSource::CallsiteResolution)
+            } else if has_prepared_direct_target {
+                Some(CalleeTargetResolutionSource::PreparedDirectTarget)
+            } else {
+                None
+            };
+
+            assert_eq!(
+                CalleeResolutionFacts::target_resolution_source_for_presence(
+                    has_prepared_identity,
+                    has_callsite_identity,
+                    has_prepared_direct_target,
+                ),
+                expected,
+                "wrong source precedence for mask {mask:04b}",
+            );
+        }
+    }
+
+    #[test]
+    fn callee_resolution_policy_prefers_prepared_identity_over_callsite_resolution() {
+        let function_names = HashMap::from([(0x402000, "sym.local".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let callsite = CallsiteKey {
+            block_addr: 0x10,
+            op_index: 0,
+        };
+        let resolution =
+            CalleeResolutionFacts::from_direct_call_targets([(callsite, 0x402000)], &ctx);
+        let prepared_identity = CalleeIdentity::from_direct_target(0x401000, &ctx);
+
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: Some(&resolution),
+                    callsite: Some(callsite),
+                    prepared_identity: Some(&prepared_identity),
+                    prepared_direct_target: None,
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("prepared identity should resolve");
+
+        assert_eq!(
+            resolved.source,
+            CalleeTargetResolutionSource::PreparedIdentity,
+        );
+        assert_eq!(resolved.identity.target_addr, Some(0x401000));
+        assert_eq!(
+            resolved.policy.arg_policy(),
+            CalleeCallArgPolicy::ImportedLike
+        );
+    }
+
+    #[test]
+    fn callee_resolution_policy_prefers_callsite_identity_over_other_typed_inputs() {
+        let function_names = HashMap::from([(0x402000, "sym.local".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let callsite = CallsiteKey {
+            block_addr: 0x10,
+            op_index: 0,
+        };
+        let resolution =
+            CalleeResolutionFacts::from_direct_call_targets([(callsite, 0x402000)], &ctx);
+
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: Some(&resolution),
+                    callsite: Some(callsite),
+                    prepared_identity: None,
+                    prepared_direct_target: Some(0x401000),
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("callsite identity should resolve");
+
+        assert_eq!(
+            resolved.source,
+            CalleeTargetResolutionSource::CallsiteResolution,
+        );
+        assert_eq!(resolved.identity.target_addr, Some(0x402000));
+        assert_eq!(resolved.policy.arg_policy(), CalleeCallArgPolicy::Standard);
+        assert!(!resolved.policy.imported);
+    }
+
+    #[test]
+    fn callee_resolution_policy_keeps_imported_callsite_over_prepared_direct_target() {
+        let function_names = HashMap::from([(0x402000, "sym.local".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let callsite = CallsiteKey {
+            block_addr: 0x10,
+            op_index: 0,
+        };
+        let resolution =
+            CalleeResolutionFacts::from_direct_call_targets([(callsite, 0x401000)], &ctx);
+
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: Some(&resolution),
+                    callsite: Some(callsite),
+                    prepared_identity: None,
+                    prepared_direct_target: Some(0x402000),
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("callsite identity should resolve");
+
+        assert_eq!(
+            resolved.source,
+            CalleeTargetResolutionSource::CallsiteResolution,
+        );
+        assert_eq!(resolved.identity.target_addr, Some(0x401000));
+        assert!(resolved.policy.imported);
+        assert_eq!(
+            resolved.policy.arg_policy(),
+            CalleeCallArgPolicy::ImportedLike
+        );
+    }
+
+    #[test]
+    fn callee_resolution_policy_uses_prepared_direct_target_without_display_fallback() {
+        let function_names = HashMap::from([(0x402000, "sym.local".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: None,
+                    callsite: None,
+                    prepared_identity: None,
+                    prepared_direct_target: Some(0x401000),
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("prepared direct target should resolve");
+
+        assert_eq!(
+            resolved.source,
+            CalleeTargetResolutionSource::PreparedDirectTarget,
+        );
+        assert_eq!(resolved.identity.target_addr, Some(0x401000));
+        assert!(resolved.policy.imported);
+    }
+
+    #[test]
+    fn callee_resolution_policy_fails_closed_after_typed_sources_fail() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        assert!(
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: None,
+                    callsite: None,
+                    prepared_identity: None,
+                    prepared_direct_target: None,
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .is_none(),
+            "rendered/display identities must not be an authoritative fallback",
+        );
+    }
+
+    #[test]
+    fn callee_resolution_policy_does_not_authorize_plain_rendered_names_for_unresolved_sites() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let unresolved_site = CallsiteKey {
+            block_addr: 0x10,
+            op_index: 0,
+        };
+        assert!(
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: None,
+                    callsite: Some(unresolved_site),
+                    prepared_identity: None,
+                    prepared_direct_target: None,
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .is_none(),
+            "a rendered name must not resolve an unresolved callsite",
+        );
+    }
+
+    #[test]
+    fn callee_resolution_policy_allows_explicit_prepared_direct_targets() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: None,
+                    callsite: None,
+                    prepared_identity: None,
+                    prepared_direct_target: Some(0x401000),
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("raw rendered target should resolve");
+
+        assert_eq!(
+            resolved.source,
+            CalleeTargetResolutionSource::PreparedDirectTarget,
+        );
+        assert!(resolved.policy.imported);
+        assert_eq!(
+            resolved.policy.arg_policy(),
+            CalleeCallArgPolicy::ImportedLike,
+        );
+    }
+
+    #[test]
+    fn callee_resolution_policy_unresolved_callsite_does_not_inherit_other_site_policy() {
+        let function_names = HashMap::from([(0x402000, "sym.local".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let imported_site = CallsiteKey {
+            block_addr: 0x10,
+            op_index: 0,
+        };
+        let unresolved_site = CallsiteKey {
+            block_addr: 0x20,
+            op_index: 0,
+        };
+        let resolution =
+            CalleeResolutionFacts::from_direct_call_targets([(imported_site, 0x401000)], &ctx);
+
+        assert!(
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: Some(&resolution),
+                    callsite: Some(unresolved_site),
+                    prepared_identity: None,
+                    prepared_direct_target: None,
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .is_none(),
+            "unresolved callsites must not inherit policy from unrelated typed or rendered facts",
+        );
+    }
+
+    #[test]
+    fn callee_resolution_policy_preserves_modeled_callee_fact_through_callsite() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts =
+            BTreeMap::from([(0x401000, modeled_callee_fact(0x401000, "sym.memcpy"))]);
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+        let callsite = CallsiteKey {
+            block_addr: 0x10,
+            op_index: 0,
+        };
+        let resolution =
+            CalleeResolutionFacts::from_direct_call_targets([(callsite, 0x401000)], &ctx);
+
+        let resolved =
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: Some(&resolution),
+                    callsite: Some(callsite),
+                    prepared_identity: None,
+                    prepared_direct_target: None,
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .expect("callsite identity should resolve");
+
+        assert_eq!(
+            resolved.source,
+            CalleeTargetResolutionSource::CallsiteResolution,
+        );
+        assert!(resolved.policy.modeled);
+        assert_eq!(resolved.policy.modeled_addr, Some(0x401000));
+        assert!(
+            resolved
+                .policy
+                .sources
+                .contains(&CalleeTargetPolicySource::CalleeFact)
+        );
+    }
+
+    #[test]
+    fn callee_resolution_policy_returns_none_without_any_identity_source() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::new();
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        assert!(
+            CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+                identity: CalleeTargetIdentityRequest {
+                    resolution: None,
+                    callsite: None,
+                    prepared_identity: None,
+                    prepared_direct_target: None,
+                    direct_target_context: Some(&ctx),
+                },
+                callee_facts: &callee_facts,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn callee_identity_raw_or_normalized_name_matching_is_disjunctive() {
+        let mut alias_only = minimal_identity_with_key(None);
+        alias_only.aliases.insert("sym.alias_only".to_string());
+        assert!(
+            CalleeResolutionFacts::identity_matches_raw_or_normalized_name(
+                &alias_only,
+                "sym.alias_only",
+                "",
+            )
+        );
+        assert!(
+            !CalleeResolutionFacts::identity_matches_raw_or_normalized_name(
+                &alias_only,
+                "sym.other",
+                "",
+            )
+        );
+
+        let mut raw_only = minimal_identity_with_key(None);
+        raw_only.raw_name = Some("sym.raw_only".to_string());
+        assert!(
+            CalleeResolutionFacts::identity_matches_raw_or_normalized_name(
+                &raw_only,
+                "sym.raw_only",
+                "",
+            )
+        );
+
+        let mut display_only = minimal_identity_with_key(None);
+        display_only.display_name = Some("sym.display_only".to_string());
+        assert!(
+            CalleeResolutionFacts::identity_matches_raw_or_normalized_name(
+                &display_only,
+                "sym.display_only",
+                "",
+            )
+        );
+
+        let normalized_only = minimal_identity_with_key(Some("printf"));
+        assert!(
+            CalleeResolutionFacts::identity_matches_raw_or_normalized_name(
+                &normalized_only,
+                "sym.imp.printf",
+                "printf",
+            )
+        );
+        assert!(
+            !CalleeResolutionFacts::identity_matches_raw_or_normalized_name(
+                &normalized_only,
+                "sym.imp.printf",
+                "",
+            )
+        );
     }
 
     #[test]
@@ -875,7 +2081,8 @@ mod tests {
     fn callee_resolution_facts_index_direct_call_targets_deterministically() {
         let function_names = HashMap::from([(0x401000, "sym.function_name".to_string())]);
         let symbols = HashMap::from([(0x401000, "sym.symbol_name".to_string())]);
-        let callee_facts = BTreeMap::from([(0x401000, callee_fact(0x401000, "sym.imp.printf"))]);
+        let callee_facts =
+            BTreeMap::from([(0x401000, imported_callee_fact(0x401000, "sym.imp.printf"))]);
         let known_signatures = HashMap::from([("printf".to_string(), non_variadic_signature(2))]);
         let ctx =
             empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
@@ -897,6 +2104,7 @@ mod tests {
         assert_eq!(by_site.primary_key(), "printf");
         assert_eq!(by_site.non_variadic_known_arity(), Some(2));
         assert!(by_site.is_imported_name_hint());
+        assert!(by_site.is_import_policy_authorized());
 
         let by_addr = facts
             .identity_for_direct_addr(0x401000)
@@ -905,6 +2113,66 @@ mod tests {
         assert_eq!(facts.identity_for_name("printf"), Some(by_site));
         assert_eq!(facts.identity_for_name("sym.imp.printf@plt"), Some(by_site));
         assert_eq!(facts.identity_for_name("sym.function_name"), Some(by_site));
+    }
+
+    #[test]
+    fn callee_resolution_facts_index_named_known_signatures_deterministically() {
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::from([
+            ("sym.imp.printf".to_string(), non_variadic_signature(1)),
+            ("strcmp".to_string(), non_variadic_signature(2)),
+        ]);
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let facts = CalleeResolutionFacts::from_context(&ctx);
+
+        let printf = facts
+            .identity_for_name("printf")
+            .expect("known signature should be indexed as named identity");
+        assert_eq!(printf.non_variadic_known_arity(), Some(1));
+        assert!(printf.is_imported_name_hint());
+        assert!(
+            !printf.is_import_policy_authorized(),
+            "known signature evidence alone must not authorize import policy"
+        );
+        let strcmp = facts
+            .identity_for_name("sym.imp.strcmp@plt")
+            .expect("normalized known signature alias should resolve");
+        assert_eq!(strcmp.non_variadic_known_arity(), Some(2));
+        assert_eq!(
+            facts.by_key.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                CalleeIdentityKey::Named("printf".to_string()),
+                CalleeIdentityKey::Named("strcmp".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn callee_resolution_facts_direct_identity_wins_over_named_signature_alias() {
+        let function_names = HashMap::from([(0x401000, "sym.imp.printf@plt".to_string())]);
+        let symbols = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let known_signatures = HashMap::from([("printf".to_string(), non_variadic_signature(2))]);
+        let ctx =
+            empty_identity_context(&function_names, &symbols, &callee_facts, &known_signatures);
+
+        let facts = CalleeResolutionFacts::from_context(&ctx);
+
+        let by_addr = facts
+            .identity_for_direct_addr(0x401000)
+            .expect("function-name address should be indexed");
+        assert_eq!(facts.identity_for_name("printf"), Some(by_addr));
+        assert_eq!(by_addr.non_variadic_known_arity(), Some(2));
+        assert!(
+            facts
+                .by_key
+                .contains_key(&CalleeIdentityKey::Named("printf".to_string())),
+            "named signature identity remains available, but aliases prefer direct evidence"
+        );
     }
 
     #[test]
@@ -997,6 +2265,11 @@ mod tests {
             .evidence
             .insert(CalleeIdentityEvidence::ImportedNameHint);
         assert!(imported_with_evidence.is_imported_name_hint());
+        assert!(!imported_with_evidence.is_import_policy_authorized());
+
+        let import_policy_authorized = imported_with_evidence.with_import_linkage_evidence();
+        assert!(import_policy_authorized.is_imported_name_hint());
+        assert!(import_policy_authorized.is_import_policy_authorized());
 
         let mut internal_with_evidence = internal_without_evidence;
         internal_with_evidence
@@ -1022,6 +2295,25 @@ mod kani_proofs {
             7 => SSAVarNameKind::Data,
             8 => SSAVarNameKind::Got,
             _ => SSAVarNameKind::Ordinary,
+        }
+    }
+
+    fn pick_callee_class(tag: u8) -> CalleeClass {
+        match tag % 6 {
+            0 => CalleeClass::Internal,
+            1 => CalleeClass::Imported,
+            2 => CalleeClass::ExternalSymbol,
+            3 => CalleeClass::RawAddress,
+            4 => CalleeClass::Indirect,
+            _ => CalleeClass::Unknown,
+        }
+    }
+
+    fn pick_callee_linkage(tag: u8) -> CalleeLinkage {
+        match tag % 3 {
+            0 => CalleeLinkage::Unknown,
+            1 => CalleeLinkage::Internal,
+            _ => CalleeLinkage::Imported,
         }
     }
 
@@ -1098,5 +2390,197 @@ mod kani_proofs {
         assert!(callee_normalized_name_is_runtime_copy("memcpy_s"));
         assert!(callee_normalized_name_is_runtime_copy("__memcpy_chk"));
         assert!(!callee_normalized_name_is_runtime_copy("not_memcpy"));
+    }
+
+    #[kani::proof]
+    fn callee_resolution_callsite_binding_is_fail_closed() {
+        let addr_a = u64::from(kani::any::<u16>());
+        let addr_b = u64::from(kani::any::<u16>()) + 0x1_0000;
+        let key_a = CalleeIdentityKey::DirectAddress(addr_a);
+        let key_a_repeat = CalleeIdentityKey::DirectAddress(addr_a);
+        let key_b = CalleeIdentityKey::DirectAddress(addr_b);
+
+        assert!(!CalleeResolutionFacts::callsite_binding_conflicts(
+            None, &key_a,
+        ));
+        assert!(!CalleeResolutionFacts::callsite_binding_conflicts(
+            Some(&key_a),
+            &key_a_repeat,
+        ));
+        assert!(CalleeResolutionFacts::callsite_binding_conflicts(
+            Some(&key_a),
+            &key_b,
+        ));
+    }
+
+    #[kani::proof]
+    fn imported_name_hint_alone_does_not_authorize_import_policy() {
+        let class = pick_callee_class(kani::any());
+        let has_import_name_hint: bool = kani::any();
+        let has_import_linkage: bool = kani::any();
+
+        let authorized = import_policy_authorized_from_evidence(class, has_import_linkage);
+
+        if !has_import_linkage {
+            assert!(!authorized);
+        }
+        if authorized {
+            assert_eq!(class, CalleeClass::Imported);
+            assert!(has_import_linkage);
+        }
+        if has_import_name_hint && !has_import_linkage {
+            assert!(!authorized);
+        }
+    }
+
+    #[kani::proof]
+    fn callee_linkage_is_exact_import_policy_authority() {
+        let linkage = pick_callee_linkage(kani::any());
+
+        assert_eq!(
+            linkage.authorizes_import_policy(),
+            linkage == CalleeLinkage::Imported,
+        );
+    }
+
+    #[kani::proof]
+    fn call_target_contract_arg_policy_requires_import_or_model_evidence() {
+        let decision = CalleeTargetPolicyDecision {
+            imported: kani::any(),
+            modeled: kani::any(),
+            modeled_addr: None,
+            sources: BTreeSet::new(),
+        };
+
+        assert_eq!(
+            decision.arg_policy(),
+            if decision.imported || decision.modeled {
+                CalleeCallArgPolicy::ImportedLike
+            } else {
+                CalleeCallArgPolicy::Standard
+            },
+        );
+        if decision.arg_policy() == CalleeCallArgPolicy::ImportedLike {
+            assert!(decision.imported || decision.modeled);
+        }
+    }
+
+    #[kani::proof]
+    fn modeled_policy_requires_explicit_callee_fact_evidence() {
+        let evidence_count: usize = kani::any();
+        let authorized = crate::facts::model_policy_authorized_from_evidence_count(evidence_count);
+
+        assert_eq!(authorized, evidence_count > 0);
+        if evidence_count == 0 {
+            assert!(!authorized);
+        }
+    }
+
+    #[kani::proof]
+    fn call_target_contract_standard_policy_has_no_target_policy_sources() {
+        let decision = CalleeTargetPolicyDecision {
+            imported: false,
+            modeled: false,
+            modeled_addr: None,
+            sources: BTreeSet::new(),
+        };
+
+        assert_eq!(decision.arg_policy(), CalleeCallArgPolicy::Standard);
+        assert!(!decision.imported_or_modeled());
+        assert!(decision.sources.is_empty());
+    }
+
+    #[kani::proof]
+    fn callee_resolution_source_precedence_is_total() {
+        let has_prepared_identity: bool = kani::any();
+        let has_callsite_identity: bool = kani::any();
+        let has_prepared_direct_target: bool = kani::any();
+
+        let source = CalleeResolutionFacts::target_resolution_source_for_presence(
+            has_prepared_identity,
+            has_callsite_identity,
+            has_prepared_direct_target,
+        );
+
+        if has_prepared_identity {
+            assert_eq!(source, Some(CalleeTargetResolutionSource::PreparedIdentity));
+        } else if has_callsite_identity {
+            assert_eq!(
+                source,
+                Some(CalleeTargetResolutionSource::CallsiteResolution)
+            );
+        } else if has_prepared_direct_target {
+            assert_eq!(
+                source,
+                Some(CalleeTargetResolutionSource::PreparedDirectTarget)
+            );
+        } else {
+            assert_eq!(source, None);
+        }
+    }
+
+    #[kani::proof]
+    fn callee_resolution_source_returns_none_only_without_inputs() {
+        let has_prepared_identity: bool = kani::any();
+        let has_callsite_identity: bool = kani::any();
+        let has_prepared_direct_target: bool = kani::any();
+
+        let source = CalleeResolutionFacts::target_resolution_source_for_presence(
+            has_prepared_identity,
+            has_callsite_identity,
+            has_prepared_direct_target,
+        );
+
+        assert_eq!(
+            source.is_none(),
+            !has_prepared_identity && !has_callsite_identity && !has_prepared_direct_target,
+        );
+    }
+
+    #[kani::proof]
+    fn callee_resolution_source_never_skips_higher_priority_inputs() {
+        let has_prepared_identity: bool = kani::any();
+        let has_callsite_identity: bool = kani::any();
+        let has_prepared_direct_target: bool = kani::any();
+
+        let source = CalleeResolutionFacts::target_resolution_source_for_presence(
+            has_prepared_identity,
+            has_callsite_identity,
+            has_prepared_direct_target,
+        );
+
+        if source == Some(CalleeTargetResolutionSource::CallsiteResolution) {
+            assert!(!has_prepared_identity);
+            assert!(has_callsite_identity);
+        }
+        if source == Some(CalleeTargetResolutionSource::PreparedDirectTarget) {
+            assert!(!has_prepared_identity);
+            assert!(!has_callsite_identity);
+            assert!(has_prepared_direct_target);
+        }
+    }
+
+    #[kani::proof]
+    fn callee_resolution_has_no_rendered_expression_source() {
+        let has_prepared_identity: bool = kani::any();
+        let has_callsite_identity: bool = kani::any();
+        let has_prepared_direct_target: bool = kani::any();
+
+        let source = CalleeResolutionFacts::target_resolution_source_for_presence(
+            has_prepared_identity,
+            has_callsite_identity,
+            has_prepared_direct_target,
+        );
+
+        assert!(
+            matches!(
+                source,
+                Some(CalleeTargetResolutionSource::PreparedIdentity)
+                    | Some(CalleeTargetResolutionSource::CallsiteResolution)
+                    | Some(CalleeTargetResolutionSource::PreparedDirectTarget)
+                    | None
+            ),
+            "authoritative callee resolution must stay limited to typed sources",
+        );
     }
 }

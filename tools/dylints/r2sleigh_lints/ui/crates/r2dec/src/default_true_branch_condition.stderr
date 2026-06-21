@@ -1,0 +1,18 @@
+warning: r2dec must residualize unresolved branch predicates instead of rendering if (1)
+  --> $DIR/default_true_branch_condition.rs:17:5
+   |
+LL | /     ctx.extract_condition_from_block(block)
+LL | |         .unwrap_or(CExpr::IntLit(1))
+   | |____________________________________^
+   |
+   = note: `#[warn(r2dec_default_true_branch_condition)]` on by default
+
+warning: r2dec must residualize unresolved branch predicates instead of rendering if (1)
+  --> $DIR/default_true_branch_condition.rs:22:5
+   |
+LL | /     ctx.extract_condition_from_block(block)
+LL | |         .unwrap_or_else(|| CExpr::IntLit(1))
+   | |____________________________________________^
+
+warning: 2 warnings emitted
+

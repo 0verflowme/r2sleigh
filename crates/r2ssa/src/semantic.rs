@@ -375,7 +375,12 @@ pub enum CallArgumentLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResultCertificate {
+    pub call_site: CallSiteId,
+    pub at: InstId,
+    pub block_addr: u64,
+    pub op_index: usize,
     pub value: ValueId,
+    pub width: u32,
     pub carrier: ReturnCarrier,
     pub owner: Option<ValueOwner>,
 }
@@ -396,6 +401,23 @@ pub enum ReturnCarrier {
 pub enum ValueOwner {
     Value(ValueId),
     StackSlot { object: ObjectId, offset: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackReloadSourceCertificate {
+    pub value: ValueId,
+    pub reload: ValueId,
+    pub source: ValueId,
+    pub canonical_source: ValueId,
+    pub object: ObjectId,
+    pub base: StackAddressBase,
+    pub offset: i64,
+    pub value_width: u32,
+    pub memory_width: u32,
+    pub store_access: StructuredAccessId,
+    pub load_access: StructuredAccessId,
+    pub store_inst: InstId,
+    pub load_inst: InstId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,6 +449,10 @@ pub struct PreparedFunctionCertificates {
     pub stack_slots: BTreeMap<ObjectId, StackSlotCertificate>,
     pub callsites: BTreeMap<CallSiteId, CallsiteCertificate>,
     pub callsites_by_inst: BTreeMap<InstId, CallSiteId>,
+    pub call_results: BTreeMap<ValueId, CallResultCertificate>,
+    pub call_results_by_inst: BTreeMap<InstId, ValueId>,
+    pub call_results_by_callsite: BTreeMap<CallSiteId, Vec<ValueId>>,
+    pub stack_reloads: BTreeMap<ValueId, StackReloadSourceCertificate>,
     pub returns: Vec<ReturnValueCertificate>,
     pub returns_by_inst: BTreeMap<InstId, usize>,
     pub failures: Vec<PreparedProofFailure>,
@@ -507,6 +533,7 @@ impl PreparedFunctionFacts {
             function,
             graph,
             &objects,
+            &memory,
             &predicates,
             &call_sites,
             &structured,
@@ -1149,6 +1176,7 @@ fn collect_prepared_function_certificates(
     function: &SSAFunction,
     graph: &SsaGraph,
     objects: &ObjectModel,
+    memory: &MemorySSAFacts,
     predicates: &PredicateFacts,
     call_sites: &CallSiteFacts,
     structured: &StructuredDataflowFacts,
@@ -1304,6 +1332,10 @@ fn collect_prepared_function_certificates(
         })
         .collect();
 
+    let (call_results, call_results_by_inst, call_results_by_callsite) =
+        collect_call_result_certificates(function, graph, objects, call_sites, structured);
+    let stack_reloads =
+        collect_stack_reload_source_certificates(function, graph, objects, memory, structured);
     let (returns, returns_by_inst) = collect_return_value_certificates(function, graph);
 
     PreparedFunctionCertificates {
@@ -1316,6 +1348,10 @@ fn collect_prepared_function_certificates(
         stack_slots,
         callsites,
         callsites_by_inst,
+        call_results,
+        call_results_by_inst,
+        call_results_by_callsite,
+        stack_reloads,
         returns,
         returns_by_inst,
         failures: Vec::new(),
@@ -1673,6 +1709,534 @@ fn collect_return_value_certificates(
     }
 
     (returns, returns_by_inst)
+}
+
+fn collect_stack_reload_source_certificates(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    memory: &MemorySSAFacts,
+    structured: &StructuredDataflowFacts,
+) -> BTreeMap<ValueId, StackReloadSourceCertificate> {
+    let store_sources = collect_stack_store_sources(function, graph, objects, memory, structured);
+    let mut certificates = BTreeMap::new();
+    let mut ready = VecDeque::new();
+
+    for access in structured
+        .memory_accesses
+        .values()
+        .filter(|access| !access.is_write)
+    {
+        let Some(value) = access.value else {
+            continue;
+        };
+        let Some((base, offset)) = stack_object_root(objects, access.object) else {
+            continue;
+        };
+        let Some(use_fact) = unique_memory_use_for_access(memory, access) else {
+            continue;
+        };
+        let Some(source) = store_sources.get(&use_fact.version) else {
+            continue;
+        };
+        if source.object != access.object || source.memory_width != access.width {
+            continue;
+        }
+        let cert = StackReloadSourceCertificate {
+            value,
+            reload: value,
+            source: source.value,
+            canonical_source: source.canonical_source,
+            object: access.object,
+            base,
+            offset,
+            value_width: graph
+                .value(value)
+                .map(|value| value.var.size)
+                .unwrap_or(access.width),
+            memory_width: access.width,
+            store_access: source.access,
+            load_access: access.id,
+            store_inst: source.access.inst,
+            load_inst: access.id.inst,
+        };
+        insert_stack_reload_source_certificate(&mut certificates, &mut ready, cert);
+    }
+
+    while let Some(value) = ready.pop_front() {
+        let Some(cert) = certificates.get(&value).cloned() else {
+            continue;
+        };
+        for use_site in graph.use_sites(value) {
+            let Some(inst) = graph.inst(use_site.inst) else {
+                continue;
+            };
+            let Some(output) = stack_reload_propagation_output(inst, value) else {
+                continue;
+            };
+            if certificates.contains_key(&output) {
+                continue;
+            }
+            let value_width = graph
+                .value(output)
+                .map(|value| value.var.size)
+                .unwrap_or(cert.value_width);
+            insert_stack_reload_source_certificate(
+                &mut certificates,
+                &mut ready,
+                StackReloadSourceCertificate {
+                    value: output,
+                    value_width,
+                    ..cert.clone()
+                },
+            );
+        }
+    }
+
+    certificates
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StackStoreSource {
+    value: ValueId,
+    canonical_source: ValueId,
+    object: ObjectId,
+    memory_width: u32,
+    access: StructuredAccessId,
+}
+
+fn collect_stack_store_sources(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    memory: &MemorySSAFacts,
+    structured: &StructuredDataflowFacts,
+) -> BTreeMap<MemoryVersion, StackStoreSource> {
+    let mut sources = BTreeMap::new();
+    for access in structured
+        .memory_accesses
+        .values()
+        .filter(|access| access.is_write)
+    {
+        let Some(value) = access.value else {
+            continue;
+        };
+        if stack_object_root(objects, access.object).is_none() {
+            continue;
+        }
+        let Some(def_fact) = unique_memory_def_for_access(memory, access) else {
+            continue;
+        };
+        sources.insert(
+            def_fact.next_version,
+            StackStoreSource {
+                value,
+                canonical_source: canonical_stack_source_value(function, graph, value),
+                object: access.object,
+                memory_width: access.width,
+                access: access.id,
+            },
+        );
+    }
+    sources
+}
+
+fn insert_stack_reload_source_certificate(
+    certificates: &mut BTreeMap<ValueId, StackReloadSourceCertificate>,
+    ready: &mut VecDeque<ValueId>,
+    cert: StackReloadSourceCertificate,
+) {
+    let value = cert.value;
+    if certificates.contains_key(&value) {
+        return;
+    }
+    certificates.insert(value, cert);
+    ready.push_back(value);
+}
+
+fn stack_reload_propagation_output(
+    inst: &crate::graph::GraphInst,
+    source: ValueId,
+) -> Option<ValueId> {
+    let output = inst.output?;
+    match &inst.payload {
+        InstPayload::Op(
+            SSAOp::Copy { .. }
+            | SSAOp::IntZExt { .. }
+            | SSAOp::IntSExt { .. }
+            | SSAOp::Trunc { .. }
+            | SSAOp::Cast { .. }
+            | SSAOp::Subpiece { .. },
+        ) if inst.inputs.len() == 1 && inst.inputs.first().copied() == Some(source) => Some(output),
+        InstPayload::Phi { .. } if expression_phi_is_identity(inst) => {
+            (inst.inputs.first().copied() == Some(source)).then_some(output)
+        }
+        _ => None,
+    }
+}
+
+fn unique_memory_def_for_access<'a>(
+    memory: &'a MemorySSAFacts,
+    access: &StructuredMemoryAccessFact,
+) -> Option<&'a MemoryDefFact> {
+    let mut matches = memory
+        .defs_by_inst
+        .get(&access.id.inst)
+        .into_iter()
+        .flatten()
+        .filter(|def| def.location.object == access.object && def.location.size == access.width);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn unique_memory_use_for_access<'a>(
+    memory: &'a MemorySSAFacts,
+    access: &StructuredMemoryAccessFact,
+) -> Option<&'a MemoryUseFact> {
+    let mut matches = memory
+        .uses_by_inst
+        .get(&access.id.inst)
+        .into_iter()
+        .flatten()
+        .filter(|use_fact| {
+            use_fact.location.object == access.object && use_fact.location.size == access.width
+        });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn canonical_stack_source_value(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    source: ValueId,
+) -> ValueId {
+    let Some(var) = graph.value(source).map(|value| &value.var) else {
+        return source;
+    };
+    let root = canonical_value_root(function.decompile_prep_facts(), var);
+    graph.value_id_for_var(root).unwrap_or(source)
+}
+
+type CallResultCertificateIndexes = (
+    BTreeMap<ValueId, CallResultCertificate>,
+    BTreeMap<InstId, ValueId>,
+    BTreeMap<CallSiteId, Vec<ValueId>>,
+);
+
+fn collect_call_result_certificates(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    call_sites: &CallSiteFacts,
+    structured: &StructuredDataflowFacts,
+) -> CallResultCertificateIndexes {
+    let mut call_results = BTreeMap::new();
+    let mut call_results_by_inst = BTreeMap::new();
+    let mut call_results_by_callsite = BTreeMap::<CallSiteId, Vec<ValueId>>::new();
+    let callsites_by_op = call_sites
+        .by_id
+        .iter()
+        .filter_map(|(id, fact)| graph.op_site_for_inst(fact.at).map(|site| (site, *id)))
+        .collect::<BTreeMap<_, _>>();
+    let mut out_states = BTreeMap::<u64, CallResultFlowState>::new();
+    let mut worklist = function
+        .blocks()
+        .map(|block| block.addr)
+        .collect::<VecDeque<_>>();
+    let mut queued = function
+        .blocks()
+        .map(|block| block.addr)
+        .collect::<BTreeSet<_>>();
+
+    while let Some(block_addr) = worklist.pop_front() {
+        queued.remove(&block_addr);
+        let Some(block) = function.get_block(block_addr) else {
+            continue;
+        };
+        let input = merge_call_result_flow_predecessors(function, &out_states, block_addr);
+        let output = process_call_result_flow_block(
+            block,
+            graph,
+            objects,
+            call_sites,
+            structured,
+            &callsites_by_op,
+            input,
+            &mut call_results,
+            &mut call_results_by_inst,
+            &mut call_results_by_callsite,
+        );
+        if out_states.get(&block_addr) == Some(&output) {
+            continue;
+        }
+        out_states.insert(block_addr, output);
+        for succ in function.successors(block_addr) {
+            if queued.insert(succ) {
+                worklist.push_back(succ);
+            }
+        }
+    }
+
+    for values in call_results_by_callsite.values_mut() {
+        values.sort_unstable();
+        values.dedup();
+    }
+
+    (call_results, call_results_by_inst, call_results_by_callsite)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CallResultFlowState {
+    tracked: BTreeMap<ValueId, CallResultCertificate>,
+    stack_owners: BTreeMap<(ObjectId, i64), CallResultCertificate>,
+}
+
+fn merge_call_result_flow_predecessors(
+    function: &SSAFunction,
+    out_states: &BTreeMap<u64, CallResultFlowState>,
+    block_addr: u64,
+) -> CallResultFlowState {
+    let preds = function.predecessors(block_addr);
+    let Some((first, rest)) = preds.split_first() else {
+        return CallResultFlowState::default();
+    };
+    let mut merged = out_states.get(first).cloned().unwrap_or_default();
+    for pred in rest {
+        let pred_state = out_states.get(pred).cloned().unwrap_or_default();
+        merged
+            .tracked
+            .retain(|value, cert| pred_state.tracked.get(value) == Some(cert));
+        merged
+            .stack_owners
+            .retain(|slot, cert| pred_state.stack_owners.get(slot) == Some(cert));
+    }
+    merged
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_call_result_flow_block(
+    block: &crate::FunctionSSABlock,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    call_sites: &CallSiteFacts,
+    structured: &StructuredDataflowFacts,
+    callsites_by_op: &BTreeMap<(u64, usize), CallSiteId>,
+    mut state: CallResultFlowState,
+    call_results: &mut BTreeMap<ValueId, CallResultCertificate>,
+    call_results_by_inst: &mut BTreeMap<InstId, ValueId>,
+    call_results_by_callsite: &mut BTreeMap<CallSiteId, Vec<ValueId>>,
+) -> CallResultFlowState {
+    let mut active_call = None;
+    for (op_index, op) in block.ops.iter().enumerate() {
+        match op {
+            SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
+                kill_return_register_flow_values(&mut state, graph);
+                active_call = callsites_by_op.get(&(block.addr, op_index)).copied();
+            }
+            SSAOp::CallDefine { dst } => {
+                let Some(call_site_id) = active_call else {
+                    continue;
+                };
+                let Some(call_site) = call_sites.by_id.get(&call_site_id) else {
+                    continue;
+                };
+                let Some(carrier) = return_carrier_for_value(dst) else {
+                    continue;
+                };
+                let Some(value) = graph.value_id_for_var(dst) else {
+                    continue;
+                };
+                let cert = CallResultCertificate {
+                    call_site: call_site_id,
+                    at: graph
+                        .inst_id_for_op_site(block.addr, op_index)
+                        .unwrap_or(call_site.at),
+                    block_addr: block.addr,
+                    op_index,
+                    value,
+                    width: dst.size,
+                    carrier,
+                    owner: Some(ValueOwner::Value(value)),
+                };
+                insert_call_result_certificate(
+                    call_results,
+                    call_results_by_inst,
+                    call_results_by_callsite,
+                    &mut state.tracked,
+                    cert,
+                );
+            }
+            SSAOp::Copy { dst, src }
+            | SSAOp::IntZExt { dst, src }
+            | SSAOp::IntSExt { dst, src }
+            | SSAOp::Trunc { dst, src }
+            | SSAOp::Cast { dst, src, .. }
+            | SSAOp::Subpiece { dst, src, .. } => {
+                let Some(src_value) = graph.value_id_for_var(src) else {
+                    continue;
+                };
+                let Some(source) = state.tracked.get(&src_value) else {
+                    continue;
+                };
+                let Some(dst_value) = graph.value_id_for_var(dst) else {
+                    continue;
+                };
+                let cert = CallResultCertificate {
+                    call_site: source.call_site,
+                    at: graph
+                        .inst_id_for_op_site(block.addr, op_index)
+                        .unwrap_or(source.at),
+                    block_addr: block.addr,
+                    op_index,
+                    value: dst_value,
+                    width: dst.size,
+                    carrier: source.carrier.clone(),
+                    owner: source.owner.clone().or(Some(ValueOwner::Value(src_value))),
+                };
+                insert_call_result_certificate(
+                    call_results,
+                    call_results_by_inst,
+                    call_results_by_callsite,
+                    &mut state.tracked,
+                    cert,
+                );
+            }
+            SSAOp::Store { val, .. } => {
+                let value = graph.value_id_for_var(val);
+                let stack_access = value
+                    .and_then(|value| {
+                        stack_memory_access_at(
+                            structured,
+                            objects,
+                            block.addr,
+                            op_index,
+                            true,
+                            Some(value),
+                        )
+                    })
+                    .or_else(|| {
+                        stack_memory_access_at(
+                            structured, objects, block.addr, op_index, true, None,
+                        )
+                    });
+                let Some((object, offset, _access)) = stack_access else {
+                    continue;
+                };
+                let Some(value) = value else {
+                    state.stack_owners.remove(&(object, offset));
+                    continue;
+                };
+                let Some(source) = state.tracked.get(&value).cloned() else {
+                    state.stack_owners.remove(&(object, offset));
+                    continue;
+                };
+                state.stack_owners.insert(
+                    (object, offset),
+                    CallResultCertificate {
+                        owner: Some(ValueOwner::StackSlot { object, offset }),
+                        ..source.clone()
+                    },
+                );
+                call_results.entry(value).and_modify(|cert| {
+                    cert.owner = Some(ValueOwner::StackSlot { object, offset });
+                });
+                state.tracked.entry(value).and_modify(|cert| {
+                    cert.owner = Some(ValueOwner::StackSlot { object, offset });
+                });
+            }
+            SSAOp::Load { dst, .. } => {
+                let Some(dst_value) = graph.value_id_for_var(dst) else {
+                    continue;
+                };
+                let Some((object, offset, access)) = stack_memory_access_at(
+                    structured,
+                    objects,
+                    block.addr,
+                    op_index,
+                    false,
+                    Some(dst_value),
+                ) else {
+                    continue;
+                };
+                let Some(source) = state.stack_owners.get(&(object, offset)) else {
+                    continue;
+                };
+                let cert = CallResultCertificate {
+                    call_site: source.call_site,
+                    at: graph
+                        .inst_id_for_op_site(block.addr, op_index)
+                        .unwrap_or(source.at),
+                    block_addr: block.addr,
+                    op_index,
+                    value: dst_value,
+                    width: dst.size,
+                    carrier: ReturnCarrier::StackSlot {
+                        object,
+                        offset,
+                        memory_access: Some(access),
+                    },
+                    owner: Some(ValueOwner::StackSlot { object, offset }),
+                };
+                insert_call_result_certificate(
+                    call_results,
+                    call_results_by_inst,
+                    call_results_by_callsite,
+                    &mut state.tracked,
+                    cert,
+                );
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+fn kill_return_register_flow_values(state: &mut CallResultFlowState, graph: &SsaGraph) {
+    state.tracked.retain(|value, _| {
+        graph
+            .value(*value)
+            .is_none_or(|value| !is_return_value_register(&value.var))
+    });
+}
+
+fn insert_call_result_certificate(
+    call_results: &mut BTreeMap<ValueId, CallResultCertificate>,
+    call_results_by_inst: &mut BTreeMap<InstId, ValueId>,
+    call_results_by_callsite: &mut BTreeMap<CallSiteId, Vec<ValueId>>,
+    tracked: &mut BTreeMap<ValueId, CallResultCertificate>,
+    cert: CallResultCertificate,
+) {
+    call_results_by_inst.insert(cert.at, cert.value);
+    call_results_by_callsite
+        .entry(cert.call_site)
+        .or_default()
+        .push(cert.value);
+    tracked.insert(cert.value, cert.clone());
+    call_results.insert(cert.value, cert);
+}
+
+fn stack_memory_access_at(
+    structured: &StructuredDataflowFacts,
+    objects: &ObjectModel,
+    block_addr: u64,
+    op_index: usize,
+    is_write: bool,
+    value: Option<ValueId>,
+) -> Option<(ObjectId, i64, StructuredAccessId)> {
+    structured
+        .memory_accesses
+        .iter()
+        .filter(|(_, access)| {
+            access.block_addr == block_addr
+                && access.op_index == op_index
+                && access.is_write == is_write
+                && value.is_none_or(|value| access.value == Some(value))
+        })
+        .filter_map(|(access_id, access)| {
+            stack_object_offset(objects, access.object)
+                .map(|offset| (access.object, offset, *access_id))
+        })
+        .next()
 }
 
 fn push_return_value_certificate(
@@ -2453,6 +3017,20 @@ fn stack_pointer_object_offset(objects: &ObjectModel, object: ObjectId) -> Optio
             base: StackAddressBase::StackPointer,
             offset,
         } => Some(offset),
+        _ => None,
+    }
+}
+
+fn stack_object_offset(objects: &ObjectModel, object: ObjectId) -> Option<i64> {
+    stack_object_root(objects, object).map(|(_, offset)| offset)
+}
+
+fn stack_object_root(objects: &ObjectModel, object: ObjectId) -> Option<(StackAddressBase, i64)> {
+    let fact = objects.object(object)?;
+    match fact.kind {
+        ObjectKind::StackSlot { base, offset } | ObjectKind::FrameObject { base, offset } => {
+            Some((base, offset))
+        }
         _ => None,
     }
 }

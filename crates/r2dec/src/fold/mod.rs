@@ -6,7 +6,7 @@ pub(crate) mod stack;
 
 use crate::ast::CStmt;
 pub use context::FoldingContext;
-pub(crate) use context::{PtrArith, SSABlock};
+pub(crate) type SSABlock = r2ssa::FunctionSSABlock;
 use r2ssa::SSAOp;
 
 pub(super) const MAX_STACK_OFFSET_DEPTH: u32 = 8;
