@@ -436,13 +436,45 @@ pub fn merge_signature_with_register_params(
     Some(signature)
 }
 
+fn normalize_signature_param_name(name: &str) -> String {
+    name.trim()
+        .trim_start_matches('_')
+        .to_ascii_lowercase()
+        .replace('-', "_")
+}
+
+fn signature_spec_has_main_abi_evidence(signature: &FunctionSignatureSpec) -> bool {
+    let mut names = signature
+        .params
+        .iter()
+        .map(|param| normalize_signature_param_name(&param.name))
+        .collect::<Vec<_>>();
+    names.retain(|name| !name.is_empty());
+    let has_argc = names.iter().any(|name| name == "argc");
+    let has_argv = names.iter().any(|name| name == "argv");
+    let has_envp = names.iter().any(|name| name == "envp" || name == "env");
+    has_argc && (has_argv || has_envp)
+}
+
 pub fn apply_main_signature_override(
     function_name: &str,
     merged_signature: &mut Option<FunctionSignatureSpec>,
-) {
-    if is_c_main_function(function_name) {
-        *merged_signature = Some(canonical_main_signature_spec());
+) -> bool {
+    if !is_c_main_function(function_name) {
+        return false;
     }
+    let Some(signature) = merged_signature.as_ref() else {
+        return false;
+    };
+    if !signature_spec_has_main_abi_evidence(signature) {
+        return false;
+    }
+    let canonical = canonical_main_signature_spec();
+    if merged_signature.as_ref() == Some(&canonical) {
+        return false;
+    }
+    *merged_signature = Some(canonical);
+    true
 }
 
 pub fn function_type_facts_from_parsed_context(
@@ -1911,9 +1943,36 @@ mod tests {
     }
 
     #[test]
-    fn apply_main_signature_override_uses_canonical_signature() {
+    fn apply_main_signature_override_refuses_name_only_main() {
         let mut merged = None;
-        apply_main_signature_override("dbg.main", &mut merged);
+        assert!(!apply_main_signature_override("dbg.main", &mut merged));
+        assert!(merged.is_none());
+    }
+
+    #[test]
+    fn apply_main_signature_override_canonicalizes_main_shaped_signature() {
+        let mut merged = Some(FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Typedef("int".into())),
+            params: vec![
+                FunctionParamSpec {
+                    name: "argc".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                        bits: 8,
+                        signedness: crate::Signedness::Signed,
+                    }))),
+                },
+                FunctionParamSpec {
+                    name: "argv".to_string(),
+                    ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Pointer(Box::new(
+                        CTypeLike::Int {
+                            bits: 8,
+                            signedness: crate::Signedness::Signed,
+                        },
+                    ))))),
+                },
+            ],
+        });
+        assert!(apply_main_signature_override("dbg.main", &mut merged));
         let merged = merged.expect("main signature");
         assert_eq!(merged.params.len(), 3);
         assert_eq!(merged.params[0].name, "argc");

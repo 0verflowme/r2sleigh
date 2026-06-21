@@ -550,11 +550,14 @@ pub(crate) fn apply_main_signature_override(
     signature_cc: &mut InferredSignatureCcJson,
     merged_signature: &mut Option<r2types::FunctionSignatureSpec>,
 ) {
-    if !r2types::is_c_main_function(function_name) {
+    let mut canonicalized = merged_signature.clone();
+    if !r2types::apply_main_signature_override(function_name, &mut canonicalized) {
         return;
     }
 
-    let main_signature = r2types::canonical_main_signature_spec();
+    let Some(main_signature) = canonicalized else {
+        return;
+    };
     signature_cc.ret_type = main_signature
         .ret_type
         .as_ref()
@@ -2336,19 +2339,19 @@ mod tests {
             }),
             params: vec![
                 r2types::FunctionParamSpec {
-                    name: "arg0".to_string(),
+                    name: "argc".to_string(),
                     ty: Some(r2types::CTypeLike::Pointer(Box::new(
                         r2types::CTypeLike::Void,
                     ))),
                 },
                 r2types::FunctionParamSpec {
-                    name: "arg2".to_string(),
+                    name: "argv".to_string(),
                     ty: Some(r2types::CTypeLike::Pointer(Box::new(
                         r2types::CTypeLike::Void,
                     ))),
                 },
                 r2types::FunctionParamSpec {
-                    name: "arg3".to_string(),
+                    name: "envp".to_string(),
                     ty: Some(r2types::CTypeLike::Pointer(Box::new(
                         r2types::CTypeLike::Void,
                     ))),

@@ -8,8 +8,8 @@ use r2ssa::{
 
 use crate::context::{
     ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec, ParsedExternalContext,
-    StackSlotKey, apply_main_signature_override, is_c_main_function, is_generic_arg_name,
-    stack_slots_from_legacy_external_stack_vars,
+    StackSlotKey, apply_main_signature_override, canonical_main_signature_spec,
+    is_generic_arg_name, stack_slots_from_legacy_external_stack_vars,
 };
 use crate::convert::CTypeLike;
 use crate::external::{
@@ -3612,14 +3612,7 @@ fn build_type_writeback_analysis_inner(
         input.ptr_bits,
     );
     hide_unproven_stack_pointer_frame_slots(&mut input.parsed_context.stack_slots);
-    let before_main_signature = merged_signature.clone();
     apply_main_signature_override(input.function_name, &mut merged_signature);
-    if merged_signature != before_main_signature {
-        push_signature_certificate_source(
-            &mut signature_certificate_sources,
-            SignatureCertificateSource::ExternalContext,
-        );
-    }
     let before_recovered_signature = merged_signature.clone();
     merged_signature = merge_recovered_arg_types_into_signature(
         merged_signature,
@@ -3815,7 +3808,9 @@ fn build_type_writeback_analysis_inner(
     );
     let existing_types =
         parse_existing_var_types_from_specs(&input.parsed_context.stack_slots, input.ptr_bits);
-    let is_main_signature = is_c_main_function(input.function_name);
+    let is_main_signature = merged_signature
+        .as_ref()
+        .is_some_and(is_canonical_main_signature_spec);
     let var_type_ctx = VarTypeCandidateContext {
         current_context_maps: &current_context_maps,
         merged_signature: merged_signature.as_ref(),
@@ -7161,13 +7156,20 @@ fn local_scalar_override_should_apply(local: &CTypeLike, external: &CTypeLike) -
     }
 }
 
+fn is_canonical_main_signature_spec(signature: &FunctionSignatureSpec) -> bool {
+    signature == &canonical_main_signature_spec()
+}
+
 fn merge_recovered_arg_types_into_signature(
     mut signature: Option<FunctionSignatureSpec>,
     vars: &[RecoveredVariable],
     ptr_bits: u32,
-    function_name: &str,
+    _function_name: &str,
 ) -> Option<FunctionSignatureSpec> {
-    if is_c_main_function(function_name) {
+    if signature
+        .as_ref()
+        .is_some_and(is_canonical_main_signature_spec)
+    {
         return signature;
     }
 
@@ -11700,7 +11702,7 @@ mod tests {
     }
 
     #[test]
-    fn main_signature_canonicalization_updates_signature_output() {
+    fn main_name_without_signature_evidence_does_not_fabricate_signature_output() {
         let parsed_context = ParsedExternalContext::default();
         let root = r2ssa::InterprocFunctionId(0x401000);
         let mut summary =
@@ -11738,19 +11740,20 @@ mod tests {
             diagnostics: TypeWritebackDiagnostics::default(),
         };
         let analysis = build_type_writeback_analysis(input);
-        assert_eq!(analysis.signature.ret_type, "int");
-        assert_eq!(analysis.signature.params.len(), 3);
-        assert_eq!(analysis.signature.params[0].name, "argc");
-        assert_eq!(analysis.signature.params[0].param_type, "int");
-        assert_eq!(
+        assert_eq!(analysis.signature.ret_type, "void");
+        assert!(
+            analysis.signature.params.is_empty(),
+            "main name alone must not fabricate argc/argv/envp parameters"
+        );
+        assert!(
             analysis
                 .type_facts
-                .merged_signature
+                .signature_certificate
                 .as_ref()
-                .unwrap()
-                .params[1]
-                .name,
-            "argv"
+                .is_none_or(|certificate| !certificate
+                    .sources
+                    .contains(&SignatureCertificateSource::ExternalContext)),
+            "name-only main canonicalization must not create external-context authority"
         );
     }
 
