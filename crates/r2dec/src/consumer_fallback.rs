@@ -6,68 +6,17 @@ pub(crate) struct EmptyStructuringFallback {
     pub(crate) is_linear_fallback: bool,
 }
 
-pub(crate) fn recover_empty_structuring<'o, F>(
-    func: &r2ssa::SSAFunction,
-    fold_ctx: &'o crate::fold::FoldingContext<'o>,
-    folded_reason: String,
-    semantic_worker_linear_reason: Option<&str>,
-    mut linearize: F,
-) -> EmptyStructuringFallback
-where
-    F: FnMut() -> Vec<CStmt>,
-{
-    let mut unfolded = crate::ControlFlowStructurer::new_unfolded(func, fold_ctx);
-    let unfolded_stmt = unfolded.structure();
-
-    if crate::Decompiler::stmt_has_content(&unfolded_stmt) {
-        return EmptyStructuringFallback {
-            body_stmt: crate::Decompiler::prepend_comment(
-                unfolded_stmt,
-                format!("r2dec residual: {}", folded_reason),
-            ),
-            use_conservative_locals: true,
-            is_linear_fallback: false,
-        };
-    }
-
-    let unfolded_reason = unfolded
-        .safety_reason()
-        .map(str::to_string)
-        .unwrap_or_else(|| "unfolded structuring produced empty output".to_string());
-    let fallback_reason = format!("{}; {}", folded_reason, unfolded_reason);
-    let mut linear_stmts = linearize();
-
-    if let Some(reason) = semantic_worker_linear_reason {
-        return EmptyStructuringFallback {
-            body_stmt: crate::consumer_structured::semantic_worker_linear_body(
-                reason,
-                linear_stmts,
-            ),
-            use_conservative_locals: true,
-            is_linear_fallback: true,
-        };
-    }
-
-    let body_stmt = if linear_stmts.is_empty() {
-        CStmt::Block(vec![CStmt::comment(format!(
-            "r2dec fallback: {} -> no statements recovered",
-            fallback_reason
-        ))])
-    } else {
-        linear_stmts.insert(
-            0,
-            CStmt::comment(format!(
-                "r2dec residual: {} -> linear cfg emission",
-                fallback_reason
-            )),
-        );
-        CStmt::Block(linear_stmts)
-    };
-
+pub(crate) fn recover_empty_structuring(folded_reason: String) -> EmptyStructuringFallback {
     EmptyStructuringFallback {
-        body_stmt,
-        use_conservative_locals: true,
-        is_linear_fallback: true,
+        body_stmt: CStmt::Block(vec![
+            CStmt::comment(format!("r2dec residual: {}", folded_reason)),
+            CStmt::comment(
+                "render contract: failed structuring has no certified executable C body"
+                    .to_string(),
+            ),
+        ]),
+        use_conservative_locals: false,
+        is_linear_fallback: false,
     }
 }
 
@@ -159,4 +108,29 @@ pub(crate) fn semantic_fallback_comment(
         "/* r2dec fallback: skipped decompilation for {} ({}) */",
         func_name, reason
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_structuring_fallback_is_comment_only() {
+        let fallback =
+            recover_empty_structuring("folded structuring produced empty output".to_string());
+
+        assert!(!fallback.use_conservative_locals);
+        assert!(!fallback.is_linear_fallback);
+        let CStmt::Block(stmts) = fallback.body_stmt else {
+            panic!("fallback must be a comment block");
+        };
+        assert!(!stmts.is_empty());
+        assert!(
+            stmts.iter().all(|stmt| matches!(stmt, CStmt::Comment(_))),
+            "empty structuring fallback must not emit executable C: {stmts:?}"
+        );
+        assert!(stmts.iter().any(|stmt| {
+            matches!(stmt, CStmt::Comment(text) if text.contains("no certified executable C body"))
+        }));
+    }
 }

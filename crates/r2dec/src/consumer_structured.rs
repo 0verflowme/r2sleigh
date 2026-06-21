@@ -36,23 +36,6 @@ where
     }
 }
 
-pub(crate) fn semantic_worker_linear_body(reason: &str, mut linear_stmts: Vec<CStmt>) -> CStmt {
-    if linear_stmts.is_empty() {
-        return CStmt::Block(vec![CStmt::comment(format!(
-            "r2dec fallback: semantic worker linearization for {} -> no statements recovered",
-            reason
-        ))]);
-    }
-    linear_stmts.insert(
-        0,
-        CStmt::comment(format!(
-            "r2dec residual: semantic worker linearization for {}",
-            reason
-        )),
-    );
-    CStmt::Block(linear_stmts)
-}
-
 pub(crate) fn semantic_worker_comment_only_body(route: &str, reason: &str) -> CStmt {
     CStmt::Block(vec![
         CStmt::comment(format!(

@@ -4528,13 +4528,7 @@ impl Decompiler {
                 .safety_reason()
                 .map(str::to_string)
                 .unwrap_or_else(|| "folded structuring produced empty output".to_string());
-            let empty_fallback = consumer_fallback::recover_empty_structuring(
-                func,
-                &fold_ctx,
-                folded_reason,
-                None,
-                || self.linearize_function_body(func, &fold_ctx),
-            );
+            let empty_fallback = consumer_fallback::recover_empty_structuring(folded_reason);
             use_conservative_locals = empty_fallback.use_conservative_locals;
             is_linear_fallback = empty_fallback.is_linear_fallback;
             body_stmt = empty_fallback.body_stmt;
@@ -4657,17 +4651,17 @@ impl Decompiler {
             locals,
             body,
         };
-        let appended_stack_return =
-            if matches!(semantic_route, planner::SemanticRoutePlan::Standard)
-                && !matches!(c_function.ret_type, CType::Void | CType::Unknown)
-                && !c_function.body.iter().any(summary_stmt_contains_return)
-                && let Some(expr) = fold_ctx.unique_scalar_stack_return_expr()
-            {
-                c_function.body.push(CStmt::Return(Some(expr)));
-                true
-            } else {
-                false
-            };
+        let appended_stack_return = if certified_standard_mode
+            && matches!(semantic_route, planner::SemanticRoutePlan::Standard)
+            && !matches!(c_function.ret_type, CType::Void | CType::Unknown)
+            && !c_function.body.iter().any(summary_stmt_contains_return)
+            && let Some(expr) = fold_ctx.unique_scalar_stack_return_expr()
+        {
+            c_function.body.push(CStmt::Return(Some(expr)));
+            true
+        } else {
+            false
+        };
         if appended_stack_return && certified_standard_mode {
             effect_render_proofs = fold_ctx.effect_render_proofs();
         }
