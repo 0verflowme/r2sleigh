@@ -24,7 +24,7 @@ jobs:
     name: Format + Clippy + Unit Tests
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Rust PATH
         run: |
           for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
@@ -55,7 +55,7 @@ jobs:
     name: Snapshot Tests (r2r)
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Rust PATH
         run: |
           for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
@@ -145,7 +145,7 @@ jobs:
     name: Rust E2E Tests
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run Rust E2E tests
         run: cargo e2e-test
 
@@ -156,7 +156,7 @@ jobs:
     needs: [quality, r2r, e2e]
     if: github.ref == 'refs/heads/master'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Rust PATH
         run: |
           for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
