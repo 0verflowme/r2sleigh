@@ -17284,120 +17284,139 @@ mod integration_tests {
     }
 
     #[test]
-    fn live_arm64_main_atoi_arg_keeps_semantic_root() {
-        use r2il::{R2ILBlock, R2ILOp, Varnode};
-        use r2ssa::SSAFunction;
+    fn live_arm64_main_atoi_arg_without_memory_cert_residualizes() {
+        use r2il::{R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
-        let block = r2ssa::SSABlock {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.add_register(RegisterDef::new("x0", 0x4000, 8));
+        arch.add_register(RegisterDef::sub("w0", 0x4000, 4, "x0"));
+        arch.add_register(RegisterDef::new("x1", 0x4010, 8));
+        arch.add_register(RegisterDef::new("x8", 0x4080, 8));
+        arch.add_register(RegisterDef::new("sp", 0x40e0, 8));
+        arch.add_register(RegisterDef::new("x30", 0x40f0, 8));
+
+        let block = R2ILBlock {
             addr: 0x100001000,
             size: 4,
             ops: vec![
-                r2ssa::SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("SP", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:200", 0, 8),
+                R2ILOp::IntSub {
+                    dst: Varnode::register(0x40e0, 8),
+                    a: Varnode::register(0x40e0, 8),
+                    b: Varnode::constant(0x200, 8),
                 },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:slot", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:178", 0, 8),
+                R2ILOp::IntAdd {
+                    dst: Varnode::unique(1, 8),
+                    a: Varnode::register(0x40e0, 8),
+                    b: Varnode::constant(0x178, 8),
                 },
-                r2ssa::SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:slot", 1, 8),
-                    val: r2ssa::SSAVar::new("X1", 0, 8),
+                R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: Varnode::unique(1, 8),
+                    val: Varnode::register(0x4010, 8),
                 },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:slot", 2, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:178", 0, 8),
+                R2ILOp::IntAdd {
+                    dst: Varnode::unique(2, 8),
+                    a: Varnode::register(0x40e0, 8),
+                    b: Varnode::constant(0x178, 8),
                 },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X8", 1, 8),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:slot", 2, 8),
+                R2ILOp::Load {
+                    dst: Varnode::register(0x4080, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::unique(2, 8),
                 },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:arg", 1, 8),
-                    a: r2ssa::SSAVar::new("X8", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
+                R2ILOp::IntAdd {
+                    dst: Varnode::unique(3, 8),
+                    a: Varnode::register(0x4080, 8),
+                    b: Varnode::constant(8, 8),
                 },
-                r2ssa::SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X0", 1, 8),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:arg", 1, 8),
+                R2ILOp::Load {
+                    dst: Varnode::register(0x4000, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::unique(3, 8),
                 },
-                r2ssa::SSAOp::Call {
-                    target: r2ssa::SSAVar::new("const:401040", 0, 8),
+                R2ILOp::Call {
+                    target: Varnode::constant(0x401040, 8),
                 },
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X0", 2, 8),
-                    src: r2ssa::SSAVar::new("const:0", 0, 8),
+                R2ILOp::Copy {
+                    dst: Varnode::register(0x4000, 8),
+                    src: Varnode::constant(0, 8),
                 },
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("PC", 1, 8),
-                    src: r2ssa::SSAVar::new("X30", 0, 8),
-                },
-                r2ssa::SSAOp::Return {
-                    target: r2ssa::SSAVar::new("PC", 1, 8),
+                R2ILOp::Return {
+                    target: Varnode::register(0x40f0, 8),
                 },
             ],
+            switch_info: None,
+            op_metadata: Default::default(),
         };
 
-        let mut raw = R2ILBlock::new(block.addr, block.size);
-        raw.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("sym._main");
-
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::aarch64());
-        set_signature_facts(
-            &mut decompiler,
-            Some(signature_spec(
-                Some(r2dec::CType::Int(64)),
-                vec![
-                    ("arg1", Some(r2dec::CType::Int(32))),
-                    (
-                        "arg2",
-                        Some(r2dec::CType::Pointer(Box::new(r2dec::CType::Pointer(
-                            Box::new(r2dec::CType::Int(8)),
-                        )))),
-                    ),
-                ],
-            )),
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("prepared SSA")
+            .with_name("sym._main");
+        let main_signature = signature_spec(
+            Some(r2dec::CType::Int(64)),
+            vec![
+                ("arg1", Some(r2dec::CType::Int(32))),
+                (
+                    "arg2",
+                    Some(r2dec::CType::Pointer(Box::new(r2dec::CType::Pointer(
+                        Box::new(r2dec::CType::Int(8)),
+                    )))),
+                ),
+            ],
         );
-        decompiler.set_function_names(HashMap::from([(0x401040, "sym.imp.atoi".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.atoi".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                },
-                params: vec![r2types::CTypeLike::Pointer(Box::new(
-                    r2types::CTypeLike::Int {
-                        bits: 8,
+        let signature_certificate = r2types::SignatureCertificate::from_signature(
+            &main_signature,
+            [r2types::SignatureCertificateSource::ExternalContext],
+        );
+        let mut function_facts = r2types::FunctionFacts::default();
+        function_facts.types.merged_signature = Some(main_signature);
+        function_facts.types.signature_certificate = signature_certificate;
+        add_imported_callee_signature_facts(
+            &mut function_facts.types,
+            &[(
+                0x401040,
+                "sym.imp.atoi",
+                r2types::FunctionType {
+                    return_type: r2types::CTypeLike::Int {
+                        bits: 32,
                         signedness: r2types::Signedness::Signed,
                     },
-                ))],
-                variadic: false,
-            },
-        )]));
-        let output = decompiler.decompile(&func);
+                    params: vec![r2types::CTypeLike::Pointer(Box::new(
+                        r2types::CTypeLike::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
+                    ))],
+                    variadic: false,
+                },
+            )],
+        );
+        let input = r2engine::decompiler_input_from_prepared_facts(
+            prepared,
+            function_facts,
+            HashMap::from([(0x401040, "sym.imp.atoi".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::aarch64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
-            output.contains("sym.imp.atoi("),
-            "expected imported atoi call, got:\n{output}"
+            output.contains("r2dec residual: certified render contract failed"),
+            "missing memory/index proof must residualize instead of rendering fake atoi call, got:\n{output}"
         );
         assert!(
-            output.contains("arg2") && !output.contains("stack_") && !output.contains("&stack"),
-            "expected semantic argv-rooted atoi arg without stack placeholders, got:\n{output}"
+            output.contains("rendered 1 memory-like access(es)")
+                && output.contains("rendered 1 array access(es)"),
+            "residual should name the missing memory/index proof, got:\n{output}"
         );
         assert!(
-            !output.contains("atoi(*") && !output.contains("atoi(lr)"),
-            "atoi imported arg should not regress to deref or transient register form, got:\n{output}"
+            !output.contains("sym.imp.atoi(")
+                && !output.contains("atoi(*")
+                && !output.contains("atoi(lr)")
+                && !output.contains("return 0;"),
+            "uncertified imported-call rendering should not survive as executable C, got:\n{output}"
         );
     }
 

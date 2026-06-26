@@ -1021,25 +1021,12 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn call_args_map(&self) -> &HashMap<(u64, usize), Vec<analysis::CallArgBinding>> {
         &self.use_info().call_args
     }
-    fn callee_identity_context_without_known_signatures<'b>(
-        &'b self,
-        known_function_signatures: &'b HashMap<String, r2types::FunctionType>,
-    ) -> r2types::CalleeIdentityContext<'b> {
-        r2types::CalleeIdentityContext {
-            function_names: self.inputs.function_names,
-            symbols: self.inputs.symbols,
-            callee_facts: self.inputs.callee_facts,
-            known_function_signatures,
-        }
-    }
     pub(crate) fn callee_identity_for_direct_target(&self, addr: u64) -> CalleeIdentity {
-        let known_function_signatures = HashMap::new();
-        let ctx = self.callee_identity_context_without_known_signatures(&known_function_signatures);
-        r2types::CalleeResolutionFacts::identity_for_direct_target_in_context(
-            self.inputs.callee_resolution,
-            addr,
-            &ctx,
-        )
+        self.inputs
+            .callee_resolution
+            .and_then(|facts| facts.identity_for_direct_addr(addr))
+            .cloned()
+            .unwrap_or_else(|| CalleeIdentity::from_name(&format!("const:{addr:x}")))
     }
     pub(crate) fn callee_identity_for_name(&self, name: &str) -> CalleeIdentity {
         if let Some(addr) = parse_address_from_var_name(name) {
@@ -1051,13 +1038,6 @@ impl<'a> FoldingContext<'a> {
             .and_then(|facts| facts.identity_for_name(name))
         {
             return identity.clone();
-        }
-        let known_function_signatures = HashMap::new();
-        let ctx = self.callee_identity_context_without_known_signatures(&known_function_signatures);
-        if let Some(identity) =
-            r2types::CalleeResolutionFacts::identity_for_name_in_context(name, &ctx)
-        {
-            return identity;
         }
         CalleeIdentity::from_name(name)
     }

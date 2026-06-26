@@ -187,19 +187,22 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when production `r2dec` builds `CalleeResolutionFacts` internally.
+    /// Warns when production `r2dec` builds or reconstructs callee resolution
+    /// internally from raw context.
     ///
     /// ### Why is this bad?
     ///
     /// Callee resolution is an engine/type-system contract. If the decompiler
-    /// reconstructs it from prepared callsites and raw maps, rendering becomes a
-    /// second owner for call identity and can silently turn missing engine facts
-    /// into confident callee policy.
+    /// reconstructs it from prepared callsites, raw maps, or direct context
+    /// identity helpers, rendering becomes a second owner for call identity and
+    /// can silently turn missing engine facts into confident callee policy.
     ///
     /// ### Example
     ///
     /// ```rust
     /// CalleeResolutionFacts::from_direct_call_targets(targets, &ctx);
+    /// CalleeResolutionFacts::identity_for_direct_target_in_context(None, addr, &ctx);
+    /// CalleeResolutionFacts::identity_for_name_in_context(name, &ctx);
     /// ```
     ///
     /// Pass the engine-owned `CalleeResolutionFacts` through
@@ -2265,7 +2268,14 @@ fn expr_is_none_path(expr: &Expr<'_>) -> bool {
 fn callee_resolution_fallback_ownership_expr(expr: &Expr<'_>) -> bool {
     matches!(
         expr.kind,
-        ExprKind::Call(callee, _) if expr_path_last_segment_is(callee, "from_direct_call_targets")
+        ExprKind::Call(callee, _)
+            if [
+                "from_direct_call_targets",
+                "identity_for_direct_target_in_context",
+                "identity_for_name_in_context",
+            ]
+            .iter()
+            .any(|name| expr_path_last_segment_is(callee, name))
     )
 }
 

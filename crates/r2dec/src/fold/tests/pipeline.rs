@@ -12783,7 +12783,7 @@ mod tests {
     }
 
     #[test]
-    fn callee_fact_name_fallback_resolves_normalized_alias_without_import_policy() {
+    fn raw_callee_fact_name_does_not_resolve_normalized_alias_without_typed_resolution() {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
             0x401000,
@@ -12792,18 +12792,63 @@ mod tests {
 
         let identity = ctx.callee_identity_for_name("printf");
 
-        assert_eq!(identity.target_addr, Some(0x401000));
+        assert_eq!(identity.target_addr, None);
         assert_eq!(identity.normalized_name(), "printf");
         assert!(
             !ctx.callee_target_policy_for_identity(&identity).imported,
-            "normalized aliases resolve identity, but import-looking names are not import authority",
+            "raw callee facts must not resolve normalized aliases outside typed callee resolution",
         );
     }
 
     #[test]
-    fn callee_fact_name_fallback_authorizes_import_policy_with_explicit_linkage() {
+    fn typed_callee_resolution_resolves_normalized_alias_without_import_policy() {
         let mut ctx = make_aarch64_ctx();
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401000, "sym.imp.printf")]);
+        let callee_facts = BTreeMap::from([(
+            0x401000,
+            minimal_callee_fact(0x401000, "sym.imp.printf"),
+        )]);
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let known_signatures = HashMap::new();
+        let resolution =
+            r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            });
+        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+
+        let identity = ctx.callee_identity_for_name("printf");
+
+        assert_eq!(identity.target_addr, Some(0x401000));
+        assert_eq!(identity.normalized_name(), "printf");
+        assert!(
+            !ctx.callee_target_policy_for_identity(&identity).imported,
+            "typed normalized aliases resolve identity, but import-looking names are not import authority",
+        );
+    }
+
+    #[test]
+    fn typed_callee_resolution_authorizes_import_policy_with_explicit_linkage() {
+        let mut ctx = make_aarch64_ctx();
+        let callee_facts = BTreeMap::from([(
+            0x401000,
+            minimal_import_callee_fact(0x401000, "sym.imp.printf"),
+        )]);
+        let function_names = HashMap::new();
+        let symbols = HashMap::new();
+        let known_signatures = HashMap::new();
+        let resolution =
+            r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
+                function_names: &function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_signatures,
+            });
+        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
+        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
 
         let identity = ctx.callee_identity_for_name("printf");
 
@@ -22097,6 +22142,7 @@ mod tests {
         ));
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
 
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
