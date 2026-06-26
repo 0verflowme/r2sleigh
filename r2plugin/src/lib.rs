@@ -15036,7 +15036,7 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "x86")]
-    fn detached_x86_vuln_memcpy_artifact_keeps_authoritative_args() {
+    fn detached_x86_vuln_memcpy_artifact_residualizes_missing_printf_effect() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();
             assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
@@ -15148,19 +15148,18 @@ mod integration_tests {
             .collect();
 
         assert!(
-            output.contains("sym.imp.memcpy(buf, user_input, user_len);"),
-            "expected detached vuln_memcpy to keep authoritative memcpy args, got:\n{output}\nssa_ops={ssa_ops:?}"
+            output.contains("int64_t dbg.vuln_memcpy(int8_t* user_input, int32_t user_len)"),
+            "expected detached vuln_memcpy header to remain type-backed, got:\n{output}\nssa_ops={ssa_ops:?}"
         );
         assert!(
-            output.contains("r2sleigh residual: uncertified callsite arguments at 0x4012c9:52")
-                && output.contains("r2sleigh residual: uncertified rendered call"),
-            "detached vuln_memcpy must residualize the uncertified printf callsite instead of inventing args, got:\n{output}\nssa_ops={ssa_ops:?}"
-        );
-        assert!(
-            !output.contains("sym.imp.printf(\"Copied: %s\\n\", buf);"),
-            "detached vuln_memcpy must not emit source-shaped printf without callsite proof, got:\n{output}\nssa_ops={ssa_ops:?}"
+            output.contains("certified render contract failed")
+                && output.contains("1 executable call(s) from 2 source CallsiteCertificate(s)")
+                && output.contains("missing callsite effects must residualize"),
+            "detached vuln_memcpy must residualize the whole function when the renderer drops the uncertified printf callsite, got:\n{output}\nssa_ops={ssa_ops:?}"
         );
         for bad in [
+            "sym.imp.memcpy(buf, user_input, user_len);",
+            "sym.imp.printf(\"Copied: %s\\n\", buf);",
             "arg1",
             "arg2",
             "tmp:",
@@ -15169,7 +15168,7 @@ mod integration_tests {
         ] {
             assert!(
                 !output.contains(bad),
-                "detached vuln_memcpy should not regress to {bad:?}, got:\n{output}\nssa_ops={ssa_ops:?}"
+                "detached vuln_memcpy must not emit source-shaped C without complete callsite proof {bad:?}, got:\n{output}\nssa_ops={ssa_ops:?}"
             );
         }
     }
@@ -15709,7 +15708,7 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "x86")]
-    fn detached_x86_my_strdup_artifact_reuses_owned_call_results() {
+    fn detached_x86_my_strdup_artifact_residualizes_missing_call_effect() {
         fn decode_hex(bytes: &str) -> Vec<u8> {
             let bytes = bytes.as_bytes();
             assert_eq!(bytes.len() % 2, 0, "hex input must have even length");
@@ -15776,18 +15775,10 @@ mod integration_tests {
         )
         .expect("analysis artifact");
 
-        let mut type_facts = artifact.function_facts.types.clone();
-        add_imported_callee_facts(
-            &mut type_facts,
-            &[
-                (0x401140, "sym.imp.strlen"),
-                (0x401170, "sym.imp.memcpy"),
-                (0x401190, "sym.imp.malloc"),
-            ],
-        );
-        type_facts.known_function_signatures.extend(HashMap::from([
+        let callees = [
             (
-                "sym.imp.strlen".to_string(),
+                0x401140,
+                "sym.imp.strlen",
                 r2types::FunctionType {
                     return_type: r2types::CTypeLike::Int {
                         bits: 64,
@@ -15803,7 +15794,8 @@ mod integration_tests {
                 },
             ),
             (
-                "sym.imp.malloc".to_string(),
+                0x401190,
+                "sym.imp.malloc",
                 r2types::FunctionType {
                     return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
                     params: vec![r2types::CTypeLike::Int {
@@ -15814,7 +15806,8 @@ mod integration_tests {
                 },
             ),
             (
-                "sym.imp.memcpy".to_string(),
+                0x401170,
+                "sym.imp.memcpy",
                 r2types::FunctionType {
                     return_type: r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Unknown)),
                     params: vec![
@@ -15828,25 +15821,20 @@ mod integration_tests {
                     variadic: false,
                 },
             ),
-        ]));
+        ];
+        let artifact = analysis_artifact_with_imported_callee_signatures(artifact, &callees);
         let function_names = HashMap::from([
             (0x401140, "sym.imp.strlen".to_string()),
             (0x401170, "sym.imp.memcpy".to_string()),
             (0x401190, "sym.imp.malloc".to_string()),
         ]);
-        let function_facts = r2types::FunctionFacts::new(type_facts.clone(), None);
-        let callee_resolution = r2engine::decompile_callee_resolution_facts(
-            &artifact.ssa_func,
-            &function_facts,
-            &function_names,
-            &HashMap::new(),
+        let input = crate::decompiler::decompiler_input_from_artifact(
+            artifact.clone(),
+            function_names,
+            HashMap::new(),
+            HashMap::new(),
             64,
         );
-        let context = r2dec::DecompilerContext::default()
-            .with_type_facts(type_facts)
-            .with_function_names(function_names)
-            .with_callee_resolution(Some(callee_resolution));
-        let input = r2dec::DecompilerInput::new(artifact.ssa_func.clone(), context);
         let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
         let output = decompiler.decompile_input(&input);
         let ssa_ops: Vec<String> = artifact
@@ -15861,34 +15849,29 @@ mod integration_tests {
             .collect();
 
         assert!(
-            output.contains("len = sym.imp.strlen(s);"),
-            "expected my_strdup to keep a single owned strlen result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+            output.contains("int8_t* dbg.my_strdup(int8_t* s)"),
+            "expected my_strdup header to remain type-backed, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
         );
         assert!(
-            output.contains("dup = sym.imp.malloc(len + 1);"),
-            "expected my_strdup to assign the owned malloc result to dup, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+            output.contains("certified render contract failed")
+                && output.contains("2 executable call(s) from 3 source CallsiteCertificate(s)")
+                && output.contains("missing callsite effects must residualize"),
+            "detached my_strdup must residualize when the renderer drops a certified memcpy callsite, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
         );
-        assert!(
-            output.contains("if (dup == 0)")
-                || output.contains("if (!dup)")
-                || output.contains("if (s_home == 0)")
-                || output.contains("if (!s_home)"),
-            "expected my_strdup null-check to stay source-like without replaying helper calls, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
-        );
-        assert!(
-            output.contains("sym.imp.memcpy(dup, s, len + 1);"),
-            "expected my_strdup to reuse dup and len in memcpy, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
-        );
-        assert!(
-            output.contains("return dup;"),
-            "expected my_strdup to return the owned dup result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
-        );
-        assert!(
-            !output.contains("sym.imp.malloc(sym.imp.strlen(")
-                && !output.contains("dup = rax;")
-                && !output.contains("return len;"),
-            "my_strdup should not replay helper calls or return the strlen result, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
-        );
+        for fake in [
+            "len = sym.imp.strlen(s);",
+            "dup = sym.imp.malloc(len + 1);",
+            "sym.imp.memcpy(dup, s, len + 1);",
+            "return dup;",
+            "sym.imp.malloc(sym.imp.strlen(",
+            "dup = rax;",
+            "return len;",
+        ] {
+            assert!(
+                !output.contains(fake),
+                "detached my_strdup must not emit source-shaped C without complete callsite proof {fake:?}, got:\n{output}\nssa_ops={ssa_ops:?}\nblock_succs={block_succs:?}"
+            );
+        }
     }
 
     #[test]

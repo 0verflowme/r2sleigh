@@ -2048,6 +2048,13 @@ fn render_permission_residual_reason(
     }
 }
 
+fn missing_decompile_route_residual_comment(func_name: &str) -> String {
+    artifact_guard_fallback_comment(
+        func_name,
+        "missing FunctionFacts::decompile_route; executable C suppressed until r2engine supplies route/refusal evidence",
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 struct CertifiedOutputCounts {
     calls: usize,
@@ -2389,6 +2396,13 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
             }
         }
         let proof_counts = certified_effect_proof_counts(effect_render_proofs);
+        if counts.calls < certificates.callsites.len() {
+            reasons.push(format!(
+                "rendered {} executable call(s) from {} source CallsiteCertificate(s); missing callsite effects must residualize instead of disappearing",
+                counts.calls,
+                certificates.callsites.len()
+            ));
+        }
         if counts.calls > proof_counts.calls {
             let first_missing = counts
                 .call_nodes
@@ -3942,6 +3956,11 @@ impl Decompiler {
             .name
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        if input.context.function_facts.decompile_route().is_none()
+            && input.context.semantic_route.is_none()
+        {
+            return missing_decompile_route_residual_comment(&func_name);
+        }
         let semantic_route = input
             .context
             .route_for(&func_name, &func.cfg_risk_summary());
@@ -7627,7 +7646,21 @@ mod tests {
             )),
             ..FunctionTypeFacts::default()
         };
-        let context = DecompilerContext::default().with_type_facts(type_facts);
+        let function_facts = FunctionFacts::new(type_facts, None).with_decompile_route(
+            r2types::DecompileRouteFacts {
+                kind: r2types::DecompileRouteKind::Standard,
+                reason: Some("test-certified standard route".to_string()),
+                fallback_comment: None,
+                skip_runtime_type_inference: false,
+                use_prepared_semantic_view: true,
+                proof_coverage: r2sym::ProofCoverage::default(),
+                render_permission: r2sym::RenderPermission::certified(
+                    r2sym::ProofOwner::R2engine,
+                    "test-certified standard route",
+                ),
+            },
+        );
+        let context = DecompilerContext::default().with_function_facts(function_facts);
 
         let mut legacy = Decompiler::new(DecompilerConfig::x86_64());
         legacy.set_type_facts(context.type_facts().clone());
@@ -7644,6 +7677,29 @@ mod tests {
         assert!(typed_text.contains("stable_demo"));
         assert!(typed_text.contains("return"));
         assert!(typed_text.contains("arg2"), "{typed_text}");
+    }
+
+    #[test]
+    fn decompile_input_without_route_facts_residualizes() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let input = DecompilerInput::new(prepared, DecompilerContext::default());
+
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+
+        assert!(
+            output.contains("missing FunctionFacts::decompile_route"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("return 0;"),
+            "missing route facts must not render executable C, got:\n{output}"
+        );
     }
 
     #[test]
@@ -8079,6 +8135,35 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("first missing node stmt:0.0"), "{reason}");
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_missing_source_call_effect() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Call {
+                target: Varnode::constant(0x401000, 8),
+            }],
+            &arch,
+        );
+        assert_eq!(prepared.certificates().callsites.len(), 1);
+        let func = CFunction::new("missing_call", CType::Void)
+            .with_body(vec![CStmt::comment("no executable call rendered")]);
+        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&[]),
+        )
+        .expect("missing source call effect should break certified rendering");
+
+        assert!(
+            reason.contains("rendered 0 executable call(s) from 1 source CallsiteCertificate(s)")
+                && reason.contains("missing callsite effects must residualize"),
+            "{reason}"
+        );
     }
 
     #[test]
