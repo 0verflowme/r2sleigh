@@ -43,6 +43,7 @@ pub struct CallsiteArgumentFacts {
     pub target: r2ssa::ValueId,
     pub direct_target: Option<u64>,
     pub argument_values: Vec<CallArgumentValueFact>,
+    pub register_argument_locations: Vec<RegisterCallArgumentLocationFact>,
     pub stack_argument_locations: Vec<StackCallArgumentLocationFact>,
 }
 
@@ -59,6 +60,14 @@ impl CallsiteArgumentFacts {
 pub struct CallArgumentValueFact {
     pub index: usize,
     pub value: r2ssa::ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterCallArgumentLocationFact {
+    pub index: usize,
+    pub value: r2ssa::ValueId,
+    pub name: String,
+    pub source_inst: Option<r2ssa::InstId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,6 +726,12 @@ mod tests {
                     target: r2ssa::ValueId(10),
                     direct_target: Some(0x402000),
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    register_argument_locations: vec![RegisterCallArgumentLocationFact {
+                        index: 0,
+                        value,
+                        name: "rdi".to_string(),
+                        source_inst: Some(r2ssa::InstId(4)),
+                    }],
                     stack_argument_locations: Vec::new(),
                 },
             )]),
@@ -731,6 +746,15 @@ mod tests {
                 .and_then(|args| args.argument_value(0)),
             Some(value),
             "callsite argument proof must travel through FunctionFacts, not r2dec local inference"
+        );
+        assert_eq!(
+            facts
+                .callsites()
+                .and_then(|callsites| callsites.arguments_for_site(callsite))
+                .and_then(|args| args.register_argument_locations.first())
+                .map(|location| (location.index, location.value, location.name.as_str())),
+            Some((0, value, "rdi")),
+            "register argument location proof must travel through FunctionFacts"
         );
     }
 

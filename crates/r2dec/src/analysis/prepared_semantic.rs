@@ -1608,6 +1608,9 @@ fn canonical_call_authoritative_args(
         if argument.index != args.len() || args.len() >= limit {
             break;
         }
+        if !call_arg_value_has_location_certificate(call_facts, argument.index, argument.value) {
+            break;
+        }
         if let Some(expr) =
             authoritative_expr_for_prepared_value(block, prepared, view, argument.value)
         {
@@ -1631,6 +1634,21 @@ fn canonical_call_authoritative_args(
     }
 
     args
+}
+
+fn call_arg_value_has_location_certificate(
+    call_facts: &r2types::CallsiteArgumentFacts,
+    index: usize,
+    value: ValueId,
+) -> bool {
+    call_facts
+        .register_argument_locations
+        .iter()
+        .any(|location| location.index == index && location.value == value)
+        || call_facts
+            .stack_argument_locations
+            .iter()
+            .any(|location| location.index == index && location.value == value)
 }
 
 fn authoritative_expr_for_prepared_value(
@@ -3523,6 +3541,44 @@ mod tests {
                     block_addr,
                     op_index,
                 };
+                let register_argument_locations = cert
+                    .argument_certificates
+                    .iter()
+                    .filter_map(|argument| {
+                        let r2ssa::CallArgumentLocation::Register { name } = &argument.location
+                        else {
+                            return None;
+                        };
+                        Some(r2types::RegisterCallArgumentLocationFact {
+                            index: argument.index,
+                            value: argument.value,
+                            name: name.clone(),
+                            source_inst: argument.source_inst,
+                        })
+                    })
+                    .collect();
+                let stack_argument_locations = cert
+                    .argument_certificates
+                    .iter()
+                    .filter_map(|argument| {
+                        let r2ssa::CallArgumentLocation::Stack {
+                            object,
+                            offset,
+                            memory_access,
+                        } = argument.location
+                        else {
+                            return None;
+                        };
+                        Some(r2types::StackCallArgumentLocationFact {
+                            index: argument.index,
+                            value: argument.value,
+                            object,
+                            offset,
+                            memory_access,
+                            source_inst: argument.source_inst,
+                        })
+                    })
+                    .collect();
                 Some((
                     callsite,
                     r2types::CallsiteArgumentFacts {
@@ -3538,7 +3594,8 @@ mod tests {
                             .enumerate()
                             .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
                             .collect(),
-                        stack_argument_locations: Vec::new(),
+                        register_argument_locations,
+                        stack_argument_locations,
                     },
                 ))
             })
@@ -3960,6 +4017,44 @@ mod tests {
             call_view.authoritative_args,
             Vec::<CExpr>::new(),
             "prepared call rendering must not infer authoritative args without FunctionFacts callsite facts"
+        );
+    }
+
+    #[test]
+    fn prepared_call_args_require_function_facts_location_contract() {
+        let prepared = test_prepared_two_arg_call_artifact();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let mut callsite_facts = test_callsite_facts(&prepared);
+        let call_facts = callsite_facts
+            .by_callsite
+            .get_mut(&CallsiteKey {
+                block_addr: 0x1000,
+                op_index: 2,
+            })
+            .expect("fixture callsite facts");
+        call_facts.register_argument_locations.clear();
+        call_facts.stack_argument_locations.clear();
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            callee_resolution: None,
+            callsite_facts: Some(&callsite_facts),
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 2))
+            .expect("direct callsite should have prepared call view");
+        assert_eq!(
+            call_view.authoritative_args,
+            Vec::<CExpr>::new(),
+            "ordered values alone must not authorize executable call args without location proof"
         );
     }
 

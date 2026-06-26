@@ -811,6 +811,21 @@ pub fn decompile_callsite_argument_facts(prepared: &SsaArtifact) -> r2types::Fun
                 .enumerate()
                 .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
                 .collect();
+            let register_argument_locations = cert
+                .argument_certificates
+                .iter()
+                .filter_map(|argument| {
+                    let r2ssa::CallArgumentLocation::Register { name } = &argument.location else {
+                        return None;
+                    };
+                    Some(r2types::RegisterCallArgumentLocationFact {
+                        index: argument.index,
+                        value: argument.value,
+                        name: name.clone(),
+                        source_inst: argument.source_inst,
+                    })
+                })
+                .collect();
             let stack_argument_locations = cert
                 .argument_certificates
                 .iter()
@@ -842,6 +857,7 @@ pub fn decompile_callsite_argument_facts(prepared: &SsaArtifact) -> r2types::Fun
                     target: cert.target,
                     direct_target: cert.direct_target,
                     argument_values,
+                    register_argument_locations,
                     stack_argument_locations,
                 },
             ))
@@ -9137,5 +9153,10 @@ mod tests {
         assert_eq!(args.argument_values.len(), 2);
         assert_eq!(args.argument_values[0].index, 0);
         assert_eq!(args.argument_values[1].index, 1);
+        assert_eq!(args.register_argument_locations.len(), 2);
+        assert_eq!(args.register_argument_locations[0].index, 0);
+        assert_eq!(args.register_argument_locations[0].name, "RDI");
+        assert_eq!(args.register_argument_locations[1].index, 1);
+        assert_eq!(args.register_argument_locations[1].name, "RSI");
     }
 }

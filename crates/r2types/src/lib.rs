@@ -63,8 +63,8 @@ pub use facts::{
 pub use function_facts::{
     AnalysisPlans, CallArgumentValueFact, CallsiteArgumentFacts, DecompileCapabilityView,
     DecompileRouteFacts, DecompileRouteKind, FunctionCallsiteFacts, FunctionFacts,
-    InterprocSummaryView, StackCallArgumentLocationFact, SummaryEffectRollup, SummaryHelperView,
-    SummaryOutParamFact,
+    InterprocSummaryView, RegisterCallArgumentLocationFact, StackCallArgumentLocationFact,
+    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

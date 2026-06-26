@@ -1311,8 +1311,12 @@ fn collect_prepared_function_certificates(
             let (block_addr, op_index) = graph.op_site_for_inst(fact.at).unwrap_or_default();
             let stack_argument_values =
                 collect_stack_call_argument_values(function, graph, objects, structured, fact);
-            let argument_certificates =
-                collect_stack_call_argument_certificates(&stack_argument_values, structured);
+            let mut argument_certificates =
+                collect_register_call_argument_certificates(function, graph, fact);
+            argument_certificates.extend(collect_stack_call_argument_certificates(
+                &stack_argument_values,
+                structured,
+            ));
             callsites_by_inst.insert(fact.at, *id);
             (
                 *id,
@@ -2913,7 +2917,7 @@ fn collect_call_argument_values(
         ) {
             break;
         }
-        let Some((index, value)) = call_argument_value_for_op(op, graph) else {
+        let Some((index, value, _)) = call_argument_value_for_op(op, graph) else {
             continue;
         };
         by_index.entry(index).or_insert(value);
@@ -2927,6 +2931,47 @@ fn collect_call_argument_values(
         values.push(value);
     }
     values
+}
+
+fn collect_register_call_argument_certificates(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    call_site: &CallSiteFact,
+) -> Vec<CallArgumentCertificate> {
+    let Some((block_addr, op_idx)) = graph.op_site_for_inst(call_site.at) else {
+        return Vec::new();
+    };
+    let Some(block) = function.get_block(block_addr) else {
+        return Vec::new();
+    };
+
+    let mut by_index = BTreeMap::<usize, CallArgumentCertificate>::new();
+    for (producer_idx, op) in block.ops[..op_idx].iter().enumerate().rev() {
+        if matches!(
+            op,
+            SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::Return { .. }
+        ) {
+            break;
+        }
+        let Some((index, value, register)) = call_argument_value_for_op(op, graph) else {
+            continue;
+        };
+        by_index.entry(index).or_insert(CallArgumentCertificate {
+            index,
+            value,
+            location: CallArgumentLocation::Register { name: register },
+            source_inst: graph.inst_id_for_op_site(block_addr, producer_idx),
+        });
+    }
+
+    let mut certificates = Vec::new();
+    for index in 0..16 {
+        let Some(certificate) = by_index.remove(&index) else {
+            break;
+        };
+        certificates.push(certificate);
+    }
+    certificates
 }
 
 fn collect_stack_call_argument_values(
@@ -3035,7 +3080,7 @@ fn stack_object_root(objects: &ObjectModel, object: ObjectId) -> Option<(StackAd
     }
 }
 
-fn call_argument_value_for_op(op: &SSAOp, graph: &SsaGraph) -> Option<(usize, ValueId)> {
+fn call_argument_value_for_op(op: &SSAOp, graph: &SsaGraph) -> Option<(usize, ValueId, String)> {
     let dst = op.dst()?;
     let index = canonical_abi_arg_index(&dst.name)?;
     let source = match op {
@@ -3048,7 +3093,7 @@ fn call_argument_value_for_op(op: &SSAOp, graph: &SsaGraph) -> Option<(usize, Va
         _ => None,
     }
     .or_else(|| graph.value_id_for_var(dst))?;
-    Some((index, source))
+    Some((index, source, dst.name.clone()))
 }
 
 fn canonical_abi_arg_index(name: &str) -> Option<usize> {

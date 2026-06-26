@@ -3686,6 +3686,20 @@ mod tests {
             .value_var(call.argument_values[0])
             .expect("arg value");
         assert!(arg.is_const());
+        assert_eq!(call.argument_certificates.len(), 1);
+        let typed_arg = &call.argument_certificates[0];
+        assert_eq!(typed_arg.index, 0);
+        assert_eq!(typed_arg.value, call.argument_values[0]);
+        assert!(
+            typed_arg.source_inst.is_some(),
+            "register call argument proof must identify the producer instruction"
+        );
+        match &typed_arg.location {
+            CallArgumentLocation::Register { name } => assert_eq!(name, "x0"),
+            CallArgumentLocation::Stack { .. } => {
+                panic!("register argument should not be certified as stack")
+            }
+        }
 
         let memory = prepared
             .memory_certificate_for_op_site(0x1600, 1, false)

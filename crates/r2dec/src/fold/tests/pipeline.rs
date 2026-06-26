@@ -598,6 +598,22 @@ mod tests {
                     block_addr,
                     op_index,
                 };
+                let register_argument_locations = cert
+                    .argument_certificates
+                    .iter()
+                    .filter_map(|argument| {
+                        let r2ssa::CallArgumentLocation::Register { name } = &argument.location
+                        else {
+                            return None;
+                        };
+                        Some(r2types::RegisterCallArgumentLocationFact {
+                            index: argument.index,
+                            value: argument.value,
+                            name: name.clone(),
+                            source_inst: argument.source_inst,
+                        })
+                    })
+                    .collect();
                 let stack_argument_locations = cert
                     .argument_certificates
                     .iter()
@@ -638,6 +654,7 @@ mod tests {
                                 value,
                             })
                             .collect(),
+                        register_argument_locations,
                         stack_argument_locations,
                     },
                 ))
