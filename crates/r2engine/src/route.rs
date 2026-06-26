@@ -183,6 +183,33 @@ pub fn decompile_route_facts_from_decision(
     }
 }
 
+pub fn decompile_route_from_facts(route: &r2types::DecompileRouteFacts) -> EngineSemanticRoutePlan {
+    match route.kind {
+        r2types::DecompileRouteKind::Standard => EngineSemanticRoutePlan::Standard,
+        r2types::DecompileRouteKind::StructuredWorker => {
+            EngineSemanticRoutePlan::StructuredWorker {
+                reason: route.reason.clone().unwrap_or_default(),
+            }
+        }
+        r2types::DecompileRouteKind::SummaryIslands => EngineSemanticRoutePlan::SummaryIslands {
+            reason: route.reason.clone().unwrap_or_default(),
+        },
+        r2types::DecompileRouteKind::LinearWorker => EngineSemanticRoutePlan::LinearWorker {
+            reason: route.reason.clone().unwrap_or_default(),
+        },
+        r2types::DecompileRouteKind::VmSummary => EngineSemanticRoutePlan::VmSummary {
+            reason: route.reason.clone().unwrap_or_default(),
+        },
+        r2types::DecompileRouteKind::FallbackComment => EngineSemanticRoutePlan::FallbackComment {
+            comment: route
+                .fallback_comment
+                .clone()
+                .or_else(|| route.reason.clone())
+                .unwrap_or_default(),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,

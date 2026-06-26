@@ -32,10 +32,10 @@ pub use route::{
     EngineRouteContext, EngineRouteDecision, EngineSemanticRoutePlan, EngineTypeRouteDecision,
     EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
     decompile_probe_decision, decompile_probe_decision_for_identity, decompile_route_decision,
-    decompile_route_facts_from_decision, detached_semantic_linearization_reason,
-    detached_semantic_route_plan, has_primary_summary_only_native_worker,
-    has_renderable_primary_summary_only_native_worker, named_worker_summary_route,
-    plan_decompile_request, plan_profile_request, plan_type_request,
+    decompile_route_facts_from_decision, decompile_route_from_facts,
+    detached_semantic_linearization_reason, detached_semantic_route_plan,
+    has_primary_summary_only_native_worker, has_renderable_primary_summary_only_native_worker,
+    named_worker_summary_route, plan_decompile_request, plan_profile_request, plan_type_request,
     prefer_symbolic_large_worker_decompile, profile_route_decision, select_engine_plan,
     semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
     semantic_route_from_artifact_plan, semantic_route_plan, semantic_route_plan_from_context,
@@ -2694,7 +2694,7 @@ impl EngineSession {
 
     pub fn decompile_summary(
         &self,
-        request: EngineSummaryDecompileRequest,
+        mut request: EngineSummaryDecompileRequest,
     ) -> Option<EngineDecompileResponse> {
         let started = std::time::Instant::now();
         let mut decision = decompile_route_decision(
@@ -2716,6 +2716,9 @@ impl EngineSession {
             unreachable!("decompile request planning returned non-decompile decision");
         };
         let decision = *decision;
+        request
+            .function_facts
+            .set_decompile_route(Some(decompile_route_facts_from_decision(&decision)));
         let planning_time = started.elapsed();
         if matches!(decision.route, EngineSemanticRoutePlan::Standard)
             && request.fallback_comment.is_none()
@@ -2741,7 +2744,7 @@ impl EngineSession {
         }
 
         let render_started = std::time::Instant::now();
-        let output = render_engine_summary_decompile_request(&request, &decision)?;
+        let output = render_engine_summary_decompile_request(&request)?;
         let render_time = render_started.elapsed();
         if let Some(cache_key) = request.render_cache_key {
             self.insert_render(cache_key, output.clone());
@@ -3480,12 +3483,16 @@ fn refused_decompile_response(
 
 fn render_engine_summary_decompile_request(
     request: &EngineSummaryDecompileRequest,
-    decision: &EngineRouteDecision,
 ) -> Option<String> {
+    let route = request
+        .function_facts
+        .decompile_route()
+        .map(decompile_route_from_facts)
+        .expect("summary decompile rendering requires FunctionFacts::decompile_route");
     render_semantic_route(
         &request.function_name,
         &request.function_facts,
-        &decision.route,
+        &route,
         &request.render_target,
     )
     .or_else(|| request.fallback_comment.clone())
@@ -6861,6 +6868,43 @@ mod tests {
         assert_eq!(metrics.renders.hits, 1);
         assert_eq!(metrics.renders.misses, 1);
         assert_eq!(metrics.renders.insertions, 1);
+    }
+
+    #[test]
+    fn summary_decompile_render_reads_route_from_function_facts() {
+        let function_facts =
+            FunctionFacts::default().with_decompile_route(r2types::DecompileRouteFacts {
+                kind: r2types::DecompileRouteKind::FallbackComment,
+                reason: Some("decision-side route must not be consulted".to_string()),
+                fallback_comment: Some("/* facts-owned summary refusal */".to_string()),
+                skip_runtime_type_inference: true,
+                use_prepared_semantic_view: false,
+                proof_coverage: r2sym::ProofCoverage::default(),
+                render_permission: r2sym::RenderPermission::refuse(
+                    r2sym::ProofOwner::R2engine,
+                    "facts-owned summary refusal",
+                ),
+            });
+        let request = EngineSummaryDecompileRequest {
+            function_name: "sym.summary".to_string(),
+            cfg_summary: CFGRiskSummary {
+                block_count: 0,
+                loop_count: 0,
+                back_edge_count: 0,
+                switch_block_count: 0,
+                max_switch_cases: 0,
+            },
+            function_facts,
+            named_worker_guarded: false,
+            render_target: EngineRenderTarget::default(),
+            render_cache_key: None,
+            fallback_comment: None,
+        };
+
+        let output = render_engine_summary_decompile_request(&request)
+            .expect("facts-owned fallback route should render");
+
+        assert_eq!(output, "/* facts-owned summary refusal */");
     }
 
     #[test]
