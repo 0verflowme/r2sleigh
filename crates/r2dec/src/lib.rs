@@ -4533,6 +4533,7 @@ impl Decompiler {
                 abi_arg_regs: &self.config.arg_regs,
                 callee_resolution,
                 callsite_facts: self.context.function_facts.callsites(),
+                call_result_facts: self.context.function_facts.call_results(),
                 stack_slots: &self.context.type_facts().stack_slots,
                 visible_bindings: &self.context.type_facts().visible_bindings,
                 param_register_aliases: &param_register_aliases,
@@ -4546,6 +4547,7 @@ impl Decompiler {
             callee_facts: &self.context.type_facts().callee_facts,
             callee_resolution,
             callsite_facts: self.context.function_facts.callsites(),
+            call_result_facts: self.context.function_facts.call_results(),
             stack_slots: &self.context.type_facts().stack_slots,
             #[cfg(test)]
             external_stack_vars: &self.context.type_facts().external_stack_vars,
@@ -6247,6 +6249,7 @@ mod tests {
             callee_facts: Box::leak(Box::new(BTreeMap::new())),
             callee_resolution: None,
             callsite_facts: None,
+            call_result_facts: None,
             stack_slots: Box::leak(Box::new(BTreeMap::new())),
             external_stack_vars: Box::leak(Box::new(HashMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
@@ -10018,6 +10021,7 @@ mod tests {
             callee_facts: &decompiler.context.type_facts().callee_facts,
             callee_resolution: None,
             callsite_facts: decompiler.context.function_facts.callsites(),
+            call_result_facts: decompiler.context.function_facts.call_results(),
             stack_slots: &decompiler.context.type_facts().stack_slots,
             #[cfg(test)]
             external_stack_vars: &decompiler.context.type_facts().external_stack_vars,

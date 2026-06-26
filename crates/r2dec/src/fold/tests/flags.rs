@@ -50,6 +50,7 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
         callee_facts: empty_callee,
         callee_resolution: None,
         callsite_facts: None,
+        call_result_facts: None,
         stack_slots: empty_stack_slots,
         external_stack_vars: empty_stack,
         visible_bindings: empty_visible,

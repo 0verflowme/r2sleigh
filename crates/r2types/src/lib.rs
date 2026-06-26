@@ -61,10 +61,10 @@ pub use facts::{
     summary_hint_can_replace_weak_existing,
 };
 pub use function_facts::{
-    AnalysisPlans, CallArgumentValueFact, CallsiteArgumentFacts, DecompileCapabilityView,
-    DecompileRouteFacts, DecompileRouteKind, FunctionCallsiteFacts, FunctionFacts,
-    InterprocSummaryView, RegisterCallArgumentLocationFact, StackCallArgumentLocationFact,
-    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
+    AnalysisPlans, CallArgumentValueFact, CallResultFact, CallsiteArgumentFacts,
+    DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind, FunctionCallResultFacts,
+    FunctionCallsiteFacts, FunctionFacts, InterprocSummaryView, RegisterCallArgumentLocationFact,
+    StackCallArgumentLocationFact, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

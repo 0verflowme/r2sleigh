@@ -35,6 +35,41 @@ impl FunctionCallsiteFacts {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionCallResultFacts {
+    pub by_value: BTreeMap<r2ssa::ValueId, CallResultFact>,
+    pub by_callsite: BTreeMap<CallsiteKey, Vec<r2ssa::ValueId>>,
+}
+
+impl FunctionCallResultFacts {
+    pub fn is_empty(&self) -> bool {
+        self.by_value.is_empty() && self.by_callsite.is_empty()
+    }
+
+    pub fn result_for_value(&self, value: r2ssa::ValueId) -> Option<&CallResultFact> {
+        self.by_value.get(&value)
+    }
+
+    pub fn results_for_site(&self, callsite: CallsiteKey) -> impl Iterator<Item = &CallResultFact> {
+        self.by_callsite
+            .get(&callsite)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| self.by_value.get(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallResultFact {
+    pub callsite: CallsiteKey,
+    pub call_site_id: r2ssa::CallSiteId,
+    pub at: r2ssa::InstId,
+    pub value: r2ssa::ValueId,
+    pub width: u32,
+    pub carrier: r2ssa::ReturnCarrier,
+    pub owner: Option<r2ssa::ValueOwner>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallsiteArgumentFacts {
     pub callsite: CallsiteKey,
@@ -278,6 +313,7 @@ pub struct FunctionFacts {
     pub decompile_route: Option<DecompileRouteFacts>,
     pub callee_resolution: CalleeResolutionFacts,
     pub callsites: FunctionCallsiteFacts,
+    pub call_results: FunctionCallResultFacts,
     pub assumptions: r2ssa::AssumptionSet,
     pub plans: AnalysisPlans,
     pub summary_view: InterprocSummaryView,
@@ -300,6 +336,7 @@ impl FunctionFacts {
             decompile_route: None,
             callee_resolution: CalleeResolutionFacts::default(),
             callsites: FunctionCallsiteFacts::default(),
+            call_results: FunctionCallResultFacts::default(),
             assumptions: r2ssa::AssumptionSet::default(),
             plans,
             summary_view: InterprocSummaryView::default(),
@@ -370,6 +407,19 @@ impl FunctionFacts {
 
     pub fn callsites(&self) -> Option<&FunctionCallsiteFacts> {
         (!self.callsites.is_empty()).then_some(&self.callsites)
+    }
+
+    pub fn with_call_results(mut self, call_results: FunctionCallResultFacts) -> Self {
+        self.call_results = call_results;
+        self
+    }
+
+    pub fn set_call_results(&mut self, call_results: FunctionCallResultFacts) {
+        self.call_results = call_results;
+    }
+
+    pub fn call_results(&self) -> Option<&FunctionCallResultFacts> {
+        (!self.call_results.is_empty()).then_some(&self.call_results)
     }
 
     pub fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
@@ -755,6 +805,54 @@ mod tests {
                 .map(|location| (location.index, location.value, location.name.as_str())),
             Some((0, value, "rdi")),
             "register argument location proof must travel through FunctionFacts"
+        );
+    }
+
+    #[test]
+    fn function_facts_owns_canonical_call_results() {
+        let callsite = crate::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 7,
+        };
+        let value = r2ssa::ValueId(21);
+        let owner = r2ssa::ValueOwner::StackSlot {
+            object: r2ssa::ObjectId(3),
+            offset: -8,
+        };
+        let call_results = FunctionCallResultFacts {
+            by_value: BTreeMap::from([(
+                value,
+                CallResultFact {
+                    callsite,
+                    call_site_id: r2ssa::CallSiteId(2),
+                    at: r2ssa::InstId(8),
+                    value,
+                    width: 8,
+                    carrier: r2ssa::ReturnCarrier::Register {
+                        name: "rax".to_string(),
+                    },
+                    owner: Some(owner.clone()),
+                },
+            )]),
+            by_callsite: BTreeMap::from([(callsite, vec![value])]),
+        };
+
+        let facts = FunctionFacts::default().with_call_results(call_results);
+
+        assert_eq!(
+            facts
+                .call_results()
+                .and_then(|results| results.result_for_value(value))
+                .and_then(|result| result.owner.as_ref()),
+            Some(&owner),
+            "call-result ownership proof must travel through FunctionFacts, not r2dec local inference"
+        );
+        assert_eq!(
+            facts
+                .call_results()
+                .map(|results| results.results_for_site(callsite).count()),
+            Some(1),
+            "call-result site index must travel through FunctionFacts"
         );
     }
 

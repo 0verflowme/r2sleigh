@@ -518,6 +518,7 @@ mod tests {
             callee_facts: empty_callee,
             callee_resolution: None,
             callsite_facts: None,
+            call_result_facts: None,
             stack_slots: empty_stack_slots,
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
@@ -568,6 +569,7 @@ mod tests {
             callee_facts: empty_callee,
             callee_resolution: None,
             callsite_facts: None,
+            call_result_facts: None,
             stack_slots: empty_stack_slots,
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
@@ -663,12 +665,45 @@ mod tests {
         r2types::FunctionCallsiteFacts { by_callsite }
     }
 
+    fn test_call_result_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallResultFacts {
+        let mut by_value = BTreeMap::new();
+        let mut by_callsite = BTreeMap::<r2types::CallsiteKey, Vec<r2ssa::ValueId>>::new();
+        for cert in prepared.certificates().call_results.values() {
+            let Some(callsite_cert) = prepared.certificates().callsites.get(&cert.call_site) else {
+                continue;
+            };
+            let callsite = r2types::CallsiteKey {
+                block_addr: callsite_cert.block_addr,
+                op_index: callsite_cert.op_index,
+            };
+            by_callsite.entry(callsite).or_default().push(cert.value);
+            by_value.insert(
+                cert.value,
+                r2types::CallResultFact {
+                    callsite,
+                    call_site_id: cert.call_site,
+                    at: cert.at,
+                    value: cert.value,
+                    width: cert.width,
+                    carrier: cert.carrier.clone(),
+                    owner: cert.owner.clone(),
+                },
+            );
+        }
+        r2types::FunctionCallResultFacts {
+            by_value,
+            by_callsite,
+        }
+    }
+
     fn make_x86_64_ctx_with_prepared<'a>(
         prepared_ssa: &'a r2ssa::SsaArtifact,
     ) -> FoldingContext<'a> {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
         ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
+        ctx.inputs.call_result_facts =
+            Some(Box::leak(Box::new(test_call_result_facts(prepared_ssa))));
         ctx
     }
 
@@ -678,6 +713,8 @@ mod tests {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
         ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
+        ctx.inputs.call_result_facts =
+            Some(Box::leak(Box::new(test_call_result_facts(prepared_ssa))));
         ctx
     }
 

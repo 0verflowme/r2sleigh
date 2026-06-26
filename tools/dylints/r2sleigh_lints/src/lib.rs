@@ -460,6 +460,32 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when production `r2dec` analysis reads prepared SSA call-result
+    /// certificate maps directly.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Call-result ownership used by executable rendering must travel through
+    /// `r2types::FunctionFacts`. Reading `prepared.certificates().call_results`
+    /// in the renderer recreates a side channel and bypasses the engine-owned
+    /// evidence projection.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// prepared.certificates().call_results.get(&value);
+    /// prepared.certificates().call_results_by_callsite.get(&site);
+    /// ```
+    ///
+    /// Use instead `FunctionCallResultFacts` from `FunctionFacts`.
+    pub R2DEC_DIRECT_PREPARED_CALL_RESULT_CERTIFICATES,
+    Warn,
+    "r2dec analysis must consume FunctionFacts call-result facts instead of prepared certificate maps"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2plugin` code directly reconstructs type
     /// signature writeback authority instead of consuming a typed `r2types`
     /// decision.
@@ -767,6 +793,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
     R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
     R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
+    R2DEC_DIRECT_PREPARED_CALL_RESULT_CERTIFICATES,
     R2PLUGIN_RAW_DIRECT_CALL_TARGET,
     R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
     R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
@@ -800,6 +827,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
         R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
         R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
+        R2DEC_DIRECT_PREPARED_CALL_RESULT_CERTIFICATES,
         R2PLUGIN_RAW_DIRECT_CALL_TARGET,
         R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
         R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
@@ -1073,6 +1101,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
                 expr.span,
                 "r2dec must consume prepared call-result ownership instead of matching rendered call expressions",
+            );
+        }
+
+        if is_r2dec_analysis_path(cx, expr)
+            && !is_inside_test_item(cx, expr)
+            && r2dec_direct_prepared_call_result_certificates_expr(cx, expr)
+        {
+            span_lint(
+                cx,
+                R2DEC_DIRECT_PREPARED_CALL_RESULT_CERTIFICATES,
+                expr.span,
+                "r2dec analysis must read call-result proof from FunctionFacts, not prepared SSA certificate maps",
             );
         }
 
@@ -1522,6 +1562,26 @@ fn is_call_result_source_expr_owner_boundary_name(name: &str) -> bool {
             | "fallback_owned_call_result_register_name_from_matching_source_call"
             | "fallback_owned_call_result_register_name_from_matching_definition"
     )
+}
+
+fn r2dec_direct_prepared_call_result_certificates_expr(
+    cx: &LateContext<'_>,
+    expr: &Expr<'_>,
+) -> bool {
+    match expr.kind {
+        ExprKind::Field(_, field) => {
+            matches!(field.name.as_str(), "call_results" | "call_results_by_callsite")
+                && cx
+                    .sess()
+                    .source_map()
+                    .span_to_snippet(expr.span)
+                    .is_ok_and(|snippet| snippet.contains("certificates()."))
+        }
+        ExprKind::MethodCall(method, _, _, _) => {
+            method.ident.as_str() == "call_result_certificates_for_callsite"
+        }
+        _ => false,
+    }
 }
 
 fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
