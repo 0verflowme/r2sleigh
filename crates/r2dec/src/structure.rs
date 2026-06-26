@@ -378,7 +378,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ) {
                     return rewritten;
                 }
-                let mut cond = self.get_branch_condition(*cond_block);
+                let Some(mut cond) = self.get_branch_condition(*cond_block) else {
+                    let mut prefix = self.structure_block_prefix_stmts(*cond_block);
+                    prefix.push(CStmt::comment(format!(
+                        "r2dec residual: unresolved branch condition at 0x{cond_block:x}"
+                    )));
+                    return if prefix.len() == 1 {
+                        prefix.into_iter().next().unwrap_or(CStmt::Empty)
+                    } else {
+                        CStmt::Block(prefix)
+                    };
+                };
                 if else_region.is_none()
                     && let Some(merge_addr) = merge_block
                     && self.single_arm_if_needs_condition_inversion(
@@ -414,6 +424,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Region::WhileLoop { header, body } => {
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*header);
+                let Some(cond) = cond else {
+                    return CStmt::Block(vec![CStmt::comment(format!(
+                        "r2dec residual: unresolved loop condition at 0x{header:x}"
+                    ))]);
+                };
                 self.record_loop_render_proof(*header, predicate, condition_value, body);
                 let body_stmt = self.structure_loop_body(body);
                 CStmt::while_loop(cond, body_stmt)
@@ -421,6 +436,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Region::DoWhileLoop { body, cond_block } => {
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*cond_block);
+                let Some(cond) = cond else {
+                    return CStmt::Block(vec![CStmt::comment(format!(
+                        "r2dec residual: unresolved loop condition at 0x{cond_block:x}"
+                    ))]);
+                };
                 self.record_loop_render_proof(body.entry(), predicate, condition_value, body);
                 let body_stmt = self.structure_loop_body(body);
                 CStmt::DoWhile {
@@ -507,12 +527,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Get the switch expression from a block.
-    fn get_switch_expression(&mut self, addr: u64) -> (CExpr, Option<ValueId>) {
+    fn get_switch_expression(&mut self, addr: u64) -> Option<(CExpr, Option<ValueId>)> {
         let switch_addr = self.unique_switch_block().unwrap_or(addr);
-        let block = match self.func.get_block(switch_addr) {
-            Some(b) => b,
-            None => return (CExpr::Var("switch_expr".to_string()), None),
-        };
+        let block = self.func.get_block(switch_addr)?;
 
         if let Some(vm_step) = self
             .fold_ctx
@@ -527,33 +544,33 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             })
             && let Some(selector) = vm_step.selector.as_ref()
         {
-            return (CExpr::Var(selector.clone()), None);
+            return Some((CExpr::Var(selector.clone()), None));
         }
 
         if let Some((expr, selector)) = self
             .fold_ctx
             .resolve_switch_expr_for_block_with_selector(switch_addr)
         {
-            return (expr, selector);
+            return Some((expr, selector));
         }
 
-        if let Some(expr) =
-            Self::selector_expr_from_condition(&self.get_branch_condition(switch_addr))
+        if let Some(cond) = self.get_branch_condition(switch_addr)
+            && let Some(expr) = Self::selector_expr_from_condition(&cond)
         {
-            return (expr, None);
+            return Some((expr, None));
         }
         if let Some(expr) = self.selector_expr_from_switch_predecessors(switch_addr) {
-            return (expr, None);
+            return Some((expr, None));
         }
 
         // Look for an indirect branch which typically has the switch variable
         for op in &block.ops {
             if let Some(expr) = self.fold_ctx.extract_switch_expr(op) {
-                return (expr, None);
+                return Some((expr, None));
             }
         }
 
-        (CExpr::Var("test".to_string()), None)
+        None
     }
 
     fn unique_switch_block(&self) -> Option<u64> {
@@ -575,7 +592,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .func
             .predecessors(addr)
             .into_iter()
-            .filter_map(|pred| Self::selector_expr_from_condition(&self.get_branch_condition(pred)))
+            .filter_map(|pred| {
+                self.get_branch_condition(pred)
+                    .and_then(|cond| Self::selector_expr_from_condition(&cond))
+            })
             .collect::<Vec<_>>();
         candidates.dedup();
         (candidates.len() == 1).then(|| candidates.pop()).flatten()
@@ -616,14 +636,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         default: Option<&Region>,
         merge_block: Option<u64>,
     ) -> CStmt {
-        let (switch_expr, switch_selector) = self.get_switch_expression(switch_block);
+        let Some((switch_expr, switch_selector)) = self.get_switch_expression(switch_block) else {
+            return CStmt::Block(vec![CStmt::comment(format!(
+                "r2dec residual: unresolved switch selector at 0x{switch_block:x}"
+            ))]);
+        };
+        if cases.iter().any(|(case_value, _)| case_value.is_none()) {
+            return CStmt::Block(vec![CStmt::comment(format!(
+                "r2dec residual: unresolved switch case value at 0x{switch_block:x}"
+            ))]);
+        }
         self.record_switch_render_proof(switch_block, switch_selector, cases, default);
 
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
-            let value_expr = case_value
-                .map(|v| CExpr::IntLit(v as i64))
-                .unwrap_or(CExpr::IntLit(0));
+            let Some(case_value) = case_value else {
+                continue;
+            };
+            let value_expr = CExpr::IntLit(*case_value as i64);
             let case_stmt = self.structure_region(case_region);
             switch_cases.push(crate::ast::SwitchCase {
                 value: value_expr,
@@ -1013,17 +1043,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     }
 
     /// Get the branch condition from a block.
-    fn get_branch_condition(&mut self, addr: u64) -> CExpr {
+    fn get_branch_condition(&mut self, addr: u64) -> Option<CExpr> {
         self.get_branch_condition_with_predicate(addr).0
     }
 
     fn get_branch_condition_with_predicate(
         &mut self,
         addr: u64,
-    ) -> (CExpr, Option<PredicateId>, Option<ValueId>) {
+    ) -> (Option<CExpr>, Option<PredicateId>, Option<ValueId>) {
         let block = match self.func.get_block(addr) {
             Some(b) => b,
-            None => return (CExpr::IntLit(1), None, None),
+            None => return (None, None, None),
         };
         let predicate = self
             .fold_ctx
@@ -1040,18 +1070,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let condition_value = predicate.map(|(_, value)| value);
 
         if let Some(cond) = self.fold_ctx.extract_condition_from_block(block) {
-            return (cond, predicate_id, condition_value);
+            return (Some(cond), predicate_id, condition_value);
         }
 
         // Look for a conditional branch in the block
         for op in &block.ops {
             if let Some(cond) = self.fold_ctx.extract_condition(op) {
-                return (cond, predicate_id, condition_value);
+                return (Some(cond), predicate_id, condition_value);
             }
         }
 
-        // Default to true
-        (CExpr::IntLit(1), predicate_id, condition_value)
+        (None, predicate_id, condition_value)
     }
 
     /// Structure an irreducible region using gotos.
@@ -1730,7 +1759,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         let if_stmt = CStmt::If {
-            cond: self.get_branch_condition(cond_block),
+            cond: self.get_branch_condition(cond_block)?,
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
@@ -1796,7 +1825,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         let if_stmt = CStmt::If {
-            cond: self.get_branch_condition(cond_block),
+            cond: self.get_branch_condition(cond_block)?,
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
@@ -3609,6 +3638,29 @@ mod tests {
             a: Varnode::register(0x10, 8),
             b: Varnode::constant(1, 8),
         });
+        switch_block.push(R2ILOp::BranchInd {
+            target: Varnode::register(0x10, 8),
+        });
+        switch_block.set_switch_info(r2il::SwitchInfo {
+            switch_addr: 0x1000,
+            min_val: 0,
+            max_val: 2,
+            default_target: None,
+            cases: vec![
+                r2il::SwitchCase {
+                    value: 0,
+                    target: 0x1010,
+                },
+                r2il::SwitchCase {
+                    value: 1,
+                    target: 0x1020,
+                },
+                r2il::SwitchCase {
+                    value: 2,
+                    target: 0x1030,
+                },
+            ],
+        });
 
         let mut case_zero = R2ILBlock::new(0x1010, 4);
         case_zero.push(R2ILOp::Return {
@@ -5137,7 +5189,7 @@ mod tests {
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         assert_eq!(
             structurer.get_switch_expression(0x1000),
-            (CExpr::Var("vm.sel".to_string()), None)
+            Some((CExpr::Var("vm.sel".to_string()), None))
         );
     }
 

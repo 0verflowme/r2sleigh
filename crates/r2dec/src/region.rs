@@ -2396,6 +2396,7 @@ impl WorkingGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::CStmt;
     use crate::fold::FoldingContext;
     use crate::structure::ControlFlowStructurer;
     use r2il::{R2ILBlock, R2ILOp, Varnode};
@@ -2870,6 +2871,36 @@ mod tests {
         }
     }
 
+    fn stmt_contains_comment(stmt: &CStmt, needle: &str) -> bool {
+        match stmt {
+            CStmt::Comment(text) => text.contains(needle),
+            CStmt::Block(stmts) => stmts.iter().any(|stmt| stmt_contains_comment(stmt, needle)),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stmt_contains_comment(then_body, needle)
+                    || else_body
+                        .as_deref()
+                        .is_some_and(|stmt| stmt_contains_comment(stmt, needle))
+            }
+            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
+                stmt_contains_comment(body, needle)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases.iter().any(|case| {
+                    case.body
+                        .iter()
+                        .any(|stmt| stmt_contains_comment(stmt, needle))
+                }) || default
+                    .as_ref()
+                    .is_some_and(|body| body.iter().any(|stmt| stmt_contains_comment(stmt, needle)))
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn iterative_loop_region_uses_unique_latch_condition_block() {
         let func = build_latch_condition_loop_cfg();
@@ -2956,19 +2987,19 @@ mod tests {
 
         let ctx = FoldingContext::new(64);
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let _ = structurer.structure();
+        let rendered = structurer.structure();
         let proof_anchors = structurer
             .control_render_proofs()
             .iter()
             .map(|proof| proof.anchor)
             .collect::<BTreeSet<_>>();
         assert!(
-            proof_anchors.contains(&0x4014a9),
-            "outer natural loop needs a render proof, got {proof_anchors:x?}"
+            proof_anchors.is_empty(),
+            "predicate-less fixture must not mint loop render proofs, got {proof_anchors:x?}"
         );
         assert!(
-            proof_anchors.contains(&0x4014e7),
-            "inner natural loop needs a render proof, got {proof_anchors:x?}"
+            stmt_contains_comment(&rendered, "r2dec residual: unresolved"),
+            "predicate-less fixture should residualize unresolved control, got {rendered:?}"
         );
     }
 
