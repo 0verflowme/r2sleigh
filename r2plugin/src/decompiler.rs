@@ -5,23 +5,6 @@ use r2il::R2ILBlock;
 use std::collections::HashMap;
 
 #[cfg(test)]
-pub(crate) fn build_decompiler_context(
-    function_facts: r2types::FunctionFacts,
-    function_names: HashMap<u64, String>,
-    strings: HashMap<u64, String>,
-    symbols: HashMap<u64, String>,
-    ptr_bits: u32,
-) -> r2dec::DecompilerContext {
-    r2dec::DecompilerContext::from_function_facts(
-        function_facts,
-        function_names,
-        strings,
-        symbols,
-        ptr_bits,
-    )
-}
-
-#[cfg(test)]
 pub(crate) fn decompiler_input_from_artifact(
     artifact: FunctionAnalysisArtifact,
     function_names: HashMap<u64, String>,
@@ -31,36 +14,17 @@ pub(crate) fn decompiler_input_from_artifact(
 ) -> r2dec::DecompilerInput {
     let FunctionAnalysisArtifact {
         ssa_func,
-        mut function_facts,
+        function_facts,
         ..
     } = artifact;
-    let func_name = ssa_func
-        .function()
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("sub_{:x}", ssa_func.entry));
-    let cfg_summary = ssa_func.function().cfg_risk_summary();
-    let route_decision = r2engine::decompile_route_decision(
-        &func_name,
-        &function_facts,
-        Some(&ssa_func),
-        &function_facts.types,
-        &cfg_summary,
-    );
-    function_facts.set_decompile_route(Some(r2engine::decompile_route_facts_from_decision(
-        &route_decision,
-    )));
-    let callee_resolution = r2engine::decompile_callee_resolution_facts(
-        &ssa_func,
-        &function_facts,
-        &function_names,
-        &symbols,
+    r2engine::decompiler_input_from_prepared_facts(
+        ssa_func,
+        function_facts,
+        function_names,
+        strings,
+        symbols,
         ptr_bits,
-    );
-    let context =
-        build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits)
-            .with_callee_resolution(Some(callee_resolution));
-    r2dec::DecompilerInput::new(ssa_func, context)
+    )
 }
 
 pub(crate) fn render_named_native_worker_summary(

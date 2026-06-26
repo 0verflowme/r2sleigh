@@ -798,6 +798,47 @@ pub fn decompile_callee_resolution_facts(
     )
 }
 
+pub fn decompiler_input_from_prepared_facts(
+    ssa_func: SsaArtifact,
+    mut function_facts: FunctionFacts,
+    function_names: HashMap<u64, String>,
+    strings: HashMap<u64, String>,
+    symbols: HashMap<u64, String>,
+    ptr_bits: u32,
+) -> r2dec::DecompilerInput {
+    let func_name = ssa_func
+        .function()
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("sub_{:x}", ssa_func.entry));
+    let cfg_summary = ssa_func.function().cfg_risk_summary();
+    let route_decision = decompile_route_decision(
+        &func_name,
+        &function_facts,
+        Some(&ssa_func),
+        &function_facts.types,
+        &cfg_summary,
+    );
+    function_facts.set_decompile_route(Some(decompile_route_facts_from_decision(&route_decision)));
+    let callee_resolution = decompile_callee_resolution_facts(
+        &ssa_func,
+        &function_facts,
+        &function_names,
+        &symbols,
+        ptr_bits,
+    );
+    let context = r2dec::DecompilerContext::from_function_facts(
+        function_facts,
+        function_names,
+        strings,
+        symbols,
+        ptr_bits,
+    )
+    .with_callee_resolution(Some(callee_resolution));
+    let context = decompiler_context_with_route_decision(context, &route_decision);
+    r2dec::DecompilerInput::new(ssa_func, context)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineMetrics {
     pub cache_hit: bool,
@@ -8819,6 +8860,38 @@ mod tests {
         assert_eq!(
             context.use_prepared_semantic_view, None,
             "engine prepared-view policy must travel through FunctionFacts"
+        );
+    }
+
+    #[test]
+    fn decompiler_input_from_prepared_facts_keeps_policy_in_function_facts() {
+        let blocks = const_return_blocks(0x401000, 0);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
+
+        let input = decompiler_input_from_prepared_facts(
+            prepared,
+            FunctionFacts::default(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+
+        assert!(
+            input.context.function_facts.decompile_route().is_some(),
+            "engine-owned decompiler input assembly must stamp route facts into FunctionFacts"
+        );
+        assert_eq!(
+            input.context.semantic_route, None,
+            "engine helper must not populate the legacy r2dec route side channel"
+        );
+        assert_eq!(
+            input.context.render_permission, None,
+            "engine helper must not populate the legacy render permission side channel"
+        );
+        assert!(
+            input.context.callee_resolution.is_some(),
+            "engine helper must attach canonical callee-resolution facts"
         );
     }
 }
