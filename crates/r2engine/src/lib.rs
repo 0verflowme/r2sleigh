@@ -793,6 +793,63 @@ pub fn decompile_callee_resolution_facts(
     )
 }
 
+pub fn decompile_callsite_argument_facts(prepared: &SsaArtifact) -> r2types::FunctionCallsiteFacts {
+    let by_callsite = prepared
+        .certificates()
+        .callsites
+        .values()
+        .filter_map(|cert| {
+            let (block_addr, op_index) = prepared.inst_op_site(cert.at)?;
+            let callsite = r2types::CallsiteKey {
+                block_addr,
+                op_index,
+            };
+            let argument_values = cert
+                .argument_values
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
+                .collect();
+            let stack_argument_locations = cert
+                .argument_certificates
+                .iter()
+                .filter_map(|argument| {
+                    let r2ssa::CallArgumentLocation::Stack {
+                        object,
+                        offset,
+                        memory_access,
+                    } = argument.location
+                    else {
+                        return None;
+                    };
+                    Some(r2types::StackCallArgumentLocationFact {
+                        index: argument.index,
+                        value: argument.value,
+                        object,
+                        offset,
+                        memory_access,
+                        source_inst: argument.source_inst,
+                    })
+                })
+                .collect();
+            Some((
+                callsite,
+                r2types::CallsiteArgumentFacts {
+                    callsite,
+                    call_site_id: cert.call_site,
+                    at: cert.at,
+                    target: cert.target,
+                    direct_target: cert.direct_target,
+                    argument_values,
+                    stack_argument_locations,
+                },
+            ))
+        })
+        .collect();
+    r2types::FunctionCallsiteFacts { by_callsite }
+}
+
 pub fn decompiler_input_from_prepared_facts(
     ssa_func: SsaArtifact,
     mut function_facts: FunctionFacts,
@@ -823,6 +880,7 @@ pub fn decompiler_input_from_prepared_facts(
         ptr_bits,
     );
     function_facts.set_callee_resolution(callee_resolution);
+    function_facts.set_callsites(decompile_callsite_argument_facts(&ssa_func));
     let context = r2dec::DecompilerContext::from_function_facts(
         function_facts,
         function_names,
@@ -2701,6 +2759,9 @@ impl EngineSession {
         artifact
             .function_facts
             .set_callee_resolution(callee_resolution);
+        artifact
+            .function_facts
+            .set_callsites(decompile_callsite_argument_facts(&artifact.ssa_func));
         let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
             blocks: &analysis_request.blocks,
             function_name: &display_name,
@@ -3992,6 +4053,9 @@ fn build_engine_analysis_artifact(
         semantic_analysis.ssa_func.certificates(),
     ));
     function_facts.merge_proof_coverage(proof_coverage_from_type_facts(&function_facts.types));
+    function_facts.set_callsites(decompile_callsite_argument_facts(
+        &semantic_analysis.ssa_func,
+    ));
     Some(EngineAnalysisArtifact {
         ssa_func: semantic_analysis.ssa_func,
         pattern_ssa_func: semantic_analysis.pattern_ssa_func,
@@ -5125,6 +5189,32 @@ mod tests {
 
     fn direct_call_return_blocks(addr: u64, target: u64) -> Vec<R2ILBlock> {
         let mut block = R2ILBlock::new(addr, 4);
+        block.push(r2il::R2ILOp::Call {
+            target: r2il::Varnode::constant(target, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        vec![block]
+    }
+
+    fn x86_64_arg_arch() -> r2il::ArchSpec {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("RDI", 0x10, 8));
+        arch.add_register(r2il::RegisterDef::new("RSI", 0x18, 8));
+        arch
+    }
+
+    fn two_arg_direct_call_return_blocks(addr: u64, target: u64) -> Vec<R2ILBlock> {
+        let mut block = R2ILBlock::new(addr, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0x10, 8),
+            src: r2il::Varnode::constant(7, 8),
+        });
+        block.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0x18, 8),
+            src: r2il::Varnode::constant(9, 8),
+        });
         block.push(r2il::R2ILOp::Call {
             target: r2il::Varnode::constant(target, 8),
         });
@@ -9017,5 +9107,35 @@ mod tests {
                 .is_some(),
             "engine helper must attach canonical callee-resolution facts to FunctionFacts"
         );
+    }
+
+    #[test]
+    fn decompiler_input_from_prepared_facts_attaches_callsite_argument_facts() {
+        let arch = x86_64_arg_arch();
+        let blocks = two_arg_direct_call_return_blocks(0x401000, 0x402000);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared");
+
+        let input = decompiler_input_from_prepared_facts(
+            prepared,
+            FunctionFacts::default(),
+            HashMap::from([(0x402000, "sym.helper".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+
+        let callsite = r2types::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 2,
+        };
+        let args = input
+            .context
+            .function_facts
+            .callsites()
+            .and_then(|callsites| callsites.arguments_for_site(callsite))
+            .expect("engine helper must attach canonical callsite argument facts");
+        assert_eq!(args.argument_values.len(), 2);
+        assert_eq!(args.argument_values[0].index, 0);
+        assert_eq!(args.argument_values[1].index, 1);
     }
 }

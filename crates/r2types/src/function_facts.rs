@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::callee::CalleeResolutionFacts;
+use crate::callee::{CalleeResolutionFacts, CallsiteKey};
 use crate::facts::{
     FunctionSignatureProjection, FunctionTypeFacts, OutParamCertificateEvidence,
     OutParamCertificateSource, SignatureProjectionResult,
@@ -16,6 +18,57 @@ pub struct AnalysisPlans {
     pub type_plan: Option<r2sym::TypePlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decompile: Option<r2sym::DecompilePlan>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionCallsiteFacts {
+    pub by_callsite: BTreeMap<CallsiteKey, CallsiteArgumentFacts>,
+}
+
+impl FunctionCallsiteFacts {
+    pub fn is_empty(&self) -> bool {
+        self.by_callsite.is_empty()
+    }
+
+    pub fn arguments_for_site(&self, callsite: CallsiteKey) -> Option<&CallsiteArgumentFacts> {
+        self.by_callsite.get(&callsite)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallsiteArgumentFacts {
+    pub callsite: CallsiteKey,
+    pub call_site_id: r2ssa::CallSiteId,
+    pub at: r2ssa::InstId,
+    pub target: r2ssa::ValueId,
+    pub direct_target: Option<u64>,
+    pub argument_values: Vec<CallArgumentValueFact>,
+    pub stack_argument_locations: Vec<StackCallArgumentLocationFact>,
+}
+
+impl CallsiteArgumentFacts {
+    pub fn argument_value(&self, index: usize) -> Option<r2ssa::ValueId> {
+        self.argument_values
+            .iter()
+            .find(|argument| argument.index == index)
+            .map(|argument| argument.value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallArgumentValueFact {
+    pub index: usize,
+    pub value: r2ssa::ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackCallArgumentLocationFact {
+    pub index: usize,
+    pub value: r2ssa::ValueId,
+    pub object: r2ssa::ObjectId,
+    pub offset: i64,
+    pub memory_access: r2ssa::StructuredAccessId,
+    pub source_inst: Option<r2ssa::InstId>,
 }
 
 impl AnalysisPlans {
@@ -215,6 +268,7 @@ pub struct FunctionFacts {
     pub proof: r2sym::ProofCoverage,
     pub decompile_route: Option<DecompileRouteFacts>,
     pub callee_resolution: CalleeResolutionFacts,
+    pub callsites: FunctionCallsiteFacts,
     pub assumptions: r2ssa::AssumptionSet,
     pub plans: AnalysisPlans,
     pub summary_view: InterprocSummaryView,
@@ -236,6 +290,7 @@ impl FunctionFacts {
             proof,
             decompile_route: None,
             callee_resolution: CalleeResolutionFacts::default(),
+            callsites: FunctionCallsiteFacts::default(),
             assumptions: r2ssa::AssumptionSet::default(),
             plans,
             summary_view: InterprocSummaryView::default(),
@@ -293,6 +348,19 @@ impl FunctionFacts {
 
     pub fn callee_resolution(&self) -> Option<&CalleeResolutionFacts> {
         (!self.callee_resolution.is_empty()).then_some(&self.callee_resolution)
+    }
+
+    pub fn with_callsites(mut self, callsites: FunctionCallsiteFacts) -> Self {
+        self.callsites = callsites;
+        self
+    }
+
+    pub fn set_callsites(&mut self, callsites: FunctionCallsiteFacts) {
+        self.callsites = callsites;
+    }
+
+    pub fn callsites(&self) -> Option<&FunctionCallsiteFacts> {
+        (!self.callsites.is_empty()).then_some(&self.callsites)
     }
 
     pub fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
@@ -629,6 +697,40 @@ mod tests {
                 .and_then(|resolution| resolution.identity_for_callsite(callsite))
                 .is_some(),
             "callsite identity must travel through FunctionFacts, not a render side channel"
+        );
+    }
+
+    #[test]
+    fn function_facts_owns_canonical_callsite_arguments() {
+        let callsite = crate::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 7,
+        };
+        let value = r2ssa::ValueId(11);
+        let callsites = FunctionCallsiteFacts {
+            by_callsite: BTreeMap::from([(
+                callsite,
+                CallsiteArgumentFacts {
+                    callsite,
+                    call_site_id: r2ssa::CallSiteId(2),
+                    at: r2ssa::InstId(5),
+                    target: r2ssa::ValueId(10),
+                    direct_target: Some(0x402000),
+                    argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    stack_argument_locations: Vec::new(),
+                },
+            )]),
+        };
+
+        let facts = FunctionFacts::default().with_callsites(callsites);
+
+        assert_eq!(
+            facts
+                .callsites()
+                .and_then(|callsites| callsites.arguments_for_site(callsite))
+                .and_then(|args| args.argument_value(0)),
+            Some(value),
+            "callsite argument proof must travel through FunctionFacts, not r2dec local inference"
         );
     }
 

@@ -268,6 +268,33 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when production `r2dec` analysis defines helpers that infer
+    /// authoritative call arguments locally.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Call arguments are executable C only after upstream SSA evidence has
+    /// been carried through `r2types::FunctionFacts`. A decompiler-local
+    /// `infer_call_authoritative_arg*` helper recreates callsite ownership
+    /// downstream and can render plausible arguments without the canonical
+    /// contract.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// fn infer_call_authoritative_args(...) { ... }
+    /// ```
+    ///
+    /// Use instead `FunctionFacts` callsite argument facts populated by
+    /// `r2engine` from `r2ssa` certificates.
+    pub R2DEC_LOCAL_AUTHORITATIVE_CALL_ARG_INFERENCE,
+    Warn,
+    "r2dec must not infer authoritative call arguments outside FunctionFacts"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when summary-only `r2dec` rendering paths emit executable-looking
     /// C constructs such as `switch`, `case`, `break`, or `return`.
     ///
@@ -733,6 +760,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_CALLEE_RESOLUTION_FALLBACK_OWNERSHIP,
     R2DEC_UNCERTIFIED_CALL_ARG_CALL_POLICY,
     R2DEC_CALL_ARG_SOURCE_NAME_AUTHORITY,
+    R2DEC_LOCAL_AUTHORITATIVE_CALL_ARG_INFERENCE,
     R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
     R2DEC_ROUTE_POLICY_OWNERSHIP,
     R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
@@ -765,6 +793,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_CALLEE_RESOLUTION_FALLBACK_OWNERSHIP,
         R2DEC_UNCERTIFIED_CALL_ARG_CALL_POLICY,
         R2DEC_CALL_ARG_SOURCE_NAME_AUTHORITY,
+        R2DEC_LOCAL_AUTHORITATIVE_CALL_ARG_INFERENCE,
         R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
         R2DEC_ROUTE_POLICY_OWNERSHIP,
         R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
@@ -817,6 +846,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_ROUTE_POLICY_OWNERSHIP,
                 item.span,
                 "r2dec must not define route/refusal policy helpers; r2engine owns route selection",
+            );
+        }
+
+        if is_r2dec_analysis_span(cx, item.span)
+            && !item_is_test_only(cx, item)
+            && r2dec_local_authoritative_call_arg_inference_item(cx, item)
+        {
+            span_lint(
+                cx,
+                R2DEC_LOCAL_AUTHORITATIVE_CALL_ARG_INFERENCE,
+                item.span,
+                "r2dec must consume FunctionFacts callsite arguments instead of inferring authoritative call args locally",
             );
         }
 
@@ -1299,6 +1340,22 @@ fn r2dec_route_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) -> b
             ]
             .iter()
             .any(|needle| snippet.contains(needle))
+        })
+}
+
+fn r2dec_local_authoritative_call_arg_inference_item(
+    cx: &LateContext<'_>,
+    item: &Item<'_>,
+) -> bool {
+    if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
+        return false;
+    }
+    cx.sess()
+        .source_map()
+        .span_to_snippet(item.span)
+        .is_ok_and(|snippet| {
+            snippet.contains("fn infer_call_authoritative_arg")
+                || snippet.contains("fn infer_stack_call_authoritative_args")
         })
 }
 
@@ -2041,6 +2098,11 @@ fn is_r2dec_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
 fn is_r2dec_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
     let filename = cx.sess().source_map().span_to_filename(span);
     format!("{filename:?}").contains("crates/r2dec/src/")
+}
+
+fn is_r2dec_analysis_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
+    let filename = cx.sess().source_map().span_to_filename(span);
+    format!("{filename:?}").contains("crates/r2dec/src/analysis/")
 }
 
 fn is_r2dec_analysis_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {

@@ -7,7 +7,8 @@ use r2ssa::{
 };
 use r2types::{
     CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
-    ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding, VisibleBindingKind,
+    ExternalStackSlotRole, ExternalStackSlotSpec, FunctionCallsiteFacts, StackSlotKey,
+    VisibleBinding, VisibleBindingKind,
 };
 
 use super::lower::LowerCtx;
@@ -62,6 +63,7 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) prepared: &'a SsaArtifact,
     pub(crate) abi_arg_regs: &'a [String],
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
+    pub(crate) callsite_facts: Option<&'a FunctionCallsiteFacts>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -1561,31 +1563,14 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             assign_certified_call_result_owner(call_site.id, inputs.prepared, view, &owner);
         }
         let max_arity = prepared_call_max_arity(inputs, &call_view);
-        let mut authoritative_args = infer_call_authoritative_args(
+        let authoritative_args = canonical_call_authoritative_args(
             site,
             inputs.prepared.function(),
+            inputs.prepared,
             view,
-            inputs.abi_arg_regs,
+            inputs.callsite_facts,
             max_arity,
         );
-        let remaining_stack_args = max_arity
-            .unwrap_or(usize::MAX)
-            .saturating_sub(authoritative_args.len());
-        if remaining_stack_args > 0
-            && let Some(call_cert) = inputs.prepared.certificates().callsites.get(&call_site.id)
-        {
-            authoritative_args.extend(
-                infer_stack_call_authoritative_args(
-                    site,
-                    inputs.prepared.function(),
-                    inputs.prepared,
-                    view,
-                    call_cert,
-                )
-                .into_iter()
-                .take(remaining_stack_args),
-            );
-        }
         call_view.authoritative_arg_values =
             authoritative_args.iter().map(|(value, _)| *value).collect();
         call_view.authoritative_args = authoritative_args
@@ -1596,6 +1581,71 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
     }
 }
 
+fn canonical_call_authoritative_args(
+    site: (u64, usize),
+    function: &r2ssa::SSAFunction,
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+    callsite_facts: Option<&FunctionCallsiteFacts>,
+    max_arity: Option<usize>,
+) -> Vec<(ValueId, CExpr)> {
+    let Some(callsite_facts) = callsite_facts else {
+        return Vec::new();
+    };
+    let Some(call_facts) = callsite_facts.arguments_for_site(CallsiteKey {
+        block_addr: site.0,
+        op_index: site.1,
+    }) else {
+        return Vec::new();
+    };
+    let Some(block) = function.get_block(site.0) else {
+        return Vec::new();
+    };
+
+    let mut args = Vec::new();
+    let limit = max_arity.unwrap_or(usize::MAX);
+    for argument in &call_facts.argument_values {
+        if argument.index != args.len() || args.len() >= limit {
+            break;
+        }
+        if let Some(expr) =
+            authoritative_expr_for_prepared_value(block, prepared, view, argument.value)
+        {
+            args.push((argument.value, expr));
+        } else {
+            break;
+        }
+    }
+
+    for stack_arg in &call_facts.stack_argument_locations {
+        if args.len() >= limit {
+            break;
+        }
+        if let Some(expr) =
+            authoritative_expr_for_prepared_value(block, prepared, view, stack_arg.value)
+        {
+            args.push((stack_arg.value, expr));
+        } else {
+            break;
+        }
+    }
+
+    args
+}
+
+fn authoritative_expr_for_prepared_value(
+    block: &r2ssa::FunctionSSABlock,
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+    value: ValueId,
+) -> Option<CExpr> {
+    let var = prepared.value_var(value)?;
+    authoritative_scalar_expr_for_value(block, view, var, 0)
+        .or_else(|| scalar_owner_expr_for_value(view, var, var.size))
+        .or_else(|| view.owner_expr_for_var(var).cloned())
+        .or_else(|| Some(CExpr::Var(var.display_name())))
+}
+
 fn prepared_call_max_arity(
     _inputs: &PreparedSemanticViewInputs<'_>,
     call_view: &PreparedCallView,
@@ -1604,102 +1654,6 @@ fn prepared_call_max_arity(
         .callee_identity
         .as_ref()
         .and_then(CalleeIdentity::non_variadic_known_arity)
-}
-
-fn infer_call_authoritative_args(
-    site: (u64, usize),
-    function: &r2ssa::SSAFunction,
-    view: &PreparedSemanticView,
-    abi_arg_regs: &[String],
-    max_arity: Option<usize>,
-) -> Vec<(ValueId, CExpr)> {
-    let (block_addr, op_idx) = site;
-    let Some(block) = function.get_block(block_addr) else {
-        return Vec::new();
-    };
-
-    let mut args = Vec::new();
-    let max_regs = max_arity.unwrap_or(abi_arg_regs.len());
-    for reg_name in abi_arg_regs.iter().take(max_regs) {
-        let Some(arg) = infer_call_authoritative_arg_expr(block, op_idx, reg_name, view) else {
-            break;
-        };
-        args.push(arg);
-    }
-
-    args
-}
-
-fn infer_stack_call_authoritative_args(
-    site: (u64, usize),
-    function: &r2ssa::SSAFunction,
-    prepared: &SsaArtifact,
-    view: &PreparedSemanticView,
-    call_cert: &r2ssa::CallsiteCertificate,
-) -> Vec<(ValueId, CExpr)> {
-    let Some(block) = function.get_block(site.0) else {
-        return Vec::new();
-    };
-
-    call_cert
-        .argument_certificates
-        .iter()
-        .filter_map(|arg| {
-            let r2ssa::CallArgumentLocation::Stack { .. } = &arg.location else {
-                return None;
-            };
-            let var = prepared.value_var(arg.value)?;
-            let expr = authoritative_scalar_expr_for_value(block, view, var, 0)
-                .or_else(|| scalar_owner_expr_for_value(view, var, var.size))
-                .or_else(|| view.owner_expr_for_var(var).cloned())
-                .or_else(|| Some(CExpr::Var(var.display_name())))?;
-            Some((arg.value, expr))
-        })
-        .collect()
-}
-
-fn infer_call_authoritative_arg_expr(
-    block: &r2ssa::FunctionSSABlock,
-    op_idx: usize,
-    reg_name: &str,
-    view: &PreparedSemanticView,
-) -> Option<(ValueId, CExpr)> {
-    let reg_name = reg_name.to_ascii_lowercase();
-    for op in block.ops[..op_idx].iter().rev() {
-        match op {
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Trunc { dst, src }
-            | SSAOp::Cast { dst, src, .. }
-            | SSAOp::Subpiece { dst, src, .. }
-                if dst.name.eq_ignore_ascii_case(&reg_name) =>
-            {
-                let value = view.value_id_for_var(src)?;
-                let expr = authoritative_scalar_expr_for_value(block, view, src, 0)
-                    .or_else(|| scalar_owner_expr_for_value(view, src, src.size))
-                    .or_else(|| view.owner_expr_for_var(src).cloned())
-                    .or_else(|| Some(CExpr::Var(src.display_name())));
-                return expr.map(|expr| (value, expr));
-            }
-            other
-                if other
-                    .dst()
-                    .is_some_and(|dst| dst.name.eq_ignore_ascii_case(&reg_name)) =>
-            {
-                let dst = other.dst().expect("checked above");
-                let value = view.value_id_for_var(dst)?;
-                let expr = authoritative_scalar_expr_for_value(block, view, dst, 0)
-                    .or_else(|| scalar_owner_expr_for_value(view, dst, dst.size))
-                    .or_else(|| view.owner_expr_for_var(dst).cloned())
-                    .or_else(|| Some(CExpr::Var(dst.display_name())));
-                return expr.map(|expr| (value, expr));
-            }
-            SSAOp::Call { .. } | SSAOp::CallInd { .. } => break,
-            _ => {}
-        }
-    }
-    None
 }
 
 fn authoritative_scalar_expr_for_value(
@@ -3558,6 +3512,40 @@ mod tests {
             .expect("prepared two-arg call SSA artifact")
     }
 
+    fn test_callsite_facts(prepared: &SsaArtifact) -> r2types::FunctionCallsiteFacts {
+        let by_callsite = prepared
+            .certificates()
+            .callsites
+            .values()
+            .filter_map(|cert| {
+                let (block_addr, op_index) = prepared.inst_op_site(cert.at)?;
+                let callsite = CallsiteKey {
+                    block_addr,
+                    op_index,
+                };
+                Some((
+                    callsite,
+                    r2types::CallsiteArgumentFacts {
+                        callsite,
+                        call_site_id: cert.call_site,
+                        at: cert.at,
+                        target: cert.target,
+                        direct_target: cert.direct_target,
+                        argument_values: cert
+                            .argument_values
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
+                            .collect(),
+                        stack_argument_locations: Vec::new(),
+                    },
+                ))
+            })
+            .collect();
+        r2types::FunctionCallsiteFacts { by_callsite }
+    }
+
     #[test]
     fn prepared_call_expr_requires_argument_value_bijection() {
         let unproved = PreparedCallView {
@@ -3679,6 +3667,7 @@ mod tests {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             callee_resolution: None,
+            callsite_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3721,6 +3710,7 @@ mod tests {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             callee_resolution: Some(&callee_resolution),
+            callsite_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3775,6 +3765,7 @@ mod tests {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             callee_resolution: Some(&callee_resolution),
+            callsite_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3819,6 +3810,7 @@ mod tests {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             callee_resolution: None,
+            callsite_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3854,6 +3846,7 @@ mod tests {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             callee_resolution: None,
+            callsite_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3911,11 +3904,13 @@ mod tests {
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
+        let callsite_facts = test_callsite_facts(&prepared);
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             callee_resolution: Some(&callee_resolution),
+            callsite_facts: Some(&callsite_facts),
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3935,7 +3930,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_call_arity_rejects_summary_hint_when_typed_signature_is_absent() {
+    fn prepared_call_args_require_function_facts_callsite_contract() {
         let prepared = test_prepared_two_arg_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let mut summaries = InterprocSummarySet::default();
@@ -3952,6 +3947,36 @@ mod tests {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
             callee_resolution: None,
+            callsite_facts: None,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 2))
+            .expect("direct callsite should have prepared call view");
+        assert_eq!(
+            call_view.authoritative_args,
+            Vec::<CExpr>::new(),
+            "prepared call rendering must not infer authoritative args without FunctionFacts callsite facts"
+        );
+    }
+
+    #[test]
+    fn prepared_call_args_use_function_facts_callsite_contract() {
+        let prepared = test_prepared_two_arg_call_artifact();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let callsite_facts = test_callsite_facts(&prepared);
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            callee_resolution: None,
+            callsite_facts: Some(&callsite_facts),
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,

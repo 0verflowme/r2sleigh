@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use r2ssa::SSAVarNameKind;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     CalleeFact, CalleeLinkage, FunctionType, InterprocSummaryView, SignatureCertificateSource,
@@ -11,7 +12,7 @@ const CALLEE_IMPORT_PREFIXES: [&str; 3] = ["sym.imp.", "imp.", "reloc."];
 const CALLEE_NAMESPACE_PREFIXES: [&str; 6] = ["sym.imp.", "sym.", "imp.", "reloc.", "dbg.", "fcn."];
 const WINDOWS_RUNTIME_REGISTRATION_SUFFIX: &str = "addvectoredexceptionhandler";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallsiteKey {
     pub block_addr: u64,
     pub op_index: usize,

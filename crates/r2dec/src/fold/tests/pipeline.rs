@@ -517,6 +517,7 @@ mod tests {
             symbols: empty_u64,
             callee_facts: empty_callee,
             callee_resolution: None,
+            callsite_facts: None,
             stack_slots: empty_stack_slots,
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
@@ -566,6 +567,7 @@ mod tests {
             symbols: empty_u64,
             callee_facts: empty_callee,
             callee_resolution: None,
+            callsite_facts: None,
             stack_slots: empty_stack_slots,
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
@@ -585,11 +587,71 @@ mod tests {
         })
     }
 
+    fn test_callsite_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallsiteFacts {
+        let by_callsite = prepared
+            .certificates()
+            .callsites
+            .values()
+            .filter_map(|cert| {
+                let (block_addr, op_index) = prepared.inst_op_site(cert.at)?;
+                let callsite = r2types::CallsiteKey {
+                    block_addr,
+                    op_index,
+                };
+                let stack_argument_locations = cert
+                    .argument_certificates
+                    .iter()
+                    .filter_map(|argument| {
+                        let r2ssa::CallArgumentLocation::Stack {
+                            object,
+                            offset,
+                            memory_access,
+                        } = argument.location
+                        else {
+                            return None;
+                        };
+                        Some(r2types::StackCallArgumentLocationFact {
+                            index: argument.index,
+                            value: argument.value,
+                            object,
+                            offset,
+                            memory_access,
+                            source_inst: argument.source_inst,
+                        })
+                    })
+                    .collect();
+                Some((
+                    callsite,
+                    r2types::CallsiteArgumentFacts {
+                        callsite,
+                        call_site_id: cert.call_site,
+                        at: cert.at,
+                        target: cert.target,
+                        direct_target: cert.direct_target,
+                        argument_values: cert
+                            .argument_values
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(index, value)| r2types::CallArgumentValueFact {
+                                index,
+                                value,
+                            })
+                            .collect(),
+                        stack_argument_locations,
+                    },
+                ))
+            })
+            .collect();
+        r2types::FunctionCallsiteFacts { by_callsite }
+    }
+
     fn make_x86_64_ctx_with_prepared<'a>(
         prepared_ssa: &'a r2ssa::SsaArtifact,
     ) -> FoldingContext<'a> {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
+        ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
         ctx
     }
 
@@ -598,6 +660,7 @@ mod tests {
     ) -> FoldingContext<'a> {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
+        ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
         ctx
     }
 
