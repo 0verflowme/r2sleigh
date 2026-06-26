@@ -124,10 +124,6 @@ impl<'a> FoldingContext<'a> {
                     self.prepared_direct_call_target(block_addr, op_idx)
                 })
             });
-        let known_function_signatures = HashMap::new();
-        let direct_target_context = prepared_direct_target.is_some().then(|| {
-            self.callee_identity_context_without_known_signatures(&known_function_signatures)
-        });
         r2types::CalleeResolutionFacts::resolve_target_policy(
             r2types::CalleeTargetResolutionRequest {
                 identity: r2types::CalleeTargetIdentityRequest {
@@ -135,7 +131,7 @@ impl<'a> FoldingContext<'a> {
                     callsite,
                     prepared_identity,
                     prepared_direct_target,
-                    direct_target_context: direct_target_context.as_ref(),
+                    direct_target_context: None,
                 },
                 callee_facts: self.inputs.callee_facts,
             },
@@ -337,9 +333,20 @@ impl<'a> FoldingContext<'a> {
         direct_target: Option<u64>,
         args: Vec<CExpr>,
     ) -> Vec<CExpr> {
+        let imported_or_modeled = self
+            .resolved_callee_target_for_site_with_direct_target(block_addr, op_idx, direct_target)
+            .is_some_and(|target| {
+                target.policy.arg_policy() == r2types::CalleeCallArgPolicy::ImportedLike
+            });
         let mut normalized = args
             .into_iter()
-            .map(|arg| self.normalize_prepared_call_arg_expr(arg))
+            .map(|arg| {
+                if imported_or_modeled {
+                    self.normalize_imported_call_arg_expr(arg, true, true, true)
+                } else {
+                    self.normalize_prepared_call_arg_expr(arg)
+                }
+            })
             .collect::<Vec<_>>();
         if let Some(max_arity) = self.non_variadic_call_arity_for_site_with_direct_target(
             block_addr,

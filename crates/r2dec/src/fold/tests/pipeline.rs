@@ -1424,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn final_call_normalization_uses_prepared_direct_target_identity_without_rendered_fallback() {
+    fn final_call_normalization_requires_typed_callsite_resolution_for_target_repair() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Call {
@@ -1448,8 +1448,34 @@ mod tests {
 
         assert_eq!(
             normalized,
+            CExpr::call(CExpr::Var("sym.poisoned".to_string()), vec![CExpr::IntLit(7)]),
+            "prepared direct targets and raw function-name maps must not repair rendered call targets without typed callsite resolution"
+        );
+    }
+
+    #[test]
+    fn final_call_normalization_uses_typed_callsite_resolution_for_target_repair() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Call {
+            target: Varnode::constant(0x401050, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("typed_direct_call_normalization");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.raw_helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 0), 0x401050, "sym.helper", None);
+
+        let normalized = ctx.normalize_call_expr_for_source_call(
+            (0x1000, 0),
+            CExpr::call(CExpr::Var("sym.poisoned".to_string()), vec![CExpr::IntLit(7)]),
+            FinalExprNormalizeContext::DefinitionRoot,
+        );
+
+        assert_eq!(
+            normalized,
             CExpr::call(CExpr::Var("sym.helper".to_string()), vec![CExpr::IntLit(7)]),
-            "prepared direct targets are typed source-call evidence and must outrank rendered callee text"
+            "typed callsite resolution must outrank rendered callee text and raw function-name maps"
         );
     }
 
@@ -22827,7 +22853,8 @@ mod tests {
 
         for (source_name, bad_expr) in cases {
             let mut ctx = make_x86_64_ctx();
-            install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
+            let source_call = (0x1000, 0);
+            install_callsite_resolution(&mut ctx, source_call, 0x401030, "sym.imp.printf", None);
             let source = make_var(source_name, 1, 8);
             ctx.state
                 .analysis_ctx
@@ -22846,8 +22873,13 @@ mod tests {
             .with_source_var(&source);
 
             assert_eq!(
-                ctx.render_call_arg_for_callee(&CExpr::Var("const:401030".to_string()), binding),
-                CExpr::Var("good".to_string()),
+                ctx.render_call_args_for_site(
+                    source_call.0,
+                    source_call.1,
+                    &CExpr::Var("const:401030".to_string()),
+                    vec![binding],
+                ),
+                vec![CExpr::Var("good".to_string())],
                 "{source_name} should use prepared owner instead of low-signal source"
             );
         }
@@ -22942,7 +22974,8 @@ mod tests {
     #[test]
     fn recovered_input_arg_preserves_stable_source_over_generic_entry_alias() {
         let mut ctx = make_x86_64_ctx();
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
+        let source_call = (0x1000, 0);
+        install_callsite_resolution(&mut ctx, source_call, 0x401030, "sym.imp.printf", None);
         let source = make_var("src_input", 1, 8);
         ctx.state
             .analysis_ctx
@@ -22961,8 +22994,13 @@ mod tests {
         .with_source_var(&source);
 
         assert_eq!(
-            ctx.render_call_arg_for_callee(&CExpr::Var("const:401030".to_string()), binding),
-            CExpr::Var("buf".to_string()),
+            ctx.render_call_args_for_site(
+                source_call.0,
+                source_call.1,
+                &CExpr::Var("const:401030".to_string()),
+                vec![binding],
+            ),
+            vec![CExpr::Var("buf".to_string())],
             "input-role recovery must preserve a stable source over a generic entry arg alias"
         );
     }
@@ -23022,20 +23060,25 @@ mod tests {
     #[test]
     fn imported_result_binding_accepts_non_stack_call_result_owner() {
         let mut ctx = make_x86_64_ctx();
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
-        install_call_owner(&mut ctx, (0x1000, 0), "owned_result", "rax_1");
+        let source_call = (0x1000, 0);
+        install_callsite_resolution(&mut ctx, source_call, 0x401030, "sym.imp.printf", None);
+        install_call_owner(&mut ctx, source_call, "owned_result", "rax_1");
 
-        let rendered = ctx.render_call_arg_for_callee(
+        let rendered = ctx.render_call_args_for_site(
+            source_call.0,
+            source_call.1,
             &CExpr::Var("const:401030".to_string()),
-            crate::analysis::CallArgBinding::result(
-                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                    "fallback".to_string(),
-                )),
-            )
-            .with_source_call(0x1000, 0),
+            vec![
+                crate::analysis::CallArgBinding::result(
+                    crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
+                        "fallback".to_string(),
+                    )),
+                )
+                .with_source_call(source_call.0, source_call.1),
+            ],
         );
 
-        assert_eq!(rendered, CExpr::Var("owned_result".to_string()));
+        assert_eq!(rendered, vec![CExpr::Var("owned_result".to_string())]);
     }
 
     #[test]

@@ -11823,6 +11823,22 @@ mod integration_tests {
         facts
     }
 
+    fn printf_type_fact() -> r2types::FunctionType {
+        r2types::FunctionType {
+            return_type: r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            params: vec![r2types::CTypeLike::Pointer(Box::new(
+                r2types::CTypeLike::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                },
+            ))],
+            variadic: true,
+        }
+    }
+
     fn analysis_artifact_with_imported_callees(
         mut artifact: crate::types::FunctionAnalysisArtifact,
         callees: &[(u64, &str)],
@@ -17387,74 +17403,61 @@ mod integration_tests {
 
     #[test]
     fn live_arm64_main_printf_format_arg_keeps_string_literal() {
-        use r2il::{R2ILBlock, R2ILOp, Varnode};
-        use r2ssa::SSAFunction;
+        use r2il::{R2ILBlock, R2ILOp, RegisterDef, Varnode};
 
-        let block = r2ssa::SSABlock {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.add_register(RegisterDef::new("x0", 0x4000, 8));
+        arch.add_register(RegisterDef::sub("w0", 0x4000, 4, "x0"));
+        arch.add_register(RegisterDef::new("x8", 0x4040, 8));
+        arch.add_register(RegisterDef::sub("w8", 0x4040, 4, "x8"));
+        arch.add_register(RegisterDef::new("x30", 0x40f0, 8));
+
+        let block = R2ILBlock {
             addr: 0x100001100,
             size: 4,
             ops: vec![
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X8", 1, 8),
-                    src: r2ssa::SSAVar::new("const:100002000", 0, 8),
+                R2ILOp::Copy {
+                    dst: Varnode::register(0x4040, 8),
+                    src: Varnode::constant(0x100002000, 8),
                 },
-                r2ssa::SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("X0", 1, 8),
-                    a: r2ssa::SSAVar::new("X8", 1, 8),
-                    b: r2ssa::SSAVar::new("const:292", 0, 8),
+                R2ILOp::IntAdd {
+                    dst: Varnode::register(0x4000, 8),
+                    a: Varnode::register(0x4040, 8),
+                    b: Varnode::constant(0x292, 8),
                 },
-                r2ssa::SSAOp::Call {
-                    target: r2ssa::SSAVar::new("const:401030", 0, 8),
+                R2ILOp::Call {
+                    target: Varnode::constant(0x401030, 8),
                 },
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X0", 2, 8),
-                    src: r2ssa::SSAVar::new("const:0", 0, 8),
+                R2ILOp::Copy {
+                    dst: Varnode::register(0x4000, 8),
+                    src: Varnode::constant(0, 8),
                 },
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("PC", 1, 8),
-                    src: r2ssa::SSAVar::new("X30", 0, 8),
-                },
-                r2ssa::SSAOp::Return {
-                    target: r2ssa::SSAVar::new("PC", 1, 8),
+                R2ILOp::Return {
+                    target: Varnode::register(0x40f0, 8),
                 },
             ],
+            switch_info: None,
+            op_metadata: Default::default(),
         };
 
-        let mut raw = R2ILBlock::new(block.addr, block.size);
-        raw.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("sym._main");
-
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::aarch64());
-        decompiler.set_function_facts(function_facts_with_imported_callees(
-            r2types::FunctionFacts::default(),
-            &[(0x401030, "sym.imp.printf")],
-        ));
-        decompiler.set_function_names(HashMap::from([(0x401030, "sym.imp.printf".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.printf".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                },
-                params: vec![r2types::CTypeLike::Pointer(Box::new(
-                    r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                ))],
-                variadic: true,
-            },
-        )]));
-        decompiler.set_strings(HashMap::from([(
-            0x100002292,
-            "usage: vuln_test <n>\\n".to_string(),
-        )]));
-        let output = decompiler.decompile(&func);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("prepared SSA")
+            .with_name("sym._main");
+        let mut function_facts = r2types::FunctionFacts::default();
+        add_imported_callee_signature_facts(
+            &mut function_facts.types,
+            &[(0x401030, "sym.imp.printf", printf_type_fact())],
+        );
+        let input = r2engine::decompiler_input_from_prepared_facts(
+            prepared,
+            function_facts,
+            HashMap::from([(0x401030, "sym.imp.printf".to_string())]),
+            HashMap::from([(0x100002292, "usage: vuln_test <n>\\n".to_string())]),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::aarch64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
             output.contains("\"usage: vuln_test <n>\\\\n\""),
@@ -17472,69 +17475,56 @@ mod integration_tests {
 
     #[test]
     fn live_x86_main_printf_format_arg_keeps_string_literal() {
-        use r2il::{R2ILBlock, R2ILOp, Varnode};
-        use r2ssa::SSAFunction;
+        use r2il::{R2ILBlock, R2ILOp, RegisterDef, Varnode};
 
-        let block = r2ssa::SSABlock {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("rax", 0x00, 8));
+        arch.add_register(RegisterDef::sub("eax", 0x00, 4, "rax"));
+        arch.add_register(RegisterDef::new("rdi", 0x10, 8));
+        arch.add_register(RegisterDef::sub("edi", 0x10, 4, "rdi"));
+        arch.add_register(RegisterDef::new("rip", 0x30, 8));
+
+        let block = R2ILBlock {
             addr: 0x401000,
             size: 4,
             ops: vec![
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RDI", 1, 8),
-                    src: r2ssa::SSAVar::new("const:40229e", 0, 8),
+                R2ILOp::Copy {
+                    dst: Varnode::register(0x10, 8),
+                    src: Varnode::constant(0x40229e, 8),
                 },
-                r2ssa::SSAOp::Call {
-                    target: r2ssa::SSAVar::new("const:401030", 0, 8),
+                R2ILOp::Call {
+                    target: Varnode::constant(0x401030, 8),
                 },
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RAX", 1, 8),
-                    src: r2ssa::SSAVar::new("const:0", 0, 8),
+                R2ILOp::Copy {
+                    dst: Varnode::register(0x00, 8),
+                    src: Varnode::constant(0, 8),
                 },
-                r2ssa::SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("PC", 1, 8),
-                    src: r2ssa::SSAVar::new("RIP", 0, 8),
-                },
-                r2ssa::SSAOp::Return {
-                    target: r2ssa::SSAVar::new("PC", 1, 8),
+                R2ILOp::Return {
+                    target: Varnode::register(0x30, 8),
                 },
             ],
+            switch_info: None,
+            op_metadata: Default::default(),
         };
 
-        let mut raw = R2ILBlock::new(block.addr, block.size);
-        raw.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("dbg.main");
-
-        let mut decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
-        decompiler.set_function_facts(function_facts_with_imported_callees(
-            r2types::FunctionFacts::default(),
-            &[(0x401030, "sym.imp.printf")],
-        ));
-        decompiler.set_function_names(HashMap::from([(0x401030, "sym.imp.printf".to_string())]));
-        decompiler.set_known_function_signatures(HashMap::from([(
-            "sym.imp.printf".to_string(),
-            r2types::FunctionType {
-                return_type: r2types::CTypeLike::Int {
-                    bits: 32,
-                    signedness: r2types::Signedness::Signed,
-                },
-                params: vec![r2types::CTypeLike::Pointer(Box::new(
-                    r2types::CTypeLike::Int {
-                        bits: 8,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                ))],
-                variadic: true,
-            },
-        )]));
-        decompiler.set_strings(HashMap::from([(
-            0x40229e,
-            "Unknown test: %d\\n".to_string(),
-        )]));
-        let output = decompiler.decompile(&func);
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("prepared SSA")
+            .with_name("dbg.main");
+        let mut function_facts = r2types::FunctionFacts::default();
+        add_imported_callee_signature_facts(
+            &mut function_facts.types,
+            &[(0x401030, "sym.imp.printf", printf_type_fact())],
+        );
+        let input = r2engine::decompiler_input_from_prepared_facts(
+            prepared,
+            function_facts,
+            HashMap::from([(0x401030, "sym.imp.printf".to_string())]),
+            HashMap::from([(0x40229e, "Unknown test: %d\\n".to_string())]),
+            HashMap::new(),
+            64,
+        );
+        let decompiler = r2dec::Decompiler::new(r2dec::DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
 
         assert!(
             output.contains("\"Unknown test: %d\\\\n\""),
