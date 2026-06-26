@@ -8399,7 +8399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_typedef_aggregate_without_layout_renders_observed_field_placeholders() {
+    fn test_typedef_aggregate_without_layout_does_not_render_field_placeholder() {
         let base = make_var("X0", 0, 8);
         let addr = make_var("tmp:6400", 3, 8);
 
@@ -8430,14 +8430,15 @@ mod tests {
         let mut visited = HashSet::new();
         let rendered = ctx
             .render_memory_access_by_name(&addr.display_name(), 4, 0, &mut visited)
-            .expect("typedef-backed aggregate access should render");
+            .expect("unproven aggregate access may render as raw pointer arithmetic");
 
-        assert_eq!(
-            rendered,
-            CExpr::PtrMember {
-                base: Box::new(CExpr::Var("obj".to_string())),
-                member: "f_30".to_string()
-            }
+        assert!(
+            !matches!(rendered, CExpr::Member { .. } | CExpr::PtrMember { .. }),
+            "bare typedef names must not manufacture placeholder member access, got {rendered:?}"
+        );
+        assert!(
+            !format!("{rendered:?}").contains("f_30"),
+            "bare typedef names must not manufacture f_<offset> fields, got {rendered:?}"
         );
     }
 

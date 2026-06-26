@@ -1,0 +1,24 @@
+warning: r2dec must not define fallback aggregate field-name helpers; use certified layout facts
+  --> $DIR/field_placeholder.rs:4:5
+   |
+LL | /     fn fallback_aggregate_field_name(type_name: &str, offset: u64) -> Option<String> {
+LL | |         (!type_name.trim().is_empty()).then(|| format!("f_{offset:x}"))
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2dec_uncertified_field_placeholder)]` on by default
+
+warning: r2dec must not define fallback aggregate field-name helpers; use certified layout facts
+  --> $DIR/field_placeholder.rs:8:5
+   |
+LL | /     fn typedef_name_looks_aggregate(&self, type_name: &str) -> bool {
+LL | |         let trimmed = type_name.trim();
+LL | |         trimmed
+LL | |             .chars()
+LL | |             .next()
+LL | |             .is_some_and(|ch| ch.is_ascii_uppercase())
+LL | |     }
+   | |_____^
+
+warning: 2 warnings emitted
+

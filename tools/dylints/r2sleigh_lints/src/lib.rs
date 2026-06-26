@@ -838,6 +838,34 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when production `r2dec` defines fallback helpers that manufacture
+    /// aggregate field names such as `f_<offset>` from a bare type name.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// A `struct` or typedef-looking name is not proof that an offset is a real
+    /// field. Member syntax must come from an explicit external layout,
+    /// certified field access fact, or typed oracle evidence. Otherwise the
+    /// renderer should keep pointer arithmetic/residual shape instead of
+    /// inventing source-like fields.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// fn fallback_aggregate_field_name(type_name: &str, offset: u64) -> Option<String> {
+    ///     Some(format!("f_{offset:x}"))
+    /// }
+    /// ```
+    ///
+    /// Use external layout facts carried through `FunctionFacts` instead.
+    pub R2DEC_UNCERTIFIED_FIELD_PLACEHOLDER,
+    Warn,
+    "r2dec must not manufacture aggregate field placeholders without layout proof"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2types` code outside `role_registry` calls the
     /// raw role-name signature lookup APIs directly.
     ///
@@ -890,6 +918,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_SOURCE_SHAPED_DECOMPILE_ORACLE,
     R2DEC_DEFAULT_TRUE_BRANCH_CONDITION,
     R2DEC_UNCERTIFIED_STACK_LOCAL_SYNTHESIS,
+    R2DEC_UNCERTIFIED_FIELD_PLACEHOLDER,
     R2TYPES_ROLE_NAME_SIGNATURE_HINT_OWNERSHIP
 ]);
 
@@ -927,6 +956,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_SOURCE_SHAPED_DECOMPILE_ORACLE,
         R2DEC_DEFAULT_TRUE_BRANCH_CONDITION,
         R2DEC_UNCERTIFIED_STACK_LOCAL_SYNTHESIS,
+        R2DEC_UNCERTIFIED_FIELD_PLACEHOLDER,
         R2TYPES_ROLE_NAME_SIGNATURE_HINT_OWNERSHIP,
     ]);
     lint_store.register_late_pass(|_| Box::new(R2sleighLintPass));
@@ -998,6 +1028,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 "r2dec tests must prove fold/AST/certificate invariants instead of source-shaped raw decompile text",
             );
         }
+
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx ImplItem<'tcx>) {
@@ -1030,6 +1061,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
                 item.span,
                 "r2dec must not derive call-result owners from matching rendered call expressions",
+            );
+        }
+
+        if is_r2dec_span(cx, item.span)
+            && !impl_item_is_test_only(cx, item)
+            && r2dec_uncertified_field_placeholder_name(item.ident.name.as_str())
+        {
+            span_lint(
+                cx,
+                R2DEC_UNCERTIFIED_FIELD_PLACEHOLDER,
+                item.span,
+                "r2dec must not define fallback aggregate field-name helpers; use certified layout facts",
             );
         }
     }
@@ -1683,6 +1726,13 @@ fn is_call_result_source_expr_owner_boundary_name(name: &str) -> bool {
             | "materializable_call_result_expr_for_call_expr"
             | "fallback_owned_call_result_register_name_from_matching_source_call"
             | "fallback_owned_call_result_register_name_from_matching_definition"
+    )
+}
+
+fn r2dec_uncertified_field_placeholder_name(name: &str) -> bool {
+    matches!(
+        name,
+        "fallback_aggregate_field_name" | "typedef_name_looks_aggregate"
     )
 }
 
