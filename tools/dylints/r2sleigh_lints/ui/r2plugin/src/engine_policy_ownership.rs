@@ -63,6 +63,10 @@ mod r2types {
 }
 
 mod r2engine {
+    pub struct EngineSemanticRoutePlan;
+
+    pub fn decompile_route_decision() {}
+
     pub fn should_use_direct_named_native_worker_decompile() -> bool {
         false
     }
@@ -118,6 +122,8 @@ fn main() {
     r2sym::compile_semantic_artifact_default_with_scope();
     r2sym::augment_semantic_artifact_with_interproc_summary();
     r2types::build_semantic_type_fallback_plan();
+    r2engine::decompile_route_decision();
+    let _ = r2engine::EngineSemanticRoutePlan;
     let _ = r2engine::should_use_direct_named_native_worker_decompile();
     let _ = r2engine::should_use_direct_named_native_worker_type_projection();
     let session = EngineSession;

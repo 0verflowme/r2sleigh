@@ -2120,7 +2120,6 @@ pub struct EngineTypeAnalysisResponse {
     pub function_facts: FunctionFacts,
     pub writeback_plan: TypeWritebackPlan,
     pub route_decision: EngineTypeRouteDecision,
-    pub semantic_route: Option<EngineSemanticRoutePlan>,
     pub callsite_count: usize,
     pub current_summary: Option<r2ssa::FunctionSemanticSummary>,
     pub artifact_cache_hit: bool,
@@ -2406,26 +2405,31 @@ impl EngineSession {
             )
         });
         if let Some(preprobe) = preprobe {
+            let mut function_facts = preprobe.function_facts;
             let writeback_plan = type_writeback_plan_for_route(TypeWritebackPlanRouteInput {
                 function_name: &analysis_request.function_name,
                 arch_name: &arch_name,
                 ptr_bits: analysis_request.ptr_bits,
-                function_facts: &preprobe.function_facts,
+                function_facts: &function_facts,
                 cfg_summary: &preprobe.cfg_summary,
                 route: &preprobe.route_decision,
                 full_writeback_plan: None,
             })?;
-            let semantic_route = detached_semantic_route_plan(
+            let decompile_decision = decompile_route_decision(
                 &analysis_request.function_name,
-                analysis_request.blocks.as_slice(),
-                &preprobe.function_facts,
+                &function_facts,
+                None,
+                &function_facts.types,
+                &preprobe.cfg_summary,
             );
+            function_facts.set_decompile_route(Some(decompile_route_facts_from_decision(
+                &decompile_decision,
+            )));
             return Some(EngineTypeAnalysisResponse {
                 cfg_summary: preprobe.cfg_summary,
-                function_facts: preprobe.function_facts,
+                function_facts,
                 writeback_plan,
                 route_decision: preprobe.route_decision,
-                semantic_route,
                 callsite_count: 0,
                 current_summary: None,
                 artifact_cache_hit: false,
@@ -2440,7 +2444,7 @@ impl EngineSession {
         }
 
         let analyze_response = self.analyze(analysis_request.clone())?;
-        let artifact = analyze_response.artifact;
+        let mut artifact = analyze_response.artifact;
         let cfg_summary = artifact.ssa_func.function().cfg_risk_summary();
         let route_decision = type_route_decision(
             &artifact.function_facts,
@@ -2456,11 +2460,18 @@ impl EngineSession {
             route: &route_decision,
             full_writeback_plan: Some(artifact.writeback_plan),
         })?;
-        let semantic_route = detached_semantic_route_plan(
+        let decompile_decision = decompile_route_decision(
             &analysis_request.function_name,
-            analysis_request.blocks.as_slice(),
             &artifact.function_facts,
+            Some(&artifact.ssa_func),
+            &artifact.function_facts.types,
+            &cfg_summary,
         );
+        artifact
+            .function_facts
+            .set_decompile_route(Some(decompile_route_facts_from_decision(
+                &decompile_decision,
+            )));
         let callsite_count =
             count_prepared_callsites(&artifact.pattern_ssa_func.local_ssa_blocks());
         let current_summary = current_interproc_summary(&artifact.function_facts);
@@ -2470,7 +2481,6 @@ impl EngineSession {
             function_facts: artifact.function_facts,
             writeback_plan,
             route_decision,
-            semantic_route,
             callsite_count,
             current_summary,
             artifact_cache_hit: analyze_response.artifact_cache_hit,
@@ -8214,6 +8224,10 @@ mod tests {
         assert_eq!(
             response.route_decision.kind,
             EngineTypeRouteKind::SemanticFallback
+        );
+        assert!(
+            response.function_facts.decompile_route().is_some(),
+            "type analysis must expose decompile route diagnostics through FunctionFacts"
         );
         assert!(response.metrics.planning_time > Duration::default());
         assert!(

@@ -5380,37 +5380,37 @@ fn complete_type_phase_timings(timings: &mut Vec<PhaseTimingJson>) {
     }
 }
 
-fn semantic_route_plan_json(route: r2engine::EngineSemanticRoutePlan) -> SemanticRoutePlanJson {
-    match route {
-        r2engine::EngineSemanticRoutePlan::Standard => SemanticRoutePlanJson {
+fn semantic_route_plan_json(route: &r2types::DecompileRouteFacts) -> SemanticRoutePlanJson {
+    match route.kind {
+        r2types::DecompileRouteKind::Standard => SemanticRoutePlanJson {
             kind: "standard".to_string(),
             reason: None,
             comment: None,
         },
-        r2engine::EngineSemanticRoutePlan::StructuredWorker { reason } => SemanticRoutePlanJson {
+        r2types::DecompileRouteKind::StructuredWorker => SemanticRoutePlanJson {
             kind: "structured_worker".to_string(),
-            reason: Some(reason),
+            reason: route.reason.clone(),
             comment: None,
         },
-        r2engine::EngineSemanticRoutePlan::LinearWorker { reason } => SemanticRoutePlanJson {
+        r2types::DecompileRouteKind::LinearWorker => SemanticRoutePlanJson {
             kind: "linear_worker".to_string(),
-            reason: Some(reason),
+            reason: route.reason.clone(),
             comment: None,
         },
-        r2engine::EngineSemanticRoutePlan::SummaryIslands { reason } => SemanticRoutePlanJson {
+        r2types::DecompileRouteKind::SummaryIslands => SemanticRoutePlanJson {
             kind: "summary_islands".to_string(),
-            reason: Some(reason),
+            reason: route.reason.clone(),
             comment: None,
         },
-        r2engine::EngineSemanticRoutePlan::VmSummary { reason } => SemanticRoutePlanJson {
+        r2types::DecompileRouteKind::VmSummary => SemanticRoutePlanJson {
             kind: "vm_summary".to_string(),
-            reason: Some(reason),
+            reason: route.reason.clone(),
             comment: None,
         },
-        r2engine::EngineSemanticRoutePlan::FallbackComment { comment } => SemanticRoutePlanJson {
+        r2types::DecompileRouteKind::FallbackComment => SemanticRoutePlanJson {
             kind: "fallback_comment".to_string(),
-            reason: None,
-            comment: Some(comment),
+            reason: route.reason.clone(),
+            comment: route.fallback_comment.clone(),
         },
     }
 }
@@ -8185,7 +8185,6 @@ struct FunctionAnalysisSharedBundle {
     cfg_risk: CfgRiskSummaryJson,
     semantic_artifact: Option<r2sym::SemanticArtifact>,
     function_facts: r2types::FunctionFacts,
-    semantic_route: Option<SemanticRoutePlanJson>,
     type_writeback: InferredTypeWritebackJson,
     prefer_bounded_type_plan: bool,
     phase_timings: Vec<PhaseTimingJson>,
@@ -8267,10 +8266,6 @@ fn build_function_analysis_shared_bundle(
 
     let cfg_risk = cfg_risk_summary_json(response.cfg_summary);
     let semantic_artifact = response.function_facts.semantics.clone();
-    let semantic_route = response
-        .semantic_route
-        .clone()
-        .map(semantic_route_plan_json);
     let prefer_bounded_type_plan = response.route_decision.prefer_bounded_type_plan;
     let function_facts = response.function_facts.clone();
     let phase_start = Instant::now();
@@ -8291,7 +8286,6 @@ fn build_function_analysis_shared_bundle(
         cfg_risk,
         semantic_artifact,
         function_facts,
-        semantic_route,
         type_writeback,
         prefer_bounded_type_plan,
         phase_timings,
@@ -8324,6 +8318,10 @@ fn function_analysis_session_report_json(
     let plans = bundle.function_facts.plans.clone();
     let assumptions = bundle.function_facts.assumptions.clone();
     let assumption_usage = bundle.function_facts.assumption_usage.clone();
+    let semantic_route = bundle
+        .function_facts
+        .decompile_route()
+        .map(semantic_route_plan_json);
     let payload = FunctionAnalysisSessionReportJson {
         function_name: bundle.function_name,
         function_addr: bundle.function_addr,
@@ -8333,7 +8331,7 @@ fn function_analysis_session_report_json(
         assumption_usage,
         semantic,
         semantic_build_plan,
-        semantic_route: bundle.semantic_route,
+        semantic_route,
         summary_diagnostics,
         type_writeback: bundle.type_writeback,
         prefer_bounded_type_plan: bundle.prefer_bounded_type_plan,

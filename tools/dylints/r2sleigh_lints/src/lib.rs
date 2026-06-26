@@ -1482,6 +1482,7 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
                 "function_semantic_summary_seed_for_name_with_linkage",
                 "has_native_worker_summary_family",
                 "render_direct_named_native_worker_summary",
+                "decompile_route_decision",
                 "should_use_direct_named_native_worker_decompile",
                 "should_use_direct_named_native_worker_type_projection",
             ]
@@ -1508,6 +1509,7 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
             .is_ok_and(|snippet| {
                 snippet.ends_with("EngineSemanticMode::Full")
                     || snippet.ends_with("EngineSemanticMode::Optional")
+                    || snippet.ends_with("EngineSemanticRoutePlan")
             }),
         _ => false,
     }
