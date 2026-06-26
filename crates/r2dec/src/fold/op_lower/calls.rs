@@ -490,7 +490,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn call_arg_binding_has_render_authority(&self, binding: &analysis::CallArgBinding) -> bool {
-        if binding.source_value_id.is_some() || binding.source_call.is_some() {
+        if binding.source_value_id.is_some() {
             return true;
         }
         binding

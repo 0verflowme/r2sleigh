@@ -1063,61 +1063,6 @@ mod tests {
         }
     }
 
-    fn expr_contains_transient_call_artifact(expr: &CExpr) -> bool {
-        match expr {
-            CExpr::Var(name) => {
-                let lower = name.to_ascii_lowercase();
-                lower == "lr"
-                    || lower.starts_with("stack_")
-                    || lower.starts_with("&stack_")
-                    || lower
-                        .strip_prefix('x')
-                        .or_else(|| lower.strip_prefix('w'))
-                        .and_then(|rest| rest.split_once('_').or(Some((rest, ""))))
-                        .is_some_and(|(reg, _)| {
-                            !reg.is_empty() && reg.chars().all(|c| c.is_ascii_digit())
-                        })
-            }
-            CExpr::Unary { operand, .. }
-            | CExpr::Paren(operand)
-            | CExpr::Deref(operand)
-            | CExpr::AddrOf(operand)
-            | CExpr::Sizeof(operand)
-            | CExpr::Cast { expr: operand, .. } => expr_contains_transient_call_artifact(operand),
-            CExpr::Binary { left, right, .. } => {
-                expr_contains_transient_call_artifact(left)
-                    || expr_contains_transient_call_artifact(right)
-            }
-            CExpr::Subscript { base, index } => {
-                expr_contains_transient_call_artifact(base)
-                    || expr_contains_transient_call_artifact(index)
-            }
-            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                expr_contains_transient_call_artifact(base)
-            }
-            CExpr::Call { func, args } => {
-                expr_contains_transient_call_artifact(func)
-                    || args.iter().any(expr_contains_transient_call_artifact)
-            }
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                expr_contains_transient_call_artifact(cond)
-                    || expr_contains_transient_call_artifact(then_expr)
-                    || expr_contains_transient_call_artifact(else_expr)
-            }
-            CExpr::Comma(items) => items.iter().any(expr_contains_transient_call_artifact),
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_)
-            | CExpr::SizeofType(_) => false,
-        }
-    }
-
     fn expr_contains_sub_zero_cmp_scaffold(expr: &CExpr) -> bool {
         fn is_zero(expr: &CExpr) -> bool {
             matches!(expr, CExpr::IntLit(0) | CExpr::UIntLit(0))
@@ -3352,26 +3297,12 @@ mod tests {
             )
             .expect("printf call should emit statement");
 
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected printf call expression");
+        let CStmt::Comment(comment) = stmt else {
+            panic!("expected residual printf call, got {stmt:?}");
         };
-        assert_eq!(
-            args[0],
-            CExpr::StringLit("unlock(%d, %d, %d) = %d\\n".to_string())
-        );
-        assert_eq!(args[1], CExpr::Var("local_2c".to_string()));
-        assert_eq!(args[2], CExpr::Var("local_30".to_string()));
-        assert_eq!(args[3], CExpr::Var("local_34".to_string()));
-        assert_eq!(
-            args[4],
-            FoldingContext::unresolved_call_arg_expr(),
-            "uncertified helper result must not render as executable nested C, got {args:?}"
-        );
         assert!(
-            args.iter()
-                .skip(1)
-                .all(|arg| !expr_contains_transient_call_artifact(arg)),
-            "unlock printf should keep recovered locals and refuse uncertified helper result, got {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "printf with uncertified helper result must residualize, got {comment}"
         );
     }
 
@@ -3443,23 +3374,12 @@ mod tests {
             )
             .expect("printf call should emit statement");
 
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected printf call expression");
+        let CStmt::Comment(comment) = stmt else {
+            panic!("expected residual printf call, got {stmt:?}");
         };
-        assert_eq!(
-            args,
-            vec![
-                CExpr::StringLit("unlock(%d, %d, %d) = %d\\n".to_string()),
-                FoldingContext::unresolved_call_arg_expr(),
-                CExpr::Var("b".to_string()),
-                CExpr::Var("c".to_string()),
-                FoldingContext::unresolved_call_arg_expr(),
-            ],
-            "uncertified printf sibling/result call arguments must not render helper-shaped C, got {args:?}"
-        );
         assert!(
-            args.iter().all(|arg| arg != &helper_call),
-            "uncertified helper call leaked into public printf args: {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "uncertified printf sibling/result call arguments must residualize, got {comment}"
         );
     }
 
@@ -3508,22 +3428,12 @@ mod tests {
             )
             .expect("printf call should emit statement");
 
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected printf call expression");
+        let CStmt::Comment(comment) = stmt else {
+            panic!("expected residual printf call, got {stmt:?}");
         };
-        assert_eq!(
-            args,
-            vec![
-                CExpr::StringLit("solve_equation(%d) = %d\\n".to_string()),
-                CExpr::Var("local_5c".to_string()),
-                FoldingContext::unresolved_call_arg_expr(),
-            ]
-        );
         assert!(
-            args.iter()
-                .skip(1)
-                .all(|arg| !expr_contains_transient_call_artifact(arg)),
-            "solve_equation printf should keep recovered local and refuse uncertified helper result, got {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "solve_equation printf with uncertified helper result must residualize, got {comment}"
         );
     }
 
@@ -3583,25 +3493,12 @@ mod tests {
             )
             .expect("printf call should emit statement");
 
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected printf call expression");
+        let CStmt::Comment(comment) = stmt else {
+            panic!("expected residual printf call, got {stmt:?}");
         };
-        assert_eq!(
-            args[0],
-            CExpr::StringLit("complex_check(%d, %d) = %d\\n".to_string())
-        );
-        assert_eq!(args[1], CExpr::Var("local_60".to_string()));
-        assert_eq!(args[2], CExpr::Var("local_64".to_string()));
-        assert_eq!(
-            args[3],
-            FoldingContext::unresolved_call_arg_expr(),
-            "uncertified helper result must not render as executable nested C, got {args:?}"
-        );
         assert!(
-            args.iter()
-                .skip(1)
-                .all(|arg| !expr_contains_transient_call_artifact(arg)),
-            "complex_check printf should keep recovered locals and refuse uncertified helper result, got {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "complex_check printf with uncertified helper result must residualize, got {comment}"
         );
     }
 
@@ -18979,41 +18876,12 @@ mod tests {
             "expected printf call args to preserve the helper result expression, got {printf_call_args:?}"
         );
         let stmts = ctx.fold_block(&block, block.addr);
-        assert_eq!(
-            stmts.len(),
-            1,
-            "expected helper call to inline into the printf use, got {stmts:?}"
-        );
-
-        let CStmt::Expr(CExpr::Call { func, args }) = &stmts[0] else {
-            panic!("expected folded printf call, got {stmts:?}");
+        let [CStmt::Comment(comment)] = stmts.as_slice() else {
+            panic!("expected residual printf call, got {stmts:?}");
         };
-        assert_eq!(**func, CExpr::Var("sym.imp.printf".to_string()));
-        assert_eq!(
-            args.first(),
-            Some(&CExpr::StringLit("unlock(%d, %d, %d) = %d\\n".to_string()))
-        );
-        assert_eq!(
-            &args[1..4],
-            &[CExpr::IntLit(1), CExpr::IntLit(2), CExpr::IntLit(3)]
-        );
         assert!(
-            args[4] == FoldingContext::unresolved_call_arg_expr(),
-            "without certified helper callsite proof, final helper result must refuse executable nested C; got {:?}",
-            args[4]
-        );
-        assert!(
-            !args.iter().any(|arg| matches!(
-                arg,
-                CExpr::Call { func, .. } if **func == CExpr::Var("sym._unlock".to_string())
-            )),
-            "uncertified helper call leaked into public printf args: {args:?}"
-        );
-        assert!(
-            args.iter()
-                .skip(1)
-                .all(|arg| !expr_contains_transient_call_artifact(arg)),
-            "later printf args should not regress to transient register or stack artifacts, got {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "printf with uncertified helper result must residualize, got {comment}"
         );
     }
 
@@ -19215,24 +19083,12 @@ mod tests {
             ))),
             "expected helper result to be materialized once before printf"
         );
-        let CStmt::Expr(CExpr::Call { args, .. }) = &stmts[1] else {
-            panic!("expected folded printf call, got {stmts:?}");
+        let CStmt::Comment(comment) = &stmts[1] else {
+            panic!("expected residual printf call after helper materialization, got {stmts:?}");
         };
-        assert_eq!(
-            &args[1..4],
-            &[CExpr::IntLit(1), CExpr::IntLit(2), CExpr::IntLit(3)]
-        );
-        assert_eq!(
-            args[4],
-            FoldingContext::unresolved_call_arg_expr(),
-            "uncertified helper result carrier must not leak as a public printf argument"
-        );
         assert!(
-            args.iter()
-                .skip(1)
-                .take(3)
-                .all(|arg| !expr_contains_transient_call_artifact(arg)),
-            "post-call helper recovery must keep preserved inputs clean, got {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "printf with uncertified helper result carrier must residualize, got {comment}"
         );
     }
 
@@ -19509,31 +19365,22 @@ mod tests {
             )),
             "uncertified helper call should remain an explicit side effect, got {stmts:?}"
         );
-        let Some(CStmt::Expr(CExpr::Call { args, .. })) = stmts.iter().find(|stmt| {
-            matches!(
+        assert!(
+            !stmts.iter().any(|stmt| matches!(
                 stmt,
                 CStmt::Expr(CExpr::Call { func, .. })
                     if **func == CExpr::Var("sym.imp.printf".to_string())
-            )
+            )),
+            "uncertified printf callsite must not render executable C, got {stmts:?}"
+        );
+        let Some(CStmt::Comment(comment)) = stmts.iter().find(|stmt| {
+            matches!(stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments"))
         }) else {
-            panic!("expected folded printf call, got {stmts:?}");
+            panic!("expected residual printf comment, got {stmts:?}");
         };
         assert!(
-            args[4] == FoldingContext::unresolved_call_arg_expr(),
-            "without certified helper callsite proof, final printf arg must refuse executable nested C, got {args:?}"
-        );
-        assert!(
-            !args.iter().any(|arg| matches!(
-                arg,
-                CExpr::Call { func, .. } if **func == CExpr::Var("sym._unlock".to_string())
-            )),
-            "uncertified helper call leaked into public printf args: {args:?}"
-        );
-        assert!(
-            args.iter()
-                .skip(1)
-                .all(|arg| !expr_contains_transient_call_artifact(arg)),
-            "live-shaped unlock printf args should not regress to transient artifacts, got {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "printf with uncertified helper result must residualize, got {comment}"
         );
     }
 
@@ -19877,41 +19724,18 @@ mod tests {
             !stmts.iter().any(|stmt| matches!(
                 stmt,
                 CStmt::Expr(CExpr::Call { func, .. })
-                    if **func == CExpr::Var("sym._unlock".to_string())
-            )),
-            "expected helper call to inline into printf, got {stmts:?}"
-        );
-        let Some(CStmt::Expr(CExpr::Call { args, .. })) = stmts.iter().find(|stmt| {
-            matches!(
-                stmt,
-                CStmt::Expr(CExpr::Call { func, .. })
                     if **func == CExpr::Var("sym.imp.printf".to_string())
-            )
+            )),
+            "uncertified printf callsite must not render executable C, got {stmts:?}"
+        );
+        let Some(CStmt::Comment(comment)) = stmts.iter().find(|stmt| {
+            matches!(stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments"))
         }) else {
-            panic!("expected folded printf call, got {stmts:?}");
+            panic!("expected residual printf comment, got {stmts:?}");
         };
-        assert_eq!(
-            args[0],
-            CExpr::StringLit("unlock(%d, %d, %d) = %d\\n".to_string())
-        );
-        assert_eq!(args[1], CExpr::Var("local_2c".to_string()));
-        assert_eq!(args[2], CExpr::Var("local_30".to_string()));
-        let uncertified_third_arg = CExpr::call(
-            CExpr::Var("sym.imp.atoi".to_string()),
-            vec![CExpr::Subscript {
-                base: Box::new(CExpr::Var("argv".to_string())),
-                index: Box::new(CExpr::IntLit(4)),
-            }],
-        );
-        assert_eq!(args[3], FoldingContext::unresolved_call_arg_expr());
-        assert_ne!(
-            args[3], uncertified_third_arg,
-            "uncertified nested atoi must not render as executable printf argument"
-        );
-        assert_eq!(
-            args[4],
-            FoldingContext::unresolved_call_arg_expr(),
-            "uncertified helper result must not render as executable nested C, got {args:?}"
+        assert!(
+            comment.contains("uncertified callsite arguments"),
+            "printf with uncertified helper/atoi args must residualize, got {comment}"
         );
     }
 
@@ -20257,34 +20081,12 @@ mod tests {
                 block.ops.len() - 1,
             )
             .expect("printf stmt");
-        let CStmt::Expr(CExpr::Call { args, .. }) = &printf_stmt else {
-            panic!("expected lowered printf call, got {printf_stmt:?}");
+        let CStmt::Comment(comment) = &printf_stmt else {
+            panic!("expected residual printf call, got {printf_stmt:?}");
         };
-        assert_eq!(
-            args[0],
-            CExpr::StringLit("unlock(%d, %d, %d) = %d\\n".to_string())
-        );
-        assert_eq!(args[1], CExpr::Var("local_2c".to_string()));
-        assert_eq!(args[2], CExpr::Var("local_30".to_string()));
-        let atoi_arg = |index| {
-            CExpr::call(
-                CExpr::Var("sym.imp.atoi".to_string()),
-                vec![CExpr::Subscript {
-                    base: Box::new(CExpr::Var("argv".to_string())),
-                    index: Box::new(CExpr::IntLit(index)),
-                }],
-            )
-        };
-        let uncertified_third_arg = atoi_arg(4);
-        assert_eq!(args[3], FoldingContext::unresolved_call_arg_expr());
-        assert_ne!(
-            args[3], uncertified_third_arg,
-            "uncertified nested atoi must not render as executable printf argument"
-        );
-        assert_eq!(
-            args[4],
-            FoldingContext::unresolved_call_arg_expr(),
-            "uncertified helper result must not render as executable nested C, got {args:?}"
+        assert!(
+            comment.contains("uncertified callsite arguments"),
+            "printf with uncertified helper/atoi args must residualize, got {comment}"
         );
     }
 
@@ -21802,31 +21604,12 @@ mod tests {
         );
 
         let stmts = ctx.fold_block(&block, block.addr);
-        assert_eq!(
-            stmts.len(),
-            1,
-            "expected helper call to inline into printf, got {stmts:?}"
-        );
-        let CStmt::Expr(CExpr::Call { func, args }) = &stmts[0] else {
-            panic!("expected folded printf call, got {stmts:?}");
+        let [CStmt::Comment(comment)] = stmts.as_slice() else {
+            panic!("expected residual printf call, got {stmts:?}");
         };
-        assert_eq!(**func, CExpr::Var("sym.imp.printf".to_string()));
-        assert_eq!(
-            args,
-            &vec![
-                CExpr::StringLit("unlock(%d, %d, %d) = %d\\n".to_string()),
-                CExpr::IntLit(1),
-                CExpr::IntLit(2),
-                CExpr::IntLit(3),
-                FoldingContext::unresolved_call_arg_expr(),
-            ]
-        );
         assert!(
-            !args.iter().any(|arg| matches!(
-                arg,
-                CExpr::Call { func, .. } if **func == CExpr::Var("sym._unlock".to_string())
-            )),
-            "uncertified helper call leaked into public printf args: {args:?}"
+            comment.contains("uncertified callsite arguments"),
+            "printf with uncertified helper result must residualize, got {comment}"
         );
     }
 
@@ -22397,6 +22180,37 @@ mod tests {
         assert!(
             comment.contains("uncertified callsite arguments"),
             "bare source names without prepared evidence must not authorize rendering: {comment}"
+        );
+    }
+
+    #[test]
+    fn unprepared_call_args_with_source_call_residualize() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.state.analysis_ctx.use_info.call_args.insert(
+            (0x1000, 0),
+            vec![crate::analysis::CallArgBinding::input(
+                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fake_arg".to_string())),
+            )
+            .with_source_call(0x1000, 0)],
+        );
+
+        let stmt = ctx
+            .op_to_stmt_with_args(
+                &SSAOp::Call {
+                    target: make_var("const:401050", 0, 8),
+                },
+                0x1000,
+                0,
+            )
+            .expect("residual stmt");
+
+        let CStmt::Comment(comment) = stmt else {
+            panic!("expected residual comment for source-call-only args, got {stmt:?}");
+        };
+        assert!(
+            comment.contains("uncertified callsite arguments"),
+            "source_call proves provenance, not call-argument render authority: {comment}"
         );
     }
 

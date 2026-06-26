@@ -268,6 +268,31 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when `r2dec` call-argument render authorization treats
+    /// `CallArgBinding::source_call` as standalone proof.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// A source call proves where a value came from; it does not prove that the
+    /// call argument is safe to emit as executable C. Argument rendering must
+    /// be backed by a certified value ID or prepared semantic authority.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// binding.source_call.is_some()
+    /// ```
+    ///
+    /// Use instead the certified callsite argument contract carried through
+    /// `FunctionFacts`, or fail closed with a residual.
+    pub R2DEC_CALL_ARG_SOURCE_CALL_AUTHORITY,
+    Warn,
+    "r2dec call-argument rendering must not treat source_call as standalone authority"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2dec` analysis defines helpers that infer
     /// authoritative call arguments locally.
     ///
@@ -845,6 +870,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_CALLEE_RESOLUTION_FALLBACK_OWNERSHIP,
     R2DEC_UNCERTIFIED_CALL_ARG_CALL_POLICY,
     R2DEC_CALL_ARG_SOURCE_NAME_AUTHORITY,
+    R2DEC_CALL_ARG_SOURCE_CALL_AUTHORITY,
     R2DEC_LOCAL_AUTHORITATIVE_CALL_ARG_INFERENCE,
     R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
     R2DEC_ROUTE_POLICY_OWNERSHIP,
@@ -880,6 +906,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_CALLEE_RESOLUTION_FALLBACK_OWNERSHIP,
         R2DEC_UNCERTIFIED_CALL_ARG_CALL_POLICY,
         R2DEC_CALL_ARG_SOURCE_NAME_AUTHORITY,
+        R2DEC_CALL_ARG_SOURCE_CALL_AUTHORITY,
         R2DEC_LOCAL_AUTHORITATIVE_CALL_ARG_INFERENCE,
         R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
         R2DEC_ROUTE_POLICY_OWNERSHIP,
@@ -1087,7 +1114,16 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2DEC_CALL_ARG_SOURCE_NAME_AUTHORITY,
                 expr.span,
-                "source_var_name is only a hint; call-argument rendering needs source_value_id, source_call, or prepared semantic authority",
+                "source_var_name is only a hint; call-argument rendering needs source_value_id or prepared semantic authority",
+            );
+        }
+
+        if is_r2dec_op_lower_path(cx, expr) && call_arg_source_call_authority_expr(cx, expr) {
+            span_lint(
+                cx,
+                R2DEC_CALL_ARG_SOURCE_CALL_AUTHORITY,
+                expr.span,
+                "source_call proves provenance only; call-argument rendering needs certified argument evidence",
             );
         }
 
@@ -2103,6 +2139,23 @@ fn call_arg_source_name_authority_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
     expr_references_call_arg_source_var_name(receiver)
 }
 
+fn call_arg_source_call_authority_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    if !enclosing_item_name(cx, expr)
+        .as_deref()
+        .is_some_and(is_call_arg_authority_boundary_name)
+    {
+        return false;
+    }
+
+    let ExprKind::MethodCall(method, receiver, _, _) = expr.kind else {
+        return false;
+    };
+    if !matches!(method.ident.as_str(), "is_some" | "is_none" | "is_some_and") {
+        return false;
+    }
+    expr_references_call_arg_source_call(receiver)
+}
+
 fn is_call_arg_authority_boundary_name(name: &str) -> bool {
     matches!(
         name,
@@ -2133,6 +2186,30 @@ fn expr_references_call_arg_source_var_name(expr: &Expr<'_>) -> bool {
         | ExprKind::Unary(_, inner)
         | ExprKind::Cast(inner, _)
         | ExprKind::DropTemps(inner) => expr_references_call_arg_source_var_name(inner),
+        _ => false,
+    }
+}
+
+fn expr_references_call_arg_source_call(expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::Field(base, ident) => {
+            ident.name.as_str() == "source_call" || expr_references_call_arg_source_call(base)
+        }
+        ExprKind::MethodCall(_, receiver, args, _) => {
+            expr_references_call_arg_source_call(receiver)
+                || args.iter().any(expr_references_call_arg_source_call)
+        }
+        ExprKind::Call(callee, args) => {
+            expr_references_call_arg_source_call(callee)
+                || args.iter().any(expr_references_call_arg_source_call)
+        }
+        ExprKind::Block(block, _) => block
+            .expr
+            .is_some_and(expr_references_call_arg_source_call),
+        ExprKind::AddrOf(_, _, inner)
+        | ExprKind::Unary(_, inner)
+        | ExprKind::Cast(inner, _)
+        | ExprKind::DropTemps(inner) => expr_references_call_arg_source_call(inner),
         _ => false,
     }
 }

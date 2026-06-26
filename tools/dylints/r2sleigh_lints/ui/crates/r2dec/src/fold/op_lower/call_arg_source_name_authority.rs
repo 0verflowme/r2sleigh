@@ -16,15 +16,12 @@ impl Context {
     }
 
     fn certified_call_args_for_site_with_direct_target(&self, binding: &Binding) -> bool {
-        binding.source_value_id.is_some()
-            || binding.source_call.is_some()
-            || binding.source_var_name.is_some()
+        binding.source_value_id.is_some() || binding.source_var_name.is_some()
     }
 
     fn certified_call_args_for_site(&self, binding: &Binding) -> bool {
         (binding.source_value_id.is_none()
-            && binding.source_var_name.is_none()
-            && binding.source_call.is_none())
+            && binding.source_var_name.is_none())
             || binding
                 .source_var_name
                 .as_ref()
@@ -41,7 +38,6 @@ impl Context {
 
     fn call_arg_binding_has_render_authority(&self, binding: &Binding) -> bool {
         binding.source_value_id.is_some()
-            || binding.source_call.is_some()
             || binding
                 .source_var_name
                 .as_deref()
