@@ -9193,18 +9193,6 @@ mod tests {
             decision.use_prepared_semantic_view
         );
         assert_eq!(route_facts.render_permission, decision.render_permission);
-        assert_eq!(
-            context.semantic_route, None,
-            "engine route policy must not be stored in the legacy r2dec route side channel"
-        );
-        assert_eq!(
-            context.skip_runtime_type_inference, None,
-            "engine runtime type policy must travel through FunctionFacts"
-        );
-        assert_eq!(
-            context.use_prepared_semantic_view, None,
-            "engine prepared-view policy must travel through FunctionFacts"
-        );
     }
 
     #[test]
@@ -9224,14 +9212,6 @@ mod tests {
         assert!(
             input.context.function_facts.decompile_route().is_some(),
             "engine-owned decompiler input assembly must stamp route facts into FunctionFacts"
-        );
-        assert_eq!(
-            input.context.semantic_route, None,
-            "engine helper must not populate the legacy r2dec route side channel"
-        );
-        assert_eq!(
-            input.context.render_permission, None,
-            "engine helper must not populate the legacy render permission side channel"
         );
         assert!(
             input

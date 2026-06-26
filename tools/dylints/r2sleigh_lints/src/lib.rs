@@ -405,6 +405,35 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when production `r2dec::DecompilerContext` defines decompile route,
+    /// render permission, or render-policy side-channel fields/mutators outside
+    /// `FunctionFacts`.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// `FunctionFacts::decompile_route` is the canonical render contract. A
+    /// parallel context field lets direct callers bypass or contradict the
+    /// engine-owned route/refusal decision, so executable C may be rendered under
+    /// a different proof policy than the one carried by the typed facts.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// struct DecompilerContext {
+    ///     semantic_route: Option<SemanticRoutePlan>,
+    ///     render_permission: Option<RenderPermission>,
+    /// }
+    /// ```
+    ///
+    /// Use `FunctionFacts::with_decompile_route(...)` instead.
+    pub R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+    Warn,
+    "r2dec must carry decompile route decisions through FunctionFacts"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2dec` code mutates switch case labels from
     /// nearby arithmetic or helper-derived display bias.
     ///
@@ -903,6 +932,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
     R2DEC_ROUTE_POLICY_OWNERSHIP,
     R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+    R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
     R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
     R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
@@ -940,6 +970,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
         R2DEC_ROUTE_POLICY_OWNERSHIP,
         R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+        R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
         R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
         R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
         R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
@@ -1020,6 +1051,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
             );
         }
 
+        if is_r2dec_span(cx, item.span)
+            && !item_is_test_only(cx, item)
+            && r2dec_decompiler_context_route_side_channel_item(cx, item)
+        {
+            span_lint(
+                cx,
+                R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+                item.span,
+                "r2dec DecompilerContext must not store route/render policy outside FunctionFacts",
+            );
+        }
+
         if is_r2dec_span(cx, item.span) && r2dec_source_shaped_decompile_oracle_item(cx, item) {
             span_lint(
                 cx,
@@ -1073,6 +1116,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_UNCERTIFIED_FIELD_PLACEHOLDER,
                 item.span,
                 "r2dec must not define fallback aggregate field-name helpers; use certified layout facts",
+            );
+        }
+
+        if is_r2dec_span(cx, item.span)
+            && !impl_item_is_test_only(cx, item)
+            && r2dec_decompiler_context_route_side_channel_method(item.ident.name.as_str())
+        {
+            span_lint(
+                cx,
+                R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+                item.span,
+                "r2dec DecompilerContext must not expose route/render policy side-channel mutators",
             );
         }
     }
@@ -1858,6 +1913,30 @@ fn engine_decompiler_context_side_channel_item(cx: &LateContext<'_>, item: &Item
     (snippet.contains("struct EngineDecompileRequest")
         || snippet.contains("struct DecompileRenderCacheKeyInput"))
         && snippet.contains("callee_resolution:")
+}
+
+fn r2dec_decompiler_context_route_side_channel_item(
+    cx: &LateContext<'_>,
+    item: &Item<'_>,
+) -> bool {
+    let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
+        return false;
+    };
+    snippet.contains("struct DecompilerContext")
+        && (snippet.contains("semantic_route:")
+            || snippet.contains("render_permission:")
+            || snippet.contains("skip_runtime_type_inference:")
+            || snippet.contains("use_prepared_semantic_view:"))
+}
+
+fn r2dec_decompiler_context_route_side_channel_method(name: &str) -> bool {
+    matches!(
+        name,
+        "with_semantic_route"
+            | "with_render_permission"
+            | "with_runtime_type_inference_policy"
+            | "with_prepared_semantic_view_policy"
+    )
 }
 
 fn plugin_unprepared_decompile_oracle_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {

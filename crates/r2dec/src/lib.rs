@@ -3570,21 +3570,10 @@ pub struct DecompilerContext {
     pub symbols: std::collections::HashMap<u64, String>,
     /// Canonical combined type and semantic facts.
     pub function_facts: FunctionFacts,
-    /// Route selected by the session engine. When absent, r2dec renders the
-    /// standard SSA path; route selection policy is engine-owned.
-    pub semantic_route: Option<SemanticRoutePlan>,
-    /// Optional engine-owned decision for whether local type inference should run.
-    pub skip_runtime_type_inference: Option<bool>,
-    /// Optional engine-owned decision for whether prepared semantic facts should
-    /// be used during folding.
-    pub use_prepared_semantic_view: Option<bool>,
     /// Engine-owned typed call-target identity index. When absent, r2dec must
     /// not reconstruct call ownership from raw maps; callers that need typed
     /// callee identity should pass the engine-owned resolution.
     pub callee_resolution: Option<CalleeResolutionFacts>,
-    /// Engine-selected permission for the selected route. Missing means legacy
-    /// direct r2dec callers still use local certifying gates.
-    pub render_permission: Option<r2sym::RenderPermission>,
 }
 
 impl DecompilerContext {
@@ -3624,11 +3613,7 @@ impl DecompilerContext {
             strings,
             symbols,
             function_facts: FunctionFacts::new(type_facts.canonicalized(), None),
-            semantic_route: None,
-            skip_runtime_type_inference: None,
-            use_prepared_semantic_view: None,
             callee_resolution: None,
-            render_permission: None,
         }
     }
 
@@ -3656,11 +3641,7 @@ impl DecompilerContext {
             strings,
             symbols,
             function_facts,
-            semantic_route: None,
-            skip_runtime_type_inference: None,
-            use_prepared_semantic_view: None,
             callee_resolution,
-            render_permission: None,
         }
     }
 
@@ -3702,21 +3683,6 @@ impl DecompilerContext {
         self
     }
 
-    pub fn with_semantic_route(mut self, route: Option<SemanticRoutePlan>) -> Self {
-        self.semantic_route = route;
-        self
-    }
-
-    pub fn with_runtime_type_inference_policy(mut self, skip: Option<bool>) -> Self {
-        self.skip_runtime_type_inference = skip;
-        self
-    }
-
-    pub fn with_prepared_semantic_view_policy(mut self, use_view: Option<bool>) -> Self {
-        self.use_prepared_semantic_view = use_view;
-        self
-    }
-
     pub fn with_callee_resolution(mut self, facts: Option<CalleeResolutionFacts>) -> Self {
         if let Some(facts) = facts {
             self.function_facts.set_callee_resolution(facts.clone());
@@ -3726,11 +3692,6 @@ impl DecompilerContext {
                 .set_callee_resolution(CalleeResolutionFacts::default());
             self.callee_resolution = None;
         }
-        self
-    }
-
-    pub fn with_render_permission(mut self, permission: Option<r2sym::RenderPermission>) -> Self {
-        self.render_permission = permission;
         self
     }
 
@@ -3763,14 +3724,12 @@ impl DecompilerContext {
         self.function_facts
             .decompile_route()
             .map(|route| &route.render_permission)
-            .or(self.render_permission.as_ref())
     }
 
     fn skip_runtime_type_inference(&self, prepared: Option<&r2ssa::SsaArtifact>) -> bool {
         self.function_facts
             .decompile_route()
             .map(|route| route.skip_runtime_type_inference)
-            .or(self.skip_runtime_type_inference)
             .unwrap_or_else(|| {
                 should_skip_runtime_type_inference(
                     prepared,
@@ -3784,7 +3743,6 @@ impl DecompilerContext {
         self.function_facts
             .decompile_route()
             .map(|route| route.use_prepared_semantic_view)
-            .or(self.use_prepared_semantic_view)
             .unwrap_or_else(|| should_use_prepared_semantic_view(prepared, &self.function_facts))
     }
 
@@ -3793,9 +3751,7 @@ impl DecompilerContext {
         if let Some(route) = self.function_facts.decompile_route() {
             return Self::route_facts_to_plan(route);
         }
-        self.semantic_route
-            .clone()
-            .unwrap_or(SemanticRoutePlan::Standard)
+        SemanticRoutePlan::Standard
     }
 }
 
@@ -3966,9 +3922,7 @@ impl Decompiler {
             .name
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-        if input.context.function_facts.decompile_route().is_none()
-            && input.context.semantic_route.is_none()
-        {
+        if input.context.function_facts.decompile_route().is_none() {
             return missing_decompile_route_residual_comment(&func_name);
         }
         let semantic_route = input
@@ -6270,6 +6224,23 @@ mod tests {
         })
     }
 
+    fn test_decompile_route(
+        kind: r2types::DecompileRouteKind,
+        reason: &str,
+        fallback_comment: Option<String>,
+        render_permission: r2sym::RenderPermission,
+    ) -> r2types::DecompileRouteFacts {
+        r2types::DecompileRouteFacts {
+            kind,
+            reason: Some(reason.to_string()),
+            fallback_comment,
+            skip_runtime_type_inference: !matches!(kind, r2types::DecompileRouteKind::Standard),
+            use_prepared_semantic_view: matches!(kind, r2types::DecompileRouteKind::Standard),
+            proof_coverage: r2sym::ProofCoverage::default(),
+            render_permission,
+        }
+    }
+
     #[test]
     fn linearized_conditional_branch_without_predicate_is_residual_comment() {
         let blocks = vec![
@@ -7667,20 +7638,16 @@ mod tests {
             )),
             ..FunctionTypeFacts::default()
         };
-        let function_facts = FunctionFacts::new(type_facts, None).with_decompile_route(
-            r2types::DecompileRouteFacts {
-                kind: r2types::DecompileRouteKind::Standard,
-                reason: Some("test-certified standard route".to_string()),
-                fallback_comment: None,
-                skip_runtime_type_inference: false,
-                use_prepared_semantic_view: true,
-                proof_coverage: r2sym::ProofCoverage::default(),
-                render_permission: r2sym::RenderPermission::certified(
+        let function_facts =
+            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
+                r2types::DecompileRouteKind::Standard,
+                "test-certified standard route",
+                None,
+                r2sym::RenderPermission::certified(
                     r2sym::ProofOwner::R2engine,
                     "test-certified standard route",
                 ),
-            },
-        );
+            ));
         let context = DecompilerContext::default().with_function_facts(function_facts);
 
         let mut legacy = Decompiler::new(DecompilerConfig::x86_64());
@@ -7732,11 +7699,16 @@ mod tests {
             }],
             &arch,
         );
-        let context = DecompilerContext::default().with_semantic_route(Some(
-            SemanticRoutePlan::FallbackComment {
-                comment: "/* engine refusal: tested route */".to_string(),
-            },
+        let function_facts = FunctionFacts::default().with_decompile_route(test_decompile_route(
+            r2types::DecompileRouteKind::FallbackComment,
+            "engine refusal: tested route",
+            Some("/* engine refusal: tested route */".to_string()),
+            r2sym::RenderPermission::refuse(
+                r2sym::ProofOwner::R2engine,
+                "engine refusal: tested route",
+            ),
         ));
+        let context = DecompilerContext::default().with_function_facts(function_facts);
         let input = DecompilerInput::new(prepared, context);
 
         let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
@@ -7745,7 +7717,7 @@ mod tests {
     }
 
     #[test]
-    fn function_facts_route_overrides_legacy_context_route() {
+    fn function_facts_route_is_the_decompile_route_authority() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -7753,22 +7725,13 @@ mod tests {
             }],
             &arch,
         );
-        let function_facts =
-            FunctionFacts::default().with_decompile_route(r2types::DecompileRouteFacts {
-                kind: r2types::DecompileRouteKind::FallbackComment,
-                reason: Some("facts-owned route".to_string()),
-                fallback_comment: Some("/* facts-owned refusal */".to_string()),
-                skip_runtime_type_inference: true,
-                use_prepared_semantic_view: false,
-                proof_coverage: r2sym::ProofCoverage::default(),
-                render_permission: r2sym::RenderPermission::refuse(
-                    r2sym::ProofOwner::R2engine,
-                    "facts-owned route",
-                ),
-            });
-        let context = DecompilerContext::default()
-            .with_function_facts(function_facts)
-            .with_semantic_route(Some(SemanticRoutePlan::Standard));
+        let function_facts = FunctionFacts::default().with_decompile_route(test_decompile_route(
+            r2types::DecompileRouteKind::FallbackComment,
+            "facts-owned route",
+            Some("/* facts-owned refusal */".to_string()),
+            r2sym::RenderPermission::refuse(r2sym::ProofOwner::R2engine, "facts-owned route"),
+        ));
+        let context = DecompilerContext::default().with_function_facts(function_facts);
         let input = DecompilerInput::new(prepared, context);
 
         let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
@@ -7809,29 +7772,24 @@ mod tests {
                 .is_some(),
             "callee resolution must be retained on FunctionFacts"
         );
-        assert!(
-            context
-                .callee_resolution
-                .as_ref()
-                .and_then(|resolution| resolution.identity_for_callsite(callsite))
-                .is_some(),
-            "legacy r2dec context field must mirror FunctionFacts while consumers migrate"
-        );
     }
 
     #[test]
     fn decompile_input_nonstandard_summary_routes_are_comment_only() {
         let arch = test_arch_for_decompile();
         for route in [
-            SemanticRoutePlan::StructuredWorker {
-                reason: "engine-selected structured summary route".to_string(),
-            },
-            SemanticRoutePlan::LinearWorker {
-                reason: "engine-selected linear summary route".to_string(),
-            },
-            SemanticRoutePlan::SummaryIslands {
-                reason: "engine-selected island summary route".to_string(),
-            },
+            (
+                r2types::DecompileRouteKind::StructuredWorker,
+                "engine-selected structured summary route",
+            ),
+            (
+                r2types::DecompileRouteKind::LinearWorker,
+                "engine-selected linear summary route",
+            ),
+            (
+                r2types::DecompileRouteKind::SummaryIslands,
+                "engine-selected island summary route",
+            ),
         ] {
             let prepared = prepared_from_ops(
                 vec![R2ILOp::Return {
@@ -7840,13 +7798,21 @@ mod tests {
                 &arch,
             );
             let signature = signature_spec(Some(CType::Int(32)), Vec::new());
-            let context = DecompilerContext::default()
-                .with_type_facts(FunctionTypeFacts {
+            let function_facts = FunctionFacts::new(
+                FunctionTypeFacts {
                     signature_certificate: external_signature_certificate(&signature),
                     merged_signature: Some(signature),
                     ..FunctionTypeFacts::default()
-                })
-                .with_semantic_route(Some(route.clone()));
+                },
+                None,
+            )
+            .with_decompile_route(test_decompile_route(
+                route.0,
+                route.1,
+                None,
+                r2sym::RenderPermission::summary(r2sym::ProofOwner::R2engine, route.1),
+            ));
+            let context = DecompilerContext::default().with_function_facts(function_facts);
             let input = DecompilerInput::new(prepared, context);
 
             let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
@@ -7855,13 +7821,15 @@ mod tests {
                 output.contains(
                     "render contract: summary facts only; no executable native C reconstructed"
                 ),
-                "summary route builder path must state the render contract for {route:?}, got:\n{output}"
+                "summary route builder path must state the render contract for {:?}, got:\n{output}",
+                route.0
             );
             assert!(
                 !output.contains("return 0;")
                     && !output.contains("switch (")
                     && !output.contains("case 0x"),
-                "summary route builder path must not emit executable C for {route:?}, got:\n{output}"
+                "summary route builder path must not emit executable C for {:?}, got:\n{output}",
+                route.0
             );
         }
     }
@@ -7875,12 +7843,16 @@ mod tests {
             }],
             &arch,
         );
-        let context = DecompilerContext::default()
-            .with_semantic_route(Some(SemanticRoutePlan::Standard))
-            .with_render_permission(Some(r2sym::RenderPermission::residual(
+        let function_facts = FunctionFacts::default().with_decompile_route(test_decompile_route(
+            r2types::DecompileRouteKind::Standard,
+            "standard route with missing expression proof",
+            None,
+            r2sym::RenderPermission::residual(
                 r2sym::ProofOwner::R2engine,
                 "missing expression proof",
-            )));
+            ),
+        ));
+        let context = DecompilerContext::default().with_function_facts(function_facts);
         let input = DecompilerInput::new(prepared, context);
 
         let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
@@ -10597,14 +10569,18 @@ mod tests {
             },
         };
         let function_facts =
-            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
-        decompiler = decompiler.with_context(
-            DecompilerContext::default()
-                .with_function_facts(function_facts)
-                .with_semantic_route(Some(SemanticRoutePlan::VmSummary {
-                    reason: "test-selected vm summary".to_string(),
-                })),
-        );
+            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact))
+                .with_decompile_route(test_decompile_route(
+                    r2types::DecompileRouteKind::VmSummary,
+                    "test-selected vm summary",
+                    None,
+                    r2sym::RenderPermission::summary(
+                        r2sym::ProofOwner::R2engine,
+                        "test-selected vm summary",
+                    ),
+                ));
+        decompiler = decompiler
+            .with_context(DecompilerContext::default().with_function_facts(function_facts));
 
         let output = decompiler.decompile(&func);
         assert!(
@@ -10691,7 +10667,16 @@ mod tests {
             },
             Some(semantic_artifact),
         )
-        .with_summary_set(Some(summary_set));
+        .with_summary_set(Some(summary_set))
+        .with_decompile_route(test_decompile_route(
+            r2types::DecompileRouteKind::LinearWorker,
+            "guarded structuring unavailable",
+            None,
+            r2sym::RenderPermission::summary(
+                r2sym::ProofOwner::R2engine,
+                "guarded structuring unavailable",
+            ),
+        ));
         assert!(function_facts.has_summary_conflicts());
         let context = DecompilerContext::from_function_facts(
             function_facts,
@@ -10699,10 +10684,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             64,
-        )
-        .with_semantic_route(Some(SemanticRoutePlan::LinearWorker {
-            reason: "guarded structuring unavailable".to_string(),
-        }));
+        );
         let input = DecompilerInput::new(prepared, context);
         assert!(input.context.function_facts.has_summary_conflicts());
         let output = Decompiler::new(DecompilerConfig::default()).decompile_input(&input);
