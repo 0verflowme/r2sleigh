@@ -37,6 +37,10 @@ fn analysis_policy_for_depth(_: u32) -> usize {
     0
 }
 
+fn r2sleigh_interproc_helper_scope_budget_allows(_: usize, _: u32) -> i32 {
+    0
+}
+
 mod r2dec {
     pub fn render_semantic_worker_linearization() -> String {
         String::new()
@@ -95,6 +99,7 @@ fn main() {
     let _ = &*TYPE_WRITEBACK_CACHE;
     let _ = caller_prefers_bounded_type_plan();
     let _ = analysis_policy_for_depth(0);
+    let _ = r2sleigh_interproc_helper_scope_budget_allows(1, 1);
     let _ = EngineTypeAnalysisRequest {
         caller_prefers_bounded_type_plan: true,
     };

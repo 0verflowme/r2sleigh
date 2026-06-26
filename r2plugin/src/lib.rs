@@ -1155,14 +1155,21 @@ pub extern "C" fn r2sleigh_signature_writeback_size_eligible(basic_block_count: 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_interproc_helper_scope_budget_allows(
+pub extern "C" fn r2sleigh_interproc_session_plan_for_depth(
+    depth: u32,
+    purpose: u32,
     basic_block_count: usize,
     cost: u32,
-) -> i32 {
+) -> R2SleighInterprocSessionPlan {
+    let policy = r2engine::analysis_policy_for_radare2_depth(depth);
     let basic_block_count = u32::try_from(basic_block_count).unwrap_or(u32::MAX);
-    i32::from(r2engine::interproc_helper_scope_within_budget(
-        basic_block_count,
-        cost,
+    r2sleigh_interproc_session_plan_from_engine(r2engine::interproc_session_plan(
+        policy,
+        r2sleigh_interproc_session_purpose_to_engine(purpose),
+        Some(r2engine::EngineInterprocTargetMetrics {
+            basic_block_count,
+            cost,
+        }),
     ))
 }
 
@@ -4247,12 +4254,23 @@ pub struct R2SleighPostAnalysisPlan {
     type_writeback_focus_only: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct R2SleighInterprocSessionPlan {
+    include_type_interproc_scope: i32,
+    include_root_symbolic_scope: i32,
+    interproc_iter: usize,
+    interproc_max_iters: usize,
+    interproc_converged: i32,
+}
+
 const R2SLEIGH_MODE_FAST: u32 = 0;
 const R2SLEIGH_MODE_BALANCED: u32 = 1;
 const R2SLEIGH_MODE_FULL: u32 = 2;
 const R2SLEIGH_TYPE_WRITEBACK_OFF: u32 = 0;
 const R2SLEIGH_TYPE_WRITEBACK_BALANCED: u32 = 1;
 const R2SLEIGH_TYPE_WRITEBACK_AGGRESSIVE: u32 = 2;
+const R2SLEIGH_INTERPROC_SESSION_DECOMPILE: u32 = 1;
 
 fn r2sleigh_mode_from_engine(mode: r2engine::EngineAnalysisMode) -> u32 {
     match mode {
@@ -4325,6 +4343,27 @@ fn r2sleigh_post_analysis_plan_from_engine(
         taint_focus_only: bool_to_ffi_i32(plan.taint_focus_only),
         sigwrite_focus_only: bool_to_ffi_i32(plan.signature_writeback_focus_only),
         type_writeback_focus_only: bool_to_ffi_i32(plan.type_writeback_focus_only),
+    }
+}
+
+fn r2sleigh_interproc_session_purpose_to_engine(
+    purpose: u32,
+) -> r2engine::EngineInterprocSessionPurpose {
+    match purpose {
+        R2SLEIGH_INTERPROC_SESSION_DECOMPILE => r2engine::EngineInterprocSessionPurpose::Decompile,
+        _ => r2engine::EngineInterprocSessionPurpose::TypeAnalysis,
+    }
+}
+
+fn r2sleigh_interproc_session_plan_from_engine(
+    plan: r2engine::EngineInterprocSessionPlan,
+) -> R2SleighInterprocSessionPlan {
+    R2SleighInterprocSessionPlan {
+        include_type_interproc_scope: bool_to_ffi_i32(plan.include_type_interproc_scope),
+        include_root_symbolic_scope: bool_to_ffi_i32(plan.include_root_symbolic_scope),
+        interproc_iter: plan.interproc_iter,
+        interproc_max_iters: plan.interproc_max_iters,
+        interproc_converged: bool_to_ffi_i32(plan.interproc_converged),
     }
 }
 
@@ -9178,6 +9217,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn c_plugin_routes_interproc_session_policy_to_engine() {
+        let c_source = include_str!("../r_anal_sleigh.c");
+
+        assert!(
+            c_source.contains("r2sleigh_interproc_session_plan_for_depth"),
+            "C glue must consume the engine-owned interproc session plan"
+        );
+        for forbidden in [
+            "should_skip_decompile_symbolic_scope",
+            "function_exceeds_helper_scope_budget",
+            "r2sleigh_interproc_helper_scope_budget_allows",
+            "prefer_bounded_semantic_type_plan",
+            "? 1: policy.type_interproc_max_iters",
+            "? false: true",
+            "1, 1, true",
+        ] {
+            assert!(
+                !c_source.contains(forbidden),
+                "C glue must not own interproc/session policy fragment {forbidden:?}"
+            );
+        }
+    }
+
     fn register_param(
         name: &str,
         ty: Option<r2dec::CType>,
@@ -9790,31 +9853,44 @@ mod tests {
             r2sleigh_signature_writeback_size_eligible(r2types::SIGNATURE_WRITEBACK_MAX_BLOCKS + 1),
             0
         );
-        assert_eq!(
-            r2sleigh_interproc_helper_scope_budget_allows(
-                r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
-                r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
-            ),
-            1
+        let in_budget_type = r2sleigh_interproc_session_plan_for_depth(
+            0,
+            0,
+            r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
+            r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
         );
+        assert_eq!(in_budget_type.include_type_interproc_scope, 1);
+        assert_eq!(in_budget_type.include_root_symbolic_scope, 0);
+        assert_eq!(in_budget_type.interproc_iter, 1);
         assert_eq!(
-            r2sleigh_interproc_helper_scope_budget_allows(
-                (r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1) as usize,
-                r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
-            ),
-            0
+            in_budget_type.interproc_max_iters,
+            r2engine::analysis_policy_for_radare2_depth(0).type_interproc_max_iters
         );
-        assert_eq!(
-            r2sleigh_interproc_helper_scope_budget_allows(
-                r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
-                r2engine::ENGINE_INTERPROC_HELPER_MAX_COST + 1,
-            ),
-            0
+        assert_eq!(in_budget_type.interproc_converged, 1);
+
+        let bounded_type = r2sleigh_interproc_session_plan_for_depth(
+            0,
+            0,
+            (r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1) as usize,
+            r2engine::ENGINE_INTERPROC_HELPER_MAX_COST,
         );
-        assert_eq!(
-            r2sleigh_interproc_helper_scope_budget_allows(usize::MAX, 1),
-            0
+        assert_eq!(bounded_type.include_type_interproc_scope, 0);
+        assert_eq!(bounded_type.include_root_symbolic_scope, 1);
+        assert_eq!(bounded_type.interproc_iter, 1);
+        assert_eq!(bounded_type.interproc_max_iters, 1);
+        assert_eq!(bounded_type.interproc_converged, 0);
+
+        let bounded_decompile = r2sleigh_interproc_session_plan_for_depth(
+            0,
+            R2SLEIGH_INTERPROC_SESSION_DECOMPILE,
+            r2engine::ENGINE_INTERPROC_HELPER_MAX_BLOCKS as usize,
+            r2engine::ENGINE_INTERPROC_HELPER_MAX_COST + 1,
         );
+        assert_eq!(bounded_decompile.include_type_interproc_scope, 0);
+        assert_eq!(bounded_decompile.include_root_symbolic_scope, 0);
+        assert_eq!(bounded_decompile.interproc_iter, 1);
+        assert_eq!(bounded_decompile.interproc_max_iters, 1);
+        assert_eq!(bounded_decompile.interproc_converged, 1);
     }
 
     #[test]

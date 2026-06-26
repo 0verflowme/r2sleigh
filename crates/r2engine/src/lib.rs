@@ -973,6 +973,61 @@ pub fn interproc_helper_scope_within_budget(basic_block_count: u32, cost: u32) -
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineInterprocSessionPurpose {
+    TypeAnalysis,
+    Decompile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineInterprocSessionPlan {
+    pub include_type_interproc_scope: bool,
+    pub include_root_symbolic_scope: bool,
+    pub interproc_iter: usize,
+    pub interproc_max_iters: usize,
+    pub interproc_converged: bool,
+}
+
+pub fn interproc_session_plan(
+    policy: EngineAnalysisPolicy,
+    purpose: EngineInterprocSessionPurpose,
+    metrics: Option<EngineInterprocTargetMetrics>,
+) -> EngineInterprocSessionPlan {
+    let within_budget = interproc_target_metrics_within_budget(metrics.as_ref());
+    match purpose {
+        EngineInterprocSessionPurpose::TypeAnalysis if within_budget => {
+            EngineInterprocSessionPlan {
+                include_type_interproc_scope: true,
+                include_root_symbolic_scope: false,
+                interproc_iter: 1,
+                interproc_max_iters: policy.type_interproc_max_iters.max(1),
+                interproc_converged: true,
+            }
+        }
+        EngineInterprocSessionPurpose::TypeAnalysis => EngineInterprocSessionPlan {
+            include_type_interproc_scope: false,
+            include_root_symbolic_scope: true,
+            interproc_iter: 1,
+            interproc_max_iters: 1,
+            interproc_converged: false,
+        },
+        EngineInterprocSessionPurpose::Decompile if within_budget => EngineInterprocSessionPlan {
+            include_type_interproc_scope: true,
+            include_root_symbolic_scope: false,
+            interproc_iter: 1,
+            interproc_max_iters: 1,
+            interproc_converged: true,
+        },
+        EngineInterprocSessionPurpose::Decompile => EngineInterprocSessionPlan {
+            include_type_interproc_scope: false,
+            include_root_symbolic_scope: false,
+            interproc_iter: 1,
+            interproc_max_iters: 1,
+            interproc_converged: true,
+        },
+    }
+}
+
 fn interproc_target_queue_pair(
     direct_target: u64,
     resolved_target: Option<u64>,
@@ -7622,6 +7677,55 @@ mod tests {
             ENGINE_INTERPROC_HELPER_MAX_BLOCKS,
             ENGINE_INTERPROC_HELPER_MAX_COST + 1,
         ));
+    }
+
+    #[test]
+    fn interproc_session_plan_owns_scope_and_budget_policy() {
+        let policy = analysis_policy_for_depth(EngineAnalysisDepth::Default);
+        let small = Some(small_interproc_target_metrics());
+        let oversized = Some(oversized_interproc_target_metrics());
+
+        let full_type =
+            interproc_session_plan(policy, EngineInterprocSessionPurpose::TypeAnalysis, small);
+        assert!(full_type.include_type_interproc_scope);
+        assert!(!full_type.include_root_symbolic_scope);
+        assert_eq!(full_type.interproc_iter, 1);
+        assert_eq!(
+            full_type.interproc_max_iters,
+            policy.type_interproc_max_iters
+        );
+        assert!(full_type.interproc_converged);
+
+        let bounded_type = interproc_session_plan(
+            policy,
+            EngineInterprocSessionPurpose::TypeAnalysis,
+            oversized,
+        );
+        assert!(!bounded_type.include_type_interproc_scope);
+        assert!(bounded_type.include_root_symbolic_scope);
+        assert_eq!(bounded_type.interproc_iter, 1);
+        assert_eq!(bounded_type.interproc_max_iters, 1);
+        assert!(!bounded_type.interproc_converged);
+
+        let full_decompile = interproc_session_plan(
+            policy,
+            EngineInterprocSessionPurpose::Decompile,
+            Some(small_interproc_target_metrics()),
+        );
+        assert!(full_decompile.include_type_interproc_scope);
+        assert!(!full_decompile.include_root_symbolic_scope);
+        assert_eq!(full_decompile.interproc_max_iters, 1);
+        assert!(full_decompile.interproc_converged);
+
+        let bounded_decompile = interproc_session_plan(
+            policy,
+            EngineInterprocSessionPurpose::Decompile,
+            Some(oversized_interproc_target_metrics()),
+        );
+        assert!(!bounded_decompile.include_type_interproc_scope);
+        assert!(!bounded_decompile.include_root_symbolic_scope);
+        assert_eq!(bounded_decompile.interproc_max_iters, 1);
+        assert!(bounded_decompile.interproc_converged);
     }
 
     #[test]

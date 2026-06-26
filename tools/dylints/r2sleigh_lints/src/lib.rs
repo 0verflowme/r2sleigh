@@ -1462,6 +1462,7 @@ fn plugin_engine_policy_ownership_item(cx: &LateContext<'_>, item: &Item<'_>) ->
                 "static TYPE_WRITEBACK_CACHE",
                 "fn caller_prefers_bounded_type_plan",
                 "fn analysis_policy_for_depth",
+                "fn r2sleigh_interproc_helper_scope_budget_allows",
             ]
             .iter()
             .any(|needle| snippet.contains(needle))
