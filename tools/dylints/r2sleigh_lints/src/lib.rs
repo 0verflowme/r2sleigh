@@ -325,14 +325,14 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when `r2engine` applies decompile route or render permission by
-    /// filling legacy `r2dec::DecompilerContext` side-channel fields.
+    /// Warns when `r2engine` applies decompile route, render permission, or
+    /// callsite/callee evidence by filling request/context side-channel fields.
     ///
     /// ### Why is this bad?
     ///
     /// The decompile spine is `FunctionFacts`. Engine-owned route, refusal,
-    /// proof coverage, and render permission must travel through
-    /// `FunctionFacts::decompile_route`; otherwise plugin/decompiler callers
+    /// proof coverage, render permission, and callee resolution must travel through
+    /// `FunctionFacts`; otherwise plugin/decompiler callers
     /// can observe different policy depending on which side channel was set.
     ///
     /// ### Example
@@ -340,9 +340,11 @@ rustc_session::declare_lint!(
     /// ```rust
     /// context.with_semantic_route(Some(route));
     /// context.with_render_permission(Some(permission));
+    /// EngineDecompileRequest { callee_resolution: Some(facts), ..request }
     /// ```
     ///
-    /// Use instead `FunctionFacts::set_decompile_route(...)`.
+    /// Use instead `FunctionFacts::set_decompile_route(...)` and
+    /// `FunctionFacts::set_callee_resolution(...)`.
     pub R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     Warn,
     "r2engine must carry decompile route decisions through FunctionFacts"
@@ -815,6 +817,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_ROUTE_POLICY_OWNERSHIP,
                 item.span,
                 "r2dec must not define route/refusal policy helpers; r2engine owns route selection",
+            );
+        }
+
+        if is_r2engine_span(cx, item.span)
+            && !item_is_test_only(cx, item)
+            && engine_decompiler_context_side_channel_item(cx, item)
+        {
+            span_lint(
+                cx,
+                R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+                item.span,
+                "r2engine must carry decompile route/callee evidence through FunctionFacts, not request or context side channels",
             );
         }
 
@@ -1530,6 +1544,15 @@ fn engine_decompiler_context_side_channel_expr(expr: &Expr<'_>) -> bool {
     )
 }
 
+fn engine_decompiler_context_side_channel_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
+    let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
+        return false;
+    };
+    (snippet.contains("struct EngineDecompileRequest")
+        || snippet.contains("struct DecompileRenderCacheKeyInput"))
+        && snippet.contains("callee_resolution:")
+}
+
 fn plugin_unprepared_decompile_oracle_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let ExprKind::MethodCall(method, _receiver, [arg], _) = expr.kind else {
         return false;
@@ -2069,6 +2092,11 @@ fn is_r2plugin_type_hint_policy_span(cx: &LateContext<'_>, span: rustc_span::Spa
 
 fn is_r2engine_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let filename = cx.sess().source_map().span_to_filename(expr.span);
+    format!("{filename:?}").contains("crates/r2engine/src/")
+}
+
+fn is_r2engine_span(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
+    let filename = cx.sess().source_map().span_to_filename(span);
     format!("{filename:?}").contains("crates/r2engine/src/")
 }
 

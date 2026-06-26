@@ -3649,15 +3649,17 @@ impl DecompilerContext {
             &symbols,
             ptr_bits,
         );
+        let function_facts = Self::canonicalize_function_facts(function_facts);
+        let callee_resolution = function_facts.callee_resolution().cloned();
         Self {
             function_names,
             strings,
             symbols,
-            function_facts: Self::canonicalize_function_facts(function_facts),
+            function_facts,
             semantic_route: None,
             skip_runtime_type_inference: None,
             use_prepared_semantic_view: None,
-            callee_resolution: None,
+            callee_resolution,
             render_permission: None,
         }
     }
@@ -3696,6 +3698,7 @@ impl DecompilerContext {
 
     pub fn with_function_facts(mut self, function_facts: FunctionFacts) -> Self {
         self.function_facts = Self::canonicalize_function_facts(function_facts);
+        self.callee_resolution = self.function_facts.callee_resolution().cloned();
         self
     }
 
@@ -3715,7 +3718,14 @@ impl DecompilerContext {
     }
 
     pub fn with_callee_resolution(mut self, facts: Option<CalleeResolutionFacts>) -> Self {
-        self.callee_resolution = facts;
+        if let Some(facts) = facts {
+            self.function_facts.set_callee_resolution(facts.clone());
+            self.callee_resolution = Some(facts);
+        } else {
+            self.function_facts
+                .set_callee_resolution(CalleeResolutionFacts::default());
+            self.callee_resolution = None;
+        }
         self
     }
 
@@ -4437,7 +4447,11 @@ impl Decompiler {
             .as_ref()
             .map(|oracle| oracle as &dyn TypeOracle);
 
-        let callee_resolution = self.context.callee_resolution.as_ref();
+        let callee_resolution = self
+            .context
+            .callee_resolution
+            .as_ref()
+            .or_else(|| self.context.function_facts.callee_resolution());
 
         let recovered_param_infos: Vec<_> = var_recovery
             .parameters()
@@ -7753,6 +7767,49 @@ mod tests {
         let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
 
         assert_eq!(output, "/* facts-owned refusal */");
+    }
+
+    #[test]
+    fn decompiler_context_reads_callee_resolution_from_function_facts() {
+        let callsite = r2types::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 2,
+        };
+        let function_names = std::collections::HashMap::from([(0x402000, "sym.helper".into())]);
+        let symbols = std::collections::HashMap::new();
+        let identity_key = r2types::CalleeIdentityKey::Named("sym.helper".to_string());
+        let mut callee_resolution = r2types::CalleeResolutionFacts::default();
+        callee_resolution.by_key.insert(
+            identity_key.clone(),
+            r2types::CalleeIdentity::from_name("sym.helper"),
+        );
+        callee_resolution.by_callsite.insert(callsite, identity_key);
+        let function_facts = FunctionFacts::default().with_callee_resolution(callee_resolution);
+
+        let context = DecompilerContext::from_function_facts(
+            function_facts,
+            function_names,
+            std::collections::HashMap::new(),
+            symbols,
+            64,
+        );
+
+        assert!(
+            context
+                .function_facts
+                .callee_resolution()
+                .and_then(|resolution| resolution.identity_for_callsite(callsite))
+                .is_some(),
+            "callee resolution must be retained on FunctionFacts"
+        );
+        assert!(
+            context
+                .callee_resolution
+                .as_ref()
+                .and_then(|resolution| resolution.identity_for_callsite(callsite))
+                .is_some(),
+            "legacy r2dec context field must mirror FunctionFacts while consumers migrate"
+        );
     }
 
     #[test]

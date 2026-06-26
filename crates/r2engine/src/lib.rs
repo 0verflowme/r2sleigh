@@ -719,7 +719,6 @@ pub struct DecompileRenderCacheKeyInput<'a> {
     pub arch: Option<&'a r2il::ArchSpec>,
     pub ptr_bits: u32,
     pub function_facts: &'a FunctionFacts,
-    pub callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub func_names_payload: &'a str,
     pub strings_payload: &'a str,
     pub symbols_payload: &'a str,
@@ -741,10 +740,6 @@ pub fn decompile_render_cache_key(input: DecompileRenderCacheKeyInput<'_>) -> Re
         stable_fnv1a_hash(input.func_names_payload),
         stable_fnv1a_hash(input.strings_payload),
         stable_fnv1a_hash(input.symbols_payload),
-        input
-            .callee_resolution
-            .map(stable_fnv1a_debug_hash)
-            .unwrap_or(0),
     ));
     let render_config_hash = stable_fnv1a_hash(&(
         "decompile-render-config-v1",
@@ -827,14 +822,14 @@ pub fn decompiler_input_from_prepared_facts(
         &symbols,
         ptr_bits,
     );
+    function_facts.set_callee_resolution(callee_resolution);
     let context = r2dec::DecompilerContext::from_function_facts(
         function_facts,
         function_names,
         strings,
         symbols,
         ptr_bits,
-    )
-    .with_callee_resolution(Some(callee_resolution));
+    );
     let context = decompiler_context_with_route_decision(context, &route_decision);
     r2dec::DecompilerInput::new(ssa_func, context)
 }
@@ -1891,7 +1886,6 @@ pub struct EngineDecompileRequest {
     pub function_name: String,
     pub prepared_ssa: SsaArtifact,
     pub function_facts: FunctionFacts,
-    pub callee_resolution: Option<CalleeResolutionFacts>,
     pub function_names: HashMap<u64, String>,
     pub strings: HashMap<u64, String>,
     pub symbols: HashMap<u64, String>,
@@ -2704,13 +2698,15 @@ impl EngineSession {
             &symbols,
             analysis_request.ptr_bits,
         );
+        artifact
+            .function_facts
+            .set_callee_resolution(callee_resolution);
         let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
             blocks: &analysis_request.blocks,
             function_name: &display_name,
             arch: analysis_request.arch.as_ref(),
             ptr_bits: analysis_request.ptr_bits,
             function_facts: &artifact.function_facts,
-            callee_resolution: Some(&callee_resolution),
             func_names_payload: &func_names_payload,
             strings_payload: &strings_payload,
             symbols_payload: &symbols_payload,
@@ -2730,7 +2726,6 @@ impl EngineSession {
             function_name: display_name,
             prepared_ssa: artifact.ssa_func,
             function_facts: artifact.function_facts,
-            callee_resolution: Some(callee_resolution),
             function_names,
             strings,
             symbols,
@@ -2979,7 +2974,6 @@ impl EngineSession {
             arch: request.arch,
             ptr_bits: request.ptr_bits,
             function_facts: &function_facts,
-            callee_resolution: None,
             func_names_payload: request.func_names_payload,
             strings_payload: request.strings_payload,
             symbols_payload: request.symbols_payload,
@@ -3459,8 +3453,7 @@ fn render_engine_decompile_request(
         request.strings.clone(),
         request.symbols.clone(),
         request.ptr_bits,
-    )
-    .with_callee_resolution(request.callee_resolution.clone());
+    );
     let context = decompiler_context_with_route_decision(context, decision);
     let input = r2dec::DecompilerInput::new(request.prepared_ssa.clone(), context);
     let output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
@@ -6645,7 +6638,6 @@ mod tests {
             function_name: "sym.zero".to_string(),
             prepared_ssa: prepared,
             function_facts: FunctionFacts::default(),
-            callee_resolution: None,
             function_names: HashMap::new(),
             strings: HashMap::new(),
             symbols: HashMap::new(),
@@ -6695,13 +6687,19 @@ mod tests {
         assert!(printf_resolution.identity_for_name("printf").is_some());
         assert!(memcpy_resolution.identity_for_name("memcpy").is_some());
 
+        let printf_facts = function_facts
+            .clone()
+            .with_callee_resolution(printf_resolution.clone());
+        let memcpy_facts = function_facts
+            .clone()
+            .with_callee_resolution(memcpy_resolution.clone());
+
         let printf_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
             blocks: &blocks,
             function_name: "sym.caller",
             arch: None,
             ptr_bits: 64,
-            function_facts: &function_facts,
-            callee_resolution: Some(&printf_resolution),
+            function_facts: &printf_facts,
             func_names_payload: "{}",
             strings_payload: "{}",
             symbols_payload: "{}",
@@ -6711,8 +6709,7 @@ mod tests {
             function_name: "sym.caller",
             arch: None,
             ptr_bits: 64,
-            function_facts: &function_facts,
-            callee_resolution: Some(&memcpy_resolution),
+            function_facts: &memcpy_facts,
             func_names_payload: "{}",
             strings_payload: "{}",
             symbols_payload: "{}",
@@ -6723,7 +6720,6 @@ mod tests {
             arch: None,
             ptr_bits: 64,
             function_facts: &function_facts,
-            callee_resolution: None,
             func_names_payload: "{}",
             strings_payload: "{}",
             symbols_payload: "{}",
@@ -8983,13 +8979,13 @@ mod tests {
 
     #[test]
     fn decompiler_input_from_prepared_facts_keeps_policy_in_function_facts() {
-        let blocks = const_return_blocks(0x401000, 0);
+        let blocks = direct_call_return_blocks(0x401000, 0x402000);
         let prepared = r2ssa::SsaArtifact::for_decompile(&blocks, None).expect("prepared");
 
         let input = decompiler_input_from_prepared_facts(
             prepared,
             FunctionFacts::default(),
-            HashMap::new(),
+            HashMap::from([(0x402000, "sym.helper".to_string())]),
             HashMap::new(),
             HashMap::new(),
             64,
@@ -9008,8 +9004,18 @@ mod tests {
             "engine helper must not populate the legacy render permission side channel"
         );
         assert!(
-            input.context.callee_resolution.is_some(),
-            "engine helper must attach canonical callee-resolution facts"
+            input
+                .context
+                .function_facts
+                .callee_resolution()
+                .and_then(|resolution| {
+                    resolution.identity_for_callsite(r2types::CallsiteKey {
+                        block_addr: 0x401000,
+                        op_index: 0,
+                    })
+                })
+                .is_some(),
+            "engine helper must attach canonical callee-resolution facts to FunctionFacts"
         );
     }
 }

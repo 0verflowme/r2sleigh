@@ -167,6 +167,13 @@ fn import_policy_authorized_from_evidence(class: CalleeClass, has_import_linkage
 }
 
 impl CalleeResolutionFacts {
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+            && self.by_direct_addr.is_empty()
+            && self.by_callsite.is_empty()
+            && self.by_name.is_empty()
+    }
+
     pub fn from_direct_call_targets<I>(targets: I, ctx: &CalleeIdentityContext<'_>) -> Self
     where
         I: IntoIterator<Item = (CallsiteKey, u64)>,

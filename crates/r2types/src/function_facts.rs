@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::callee::CalleeResolutionFacts;
 use crate::facts::{
     FunctionSignatureProjection, FunctionTypeFacts, OutParamCertificateEvidence,
     OutParamCertificateSource, SignatureProjectionResult,
@@ -213,6 +214,7 @@ pub struct FunctionFacts {
     pub semantics: Option<r2sym::SemanticArtifact>,
     pub proof: r2sym::ProofCoverage,
     pub decompile_route: Option<DecompileRouteFacts>,
+    pub callee_resolution: CalleeResolutionFacts,
     pub assumptions: r2ssa::AssumptionSet,
     pub plans: AnalysisPlans,
     pub summary_view: InterprocSummaryView,
@@ -233,6 +235,7 @@ impl FunctionFacts {
             semantics,
             proof,
             decompile_route: None,
+            callee_resolution: CalleeResolutionFacts::default(),
             assumptions: r2ssa::AssumptionSet::default(),
             plans,
             summary_view: InterprocSummaryView::default(),
@@ -277,6 +280,19 @@ impl FunctionFacts {
     pub fn with_decompile_route(mut self, route: DecompileRouteFacts) -> Self {
         self.decompile_route = Some(route);
         self
+    }
+
+    pub fn with_callee_resolution(mut self, callee_resolution: CalleeResolutionFacts) -> Self {
+        self.callee_resolution = callee_resolution;
+        self
+    }
+
+    pub fn set_callee_resolution(&mut self, callee_resolution: CalleeResolutionFacts) {
+        self.callee_resolution = callee_resolution;
+    }
+
+    pub fn callee_resolution(&self) -> Option<&CalleeResolutionFacts> {
+        (!self.callee_resolution.is_empty()).then_some(&self.callee_resolution)
     }
 
     pub fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
@@ -584,7 +600,37 @@ fn push_structured_summary_pointer_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn function_facts_owns_canonical_callee_resolution() {
+        let callsite = crate::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 3,
+        };
+        let function_names = HashMap::from([(0x402000, "sym.helper".to_string())]);
+        let symbols = HashMap::new();
+        let known_function_signatures = HashMap::new();
+        let callee_facts = BTreeMap::new();
+        let ctx = crate::CalleeIdentityContext {
+            function_names: &function_names,
+            symbols: &symbols,
+            callee_facts: &callee_facts,
+            known_function_signatures: &known_function_signatures,
+        };
+        let resolution =
+            CalleeResolutionFacts::from_direct_call_targets([(callsite, 0x402000)], &ctx);
+
+        let facts = FunctionFacts::default().with_callee_resolution(resolution);
+
+        assert!(
+            facts
+                .callee_resolution()
+                .and_then(|resolution| resolution.identity_for_callsite(callsite))
+                .is_some(),
+            "callsite identity must travel through FunctionFacts, not a render side channel"
+        );
+    }
 
     fn summary_with_effects(id: r2ssa::InterprocFunctionId) -> r2ssa::FunctionSemanticSummary {
         let mut summary = r2ssa::FunctionSemanticSummary::unknown(id, Some("sym.effect".into()));
