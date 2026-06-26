@@ -897,6 +897,52 @@ pub fn decompile_call_result_facts(prepared: &SsaArtifact) -> r2types::FunctionC
     }
 }
 
+pub fn decompile_control_facts(prepared: &SsaArtifact) -> r2types::FunctionControlFacts {
+    let predicates = prepared.predicates();
+    let branch_predicates = predicates
+        .predicates
+        .values()
+        .map(|predicate| {
+            (
+                predicate.block_addr,
+                r2types::BranchPredicateFact {
+                    id: predicate.id,
+                    block_addr: predicate.block_addr,
+                    condition: predicate.condition,
+                    comparison: predicate.comparison.as_ref().map(|comparison| {
+                        r2types::PredicateComparisonFact {
+                            kind: comparison.kind,
+                            lhs: comparison.lhs,
+                            rhs: comparison.rhs,
+                        }
+                    }),
+                    true_target: predicate.true_target,
+                    false_target: predicate.false_target,
+                },
+            )
+        })
+        .collect();
+    let switches = predicates
+        .switches
+        .iter()
+        .map(|(block_addr, switch)| {
+            (
+                *block_addr,
+                r2types::SwitchSelectorFact {
+                    block_addr: switch.block_addr,
+                    selector: switch.selector,
+                    cases: switch.cases.clone(),
+                    default: switch.default,
+                },
+            )
+        })
+        .collect();
+    r2types::FunctionControlFacts {
+        branch_predicates,
+        switches,
+    }
+}
+
 pub fn decompiler_input_from_prepared_facts(
     ssa_func: SsaArtifact,
     mut function_facts: FunctionFacts,
@@ -929,6 +975,7 @@ pub fn decompiler_input_from_prepared_facts(
     function_facts.set_callee_resolution(callee_resolution);
     function_facts.set_callsites(decompile_callsite_argument_facts(&ssa_func));
     function_facts.set_call_results(decompile_call_result_facts(&ssa_func));
+    function_facts.set_control(decompile_control_facts(&ssa_func));
     let context = r2dec::DecompilerContext::from_function_facts(
         function_facts,
         function_names,
@@ -2813,6 +2860,9 @@ impl EngineSession {
         artifact
             .function_facts
             .set_call_results(decompile_call_result_facts(&artifact.ssa_func));
+        artifact
+            .function_facts
+            .set_control(decompile_control_facts(&artifact.ssa_func));
         let render_cache_key = decompile_render_cache_key(DecompileRenderCacheKeyInput {
             blocks: &analysis_request.blocks,
             function_name: &display_name,
@@ -4108,6 +4158,7 @@ fn build_engine_analysis_artifact(
         &semantic_analysis.ssa_func,
     ));
     function_facts.set_call_results(decompile_call_result_facts(&semantic_analysis.ssa_func));
+    function_facts.set_control(decompile_control_facts(&semantic_analysis.ssa_func));
     Some(EngineAnalysisArtifact {
         ssa_func: semantic_analysis.ssa_func,
         pattern_ssa_func: semantic_analysis.pattern_ssa_func,
@@ -9246,6 +9297,37 @@ mod tests {
                 r2ssa::ReturnCarrier::Register { ref name } if name == "rax"
             )),
             "call-result proof must travel through FunctionFacts"
+        );
+    }
+
+    #[test]
+    fn decompiler_input_from_prepared_facts_attaches_control_facts() {
+        let blocks = symbolic_register_branch_blocks(0x401000);
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile(&blocks, Some(&vm_test_arch())).expect("prepared");
+
+        let input = decompiler_input_from_prepared_facts(
+            prepared,
+            FunctionFacts::default(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            64,
+        );
+
+        let control = input
+            .context
+            .function_facts
+            .control()
+            .expect("engine helper must attach canonical control facts");
+        let branch = control
+            .branch_for_block(0x401000)
+            .expect("conditional branch fact must travel through FunctionFacts");
+        assert_eq!(branch.true_target, 0x401010);
+        assert_eq!(branch.false_target, 0x401004);
+        assert_eq!(
+            branch.comparison.as_ref().map(|comparison| comparison.kind),
+            Some(r2ssa::CompareKind::Equal)
         );
     }
 }

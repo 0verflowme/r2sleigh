@@ -8,7 +8,7 @@ use r2ssa::{
 use r2types::{
     CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
     ExternalStackSlotRole, ExternalStackSlotSpec, FunctionCallResultFacts, FunctionCallsiteFacts,
-    StackSlotKey, VisibleBinding, VisibleBindingKind,
+    FunctionControlFacts, StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
 
 use super::lower::LowerCtx;
@@ -57,6 +57,7 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) call_result_facts_by_value: BTreeMap<ValueId, r2types::CallResultFact>,
     pub(crate) call_result_source_by_value: HashMap<ValueId, (u64, usize)>,
     pub(crate) call_result_source_by_name: HashMap<String, (u64, usize)>,
+    pub(crate) switch_selector_value_by_block: BTreeMap<u64, ValueId>,
     pub(crate) switch_selector_expr_by_block: BTreeMap<u64, CExpr>,
 }
 
@@ -66,6 +67,7 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) callsite_facts: Option<&'a FunctionCallsiteFacts>,
     pub(crate) call_result_facts: Option<&'a FunctionCallResultFacts>,
+    pub(crate) control_facts: Option<&'a FunctionControlFacts>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
@@ -252,7 +254,7 @@ pub(crate) fn build_prepared_runtime_facts(
     pin_aliases_for_prepared_pinned_values(&mut use_info);
     populate_prepared_call_runtime_facts(&mut use_info, blocks, env, prepared, view);
     overlay_local_struct_semantics(&mut use_info, blocks, env);
-    overlay_prepared_switch_roots(&mut use_info, prepared);
+    overlay_prepared_switch_roots(&mut use_info, prepared, view);
     populate_prepared_render_definitions(&mut use_info, blocks, env);
     finalize_prepared_call_inlining(&mut use_info);
 
@@ -1236,7 +1238,11 @@ fn populate_predicates(view: &mut PreparedSemanticView, inputs: &PreparedSemanti
     view.predicate_expr_by_value.clear();
     view.branch_predicate_expr_by_block.clear();
 
-    for predicate in inputs.prepared.predicates().predicates.values() {
+    let Some(control_facts) = inputs.control_facts else {
+        return;
+    };
+
+    for predicate in control_facts.branch_predicates.values() {
         let Some(compare) = predicate.comparison.as_ref() else {
             continue;
         };
@@ -1534,12 +1540,17 @@ fn compare_def_expr_for_flag_operand(
 }
 
 fn populate_switches(view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
-    for (block_addr, switch) in &inputs.prepared.predicates().switches {
-        if let Some(selector) = switch
-            .selector
-            .and_then(|selector| prepared_var(inputs.prepared, selector).cloned())
+    let Some(control_facts) = inputs.control_facts else {
+        return;
+    };
+
+    for (block_addr, switch) in &control_facts.switches {
+        if let Some(selector_value) = switch.selector
+            && let Some(selector) = prepared_var(inputs.prepared, selector_value).cloned()
         {
             let expr = expr_for_compare_operand(inputs, selector, view);
+            view.switch_selector_value_by_block
+                .insert(*block_addr, selector_value);
             view.switch_selector_expr_by_block.insert(*block_addr, expr);
         }
     }
@@ -2904,16 +2915,17 @@ fn populate_prepared_call_runtime_facts(
     }
 }
 
-fn overlay_prepared_switch_roots(use_info: &mut UseInfo, prepared: &SsaArtifact) {
-    for switch in prepared.predicates().switches.values() {
-        let Some(selector) = switch
-            .selector
-            .and_then(|selector| prepared_var(prepared, selector))
-        else {
+fn overlay_prepared_switch_roots(
+    use_info: &mut UseInfo,
+    prepared: &SsaArtifact,
+    view: &PreparedSemanticView,
+) {
+    for (block_addr, selector_value) in &view.switch_selector_value_by_block {
+        let Some(selector) = prepared_var(prepared, *selector_value) else {
             continue;
         };
         use_info.switch_selector_roots.insert(
-            switch.block_addr,
+            *block_addr,
             SemanticValue::Scalar(ScalarValue::Root(
                 use_info
                     .value_id_for_var(selector)
@@ -3491,6 +3503,30 @@ mod tests {
         SsaArtifact::from_blocks(&[block], None).expect("prepared call SSA artifact")
     }
 
+    fn test_prepared_branch_artifact() -> SsaArtifact {
+        let cond = Varnode::unique(0x2000, 1);
+        let mut entry = R2ILBlock::new(0x2000, 4);
+        entry.push(R2ILOp::IntEqual {
+            dst: cond.clone(),
+            a: Varnode::constant(7, 8),
+            b: Varnode::constant(9, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x2010, 8),
+            cond,
+        });
+        let mut fallthrough = R2ILBlock::new(0x2004, 1);
+        fallthrough.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut target = R2ILBlock::new(0x2010, 1);
+        target.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+        SsaArtifact::for_decompile(&[entry, fallthrough, target], None)
+            .expect("prepared branch SSA artifact")
+    }
+
     fn test_prepared_recursive_call_artifact() -> SsaArtifact {
         let mut block = R2ILBlock::new(0x1500, 8);
         block.push(R2ILOp::Call {
@@ -3682,6 +3718,53 @@ mod tests {
         }
     }
 
+    fn test_control_facts(prepared: &SsaArtifact) -> r2types::FunctionControlFacts {
+        let branch_predicates = prepared
+            .predicates()
+            .predicates
+            .values()
+            .map(|predicate| {
+                (
+                    predicate.block_addr,
+                    r2types::BranchPredicateFact {
+                        id: predicate.id,
+                        block_addr: predicate.block_addr,
+                        condition: predicate.condition,
+                        comparison: predicate.comparison.as_ref().map(|comparison| {
+                            r2types::PredicateComparisonFact {
+                                kind: comparison.kind,
+                                lhs: comparison.lhs,
+                                rhs: comparison.rhs,
+                            }
+                        }),
+                        true_target: predicate.true_target,
+                        false_target: predicate.false_target,
+                    },
+                )
+            })
+            .collect();
+        let switches = prepared
+            .predicates()
+            .switches
+            .iter()
+            .map(|(block_addr, switch)| {
+                (
+                    *block_addr,
+                    r2types::SwitchSelectorFact {
+                        block_addr: switch.block_addr,
+                        selector: switch.selector,
+                        cases: switch.cases.clone(),
+                        default: switch.default,
+                    },
+                )
+            })
+            .collect();
+        r2types::FunctionControlFacts {
+            branch_predicates,
+            switches,
+        }
+    }
+
     #[test]
     fn prepared_call_expr_requires_argument_value_bijection() {
         let unproved = PreparedCallView {
@@ -3805,6 +3888,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3849,6 +3933,7 @@ mod tests {
             callee_resolution: Some(&callee_resolution),
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3905,6 +3990,7 @@ mod tests {
             callee_resolution: Some(&callee_resolution),
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3951,6 +4037,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -3988,6 +4075,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4053,6 +4141,7 @@ mod tests {
             callee_resolution: Some(&callee_resolution),
             callsite_facts: Some(&callsite_facts),
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4091,6 +4180,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4130,6 +4220,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: Some(&callsite_facts),
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4160,6 +4251,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: Some(&callsite_facts),
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4199,6 +4291,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: None,
             call_result_facts: Some(&call_result_facts),
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4238,6 +4331,7 @@ mod tests {
             callee_resolution: None,
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
@@ -4253,6 +4347,68 @@ mod tests {
         assert!(
             view.call_result_source_by_value.is_empty(),
             "call-result source indexes must be populated from FunctionFacts, not local prepared SSA reads"
+        );
+    }
+
+    #[test]
+    fn prepared_branch_predicates_require_function_facts_control_contract() {
+        let prepared = test_prepared_branch_artifact();
+        assert!(
+            !prepared.predicates().predicates.is_empty(),
+            "fixture must expose raw prepared predicate facts"
+        );
+        let abi_arg_regs = Vec::new();
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            callee_resolution: None,
+            callsite_facts: None,
+            call_result_facts: None,
+            control_facts: None,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        assert!(
+            view.branch_predicate_expr_by_block.is_empty(),
+            "prepared semantic view must not render branch predicates from raw prepared SSA side channels"
+        );
+    }
+
+    #[test]
+    fn prepared_branch_predicates_use_function_facts_control_contract() {
+        let prepared = test_prepared_branch_artifact();
+        let control_facts = test_control_facts(&prepared);
+        let abi_arg_regs = Vec::new();
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            callee_resolution: None,
+            callsite_facts: None,
+            call_result_facts: None,
+            control_facts: Some(&control_facts),
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+        });
+
+        assert_eq!(
+            view.branch_expr_for_block(0x2000),
+            Some(&CExpr::binary(
+                BinaryOp::Eq,
+                CExpr::IntLit(7),
+                CExpr::IntLit(9)
+            )),
+            "branch predicate rendering must be authorized by FunctionFacts control evidence"
         );
     }
 

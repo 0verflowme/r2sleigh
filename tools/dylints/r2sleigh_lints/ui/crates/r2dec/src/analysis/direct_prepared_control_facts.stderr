@@ -1,0 +1,16 @@
+warning: r2dec analysis must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps
+  --> $DIR/direct_prepared_control_facts.rs:19:14
+   |
+LL |     let _ = &prepared.predicates().predicates;
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_direct_prepared_control_facts)]` on by default
+
+warning: r2dec analysis must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps
+  --> $DIR/direct_prepared_control_facts.rs:20:14
+   |
+LL |     let _ = &prepared.predicates().switches;
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 2 warnings emitted
+

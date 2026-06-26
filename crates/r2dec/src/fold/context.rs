@@ -70,6 +70,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) callsite_facts: Option<&'a r2types::FunctionCallsiteFacts>,
     pub(crate) call_result_facts: Option<&'a r2types::FunctionCallResultFacts>,
+    pub(crate) control_facts: Option<&'a r2types::FunctionControlFacts>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
@@ -329,6 +330,7 @@ impl<'a> FoldingContext<'a> {
             callee_resolution: None,
             callsite_facts: None,
             call_result_facts: None,
+            control_facts: None,
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
             #[cfg(test)]
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),

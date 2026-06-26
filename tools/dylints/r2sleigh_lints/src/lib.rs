@@ -486,6 +486,32 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when production `r2dec` analysis reads prepared SSA predicate or
+    /// switch maps directly.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Branch predicate and switch selector rendering must be authorized by
+    /// `r2types::FunctionFacts`. Reading `prepared.predicates().predicates` or
+    /// `prepared.predicates().switches` in the renderer recreates a side
+    /// channel and bypasses the engine-owned control evidence projection.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// prepared.predicates().predicates.values();
+    /// prepared.predicates().switches.get(&block);
+    /// ```
+    ///
+    /// Use instead `FunctionControlFacts` from `FunctionFacts`.
+    pub R2DEC_DIRECT_PREPARED_CONTROL_FACTS,
+    Warn,
+    "r2dec analysis must consume FunctionFacts control facts instead of prepared predicate maps"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2plugin` code directly reconstructs type
     /// signature writeback authority instead of consuming a typed `r2types`
     /// decision.
@@ -828,6 +854,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
         R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
         R2DEC_DIRECT_PREPARED_CALL_RESULT_CERTIFICATES,
+        R2DEC_DIRECT_PREPARED_CONTROL_FACTS,
         R2PLUGIN_RAW_DIRECT_CALL_TARGET,
         R2PLUGIN_TYPE_WRITEBACK_POLICY_OWNERSHIP,
         R2PLUGIN_TYPE_WRITEBACK_APPLY_THRESHOLD_OWNERSHIP,
@@ -1113,6 +1140,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_DIRECT_PREPARED_CALL_RESULT_CERTIFICATES,
                 expr.span,
                 "r2dec analysis must read call-result proof from FunctionFacts, not prepared SSA certificate maps",
+            );
+        }
+
+        if is_r2dec_analysis_path(cx, expr)
+            && !is_inside_test_item(cx, expr)
+            && r2dec_direct_prepared_control_facts_expr(cx, expr)
+        {
+            span_lint(
+                cx,
+                R2DEC_DIRECT_PREPARED_CONTROL_FACTS,
+                expr.span,
+                "r2dec analysis must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps",
             );
         }
 
@@ -1579,6 +1618,20 @@ fn r2dec_direct_prepared_call_result_certificates_expr(
         }
         ExprKind::MethodCall(method, _, _, _) => {
             method.ident.as_str() == "call_result_certificates_for_callsite"
+        }
+        _ => false,
+    }
+}
+
+fn r2dec_direct_prepared_control_facts_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::Field(_, field) => {
+            matches!(field.name.as_str(), "predicates" | "switches")
+                && cx
+                    .sess()
+                    .source_map()
+                    .span_to_snippet(expr.span)
+                    .is_ok_and(|snippet| snippet.contains("predicates()"))
         }
         _ => false,
     }

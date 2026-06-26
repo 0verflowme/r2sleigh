@@ -59,6 +59,51 @@ impl FunctionCallResultFacts {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionControlFacts {
+    pub branch_predicates: BTreeMap<u64, BranchPredicateFact>,
+    pub switches: BTreeMap<u64, SwitchSelectorFact>,
+}
+
+impl FunctionControlFacts {
+    pub fn is_empty(&self) -> bool {
+        self.branch_predicates.is_empty() && self.switches.is_empty()
+    }
+
+    pub fn branch_for_block(&self, block_addr: u64) -> Option<&BranchPredicateFact> {
+        self.branch_predicates.get(&block_addr)
+    }
+
+    pub fn switch_for_block(&self, block_addr: u64) -> Option<&SwitchSelectorFact> {
+        self.switches.get(&block_addr)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchPredicateFact {
+    pub id: r2ssa::PredicateId,
+    pub block_addr: u64,
+    pub condition: r2ssa::ValueId,
+    pub comparison: Option<PredicateComparisonFact>,
+    pub true_target: u64,
+    pub false_target: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PredicateComparisonFact {
+    pub kind: r2ssa::CompareKind,
+    pub lhs: r2ssa::ValueId,
+    pub rhs: r2ssa::ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchSelectorFact {
+    pub block_addr: u64,
+    pub selector: Option<r2ssa::ValueId>,
+    pub cases: Vec<(u64, u64)>,
+    pub default: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResultFact {
     pub callsite: CallsiteKey,
@@ -314,6 +359,7 @@ pub struct FunctionFacts {
     pub callee_resolution: CalleeResolutionFacts,
     pub callsites: FunctionCallsiteFacts,
     pub call_results: FunctionCallResultFacts,
+    pub control: FunctionControlFacts,
     pub assumptions: r2ssa::AssumptionSet,
     pub plans: AnalysisPlans,
     pub summary_view: InterprocSummaryView,
@@ -337,6 +383,7 @@ impl FunctionFacts {
             callee_resolution: CalleeResolutionFacts::default(),
             callsites: FunctionCallsiteFacts::default(),
             call_results: FunctionCallResultFacts::default(),
+            control: FunctionControlFacts::default(),
             assumptions: r2ssa::AssumptionSet::default(),
             plans,
             summary_view: InterprocSummaryView::default(),
@@ -420,6 +467,19 @@ impl FunctionFacts {
 
     pub fn call_results(&self) -> Option<&FunctionCallResultFacts> {
         (!self.call_results.is_empty()).then_some(&self.call_results)
+    }
+
+    pub fn with_control(mut self, control: FunctionControlFacts) -> Self {
+        self.control = control;
+        self
+    }
+
+    pub fn set_control(&mut self, control: FunctionControlFacts) {
+        self.control = control;
+    }
+
+    pub fn control(&self) -> Option<&FunctionControlFacts> {
+        (!self.control.is_empty()).then_some(&self.control)
     }
 
     pub fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
@@ -853,6 +913,49 @@ mod tests {
                 .map(|results| results.results_for_site(callsite).count()),
             Some(1),
             "call-result site index must travel through FunctionFacts"
+        );
+    }
+
+    #[test]
+    fn function_facts_owns_canonical_control_facts() {
+        let branch = BranchPredicateFact {
+            id: r2ssa::PredicateId(0),
+            block_addr: 0x401000,
+            condition: r2ssa::ValueId(31),
+            comparison: Some(PredicateComparisonFact {
+                kind: r2ssa::CompareKind::Equal,
+                lhs: r2ssa::ValueId(32),
+                rhs: r2ssa::ValueId(33),
+            }),
+            true_target: 0x401010,
+            false_target: 0x401004,
+        };
+        let switch = SwitchSelectorFact {
+            block_addr: 0x402000,
+            selector: Some(r2ssa::ValueId(41)),
+            cases: vec![(0, 0x402010), (1, 0x402020)],
+            default: Some(0x402030),
+        };
+        let control = FunctionControlFacts {
+            branch_predicates: BTreeMap::from([(branch.block_addr, branch.clone())]),
+            switches: BTreeMap::from([(switch.block_addr, switch.clone())]),
+        };
+
+        let facts = FunctionFacts::default().with_control(control);
+
+        assert_eq!(
+            facts
+                .control()
+                .and_then(|control| control.branch_for_block(0x401000)),
+            Some(&branch),
+            "branch predicate proof must travel through FunctionFacts"
+        );
+        assert_eq!(
+            facts
+                .control()
+                .and_then(|control| control.switch_for_block(0x402000)),
+            Some(&switch),
+            "switch selector proof must travel through FunctionFacts"
         );
     }
 
