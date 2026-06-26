@@ -62,9 +62,9 @@ use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
-    CTypeLike, CalleeResolutionFacts, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts,
-    FunctionSignatureSpec, FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference,
-    TypeOracle, VisibleBinding, VisibleBindingKind,
+    CTypeLike, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts, FunctionSignatureSpec,
+    FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding,
+    VisibleBindingKind,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -3570,10 +3570,6 @@ pub struct DecompilerContext {
     pub symbols: std::collections::HashMap<u64, String>,
     /// Canonical combined type and semantic facts.
     pub function_facts: FunctionFacts,
-    /// Engine-owned typed call-target identity index. When absent, r2dec must
-    /// not reconstruct call ownership from raw maps; callers that need typed
-    /// callee identity should pass the engine-owned resolution.
-    pub callee_resolution: Option<CalleeResolutionFacts>,
 }
 
 impl DecompilerContext {
@@ -3613,7 +3609,6 @@ impl DecompilerContext {
             strings,
             symbols,
             function_facts: FunctionFacts::new(type_facts.canonicalized(), None),
-            callee_resolution: None,
         }
     }
 
@@ -3635,13 +3630,11 @@ impl DecompilerContext {
             ptr_bits,
         );
         let function_facts = Self::canonicalize_function_facts(function_facts);
-        let callee_resolution = function_facts.callee_resolution().cloned();
         Self {
             function_names,
             strings,
             symbols,
             function_facts,
-            callee_resolution,
         }
     }
 
@@ -3679,19 +3672,6 @@ impl DecompilerContext {
 
     pub fn with_function_facts(mut self, function_facts: FunctionFacts) -> Self {
         self.function_facts = Self::canonicalize_function_facts(function_facts);
-        self.callee_resolution = self.function_facts.callee_resolution().cloned();
-        self
-    }
-
-    pub fn with_callee_resolution(mut self, facts: Option<CalleeResolutionFacts>) -> Self {
-        if let Some(facts) = facts {
-            self.function_facts.set_callee_resolution(facts.clone());
-            self.callee_resolution = Some(facts);
-        } else {
-            self.function_facts
-                .set_callee_resolution(CalleeResolutionFacts::default());
-            self.callee_resolution = None;
-        }
         self
     }
 
@@ -4401,11 +4381,7 @@ impl Decompiler {
             .as_ref()
             .map(|oracle| oracle as &dyn TypeOracle);
 
-        let callee_resolution = self
-            .context
-            .callee_resolution
-            .as_ref()
-            .or_else(|| self.context.function_facts.callee_resolution());
+        let callee_resolution = self.context.function_facts.callee_resolution();
 
         let recovered_param_infos: Vec<_> = var_recovery
             .parameters()

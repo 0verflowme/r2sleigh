@@ -203,7 +203,7 @@ rustc_session::declare_lint!(
     /// ```
     ///
     /// Pass the engine-owned `CalleeResolutionFacts` through
-    /// `DecompilerContext::with_callee_resolution()` instead.
+    /// `FunctionFacts::with_callee_resolution()` instead.
     pub R2DEC_CALLEE_RESOLUTION_FALLBACK_OWNERSHIP,
     Warn,
     "r2dec must not synthesize CalleeResolutionFacts; r2engine owns callee resolution"
@@ -429,6 +429,33 @@ rustc_session::declare_lint!(
     pub R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     Warn,
     "r2dec must carry decompile route decisions through FunctionFacts"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
+    /// Warns when production `r2dec::DecompilerContext` defines a callee
+    /// resolution side-channel field or mutator outside `FunctionFacts`.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Callee identity is canonical `FunctionFacts` evidence. A parallel
+    /// renderer context field lets direct callers bypass the engine-owned
+    /// callsite identity contract and can make raw target/name maps look
+    /// authoritative.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// struct DecompilerContext {
+    ///     callee_resolution: Option<CalleeResolutionFacts>,
+    /// }
+    /// ```
+    ///
+    /// Use `FunctionFacts::with_callee_resolution(...)` instead.
+    pub R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
+    Warn,
+    "r2dec must carry callee resolution through FunctionFacts"
 );
 
 rustc_session::declare_lint!(
@@ -933,6 +960,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_ROUTE_POLICY_OWNERSHIP,
     R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+    R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
     R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
     R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
     R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
@@ -971,6 +999,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_ROUTE_POLICY_OWNERSHIP,
         R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
         R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+        R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
         R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
         R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
         R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
@@ -1063,6 +1092,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
             );
         }
 
+        if is_r2dec_span(cx, item.span)
+            && !item_is_test_only(cx, item)
+            && r2dec_decompiler_context_callee_resolution_side_channel_item(cx, item)
+        {
+            span_lint(
+                cx,
+                R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
+                item.span,
+                "r2dec DecompilerContext must not store callee resolution outside FunctionFacts",
+            );
+        }
+
         if is_r2dec_span(cx, item.span) && r2dec_source_shaped_decompile_oracle_item(cx, item) {
             span_lint(
                 cx,
@@ -1128,6 +1169,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
                 item.span,
                 "r2dec DecompilerContext must not expose route/render policy side-channel mutators",
+            );
+        }
+
+        if is_r2dec_span(cx, item.span)
+            && !impl_item_is_test_only(cx, item)
+            && item.ident.name.as_str() == "with_callee_resolution"
+        {
+            span_lint(
+                cx,
+                R2DEC_DECOMPILER_CONTEXT_CALLEE_RESOLUTION_SIDE_CHANNEL,
+                item.span,
+                "r2dec DecompilerContext must not expose callee-resolution side-channel mutators",
             );
         }
     }
@@ -1927,6 +1980,16 @@ fn r2dec_decompiler_context_route_side_channel_item(
             || snippet.contains("render_permission:")
             || snippet.contains("skip_runtime_type_inference:")
             || snippet.contains("use_prepared_semantic_view:"))
+}
+
+fn r2dec_decompiler_context_callee_resolution_side_channel_item(
+    cx: &LateContext<'_>,
+    item: &Item<'_>,
+) -> bool {
+    let Ok(snippet) = cx.sess().source_map().span_to_snippet(item.span) else {
+        return false;
+    };
+    snippet.contains("struct DecompilerContext") && snippet.contains("callee_resolution:")
 }
 
 fn r2dec_decompiler_context_route_side_channel_method(name: &str) -> bool {
