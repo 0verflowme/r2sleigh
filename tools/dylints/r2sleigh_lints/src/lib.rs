@@ -784,6 +784,35 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when production `r2dec` uses broad local analysis presence, such
+    /// as `has_definitions()` or `has_stack_slots()`, as proof that a synthetic
+    /// stack local may be rendered.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Seeing a stack-shaped expression or any local definitions is not proof
+    /// that an offset is a real local, stack argument, saved slot, or typed
+    /// field. Executable stack locals must be backed by typed stack-slot facts
+    /// in `FunctionFacts`; otherwise the renderer should leave a residual/raw
+    /// expression.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// if offset < 0 && (self.has_stack_slots() || self.has_definitions()) {
+    ///     return Some(Self::stack_synthetic_name(offset));
+    /// }
+    /// ```
+    ///
+    /// Use instead a typed stack-slot match from `FunctionFacts`.
+    pub R2DEC_UNCERTIFIED_STACK_LOCAL_SYNTHESIS,
+    Warn,
+    "r2dec must not synthesize stack locals from broad local analysis presence"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2types` code outside `role_registry` calls the
     /// raw role-name signature lookup APIs directly.
     ///
@@ -834,6 +863,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2PLUGIN_UNPREPARED_DECOMPILE_ORACLE,
     R2DEC_SOURCE_SHAPED_DECOMPILE_ORACLE,
     R2DEC_DEFAULT_TRUE_BRANCH_CONDITION,
+    R2DEC_UNCERTIFIED_STACK_LOCAL_SYNTHESIS,
     R2TYPES_ROLE_NAME_SIGNATURE_HINT_OWNERSHIP
 ]);
 
@@ -869,6 +899,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2PLUGIN_UNPREPARED_DECOMPILE_ORACLE,
         R2DEC_SOURCE_SHAPED_DECOMPILE_ORACLE,
         R2DEC_DEFAULT_TRUE_BRANCH_CONDITION,
+        R2DEC_UNCERTIFIED_STACK_LOCAL_SYNTHESIS,
         R2TYPES_ROLE_NAME_SIGNATURE_HINT_OWNERSHIP,
     ]);
     lint_store.register_late_pass(|_| Box::new(R2sleighLintPass));
@@ -1245,6 +1276,18 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_DEFAULT_TRUE_BRANCH_CONDITION,
                 expr.span,
                 "r2dec must residualize unresolved branch predicates instead of rendering if (1)",
+            );
+        }
+
+        if is_r2dec_path(cx, expr)
+            && !is_inside_test_item(cx, expr)
+            && r2dec_uncertified_stack_local_synthesis_expr(expr)
+        {
+            span_lint(
+                cx,
+                R2DEC_UNCERTIFIED_STACK_LOCAL_SYNTHESIS,
+                expr.span,
+                "r2dec must require typed stack-slot proof before synthesizing stack locals",
             );
         }
 
@@ -1822,6 +1865,14 @@ fn r2dec_default_true_branch_condition_expr(cx: &LateContext<'_>, expr: &Expr<'_
             snippet.contains("extract_condition_from_block")
                 && snippet.contains("CExpr::IntLit(1)")
         })
+}
+
+fn r2dec_uncertified_stack_local_synthesis_expr(expr: &Expr<'_>) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::MethodCall(method, _, _, _)
+            if matches!(method.ident.as_str(), "has_definitions" | "has_stack_slots")
+    )
 }
 
 fn r2types_role_name_signature_hint_expr(expr: &Expr<'_>) -> bool {

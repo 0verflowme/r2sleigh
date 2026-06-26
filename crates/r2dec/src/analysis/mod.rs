@@ -820,14 +820,6 @@ impl UseInfo {
         self.stack_slots.values().copied()
     }
 
-    pub(crate) fn has_stack_slots(&self) -> bool {
-        !self.stack_slots.is_empty() || !self.stack_slots_by_value.is_empty()
-    }
-
-    pub(crate) fn has_definitions(&self) -> bool {
-        !self.definitions.is_empty() || !self.definitions_by_value.is_empty()
-    }
-
     pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
         self.stack_slot_for_name(name)
     }

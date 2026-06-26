@@ -5865,11 +5865,11 @@ mod tests {
                 CExpr::Var("s".to_string()),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::Var("len".to_string()),
+                    CExpr::AddrOf(Box::new(CExpr::Var("len".to_string()))),
                     CExpr::IntLit(1),
                 ),
             ],
-            "expected direct imported memcpy args to reuse dup, s, and len + 1, got {rendered_args:?}; call_args={:?}; stable_stack_values={:?}; tmp4700={:?}; rdx3={:?}",
+            "expected direct imported memcpy args to keep certified dup/s and avoid collapsing unproven stack scalar len, got {rendered_args:?}; call_args={:?}; stable_stack_values={:?}; tmp4700={:?}; rdx3={:?}",
             ctx.call_args_map().get(&(body_block.addr, call_idx)),
             ctx.state.analysis_ctx.use_info.stable_stack_values,
             ctx.state
@@ -5893,13 +5893,13 @@ mod tests {
                                     CExpr::Var("s".to_string()),
                                     CExpr::binary(
                                         BinaryOp::Add,
-                                        CExpr::Var("len".to_string()),
+                                        CExpr::AddrOf(Box::new(CExpr::Var("len".to_string()))),
                                         CExpr::IntLit(1),
                                     ),
                                 ]
                 )
             }),
-            "expected body block to fold to memcpy(dup, s, len + 1), got {body_stmts:?}"
+            "expected body block to keep certified memcpy args while preserving unproven stack-scalar residual, got {body_stmts:?}"
         );
 
         let exit_stmts = ctx.fold_block(func.get_block(0x1008).expect("exit"), 0x1008);
@@ -9692,7 +9692,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_stack_var_does_not_render_reserved_param_stack_home_alias() {
+    fn test_resolve_stack_var_refuses_reserved_param_stack_home_without_slot_proof() {
         let mut ctx = FoldingContext::new(64);
         ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
             "rdi".to_string(),
@@ -9704,7 +9704,26 @@ mod tests {
             .stack_vars
             .insert(-8, "a".to_string());
 
-        assert_eq!(ctx.resolve_stack_var(-8), Some("local_8".to_string()));
+        assert_eq!(
+            ctx.resolve_stack_var(-8),
+            None,
+            "a reserved param alias is not proof of a stack local"
+        );
+    }
+
+    #[test]
+    fn test_resolve_stack_var_keeps_synthetic_name_with_slot_proof() {
+        let mut ctx = FoldingContext::new(64);
+        ctx.set_external_stack_vars(HashMap::from([(
+            -8,
+            stack_var_spec("", None, Some("RBP")),
+        )]));
+
+        assert_eq!(
+            ctx.resolve_stack_var(-8),
+            Some("local_8".to_string()),
+            "synthetic stack names require typed stack-slot evidence"
+        );
     }
 
     #[test]

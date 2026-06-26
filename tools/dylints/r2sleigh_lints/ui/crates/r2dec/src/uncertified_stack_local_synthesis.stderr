@@ -1,0 +1,16 @@
+warning: r2dec must require typed stack-slot proof before synthesizing stack locals
+  --> $DIR/uncertified_stack_local_synthesis.rs:17:27
+   |
+LL |         if offset < 0 && (self.has_stack_slots() || self.has_definitions()) {
+   |                           ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_uncertified_stack_local_synthesis)]` on by default
+
+warning: r2dec must require typed stack-slot proof before synthesizing stack locals
+  --> $DIR/uncertified_stack_local_synthesis.rs:17:53
+   |
+LL |         if offset < 0 && (self.has_stack_slots() || self.has_definitions()) {
+   |                                                     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 2 warnings emitted
+

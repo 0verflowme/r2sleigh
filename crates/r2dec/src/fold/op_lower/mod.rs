@@ -1009,12 +1009,6 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn known_named_values(&self) -> Vec<String> {
         self.use_info().known_named_values()
     }
-    pub(crate) fn has_stack_slots(&self) -> bool {
-        self.use_info().has_stack_slots()
-    }
-    pub(crate) fn has_definitions(&self) -> bool {
-        self.use_info().has_definitions()
-    }
     pub(crate) fn stack_slots(&self) -> impl Iterator<Item = analysis::StackSlotProvenance> + '_ {
         self.use_info().stack_slots()
     }

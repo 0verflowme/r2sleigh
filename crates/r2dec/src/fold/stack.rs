@@ -80,6 +80,14 @@ impl<'a> FoldingContext<'a> {
         matches!(slot.base, ExternalStackBase::FramePointer) && -slot.offset == offset
     }
 
+    fn has_typed_stack_slot_for_offset(&self, offset: i64) -> bool {
+        self.inputs
+            .stack_slots
+            .keys()
+            .any(|slot_key| Self::stack_slot_matches_offset(slot_key, offset))
+            || self.stack_slots().any(|slot| slot.offset == offset)
+    }
+
     fn visible_stack_binding_for_offset(&self, offset: i64) -> Option<&VisibleBinding> {
         self.inputs.visible_bindings.iter().find(|binding| {
             binding
@@ -550,19 +558,15 @@ impl<'a> FoldingContext<'a> {
             })
             .or_else(|| external_name.clone())
             .or_else(|| {
-                self.stack_slots()
-                    .any(|slot| slot.offset == offset)
-                    .then(|| Self::stack_synthetic_name(offset))
-            })
-            .or_else(|| {
-                (offset < 0 && (self.has_stack_slots() || self.has_definitions()))
+                self.has_typed_stack_slot_for_offset(offset)
                     .then(|| Self::stack_synthetic_name(offset))
             });
-        resolved.map(|name| {
+        resolved.and_then(|name| {
             if self.is_reserved_param_alias_name(&name) {
-                Self::stack_synthetic_name(offset)
+                self.has_typed_stack_slot_for_offset(offset)
+                    .then(|| Self::stack_synthetic_name(offset))
             } else {
-                name
+                Some(name)
             }
         })
     }
