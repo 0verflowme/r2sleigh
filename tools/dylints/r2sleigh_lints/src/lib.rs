@@ -325,6 +325,32 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
+    /// Warns when `r2engine` applies decompile route or render permission by
+    /// filling legacy `r2dec::DecompilerContext` side-channel fields.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// The decompile spine is `FunctionFacts`. Engine-owned route, refusal,
+    /// proof coverage, and render permission must travel through
+    /// `FunctionFacts::decompile_route`; otherwise plugin/decompiler callers
+    /// can observe different policy depending on which side channel was set.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// context.with_semantic_route(Some(route));
+    /// context.with_render_permission(Some(permission));
+    /// ```
+    ///
+    /// Use instead `FunctionFacts::set_decompile_route(...)`.
+    pub R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+    Warn,
+    "r2engine must carry decompile route decisions through FunctionFacts"
+);
+
+rustc_session::declare_lint!(
+    /// ### What it does
+    ///
     /// Warns when production `r2dec` code mutates switch case labels from
     /// nearby arithmetic or helper-derived display bias.
     ///
@@ -707,6 +733,7 @@ rustc_session::declare_lint_pass!(R2sleighLintPass => [
     R2DEC_CALL_ARG_SOURCE_NAME_AUTHORITY,
     R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
     R2DEC_ROUTE_POLICY_OWNERSHIP,
+    R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
     R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
     R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
     R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
@@ -738,6 +765,7 @@ pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut rustc_lint
         R2DEC_CALL_ARG_SOURCE_NAME_AUTHORITY,
         R2DEC_SUMMARY_ROUTE_EXECUTABLE_C,
         R2DEC_ROUTE_POLICY_OWNERSHIP,
+        R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
         R2DEC_SWITCH_CASE_VALUE_OWNERSHIP,
         R2DEC_CALL_RESULT_STACK_OWNER_FALLBACK,
         R2DEC_CALL_RESULT_SOURCE_EXPR_OWNER_FALLBACK,
@@ -945,6 +973,15 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 R2DEC_ROUTE_POLICY_OWNERSHIP,
                 expr.span,
                 "r2dec must receive route/refusal decisions from r2engine instead of selecting them locally",
+            );
+        }
+
+        if is_r2engine_path(cx, expr) && engine_decompiler_context_side_channel_expr(expr) {
+            span_lint(
+                cx,
+                R2ENGINE_DECOMPILER_CONTEXT_ROUTE_SIDE_CHANNEL,
+                expr.span,
+                "r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields",
             );
         }
 
@@ -1474,6 +1511,20 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
             }),
         _ => false,
     }
+}
+
+fn engine_decompiler_context_side_channel_expr(expr: &Expr<'_>) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::MethodCall(method, _, _, _)
+            if matches!(
+                method.ident.as_str(),
+                "with_semantic_route"
+                    | "with_render_permission"
+                    | "with_runtime_type_inference_policy"
+                    | "with_prepared_semantic_view_policy"
+            )
+    )
 }
 
 fn plugin_unprepared_decompile_oracle_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
@@ -2011,6 +2062,11 @@ fn is_r2plugin_type_hint_policy_span(cx: &LateContext<'_>, span: rustc_span::Spa
     let filename = format!("{filename:?}");
     filename.contains("r2plugin/src/types.rs")
         || filename.contains("r2plugin/src/metadata_type_hint_ownership.rs")
+}
+
+fn is_r2engine_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    let filename = cx.sess().source_map().span_to_filename(expr.span);
+    format!("{filename:?}").contains("crates/r2engine/src/")
 }
 
 fn is_r2types_non_role_registry_path(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {

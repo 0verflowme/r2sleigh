@@ -149,6 +149,40 @@ impl EngineSemanticRoutePlan {
     }
 }
 
+fn decompile_route_kind(route: &EngineSemanticRoutePlan) -> r2types::DecompileRouteKind {
+    match route {
+        EngineSemanticRoutePlan::Standard => r2types::DecompileRouteKind::Standard,
+        EngineSemanticRoutePlan::StructuredWorker { .. } => {
+            r2types::DecompileRouteKind::StructuredWorker
+        }
+        EngineSemanticRoutePlan::SummaryIslands { .. } => {
+            r2types::DecompileRouteKind::SummaryIslands
+        }
+        EngineSemanticRoutePlan::LinearWorker { .. } => r2types::DecompileRouteKind::LinearWorker,
+        EngineSemanticRoutePlan::VmSummary { .. } => r2types::DecompileRouteKind::VmSummary,
+        EngineSemanticRoutePlan::FallbackComment { .. } => {
+            r2types::DecompileRouteKind::FallbackComment
+        }
+    }
+}
+
+pub fn decompile_route_facts_from_decision(
+    decision: &EngineRouteDecision,
+) -> r2types::DecompileRouteFacts {
+    r2types::DecompileRouteFacts {
+        kind: decompile_route_kind(&decision.route),
+        reason: decision.route_reason.clone(),
+        fallback_comment: match &decision.route {
+            EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+            _ => None,
+        },
+        skip_runtime_type_inference: decision.skip_runtime_type_inference,
+        use_prepared_semantic_view: decision.use_prepared_semantic_view,
+        proof_coverage: decision.proof_coverage.clone(),
+        render_permission: decision.render_permission.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,
@@ -731,6 +765,28 @@ pub fn decompile_route_decision(
     }
 }
 
+pub fn decompile_route_decision_with_route(
+    mut decision: EngineRouteDecision,
+    route: EngineSemanticRoutePlan,
+    cfg_summary: &CFGRiskSummary,
+    prepared_available: bool,
+) -> EngineRouteDecision {
+    decision.route = route;
+    decision.plan = select_engine_plan(EngineRequestKind::Decompile, Some(&decision.route), None);
+    decision.route_reason = semantic_route_reason(&decision.route);
+    decision.refusal = match &decision.route {
+        EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
+        _ => None,
+    };
+    decision.render_permission = render_permission_for_decompile_route(
+        &decision.route,
+        cfg_summary,
+        &decision.proof_coverage,
+        prepared_available,
+    );
+    decision
+}
+
 fn render_permission_for_decompile_route(
     route: &EngineSemanticRoutePlan,
     cfg_summary: &CFGRiskSummary,
@@ -757,11 +813,9 @@ pub(crate) fn decompiler_context_with_route_decision(
     context: r2dec::DecompilerContext,
     decision: &EngineRouteDecision,
 ) -> r2dec::DecompilerContext {
-    context
-        .with_semantic_route(Some(decision.route.to_decompiler_route()))
-        .with_render_permission(Some(decision.render_permission.clone()))
-        .with_runtime_type_inference_policy(Some(decision.skip_runtime_type_inference))
-        .with_prepared_semantic_view_policy(Some(decision.use_prepared_semantic_view))
+    let mut function_facts = context.function_facts.clone();
+    function_facts.set_decompile_route(Some(decompile_route_facts_from_decision(decision)));
+    context.with_function_facts(function_facts)
 }
 
 pub fn semantic_route_reason(route: &EngineSemanticRoutePlan) -> Option<String> {

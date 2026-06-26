@@ -61,8 +61,8 @@ pub use facts::{
     summary_hint_can_replace_weak_existing,
 };
 pub use function_facts::{
-    AnalysisPlans, DecompileCapabilityView, FunctionFacts, InterprocSummaryView,
-    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
+    AnalysisPlans, DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind, FunctionFacts,
+    InterprocSummaryView, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

@@ -31,7 +31,7 @@ pub(crate) fn decompiler_input_from_artifact(
 ) -> r2dec::DecompilerInput {
     let FunctionAnalysisArtifact {
         ssa_func,
-        function_facts,
+        mut function_facts,
         ..
     } = artifact;
     let func_name = ssa_func
@@ -47,6 +47,9 @@ pub(crate) fn decompiler_input_from_artifact(
         &function_facts.types,
         &cfg_summary,
     );
+    function_facts.set_decompile_route(Some(r2engine::decompile_route_facts_from_decision(
+        &route_decision,
+    )));
     let callee_resolution = r2engine::decompile_callee_resolution_facts(
         &ssa_func,
         &function_facts,
@@ -57,11 +60,6 @@ pub(crate) fn decompiler_input_from_artifact(
     let context =
         build_decompiler_context(function_facts, function_names, strings, symbols, ptr_bits)
             .with_callee_resolution(Some(callee_resolution));
-    let context = context
-        .with_semantic_route(Some(route_decision.route.to_decompiler_route()))
-        .with_render_permission(Some(route_decision.render_permission.clone()))
-        .with_runtime_type_inference_policy(Some(route_decision.skip_runtime_type_inference))
-        .with_prepared_semantic_view_policy(Some(route_decision.use_prepared_semantic_view));
     r2dec::DecompilerInput::new(ssa_func, context)
 }
 

@@ -1,0 +1,28 @@
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:23:15
+   |
+LL |     let ctx = ctx.with_semantic_route();
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2engine_decompiler_context_route_side_channel)]` on by default
+
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:24:15
+   |
+LL |     let ctx = ctx.with_render_permission();
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:25:15
+   |
+LL |     let ctx = ctx.with_runtime_type_inference_policy();
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2engine must write decompile route/refusal decisions into FunctionFacts, not legacy DecompilerContext policy fields
+  --> $DIR/decompiler_context_side_channel.rs:26:13
+   |
+LL |     let _ = ctx.with_prepared_semantic_view_policy();
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 4 warnings emitted
+

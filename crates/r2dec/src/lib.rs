@@ -3710,8 +3710,65 @@ impl DecompilerContext {
         self
     }
 
+    fn route_facts_to_plan(route: &r2types::DecompileRouteFacts) -> SemanticRoutePlan {
+        match route.kind {
+            r2types::DecompileRouteKind::Standard => SemanticRoutePlan::Standard,
+            r2types::DecompileRouteKind::StructuredWorker => SemanticRoutePlan::StructuredWorker {
+                reason: route.reason.clone().unwrap_or_default(),
+            },
+            r2types::DecompileRouteKind::SummaryIslands => SemanticRoutePlan::SummaryIslands {
+                reason: route.reason.clone().unwrap_or_default(),
+            },
+            r2types::DecompileRouteKind::LinearWorker => SemanticRoutePlan::LinearWorker {
+                reason: route.reason.clone().unwrap_or_default(),
+            },
+            r2types::DecompileRouteKind::VmSummary => SemanticRoutePlan::VmSummary {
+                reason: route.reason.clone().unwrap_or_default(),
+            },
+            r2types::DecompileRouteKind::FallbackComment => SemanticRoutePlan::FallbackComment {
+                comment: route
+                    .fallback_comment
+                    .clone()
+                    .or_else(|| route.reason.clone())
+                    .unwrap_or_default(),
+            },
+        }
+    }
+
+    fn effective_render_permission(&self) -> Option<&r2sym::RenderPermission> {
+        self.function_facts
+            .decompile_route()
+            .map(|route| &route.render_permission)
+            .or(self.render_permission.as_ref())
+    }
+
+    fn skip_runtime_type_inference(&self, prepared: Option<&r2ssa::SsaArtifact>) -> bool {
+        self.function_facts
+            .decompile_route()
+            .map(|route| route.skip_runtime_type_inference)
+            .or(self.skip_runtime_type_inference)
+            .unwrap_or_else(|| {
+                should_skip_runtime_type_inference(
+                    prepared,
+                    &self.function_facts.types,
+                    &self.function_facts,
+                )
+            })
+    }
+
+    fn use_prepared_semantic_view(&self, prepared: Option<&r2ssa::SsaArtifact>) -> bool {
+        self.function_facts
+            .decompile_route()
+            .map(|route| route.use_prepared_semantic_view)
+            .or(self.use_prepared_semantic_view)
+            .unwrap_or_else(|| should_use_prepared_semantic_view(prepared, &self.function_facts))
+    }
+
     fn route_for(&self, func_name: &str, cfg_summary: &r2ssa::CFGRiskSummary) -> SemanticRoutePlan {
         let _ = (func_name, cfg_summary);
+        if let Some(route) = self.function_facts.decompile_route() {
+            return Self::route_facts_to_plan(route);
+        }
         self.semantic_route
             .clone()
             .unwrap_or(SemanticRoutePlan::Standard)
@@ -3850,9 +3907,10 @@ impl Decompiler {
         if let SemanticRoutePlan::FallbackComment { comment } = &semantic_route {
             return comment.clone();
         }
-        if let Some(comment) =
-            render_permission_refusal_comment(&func_name, self.context.render_permission.as_ref())
-        {
+        if let Some(comment) = render_permission_refusal_comment(
+            &func_name,
+            self.context.effective_render_permission(),
+        ) {
             return comment;
         }
         if let Some(output) = self.vm_summary_output_for_route(
@@ -3890,9 +3948,10 @@ impl Decompiler {
         if let SemanticRoutePlan::FallbackComment { comment } = &semantic_route {
             return comment.clone();
         }
-        if let Some(comment) =
-            render_permission_refusal_comment(&func_name, input.context.render_permission.as_ref())
-        {
+        if let Some(comment) = render_permission_refusal_comment(
+            &func_name,
+            input.context.effective_render_permission(),
+        ) {
             return comment;
         }
         if let Some(output) = self.vm_summary_output_for_route(
@@ -4293,14 +4352,7 @@ impl Decompiler {
         var_recovery.set_type_facts(self.context.type_facts().clone());
         var_recovery.recover(func);
 
-        let skip_runtime_type_inference =
-            self.context.skip_runtime_type_inference.unwrap_or_else(|| {
-                should_skip_runtime_type_inference(
-                    prepared,
-                    self.context.type_facts(),
-                    &self.context.function_facts,
-                )
-            });
+        let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
         let type_inference = (!skip_runtime_type_inference).then(|| {
             let mut type_inference = TypeInference::new_with_abi(
                 self.config.ptr_size,
@@ -4441,10 +4493,7 @@ impl Decompiler {
             arg_regs: self.config.arg_regs.clone(),
             caller_saved_regs: self.config.caller_saved_regs.clone(),
         };
-        let use_prepared_semantic_view =
-            self.context.use_prepared_semantic_view.unwrap_or_else(|| {
-                should_use_prepared_semantic_view(prepared, &self.context.function_facts)
-            });
+        let use_prepared_semantic_view = self.context.use_prepared_semantic_view(prepared);
         let prepared_semantic_view = use_prepared_semantic_view.then(|| {
             analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
                 prepared: prepared.expect("prepared semantic view requires prepared artifact"),
@@ -4490,7 +4539,7 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let semantic_route = self.context.route_for(&func_name, &func.cfg_risk_summary());
         let certified_standard_mode = prepared.is_some()
-            && self.context.render_permission.is_some()
+            && self.context.effective_render_permission().is_some()
             && matches!(semantic_route, planner::SemanticRoutePlan::Standard);
         if certified_standard_mode {
             fold_ctx.clear_effect_render_proofs();
@@ -4711,7 +4760,7 @@ impl Decompiler {
         }
         if matches!(semantic_route, planner::SemanticRoutePlan::Standard) {
             let residual_reason =
-                render_permission_residual_reason(self.context.render_permission.as_ref())
+                render_permission_residual_reason(self.context.effective_render_permission())
                     .or_else(|| {
                         (prepared.is_some()
                             && matches!(semantic_route, planner::SemanticRoutePlan::Standard))
@@ -7616,6 +7665,38 @@ mod tests {
         let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
 
         assert_eq!(output, "/* engine refusal: tested route */");
+    }
+
+    #[test]
+    fn function_facts_route_overrides_legacy_context_route() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let function_facts =
+            FunctionFacts::default().with_decompile_route(r2types::DecompileRouteFacts {
+                kind: r2types::DecompileRouteKind::FallbackComment,
+                reason: Some("facts-owned route".to_string()),
+                fallback_comment: Some("/* facts-owned refusal */".to_string()),
+                skip_runtime_type_inference: true,
+                use_prepared_semantic_view: false,
+                proof_coverage: r2sym::ProofCoverage::default(),
+                render_permission: r2sym::RenderPermission::refuse(
+                    r2sym::ProofOwner::R2engine,
+                    "facts-owned route",
+                ),
+            });
+        let context = DecompilerContext::default()
+            .with_function_facts(function_facts)
+            .with_semantic_route(Some(SemanticRoutePlan::Standard));
+        let input = DecompilerInput::new(prepared, context);
+
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+
+        assert_eq!(output, "/* facts-owned refusal */");
     }
 
     #[test]

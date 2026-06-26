@@ -122,6 +122,29 @@ pub struct DecompileCapabilityView {
     pub summary_conflicted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DecompileRouteKind {
+    Standard,
+    StructuredWorker,
+    SummaryIslands,
+    LinearWorker,
+    VmSummary,
+    FallbackComment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecompileRouteFacts {
+    pub kind: DecompileRouteKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_comment: Option<String>,
+    pub skip_runtime_type_inference: bool,
+    pub use_prepared_semantic_view: bool,
+    pub proof_coverage: r2sym::ProofCoverage,
+    pub render_permission: r2sym::RenderPermission,
+}
+
 impl InterprocSummaryView {
     pub fn new(set: Option<r2ssa::InterprocSummarySet>) -> Self {
         let rollup = summary_rollup(set.as_ref());
@@ -189,6 +212,7 @@ pub struct FunctionFacts {
     pub types: FunctionTypeFacts,
     pub semantics: Option<r2sym::SemanticArtifact>,
     pub proof: r2sym::ProofCoverage,
+    pub decompile_route: Option<DecompileRouteFacts>,
     pub assumptions: r2ssa::AssumptionSet,
     pub plans: AnalysisPlans,
     pub summary_view: InterprocSummaryView,
@@ -208,6 +232,7 @@ impl FunctionFacts {
             types,
             semantics,
             proof,
+            decompile_route: None,
             assumptions: r2ssa::AssumptionSet::default(),
             plans,
             summary_view: InterprocSummaryView::default(),
@@ -247,6 +272,19 @@ impl FunctionFacts {
     pub fn with_proof_coverage(mut self, proof: r2sym::ProofCoverage) -> Self {
         self.proof = proof;
         self
+    }
+
+    pub fn with_decompile_route(mut self, route: DecompileRouteFacts) -> Self {
+        self.decompile_route = Some(route);
+        self
+    }
+
+    pub fn set_decompile_route(&mut self, route: Option<DecompileRouteFacts>) {
+        self.decompile_route = route;
+    }
+
+    pub fn decompile_route(&self) -> Option<&DecompileRouteFacts> {
+        self.decompile_route.as_ref()
     }
 
     pub fn merge_proof_coverage(&mut self, proof: r2sym::ProofCoverage) {

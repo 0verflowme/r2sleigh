@@ -32,9 +32,10 @@ pub use route::{
     EngineRouteContext, EngineRouteDecision, EngineSemanticRoutePlan, EngineTypeRouteDecision,
     EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
     decompile_probe_decision, decompile_probe_decision_for_identity, decompile_route_decision,
-    detached_semantic_linearization_reason, detached_semantic_route_plan,
-    has_primary_summary_only_native_worker, has_renderable_primary_summary_only_native_worker,
-    named_worker_summary_route, plan_decompile_request, plan_profile_request, plan_type_request,
+    decompile_route_facts_from_decision, detached_semantic_linearization_reason,
+    detached_semantic_route_plan, has_primary_summary_only_native_worker,
+    has_renderable_primary_summary_only_native_worker, named_worker_summary_route,
+    plan_decompile_request, plan_profile_request, plan_type_request,
     prefer_symbolic_large_worker_decompile, profile_route_decision, select_engine_plan,
     semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
     semantic_route_from_artifact_plan, semantic_route_plan, semantic_route_plan_from_context,
@@ -44,9 +45,9 @@ pub use route::{
     type_cfg_prefers_bounded_plan, type_route_decision,
 };
 use route::{
-    decompiler_context_with_route_decision, has_renderable_native_linear_worker_summary,
-    native_body_has_renderable_worker_summary, proof_coverage_from_type_facts,
-    raw_cfg_risk_summary_for_preprobe,
+    decompile_route_decision_with_route, decompiler_context_with_route_decision,
+    has_renderable_native_linear_worker_summary, native_body_has_renderable_worker_summary,
+    proof_coverage_from_type_facts, raw_cfg_risk_summary_for_preprobe,
 };
 pub use stable_hash::{
     stable_blocks_hash, stable_fnv1a_bytes, stable_fnv1a_debug_hash, stable_fnv1a_hash,
@@ -2634,7 +2635,7 @@ impl EngineSession {
         })
     }
 
-    pub fn decompile(&self, request: EngineDecompileRequest) -> EngineDecompileResponse {
+    pub fn decompile(&self, mut request: EngineDecompileRequest) -> EngineDecompileResponse {
         let started = std::time::Instant::now();
         let cfg_summary = request.prepared_ssa.function().cfg_risk_summary();
         let request_plan = plan_decompile_request(
@@ -2649,6 +2650,9 @@ impl EngineSession {
             unreachable!("decompile request planning returned non-decompile decision");
         };
         let decision = *decision;
+        request
+            .function_facts
+            .set_decompile_route(Some(decompile_route_facts_from_decision(&decision)));
         let planning_time = started.elapsed();
 
         let cache_lookup = self.cached_render_with_decision(
@@ -2703,14 +2707,8 @@ impl EngineSession {
         if let Some(route) =
             named_worker_summary_route(request.named_worker_guarded, &request.function_facts)
         {
-            decision.route = route;
-            decision.plan =
-                select_engine_plan(EngineRequestKind::Decompile, Some(&decision.route), None);
-            decision.route_reason = semantic_route_reason(&decision.route);
-            decision.refusal = match &decision.route {
-                EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
-                _ => None,
-            };
+            decision =
+                decompile_route_decision_with_route(decision, route, &request.cfg_summary, false);
         }
         let request_plan = EngineRequestPlan::decompile(decision);
         let diagnostics = request_plan.diagnostics();
@@ -8133,8 +8131,10 @@ mod tests {
             EngineTypeRouteKind::SemanticFallback
         );
         assert!(response.metrics.planning_time > Duration::default());
-        assert_eq!(response.writeback_plan.signature.params[0].name, "argc");
-        assert_eq!(response.writeback_plan.signature.params[1].name, "argv");
+        assert!(
+            response.writeback_plan.signature.params.is_empty(),
+            "name-only main fallback must not fabricate argc/argv params without ABI evidence"
+        );
     }
 
     #[test]
@@ -8750,17 +8750,31 @@ mod tests {
         let context =
             decompiler_context_with_route_decision(r2dec::DecompilerContext::default(), &decision);
 
+        let route_facts = context
+            .function_facts
+            .decompile_route()
+            .expect("route decision should be carried by FunctionFacts");
+        assert_eq!(route_facts.kind, r2types::DecompileRouteKind::Standard);
         assert_eq!(
-            context.semantic_route,
-            Some(decision.route.to_decompiler_route())
+            route_facts.skip_runtime_type_inference,
+            decision.skip_runtime_type_inference
         );
         assert_eq!(
-            context.skip_runtime_type_inference,
-            Some(decision.skip_runtime_type_inference)
+            route_facts.use_prepared_semantic_view,
+            decision.use_prepared_semantic_view
+        );
+        assert_eq!(route_facts.render_permission, decision.render_permission);
+        assert_eq!(
+            context.semantic_route, None,
+            "engine route policy must not be stored in the legacy r2dec route side channel"
         );
         assert_eq!(
-            context.use_prepared_semantic_view,
-            Some(decision.use_prepared_semantic_view)
+            context.skip_runtime_type_inference, None,
+            "engine runtime type policy must travel through FunctionFacts"
+        );
+        assert_eq!(
+            context.use_prepared_semantic_view, None,
+            "engine prepared-view policy must travel through FunctionFacts"
         );
     }
 }
