@@ -9164,6 +9164,20 @@ mod tests {
         ctype_to_type_like(&ty)
     }
 
+    #[test]
+    fn c_plugin_does_not_invent_empty_decompile_fallback() {
+        let c_source = include_str!("../r_anal_sleigh.c");
+
+        assert!(
+            !c_source.contains("empty decompilation output"),
+            "C glue must not invent decompile fallback text; r2engine/rust output owns refusal policy"
+        );
+        assert!(
+            !c_source.contains("r2dec fallback: empty"),
+            "C glue must print engine output only, not synthesize fallback semantics"
+        );
+    }
+
     fn register_param(
         name: &str,
         ty: Option<r2dec::CType>,

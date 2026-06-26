@@ -8622,17 +8622,8 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			sleigh_interproc_seeds_free (&interproc_seeds);
 
 			if (cons) {
-				if (result && result[0]) {
+				if (result) {
 					sleigh_print_decompiler_text (core, cons, result);
-				} else {
-					const char *fname = (fcn && fcn->name) ? fcn->name : "unknown";
-					char *fallback = r_str_newf ("/* r2dec fallback: empty decompilation output for %s */", fname);
-					if (fallback) {
-						sleigh_print_decompiler_text (core, cons, fallback);
-						free (fallback);
-					} else {
-						r_cons_printf (cons, "/* r2dec fallback: empty decompilation output for %s */\n", fname);
-					}
 				}
 			}
 
