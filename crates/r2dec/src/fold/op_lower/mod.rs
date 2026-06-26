@@ -25,8 +25,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use r2il::userops::is_arm64_pauth_userop;
 use r2ssa::{
     CallSiteFact, CallSiteFacts, DecompilePrepFacts, MemoryDefFact, MemoryLocation, MemoryUseFact,
-    ObjectKind, ObjectModel, PredicateFacts, PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar,
-    SSAVarNameKind, SsaArtifact, ValueId,
+    ObjectKind, ObjectModel, PreparedFunctionFacts, SSAFunction, SSAOp, SSAVar, SSAVarNameKind,
+    SsaArtifact, ValueId,
 };
 #[cfg(test)]
 use r2types::StackSlotKey;
@@ -849,10 +849,8 @@ impl<'a> FoldingContext<'a> {
             .or(self.inputs.prepared_objects)
     }
 
-    pub(crate) fn prepared_predicates(&self) -> Option<&PredicateFacts> {
-        self.prepared_facts()
-            .map(|facts| &facts.predicates)
-            .or(self.inputs.prepared_predicates)
+    pub(crate) fn control_facts(&self) -> Option<&r2types::FunctionControlFacts> {
+        self.inputs.control_facts
     }
 
     pub(crate) fn prepared_call_sites(&self) -> Option<&CallSiteFacts> {
@@ -1389,10 +1387,7 @@ impl<'a> FoldingContext<'a> {
             func,
             &env,
         );
-        let has_prepared_switches = self
-            .prepared_predicates()
-            .is_some_and(|facts| !facts.switches.is_empty());
-        if !has_prepared_switches {
+        if self.inputs.prepared_ssa.is_none() {
             analysis::use_info::populate_switch_selector_roots(
                 self.state.analysis_ctx.semantic_mut(),
                 func,
@@ -3604,7 +3599,7 @@ impl<'a> FoldingContext<'a> {
             return Some((self.refine_switch_selector_expr(expr), None));
         }
         if let Some((selector_id, selector)) = self
-            .prepared_predicates()
+            .control_facts()
             .and_then(|facts| facts.switches.get(&block_addr))
             .and_then(|switch| switch.selector)
             .and_then(|selector| {
@@ -3630,7 +3625,7 @@ impl<'a> FoldingContext<'a> {
                 .choose_preferred_visible_expr(Some(rendered), Some(semanticized))
                 .map(|expr| (self.refine_switch_selector_expr(expr), Some(selector_id)));
         }
-        if let Some((selector_id, selector)) = self.prepared_predicates().and_then(|facts| {
+        if let Some((selector_id, selector)) = self.control_facts().and_then(|facts| {
             (facts.switches.len() == 1)
                 .then(|| {
                     facts
@@ -3664,48 +3659,6 @@ impl<'a> FoldingContext<'a> {
                 .choose_preferred_visible_expr(Some(rendered), Some(semanticized))
                 .map(|expr| (self.refine_switch_selector_expr(expr), Some(selector_id)));
         }
-        if let Some(selector) = self
-            .inputs
-            .prepared_ssa
-            .and_then(|prepared| prepared.function().infer_switch_selector_var(block_addr))
-        {
-            let rooted = self
-                .prepared_canonical_value_root(&selector)
-                .unwrap_or(selector);
-            let rendered = if rooted.is_const() {
-                self.const_to_expr(&rooted)
-            } else {
-                self.resolve_predicate_operand(
-                    &self.origin_name_to_expr(&rooted.display_name()),
-                    0,
-                    &mut HashSet::new(),
-                )
-            };
-            let mut semantic_visited = HashSet::new();
-            let semanticized = self.semanticize_visible_expr(&rendered, 0, &mut semantic_visited);
-            return self
-                .choose_preferred_visible_expr(Some(rendered), Some(semanticized))
-                .map(|expr| (self.refine_switch_selector_expr(expr), None));
-        }
-        if let Some(selector) = self.infer_unique_switch_selector_var() {
-            let rooted = self
-                .prepared_canonical_value_root(&selector)
-                .unwrap_or(selector);
-            let rendered = if rooted.is_const() {
-                self.const_to_expr(&rooted)
-            } else {
-                self.resolve_predicate_operand(
-                    &self.origin_name_to_expr(&rooted.display_name()),
-                    0,
-                    &mut HashSet::new(),
-                )
-            };
-            let mut semantic_visited = HashSet::new();
-            let semanticized = self.semanticize_visible_expr(&rendered, 0, &mut semantic_visited);
-            return self
-                .choose_preferred_visible_expr(Some(rendered), Some(semanticized))
-                .map(|expr| (self.refine_switch_selector_expr(expr), None));
-        }
         let value = self.switch_selector_roots_map().get(&block_addr)?;
         let mut visited = HashSet::new();
         let rendered = self
@@ -3738,24 +3691,6 @@ impl<'a> FoldingContext<'a> {
         };
         self.choose_preferred_visible_expr(Some(refined.clone()), fallback)
             .unwrap_or(refined)
-    }
-
-    fn infer_unique_switch_selector_var(&self) -> Option<SSAVar> {
-        let prepared = self.inputs.prepared_ssa?;
-        let mut switch_blocks = prepared.function().cfg().block_addrs().filter(|addr| {
-            prepared
-                .function()
-                .cfg()
-                .get_block(*addr)
-                .is_some_and(|block| {
-                    matches!(block.terminator, r2ssa::cfg::BlockTerminator::Switch { .. })
-                })
-        });
-        let block_addr = switch_blocks.next()?;
-        if switch_blocks.next().is_some() {
-            return None;
-        }
-        prepared.function().infer_switch_selector_var(block_addr)
     }
 
     fn simplify_switch_selector_expr(&self, expr: CExpr) -> CExpr {

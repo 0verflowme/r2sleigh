@@ -3759,8 +3759,27 @@ mod tests {
                 )
             })
             .collect();
+        let block_assumptions = prepared
+            .predicates()
+            .block_assumptions
+            .iter()
+            .map(|(block_addr, assumptions)| {
+                (
+                    *block_addr,
+                    assumptions
+                        .iter()
+                        .map(|assumption| r2types::ControlBlockAssumptionFact {
+                            predecessor: assumption.predecessor,
+                            predicate: assumption.predicate,
+                            truth: assumption.truth,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
         r2types::FunctionControlFacts {
             branch_predicates,
+            block_assumptions,
             switches,
         }
     }

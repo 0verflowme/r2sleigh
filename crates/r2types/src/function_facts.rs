@@ -62,12 +62,15 @@ impl FunctionCallResultFacts {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionControlFacts {
     pub branch_predicates: BTreeMap<u64, BranchPredicateFact>,
+    pub block_assumptions: BTreeMap<u64, Vec<ControlBlockAssumptionFact>>,
     pub switches: BTreeMap<u64, SwitchSelectorFact>,
 }
 
 impl FunctionControlFacts {
     pub fn is_empty(&self) -> bool {
-        self.branch_predicates.is_empty() && self.switches.is_empty()
+        self.branch_predicates.is_empty()
+            && self.block_assumptions.is_empty()
+            && self.switches.is_empty()
     }
 
     pub fn branch_for_block(&self, block_addr: u64) -> Option<&BranchPredicateFact> {
@@ -76,6 +79,16 @@ impl FunctionControlFacts {
 
     pub fn switch_for_block(&self, block_addr: u64) -> Option<&SwitchSelectorFact> {
         self.switches.get(&block_addr)
+    }
+
+    pub fn assumptions_for_block(
+        &self,
+        block_addr: u64,
+    ) -> impl Iterator<Item = &ControlBlockAssumptionFact> {
+        self.block_assumptions
+            .get(&block_addr)
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -94,6 +107,13 @@ pub struct PredicateComparisonFact {
     pub kind: r2ssa::CompareKind,
     pub lhs: r2ssa::ValueId,
     pub rhs: r2ssa::ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlBlockAssumptionFact {
+    pub predecessor: u64,
+    pub predicate: r2ssa::PredicateId,
+    pub truth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -938,6 +958,14 @@ mod tests {
         };
         let control = FunctionControlFacts {
             branch_predicates: BTreeMap::from([(branch.block_addr, branch.clone())]),
+            block_assumptions: BTreeMap::from([(
+                branch.true_target,
+                vec![ControlBlockAssumptionFact {
+                    predecessor: branch.block_addr,
+                    predicate: branch.id,
+                    truth: true,
+                }],
+            )]),
             switches: BTreeMap::from([(switch.block_addr, switch.clone())]),
         };
 
@@ -949,6 +977,13 @@ mod tests {
                 .and_then(|control| control.branch_for_block(0x401000)),
             Some(&branch),
             "branch predicate proof must travel through FunctionFacts"
+        );
+        assert_eq!(
+            facts
+                .control()
+                .map(|control| control.assumptions_for_block(0x401010).count()),
+            Some(1),
+            "block assumption proof must travel through FunctionFacts"
         );
         assert_eq!(
             facts

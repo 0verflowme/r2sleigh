@@ -1,9 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use r2ssa::{
-    CompareKind as PreparedCompareKind, CompareProvenance, FunctionSSABlock, SSAOp, SSAVar,
-};
+use r2ssa::{CompareKind as PreparedCompareKind, FunctionSSABlock, SSAOp, SSAVar};
+use r2types::PredicateComparisonFact;
 
 use super::context::FoldingContext;
 use super::op_lower::{is_generic_arg_name, parse_const_value};
@@ -969,10 +968,10 @@ impl<'a> FoldingContext<'a> {
         let key = var.display_name();
         let prepared_value_id = self.prepared_value_id_for_var(var);
         let prepared = self
-            .prepared_predicates()
+            .control_facts()
             .and_then(|facts| {
                 facts
-                    .predicates
+                    .branch_predicates
                     .values()
                     .find(|predicate| Some(predicate.condition) == prepared_value_id)
                     .and_then(|predicate| self.prepared_branch_condition_expr(predicate.block_addr))
@@ -1040,8 +1039,8 @@ impl<'a> FoldingContext<'a> {
             }
         }
         if let Some(predicate) = self
-            .prepared_predicates()?
-            .predicates
+            .control_facts()?
+            .branch_predicates
             .values()
             .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))
             && let Some(expr) = self
@@ -1054,8 +1053,8 @@ impl<'a> FoldingContext<'a> {
             }
         }
         let compare = self
-            .prepared_predicates()?
-            .predicates
+            .control_facts()?
+            .branch_predicates
             .values()
             .find(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))?
             .comparison
@@ -1077,14 +1076,10 @@ impl<'a> FoldingContext<'a> {
                 return Some(resolved);
             }
         }
-        let facts = self.prepared_predicates()?;
+        let facts = self.control_facts()?;
         let compare = facts
-            .predicates
-            .values()
-            .find(|predicate| {
-                predicate.block_addr == block_addr
-                    && Some(predicate.condition) == self.prepared_value_id_for_var(var)
-            })
+            .branch_for_block(block_addr)
+            .filter(|predicate| Some(predicate.condition) == self.prepared_value_id_for_var(var))
             .and_then(|predicate| predicate.comparison.as_ref())
             .or_else(|| {
                 facts
@@ -1092,7 +1087,12 @@ impl<'a> FoldingContext<'a> {
                     .values()
                     .flat_map(|assumptions| assumptions.iter())
                     .find(|assumption| assumption.predecessor == block_addr)
-                    .and_then(|assumption| facts.predicates.get(&assumption.predicate))
+                    .and_then(|assumption| {
+                        facts
+                            .branch_predicates
+                            .values()
+                            .find(|predicate| predicate.id == assumption.predicate)
+                    })
                     .and_then(|predicate| predicate.comparison.as_ref())
             })?;
         self.prepared_compare_provenance_expr(compare)
@@ -1107,7 +1107,7 @@ impl<'a> FoldingContext<'a> {
         self.prepared_predicate_candidate_for_branch_block(block_addr, var)
     }
 
-    fn prepared_compare_provenance_expr(&self, prov: &CompareProvenance) -> Option<CExpr> {
+    fn prepared_compare_provenance_expr(&self, prov: &PredicateComparisonFact) -> Option<CExpr> {
         let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
         let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
         let compare_width = lhs_var.size.max(rhs_var.size);

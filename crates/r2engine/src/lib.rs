@@ -922,6 +922,23 @@ pub fn decompile_control_facts(prepared: &SsaArtifact) -> r2types::FunctionContr
             )
         })
         .collect();
+    let block_assumptions = predicates
+        .block_assumptions
+        .iter()
+        .map(|(block_addr, assumptions)| {
+            (
+                *block_addr,
+                assumptions
+                    .iter()
+                    .map(|assumption| r2types::ControlBlockAssumptionFact {
+                        predecessor: assumption.predecessor,
+                        predicate: assumption.predicate,
+                        truth: assumption.truth,
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
     let switches = predicates
         .switches
         .iter()
@@ -939,6 +956,7 @@ pub fn decompile_control_facts(prepared: &SsaArtifact) -> r2types::FunctionContr
         .collect();
     r2types::FunctionControlFacts {
         branch_predicates,
+        block_assumptions,
         switches,
     }
 }

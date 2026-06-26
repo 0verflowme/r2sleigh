@@ -1,16 +1,28 @@
-warning: r2dec analysis must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps
-  --> $DIR/direct_prepared_control_facts.rs:19:14
+warning: r2dec must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps or local selector inference
+  --> $DIR/direct_prepared_control_facts.rs:36:14
    |
 LL |     let _ = &prepared.predicates().predicates;
    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: `#[warn(r2dec_direct_prepared_control_facts)]` on by default
 
-warning: r2dec analysis must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps
-  --> $DIR/direct_prepared_control_facts.rs:20:14
+warning: r2dec must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps or local selector inference
+  --> $DIR/direct_prepared_control_facts.rs:37:14
    |
 LL |     let _ = &prepared.predicates().switches;
    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-warning: 2 warnings emitted
+warning: r2dec must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps or local selector inference
+  --> $DIR/direct_prepared_control_facts.rs:38:14
+   |
+LL |     let _ = &inputs.prepared_predicates;
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2dec must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps or local selector inference
+  --> $DIR/direct_prepared_control_facts.rs:39:13
+   |
+LL |     let _ = prepared.function().infer_switch_selector_var(0x1000);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 4 warnings emitted
 

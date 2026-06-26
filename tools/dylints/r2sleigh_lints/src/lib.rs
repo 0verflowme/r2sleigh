@@ -486,21 +486,25 @@ rustc_session::declare_lint!(
 rustc_session::declare_lint!(
     /// ### What it does
     ///
-    /// Warns when production `r2dec` analysis reads prepared SSA predicate or
-    /// switch maps directly.
+    /// Warns when production `r2dec` reads prepared SSA predicate or switch
+    /// maps directly, carries them through a side channel, or infers switch
+    /// selectors from prepared SSA instead of the canonical control contract.
     ///
     /// ### Why is this bad?
     ///
     /// Branch predicate and switch selector rendering must be authorized by
-    /// `r2types::FunctionFacts`. Reading `prepared.predicates().predicates` or
-    /// `prepared.predicates().switches` in the renderer recreates a side
-    /// channel and bypasses the engine-owned control evidence projection.
+    /// `r2types::FunctionFacts`. Reading `prepared.predicates().predicates`,
+    /// carrying `prepared_predicates`, or calling `infer_switch_selector_var`
+    /// in the renderer recreates a side channel and bypasses the engine-owned
+    /// control evidence projection.
     ///
     /// ### Example
     ///
     /// ```rust
     /// prepared.predicates().predicates.values();
     /// prepared.predicates().switches.get(&block);
+    /// inputs.prepared_predicates;
+    /// prepared.function().infer_switch_selector_var(block);
     /// ```
     ///
     /// Use instead `FunctionControlFacts` from `FunctionFacts`.
@@ -1143,7 +1147,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
             );
         }
 
-        if is_r2dec_analysis_path(cx, expr)
+        if is_r2dec_path(cx, expr)
             && !is_inside_test_item(cx, expr)
             && r2dec_direct_prepared_control_facts_expr(cx, expr)
         {
@@ -1151,7 +1155,7 @@ impl<'tcx> LateLintPass<'tcx> for R2sleighLintPass {
                 cx,
                 R2DEC_DIRECT_PREPARED_CONTROL_FACTS,
                 expr.span,
-                "r2dec analysis must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps",
+                "r2dec must read branch/switch proof from FunctionFacts, not prepared SSA predicate maps or local selector inference",
             );
         }
 
@@ -1626,12 +1630,16 @@ fn r2dec_direct_prepared_call_result_certificates_expr(
 fn r2dec_direct_prepared_control_facts_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     match expr.kind {
         ExprKind::Field(_, field) => {
-            matches!(field.name.as_str(), "predicates" | "switches")
-                && cx
-                    .sess()
-                    .source_map()
-                    .span_to_snippet(expr.span)
-                    .is_ok_and(|snippet| snippet.contains("predicates()"))
+            field.name.as_str() == "prepared_predicates"
+                || (matches!(field.name.as_str(), "predicates" | "switches")
+                    && cx
+                        .sess()
+                        .source_map()
+                        .span_to_snippet(expr.span)
+                        .is_ok_and(|snippet| snippet.contains("predicates()")))
+        }
+        ExprKind::MethodCall(method, _, _, _) => {
+            method.ident.as_str() == "infer_switch_selector_var"
         }
         _ => false,
     }

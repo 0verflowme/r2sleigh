@@ -4565,7 +4565,6 @@ impl Decompiler {
             prepared_semantic_view: prepared_semantic_view.as_ref(),
             prepared_objects: prepared.map(|artifact| artifact.objects()),
             prepared_memory: prepared.map(|artifact| artifact.memory()),
-            prepared_predicates: prepared.map(|artifact| artifact.predicates()),
             prepared_call_sites: prepared.map(|artifact| artifact.call_sites()),
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
@@ -6267,7 +6266,6 @@ mod tests {
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_predicates: None,
             prepared_call_sites: None,
         })
     }
@@ -10043,7 +10041,6 @@ mod tests {
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_predicates: None,
             prepared_call_sites: None,
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);

@@ -62,11 +62,11 @@ pub use facts::{
 };
 pub use function_facts::{
     AnalysisPlans, BranchPredicateFact, CallArgumentValueFact, CallResultFact,
-    CallsiteArgumentFacts, DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind,
-    FunctionCallResultFacts, FunctionCallsiteFacts, FunctionControlFacts, FunctionFacts,
-    InterprocSummaryView, PredicateComparisonFact, RegisterCallArgumentLocationFact,
-    StackCallArgumentLocationFact, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
-    SwitchSelectorFact,
+    CallsiteArgumentFacts, ControlBlockAssumptionFact, DecompileCapabilityView,
+    DecompileRouteFacts, DecompileRouteKind, FunctionCallResultFacts, FunctionCallsiteFacts,
+    FunctionControlFacts, FunctionFacts, InterprocSummaryView, PredicateComparisonFact,
+    RegisterCallArgumentLocationFact, StackCallArgumentLocationFact, SummaryEffectRollup,
+    SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

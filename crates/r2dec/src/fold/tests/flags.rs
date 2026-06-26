@@ -66,7 +66,6 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
         prepared_semantic_view: None,
         prepared_objects: None,
         prepared_memory: None,
-        prepared_predicates: None,
         prepared_call_sites: None,
     });
     ctx.inputs.prepared_ssa = Some(prepared_ssa);

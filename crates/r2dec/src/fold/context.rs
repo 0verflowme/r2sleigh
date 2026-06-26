@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::CType;
-use r2ssa::{CallSiteFacts, MemorySSAFacts, ObjectModel, PredicateFacts, SsaArtifact, ValueId};
+use r2ssa::{CallSiteFacts, MemorySSAFacts, ObjectModel, SsaArtifact, ValueId};
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
 use r2types::{
@@ -87,7 +87,6 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) prepared_objects: Option<&'a ObjectModel>,
     #[allow(dead_code)]
     pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
-    pub(crate) prepared_predicates: Option<&'a PredicateFacts>,
     pub(crate) prepared_call_sites: Option<&'a CallSiteFacts>,
 }
 
@@ -346,7 +345,6 @@ impl<'a> FoldingContext<'a> {
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_predicates: None,
             prepared_call_sites: None,
         };
 

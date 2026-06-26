@@ -1057,14 +1057,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         };
         let predicate = self
             .fold_ctx
-            .inputs
-            .prepared_predicates
-            .and_then(|facts| {
-                facts
-                    .predicates
-                    .values()
-                    .find(|predicate| predicate.block_addr == addr)
-            })
+            .control_facts()
+            .and_then(|facts| facts.branch_for_block(addr))
             .map(|predicate| (predicate.id, predicate.condition));
         let predicate_id = predicate.map(|(id, _)| id);
         let condition_value = predicate.map(|(_, value)| value);

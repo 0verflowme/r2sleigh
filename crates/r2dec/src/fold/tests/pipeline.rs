@@ -534,7 +534,6 @@ mod tests {
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_predicates: None,
             prepared_call_sites: None,
         })
     }
@@ -586,7 +585,6 @@ mod tests {
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_predicates: None,
             prepared_call_sites: None,
         })
     }
@@ -698,6 +696,70 @@ mod tests {
         }
     }
 
+    fn test_control_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionControlFacts {
+        let predicates = prepared.predicates();
+        let branch_predicates = predicates
+            .predicates
+            .values()
+            .map(|predicate| {
+                (
+                    predicate.block_addr,
+                    r2types::BranchPredicateFact {
+                        id: predicate.id,
+                        block_addr: predicate.block_addr,
+                        condition: predicate.condition,
+                        comparison: predicate.comparison.as_ref().map(|comparison| {
+                            r2types::PredicateComparisonFact {
+                                kind: comparison.kind,
+                                lhs: comparison.lhs,
+                                rhs: comparison.rhs,
+                            }
+                        }),
+                        true_target: predicate.true_target,
+                        false_target: predicate.false_target,
+                    },
+                )
+            })
+            .collect();
+        let block_assumptions = predicates
+            .block_assumptions
+            .iter()
+            .map(|(block_addr, assumptions)| {
+                (
+                    *block_addr,
+                    assumptions
+                        .iter()
+                        .map(|assumption| r2types::ControlBlockAssumptionFact {
+                            predecessor: assumption.predecessor,
+                            predicate: assumption.predicate,
+                            truth: assumption.truth,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let switches = predicates
+            .switches
+            .iter()
+            .map(|(block_addr, switch)| {
+                (
+                    *block_addr,
+                    r2types::SwitchSelectorFact {
+                        block_addr: switch.block_addr,
+                        selector: switch.selector,
+                        cases: switch.cases.clone(),
+                        default: switch.default,
+                    },
+                )
+            })
+            .collect();
+        r2types::FunctionControlFacts {
+            branch_predicates,
+            block_assumptions,
+            switches,
+        }
+    }
+
     fn make_x86_64_ctx_with_prepared<'a>(
         prepared_ssa: &'a r2ssa::SsaArtifact,
     ) -> FoldingContext<'a> {
@@ -706,6 +768,7 @@ mod tests {
         ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
         ctx.inputs.call_result_facts =
             Some(Box::leak(Box::new(test_call_result_facts(prepared_ssa))));
+        ctx.inputs.control_facts = Some(Box::leak(Box::new(test_control_facts(prepared_ssa))));
         ctx
     }
 
@@ -717,6 +780,7 @@ mod tests {
         ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
         ctx.inputs.call_result_facts =
             Some(Box::leak(Box::new(test_call_result_facts(prepared_ssa))));
+        ctx.inputs.control_facts = Some(Box::leak(Box::new(test_control_facts(prepared_ssa))));
         ctx
     }
 
@@ -23477,14 +23541,14 @@ mod tests {
             .find(|value| value.var.is_temp())
             .map(|value| value.id)
             .expect("cond value id");
-        let mut predicate_facts = r2ssa::PredicateFacts::default();
-        predicate_facts.predicates.insert(
-            r2ssa::PredicateId(1),
-            r2ssa::PredicateFact {
+        let mut control_facts = r2types::FunctionControlFacts::default();
+        control_facts.branch_predicates.insert(
+            0x5000,
+            r2types::BranchPredicateFact {
                 id: r2ssa::PredicateId(1),
                 block_addr: 0x5000,
                 condition: lhs_value_id,
-                comparison: Some(r2ssa::CompareProvenance {
+                comparison: Some(r2types::PredicateComparisonFact {
                     kind: r2ssa::CompareKind::Equal,
                     lhs: lhs_value_id,
                     rhs: rhs_value_id,
@@ -23493,15 +23557,15 @@ mod tests {
                 false_target: 0x5004,
             },
         );
-        predicate_facts.block_assumptions.insert(
+        control_facts.block_assumptions.insert(
             0x5000,
-            vec![r2ssa::BlockAssumption {
+            vec![r2types::ControlBlockAssumptionFact {
                 predecessor: 0x5000,
                 predicate: r2ssa::PredicateId(1),
                 truth: true,
             }],
         );
-        ctx.inputs.prepared_predicates = Some(Box::leak(Box::new(predicate_facts)));
+        ctx.inputs.control_facts = Some(Box::leak(Box::new(control_facts)));
 
         assert_ne!(
             lhs_value_id, cond_value_id,
