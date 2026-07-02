@@ -4,12 +4,13 @@ use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::CType;
-use r2ssa::{CallSiteFacts, MemorySSAFacts, ObjectModel, SsaArtifact, ValueId};
+use r2ssa::{MemorySSAFacts, ObjectModel, SsaArtifact, ValueId};
 #[cfg(test)]
 use r2types::ExternalStackVarSpec;
 use r2types::{
-    CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb, InterprocSummaryView,
-    SignatureRegistry, StackSlotKey, TypeOracle, VisibleBinding,
+    CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb,
+    FieldAccessCertificate, FunctionFacts, InterprocSummaryView, SignatureRegistry, StackSlotKey,
+    TypeOracle, VisibleBinding,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,6 +44,7 @@ pub(crate) struct EffectRenderProof {
     pub(crate) kind: EffectRenderProofKind,
     pub(crate) block_addr: u64,
     pub(crate) op_idx: usize,
+    pub(crate) call_disposition: Option<r2types::CallsiteRenderDisposition>,
     pub(crate) target: Option<ValueId>,
     pub(crate) address: Option<ValueId>,
     pub(crate) value: Option<ValueId>,
@@ -63,31 +65,74 @@ pub(crate) struct FoldArchConfig {
 #[derive(Clone, Copy)]
 pub(crate) struct FoldInputs<'a> {
     pub(crate) arch: &'a FoldArchConfig,
+    #[cfg(test)]
     pub(crate) function_names: &'a HashMap<u64, String>,
+    #[cfg(test)]
     pub(crate) strings: &'a HashMap<u64, String>,
+    #[cfg(test)]
     pub(crate) symbols: &'a HashMap<u64, String>,
-    pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
-    pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
-    pub(crate) callsite_facts: Option<&'a r2types::FunctionCallsiteFacts>,
-    pub(crate) call_result_facts: Option<&'a r2types::FunctionCallResultFacts>,
-    pub(crate) control_facts: Option<&'a r2types::FunctionControlFacts>,
+    pub(crate) function_facts: &'a FunctionFacts,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) certified_rendering_required: bool,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+    pub(crate) field_access_certificates: &'a [FieldAccessCertificate],
     #[cfg(test)]
     pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) external_type_db: &'a ExternalTypeDb,
-    pub(crate) semantic_artifact: Option<&'a r2sym::SemanticArtifact>,
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
-    pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
     pub(crate) prepared_objects: Option<&'a ObjectModel>,
     #[allow(dead_code)]
     pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
-    pub(crate) prepared_call_sites: Option<&'a CallSiteFacts>,
+}
+
+impl<'a> FoldInputs<'a> {
+    pub(crate) fn callee_facts(&self) -> &'a BTreeMap<u64, CalleeFact> {
+        &self.function_facts.type_facts().callee_facts
+    }
+
+    pub(crate) fn callee_resolution(&self) -> Option<&'a CalleeResolutionFacts> {
+        self.function_facts.callee_resolution()
+    }
+
+    pub(crate) fn callsite_facts(&self) -> Option<&'a r2types::FunctionCallsiteFacts> {
+        self.function_facts.callsites()
+    }
+
+    pub(crate) fn call_result_facts(&self) -> Option<&'a r2types::FunctionCallResultFacts> {
+        self.function_facts.call_results()
+    }
+
+    pub(crate) fn call_render_facts(&self) -> Option<&'a r2types::FunctionCallRenderFacts> {
+        self.function_facts.call_render()
+    }
+
+    pub(crate) fn control_facts(&self) -> Option<&'a r2types::FunctionControlFacts> {
+        self.function_facts.control()
+    }
+
+    pub(crate) fn render_facts(&self) -> Option<&'a r2types::FunctionRenderFacts> {
+        self.function_facts.render()
+    }
+
+    pub(crate) fn semantic_artifact(&self) -> Option<&'a r2sym::SemanticArtifact> {
+        self.function_facts.semantic_artifact()
+    }
+
+    pub(crate) fn summary_view(&self) -> Option<&'a InterprocSummaryView> {
+        Some(self.function_facts.summary_view())
+    }
+}
+
+pub(crate) fn empty_function_facts() -> &'static FunctionFacts {
+    static EMPTY_FUNCTION_FACTS: OnceLock<FunctionFacts> = OnceLock::new();
+    EMPTY_FUNCTION_FACTS.get_or_init(FunctionFacts::default)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,8 +157,6 @@ pub struct FoldingContext<'a> {
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
     pub(crate) call_result_owner_name_cache:
         std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
-    pub(crate) authoritative_source_args_cache:
-        std::cell::RefCell<BTreeMap<(u64, usize), Vec<crate::ast::CExpr>>>,
     pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
     pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
     pub(crate) prepared_semantic_view_building: Cell<bool>,
@@ -193,7 +236,6 @@ impl<'a> FoldingContext<'a> {
             preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
             call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
-            authoritative_source_args_cache: std::cell::RefCell::new(BTreeMap::new()),
             owned_call_visible_names_cache: std::cell::RefCell::new(None),
             prepared_semantic_view_cache: OnceCell::new(),
             prepared_semantic_view_building: Cell::new(false),
@@ -214,28 +256,6 @@ impl<'a> FoldingContext<'a> {
         self.effect_render_proofs.borrow().clone()
     }
 
-    pub(crate) fn record_effect_render_proof_for_values(
-        &self,
-        kind: EffectRenderProofKind,
-        block_addr: u64,
-        op_idx: usize,
-        target: Option<ValueId>,
-        values: Vec<ValueId>,
-    ) {
-        self.effect_render_proofs
-            .borrow_mut()
-            .push(EffectRenderProof {
-                kind,
-                block_addr,
-                op_idx,
-                target,
-                address: None,
-                value: None,
-                values,
-                materialized_phi_copy: false,
-            });
-    }
-
     pub(crate) fn record_effect_render_proof_for_value(
         &self,
         kind: EffectRenderProofKind,
@@ -249,6 +269,7 @@ impl<'a> FoldingContext<'a> {
                 kind,
                 block_addr,
                 op_idx,
+                call_disposition: None,
                 target: None,
                 address: None,
                 value,
@@ -269,6 +290,7 @@ impl<'a> FoldingContext<'a> {
                 kind: EffectRenderProofKind::Expression,
                 block_addr,
                 op_idx,
+                call_disposition: None,
                 target: None,
                 address: None,
                 value,
@@ -285,31 +307,58 @@ impl<'a> FoldingContext<'a> {
         address: ValueId,
         value: Option<ValueId>,
     ) {
+        let proof = EffectRenderProof {
+            kind,
+            block_addr,
+            op_idx,
+            call_disposition: None,
+            target: None,
+            address: Some(address),
+            value,
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        };
+        let mut proofs = self.effect_render_proofs.borrow_mut();
+        if !proofs.contains(&proof) {
+            proofs.push(proof);
+        }
+    }
+
+    pub(crate) fn record_call_effect_render_proof(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        target: Option<ValueId>,
+        values: Vec<ValueId>,
+        disposition: r2types::CallsiteRenderDisposition,
+    ) {
         self.effect_render_proofs
             .borrow_mut()
             .push(EffectRenderProof {
-                kind,
+                kind: EffectRenderProofKind::Call,
                 block_addr,
                 op_idx,
-                target: None,
-                address: Some(address),
-                value,
-                values: Vec::new(),
+                call_disposition: Some(disposition),
+                target,
+                address: None,
+                value: None,
+                values,
                 materialized_phi_copy: false,
             });
     }
 
     /// Test convenience constructor.
     pub fn new(ptr_size: u32) -> Self {
+        #[cfg(test)]
         static EMPTY_U64_STRING: OnceLock<HashMap<u64, String>> = OnceLock::new();
         static EMPTY_STACK_SLOTS: OnceLock<BTreeMap<StackSlotKey, ExternalStackSlotSpec>> =
             OnceLock::new();
+        static EMPTY_FIELD_CERTS: OnceLock<Vec<FieldAccessCertificate>> = OnceLock::new();
         #[cfg(test)]
         static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
         static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
         static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
         static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
-        static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
         static EMPTY_STRING_CTYPE: OnceLock<HashMap<String, CType>> = OnceLock::new();
         static ARCH64: OnceLock<FoldArchConfig> = OnceLock::new();
         static ARCH32: OnceLock<FoldArchConfig> = OnceLock::new();
@@ -322,30 +371,29 @@ impl<'a> FoldingContext<'a> {
 
         let inputs = FoldInputs {
             arch,
+            #[cfg(test)]
             function_names: EMPTY_U64_STRING.get_or_init(HashMap::new),
+            #[cfg(test)]
             strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
+            #[cfg(test)]
             symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
-            callee_facts: EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new),
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
+            function_facts: empty_function_facts(),
+            #[cfg(test)]
+            certified_rendering_required: false,
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
+            field_access_certificates: EMPTY_FIELD_CERTS.get_or_init(Vec::new),
             #[cfg(test)]
             external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
             external_type_db: EMPTY_TYPE_DB.get_or_init(ExternalTypeDb::default),
-            semantic_artifact: None,
             param_register_aliases: EMPTY_STRING_STRING.get_or_init(HashMap::new),
             type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
-            summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_call_sites: None,
         };
 
         Self::from_inputs(inputs)

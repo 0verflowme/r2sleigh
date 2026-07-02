@@ -1,14 +1,11 @@
 //! Unified instruction export pipeline for r2sleigh.
 
-use std::collections::HashSet;
-use std::fmt;
-
-#[cfg(feature = "dec")]
-use r2dec::{CStmt, CodeGenConfig, CodeGenerator, lower_ssa_ops_to_stmts};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId, Varnode, validate_block_full};
 use r2sleigh_lift::{Disassembler, format_op, op_to_esil_named};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::fmt;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,21 +323,27 @@ fn export_dec(
     format: ExportFormat,
 ) -> Result<String, ExportError> {
     let ssa_block = r2ssa::block::to_ssa(input.block, input.disasm);
-    let ptr_size = input.arch.addr_size.saturating_mul(8);
-    let stmts: Vec<CStmt> = lower_ssa_ops_to_stmts(ptr_size, &ssa_block.ops);
+    let residuals = ssa_block
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(op_index, op)| DecResidualJson {
+            kind: "residual",
+            op_index,
+            comment: format!(
+                "r2sleigh-export residual: instruction-level dec requires r2engine FunctionFacts render proof; executable C suppressed: {op:?}"
+            ),
+        })
+        .collect::<Vec<_>>();
 
     match format {
-        ExportFormat::Json => serde_json::to_string_pretty(&stmts)
+        ExportFormat::Json => serde_json::to_string_pretty(&residuals)
             .map_err(|e| ExportError::SerializeError(e.to_string())),
-        ExportFormat::Text | ExportFormat::CLike => {
-            let mut codegen = CodeGenerator::new(CodeGenConfig::default());
-            let mut output = String::new();
-            for stmt in &stmts {
-                output.push_str(&codegen.generate_stmt(stmt));
-                output.push('\n');
-            }
-            Ok(output.trim_end_matches('\n').to_string())
-        }
+        ExportFormat::Text | ExportFormat::CLike => Ok(residuals
+            .iter()
+            .map(|residual| format!("/* {} */", residual.comment))
+            .collect::<Vec<_>>()
+            .join("\n")),
         _ => Err(ExportError::UnsupportedCombination {
             action: InstructionAction::Dec,
             format,
@@ -454,6 +457,14 @@ struct DefUseInfoJson {
     inputs: Vec<String>,
     outputs: Vec<String>,
     live: Vec<String>,
+}
+
+#[cfg(feature = "dec")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DecResidualJson {
+    kind: &'static str,
+    op_index: usize,
+    comment: String,
 }
 
 #[cfg(all(test, feature = "x86"))]
@@ -687,11 +698,21 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dec")]
-    fn dec_c_like_nonempty_for_simple_block() {
+    fn dec_c_like_residualizes_without_function_facts() {
         let input = lift_input(X86_BYTES_DEC, 0x1000);
         let out = export_instruction(&input, InstructionAction::Dec, ExportFormat::CLike)
-            .expect("dec c-like");
-        assert!(!out.trim().is_empty(), "expected non-empty c-like output");
+            .expect("dec residual");
+        assert!(
+            out.contains("r2sleigh-export residual")
+                && out.contains("FunctionFacts render proof")
+                && out.contains("executable C suppressed"),
+            "expected explicit residual, got: {out}"
+        );
+        assert!(
+            out.lines()
+                .all(|line| line.starts_with("/* ") && line.ends_with(" */")),
+            "instruction-level dec must stay comment-only: {out}"
+        );
     }
 
     #[test]
@@ -957,7 +978,12 @@ mod tests {
                 ExportFormat::Json,
                 normalize_json_output,
             );
-            assert_eq!(dec_json, "[]");
+            assert!(
+                dec_json.contains("\"kind\":\"residual\"")
+                    && dec_json.contains("FunctionFacts render proof")
+                    && dec_json.contains("executable C suppressed"),
+                "dec json must be explicit residual-only output: {dec_json}"
+            );
         }
     }
 }

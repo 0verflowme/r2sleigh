@@ -1,75 +1,54 @@
-#[cfg(test)]
-use crate::InferredParam;
 use crate::blocks::BlockSlice;
 use crate::context::{PluginCtxView, require_ctx_view};
 use crate::helpers::{effective_ptr_bits, resolve_function_name};
-use crate::{
-    ArchSpec, Disassembler, InferredParamJson, InferredSignatureCcJson, R2ILBlock, R2ILContext,
-};
+use crate::{ArchSpec, R2ILBlock, R2ILContext};
+#[cfg(test)]
+use crate::{InferredParamJson, InferredSignatureCcJson};
 use std::ffi::CString;
+#[cfg(test)]
 use std::hash::Hash;
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::OnceLock;
 
-const ANALYSIS_CACHE_LIMIT: usize = 256;
-
 pub(crate) struct FunctionInput<'a> {
     pub(crate) ctx: PluginCtxView<'a>,
     pub(crate) blocks: BlockSlice,
-    pub(crate) function_addr: u64,
     pub(crate) function_name: String,
 }
 
 pub(crate) type FunctionAnalysis = r2engine::EngineAnalysis;
+#[cfg(test)]
 pub(crate) type FunctionAnalysisArtifact = r2engine::EngineAnalysisArtifact;
 
+#[cfg(test)]
 type FunctionAnalysisCacheKey = r2engine::AnalysisCacheKey;
 #[cfg(test)]
 type FunctionArtifactCacheKey = r2engine::ArtifactCacheKey;
 
+#[cfg(test)]
 fn hash_debug_payload<T: std::fmt::Debug>(value: &T) -> u64 {
     r2engine::stable_fnv1a_debug_hash(value)
 }
 
+#[cfg(test)]
 fn hash_optional_arch(arch: Option<&ArchSpec>) -> u64 {
     arch.map(hash_debug_payload).unwrap_or(0)
 }
 
+#[cfg(test)]
 pub(crate) fn hash_string_payload(payload: &str) -> u64 {
     r2engine::stable_fnv1a_hash(payload)
 }
 
-fn engine_mode_from_ffi(mode: u32) -> r2engine::EngineAnalysisMode {
-    match mode {
-        0 => r2engine::EngineAnalysisMode::Fast,
-        2 => r2engine::EngineAnalysisMode::Full,
-        _ => r2engine::EngineAnalysisMode::Balanced,
-    }
-}
-
+#[cfg(test)]
 fn hash_value<T: Hash>(value: &T) -> u64 {
     r2engine::stable_fnv1a_hash(value)
 }
 
+#[cfg(test)]
 fn hash_blocks(blocks: &[R2ILBlock]) -> u64 {
     r2engine::stable_blocks_hash(blocks)
-}
-
-fn function_analysis_cache_key_parts(
-    _function_name: &str,
-    arch: Option<&ArchSpec>,
-    blocks: &[R2ILBlock],
-) -> Option<FunctionAnalysisCacheKey> {
-    Some(FunctionAnalysisCacheKey::from_hashes(
-        0,
-        0,
-        hash_optional_arch(arch),
-        hash_blocks(blocks),
-        0,
-        0,
-        0,
-    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -120,16 +99,15 @@ fn function_artifact_cache_key_parts(
     symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
 ) -> Option<FunctionArtifactCacheKey> {
     let ptr_bits = arch.map(effective_ptr_bits).unwrap_or(64);
-    let parsed = r2types::parse_external_context_json(external_context_json, ptr_bits);
-    let external_context_fallback_hash = hash_string_payload(external_context_json);
+    let parsed = r2engine::parse_external_context_json_for_engine(external_context_json, ptr_bits);
     function_artifact_cache_key_parts_hashed(
         function_name,
         0,
         arch,
         blocks,
         semantic_metadata_enabled,
-        session_context_identity_hash_from_parsed(&parsed, external_context_fallback_hash),
-        r2engine::assumptions_identity_hash(&parsed.assumptions),
+        parsed.context_identity_hash,
+        parsed.assumptions_hash,
         interproc_scope_hash,
         interproc_max_iterations,
         symbolic_scope,
@@ -138,29 +116,8 @@ fn function_artifact_cache_key_parts(
 
 #[cfg(test)]
 fn session_context_identity_hash(external_context_json: &str, ptr_bits: u32) -> u64 {
-    let parsed = r2types::parse_external_context_json(external_context_json, ptr_bits);
-    session_context_identity_hash_from_parsed(&parsed, hash_string_payload(external_context_json))
-}
-
-#[cfg(test)]
-fn session_context_identity_hash_from_parsed(
-    parsed: &r2types::ParsedExternalContext,
-    fallback_hash: u64,
-) -> u64 {
-    match (
-        parsed.context_hash,
-        parsed.context_dirty_epoch,
-        parsed.type_dirty_epoch,
-    ) {
-        (None, None, None) => fallback_hash,
-        (context_hash, dirty_epoch, type_dirty_epoch) => hash_value(&(
-            "radare2-typed-context",
-            parsed.context_schema_version,
-            context_hash.unwrap_or(fallback_hash),
-            dirty_epoch,
-            type_dirty_epoch,
-        )),
-    }
+    r2engine::parse_external_context_json_for_engine(external_context_json, ptr_bits)
+        .context_identity_hash
 }
 
 pub(crate) struct FunctionFactsStore {
@@ -170,7 +127,7 @@ pub(crate) struct FunctionFactsStore {
 impl FunctionFactsStore {
     fn new() -> Self {
         Self {
-            engine_session: r2engine::EngineSession::new(ANALYSIS_CACHE_LIMIT),
+            engine_session: r2engine::EngineSession::default(),
         }
     }
 }
@@ -184,6 +141,7 @@ pub(crate) fn engine_session() -> &'static r2engine::EngineSession {
     &function_facts_store().engine_session
 }
 
+#[cfg(test)]
 fn rename_function_analysis_artifact(
     artifact: FunctionAnalysisArtifact,
     function_name: &str,
@@ -245,62 +203,15 @@ pub extern "C" fn r2sleigh_engine_cache_stats_reset() {
     });
 }
 
-fn merged_assumption_usage(
-    prepared: &r2ssa::SsaArtifact,
-    function_facts: &r2types::FunctionFacts,
-) -> r2ssa::AssumptionUsageReport {
-    let mut usage = prepared.facts().assumption_usage.clone();
-    usage.extend(&function_facts.assumption_usage);
-    usage
-}
-
 #[cfg(test)]
-fn type_like_to_ctype(ty: &r2types::CTypeLike) -> r2dec::CType {
-    match ty {
-        r2types::CTypeLike::Void => r2dec::CType::Void,
-        r2types::CTypeLike::Bool => r2dec::CType::Bool,
-        r2types::CTypeLike::Int { bits, signedness } => match signedness {
-            r2types::Signedness::Unsigned => r2dec::CType::UInt(*bits),
-            r2types::Signedness::Signed | r2types::Signedness::Unknown => r2dec::CType::Int(*bits),
-        },
-        r2types::CTypeLike::Float(bits) => r2dec::CType::Float(*bits),
-        r2types::CTypeLike::Pointer(inner) => {
-            r2dec::CType::Pointer(Box::new(type_like_to_ctype(inner)))
-        }
-        r2types::CTypeLike::Array(inner, len) => {
-            r2dec::CType::Array(Box::new(type_like_to_ctype(inner)), *len)
-        }
-        r2types::CTypeLike::Struct(name) => r2dec::CType::Struct(name.clone()),
-        r2types::CTypeLike::Union(name) => r2dec::CType::Union(name.clone()),
-        r2types::CTypeLike::Enum(name) => r2dec::CType::Enum(name.clone()),
-        r2types::CTypeLike::Typedef(name) => r2dec::CType::Typedef(name.clone()),
-        r2types::CTypeLike::Function | r2types::CTypeLike::Unknown => r2dec::CType::Unknown,
-    }
-}
-
-pub(crate) fn signature_to_json(sig: &r2types::InferredSignature) -> InferredSignatureCcJson {
-    InferredSignatureCcJson {
-        function_name: sig.function_name.clone(),
-        signature: sig.signature.clone(),
-        ret_type: sig.ret_type.clone(),
-        params: sig
-            .params
-            .iter()
-            .map(|param| InferredParamJson {
-                name: param.name.clone(),
-                param_type: param.param_type.clone(),
-            })
-            .collect(),
-        callconv: sig.callconv.clone(),
-        arch: sig.arch.clone(),
-        confidence: sig.confidence,
-        callconv_confidence: sig.callconv_confidence,
-    }
+fn type_like_to_string(ty: &r2types::CTypeLike) -> String {
+    r2types::render_c_type_like(ty)
 }
 
 pub(crate) type VarProt = r2types::RecoveredVariable;
 #[cfg(test)]
 pub(crate) type TypeHintRank = r2types::TypeHintRank;
+#[cfg(test)]
 pub(crate) type TypeHint = r2types::TypeHint;
 
 fn build_var_recovery_ssa_blocks(
@@ -331,71 +242,7 @@ pub(crate) fn build_function_input<'a>(
     Some(FunctionInput {
         ctx,
         blocks,
-        function_addr: fcn_addr,
         function_name: resolve_function_name(fcn_addr, fcn_name),
-    })
-}
-
-pub(crate) fn function_analysis_artifact_cache_identity_hash_with_parsed_context_and_scope_facts(
-    input: &FunctionInput<'_>,
-    parsed_context: &r2types::ParsedExternalContext,
-    external_context_fallback_hash: u64,
-    scope_facts: &InterprocScopeFacts,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<u64> {
-    let reg_type_hints = if input.ctx.semantic_metadata_enabled {
-        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
-    } else {
-        std::collections::HashMap::new()
-    };
-    let request = engine_analyze_request_with_scope_facts(
-        input,
-        parsed_context,
-        external_context_fallback_hash,
-        scope_facts,
-        interproc_max_iterations,
-        symbolic_scope,
-        reg_type_hints,
-        None,
-        true,
-    );
-    Some(hash_value(&r2engine::function_artifact_cache_key(&request)))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn engine_analyze_request_with_scope_facts(
-    input: &FunctionInput<'_>,
-    parsed_context: &r2types::ParsedExternalContext,
-    external_context_fallback_hash: u64,
-    scope_facts: &InterprocScopeFacts,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-    reg_type_hints: std::collections::HashMap<String, TypeHint>,
-    precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
-    include_interproc_summary_set: bool,
-) -> r2engine::EngineAnalyzeRequest {
-    let ptr_bits = input
-        .ctx
-        .arch
-        .as_ref()
-        .map(|arch| effective_ptr_bits(arch))
-        .unwrap_or(64);
-    r2engine::EngineAnalyzeRequest::full_semantics(r2engine::EngineAnalyzeRequestParts {
-        function_name: input.function_name.clone(),
-        function_addr: input.function_addr,
-        blocks: input.blocks.as_slice().to_vec(),
-        arch: input.ctx.arch.cloned(),
-        ptr_bits,
-        semantic_metadata_enabled: input.ctx.semantic_metadata_enabled,
-        reg_type_hints,
-        parsed_context: parsed_context.clone(),
-        external_context_fallback_hash,
-        scope_facts: scope_facts.clone(),
-        interproc_max_iterations,
-        symbolic_scope: symbolic_scope.cloned(),
-        precomputed_semantic_artifact,
-        include_interproc_summary_set,
     })
 }
 
@@ -415,9 +262,12 @@ pub(crate) fn build_function_analysis(input: &FunctionInput<'_>) -> Option<Funct
     )
 }
 
+#[cfg(test)]
 pub(crate) type InterprocScopeFacts = r2engine::InterprocScopeFacts;
+#[cfg(test)]
 pub(crate) type InterprocSeedEntry = r2engine::InterprocSeedEntry;
 
+#[cfg(test)]
 pub(crate) fn empty_interproc_scope_facts() -> InterprocScopeFacts {
     r2engine::InterprocScopeFacts::empty()
 }
@@ -430,29 +280,12 @@ where
     r2engine::interproc_scope_facts_from_seed_entries(entries)
 }
 
+#[cfg(test)]
 pub(crate) fn interproc_scope_facts_from_typed_seed_entries<I>(entries: I) -> InterprocScopeFacts
 where
     I: IntoIterator<Item = InterprocSeedEntry>,
 {
     r2engine::interproc_scope_facts_from_typed_seed_entries(entries)
-}
-
-pub(crate) fn build_interproc_summary_set_with_scope_facts(
-    input: &FunctionInput<'_>,
-    analysis: &FunctionAnalysis,
-    scope_facts: &InterprocScopeFacts,
-    max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> r2ssa::InterprocSummarySet {
-    r2engine::build_interproc_summary_set_with_scope_facts(
-        &input.function_name,
-        input.function_addr,
-        input.ctx.arch,
-        analysis,
-        scope_facts,
-        max_iterations,
-        symbolic_scope,
-    )
 }
 
 pub(crate) fn infer_signature_cc_from_analysis(
@@ -465,19 +298,18 @@ pub(crate) fn infer_signature_cc_from_analysis(
         .as_ref()
         .map(|arch| effective_ptr_bits(arch))
         .unwrap_or(64);
-    let reg_type_hints = if input.ctx.semantic_metadata_enabled {
-        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
-    } else {
-        std::collections::HashMap::new()
-    };
-    r2engine::infer_signature_from_analysis(r2engine::EngineSignatureInferenceRequest {
-        function_name: &input.function_name,
-        arch: input.ctx.arch,
-        ptr_bits,
-        semantic_metadata_enabled: input.ctx.semantic_metadata_enabled,
-        reg_type_hints: &reg_type_hints,
-        analysis,
-    })
+    r2engine::infer_signature_from_analysis_with_register_names(
+        r2engine::EngineSignatureInferenceWithRegisterNamesRequest {
+            function_name: &input.function_name,
+            arch: input.ctx.arch,
+            ptr_bits,
+            semantic_metadata_enabled: input.ctx.semantic_metadata_enabled,
+            r2il_blocks: input.blocks.as_slice(),
+            reg_type_hints: std::collections::HashMap::new(),
+            analysis,
+        },
+        |vn| input.ctx.disasm.register_name(vn),
+    )
 }
 
 #[allow(dead_code)]
@@ -506,25 +338,24 @@ fn apply_signature_context_overrides(
                 .params
                 .get(idx)
                 .and_then(|param| param.ty.as_ref())
-                .map(|ty| type_like_to_ctype(ty).to_string())
+                .map(type_like_to_string)
                 .unwrap_or_else(|| "void *".to_string());
             sig.params.push(InferredParamJson {
                 name: format!("arg{}", idx + 1),
                 param_type,
             });
         }
-        if let Some(ret_ty) = signature.ret_type.as_ref() {
-            let ret_ty = type_like_to_ctype(ret_ty);
-            let ret_ty_str = ret_ty.to_string();
-            if !matches!(ret_ty, r2dec::CType::Unknown) {
-                sig.ret_type = ret_ty_str;
-            }
+        if let Some(ret_ty) = signature.ret_type.as_ref()
+            && !matches!(ret_ty, r2types::CTypeLike::Unknown)
+        {
+            let ret_ty_str = type_like_to_string(ret_ty);
+            sig.ret_type = ret_ty_str;
         }
         for (idx, param) in signature.params.iter().enumerate() {
             if let Some(ty) = param.ty.as_ref() {
-                let ty_str = type_like_to_ctype(ty).to_string();
+                let ty_str = type_like_to_string(ty);
                 param_types.insert(idx, ty_str.clone());
-                if !matches!(type_like_to_ctype(ty), r2dec::CType::Unknown)
+                if !matches!(ty, r2types::CTypeLike::Unknown)
                     && let Some(inferred_param) = sig.params.get_mut(idx)
                 {
                     inferred_param.param_type = ty_str;
@@ -561,7 +392,7 @@ pub(crate) fn apply_main_signature_override(
     signature_cc.ret_type = main_signature
         .ret_type
         .as_ref()
-        .map(|ty| type_like_to_ctype(ty).to_string())
+        .map(type_like_to_string)
         .unwrap_or_else(|| "int32_t".to_string());
     signature_cc.params = main_signature
         .params
@@ -571,7 +402,7 @@ pub(crate) fn apply_main_signature_override(
             param_type: param
                 .ty
                 .as_ref()
-                .map(|ty| type_like_to_ctype(ty).to_string())
+                .map(type_like_to_string)
                 .unwrap_or_else(|| "void *".to_string()),
         })
         .collect();
@@ -600,254 +431,7 @@ fn signature_strength(signature: &r2types::FunctionSignatureSpec) -> u8 {
 }
 
 #[allow(dead_code)]
-pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artifact(
-    input: &FunctionInput<'_>,
-    analysis: FunctionAnalysis,
-    external_context_json: &str,
-    interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
-    semantic_artifact: r2sym::SemanticArtifact,
-) -> Option<FunctionAnalysisArtifact> {
-    let ptr_bits = input
-        .ctx
-        .arch
-        .as_ref()
-        .map(|arch| effective_ptr_bits(arch))
-        .unwrap_or(64);
-    let parsed_context = r2types::parse_external_context_json(external_context_json, ptr_bits);
-    build_function_analysis_artifact_from_analysis_with_semantic_artifact_context(
-        input,
-        analysis,
-        &parsed_context,
-        interproc_summary_set,
-        semantic_artifact,
-    )
-}
-
-pub(crate) fn build_function_analysis_artifact_from_analysis_with_semantic_artifact_context(
-    input: &FunctionInput<'_>,
-    analysis: FunctionAnalysis,
-    parsed_context: &r2types::ParsedExternalContext,
-    interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
-    semantic_artifact: r2sym::SemanticArtifact,
-) -> Option<FunctionAnalysisArtifact> {
-    build_function_analysis_artifact_from_analysis_with_optional_semantics_context(
-        input,
-        analysis,
-        parsed_context,
-        interproc_summary_set,
-        Some(semantic_artifact),
-    )
-}
-
-pub(crate) fn build_function_analysis_artifact_from_analysis_with_optional_semantics_context(
-    input: &FunctionInput<'_>,
-    analysis: FunctionAnalysis,
-    parsed_context: &r2types::ParsedExternalContext,
-    interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
-    semantic_artifact: Option<r2sym::SemanticArtifact>,
-) -> Option<FunctionAnalysisArtifact> {
-    let ptr_bits = input
-        .ctx
-        .arch
-        .as_ref()
-        .map(|arch| effective_ptr_bits(arch))
-        .unwrap_or(64);
-    let signature = infer_signature_cc_from_analysis(input, &analysis)?;
-    let assumption_applied_analysis = if parsed_context.assumptions.is_empty() {
-        analysis.clone()
-    } else {
-        FunctionAnalysis {
-            ssa_func: analysis
-                .ssa_func
-                .with_assumptions(&parsed_context.assumptions),
-            pattern_ssa_func: analysis
-                .pattern_ssa_func
-                .with_assumptions(&parsed_context.assumptions),
-        }
-    };
-
-    let pattern_ssa_blocks = assumption_applied_analysis
-        .pattern_ssa_func
-        .local_ssa_blocks();
-    let (arch_name, _) = r2engine::engine_arch_target(input.ctx.arch);
-    let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
-    let local_structs = r2types::infer_local_struct_artifacts_from_ssa(
-        &pattern_ssa_blocks,
-        Some(arch_name.as_str()),
-        ptr_bits,
-        &mut diagnostics,
-    );
-    let local_field_accesses = r2types::local_field_accesses_from_struct_artifacts(&local_structs);
-    let reg_type_hints = if input.ctx.semantic_metadata_enabled {
-        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
-    } else {
-        std::collections::HashMap::new()
-    };
-    let vars = recover_vars_from_ssa(
-        &pattern_ssa_blocks,
-        input.ctx.arch,
-        &reg_type_hints,
-        input.ctx.semantic_metadata_enabled,
-    );
-    let writeback = if let Some(semantic_artifact) = semantic_artifact.as_ref() {
-        r2types::build_type_writeback_analysis_with_semantics(
-            r2types::TypeWritebackAnalysisInput {
-                function_name: &input.function_name,
-                ptr_bits,
-                inferred_signature: signature.clone(),
-                recovered_vars: &vars,
-                ssa_blocks: &pattern_ssa_blocks,
-                parsed_context: parsed_context.clone(),
-                local_structs,
-                interproc_summary_set: interproc_summary_set.clone(),
-                diagnostics,
-            },
-            r2types::TypeWritebackSemanticInputs {
-                artifact: semantic_artifact,
-                local_field_accesses: &local_field_accesses,
-            },
-        )
-    } else {
-        r2types::build_type_writeback_analysis(r2types::TypeWritebackAnalysisInput {
-            function_name: &input.function_name,
-            ptr_bits,
-            inferred_signature: signature.clone(),
-            recovered_vars: &vars,
-            ssa_blocks: &pattern_ssa_blocks,
-            parsed_context: parsed_context.clone(),
-            local_structs,
-            interproc_summary_set: interproc_summary_set.clone(),
-            diagnostics,
-        })
-    };
-    let mut function_facts = writeback.function_facts;
-    function_facts.assumption_usage =
-        merged_assumption_usage(&assumption_applied_analysis.ssa_func, &function_facts);
-    Some(FunctionAnalysisArtifact {
-        ssa_func: assumption_applied_analysis.ssa_func,
-        pattern_ssa_func: assumption_applied_analysis.pattern_ssa_func,
-        function_facts,
-        writeback_plan: writeback.plan,
-    })
-}
-
-#[allow(dead_code)]
-pub(crate) fn build_function_analysis_artifact_with_scope_context_and_scope_facts(
-    input: &FunctionInput<'_>,
-    parsed_context: &r2types::ParsedExternalContext,
-    external_context_fallback_hash: u64,
-    scope_facts: &InterprocScopeFacts,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionAnalysisArtifact> {
-    let reg_type_hints = if input.ctx.semantic_metadata_enabled {
-        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
-    } else {
-        std::collections::HashMap::new()
-    };
-    let request = engine_analyze_request_with_scope_facts(
-        input,
-        parsed_context,
-        external_context_fallback_hash,
-        scope_facts,
-        interproc_max_iterations,
-        symbolic_scope,
-        reg_type_hints,
-        None,
-        true,
-    );
-    engine_session()
-        .analyze(request)
-        .map(|response| rename_function_analysis_artifact(response.artifact, &input.function_name))
-}
-
-pub(crate) fn get_cached_function_analysis_artifact_with_parsed_context_and_scope_facts(
-    input: &FunctionInput<'_>,
-    parsed_context: &r2types::ParsedExternalContext,
-    external_context_fallback_hash: u64,
-    scope_facts: &InterprocScopeFacts,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<FunctionAnalysisArtifact> {
-    let reg_type_hints = if input.ctx.semantic_metadata_enabled {
-        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
-    } else {
-        std::collections::HashMap::new()
-    };
-    let request = engine_analyze_request_with_scope_facts(
-        input,
-        parsed_context,
-        external_context_fallback_hash,
-        scope_facts,
-        interproc_max_iterations,
-        symbolic_scope,
-        reg_type_hints,
-        None,
-        true,
-    );
-    engine_session()
-        .cached_analyze(&request)
-        .map(|response| rename_function_analysis_artifact(response.artifact, &input.function_name))
-}
-
-pub(crate) fn alias_cached_function_analysis_artifact(
-    input: &FunctionInput<'_>,
-    _source_external_context_json: &str,
-    _target_external_context_json: &str,
-) -> bool {
-    let Some(analysis_key) = function_analysis_cache_key_parts(
-        &input.function_name,
-        input.ctx.arch,
-        input.blocks.as_slice(),
-    ) else {
-        return false;
-    };
-    let function_name_hash = hash_string_payload(&input.function_name);
-    engine_session().clear_analysis_artifacts_for_function(&analysis_key, function_name_hash)
-}
-
-pub(crate) fn function_root_interproc_summary_with_parsed_context_and_scope_facts(
-    input: &FunctionInput<'_>,
-    parsed_context: &r2types::ParsedExternalContext,
-    external_context_fallback_hash: u64,
-    scope_facts: &InterprocScopeFacts,
-    interproc_max_iterations: usize,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<r2ssa::FunctionSemanticSummary> {
-    get_cached_function_analysis_artifact_with_parsed_context_and_scope_facts(
-        input,
-        parsed_context,
-        external_context_fallback_hash,
-        scope_facts,
-        interproc_max_iterations,
-        symbolic_scope,
-    )
-    .and_then(|artifact| {
-        artifact
-            .function_facts
-            .interproc_summary_set()
-            .and_then(|summary_set| {
-                summary_set
-                    .root
-                    .and_then(|root| summary_set.summaries.get(&root).cloned())
-            })
-    })
-    .or_else(|| {
-        let analysis = build_function_analysis(input)?;
-        let summary_set = build_interproc_summary_set_with_scope_facts(
-            input,
-            &analysis,
-            scope_facts,
-            interproc_max_iterations,
-            symbolic_scope,
-        );
-        summary_set
-            .root
-            .and_then(|root| summary_set.summaries.get(&root).cloned())
-    })
-}
-
-#[allow(dead_code)]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_detached_function_analysis_artifact(
     blocks: &[R2ILBlock],
@@ -871,6 +455,7 @@ pub(crate) fn build_detached_function_analysis_artifact(
     )
 }
 
+#[cfg(test)]
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn build_detached_function_analysis_artifact_with_scope(
     blocks: &[R2ILBlock],
@@ -895,6 +480,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics(
     blocks: &[R2ILBlock],
@@ -921,6 +507,7 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_semantics
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_semantics(
     blocks: &[R2ILBlock],
@@ -934,19 +521,20 @@ pub(crate) fn build_detached_function_analysis_artifact_with_scope_and_optional_
     precomputed_semantic_artifact: Option<r2sym::SemanticArtifact>,
     compile_missing_semantics: bool,
 ) -> Option<FunctionAnalysisArtifact> {
-    let parsed_context = r2types::parse_external_context_json(external_context_json, ptr_bits);
+    let parsed_context =
+        r2engine::parse_external_context_json_for_engine(external_context_json, ptr_bits);
     let scope_facts = empty_interproc_scope_facts();
-    let request = r2engine::EngineAnalyzeRequest::from_compile_missing_semantics(
-        r2engine::EngineAnalyzeRequestParts {
+    let request = r2engine::EngineAnalyzeRequest::from_input_with_compile_missing_semantics(
+        r2engine::EngineAnalyzeRequestInput {
             function_name: function_name.to_string(),
             function_addr: blocks.first().map(|block| block.addr).unwrap_or_default(),
             blocks: blocks.to_vec(),
             arch: arch.cloned(),
-            ptr_bits,
+            ptr_bits: Some(ptr_bits),
             semantic_metadata_enabled,
             reg_type_hints: reg_type_hints.clone(),
-            parsed_context,
-            external_context_fallback_hash: hash_string_payload(external_context_json),
+            parsed_context: parsed_context.parsed_context,
+            external_context_fallback_hash: parsed_context.fallback_hash,
             scope_facts,
             interproc_max_iterations: 1,
             symbolic_scope: symbolic_scope.cloned(),
@@ -1057,9 +645,10 @@ pub(crate) fn merge_type_hint(
     r2types::merge_type_hint(hints, key, incoming);
 }
 
+#[cfg(test)]
 pub(crate) fn collect_register_type_hints(
     r2il_blocks: &[R2ILBlock],
-    disasm: &Disassembler,
+    disasm: &crate::Disassembler,
 ) -> std::collections::HashMap<String, TypeHint> {
     r2engine::collect_register_type_hints_with_names(r2il_blocks, |vn| disasm.register_name(vn))
 }
@@ -1133,38 +722,22 @@ pub(crate) fn merge_register_type_hints(
 
 #[cfg(test)]
 pub(crate) fn merge_pointer_slot_evidence(
-    inferred_params: &mut [InferredParam],
+    inferred_params: &mut [r2types::SignatureParamCandidate],
     pointer_arg_slots: &std::collections::BTreeSet<usize>,
 ) {
-    if pointer_arg_slots.is_empty() {
-        return;
-    }
-
-    let param_count = inferred_params.len();
-    for (fallback_idx, param) in inferred_params.iter_mut().enumerate() {
-        let explicit_slot = if param.arg_index == usize::MAX {
-            None
-        } else {
-            Some(param.arg_index)
-        };
-        let slot = explicit_slot.unwrap_or(fallback_idx);
-        let fallback_slot_match = pointer_arg_slots.contains(&fallback_idx)
-            && (explicit_slot.is_none() || param_count == 1);
-        if pointer_arg_slots.contains(&slot) || fallback_slot_match {
-            param.evidence.pointer_proven = param.evidence.pointer_proven.max(1);
-        }
-    }
+    r2types::merge_pointer_slot_evidence_into_signature_params(inferred_params, pointer_arg_slots);
 }
 
+#[cfg(test)]
 pub(crate) fn recover_vars_from_ssa(
     ssa_blocks: &[r2ssa::SSABlock],
     arch: Option<&ArchSpec>,
     metadata_reg_type_hints: &std::collections::HashMap<String, TypeHint>,
     semantic_typing_enabled: bool,
 ) -> Vec<VarProt> {
-    r2types::recover_vars_from_ssa(
+    r2engine::recover_vars_from_ssa(
         ssa_blocks,
-        arch.map(|spec| spec.name.as_str()),
+        arch,
         metadata_reg_type_hints,
         semantic_typing_enabled,
     )
@@ -1245,21 +818,20 @@ fn recover_vars_for_ffi(
     let ssa_blocks = build_var_recovery_ssa_blocks(input.blocks.as_slice(), input.ctx.arch)?;
 
     let semantic_typing_enabled = input.ctx.semantic_metadata_enabled;
-    let reg_type_hints = if semantic_typing_enabled {
-        collect_register_type_hints(input.blocks.as_slice(), input.ctx.disasm)
-    } else {
-        std::collections::HashMap::new()
-    };
 
     if ssa_blocks.is_empty() {
         return None;
     }
 
-    Some(recover_vars_from_ssa(
-        &ssa_blocks,
-        input.ctx.arch,
-        &reg_type_hints,
-        semantic_typing_enabled,
+    Some(r2engine::recover_vars_from_ssa_with_register_names(
+        r2engine::EngineRecoverVarsRequest {
+            ssa_blocks: &ssa_blocks,
+            r2il_blocks: input.blocks.as_slice(),
+            arch: input.ctx.arch,
+            semantic_typing_enabled,
+            metadata_reg_type_hints: std::collections::HashMap::new(),
+        },
+        |vn| input.ctx.disasm.register_name(vn),
     ))
 }
 
@@ -1369,29 +941,6 @@ pub extern "C" fn r2sleigh_data_refs_typed(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sleigh_data_ref_cache_key(
-    blocks: *const *const R2ILBlock,
-    num_blocks: usize,
-    fcn_addr: u64,
-    basic_block_count: usize,
-    linear_size: u64,
-    context_hash: u64,
-    mode: u32,
-) -> u64 {
-    let Some(blocks) = (unsafe { BlockSlice::from_ffi(blocks, num_blocks) }) else {
-        return 0;
-    };
-    r2engine::data_ref_cache_key(
-        fcn_addr,
-        basic_block_count,
-        linear_size,
-        context_hash,
-        blocks.as_slice(),
-        engine_mode_from_ffi(mode),
-    )
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn r2sleigh_data_refs_items(
     refs: *const R2SleighDataRefs,
     count: *mut usize,
@@ -1426,9 +975,20 @@ pub extern "C" fn r2sleigh_data_refs_free(refs: *mut R2SleighDataRefs) {
 mod tests {
     use super::*;
     use crate::{
-        ArchSpec, InferredParam, TypeEvidence, collect_type_evidence_for_var,
-        infer_signature_return_type, resolve_evidence_driven_type,
+        ArchSpec, TypeEvidence, collect_type_evidence_for_var, infer_signature_return_type,
+        resolve_evidence_driven_type,
     };
+
+    fn signed_type(bits: u32) -> r2types::CTypeLike {
+        r2types::CTypeLike::Int {
+            bits,
+            signedness: r2types::Signedness::Signed,
+        }
+    }
+
+    fn void_ptr_type() -> r2types::CTypeLike {
+        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Void))
+    }
 
     fn const_return_blocks(addr: u64, value: u64) -> Vec<r2il::R2ILBlock> {
         let mut block = r2il::R2ILBlock::new(addr, 4);
@@ -1462,43 +1022,6 @@ mod tests {
             .is_none(),
             "a resolved display name alone should not seed canonical worker semantics"
         );
-    }
-
-    #[test]
-    fn data_ref_cache_key_ffi_hashes_full_il_payload() {
-        let mut first = r2il::R2ILBlock::new(0x401000, 4);
-        first.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0, 8),
-            src: r2il::Varnode::constant(0x10000, 8),
-        });
-        let mut second = r2il::R2ILBlock::new(0x401000, 4);
-        second.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0, 8),
-            src: r2il::Varnode::constant(0x20000, 8),
-        });
-        let first_blocks = [&first as *const r2il::R2ILBlock];
-        let second_blocks = [&second as *const r2il::R2ILBlock];
-
-        let first_key = r2sleigh_data_ref_cache_key(
-            first_blocks.as_ptr(),
-            first_blocks.len(),
-            0x401000,
-            1,
-            4,
-            0xdead_beef,
-            2,
-        );
-        let second_key = r2sleigh_data_ref_cache_key(
-            second_blocks.as_ptr(),
-            second_blocks.len(),
-            0x401000,
-            1,
-            4,
-            0xdead_beef,
-            2,
-        );
-
-        assert_ne!(first_key, second_key);
     }
 
     #[test]
@@ -2473,9 +1996,12 @@ mod tests {
 
     #[test]
     fn pointer_slot_evidence_marks_param_as_pointer_without_direct_overwrite() {
-        let mut inferred_params = vec![InferredParam {
+        let mut inferred_params = vec![r2types::SignatureParamCandidate {
             name: "arg1".to_string(),
-            ty: r2dec::CType::Int(64),
+            ty: r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            },
             arg_index: 1,
             size_bytes: 8,
             evidence: TypeEvidence::default(),
@@ -2509,14 +2035,14 @@ mod tests {
             ],
         }];
         let evidence_ctx = collect_signature_type_evidence_context(&blocks);
-        let initial_ty = r2dec::CType::Unknown;
+        let initial_ty = r2types::CTypeLike::Unknown;
         let evidence = collect_type_evidence_for_var(
             &evidence_ctx,
             &r2ssa::SSAVar::new("esi", 0, 4),
             &initial_ty,
         );
         let ty = resolve_evidence_driven_type(initial_ty, 4, 64, &evidence);
-        assert_eq!(ty, r2dec::CType::Int(32));
+        assert_eq!(ty, signed_type(32));
     }
 
     #[test]
@@ -2538,14 +2064,14 @@ mod tests {
             ],
         }];
         let evidence_ctx = collect_signature_type_evidence_context(&blocks);
-        let initial_ty = r2dec::CType::Unknown;
+        let initial_ty = r2types::CTypeLike::Unknown;
         let evidence = collect_type_evidence_for_var(
             &evidence_ctx,
             &r2ssa::SSAVar::new("rdi", 0, 8),
             &initial_ty,
         );
         let ty = resolve_evidence_driven_type(initial_ty, 8, 64, &evidence);
-        assert_eq!(ty, r2dec::CType::void_ptr());
+        assert_eq!(ty, void_ptr_type());
     }
 
     #[test]
@@ -2555,8 +2081,8 @@ mod tests {
             scalar_likely: 1,
             ..TypeEvidence::default()
         };
-        let ty = resolve_evidence_driven_type(r2dec::CType::Unknown, 8, 64, &evidence);
-        assert_eq!(ty, r2dec::CType::void_ptr());
+        let ty = resolve_evidence_driven_type(r2types::CTypeLike::Unknown, 8, 64, &evidence);
+        assert_eq!(ty, void_ptr_type());
     }
 
     #[test]
@@ -2570,14 +2096,14 @@ mod tests {
             }],
         }];
         let evidence_ctx = collect_signature_type_evidence_context(&blocks);
-        let initial_ty = r2dec::CType::Unknown;
+        let initial_ty = r2types::CTypeLike::Unknown;
         let evidence = collect_type_evidence_for_var(
             &evidence_ctx,
             &r2ssa::SSAVar::new("dil", 0, 1),
             &initial_ty,
         );
         let ty = resolve_evidence_driven_type(initial_ty, 1, 64, &evidence);
-        assert_eq!(ty, r2dec::CType::Bool);
+        assert_eq!(ty, r2types::CTypeLike::Bool);
     }
 
     #[test]
@@ -2610,7 +2136,13 @@ mod tests {
         let mut type_inference = r2types::TypeInference::new(64);
         type_inference.infer_function(&func);
         let (ret_ty, _) = infer_signature_return_type(&func, &type_inference, 64, &evidence_ctx);
-        assert_eq!(ret_ty, r2dec::CType::Int(32));
+        assert_eq!(
+            ret_ty,
+            r2types::CTypeLike::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Unknown,
+            }
+        );
     }
 
     #[test]
@@ -2737,21 +2269,6 @@ mod tests {
             key_a, key_b,
             "different helper closures must not alias the same artifact cache entry"
         );
-    }
-
-    #[test]
-    fn session_cache_evicts_only_oldest_and_refreshes_recency() {
-        let cache = r2engine::SessionCache::new(2);
-        cache.insert(1_u64, "one".to_string());
-        cache.insert(2_u64, "two".to_string());
-        assert_eq!(cache.get_cloned(&1).as_deref(), Some("one"));
-
-        cache.insert(3_u64, "three".to_string());
-
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.get_cloned(&1).as_deref(), Some("one"));
-        assert!(cache.get_cloned(&2).is_none());
-        assert_eq!(cache.get_cloned(&3).as_deref(), Some("three"));
     }
 
     #[test]

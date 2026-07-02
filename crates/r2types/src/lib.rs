@@ -16,6 +16,11 @@ pub mod signature_infer;
 pub mod solver;
 pub mod writeback;
 
+pub fn parse_external_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
+    let normalized = external::normalize_external_type_name(spec);
+    facts::parse_type_like_spec(&normalized, ptr_bits)
+}
+
 pub use callee::{
     CalleeArityDecision, CalleeAritySource, CalleeCallArgPolicy, CalleeClass, CalleeIdentity,
     CalleeIdentityContext, CalleeIdentityEvidence, CalleeIdentityKey, CalleeResolutionFacts,
@@ -37,7 +42,7 @@ pub use context::{
     is_generic_arg_name, merge_signature_with_register_params, normalize_function_basename,
     parse_external_assumption_payload_json, parse_external_context, parse_external_context_json,
 };
-pub use convert::{CTypeLike, to_c_type_like};
+pub use convert::{CTypeLike, render_c_type_like, to_c_type_like};
 pub use external::{
     ExternalAggregateKind, ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb,
     ExternalTypedef, ExternalUnion, normalize_external_type_name,
@@ -53,20 +58,24 @@ pub use facts::{
     FunctionTypeFactsBuilder, InterprocFactDiagnostics, LocalFieldAccessFact, OutParamCertificate,
     OutParamCertificateEvidence, OutParamCertificateSource, ResolvedFieldLayout,
     SIGNATURE_PROJECTION_STRONG_CONFIDENCE, SIGNATURE_PROJECTION_WEAK_CONFIDENCE,
-    SignatureCertificate, SignatureCertificateSource, SignatureProjectionRejection,
-    SignatureProjectionResult, SignatureProjectionSource, VisibleBinding, VisibleBindingKind,
-    is_generic_signature_type, parse_type_like_spec, signature_hint_can_replace_existing,
-    signature_param_count_is_authoritative, signature_param_name_is_weak,
-    signature_projection_is_exact, signature_return_hint_can_replace_existing, signature_strength,
+    ScalarArrayRenderCandidate, SignatureCertificate, SignatureCertificateSource,
+    SignatureProjectionRejection, SignatureProjectionResult, SignatureProjectionSource,
+    VisibleBinding, VisibleBindingKind, is_generic_signature_type, parse_type_like_spec,
+    signature_hint_can_replace_existing, signature_param_count_is_authoritative,
+    signature_param_name_is_weak, signature_projection_is_exact,
+    signature_return_hint_can_replace_existing, signature_strength,
     summary_hint_can_replace_weak_existing,
 };
 pub use function_facts::{
-    AnalysisPlans, BranchPredicateFact, CallArgumentValueFact, CallResultFact,
-    CallsiteArgumentFacts, ControlBlockAssumptionFact, DecompileCapabilityView,
-    DecompileRouteFacts, DecompileRouteKind, FunctionCallResultFacts, FunctionCallsiteFacts,
-    FunctionControlFacts, FunctionFacts, InterprocSummaryView, PredicateComparisonFact,
-    RegisterCallArgumentLocationFact, StackCallArgumentLocationFact, SummaryEffectRollup,
-    SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
+    AnalysisPlans, ArrayAccessRenderFact, BranchPredicateFact, CallArgumentValueFact,
+    CallResultFact, CallsiteArgumentFacts, CallsiteRenderDisposition, CallsiteRenderFact,
+    ControlBlockAssumptionFact, DecompileCapabilityView, DecompileRouteFacts, DecompileRouteKind,
+    ExpressionRenderFact, FunctionCallRenderFacts, FunctionCallResultFacts, FunctionCallsiteFacts,
+    FunctionControlFacts, FunctionFacts, FunctionInputQualityFacts, FunctionRenderFacts,
+    InterprocSummaryView, LoopStructureFact, MemberAccessRenderFact, MemoryAccessRenderFact,
+    MemoryOpSiteKey, OpSiteKey, PredicateComparisonFact, RegisterCallArgumentLocationFact,
+    ReturnValueRenderFact, StackCallArgumentLocationFact, StackSlotOwnerRenderAuthorization,
+    SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
@@ -74,10 +83,10 @@ pub use oracle::{LayoutOracle, TypeOracle};
 pub use prepare::{
     ArgAliasMap, BaseRegList, MetadataScalarKind, SignatureTypeEvidenceContext, TypeHint,
     TypeHintRank, X86_ARG_REGS, X86_FRAME_BASES, collect_pointer_arg_slots,
-    collect_signature_type_evidence_context, merge_type_hint, recover_vars_arch_profile,
-    recover_vars_from_ssa, scalar_metadata_type_hint, scalar_register_family_key,
-    size_to_signed_int_type, size_to_type, size_to_unsigned_int_type, ssa_var_block_key,
-    ssa_var_key, type_hint_from_value_metadata,
+    collect_signature_type_evidence_context, merge_type_hint, recover_signature_params_from_ssa,
+    recover_vars_arch_profile, recover_vars_from_ssa, scalar_metadata_type_hint,
+    scalar_register_family_key, size_to_signed_int_type, size_to_type, size_to_unsigned_int_type,
+    ssa_var_block_key, ssa_var_key, type_hint_from_value_metadata,
 };
 pub use r2ssa::AssumptionUsageReport;
 pub use role_registry::{
@@ -134,3 +143,50 @@ pub use writeback::{
     writeback_type_name_is_generic, writeback_type_name_is_opaque_placeholder,
     writeback_var_name_is_generated,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed_type(bits: u32) -> CTypeLike {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        }
+    }
+
+    fn unsigned_type(bits: u32) -> CTypeLike {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Unsigned,
+        }
+    }
+
+    fn ptr_type(inner: CTypeLike) -> CTypeLike {
+        CTypeLike::Pointer(Box::new(inner))
+    }
+
+    #[test]
+    fn parse_external_type_like_spec_normalizes_radare2_type_names() {
+        assert_eq!(
+            parse_external_type_like_spec("type.int", 64),
+            Some(signed_type(32))
+        );
+        assert_eq!(
+            parse_external_type_like_spec("type.uint16_t *", 64),
+            Some(ptr_type(unsigned_type(16)))
+        );
+        assert_eq!(
+            parse_external_type_like_spec("struct.sla_node *", 64),
+            Some(ptr_type(CTypeLike::Struct("sla_node".to_string())))
+        );
+        assert_eq!(
+            parse_external_type_like_spec("type.IOCPU_VTable.setCPUNumber", 64),
+            Some(ptr_type(CTypeLike::Void))
+        );
+        assert_eq!(
+            parse_external_type_like_spec("type.intptr_t", 64),
+            Some(signed_type(64))
+        );
+    }
+}

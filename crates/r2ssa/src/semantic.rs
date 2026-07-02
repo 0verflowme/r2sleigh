@@ -1234,7 +1234,7 @@ fn collect_prepared_function_certificates(
         })
         .collect();
 
-    let renderable_expressions = collect_renderable_expression_values(graph, structured);
+    let renderable_expressions = collect_renderable_expression_values(function, graph, structured);
     let expressions = graph
         .values
         .iter()
@@ -1340,7 +1340,13 @@ fn collect_prepared_function_certificates(
         collect_call_result_certificates(function, graph, objects, call_sites, structured);
     let stack_reloads =
         collect_stack_reload_source_certificates(function, graph, objects, memory, structured);
-    let (returns, returns_by_inst) = collect_return_value_certificates(function, graph);
+    let (returns, returns_by_inst) = collect_return_value_certificates(
+        function,
+        graph,
+        predicates,
+        &call_results,
+        &stack_reloads,
+    );
 
     PreparedFunctionCertificates {
         loops,
@@ -1363,6 +1369,7 @@ fn collect_prepared_function_certificates(
 }
 
 fn collect_renderable_expression_values(
+    function: &SSAFunction,
     graph: &SsaGraph,
     structured: &StructuredDataflowFacts,
 ) -> BTreeSet<ValueId> {
@@ -1390,7 +1397,7 @@ fn collect_renderable_expression_values(
         if graph.value(output).is_none_or(|value| value.var.size == 0) {
             continue;
         }
-        if !expression_inst_is_renderable(inst, &certified_memory_read_insts) {
+        if !expression_inst_is_renderable(function, graph, inst, &certified_memory_read_insts) {
             continue;
         }
 
@@ -1433,6 +1440,7 @@ fn collect_renderable_expression_values(
                 continue;
             }
             if expression_loop_phi_is_renderable(
+                function,
                 graph,
                 structured,
                 inst,
@@ -1458,16 +1466,25 @@ fn expression_leaf_is_renderable(value: &crate::graph::GraphValue) -> bool {
 }
 
 fn expression_inst_is_renderable(
+    function: &SSAFunction,
+    graph: &SsaGraph,
     inst: &crate::graph::GraphInst,
     certified_memory_read_insts: &BTreeSet<InstId>,
 ) -> bool {
     match &inst.payload {
-        InstPayload::Phi { .. } => expression_phi_is_identity(inst),
+        InstPayload::Phi { .. } => expression_phi_is_renderable(function, graph, inst),
         InstPayload::Op(op) => {
             expression_op_is_pure(op)
                 || (op.is_memory_read() && certified_memory_read_insts.contains(&inst.id))
         }
     }
+}
+
+fn expression_phi_is_identity_renderable(graph: &SsaGraph, inst: &crate::graph::GraphInst) -> bool {
+    let Some(first) = inst.inputs.first() else {
+        return false;
+    };
+    expression_phi_is_identity(inst) && !expression_value_depends_on_memory_read(graph, *first)
 }
 
 fn expression_phi_is_identity(inst: &crate::graph::GraphInst) -> bool {
@@ -1477,7 +1494,62 @@ fn expression_phi_is_identity(inst: &crate::graph::GraphInst) -> bool {
     inst.inputs.iter().all(|input| input == first)
 }
 
+fn expression_phi_is_renderable(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    inst: &crate::graph::GraphInst,
+) -> bool {
+    expression_phi_is_identity_renderable(graph, inst)
+        || expression_phi_has_single_canonical_root(function, graph, inst)
+}
+
+fn expression_phi_has_single_canonical_root(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    inst: &crate::graph::GraphInst,
+) -> bool {
+    let Some(prep_facts) = function.decompile_prep_facts() else {
+        return false;
+    };
+    let mut roots = inst.inputs.iter().filter_map(|input| {
+        let var = graph.value(*input).map(|value| &value.var)?;
+        let root = prep_facts.canonical_root_of(var).unwrap_or(var);
+        graph.value_id_for_var(root).or(Some(*input))
+    });
+    let Some(first) = roots.next() else {
+        return false;
+    };
+    if expression_value_depends_on_memory_read(graph, first) {
+        return false;
+    }
+    roots.all(|root| root == first)
+}
+
+fn expression_value_depends_on_memory_read(graph: &SsaGraph, value: ValueId) -> bool {
+    let mut stack = vec![(value, 0usize)];
+    let mut visited = BTreeSet::new();
+
+    while let Some((current, depth)) = stack.pop() {
+        if depth >= 32 || !visited.insert(current) {
+            continue;
+        }
+        let Some(inst) = graph
+            .def_inst(current)
+            .and_then(|inst_id| graph.inst(inst_id))
+        else {
+            continue;
+        };
+        if matches!(&inst.payload, InstPayload::Op(op) if op.is_memory_read()) {
+            return true;
+        }
+        stack.extend(inst.inputs.iter().map(|input| (*input, depth + 1)));
+    }
+
+    false
+}
+
 fn expression_loop_phi_is_renderable(
+    function: &SSAFunction,
     graph: &SsaGraph,
     structured: &StructuredDataflowFacts,
     inst: &crate::graph::GraphInst,
@@ -1501,6 +1573,11 @@ fn expression_loop_phi_is_renderable(
     }
 
     let latches = loop_fact.latches.iter().copied().collect::<BTreeSet<_>>();
+    let env = ExpressionRenderEnv {
+        function,
+        graph,
+        certified_memory_read_insts,
+    };
     let mut saw_entry = false;
     let mut saw_backedge = false;
     for (pred_id, input) in predecessors.iter().zip(inst.inputs.iter().copied()) {
@@ -1510,15 +1587,7 @@ fn expression_loop_phi_is_renderable(
         if latches.contains(&pred_addr) {
             saw_backedge = true;
             let mut visited = BTreeSet::new();
-            if !value_renderable_modulo_loop_phi(
-                graph,
-                input,
-                output,
-                renderable,
-                certified_memory_read_insts,
-                &mut visited,
-                0,
-            ) {
+            if !value_renderable_modulo_loop_phi(&env, input, output, renderable, &mut visited, 0) {
                 return false;
             }
         } else {
@@ -1532,12 +1601,17 @@ fn expression_loop_phi_is_renderable(
     saw_entry && saw_backedge
 }
 
+struct ExpressionRenderEnv<'a> {
+    function: &'a SSAFunction,
+    graph: &'a SsaGraph,
+    certified_memory_read_insts: &'a BTreeSet<InstId>,
+}
+
 fn value_renderable_modulo_loop_phi(
-    graph: &SsaGraph,
+    env: &ExpressionRenderEnv<'_>,
     value: ValueId,
     loop_phi: ValueId,
     renderable: &BTreeSet<ValueId>,
-    certified_memory_read_insts: &BTreeSet<InstId>,
     visited: &mut BTreeSet<ValueId>,
     depth: usize,
 ) -> bool {
@@ -1548,25 +1622,28 @@ fn value_renderable_modulo_loop_phi(
         return false;
     }
 
-    let result = graph
+    let result = env
+        .graph
         .def_inst(value)
-        .and_then(|inst_id| graph.inst(inst_id))
+        .and_then(|inst_id| env.graph.inst(inst_id))
         .is_some_and(|inst| {
             let eligible = match &inst.payload {
-                InstPayload::Phi { .. } => expression_phi_is_identity(inst),
+                InstPayload::Phi { .. } => {
+                    expression_phi_is_renderable(env.function, env.graph, inst)
+                }
                 InstPayload::Op(op) => {
                     expression_op_is_pure(op)
-                        || (op.is_memory_read() && certified_memory_read_insts.contains(&inst.id))
+                        || (op.is_memory_read()
+                            && env.certified_memory_read_insts.contains(&inst.id))
                 }
             };
             eligible
                 && inst.inputs.iter().all(|input| {
                     value_renderable_modulo_loop_phi(
-                        graph,
+                        env,
                         *input,
                         loop_phi,
                         renderable,
-                        certified_memory_read_insts,
                         visited,
                         depth + 1,
                     )
@@ -1646,6 +1723,9 @@ fn expression_op_is_pure(op: &SSAOp) -> bool {
 fn collect_return_value_certificates(
     function: &SSAFunction,
     graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
 ) -> (Vec<ReturnValueCertificate>, BTreeMap<InstId, usize>) {
     let mut returns = Vec::new();
     let mut returns_by_inst = BTreeMap::new();
@@ -1677,18 +1757,68 @@ fn collect_return_value_certificates(
         }
     }
 
+    let reaching_control_returns = collect_reaching_control_return_values(
+        function,
+        graph,
+        predicates,
+        call_results,
+        stack_reloads,
+    );
+
     for block in function.blocks() {
         let mut last_return_value_write = None;
         for (op_idx, op) in block.ops.iter().enumerate() {
             if let SSAOp::Return { target } = op {
-                push_return_value_certificate(
-                    graph,
-                    &mut returns,
-                    &mut returns_by_inst,
-                    block.addr,
-                    op_idx,
-                    target,
-                );
+                if is_return_value_register(target) {
+                    push_return_value_certificate(
+                        graph,
+                        &mut returns,
+                        &mut returns_by_inst,
+                        block.addr,
+                        op_idx,
+                        target,
+                    );
+                } else if is_control_return_target(target) {
+                    if let Some((_, value)) = last_return_value_write {
+                        push_return_value_certificate(
+                            graph,
+                            &mut returns,
+                            &mut returns_by_inst,
+                            block.addr,
+                            op_idx,
+                            value,
+                        );
+                    } else if let Some(value) =
+                        reaching_control_returns.get(&(block.addr, op_idx)).copied()
+                    {
+                        push_return_value_certificate_for_value(
+                            graph,
+                            &mut returns,
+                            &mut returns_by_inst,
+                            block.addr,
+                            op_idx,
+                            value,
+                        );
+                    } else if let Some(return_phi) = unique_return_value_phi_for_block(block) {
+                        push_return_value_certificate(
+                            graph,
+                            &mut returns,
+                            &mut returns_by_inst,
+                            block.addr,
+                            op_idx,
+                            return_phi,
+                        );
+                    }
+                } else {
+                    push_return_value_certificate(
+                        graph,
+                        &mut returns,
+                        &mut returns_by_inst,
+                        block.addr,
+                        op_idx,
+                        target,
+                    );
+                }
                 continue;
             }
 
@@ -1713,6 +1843,283 @@ fn collect_return_value_certificates(
     }
 
     (returns, returns_by_inst)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReachingReturnValue {
+    value: ValueId,
+    identity: ReturnSemanticIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReturnSemanticIdentity {
+    CallResult(CallSiteId),
+    StackSlot(ObjectId, i64),
+    Value(ValueId),
+    Const(u64),
+}
+
+fn collect_reaching_control_return_values(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
+) -> BTreeMap<(u64, usize), ValueId> {
+    let mut in_states = BTreeMap::<u64, Option<ReachingReturnValue>>::new();
+    let mut out_states = BTreeMap::<u64, Option<ReachingReturnValue>>::new();
+    let mut returns_by_op = BTreeMap::new();
+    let mut worklist = function
+        .blocks()
+        .map(|block| block.addr)
+        .collect::<VecDeque<_>>();
+    let mut queued = function
+        .blocks()
+        .map(|block| block.addr)
+        .collect::<BTreeSet<_>>();
+
+    while let Some(block_addr) = worklist.pop_front() {
+        queued.remove(&block_addr);
+        let input = merge_reaching_return_predecessors(
+            function,
+            graph,
+            predicates,
+            call_results,
+            stack_reloads,
+            &out_states,
+            block_addr,
+        );
+        if in_states.get(&block_addr) != Some(&input) {
+            in_states.insert(block_addr, input);
+        }
+        let Some(block) = function.get_block(block_addr) else {
+            continue;
+        };
+        let (output, block_returns) =
+            process_reaching_return_block(graph, call_results, stack_reloads, block, input);
+        for (site, value) in block_returns {
+            returns_by_op.insert(site, value);
+        }
+        if out_states.get(&block_addr) == Some(&output) {
+            continue;
+        }
+        out_states.insert(block_addr, output);
+        for succ in function.successors(block_addr) {
+            if queued.insert(succ) {
+                worklist.push_back(succ);
+            }
+        }
+    }
+
+    returns_by_op
+}
+
+fn merge_reaching_return_predecessors(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
+    out_states: &BTreeMap<u64, Option<ReachingReturnValue>>,
+    block_addr: u64,
+) -> Option<ReachingReturnValue> {
+    let preds = function.predecessors(block_addr);
+    let (first, rest) = preds.split_first()?;
+    let first_state = out_states.get(first).copied().flatten()?;
+    let mut common = return_identity_candidates_for_block(
+        *first,
+        first_state,
+        graph,
+        predicates,
+        call_results,
+        stack_reloads,
+    );
+    for pred in rest {
+        let pred_state = out_states.get(pred).copied().flatten()?;
+        let pred_candidates = return_identity_candidates_for_block(
+            *pred,
+            pred_state,
+            graph,
+            predicates,
+            call_results,
+            stack_reloads,
+        );
+        common.retain(|identity| pred_candidates.contains(identity));
+        if common.is_empty() {
+            return None;
+        }
+    }
+    let identity = common
+        .iter()
+        .find(|identity| !matches!(identity, ReturnSemanticIdentity::Const(_)))
+        .copied()
+        .or_else(|| common.iter().next().copied())?;
+    let value = preds
+        .iter()
+        .filter_map(|pred| out_states.get(pred).copied().flatten())
+        .find(|state| state.identity == identity)
+        .map(|state| state.value)
+        .unwrap_or(first_state.value);
+    Some(ReachingReturnValue { value, identity })
+}
+
+fn process_reaching_return_block(
+    graph: &SsaGraph,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
+    block: &crate::function::SSABlock,
+    mut state: Option<ReachingReturnValue>,
+) -> (Option<ReachingReturnValue>, BTreeMap<(u64, usize), ValueId>) {
+    let mut returns_by_op = BTreeMap::new();
+    for (op_idx, op) in block.ops.iter().enumerate() {
+        if let SSAOp::Return { target } = op
+            && is_control_return_target(target)
+            && let Some(state) = state
+        {
+            returns_by_op.insert((block.addr, op_idx), state.value);
+        }
+        if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
+            state = None;
+        }
+        if let Some(dst) = op.dst()
+            && is_return_value_register(dst)
+        {
+            state = reaching_return_value_for_var(graph, call_results, stack_reloads, dst);
+        }
+    }
+    (state, returns_by_op)
+}
+
+fn reaching_return_value_for_var(
+    graph: &SsaGraph,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
+    var: &SSAVar,
+) -> Option<ReachingReturnValue> {
+    let value = graph.value_id_for_var(var)?;
+    Some(ReachingReturnValue {
+        value,
+        identity: return_semantic_identity_for_value(graph, call_results, stack_reloads, value),
+    })
+}
+
+fn return_identity_candidates_for_block(
+    block_addr: u64,
+    state: ReachingReturnValue,
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
+) -> BTreeSet<ReturnSemanticIdentity> {
+    let mut candidates = BTreeSet::from([state.identity]);
+    let Some(assumptions) = predicates.block_assumptions.get(&block_addr) else {
+        return candidates;
+    };
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for assumption in assumptions {
+            let Some(predicate) = predicates.predicates.get(&assumption.predicate) else {
+                continue;
+            };
+            let Some(compare) = &predicate.comparison else {
+                continue;
+            };
+            if !assumption_proves_equality(compare.kind, assumption.truth) {
+                continue;
+            }
+            let lhs =
+                return_semantic_identity_for_value(graph, call_results, stack_reloads, compare.lhs);
+            let rhs =
+                return_semantic_identity_for_value(graph, call_results, stack_reloads, compare.rhs);
+            if candidates.contains(&lhs) && candidates.insert(rhs) {
+                changed = true;
+            }
+            if candidates.contains(&rhs) && candidates.insert(lhs) {
+                changed = true;
+            }
+        }
+    }
+
+    candidates
+}
+
+fn assumption_proves_equality(kind: CompareKind, truth: bool) -> bool {
+    matches!(
+        (kind, truth),
+        (CompareKind::Equal, true) | (CompareKind::NotEqual, false)
+    )
+}
+
+fn return_semantic_identity_for_value(
+    graph: &SsaGraph,
+    call_results: &BTreeMap<ValueId, CallResultCertificate>,
+    stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
+    value: ValueId,
+) -> ReturnSemanticIdentity {
+    if let Some(call_result) = call_results.get(&value) {
+        if let Some(ValueOwner::StackSlot { object, offset }) = call_result.owner {
+            return ReturnSemanticIdentity::StackSlot(object, offset);
+        }
+        return ReturnSemanticIdentity::CallResult(call_result.call_site);
+    }
+    if let Some(reload) = stack_reloads.get(&value) {
+        return ReturnSemanticIdentity::StackSlot(reload.object, reload.offset);
+    }
+    let canonical = canonical_graph_value_root(graph, value);
+    if let Some(var) = graph.value(canonical).map(|value| &value.var)
+        && let Some(literal) = const_value(var)
+    {
+        return ReturnSemanticIdentity::Const(literal);
+    }
+    ReturnSemanticIdentity::Value(canonical)
+}
+
+fn canonical_graph_value_root(graph: &SsaGraph, value: ValueId) -> ValueId {
+    let mut current = value;
+    for _ in 0..32 {
+        let Some(def_inst) = graph.def_inst(current) else {
+            break;
+        };
+        let Some(inst) = graph.inst(def_inst) else {
+            break;
+        };
+        let next = match &inst.payload {
+            InstPayload::Phi { .. } => {
+                let Some(first) = inst.inputs.first().copied() else {
+                    break;
+                };
+                if inst.inputs.iter().all(|input| *input == first) {
+                    first
+                } else {
+                    break;
+                }
+            }
+            InstPayload::Op(SSAOp::Copy { .. }) => {
+                let Some(first) = inst.inputs.first().copied() else {
+                    break;
+                };
+                first
+            }
+            _ => break,
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+fn unique_return_value_phi_for_block(block: &crate::function::SSABlock) -> Option<&SSAVar> {
+    let mut matches = block
+        .phis
+        .iter()
+        .filter(|phi| is_return_value_register(&phi.dst))
+        .map(|phi| &phi.dst);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 fn collect_stack_reload_source_certificates(
@@ -2271,6 +2678,34 @@ fn push_return_value_certificate(
     });
 }
 
+fn push_return_value_certificate_for_value(
+    graph: &SsaGraph,
+    returns: &mut Vec<ReturnValueCertificate>,
+    returns_by_inst: &mut BTreeMap<InstId, usize>,
+    block_addr: u64,
+    op_idx: usize,
+    value: ValueId,
+) {
+    let Some(at) = graph.inst_id_for_op_site(block_addr, op_idx) else {
+        return;
+    };
+    if returns_by_inst.contains_key(&at) {
+        return;
+    }
+    let Some(value_var) = graph.value(value).map(|value| &value.var) else {
+        return;
+    };
+    returns_by_inst.insert(at, returns.len());
+    returns.push(ReturnValueCertificate {
+        at,
+        block_addr,
+        op_index: op_idx,
+        value,
+        width: value_var.size,
+        carrier: return_carrier_for_value(value_var),
+    });
+}
+
 fn return_carrier_for_value(value: &SSAVar) -> Option<ReturnCarrier> {
     if is_return_value_register(value) {
         return Some(ReturnCarrier::Register {
@@ -2293,6 +2728,18 @@ fn is_return_value_register(value: &SSAVar) -> bool {
         name.as_str(),
         "rax" | "eax" | "ax" | "al" | "xmm0" | "st0" | "x0" | "w0" | "r0" | "v0" | "a0" | "r3"
     )
+}
+
+fn is_control_return_target(value: &SSAVar) -> bool {
+    if !value.is_register() {
+        return false;
+    }
+    let name = value
+        .name
+        .trim()
+        .trim_start_matches('$')
+        .to_ascii_lowercase();
+    matches!(name.as_str(), "pc" | "lr" | "ra" | "x30" | "rip" | "eip")
 }
 
 fn collect_structured_loop_facts(
@@ -3120,7 +3567,7 @@ fn collect_compare_defs(
     function: &SSAFunction,
     graph: &SsaGraph,
 ) -> BTreeMap<SSAVar, CompareProvenance> {
-    let mut compare_defs = BTreeMap::new();
+    let mut compare_defs = BTreeMap::<SSAVar, CompareProvenance>::new();
     let mut sub_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
     let mut signed_overflow_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
     let mut signed_sign_sources = BTreeMap::<SSAVar, (ValueId, ValueId)>::new();
@@ -3146,6 +3593,20 @@ fn collect_compare_defs(
                         signed_sign_sources.insert(dst.clone(), (lhs, rhs));
                     }
                 }
+                SSAOp::BoolNot { dst, src } => {
+                    if let Some(compare) = compare_defs.get(src).cloned()
+                        && let Some(kind) = invert_compare_kind(compare.kind)
+                    {
+                        compare_defs.insert(
+                            dst.clone(),
+                            CompareProvenance {
+                                kind,
+                                lhs: compare.lhs,
+                                rhs: compare.rhs,
+                            },
+                        );
+                    }
+                }
                 _ => {}
             }
             let Some((dst, kind, lhs, rhs)) = compare_components(op) else {
@@ -3164,6 +3625,8 @@ fn collect_compare_defs(
             let Some(rhs_id) = graph.value_id_for_var(rhs) else {
                 continue;
             };
+            let (lhs_id, rhs_id) =
+                normalize_zero_sub_compare_operands(kind, lhs, rhs, lhs_id, rhs_id, &sub_sources);
             compare_defs.insert(
                 dst.clone(),
                 CompareProvenance {
@@ -3180,6 +3643,38 @@ fn collect_compare_defs(
         }
     }
     compare_defs
+}
+
+fn invert_compare_kind(kind: CompareKind) -> Option<CompareKind> {
+    match kind {
+        CompareKind::Equal => Some(CompareKind::NotEqual),
+        CompareKind::NotEqual => Some(CompareKind::Equal),
+        _ => None,
+    }
+}
+
+fn normalize_zero_sub_compare_operands(
+    kind: CompareKind,
+    lhs: &SSAVar,
+    rhs: &SSAVar,
+    lhs_id: ValueId,
+    rhs_id: ValueId,
+    sub_sources: &BTreeMap<SSAVar, (ValueId, ValueId)>,
+) -> (ValueId, ValueId) {
+    if !matches!(kind, CompareKind::Equal | CompareKind::NotEqual) {
+        return (lhs_id, rhs_id);
+    }
+    if const_value(rhs) == Some(0)
+        && let Some((sub_lhs, sub_rhs)) = sub_sources.get(lhs).copied()
+    {
+        return (sub_lhs, sub_rhs);
+    }
+    if const_value(lhs) == Some(0)
+        && let Some((sub_lhs, sub_rhs)) = sub_sources.get(rhs).copied()
+    {
+        return (sub_lhs, sub_rhs);
+    }
+    (lhs_id, rhs_id)
 }
 
 fn signed_flag_compare_components<'a>(

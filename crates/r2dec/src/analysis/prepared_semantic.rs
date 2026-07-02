@@ -7,8 +7,8 @@ use r2ssa::{
 };
 use r2types::{
     CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
-    ExternalStackSlotRole, ExternalStackSlotSpec, FunctionCallResultFacts, FunctionCallsiteFacts,
-    FunctionControlFacts, StackSlotKey, VisibleBinding, VisibleBindingKind,
+    ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, FunctionCallResultFacts,
+    FunctionCallsiteFacts, FunctionFacts, StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
 
 use super::lower::LowerCtx;
@@ -38,6 +38,7 @@ pub(crate) struct PreparedCallView {
     pub(crate) authoritative_args: Vec<CExpr>,
     pub(crate) authoritative_arg_values: Vec<ValueId>,
     pub(crate) result_owner: Option<CExpr>,
+    pub(crate) render_fact: Option<r2types::CallsiteRenderFact>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -59,24 +60,55 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) call_result_source_by_name: HashMap<String, (u64, usize)>,
     pub(crate) switch_selector_value_by_block: BTreeMap<u64, ValueId>,
     pub(crate) switch_selector_expr_by_block: BTreeMap<u64, CExpr>,
+    pub(crate) certified_rendering_required: bool,
+    pub(crate) authorized_stack_owner_names: BTreeMap<i64, BTreeSet<String>>,
+    pub(crate) authorized_stack_owner_names_by_object:
+        BTreeMap<(r2ssa::ObjectId, i64), BTreeSet<String>>,
 }
 
 pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) prepared: &'a SsaArtifact,
     pub(crate) abi_arg_regs: &'a [String],
-    pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
-    pub(crate) callsite_facts: Option<&'a FunctionCallsiteFacts>,
-    pub(crate) call_result_facts: Option<&'a FunctionCallResultFacts>,
-    pub(crate) control_facts: Option<&'a FunctionControlFacts>,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
     pub(crate) param_register_aliases: &'a HashMap<String, String>,
+    pub(crate) function_facts: &'a FunctionFacts,
+    #[cfg(test)]
+    pub(crate) certified_rendering_required: bool,
+}
+
+impl<'a> PreparedSemanticViewInputs<'a> {
+    fn callee_resolution(&self) -> Option<&'a CalleeResolutionFacts> {
+        self.function_facts.callee_resolution()
+    }
+
+    fn callsite_facts(&self) -> Option<&'a FunctionCallsiteFacts> {
+        self.function_facts.callsites()
+    }
+
+    fn call_result_facts(&self) -> Option<&'a FunctionCallResultFacts> {
+        self.function_facts.call_results()
+    }
+
+    fn call_render_facts(&self) -> Option<&'a r2types::FunctionCallRenderFacts> {
+        self.function_facts.call_render()
+    }
+
+    fn control_facts(&self) -> Option<&'a r2types::FunctionControlFacts> {
+        self.function_facts.control()
+    }
 }
 
 impl PreparedSemanticView {
     pub(crate) fn build(inputs: PreparedSemanticViewInputs<'_>) -> Self {
+        let certified_rendering_required =
+            prepared_view_requires_certified_rendering(inputs.function_facts);
+        #[cfg(test)]
+        let certified_rendering_required =
+            certified_rendering_required || inputs.certified_rendering_required;
         let mut view = Self {
             param_alias_by_reg: inputs.param_register_aliases.clone(),
+            certified_rendering_required,
             ..Self::default()
         };
         for (rank, reg) in inputs.abi_arg_regs.iter().enumerate() {
@@ -91,8 +123,9 @@ impl PreparedSemanticView {
         populate_stack_aliases(&mut view, &inputs);
         populate_stack_offsets(&mut view, inputs.prepared);
         overlay_param_home_stack_aliases(&mut view, &inputs);
-        populate_owner_exprs(&mut view, inputs.prepared);
-        populate_call_result_sources(&mut view, inputs.call_result_facts);
+        populate_authorized_stack_owner_names(&mut view, &inputs);
+        populate_owner_exprs(&mut view, &inputs);
+        populate_call_result_sources(&mut view, inputs.call_result_facts());
         populate_calls(&mut view, &inputs);
         populate_predicates(&mut view, &inputs);
         populate_switches(&mut view, &inputs);
@@ -125,6 +158,7 @@ impl PreparedSemanticView {
             .or_else(|| self.owner_expr_by_name.get(&var.name))
     }
 
+    #[cfg(test)]
     pub(crate) fn owner_expr_for_value_id(&self, value_id: ValueId) -> Option<&CExpr> {
         self.owner_expr_by_value.get(&value_id)
     }
@@ -221,6 +255,15 @@ impl PreparedSemanticView {
             })
             .collect()
     }
+}
+
+fn prepared_view_requires_certified_rendering(function_facts: &FunctionFacts) -> bool {
+    let Some(route) = function_facts.decompile_route() else {
+        return false;
+    };
+    route.kind == r2types::DecompileRouteKind::Standard
+        && route.render_permission.kind == r2sym::RenderPermissionKind::CertifiedC
+        && route.render_permission.owner == r2sym::ProofOwner::R2engine
 }
 
 fn prepared_var(prepared: &SsaArtifact, value_id: ValueId) -> Option<&SSAVar> {
@@ -380,9 +423,6 @@ fn populate_prepared_render_definitions(
                     ptr_arith: &use_info.ptr_arith,
                     stack_slots: &use_info.stack_slots,
                     forwarded_values: &use_info.forwarded_values,
-                    function_names: env.function_names,
-                    strings: env.strings,
-                    symbols: env.symbols,
                     type_oracle: env.type_oracle,
                 };
                 lower.op_to_expr(op)
@@ -619,6 +659,92 @@ fn populate_stack_aliases(
     }
 }
 
+fn prepared_stack_slot_offset(slot: &StackSlotKey) -> i64 {
+    match slot.base {
+        ExternalStackBase::FramePointer => -slot.offset,
+        _ => slot.offset,
+    }
+}
+
+fn record_authorized_stack_owner_name(
+    view: &mut PreparedSemanticView,
+    function_facts: &FunctionFacts,
+    offset: i64,
+    name: &str,
+) {
+    let name = name.trim();
+    for object in function_facts
+        .render_facts()
+        .stack_slot_offsets
+        .iter()
+        .filter_map(|(object, slot_offset)| (*slot_offset == offset).then_some(*object))
+    {
+        if let Some(authorization) =
+            function_facts.authorized_stack_slot_owner_render(object, offset, name)
+        {
+            view.authorized_stack_owner_names_by_object
+                .entry((authorization.object, authorization.offset))
+                .or_default()
+                .insert(name.to_ascii_lowercase());
+        }
+    }
+    if function_facts
+        .authorized_stack_slot_owner_render_by_offset(offset, name)
+        .is_some()
+    {
+        view.authorized_stack_owner_names
+            .entry(offset)
+            .or_default()
+            .insert(name.to_ascii_lowercase());
+    }
+}
+
+fn populate_authorized_stack_owner_names(
+    view: &mut PreparedSemanticView,
+    inputs: &PreparedSemanticViewInputs<'_>,
+) {
+    let function_facts = inputs.function_facts;
+    let alias_candidates: Vec<_> = view
+        .stack_aliases_by_offset
+        .iter()
+        .map(|(offset, alias)| (*offset, alias.visible_name.clone()))
+        .collect();
+    for (offset, name) in alias_candidates {
+        record_authorized_stack_owner_name(view, function_facts, offset, &name);
+    }
+    for binding in inputs.visible_bindings {
+        let Some(slot) = binding.stack_slot.as_ref() else {
+            continue;
+        };
+        if !matches!(
+            binding.kind,
+            VisibleBindingKind::Param | VisibleBindingKind::Local | VisibleBindingKind::StackObject
+        ) {
+            continue;
+        }
+        record_authorized_stack_owner_name(
+            view,
+            function_facts,
+            prepared_stack_slot_offset(slot),
+            &binding.name,
+        );
+    }
+    for (slot_key, slot) in inputs.stack_slots {
+        if !matches!(
+            slot.role,
+            ExternalStackSlotRole::Local | ExternalStackSlotRole::StackArg
+        ) {
+            continue;
+        }
+        record_authorized_stack_owner_name(
+            view,
+            function_facts,
+            prepared_stack_slot_offset(slot_key),
+            &slot.name,
+        );
+    }
+}
+
 fn prepared_binding_arg_alias(
     binding: &VisibleBinding,
     visible_bindings: &[VisibleBinding],
@@ -767,7 +893,8 @@ fn populate_stack_offsets(view: &mut PreparedSemanticView, prepared: &SsaArtifac
     }
 }
 
-fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
+fn populate_owner_exprs(view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
+    let prepared = inputs.prepared;
     let mut producer_by_dst = HashMap::<SSAVar, &SSAOp>::new();
     for block in prepared.function().blocks() {
         for op in &block.ops {
@@ -784,7 +911,7 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact)
         let Some(alias) = preferred_stack_alias_name(view, offset) else {
             continue;
         };
-        if !alias.is_empty() {
+        if !alias.is_empty() && prepared_stack_owner_recovery_allowed(view, offset, &alias) {
             view.insert_owner_expr(&value, CExpr::AddrOf(Box::new(CExpr::Var(alias.clone()))));
         }
     }
@@ -797,9 +924,8 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact)
                         local_store_owner_expr_for_offset(view, prepared, block, op_idx, offset)
                             .map(|expr| (expr, Some(offset)))
                             .or_else(|| {
-                                preferred_stack_alias_name(view, offset)
-                                    .filter(|alias| !alias.is_empty())
-                                    .map(|alias| (CExpr::Var(alias), Some(offset)))
+                                prepared_stack_alias_expr_for_offset(view, offset)
+                                    .map(|expr| (expr, Some(offset)))
                             })
                     })
                     .or_else(|| {
@@ -1021,10 +1147,14 @@ fn populate_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact)
         }
     }
 
-    refine_load_owner_exprs(view, prepared);
+    refine_load_owner_exprs(view, inputs);
 }
 
-fn refine_load_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifact) {
+fn refine_load_owner_exprs(
+    view: &mut PreparedSemanticView,
+    inputs: &PreparedSemanticViewInputs<'_>,
+) {
+    let prepared = inputs.prepared;
     for block in prepared.function().blocks() {
         for (op_idx, op) in block.ops.iter().enumerate() {
             let SSAOp::Load { dst, addr, .. } = op else {
@@ -1035,9 +1165,8 @@ fn refine_load_owner_exprs(view: &mut PreparedSemanticView, prepared: &SsaArtifa
                     local_store_owner_expr_for_offset(view, prepared, block, op_idx, offset)
                         .map(|expr| (expr, Some(offset)))
                         .or_else(|| {
-                            preferred_stack_alias_name(view, offset)
-                                .filter(|alias| !alias.is_empty())
-                                .map(|alias| (CExpr::Var(alias), Some(offset)))
+                            prepared_stack_alias_expr_for_offset(view, offset)
+                                .map(|expr| (expr, Some(offset)))
                         })
                 })
                 .or_else(|| {
@@ -1238,7 +1367,7 @@ fn populate_predicates(view: &mut PreparedSemanticView, inputs: &PreparedSemanti
     view.predicate_expr_by_value.clear();
     view.branch_predicate_expr_by_block.clear();
 
-    let Some(control_facts) = inputs.control_facts else {
+    let Some(control_facts) = inputs.control_facts() else {
         return;
     };
 
@@ -1540,7 +1669,7 @@ fn compare_def_expr_for_flag_operand(
 }
 
 fn populate_switches(view: &mut PreparedSemanticView, inputs: &PreparedSemanticViewInputs<'_>) {
-    let Some(control_facts) = inputs.control_facts else {
+    let Some(control_facts) = inputs.control_facts() else {
         return;
     };
 
@@ -1561,8 +1690,8 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
         let Some(site) = prepared_call_site_tuple(inputs.prepared, call_site.at) else {
             continue;
         };
-        let mut callee_identity =
-            lookup_callee_identity_for_site(inputs, site, call_site.direct_target);
+        let direct_target = callsite_direct_target(inputs.callsite_facts(), site);
+        let mut callee_identity = lookup_callee_identity_for_site(inputs, site, direct_target);
         if inputs
             .prepared
             .structured()
@@ -1573,20 +1702,29 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             identity.is_recursive = true;
         }
         let mut call_view = PreparedCallView {
-            direct_target: call_site.direct_target,
+            direct_target,
             callee_identity,
             authoritative_args: Vec::new(),
             authoritative_arg_values: Vec::new(),
             result_owner: None,
+            render_fact: inputs
+                .call_render_facts()
+                .and_then(|facts| {
+                    facts.fact_for_site(CallsiteKey {
+                        block_addr: site.0,
+                        op_index: site.1,
+                    })
+                })
+                .cloned(),
         };
         call_view.result_owner =
-            certified_call_result_owner(site, inputs.prepared, view, inputs.call_result_facts);
+            certified_call_result_owner(site, inputs.prepared, view, inputs.call_result_facts());
         if let Some(owner) = call_view.result_owner.clone() {
             assign_certified_call_result_owner(
                 site,
                 inputs.prepared,
                 view,
-                inputs.call_result_facts,
+                inputs.call_result_facts(),
                 &owner,
             );
         }
@@ -1596,7 +1734,7 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             inputs.prepared.function(),
             inputs.prepared,
             view,
-            inputs.callsite_facts,
+            inputs.callsite_facts(),
             max_arity,
         );
         call_view.authoritative_arg_values =
@@ -1607,6 +1745,18 @@ fn populate_calls(view: &mut PreparedSemanticView, inputs: &PreparedSemanticView
             .collect();
         view.call_view_by_site.insert(site, call_view);
     }
+}
+
+fn callsite_direct_target(
+    callsite_facts: Option<&FunctionCallsiteFacts>,
+    site: (u64, usize),
+) -> Option<u64> {
+    callsite_facts?
+        .arguments_for_site(CallsiteKey {
+            block_addr: site.0,
+            op_index: site.1,
+        })?
+        .direct_target
 }
 
 fn canonical_call_authoritative_args(
@@ -1818,8 +1968,8 @@ fn certified_call_result_owner_expr(
     view: &PreparedSemanticView,
 ) -> Option<CExpr> {
     match cert.owner.as_ref() {
-        Some(ValueOwner::StackSlot { offset, .. }) => {
-            preferred_stack_alias_name(view, *offset).map(CExpr::Var)
+        Some(ValueOwner::StackSlot { object, offset }) => {
+            prepared_stack_alias_name_for_object_offset(view, *object, *offset).map(CExpr::Var)
         }
         Some(ValueOwner::Value(value)) if *value != cert.value => {
             let var = prepared.value_var(*value)?;
@@ -1859,7 +2009,53 @@ fn alias_for_memory_location(
     view: &PreparedSemanticView,
     location: MemoryLocation,
 ) -> Option<String> {
-    preferred_stack_alias_name(view, location.offset)
+    prepared_stack_alias_name_for_offset(view, location.offset)
+}
+
+fn prepared_stack_owner_recovery_allowed(
+    view: &PreparedSemanticView,
+    offset: i64,
+    name: &str,
+) -> bool {
+    !view.certified_rendering_required
+        || view
+            .authorized_stack_owner_names
+            .get(&offset)
+            .is_some_and(|names| names.contains(&name.to_ascii_lowercase()))
+}
+
+fn prepared_stack_owner_offset_authorized(view: &PreparedSemanticView, offset: i64) -> bool {
+    !view.certified_rendering_required
+        || view
+            .authorized_stack_owner_names
+            .get(&offset)
+            .is_some_and(|names| !names.is_empty())
+}
+
+fn prepared_stack_alias_name_for_object_offset(
+    view: &PreparedSemanticView,
+    object: r2ssa::ObjectId,
+    offset: i64,
+) -> Option<String> {
+    let authorized = view
+        .authorized_stack_owner_names_by_object
+        .get(&(object, offset))?;
+    preferred_stack_alias_name(view, offset)
+        .filter(|alias| authorized.contains(&alias.to_ascii_lowercase()))
+        .or_else(|| authorized.iter().next().cloned())
+}
+
+fn prepared_stack_alias_name_for_offset(
+    view: &PreparedSemanticView,
+    offset: i64,
+) -> Option<String> {
+    preferred_stack_alias_name(view, offset)
+        .filter(|alias| !alias.is_empty())
+        .filter(|alias| prepared_stack_owner_recovery_allowed(view, offset, alias))
+}
+
+fn prepared_stack_alias_expr_for_offset(view: &PreparedSemanticView, offset: i64) -> Option<CExpr> {
+    prepared_stack_alias_name_for_offset(view, offset).map(CExpr::Var)
 }
 
 fn stack_offset_for_value(prepared: &SsaArtifact, value: &SSAVar) -> Option<i64> {
@@ -2042,7 +2238,7 @@ fn lookup_callee_identity_for_site(
     direct_target: Option<u64>,
 ) -> Option<CalleeIdentity> {
     CalleeResolutionFacts::resolve_target_identity(CalleeTargetIdentityRequest {
-        resolution: inputs.callee_resolution,
+        resolution: inputs.callee_resolution(),
         callsite: Some(CallsiteKey {
             block_addr: site.0,
             op_index: site.1,
@@ -2490,7 +2686,10 @@ fn local_store_owner_expr_for_offset(
     before_idx: usize,
     offset: i64,
 ) -> Option<CExpr> {
-    let alias = preferred_stack_alias_name(view, offset).filter(|alias| !alias.is_empty());
+    if !prepared_stack_owner_offset_authorized(view, offset) {
+        return None;
+    }
+    let alias = prepared_stack_alias_name_for_offset(view, offset);
     let prefer_alias = alias
         .as_deref()
         .is_some_and(|name| !is_generic_prepared_stack_alias(name));
@@ -2821,10 +3020,14 @@ fn collect_prepared_runtime_facts(
                         value_kind: StackSlotValueKind::Scalar,
                     };
                     merge_prepared_stack_slot(use_info, &key, reload_value, provenance);
-                    let reload_param_expr = reload_value.and_then(|value_id| {
-                        prepared_stack_reload_param_alias_expr(prepared, env, value_id)
-                    });
-                    let stack_alias_expr = preferred_stack_alias_name(view, offset).map(CExpr::Var);
+                    let reload_param_expr = prepared_stack_owner_offset_authorized(view, offset)
+                        .then(|| {
+                            reload_value.and_then(|value_id| {
+                                prepared_stack_reload_param_alias_expr(prepared, env, value_id)
+                            })
+                        })
+                        .flatten();
+                    let stack_alias_expr = prepared_stack_alias_expr_for_offset(view, offset);
                     if let Some(expr) = reload_param_expr.or(stack_alias_expr) {
                         if let CExpr::Var(alias) = &expr {
                             use_info
@@ -2889,6 +3092,9 @@ fn populate_prepared_call_runtime_facts(
             let Some(call_view) = view.call_view_for_site(site) else {
                 continue;
             };
+            if !prepared_call_render_authorized(call_view) {
+                continue;
+            }
 
             let args = call_view
                 .authoritative_args
@@ -3098,6 +3304,9 @@ fn prepared_call_expr(
     view: &PreparedSemanticView,
     env: &PassEnv<'_>,
 ) -> Option<CExpr> {
+    if !prepared_call_render_authorized(call_view) {
+        return None;
+    }
     if !prepared_call_args_have_value_bijection(call_view) {
         return None;
     }
@@ -3128,6 +3337,9 @@ fn prepared_call_callee_expr(call_view: &PreparedCallView) -> Option<CExpr> {
 }
 
 fn prepared_call_expr_from_view(call_view: &PreparedCallView) -> Option<CExpr> {
+    if !prepared_call_render_authorized(call_view) {
+        return None;
+    }
     if !prepared_call_args_have_value_bijection(call_view) {
         return None;
     }
@@ -3140,6 +3352,27 @@ fn prepared_call_expr_from_view(call_view: &PreparedCallView) -> Option<CExpr> {
 
 fn prepared_call_args_have_value_bijection(call_view: &PreparedCallView) -> bool {
     call_view.authoritative_args.len() == call_view.authoritative_arg_values.len()
+}
+
+fn prepared_call_render_authorized(call_view: &PreparedCallView) -> bool {
+    let Some(render_fact) = &call_view.render_fact else {
+        return false;
+    };
+    if matches!(
+        render_fact.disposition,
+        r2types::CallsiteRenderDisposition::Suppressed
+            | r2types::CallsiteRenderDisposition::Residualized
+    ) {
+        return false;
+    }
+    prepared_call_args_have_value_bijection(call_view)
+        && render_fact.proof_values.len() >= call_view.authoritative_arg_values.len()
+        && render_fact
+            .proof_values
+            .iter()
+            .take(call_view.authoritative_arg_values.len())
+            .copied()
+            .eq(call_view.authoritative_arg_values.iter().copied())
 }
 
 fn record_prepared_consumed_by_call(
@@ -3228,8 +3461,8 @@ fn record_prepared_call_result_aliases(
                 .entry(alias)
                 .or_insert_with(|| call_expr.clone());
         }
-        if let Some(ValueOwner::StackSlot { offset, .. }) = cert.owner.as_ref()
-            && let Some(alias) = preferred_stack_alias_name(view, *offset)
+        if let Some(ValueOwner::StackSlot { object, offset }) = cert.owner.as_ref()
+            && let Some(alias) = prepared_stack_alias_name_for_object_offset(view, *object, *offset)
         {
             record_prepared_call_alias(use_info, site, &alias, false);
             if *offset < 0 {
@@ -3614,6 +3847,33 @@ mod tests {
             .expect("prepared stack-owned call result SSA artifact")
     }
 
+    fn test_prepared_stack_store_load_artifact() -> SsaArtifact {
+        let arch = test_x86_64_result_arch();
+        let slot = Varnode::unique(0x3000, 8);
+        let loaded = Varnode::unique(0x3008, 8);
+        let mut block = R2ILBlock::new(0x3000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: slot.clone(),
+            a: Varnode::register(16, 8),
+            b: Varnode::constant(u64::MAX - 7, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: slot.clone(),
+            val: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: loaded,
+            space: SpaceId::Ram,
+            addr: slot,
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        SsaArtifact::for_decompile(&[block], Some(&arch))
+            .expect("prepared stack store/load SSA artifact")
+    }
+
     fn test_callsite_facts(prepared: &SsaArtifact) -> r2types::FunctionCallsiteFacts {
         let by_callsite = prepared
             .certificates()
@@ -3718,9 +3978,45 @@ mod tests {
         }
     }
 
+    fn test_stack_owner_function_facts(
+        stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
+        call_result_facts: r2types::FunctionCallResultFacts,
+    ) -> FunctionFacts {
+        let (object, offset) = call_result_facts
+            .by_value
+            .values()
+            .find_map(|fact| match fact.owner.as_ref()? {
+                ValueOwner::StackSlot { object, offset } => Some((*object, *offset)),
+                ValueOwner::Value(_) => None,
+            })
+            .expect("fixture should carry stack-slot call-result owner");
+        FunctionFacts::new(
+            r2types::FunctionTypeFacts {
+                stack_slots,
+                ..r2types::FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_call_results(call_result_facts)
+        .with_render(r2types::FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(object, offset)]),
+            ..r2types::FunctionRenderFacts::default()
+        })
+    }
+
+    fn leak_function_facts(facts: FunctionFacts) -> &'static FunctionFacts {
+        Box::leak(Box::new(facts))
+    }
+
     fn test_control_facts(prepared: &SsaArtifact) -> r2types::FunctionControlFacts {
-        let branch_predicates = prepared
-            .predicates()
+        let predicates = prepared.predicates();
+        let certificates = prepared.certificates();
+        let sorted_u64s = |values: &[u64]| {
+            let mut values = values.to_vec();
+            values.sort_unstable();
+            values
+        };
+        let branch_predicates = predicates
             .predicates
             .values()
             .map(|predicate| {
@@ -3743,6 +4039,27 @@ mod tests {
                 )
             })
             .collect();
+        let loops = certificates
+            .loops
+            .iter()
+            .map(|(loop_id, cert)| {
+                (
+                    *loop_id,
+                    r2types::LoopStructureFact {
+                        loop_id: *loop_id,
+                        proof_node: cert.proof_node.to_string(),
+                        header: cert.header,
+                        condition: cert.condition,
+                        condition_value: cert
+                            .condition
+                            .and_then(|id| predicates.predicates.get(&id).map(|p| p.condition)),
+                        body: sorted_u64s(&cert.body),
+                        latches: sorted_u64s(&cert.latches),
+                        exits: sorted_u64s(&cert.exits),
+                    },
+                )
+            })
+            .collect();
         let switches = prepared
             .predicates()
             .switches
@@ -3751,6 +4068,7 @@ mod tests {
                 (
                     *block_addr,
                     r2types::SwitchSelectorFact {
+                        proof_node: r2ssa::ProofNodeId::switch_certificate(*block_addr).to_string(),
                         block_addr: switch.block_addr,
                         selector: switch.selector,
                         cases: switch.cases.clone(),
@@ -3780,6 +4098,7 @@ mod tests {
         r2types::FunctionControlFacts {
             branch_predicates,
             block_assumptions,
+            loops,
             switches,
         }
     }
@@ -3797,10 +4116,31 @@ mod tests {
             "prepared call expressions must not carry rendered args without ValueId proof"
         );
 
+        let missing_render_fact = PreparedCallView {
+            callee_identity: Some(CalleeIdentity::from_name("sym.helper")),
+            authoritative_args: vec![CExpr::IntLit(7)],
+            authoritative_arg_values: vec![ValueId(7)],
+            ..PreparedCallView::default()
+        };
+        assert!(
+            prepared_call_expr_from_view(&missing_render_fact).is_none(),
+            "prepared call expressions require FunctionFacts call-render authorization"
+        );
+
         let proved = PreparedCallView {
             callee_identity: Some(CalleeIdentity::from_name("sym.helper")),
             authoritative_args: vec![CExpr::IntLit(7)],
             authoritative_arg_values: vec![ValueId(7)],
+            render_fact: Some(r2types::CallsiteRenderFact {
+                callsite: CallsiteKey {
+                    block_addr: 0x1000,
+                    op_index: 0,
+                },
+                target: None,
+                disposition: r2types::CallsiteRenderDisposition::SideEffectStatement,
+                proof_values: vec![ValueId(7)],
+                residual_reason: None,
+            }),
             ..PreparedCallView::default()
         };
         assert_eq!(
@@ -3904,13 +4244,11 @@ mod tests {
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: false,
         });
 
         assert_eq!(view.param_alias_by_reg, param_register_aliases);
@@ -3945,17 +4283,17 @@ mod tests {
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
+        let function_facts =
+            FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: Some(&callee_resolution),
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -3987,7 +4325,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_view_uses_typed_direct_addr_identity_without_callsite_binding() {
+    fn prepared_view_uses_typed_direct_addr_identity_through_callsite_facts() {
         let prepared = test_prepared_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
         let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
@@ -4002,26 +4340,29 @@ mod tests {
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
+        let callsite_facts = test_callsite_facts(&prepared);
+        let function_facts = FunctionFacts::default()
+            .with_callee_resolution(callee_resolution.clone())
+            .with_callsites(callsite_facts.clone());
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: Some(&callee_resolution),
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
         });
 
         let call_view = view
             .call_view_for_site((0x1000, 0))
             .expect("direct callsite should have prepared call view");
+        assert_eq!(call_view.direct_target, Some(0x401000));
         let identity = call_view
             .callee_identity
             .as_ref()
-            .expect("direct-address identity should be used without callsite binding");
+            .expect("direct-address identity should be certified through callsite facts");
         assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
         assert!(identity.is_imported_name_hint());
         let resolved =
@@ -4043,6 +4384,47 @@ mod tests {
     }
 
     #[test]
+    fn prepared_view_requires_callsite_facts_for_direct_addr_identity() {
+        let prepared = test_prepared_call_artifact();
+        let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
+        let key = r2types::CalleeIdentityKey::DirectAddress(0x401000);
+        let mut callee_resolution = CalleeResolutionFacts::default();
+        callee_resolution
+            .by_direct_addr
+            .insert(0x401000, key.clone());
+        callee_resolution
+            .by_key
+            .insert(key, CalleeIdentity::from_name("sym.imp.printf"));
+        let stack_slots = BTreeMap::new();
+        let visible_bindings = Vec::new();
+        let param_register_aliases = HashMap::new();
+        let function_facts =
+            FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
+
+        let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
+        });
+
+        let call_view = view
+            .call_view_for_site((0x1000, 0))
+            .expect("direct callsite should have prepared call view");
+        assert_eq!(
+            call_view.direct_target, None,
+            "prepared semantic view must not reparse direct targets from SSA names"
+        );
+        assert!(
+            call_view.callee_identity.is_none(),
+            "direct-address callee identity requires FunctionFacts direct-target evidence"
+        );
+    }
+
+    #[test]
     fn prepared_view_refuses_raw_callee_identity_without_typed_resolution() {
         let prepared = test_prepared_call_artifact();
         let abi_arg_regs = vec!["rdi".to_string(), "rsi".to_string()];
@@ -4053,13 +4435,11 @@ mod tests {
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4091,13 +4471,11 @@ mod tests {
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4153,17 +4531,18 @@ mod tests {
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
         let callsite_facts = test_callsite_facts(&prepared);
+        let function_facts = FunctionFacts::default()
+            .with_callee_resolution(callee_resolution.clone())
+            .with_callsites(callsite_facts.clone());
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: Some(&callee_resolution),
-            callsite_facts: Some(&callsite_facts),
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4196,13 +4575,11 @@ mod tests {
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4232,17 +4609,16 @@ mod tests {
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
+        let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: Some(&callsite_facts),
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4263,17 +4639,16 @@ mod tests {
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
+        let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: Some(&callsite_facts),
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4297,23 +4672,27 @@ mod tests {
             },
             ExternalStackSlotSpec {
                 name: "call_result".to_string(),
+                ty: Some(r2types::CTypeLike::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                }),
                 role: ExternalStackSlotRole::Local,
                 ..ExternalStackSlotSpec::default()
             },
         )]);
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
+        let function_facts =
+            test_stack_owner_function_facts(stack_slots.clone(), call_result_facts.clone());
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: Some(&call_result_facts),
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4347,13 +4726,11 @@ mod tests {
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: false,
         });
 
         let call_view = view
@@ -4366,6 +4743,90 @@ mod tests {
         assert!(
             view.call_result_source_by_value.is_empty(),
             "call-result source indexes must be populated from FunctionFacts, not local prepared SSA reads"
+        );
+    }
+
+    #[test]
+    fn certified_prepared_view_rejects_local_store_owner_recovery() {
+        let prepared = test_prepared_stack_store_load_artifact();
+        let abi_arg_regs = Vec::new();
+        let stack_slots = BTreeMap::new();
+        let empty_visible_bindings = Vec::new();
+        let visible_bindings = vec![VisibleBinding {
+            name: "tmp".to_string(),
+            ty: Some(r2types::CTypeLike::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            }),
+            kind: VisibleBindingKind::Local,
+            stack_slot: Some(StackSlotKey {
+                base: r2types::ExternalStackBase::StackPointer,
+                offset: -8,
+            }),
+            param_index: None,
+            source_reg: None,
+        }];
+        let param_register_aliases = HashMap::new();
+
+        let local_view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            stack_slots: &stack_slots,
+            visible_bindings: &empty_visible_bindings,
+            param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: false,
+        });
+        let certified_view = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            stack_slots: &stack_slots,
+            visible_bindings: &empty_visible_bindings,
+            param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: true,
+        });
+        let render_facts = r2types::FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
+            ..r2types::FunctionRenderFacts::default()
+        };
+        let function_facts = FunctionFacts::new(
+            r2types::FunctionTypeFacts {
+                visible_bindings: visible_bindings.clone(),
+                ..r2types::FunctionTypeFacts::default()
+            },
+            None,
+        )
+        .with_render(render_facts.clone());
+        let certified_with_stack_proof = PreparedSemanticView::build(PreparedSemanticViewInputs {
+            prepared: &prepared,
+            abi_arg_regs: &abi_arg_regs,
+            stack_slots: &stack_slots,
+            visible_bindings: &visible_bindings,
+            param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: true,
+        });
+
+        let block = prepared.function().get_block(0x3000).expect("block");
+        let SSAOp::Load { dst, .. } = &block.ops[2] else {
+            panic!("fixture op should be a stack load");
+        };
+
+        assert_eq!(
+            local_view.owner_expr_for_var(dst),
+            Some(&CExpr::IntLit(7)),
+            "non-certified prepared view may recover a same-block stack store value"
+        );
+        assert_ne!(
+            certified_view.owner_expr_for_var(dst),
+            Some(&CExpr::IntLit(7)),
+            "certified prepared view must not use local stack-store recovery without FunctionFacts render proof"
+        );
+        assert_eq!(
+            certified_with_stack_proof.owner_expr_for_var(dst),
+            Some(&CExpr::Var("tmp".to_string())),
+            "certified prepared view may recover a stack owner only when FunctionFacts carries typed stack-slot render proof"
         );
     }
 
@@ -4384,13 +4845,11 @@ mod tests {
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: leak_function_facts(FunctionFacts::default()),
+            certified_rendering_required: false,
         });
 
         assert!(
@@ -4407,17 +4866,16 @@ mod tests {
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
         let param_register_aliases = HashMap::new();
+        let function_facts = FunctionFacts::default().with_control(control_facts.clone());
 
         let view = PreparedSemanticView::build(PreparedSemanticViewInputs {
             prepared: &prepared,
             abi_arg_regs: &abi_arg_regs,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: Some(&control_facts),
             stack_slots: &stack_slots,
             visible_bindings: &visible_bindings,
             param_register_aliases: &param_register_aliases,
+            function_facts: &function_facts,
+            certified_rendering_required: false,
         });
 
         assert_eq!(

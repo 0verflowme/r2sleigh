@@ -26,9 +26,6 @@ pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>
         ptr_arith: &use_info.ptr_arith,
         stack_slots: &use_info.stack_slots,
         forwarded_values: &use_info.forwarded_values,
-        function_names: env.function_names,
-        strings: env.strings,
-        symbols: env.symbols,
         type_oracle: env.type_oracle,
     };
 

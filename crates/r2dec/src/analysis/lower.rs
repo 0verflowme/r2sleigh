@@ -28,9 +28,6 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) ptr_arith: &'a HashMap<String, PtrArith>,
     pub(crate) stack_slots: &'a HashMap<String, StackSlotProvenance>,
     pub(crate) forwarded_values: &'a HashMap<String, ValueProvenance>,
-    pub(crate) function_names: &'a HashMap<u64, String>,
-    pub(crate) strings: &'a HashMap<u64, String>,
-    pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
 }
 
@@ -135,15 +132,6 @@ impl<'a> LowerCtx<'a> {
                 return format!("0x{:x}", val);
             }
             return format!("{}", val);
-        }
-
-        if let Some(addr) = parse_address_from_var_name(&var.name) {
-            if let Some(name) = self.function_names.get(&addr) {
-                return name.clone();
-            }
-            if let Some(name) = self.symbols.get(&addr) {
-                return name.clone();
-            }
         }
 
         let display = var.display_name();
@@ -700,20 +688,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn resolve_addr_literal(&self, addr: u64) -> Option<CExpr> {
-        if addr <= 0xff {
-            return None;
-        }
-
-        if let Some(name) = self.function_names.get(&addr) {
-            return Some(CExpr::Var(name.clone()));
-        }
-        if let Some(s) = self.strings.get(&addr) {
-            return Some(CExpr::StringLit(s.clone()));
-        }
-        if let Some(name) = self.symbols.get(&addr) {
-            return Some(CExpr::Var(name.clone()));
-        }
-
+        let _ = addr;
         None
     }
 
@@ -1399,9 +1374,9 @@ mod tests {
         ptr_arith: &'a HashMap<String, PtrArith>,
         stack_slots: &'a HashMap<String, StackSlotProvenance>,
         forwarded_values: &'a HashMap<String, ValueProvenance>,
-        function_names: &'a HashMap<u64, String>,
-        strings: &'a HashMap<u64, String>,
-        symbols: &'a HashMap<u64, String>,
+        #[cfg(test)] _function_names: &'a HashMap<u64, String>,
+        #[cfg(test)] _strings: &'a HashMap<u64, String>,
+        #[cfg(test)] _symbols: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
         let type_hints = Box::leak(Box::new(HashMap::new()));
         let semantic_values = Box::leak(Box::new(HashMap::new()));
@@ -1419,15 +1394,12 @@ mod tests {
             ptr_arith,
             stack_slots,
             forwarded_values,
-            function_names,
-            strings,
-            symbols,
             type_oracle: None,
         }
     }
 
     #[test]
-    fn resolve_addr_literal_prefers_function_then_string_then_symbol() {
+    fn resolve_addr_literal_ignores_raw_function_string_symbol_maps() {
         let mut fn_map = HashMap::new();
         let mut str_map = HashMap::new();
         let mut sym_map = HashMap::new();
@@ -1462,26 +1434,13 @@ mod tests {
             &sym_map,
         );
 
-        assert_eq!(
-            ctx.resolve_addr_literal(0x401000),
-            Some(CExpr::Var("sym.main".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x402000),
-            Some(CExpr::StringLit("format: %d\\n".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x403000),
-            Some(CExpr::Var("obj.global".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x404000),
-            Some(CExpr::StringLit("string_wins_over_symbol".to_string()))
-        );
-        assert_eq!(
-            ctx.resolve_addr_literal(0x405000),
-            Some(CExpr::Var("sym.wins".to_string()))
-        );
+        for addr in [0x401000, 0x402000, 0x403000, 0x404000, 0x405000] {
+            assert_eq!(
+                ctx.resolve_addr_literal(addr),
+                None,
+                "raw function/string/symbol maps must not authorize address literal rendering"
+            );
+        }
     }
 
     #[test]
@@ -1552,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn get_expr_resolves_ram_addresses_to_strings() {
+    fn get_expr_keeps_ram_addresses_numeric_without_typed_string_fact() {
         let fn_map = HashMap::new();
         let mut str_map = HashMap::new();
         let sym_map = HashMap::new();
@@ -1580,10 +1539,7 @@ mod tests {
         );
 
         let var = SSAVar::new("ram:403048", 0, 8);
-        assert_eq!(
-            ctx.get_expr(&var),
-            CExpr::StringLit("Usage: %s <test_num> [args...]\\n".to_string())
-        );
+        assert_eq!(ctx.get_expr(&var), CExpr::Var("ram:403048".to_string()));
     }
 
     #[test]

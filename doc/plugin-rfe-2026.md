@@ -112,11 +112,11 @@ RFE Themes
 Add a canonical per-function combined report based on `FunctionFacts`,
 `SsaArtifact`, decompiler plan, and semantic artifact.
 
-Proposed commands:
+Engine-owned report surfaces, not plugin commands:
 
-- `a:sla.facts`
-- `a:sla.facts.json`
-- `a:sla.plan`
+- canonical `FunctionFacts` report API
+- canonical decompile route/refusal diagnostics API
+- canonical residual/proof summary API
 
 Payload should include:
 
@@ -426,8 +426,6 @@ Proposed Command Additions
 
 | Command | Purpose | Canonical owner |
 |--------|---------|-----------------|
-| `a:sla.facts` | combined per-function fact view | `r2ssa` + `r2sym` + `r2types` + `r2dec` |
-| `a:sla.plan` | explain route/analysis decisions | `r2sym` + `r2dec` |
 | `a:sla.assume` | user-informed analysis seeds | `r2ssa` / `r2sym` / `r2types` |
 | `a:sym.why` | explain why a target is or is not reachable | `r2sym` |
 | `a:sym.witness` | concrete witness + memory/register state | `r2sym` |

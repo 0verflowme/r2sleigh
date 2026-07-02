@@ -1,6 +1,6 @@
 use super::*;
 use crate::fold::FoldingContext;
-use crate::fold::context::{FoldArchConfig, FoldInputs};
+use crate::fold::context::{FoldArchConfig, FoldInputs, empty_function_facts};
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -39,7 +39,6 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
     let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
     let empty_visible = Box::leak(Box::new(Vec::new()));
     let empty_str = Box::leak(Box::new(HashMap::new()));
-    let empty_callee = Box::leak(Box::new(BTreeMap::new()));
     let empty_ty = Box::leak(Box::new(HashMap::new()));
 
     let mut ctx = FoldingContext::from_inputs(FoldInputs {
@@ -47,29 +46,48 @@ fn make_x86_64_ctx_with_prepared<'a>(prepared_ssa: &'a r2ssa::SsaArtifact) -> Fo
         function_names: empty_u64,
         strings: empty_u64,
         symbols: empty_u64,
-        callee_facts: empty_callee,
-        callee_resolution: None,
-        callsite_facts: None,
-        call_result_facts: None,
-        control_facts: None,
+        function_facts: empty_function_facts(),
+        certified_rendering_required: false,
         stack_slots: empty_stack_slots,
+        field_access_certificates: &[],
         external_stack_vars: empty_stack,
         visible_bindings: empty_visible,
         external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
-        semantic_artifact: None,
         param_register_aliases: empty_str,
         type_hints: empty_ty,
         type_oracle: None,
         function_return_type: None,
         prepared_ssa: None,
-        summary_view: None,
         prepared_semantic_view: None,
         prepared_objects: None,
         prepared_memory: None,
-        prepared_call_sites: None,
     });
     ctx.inputs.prepared_ssa = Some(prepared_ssa);
     ctx
+}
+
+fn install_semantic_artifact(ctx: &mut FoldingContext<'_>, artifact: r2sym::SemanticArtifact) {
+    let mut function_facts = ctx.inputs.function_facts.clone();
+    function_facts.set_semantics(Some(artifact));
+    ctx.inputs.function_facts = Box::leak(Box::new(function_facts));
+}
+
+fn install_certified_route(ctx: &mut FoldingContext<'_>) {
+    let mut function_facts = ctx.inputs.function_facts.clone();
+    function_facts = function_facts.with_decompile_route(r2types::DecompileRouteFacts {
+        kind: r2types::DecompileRouteKind::Standard,
+        reason: Some("test certified Standard".to_string()),
+        fallback_comment: None,
+        skip_runtime_type_inference: true,
+        use_prepared_semantic_view: true,
+        proof_coverage: r2sym::ProofCoverage::default(),
+        render_permission: r2sym::RenderPermission::certified(
+            r2sym::ProofOwner::R2engine,
+            "test certified Standard",
+        ),
+    });
+    ctx.inputs.function_facts = Box::leak(Box::new(function_facts));
+    ctx.inputs.certified_rendering_required = false;
 }
 
 fn install_call_owner(
@@ -225,6 +243,30 @@ fn tmp_flag_aliases_reconstruct_signed_ge_condition() {
 }
 
 #[test]
+fn symbolic_condition_parser_accepts_boolean_and_deref_terms() {
+    let ctx = FoldingContext::new(64);
+
+    assert_eq!(
+        super::SymbolicConditionExprParser::new(&ctx, "false")
+            .and_then(super::SymbolicConditionExprParser::parse),
+        Some(CExpr::IntLit(0))
+    );
+    assert_eq!(
+        super::SymbolicConditionExprParser::new(&ctx, "*(arg0 + 0x8) == 0x2a")
+            .and_then(super::SymbolicConditionExprParser::parse),
+        Some(CExpr::binary(
+            BinaryOp::Eq,
+            CExpr::deref(CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("arg0".to_string()),
+                CExpr::IntLit(0x8),
+            )),
+            CExpr::IntLit(0x2a),
+        ))
+    );
+}
+
+#[test]
 fn exact_compiled_condition_shortcuts_to_literal_condition() {
     let arch = make_test_arch_x86_64();
     let mut entry = R2ILBlock::new(0x1000, 4);
@@ -272,16 +314,21 @@ fn exact_compiled_condition_shortcuts_to_literal_condition() {
         )],
         Vec::new(),
     );
-    ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
-        crate::test_native_semantic_artifact(
-            r2sym::RefinementStage::Compiled,
-            r2sym::ArtifactGranularity::WholeFunction,
-            r2sym::SliceClass::Worker,
-            false,
-            Vec::new(),
-            vec![region],
-        ),
-    ));
+    let artifact = crate::test_native_semantic_artifact(
+        r2sym::RefinementStage::Compiled,
+        r2sym::ArtifactGranularity::WholeFunction,
+        r2sym::SliceClass::Worker,
+        false,
+        Vec::new(),
+        vec![region],
+    );
+    assert!(
+        artifact
+            .actionable_compiled_condition_for_block(0x1000)
+            .is_some(),
+        "test artifact should carry an actionable compiled condition at the branch anchor"
+    );
+    install_semantic_artifact(&mut ctx, artifact);
 
     let entry = prepared.function().get_block(0x1000).expect("entry");
     assert_eq!(
@@ -290,7 +337,8 @@ fn exact_compiled_condition_shortcuts_to_literal_condition() {
     );
     assert_eq!(
         ctx.extract_condition_from_block(entry),
-        Some(CExpr::IntLit(0))
+        None,
+        "prepared branch rendering must require FunctionFacts control evidence instead of summary-only compiled conditions"
     );
 }
 
@@ -377,7 +425,7 @@ fn actionable_control_island_shortcuts_when_branch_fact_is_not_decisive() {
             cache_hit: false,
         },
     };
-    ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
+    install_semantic_artifact(&mut ctx, artifact);
 
     let entry = prepared.function().get_block(0x2000).expect("entry");
     assert_eq!(
@@ -434,7 +482,8 @@ fn actionable_control_island_parses_non_literal_compiled_condition_expr() {
         )],
         Vec::new(),
     );
-    ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
+    install_semantic_artifact(
+        &mut ctx,
         crate::test_native_semantic_artifact(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::Regioned,
@@ -443,7 +492,7 @@ fn actionable_control_island_parses_non_literal_compiled_condition_expr() {
             Vec::new(),
             vec![region],
         ),
-    ));
+    );
 
     assert_eq!(
         ctx.symbolic_actionable_compiled_condition_expr(0x3000),
@@ -480,6 +529,7 @@ fn actionable_memory_island_parses_memory_condition_expr() {
     let prepared =
         prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("memory_island");
     let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+    install_certified_route(&mut ctx);
     let region = crate::test_semantic_region(
         0x4000,
         std::collections::BTreeSet::new(),
@@ -500,27 +550,38 @@ fn actionable_memory_island_parses_memory_condition_expr() {
             r2sym::SemanticEvidence::exact(),
         )],
     );
-    ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
-        crate::test_native_semantic_artifact(
-            r2sym::RefinementStage::Residual,
-            r2sym::ArtifactGranularity::Regioned,
-            r2sym::SliceClass::Worker,
-            true,
-            vec![r2sym::ResidualReason::LargeCfg],
-            vec![region],
-        ),
-    ));
+    let artifact = crate::test_native_semantic_artifact(
+        r2sym::RefinementStage::Residual,
+        r2sym::ArtifactGranularity::Regioned,
+        r2sym::SliceClass::Worker,
+        true,
+        vec![r2sym::ResidualReason::LargeCfg],
+        vec![region],
+    );
+    assert!(
+        !artifact
+            .actionable_memory_terms_for_block(0x4000)
+            .is_empty(),
+        "test artifact should carry actionable memory terms at the branch anchor"
+    );
+    install_semantic_artifact(&mut ctx, artifact);
 
+    let expected = CExpr::binary(
+        BinaryOp::Eq,
+        CExpr::deref(CExpr::binary(
+            BinaryOp::Add,
+            CExpr::Var("arg0".to_string()),
+            CExpr::IntLit(0x8),
+        )),
+        CExpr::IntLit(0x2a),
+    );
+    assert_eq!(
+        ctx.symbolic_actionable_memory_condition_expr(0x4000),
+        Some(expected)
+    );
     assert_eq!(
         ctx.extract_condition_from_block(prepared.function().get_block(0x4000).expect("entry")),
-        Some(CExpr::binary(
-            BinaryOp::Eq,
-            CExpr::deref(CExpr::binary(
-                BinaryOp::Add,
-                CExpr::Var("arg0".to_string()),
-                CExpr::IntLit(0x8),
-            )),
-            CExpr::IntLit(0x2a),
-        ))
+        None,
+        "prepared branch rendering must require FunctionFacts control evidence instead of summary-only memory conditions"
     );
 }

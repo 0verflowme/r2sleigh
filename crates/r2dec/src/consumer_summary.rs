@@ -1,4 +1,4 @@
-use crate::ast::{CFunction, CStmt, CType};
+use crate::ast::CStmt;
 use crate::codegen::{CodeGenConfig, CodeGenerator};
 use r2types::{CTypeLike, FunctionFacts, FunctionTypeFacts};
 use std::collections::BTreeSet;
@@ -113,34 +113,30 @@ pub(crate) fn certified_field_access_labels(type_facts: &FunctionTypeFacts) -> V
 pub(crate) fn render_for_route(
     func_name: &str,
     function_facts: &FunctionFacts,
-    route: &crate::planner::SemanticRoutePlan,
+    route: &r2types::DecompileRouteFacts,
     codegen_config: CodeGenConfig,
 ) -> Option<String> {
-    let (reason, route_kind) = match route {
-        crate::planner::SemanticRoutePlan::StructuredWorker { reason } => {
-            (reason, "structured_worker_summary")
+    let (reason, route_kind) = match route.kind {
+        r2types::DecompileRouteKind::StructuredWorker => {
+            (crate::route_reason(route), "structured_worker_summary")
         }
-        crate::planner::SemanticRoutePlan::LinearWorker { reason } => {
-            (reason, "native_linear_summary")
+        r2types::DecompileRouteKind::LinearWorker => {
+            (crate::route_reason(route), "native_linear_summary")
         }
-        crate::planner::SemanticRoutePlan::SummaryIslands { reason } => (reason, "summary_islands"),
+        r2types::DecompileRouteKind::SummaryIslands => {
+            (crate::route_reason(route), "summary_islands")
+        }
         _ => return None,
     };
     let semantic_artifact = function_facts.semantic_artifact()?;
-    let is_summary_island_route = matches!(
-        route,
-        crate::planner::SemanticRoutePlan::SummaryIslands { .. }
-    );
-    let is_structured_worker_route = matches!(
-        route,
-        crate::planner::SemanticRoutePlan::StructuredWorker { .. }
-    );
+    let is_summary_island_route = route.kind == r2types::DecompileRouteKind::SummaryIslands;
+    let is_structured_worker_route = route.kind == r2types::DecompileRouteKind::StructuredWorker;
     let is_residual_route = !is_summary_island_route
         && (matches!(semantic_artifact.stage, r2sym::RefinementStage::Residual)
             || !semantic_artifact.diagnostics.residual_reasons.is_empty());
     let claim_summary = semantic_artifact.semantic_claim_summary();
     let certified_out_param_count = function_facts
-        .types
+        .type_facts()
         .source_authorized_out_param_certificates()
         .count();
 
@@ -324,7 +320,7 @@ pub(crate) fn render_for_route(
     if function_facts.has_assumption_conflicts() {
         body.push(CStmt::comment(format!(
             "assumption conflicts: {}",
-            function_facts.assumption_usage.conflicts.len()
+            function_facts.assumption_usage().conflicts.len()
         )));
     }
     if function_facts.has_summary_conflicts() {
@@ -333,7 +329,7 @@ pub(crate) fn render_for_route(
         ));
     }
 
-    let certified_fields = certified_field_access_labels(&function_facts.types);
+    let certified_fields = certified_field_access_labels(function_facts.type_facts());
     if !certified_fields.is_empty() {
         body.push(CStmt::comment(format!(
             "certified field accesses: {}",
@@ -347,7 +343,7 @@ pub(crate) fn render_for_route(
                 "summary return: {return_relation:?}"
             )));
         }
-        let certified_out_params = certified_out_param_labels(&function_facts.types);
+        let certified_out_params = certified_out_param_labels(function_facts.type_facts());
         if !certified_out_params.is_empty() {
             body.push(CStmt::comment(format!(
                 "certified out params: {}",
@@ -393,22 +389,25 @@ pub(crate) fn render_for_route(
 
     crate::append_summary_return_if_needed(&mut body, function_facts, semantic_artifact);
 
-    let c_func = semantic_worker_summary_function(func_name, body);
     let mut codegen = CodeGenerator::new(codegen_config);
-    Some(crate::rewrite_summary_arg_labels(
-        codegen.generate_function(&c_func),
-        &function_facts.types,
-    ))
-}
-
-fn semantic_worker_summary_function(func_name: &str, body: Vec<CStmt>) -> CFunction {
-    CFunction {
-        name: func_name.to_string(),
-        ret_type: CType::Void,
-        params: Vec::new(),
-        locals: Vec::new(),
-        body,
+    let mut out = String::new();
+    out.push_str(&format!(
+        "/* summary-only route for {}; executable C refused: missing native render proof */\n",
+        crate::sanitize_comment_text(func_name)
+    ));
+    for stmt in body {
+        let rendered = codegen.generate_stmt(&stmt);
+        if !rendered.trim().is_empty() {
+            out.push_str(&rendered);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
     }
+    Some(crate::rewrite_summary_arg_labels(
+        out,
+        function_facts.type_facts(),
+    ))
 }
 
 #[cfg(test)]
@@ -514,8 +513,17 @@ mod tests {
         let output = render_for_route(
             "dbg.write_out",
             &function_facts,
-            &crate::planner::SemanticRoutePlan::LinearWorker {
-                reason: "test summary".to_string(),
+            &r2types::DecompileRouteFacts {
+                kind: r2types::DecompileRouteKind::LinearWorker,
+                reason: Some("test summary".to_string()),
+                fallback_comment: None,
+                skip_runtime_type_inference: true,
+                use_prepared_semantic_view: false,
+                proof_coverage: r2sym::ProofCoverage::default(),
+                render_permission: r2sym::RenderPermission::summary(
+                    r2sym::ProofOwner::R2engine,
+                    "test summary",
+                ),
             },
             CodeGenConfig::default(),
         )

@@ -25,3 +25,4 @@ r2 = ["r2pipe", "serde_json"]
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.6"
+serde_json.workspace = true

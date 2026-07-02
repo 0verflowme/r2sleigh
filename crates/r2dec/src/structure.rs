@@ -16,6 +16,7 @@ use crate::region::{Region, RegionAnalyzer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlRenderProofKind {
+    Branch,
     Loop,
     Switch,
 }
@@ -24,6 +25,8 @@ pub enum ControlRenderProofKind {
 pub struct ControlRenderProof {
     pub kind: ControlRenderProofKind,
     pub anchor: u64,
+    pub branch_condition: Option<PredicateId>,
+    pub branch_condition_value: Option<ValueId>,
     pub loop_condition: Option<PredicateId>,
     pub loop_condition_value: Option<ValueId>,
     pub loop_body_blocks: Vec<u64>,
@@ -39,6 +42,29 @@ impl ControlRenderProof {
         Self {
             kind,
             anchor,
+            branch_condition: None,
+            branch_condition_value: None,
+            loop_condition: None,
+            loop_condition_value: None,
+            loop_body_blocks: Vec::new(),
+            loop_latches: Vec::new(),
+            loop_exits: Vec::new(),
+            switch_selector: None,
+            switch_cases: Vec::new(),
+            switch_default: None,
+        }
+    }
+
+    fn branch_proof(
+        anchor: u64,
+        branch_condition: Option<PredicateId>,
+        branch_condition_value: Option<ValueId>,
+    ) -> Self {
+        Self {
+            kind: ControlRenderProofKind::Branch,
+            anchor,
+            branch_condition,
+            branch_condition_value,
             loop_condition: None,
             loop_condition_value: None,
             loop_body_blocks: Vec::new(),
@@ -61,6 +87,8 @@ impl ControlRenderProof {
         Self {
             kind: ControlRenderProofKind::Loop,
             anchor,
+            branch_condition: None,
+            branch_condition_value: None,
             loop_condition,
             loop_condition_value,
             loop_body_blocks,
@@ -81,6 +109,8 @@ impl ControlRenderProof {
         Self {
             kind: ControlRenderProofKind::Switch,
             anchor,
+            branch_condition: None,
+            branch_condition_value: None,
             loop_condition: None,
             loop_condition_value: None,
             loop_body_blocks: Vec::new(),
@@ -207,6 +237,43 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         &self.control_render_proofs
     }
 
+    fn record_branch_render_proof(
+        &mut self,
+        anchor: u64,
+        condition: Option<PredicateId>,
+        condition_value: Option<ValueId>,
+    ) {
+        self.control_render_proofs
+            .push(ControlRenderProof::branch_proof(
+                anchor,
+                condition,
+                condition_value,
+            ));
+    }
+
+    fn branch_render_proof(
+        &self,
+        anchor: u64,
+        condition: Option<PredicateId>,
+        condition_value: Option<ValueId>,
+    ) -> ControlRenderProof {
+        ControlRenderProof::branch_proof(anchor, condition, condition_value)
+    }
+
+    fn certified_branch_render_proof(
+        &self,
+        anchor: u64,
+        condition: Option<PredicateId>,
+        condition_value: Option<ValueId>,
+    ) -> Option<ControlRenderProof> {
+        let proof = self.branch_render_proof(anchor, condition, condition_value);
+        let predicate = self.fold_ctx.control_facts()?.branch_for_block(anchor)?;
+        (predicate.comparison.is_some()
+            && Some(predicate.id) == proof.branch_condition
+            && Some(predicate.condition) == proof.branch_condition_value)
+            .then_some(proof)
+    }
+
     fn record_loop_render_proof(
         &mut self,
         anchor: u64,
@@ -214,17 +281,50 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         condition_value: Option<ValueId>,
         body: &Region,
     ) {
+        let proof = self.loop_render_proof(anchor, condition, condition_value, body);
+        self.control_render_proofs.push(proof);
+    }
+
+    fn loop_render_proof(
+        &self,
+        anchor: u64,
+        condition: Option<PredicateId>,
+        condition_value: Option<ValueId>,
+        body: &Region,
+    ) -> ControlRenderProof {
         let loop_body_blocks = self.canonical_loop_body_blocks(anchor, body);
         let (loop_latches, loop_exits) = self.rendered_loop_edges(anchor, &loop_body_blocks);
-        self.control_render_proofs
-            .push(ControlRenderProof::loop_proof(
-                anchor,
-                condition,
-                condition_value,
-                loop_body_blocks,
-                loop_latches,
-                loop_exits,
-            ));
+        ControlRenderProof::loop_proof(
+            anchor,
+            condition,
+            condition_value,
+            loop_body_blocks,
+            loop_latches,
+            loop_exits,
+        )
+    }
+
+    fn certified_loop_render_proof(
+        &self,
+        anchor: u64,
+        condition: Option<PredicateId>,
+        condition_value: Option<ValueId>,
+        body: &Region,
+    ) -> Option<ControlRenderProof> {
+        let proof = self.loop_render_proof(anchor, condition, condition_value, body);
+        let facts = self.fold_ctx.control_facts()?;
+        facts
+            .loops
+            .values()
+            .any(|fact| {
+                fact.header == proof.anchor
+                    && fact.condition == proof.loop_condition
+                    && fact.condition_value == proof.loop_condition_value
+                    && fact.body == proof.loop_body_blocks
+                    && fact.latches == proof.loop_latches
+                    && fact.exits == proof.loop_exits
+            })
+            .then_some(proof)
     }
 
     fn canonical_loop_body_blocks(&self, anchor: u64, body: &Region) -> Vec<u64> {
@@ -247,19 +347,43 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         cases: &[(Option<u64>, Box<Region>)],
         default: Option<&Region>,
     ) {
+        let proof = self.switch_render_proof(anchor, selector, cases, default);
+        self.control_render_proofs.push(proof);
+    }
+
+    fn switch_render_proof(
+        &self,
+        anchor: u64,
+        selector: Option<ValueId>,
+        cases: &[(Option<u64>, Box<Region>)],
+        default: Option<&Region>,
+    ) -> ControlRenderProof {
         let mut switch_cases = cases
             .iter()
             .filter_map(|(value, region)| value.map(|value| (value, region.entry())))
             .collect::<Vec<_>>();
         switch_cases.sort_unstable();
         let switch_default = default.map(Region::entry);
-        self.control_render_proofs
-            .push(ControlRenderProof::switch_proof(
-                anchor,
-                selector,
-                switch_cases,
-                switch_default,
-            ));
+        ControlRenderProof::switch_proof(anchor, selector, switch_cases, switch_default)
+    }
+
+    fn certified_switch_render_proof(
+        &self,
+        anchor: u64,
+        selector: Option<ValueId>,
+        cases: &[(Option<u64>, Box<Region>)],
+        default: Option<&Region>,
+    ) -> Option<ControlRenderProof> {
+        let proof = self.switch_render_proof(anchor, selector, cases, default);
+        let facts = self.fold_ctx.control_facts()?;
+        facts.switches.get(&anchor).and_then(|fact| {
+            let mut fact_cases = fact.cases.clone();
+            fact_cases.sort_unstable();
+            (fact.selector == proof.switch_selector
+                && fact_cases == proof.switch_cases
+                && fact.default == proof.switch_default)
+                .then_some(proof)
+        })
     }
 
     fn sorted_region_blocks_with_anchor(anchor: u64, region: &Region) -> Vec<u64> {
@@ -293,6 +417,21 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Structure the function's control flow.
     pub fn structure(&mut self) -> CStmt {
+        let stmt = self.structure_preserving_render_proof_identity();
+        if self.safety_reason.is_some() {
+            return CStmt::Empty;
+        }
+        // Post-process: flatten, simplify loops, remove redundant control flow.
+        Self::cleanup(stmt)
+    }
+
+    /// Structure control flow without post-proof AST rewrites.
+    ///
+    /// Certified rendering validates final executable control nodes against the
+    /// `FunctionFacts` proof identities recorded while structuring. Cleanup can
+    /// invert, merge, synthesize, or delete control nodes, so certified callers
+    /// must validate the unrewritten AST or residualize.
+    pub(crate) fn structure_preserving_render_proof_identity(&mut self) -> CStmt {
         self.reset_safety_budget();
         self.control_render_proofs.clear();
         if self.region_analyzer.is_none() {
@@ -315,8 +454,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if self.safety_reason.is_some() {
             return CStmt::Empty;
         }
-        // Post-process: flatten, simplify loops, remove redundant control flow
-        Self::cleanup(stmt)
+        stmt
     }
 
     /// Structure a region into C statements.
@@ -346,21 +484,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 else_region,
                 merge_block,
             } => {
-                if let Some(rewritten) = self.try_structure_symbolic_actionable_if(
-                    *cond_block,
-                    then_region,
-                    else_region.as_deref(),
-                    *merge_block,
-                ) {
-                    return rewritten;
-                }
-                if let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
-                    *cond_block,
-                    then_region,
-                    else_region.as_deref(),
-                    *merge_block,
-                ) {
-                    return rewritten;
+                if !self.fold_ctx.requires_certified_rendering() {
+                    if let Some(rewritten) = self.try_structure_symbolic_actionable_if(
+                        *cond_block,
+                        then_region,
+                        else_region.as_deref(),
+                        *merge_block,
+                    ) {
+                        return rewritten;
+                    }
+                    if let Some(rewritten) = self.try_structure_if_else_with_slot_merge_returns(
+                        *cond_block,
+                        then_region,
+                        else_region.as_deref(),
+                        *merge_block,
+                    ) {
+                        return rewritten;
+                    }
                 }
                 if let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
                     *cond_block,
@@ -370,15 +510,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 ) {
                     return rewritten;
                 }
-                if let Some(rewritten) = self.try_structure_guarded_switch_with_default(
-                    *cond_block,
-                    then_region,
-                    else_region.as_deref(),
-                    *merge_block,
-                ) {
+                if !self.fold_ctx.requires_certified_rendering()
+                    && let Some(rewritten) = self.try_structure_guarded_switch_with_default(
+                        *cond_block,
+                        then_region,
+                        else_region.as_deref(),
+                        *merge_block,
+                    )
+                {
                     return rewritten;
                 }
-                let Some(mut cond) = self.get_branch_condition(*cond_block) else {
+                let (cond, predicate, condition_value) =
+                    self.get_branch_condition_with_predicate(*cond_block);
+                let Some(mut cond) = cond else {
                     let mut prefix = self.structure_block_prefix_stmts(*cond_block);
                     prefix.push(CStmt::comment(format!(
                         "r2dec residual: unresolved branch condition at 0x{cond_block:x}"
@@ -398,6 +542,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     )
                 {
                     cond = Self::negate_condition(cond);
+                }
+                if self.fold_ctx.requires_certified_rendering() {
+                    let Some(proof) =
+                        self.certified_branch_render_proof(*cond_block, predicate, condition_value)
+                    else {
+                        return CStmt::Block(vec![CStmt::comment(format!(
+                            "r2dec residual: uncertified branch structure at 0x{cond_block:x}"
+                        ))]);
+                    };
+                    self.control_render_proofs.push(proof);
+                } else {
+                    self.record_branch_render_proof(*cond_block, predicate, condition_value);
                 }
                 let then_stmt = self.structure_branch_region(*cond_block, then_region);
                 let else_stmt = else_region
@@ -429,7 +585,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         "r2dec residual: unresolved loop condition at 0x{header:x}"
                     ))]);
                 };
-                self.record_loop_render_proof(*header, predicate, condition_value, body);
+                if self.fold_ctx.requires_certified_rendering() {
+                    let Some(proof) =
+                        self.certified_loop_render_proof(*header, predicate, condition_value, body)
+                    else {
+                        return CStmt::Block(vec![CStmt::comment(format!(
+                            "r2dec residual: uncertified loop structure at 0x{header:x}"
+                        ))]);
+                    };
+                    self.control_render_proofs.push(proof);
+                } else {
+                    self.record_loop_render_proof(*header, predicate, condition_value, body);
+                }
                 let body_stmt = self.structure_loop_body(body);
                 CStmt::while_loop(cond, body_stmt)
             }
@@ -441,7 +608,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         "r2dec residual: unresolved loop condition at 0x{cond_block:x}"
                     ))]);
                 };
-                self.record_loop_render_proof(body.entry(), predicate, condition_value, body);
+                let anchor = body.entry();
+                if self.fold_ctx.requires_certified_rendering() {
+                    let Some(proof) =
+                        self.certified_loop_render_proof(anchor, predicate, condition_value, body)
+                    else {
+                        return CStmt::Block(vec![CStmt::comment(format!(
+                            "r2dec residual: uncertified loop structure at 0x{anchor:x}"
+                        ))]);
+                    };
+                    self.control_render_proofs.push(proof);
+                } else {
+                    self.record_loop_render_proof(anchor, predicate, condition_value, body);
+                }
                 let body_stmt = self.structure_loop_body(body);
                 CStmt::DoWhile {
                     body: Box::new(body_stmt),
@@ -534,12 +713,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if let Some(vm_step) = self
             .fold_ctx
             .inputs
-            .semantic_artifact
+            .semantic_artifact()
             .and_then(|artifact| artifact.vm_step_for_dispatch_header(switch_addr))
             .or_else(|| {
                 self.fold_ctx
                     .inputs
-                    .semantic_artifact
+                    .semantic_artifact()
                     .and_then(|artifact| artifact.vm_transfer_for_dispatch_header(switch_addr))
             })
             && let Some(selector) = vm_step.selector.as_ref()
@@ -646,7 +825,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 "r2dec residual: unresolved switch case value at 0x{switch_block:x}"
             ))]);
         }
-        self.record_switch_render_proof(switch_block, switch_selector, cases, default);
+        if self.fold_ctx.requires_certified_rendering() {
+            let Some(proof) =
+                self.certified_switch_render_proof(switch_block, switch_selector, cases, default)
+            else {
+                return CStmt::Block(vec![CStmt::comment(format!(
+                    "r2dec residual: uncertified switch structure at 0x{switch_block:x}"
+                ))]);
+            };
+            self.control_render_proofs.push(proof);
+        } else {
+            self.record_switch_render_proof(switch_block, switch_selector, cases, default);
+        }
 
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
@@ -655,9 +845,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             };
             let value_expr = CExpr::IntLit(*case_value as i64);
             let case_stmt = self.structure_region(case_region);
+            let body = if self.fold_ctx.requires_certified_rendering() {
+                vec![case_stmt]
+            } else {
+                vec![case_stmt, CStmt::Break]
+            };
             switch_cases.push(crate::ast::SwitchCase {
                 value: value_expr,
-                body: vec![case_stmt, CStmt::Break],
+                body,
             });
         }
 
@@ -715,7 +910,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn symbolic_exact_reachable_target(&self, cond_block: u64) -> Option<u64> {
         self.fold_ctx
             .inputs
-            .semantic_artifact?
+            .semantic_artifact()?
             .exact_reachable_target_for_block(cond_block)
     }
 
@@ -723,7 +918,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn symbolic_actionable_reachable_target(&self, cond_block: u64) -> Option<u64> {
         self.fold_ctx
             .inputs
-            .semantic_artifact?
+            .semantic_artifact()?
             .actionable_reachable_target_for_block(cond_block)
     }
 
@@ -1065,6 +1260,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         if let Some(cond) = self.fold_ctx.extract_condition_from_block(block) {
             return (Some(cond), predicate_id, condition_value);
+        }
+        if self.fold_ctx.requires_certified_rendering() {
+            return (None, predicate_id, condition_value);
         }
 
         // Look for a conditional branch in the block
@@ -1702,6 +1900,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         else_region: Option<&Region>,
         merge_block: Option<u64>,
     ) -> Option<CStmt> {
+        if self.fold_ctx.requires_certified_rendering() {
+            return None;
+        }
         let merge_block = merge_block?;
         let else_region = else_region?;
 
@@ -1752,11 +1953,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         }
 
+        let (cond, predicate, condition_value) =
+            self.get_branch_condition_with_predicate(cond_block);
+        let cond = cond?;
         let if_stmt = CStmt::If {
-            cond: self.get_branch_condition(cond_block)?,
+            cond,
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
+        self.record_branch_render_proof(cond_block, predicate, condition_value);
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
         prefix.push(if_stmt);
         Some(if prefix.len() == 1 {
@@ -1818,11 +2023,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return None;
         }
 
+        let (cond, predicate, condition_value) =
+            self.get_branch_condition_with_predicate(cond_block);
+        let cond = cond?;
+        let branch_proof = if self.fold_ctx.requires_certified_rendering() {
+            Some(self.certified_branch_render_proof(cond_block, predicate, condition_value)?)
+        } else {
+            None
+        };
         let if_stmt = CStmt::If {
-            cond: self.get_branch_condition(cond_block)?,
+            cond,
             then_body: Box::new(then_stmt),
             else_body: Some(Box::new(else_stmt)),
         };
+        if let Some(proof) = branch_proof {
+            self.control_render_proofs.push(proof);
+        } else {
+            self.record_branch_render_proof(cond_block, predicate, condition_value);
+        }
         let mut prefix = self.structure_block_prefix_stmts(cond_block);
         prefix.push(if_stmt);
         Some(if prefix.len() == 1 {
@@ -2027,6 +2245,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         pred_addr: u64,
         summary: &crate::analysis::FrameSlotMergeSummary,
     ) -> Option<CStmt> {
+        if self.fold_ctx.requires_certified_rendering() {
+            return None;
+        }
         let mut visited = std::collections::HashSet::new();
         let expr = summary
             .incoming
@@ -2209,9 +2430,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             // do not let an earlier synthesized return expression beat the merged value.
             CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(merged.clone()))),
             CStmt::Comment(reason)
-                if reason.starts_with(
-                    "r2sleigh residual: unresolved value return for control-only exit",
-                ) =>
+                if !self.fold_ctx.requires_certified_rendering()
+                    && reason.starts_with(
+                        "r2sleigh residual: unresolved value return for control-only exit",
+                    ) =>
             {
                 Some(CStmt::Return(Some(merged.clone())))
             }
@@ -3575,7 +3797,7 @@ mod tests {
     use crate::fold::FoldingContext;
     use crate::region::Region;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
-    use r2ssa::{BlockTerminator, SSAFunction};
+    use r2ssa::{BlockTerminator, SSAFunction, SsaArtifact};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn v(name: &str) -> CExpr {
@@ -3588,6 +3810,57 @@ mod tests {
 
     fn assign(lhs: &str, rhs: CExpr) -> CStmt {
         expr_stmt(CExpr::assign(v(lhs), rhs))
+    }
+
+    fn test_structured_worker_route(reason: &str) -> r2types::DecompileRouteFacts {
+        r2types::DecompileRouteFacts {
+            kind: r2types::DecompileRouteKind::StructuredWorker,
+            reason: Some(reason.to_string()),
+            fallback_comment: None,
+            skip_runtime_type_inference: true,
+            use_prepared_semantic_view: false,
+            proof_coverage: r2sym::ProofCoverage::default(),
+            render_permission: r2sym::RenderPermission::summary(
+                r2sym::ProofOwner::R2engine,
+                reason,
+            ),
+        }
+    }
+
+    fn certified_standard_route_for_test(reason: &str) -> r2types::DecompileRouteFacts {
+        r2types::DecompileRouteFacts {
+            kind: r2types::DecompileRouteKind::Standard,
+            reason: Some(reason.to_string()),
+            fallback_comment: None,
+            skip_runtime_type_inference: true,
+            use_prepared_semantic_view: true,
+            proof_coverage: r2sym::ProofCoverage::default(),
+            render_permission: r2sym::RenderPermission::certified(
+                r2sym::ProofOwner::R2engine,
+                reason,
+            ),
+        }
+    }
+
+    fn install_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
+        ctx.inputs.function_facts = Box::leak(Box::new(facts));
+        ctx.inputs.certified_rendering_required = false;
+    }
+
+    fn install_semantic_artifact(ctx: &mut FoldingContext<'_>, artifact: r2sym::SemanticArtifact) {
+        let mut function_facts = ctx.inputs.function_facts.clone();
+        function_facts.set_semantics(Some(artifact));
+        install_function_facts(ctx, function_facts);
+    }
+
+    fn certified_function_facts(
+        control: r2types::FunctionControlFacts,
+        render: r2types::FunctionRenderFacts,
+    ) -> r2types::FunctionFacts {
+        r2types::FunctionFacts::default()
+            .with_control(control)
+            .with_render(render)
+            .with_decompile_route(certified_standard_route_for_test("test certified Standard"))
     }
 
     fn test_arch() -> ArchSpec {
@@ -3677,6 +3950,42 @@ mod tests {
         .with_name("switch_unrelated_sub_demo")
     }
 
+    fn prepared_with_switch_block_and_cases() -> SsaArtifact {
+        let mut switch_block = R2ILBlock::new(0x1000, 4);
+        switch_block.push(R2ILOp::BranchInd {
+            target: Varnode::register(0x10, 8),
+        });
+        switch_block.set_switch_info(r2il::SwitchInfo {
+            switch_addr: 0x1000,
+            min_val: 0,
+            max_val: 1,
+            default_target: None,
+            cases: vec![
+                r2il::SwitchCase {
+                    value: 0,
+                    target: 0x1010,
+                },
+                r2il::SwitchCase {
+                    value: 1,
+                    target: 0x1020,
+                },
+            ],
+        });
+
+        let mut case_zero = R2ILBlock::new(0x1010, 4);
+        case_zero.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut case_one = R2ILBlock::new(0x1020, 4);
+        case_one.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+
+        SsaArtifact::for_decompile(&[switch_block, case_zero, case_one], Some(&test_arch()))
+            .expect("prepared switch artifact")
+            .with_name("certified_switch_structuring")
+    }
+
     fn function_with_conditional_return_blocks(
         cond_block: u64,
         true_target: u64,
@@ -3706,6 +4015,162 @@ mod tests {
         SSAFunction::from_blocks_with_arch(&[cond, false_block, true_block], Some(&test_arch()))
             .expect("ssa function")
             .with_name("worker_structured_demo")
+    }
+
+    fn prepared_with_conditional_return_blocks(
+        cond_block: u64,
+        true_target: u64,
+        false_target: u64,
+    ) -> SsaArtifact {
+        let mut cond = R2ILBlock::new(cond_block, 4);
+        cond.push(R2ILOp::IntEqual {
+            dst: Varnode::register(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        cond.push(R2ILOp::CBranch {
+            target: Varnode::constant(true_target, 8),
+            cond: Varnode::register(0x80, 1),
+        });
+
+        let mut false_block = R2ILBlock::new(false_target, 4);
+        false_block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+
+        let mut true_block = R2ILBlock::new(true_target, 4);
+        true_block.push(R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+
+        SsaArtifact::for_decompile(&[cond, false_block, true_block], Some(&test_arch()))
+            .expect("prepared ssa artifact")
+            .with_name("certified_branch_structuring")
+    }
+
+    fn prepared_with_guarded_while_loop() -> SsaArtifact {
+        let mut header = R2ILBlock::new(0x1000, 4);
+        header.push(R2ILOp::IntEqual {
+            dst: Varnode::register(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::register(0x80, 1),
+        });
+
+        let mut body = R2ILBlock::new(0x1004, 4);
+        body.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1000, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x1008, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+
+        SsaArtifact::for_decompile(&[header, body, exit], Some(&test_arch()))
+            .expect("prepared while artifact")
+            .with_name("certified_loop_structuring")
+    }
+
+    fn render_facts_for_prepared(prepared: &SsaArtifact) -> r2types::FunctionRenderFacts {
+        r2types::FunctionRenderFacts {
+            expressions: prepared
+                .certificates()
+                .expressions
+                .iter()
+                .map(|(value, cert)| {
+                    (
+                        *value,
+                        r2types::ExpressionRenderFact {
+                            value: cert.value,
+                            defining_inst: cert.defining_inst,
+                            width: cert.width,
+                            renderable: cert.renderable,
+                        },
+                    )
+                })
+                .collect(),
+            ..r2types::FunctionRenderFacts::default()
+        }
+    }
+
+    fn control_facts_for_guarded_while_loop(
+        prepared: &SsaArtifact,
+        include_loop: bool,
+    ) -> r2types::FunctionControlFacts {
+        let predicate = prepared
+            .predicates()
+            .predicates
+            .values()
+            .find(|predicate| predicate.block_addr == 0x1000)
+            .expect("loop header predicate");
+        let mut facts = r2types::FunctionControlFacts::default();
+        facts.branch_predicates.insert(
+            0x1000,
+            r2types::BranchPredicateFact {
+                id: predicate.id,
+                block_addr: predicate.block_addr,
+                condition: predicate.condition,
+                comparison: predicate.comparison.as_ref().map(|comparison| {
+                    r2types::PredicateComparisonFact {
+                        kind: comparison.kind,
+                        lhs: comparison.lhs,
+                        rhs: comparison.rhs,
+                    }
+                }),
+                true_target: predicate.true_target,
+                false_target: predicate.false_target,
+            },
+        );
+        if include_loop {
+            facts.loops.insert(
+                r2ssa::LoopId(0),
+                r2types::LoopStructureFact {
+                    loop_id: r2ssa::LoopId(0),
+                    proof_node: "FunctionFacts.loop:LoopId(0)".to_string(),
+                    header: 0x1000,
+                    condition: Some(predicate.id),
+                    condition_value: Some(predicate.condition),
+                    body: vec![0x1000, 0x1004],
+                    latches: vec![0x1004],
+                    exits: vec![0x1008],
+                },
+            );
+        }
+        facts
+    }
+
+    fn control_facts_for_switch(
+        prepared: &SsaArtifact,
+        include_cases: bool,
+    ) -> r2types::FunctionControlFacts {
+        let selector = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.eq_ignore_ascii_case("rdi") && value.var.version == 0)
+            .map(|value| value.id)
+            .expect("rdi selector value");
+        r2types::FunctionControlFacts {
+            switches: BTreeMap::from([(
+                0x1000,
+                r2types::SwitchSelectorFact {
+                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x1000).to_string(),
+                    block_addr: 0x1000,
+                    selector: Some(selector),
+                    cases: if include_cases {
+                        vec![(0, 0x1010), (1, 0x1020)]
+                    } else {
+                        Vec::new()
+                    },
+                    default: None,
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        }
     }
 
     fn function_with_multi_block_true_arm(
@@ -3988,6 +4453,144 @@ mod tests {
             values,
             vec![0, 1, 2],
             "switch rendering must not bias canonical case values from nearby arithmetic"
+        );
+    }
+
+    #[test]
+    fn certified_branch_structuring_requires_function_facts_predicate() {
+        let prepared = prepared_with_conditional_return_blocks(0x1000, 0x1010, 0x1004);
+        let mut function_facts = r2types::FunctionFacts::default();
+        function_facts.attach_prepared_decompile_evidence(&prepared);
+
+        let mut certified_ctx = FoldingContext::new(64);
+        certified_ctx.inputs.prepared_ssa = Some(&prepared);
+        function_facts.set_render(render_facts_for_prepared(&prepared));
+        install_function_facts(
+            &mut certified_ctx,
+            function_facts
+                .with_decompile_route(certified_standard_route_for_test("test certified branch")),
+        );
+        let mut certified_structurer =
+            ControlFlowStructurer::new(prepared.function(), &certified_ctx);
+        let certified_stmt = certified_structurer.structure();
+        assert!(
+            stmt_contains_if(&certified_stmt),
+            "FunctionFacts branch predicate should authorize structured if output, got {certified_stmt:?}"
+        );
+
+        let mut missing_control_ctx = FoldingContext::new(64);
+        missing_control_ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_facts(
+            &mut missing_control_ctx,
+            r2types::FunctionFacts::default()
+                .with_render(render_facts_for_prepared(&prepared))
+                .with_decompile_route(certified_standard_route_for_test(
+                    "test certified missing branch proof",
+                )),
+        );
+        let mut missing_control_structurer =
+            ControlFlowStructurer::new(prepared.function(), &missing_control_ctx);
+        let missing_control_stmt = missing_control_structurer.structure();
+
+        assert!(
+            !stmt_contains_if(&missing_control_stmt),
+            "certified branch structuring must not use local CBranch extraction without FunctionFacts control proof: {missing_control_stmt:?}"
+        );
+        assert!(
+            stmt_contains_comment(&missing_control_stmt, "unresolved branch condition"),
+            "missing FunctionFacts control proof should residualize the branch, got {missing_control_stmt:?}"
+        );
+    }
+
+    #[test]
+    fn certified_loop_structuring_requires_function_facts_loop_structure() {
+        let prepared = prepared_with_guarded_while_loop();
+        let region = Region::WhileLoop {
+            header: 0x1000,
+            body: Box::new(Region::Block(0x1004)),
+        };
+
+        let certified_control = control_facts_for_guarded_while_loop(&prepared, true);
+        let mut certified_ctx = FoldingContext::new(64);
+        certified_ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_facts(
+            &mut certified_ctx,
+            certified_function_facts(certified_control, render_facts_for_prepared(&prepared)),
+        );
+        let mut certified_structurer =
+            ControlFlowStructurer::new(prepared.function(), &certified_ctx);
+        let certified_stmt = certified_structurer.structure_region(&region);
+        assert!(
+            stmt_contains_loop(&certified_stmt),
+            "FunctionFacts loop structure should authorize while output, got {certified_stmt:?}"
+        );
+
+        let missing_loop_control = control_facts_for_guarded_while_loop(&prepared, false);
+        let mut missing_loop_ctx = FoldingContext::new(64);
+        missing_loop_ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_facts(
+            &mut missing_loop_ctx,
+            certified_function_facts(missing_loop_control, render_facts_for_prepared(&prepared)),
+        );
+        let mut missing_loop_structurer =
+            ControlFlowStructurer::new(prepared.function(), &missing_loop_ctx);
+        let missing_loop_stmt = missing_loop_structurer.structure_region(&region);
+        assert!(
+            !stmt_contains_loop(&missing_loop_stmt),
+            "certified loop structuring must not render while from branch proof alone: {missing_loop_stmt:?}"
+        );
+        assert!(
+            stmt_contains_comment(&missing_loop_stmt, "uncertified loop structure"),
+            "missing FunctionFacts loop proof should residualize the loop, got {missing_loop_stmt:?}"
+        );
+    }
+
+    #[test]
+    fn certified_switch_structuring_requires_function_facts_case_targets() {
+        let prepared = prepared_with_switch_block_and_cases();
+        let cases = vec![
+            (Some(0), Box::new(Region::Block(0x1010))),
+            (Some(1), Box::new(Region::Block(0x1020))),
+        ];
+
+        let certified_control = control_facts_for_switch(&prepared, true);
+        let mut certified_ctx = FoldingContext::new(64);
+        certified_ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_facts(
+            &mut certified_ctx,
+            certified_function_facts(certified_control, render_facts_for_prepared(&prepared)),
+        );
+        let mut certified_structurer =
+            ControlFlowStructurer::new(prepared.function(), &certified_ctx);
+        let certified_stmt =
+            certified_structurer.structure_switch_region(0x1000, &cases, None, None);
+        assert!(
+            first_switch_case_values(&certified_stmt).is_some(),
+            "FunctionFacts switch selector/cases should authorize switch output, got {certified_stmt:?}"
+        );
+        assert!(
+            !ControlFlowStructurer::stmt_contains_control_transfer(&certified_stmt),
+            "certified switch structuring must not synthesize case exits without exact transfer facts: {certified_stmt:?}"
+        );
+
+        let selector_only_control = control_facts_for_switch(&prepared, false);
+        let mut selector_only_ctx = FoldingContext::new(64);
+        selector_only_ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_facts(
+            &mut selector_only_ctx,
+            certified_function_facts(selector_only_control, render_facts_for_prepared(&prepared)),
+        );
+        let mut selector_only_structurer =
+            ControlFlowStructurer::new(prepared.function(), &selector_only_ctx);
+        let selector_only_stmt =
+            selector_only_structurer.structure_switch_region(0x1000, &cases, None, None);
+        assert!(
+            first_switch_case_values(&selector_only_stmt).is_none(),
+            "certified switch structuring must not render switch cases from selector proof alone: {selector_only_stmt:?}"
+        );
+        assert!(
+            stmt_contains_comment(&selector_only_stmt, "uncertified switch structure"),
+            "missing FunctionFacts switch case proof should residualize the switch, got {selector_only_stmt:?}"
         );
     }
 
@@ -5178,7 +5781,7 @@ mod tests {
                 cache_hit: false,
             },
         };
-        ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
+        install_semantic_artifact(&mut ctx, artifact);
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         assert_eq!(
@@ -5214,7 +5817,8 @@ mod tests {
             ],
             Vec::new(),
         );
-        ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
+        install_semantic_artifact(
+            &mut ctx,
             crate::test_native_semantic_artifact(
                 r2sym::RefinementStage::Compiled,
                 r2sym::ArtifactGranularity::Regioned,
@@ -5223,12 +5827,77 @@ mod tests {
                 Vec::new(),
                 vec![region],
             ),
-        ));
+        );
 
         let structurer = ControlFlowStructurer::new(&func, &ctx);
         assert_eq!(
             structurer.symbolic_exact_reachable_target(0x2000),
             Some(0x2004)
+        );
+    }
+
+    #[test]
+    fn certified_structuring_refuses_symbolic_exact_target_branch_elision() {
+        let func = function_with_conditional_return_blocks(0x2000, 0x2004, 0x2008);
+        let mut ctx = FoldingContext::new(64);
+        install_function_facts(
+            &mut ctx,
+            r2types::FunctionFacts::default().with_decompile_route(
+                certified_standard_route_for_test("test certified exact target refusal"),
+            ),
+        );
+        let region = crate::test_semantic_region(
+            0x2000,
+            BTreeSet::from([0x2004, 0x2008]),
+            vec![
+                crate::test_control_fact(
+                    0x2004,
+                    r2sym::SymbolicReachabilityStatus::Reachable,
+                    Some(true),
+                    Some("x == 0"),
+                    None,
+                    r2sym::SemanticEvidence::exact(),
+                ),
+                crate::test_control_fact(
+                    0x2008,
+                    r2sym::SymbolicReachabilityStatus::Unreachable,
+                    Some(false),
+                    Some("!(x == 0)"),
+                    None,
+                    r2sym::SemanticEvidence::exact(),
+                ),
+            ],
+            Vec::new(),
+        );
+        install_semantic_artifact(
+            &mut ctx,
+            crate::test_native_semantic_artifact(
+                r2sym::RefinementStage::Compiled,
+                r2sym::ArtifactGranularity::Regioned,
+                r2sym::SliceClass::Worker,
+                false,
+                Vec::new(),
+                vec![region],
+            ),
+        );
+
+        let region = Region::IfThenElse {
+            cond_block: 0x2000,
+            then_region: Box::new(Region::Block(0x2004)),
+            else_region: Some(Box::new(Region::Block(0x2008))),
+            merge_block: None,
+        };
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let stmt = structurer.structure_region(&region);
+
+        assert!(
+            !stmt_contains_if(&stmt),
+            "certified mode must not elide or render a branch from r2sym exact target side-channel proof: {stmt:?}"
+        );
+        assert!(
+            stmt_contains_comment(&stmt, "unresolved branch condition")
+                || stmt_contains_comment(&stmt, "uncertified branch structure"),
+            "missing FunctionFacts control proof should residualize exact-target branch elision, got {stmt:?}"
         );
     }
 
@@ -5271,7 +5940,8 @@ mod tests {
             ],
             Vec::new(),
         );
-        ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
+        install_semantic_artifact(
+            &mut ctx,
             crate::test_native_semantic_artifact(
                 r2sym::RefinementStage::Compiled,
                 r2sym::ArtifactGranularity::Regioned,
@@ -5280,7 +5950,7 @@ mod tests {
                 Vec::new(),
                 vec![region],
             ),
-        ));
+        );
 
         let structurer = ControlFlowStructurer::new(&func, &ctx);
         assert_eq!(
@@ -5338,7 +6008,8 @@ mod tests {
             ],
             Vec::new(),
         );
-        ctx.inputs.semantic_artifact = Some(crate::leaked_test_semantic_artifact(
+        install_semantic_artifact(
+            &mut ctx,
             crate::test_native_semantic_artifact(
                 r2sym::RefinementStage::Compiled,
                 r2sym::ArtifactGranularity::Regioned,
@@ -5347,7 +6018,7 @@ mod tests {
                 Vec::new(),
                 vec![region],
             ),
-        ));
+        );
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         let then_region = crate::region::Region::Sequence(vec![
@@ -5480,13 +6151,11 @@ mod tests {
                 cache_hit: false,
             },
         };
-        ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
+        install_semantic_artifact(&mut ctx, artifact);
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         let routed = crate::consumer_structured::primary_body_for_semantic_route(
-            &crate::SemanticRoutePlan::StructuredWorker {
-                reason: "large native worker summarized as typed islands".to_string(),
-            },
+            &test_structured_worker_route("large native worker summarized as typed islands"),
             &mut structurer,
             Vec::new,
         );
@@ -5624,13 +6293,11 @@ mod tests {
                 cache_hit: false,
             },
         };
-        ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
+        install_semantic_artifact(&mut ctx, artifact);
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         let routed = crate::consumer_structured::primary_body_for_semantic_route(
-            &crate::SemanticRoutePlan::StructuredWorker {
-                reason: "likely semantic worker reachability".to_string(),
-            },
+            &test_structured_worker_route("likely semantic worker reachability"),
             &mut structurer,
             Vec::new,
         );
@@ -5766,13 +6433,11 @@ mod tests {
                 cache_hit: false,
             },
         };
-        ctx.inputs.semantic_artifact = Some(Box::leak(Box::new(artifact)));
+        install_semantic_artifact(&mut ctx, artifact);
 
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
         let routed = crate::consumer_structured::primary_body_for_semantic_route(
-            &crate::SemanticRoutePlan::StructuredWorker {
-                reason: "semantic worker target suffix".to_string(),
-            },
+            &test_structured_worker_route("semantic worker target suffix"),
             &mut structurer,
             Vec::new,
         );

@@ -22,6 +22,9 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn indexed_pointer_add_expr(&self, expr: &CExpr, elem_ty: &CType) -> Option<CExpr> {
+        if self.requires_certified_rendering() {
+            return None;
+        }
         let CExpr::Binary {
             op: BinaryOp::Add,
             left,
@@ -110,6 +113,66 @@ impl<'a> FoldingContext<'a> {
             self.lookup_semantic_value(name),
             Some(analysis::SemanticValue::Address(_)) | Some(analysis::SemanticValue::Load { .. })
         )
+    }
+
+    pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
+        if var.is_const() {
+            let value = parse_const_value(&var.name)?;
+            return Some(if value > 0x7fff_ffff {
+                CExpr::UIntLit(value)
+            } else {
+                CExpr::IntLit(value as i64)
+            });
+        }
+
+        let value = self.prepared_value_id_for_var(var)?;
+        if !self
+            .certified_render_context()
+            .is_some_and(|proof| proof.expression_is_renderable(value))
+        {
+            return None;
+        }
+        let rendered = self.var_name(var);
+        Some(
+            self.arg_alias_for_rendered_name(&rendered)
+                .map(CExpr::Var)
+                .unwrap_or_else(|| CExpr::Var(rendered)),
+        )
+    }
+
+    pub(super) fn certified_memory_address_expr(
+        &self,
+        fact: &r2types::MemoryAccessRenderFact,
+    ) -> Option<(SSAVar, CExpr)> {
+        let prepared = self.prepared_ssa()?;
+        let addr = prepared.value_var(fact.address)?.clone();
+        let expr = self.render_certified_value_expr_for_var(&addr)?;
+        if self.expr_contains_raw_stack_base_arithmetic(&expr)
+            || self.certified_return_expr_contains_raw_storage_name(&expr)
+        {
+            return None;
+        }
+        Some((addr, expr))
+    }
+
+    pub(super) fn render_certified_memory_expr_for_fact(
+        &self,
+        fact: &r2types::MemoryAccessRenderFact,
+        elem_ty: CType,
+    ) -> Option<CExpr> {
+        let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
+        let ptr_ty = CType::ptr(elem_ty);
+        let casted = self.cast_addr_expr_to_ptr_if_needed(&addr, addr_expr, &ptr_ty);
+        Some(CExpr::Deref(Box::new(casted)))
+    }
+
+    pub(super) fn render_certified_memory_expr_for_current_op(
+        &self,
+        elem_ty: CType,
+        is_write: bool,
+    ) -> Option<CExpr> {
+        let fact = self.certified_memory_access_for_current_op(is_write)?;
+        self.render_certified_memory_expr_for_fact(fact, elem_ty)
     }
 
     pub(super) fn render_authoritative_memory_access_by_name(
@@ -203,20 +266,6 @@ impl<'a> FoldingContext<'a> {
             return CExpr::Deref(Box::new(casted));
         }
 
-        if addr.is_memory()
-            && let Some(address) = parse_address_from_var_name(&addr.name)
-        {
-            if let Some(sym) = self.lookup_symbol(address) {
-                return CExpr::Var(sym.clone());
-            }
-            if let Some(name) = self.lookup_function(address) {
-                return CExpr::Var(name.clone());
-            }
-            if let Some(s) = self.lookup_string(address) {
-                return CExpr::StringLit(s.clone());
-            }
-        }
-
         if dst.size >= addr.size
             && let Some(stack_var) = self.stack_var_for_addr_var(addr)
         {
@@ -279,13 +328,6 @@ impl<'a> FoldingContext<'a> {
             return expr;
         }
 
-        if addr.is_memory()
-            && let Some(address) = parse_address_from_var_name(&addr.name)
-            && let Some(sym) = self.lookup_symbol(address)
-        {
-            return CExpr::Var(sym.clone());
-        }
-
         if let Some(stack_var) = self.stack_var_for_addr_var(addr) {
             return CExpr::Var(stack_var);
         }
@@ -320,7 +362,7 @@ impl<'a> FoldingContext<'a> {
         let mut try_render = |candidate: &CExpr, ctx: &FoldingContext<'_>| {
             let canonical = ctx.canonicalize_visible_address_expr(candidate, depth + 1);
             let addr = ctx.normalized_addr_from_visible_expr(&canonical, depth + 1)?;
-            ctx.render_access_expr_from_addr(&addr, elem_size, depth + 1, visited)
+            ctx.render_access_expr_from_addr(&addr, elem_size, false, depth + 1, visited)
         };
 
         let mut semantic_visited = HashSet::new();

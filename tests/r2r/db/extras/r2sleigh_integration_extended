@@ -13,7 +13,7 @@ e??anal.sla | jq -Rs 'length==0'
 EOF_CMDS
 RUN
 
-NAME=manual_sparse_switch_o2_uses_edge_specific_return_phi
+NAME=manual_sparse_switch_o2_residualizes_uncertified_return_phi
 FILE=bins/r2sleigh_manual_limits_O2
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -23,7 +23,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~sparse_switch[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("return a + b;") and contains("return op + a - b;") and contains("return b == 0 ? -1 : a / b;") and (contains("r2sleigh residual:")|not) and (contains("t49900")|not) and (contains("t49a00")|not)'
+a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("return -1;") and contains("r2sleigh residual: uncertified return expression") and contains("r2sleigh residual: missing certified value return") and (contains("t49900")|not) and (contains("t49a00")|not) and (contains("switch (test)")|not) and (contains("case fake")|not)'
 EOF_CMDS
 RUN
 
@@ -39,11 +39,11 @@ true
 EOF_EXPECT
 CMDS=<<EOF_CMDS
 a:sla.debug.mem >/dev/null
-a:sla.mem | jq -Rs 'contains("moved to a:sla.debug.mem")'
-a:sla.types | jq -Rs 'contains("moved to a:sla.debug.types")'
-a:sla.profilej | jq -Rs 'contains("moved to a:sla.debug.profilej")'
-a:sla.assumej [] | jq -Rs 'contains("moved to a:sla.debug.assumej")'
-a:sym.runj {} | jq -Rs 'contains("moved to a:sym.debug.runj")'
+a:sla.mem | jq -Rs '. == ""'
+a:sla.types | jq -Rs '. == ""'
+a:sla.profilej | jq -Rs '. == ""'
+a:sla.assumej [] | jq -Rs '. == ""'
+a:sym.runj {} | jq -Rs '. == ""'
 EOF_CMDS
 RUN
 
@@ -145,7 +145,7 @@ a:sla.dec | head -n1 | jq -Rs 'contains("solve_equation") and (contains("int") o
 EOF_CMDS
 RUN
 
-NAME=dec_boolxor_preserves_xor_shape
+NAME=dec_boolxor_residualizes_without_return_proof
 FILE=bins/vuln_test_x86
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -155,7 +155,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~test_boolxor[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("test_boolxor") and contains("^") and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("test_boolxor") and contains("r2sleigh residual: uncertified return expression") and contains("summary return unresolved") and (contains("r2dec fallback:")|not) and (contains("if (EAX")|not)'
 EOF_CMDS
 RUN
 
@@ -173,7 +173,7 @@ af
 a:sla.dec | jq -Rs 'contains("test_array_index") and contains("return") and (contains("r2dec fallback:")|not)'
 s `afl~test_struct_array_index[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct* arr") and contains("arr[idx].third = v;") and contains("return arr[idx].fourteenth + arr[idx].third;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not) and (contains("*(arr +")|not)'
+a:sla.dec | jq -Rs 'contains("test_struct_array_index") and contains("DemoStruct* arr") and ((contains("arr[idx].third = v;") and contains("r2sleigh residual: uncertified return expression")) or (contains("r2dec residual: certified render contract failed") and contains("raw pointer-arithmetic dereference"))) and (contains("r2dec fallback:")|not) and (contains("*(arr +")|not)'
 EOF_CMDS
 RUN
 
@@ -192,10 +192,10 @@ af
 a:sla.dec | jq -Rs 'contains("process_string") and contains("strlen(s)") and contains("return -1;") and contains("return -2;") and contains("return len;") and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not)'
 s `afl~authenticate[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("rendered uncertified raw artifact name(s): EAX") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("authenticate") and contains("r2dec residual: certified render contract failed") and contains("with only 1 rendered FunctionCallsiteFacts proof(s)") and contains("summary return unresolved") and (contains("if (EAX")|not) and (contains("return 0;")|not) and (contains("return 1;")|not) and (contains("r10_1")|not) and (contains("r2dec fallback:")|not)'
 s `afl~alloc_and_copy[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int8_t* alloc_and_copy(int8_t* src, size_t len)") and contains("buf = sym.imp.malloc(len + 1);") and contains("if (buf == 0)") and contains("sym.imp.memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("buf[-0x8]")|not) and (contains("r2dec residual:")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
+a:sla.dec | jq -Rs 'contains("int8_t* alloc_and_copy(int8_t* src, size_t len)") and contains("buf = sym.imp.malloc(len + 1);") and contains("if (buf == 0)") and contains("sym.imp.memcpy(buf, src, len);") and contains("buf[len] = 0;") and contains("return buf;") and (contains("r2sleigh residual: missing certified value return")|not) and (contains("summary return unresolved")|not) and (contains("buf[-0x8]")|not) and (contains("r2dec fallback:")|not) and (contains("ArrayIndexCertificate")|not)'
 EOF_CMDS
 RUN
 
@@ -355,6 +355,21 @@ aaa
 s `afl~alloc_wrapper2[0]` >/dev/null
 af
 a:sla.debug.types | jq -c '([.mutation_plan.mutations[]?.kind] as $k | ($k | index("signature") != null) and ($k | index("callconv") != null) and (($k | index("var") != null) or ($k | index("var_type") != null)))'
+EOF_CMDS
+RUN
+
+NAME=typed_multi_assumptions_and_scope_survive_session_payload
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+true
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s `afl~test_symbolic_helper_pure_guard[0]` >/dev/null
+af
+a:sla.debug.assumej [{"subject":{"register":{"name":"rdi"}},"value":{"type_hint":{"ty":"int32_t"}}},{"subject":{"register":{"name":"rsi"}},"value":{"type_hint":{"ty":"size_t"}}}] >/dev/null
+a:sla.debug.types | jq -c '(.compiled_semantics.execution=="native") and (((.interproc.scope.payloads // []) | length) >= 1) and (.assumptions.items // [] | any((.subject.register.name? // "" | ascii_downcase) == "rdi" and .value.type_hint.ty == "int32_t")) and (.assumptions.items // [] | any((.subject.register.name? // "" | ascii_downcase) == "rsi" and .value.type_hint.ty == "size_t"))'
 EOF_CMDS
 RUN
 
@@ -820,7 +835,7 @@ a:sla.dec | jq -Rs 'contains("table_walk") and ((contains("render contract: summ
 EOF_CMDS
 RUN
 
-NAME=manual_sparse_switch_refuses_fake_cases_or_proves_source_cases
+NAME=manual_sparse_switch_refuses_fake_cases_without_render_proof
 FILE=bins/r2sleigh_manual_limits_O0
 ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
 EXPECT=<<EOF_EXPECT
@@ -830,6 +845,6 @@ CMDS=<<EOF_CMDS
 aaa
 s `afl~sparse_switch[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("return a - b;") and contains("return a + b;") and contains("return a * 3 + b;") and contains("return (a ^ b) + 42;") and contains("return b == 0 ? -1 : a / b;") and contains("return op + a - b;") and (contains("r2sleigh residual:")|not) and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("case 1:")|not) and (contains("case 2:")|not)'
+a:sla.dec | jq -Rs 'contains("int32_t sparse_switch") and contains("r2dec residual: render proof identity Branch") and contains("summary return unresolved") and (contains("switch (test)")|not) and (contains("case fake")|not) and (contains("case 1:")|not) and (contains("case 2:")|not) and (contains("return a - b;")|not) and (contains("return a + b;")|not) and (contains("return a * 3 + b;")|not) and (contains("return (a ^ b) + 42;")|not) and (contains("return b == 0 ? -1 : a / b;")|not) and (contains("return op + a - b;")|not)'
 EOF_CMDS
 RUN

@@ -1,0 +1,40 @@
+warning: r2engine must keep EngineDecompileRequest internal; expose EngineFunctionDecompileRequest for plugin/user decompile paths
+  --> $DIR/lib.rs:1:1
+   |
+LL | / pub struct EngineDecompileRequest {
+LL | |     function_addr: u64,
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2engine_lower_level_decompile_api_bypass)]` on by default
+
+warning: r2engine must not define route conversion helpers or depend on r2dec route types
+  --> $DIR/lib.rs:10:1
+   |
+LL | pub struct EngineSemanticRoutePlan;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2engine_r2dec_summary_render_route_side_channel)]` on by default
+
+warning: r2engine EngineArtifacts must not duplicate FunctionFacts semantic or route evidence
+  --> $DIR/lib.rs:13:1
+   |
+LL | / pub struct EngineArtifacts {
+LL | |     semantic_artifact: Option<SemanticArtifact>,
+LL | |     function_facts: Option<FunctionFacts>,
+LL | |     route: Option<EngineSemanticRoutePlan>,
+LL | | }
+   | |_^
+   |
+   = note: `#[warn(r2engine_artifacts_facts_side_channel)]` on by default
+
+warning: r2engine must not expose public decompile(&self, EngineDecompileRequest); use decompile_function with EngineFunctionDecompileRequest
+  --> $DIR/lib.rs:22:5
+   |
+LL | /     pub fn decompile(&self, request: EngineDecompileRequest) -> String {
+LL | |         format!("0x{:x}", request.function_addr)
+LL | |     }
+   | |_____^
+
+warning: 4 warnings emitted
+

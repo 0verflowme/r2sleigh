@@ -23,9 +23,9 @@ use crate::facts::{
     CalleeSyncEffect, CalleeSyncOp, CalleeTransferEffect, CalleeTransferLength, FunctionParamSpec,
     FunctionSignatureProjection, FunctionSignatureSpec, FunctionTypeFactInputs, FunctionTypeFacts,
     InterprocFactDiagnostics, LocalFieldAccessFact, OutParamCertificate,
-    OutParamCertificateEvidence, OutParamCertificateSource, SignatureCertificate,
-    SignatureCertificateSource, SignatureProjectionResult, SignatureProjectionSource,
-    VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    OutParamCertificateEvidence, OutParamCertificateSource, ScalarArrayRenderCandidate,
+    SignatureCertificate, SignatureCertificateSource, SignatureProjectionResult,
+    SignatureProjectionSource, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
 };
 use crate::function_facts::{FunctionFacts, InterprocSummaryView};
 use crate::model::Signedness;
@@ -3862,6 +3862,7 @@ fn build_type_writeback_analysis_inner(
             .unwrap_or_default(),
         field_access_certificates,
         array_index_certificates,
+        scalar_array_render_candidates: scalar_array_access_certificates.render_candidates,
         out_param_certificates,
         signature_certificate,
         interproc_diagnostics: input
@@ -4520,6 +4521,7 @@ struct ScalarArrayAddrExpr {
 struct ScalarArrayAccessCertificates {
     array_index: Vec<ArrayIndexCertificate>,
     field_access: Vec<crate::FieldAccessCertificate>,
+    render_candidates: Vec<ScalarArrayRenderCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5183,6 +5185,7 @@ fn scalar_array_access_certificates_from_ssa(
     let mut pointer_value_names: HashMap<String, Option<ScalarPointerValue>> = HashMap::new();
     let mut array_addr_exprs: HashMap<String, ScalarArrayAddrExpr> = HashMap::new();
     let mut array_addr_expr_names: HashMap<String, Option<ScalarArrayAddrExpr>> = HashMap::new();
+    let mut stack_pointer_values: HashMap<(u64, i64), ScalarPointerValue> = HashMap::new();
     let mut certificates = ScalarArrayAccessCertificates::default();
 
     let block_ops: HashMap<u64, HashMap<String, SSAOp>> = ssa_blocks
@@ -5483,17 +5486,64 @@ fn scalar_array_access_certificates_from_ssa(
                             addr,
                             &stack_addr_offsets,
                             &stack_addr_offset_names,
-                        ) && let Some(mut pointer) =
-                            scalar_pointer_value_for_stack_slot(parsed_context, offset, ptr_bits)
-                        {
+                        ) {
+                            let pointer = stack_pointer_values
+                                .get(&(block.addr, offset))
+                                .cloned()
+                                .or_else(|| {
+                                    scalar_pointer_value_for_stack_slot(
+                                        parsed_context,
+                                        offset,
+                                        ptr_bits,
+                                    )
+                                });
+                            if let Some(mut pointer) = pointer {
+                                pointer.confidence = pointer.confidence.saturating_sub(1);
+                                changed |= set_scalar_pointer_value(
+                                    block.addr,
+                                    dst,
+                                    pointer,
+                                    &mut pointer_values,
+                                    &mut pointer_value_names,
+                                );
+                            }
+                        }
+                    }
+                    SSAOp::Store { addr, val, .. } => {
+                        if let Some(offset) = stack_addr_offset_for_var(
+                            block.addr,
+                            addr,
+                            &stack_addr_offsets,
+                            &stack_addr_offset_names,
+                        ) {
+                            let ctx = ScalarArrayInferenceCtx {
+                                parsed_context,
+                                merged_signature,
+                                ptr_bits,
+                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_values: &pointer_values,
+                                pointer_value_names: &pointer_value_names,
+                                array_addr_exprs: &array_addr_exprs,
+                                array_addr_expr_names: &array_addr_expr_names,
+                                stack_addr_offsets: &stack_addr_offsets,
+                                stack_addr_offset_names: &stack_addr_offset_names,
+                                block_ops: &block_ops,
+                                value_ops: &value_ops,
+                            };
+                            let Some(mut pointer) =
+                                scalar_pointer_value_for_var(block.addr, val, &ctx)
+                            else {
+                                continue;
+                            };
                             pointer.confidence = pointer.confidence.saturating_sub(1);
-                            changed |= set_scalar_pointer_value(
-                                block.addr,
-                                dst,
-                                pointer,
-                                &mut pointer_values,
-                                &mut pointer_value_names,
-                            );
+                            let key = (block.addr, offset);
+                            if stack_pointer_values
+                                .get(&key)
+                                .is_none_or(|prev| prev.confidence < pointer.confidence)
+                            {
+                                stack_pointer_values.insert(key, pointer);
+                                changed = true;
+                            }
                         }
                     }
                     _ => {}
@@ -5506,7 +5556,7 @@ fn scalar_array_access_certificates_from_ssa(
     }
 
     for block in ssa_blocks {
-        for op in &block.ops {
+        for (op_index, op) in block.ops.iter().enumerate() {
             match op {
                 SSAOp::Load { dst, addr, .. } => {
                     let ctx = ScalarArrayInferenceCtx {
@@ -5531,14 +5581,26 @@ fn scalar_array_access_certificates_from_ssa(
                     )
                     .or_else(|| direct_scalar_pointer_array_expr(block.addr, addr, &ctx))
                     {
-                        push_scalar_array_access_certificates(
+                        let access_width = dst.size;
+                        if push_scalar_array_access_certificates(
                             &mut certificates,
                             &expr,
-                            u64::from(dst.size),
+                            u64::from(access_width),
                             parsed_context,
                             merged_signature,
                             ptr_bits,
-                        );
+                        ) {
+                            certificates
+                                .render_candidates
+                                .push(ScalarArrayRenderCandidate {
+                                    block_addr: block.addr,
+                                    op_index,
+                                    is_write: false,
+                                    field_offset: expr.field_offset,
+                                    element_stride: expr.pointer.element_stride,
+                                    access_width,
+                                });
+                        }
                     }
                 }
                 SSAOp::Store { addr, val, .. } => {
@@ -5564,14 +5626,26 @@ fn scalar_array_access_certificates_from_ssa(
                     )
                     .or_else(|| direct_scalar_pointer_array_expr(block.addr, addr, &ctx))
                     {
-                        push_scalar_array_access_certificates(
+                        let access_width = val.size;
+                        if push_scalar_array_access_certificates(
                             &mut certificates,
                             &expr,
-                            u64::from(val.size),
+                            u64::from(access_width),
                             parsed_context,
                             merged_signature,
                             ptr_bits,
-                        );
+                        ) {
+                            certificates
+                                .render_candidates
+                                .push(ScalarArrayRenderCandidate {
+                                    block_addr: block.addr,
+                                    op_index,
+                                    is_write: true,
+                                    field_offset: expr.field_offset,
+                                    element_stride: expr.pointer.element_stride,
+                                    access_width,
+                                });
+                        }
                     }
                 }
                 _ => {}
@@ -5583,6 +5657,8 @@ fn scalar_array_access_certificates_from_ssa(
     certificates.array_index.dedup();
     certificates.field_access.sort();
     certificates.field_access.dedup();
+    certificates.render_candidates.sort();
+    certificates.render_candidates.dedup();
     certificates
 }
 
@@ -5593,7 +5669,7 @@ fn push_scalar_array_access_certificates(
     parsed_context: &ParsedExternalContext,
     merged_signature: Option<&FunctionSignatureSpec>,
     ptr_bits: u32,
-) {
+) -> bool {
     let full_element_access = expr.field_offset == 0 && access_width == expr.pointer.element_stride;
     let field_layout = external_layout_field_access_for_scalar_expr(
         expr,
@@ -5604,7 +5680,7 @@ fn push_scalar_array_access_certificates(
     );
 
     if !full_element_access && field_layout.is_none() {
-        return;
+        return false;
     }
 
     certificates.array_index.push(ArrayIndexCertificate {
@@ -5624,6 +5700,8 @@ fn push_scalar_array_access_certificates(
                 field_type: field.ty,
             });
     }
+
+    true
 }
 
 fn external_layout_field_access_for_scalar_expr(
@@ -5872,12 +5950,12 @@ fn scalar_element_stride(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
         }
         CTypeLike::Void
         | CTypeLike::Unknown
-        | CTypeLike::Pointer(_)
         | CTypeLike::Array(_, _)
         | CTypeLike::Struct(_)
         | CTypeLike::Union(_)
         | CTypeLike::Enum(_)
         | CTypeLike::Function => None,
+        CTypeLike::Pointer(_) => Some((ptr_bits / 8).max(1) as u64),
     }
 }
 
@@ -17279,6 +17357,18 @@ mod tests {
             "expected scalar typed stack pointer index certificate, got {:?}",
             analysis.type_facts.array_index_certificates
         );
+        assert_eq!(
+            analysis.type_facts.scalar_array_render_candidates,
+            vec![ScalarArrayRenderCandidate {
+                block_addr: 0x4013b1,
+                op_index: 5,
+                is_write: true,
+                field_offset: 0,
+                element_stride: 1,
+                access_width: 1,
+            }],
+            "render candidates must preserve the concrete scalar store op identity"
+        );
     }
 
     #[test]
@@ -17462,6 +17552,136 @@ mod tests {
     }
 
     #[test]
+    fn typed_argument_spill_reload_access_certifies_scalar_array_index() {
+        let argv_ty = CTypeLike::Pointer(Box::new(CTypeLike::Pointer(Box::new(CTypeLike::Int {
+            bits: 8,
+            signedness: Signedness::Signed,
+        }))));
+        let parsed_context = ParsedExternalContext {
+            register_params: vec![
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg1".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    reg: "x0".to_string(),
+                },
+                crate::context::ExternalRegisterParamSpec {
+                    name: "arg2".to_string(),
+                    ty: Some(argv_ty.clone()),
+                    reg: "x1".to_string(),
+                },
+            ],
+            merged_signature: Some(FunctionSignatureSpec {
+                ret_type: Some(CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                }),
+                params: vec![
+                    FunctionParamSpec {
+                        name: "arg1".to_string(),
+                        ty: Some(CTypeLike::Int {
+                            bits: 32,
+                            signedness: Signedness::Signed,
+                        }),
+                    },
+                    FunctionParamSpec {
+                        name: "arg2".to_string(),
+                        ty: Some(argv_ty),
+                    },
+                ],
+            }),
+            ..ParsedExternalContext::default()
+        };
+        let ssa_blocks = [SSABlock {
+            addr: 0x100001000,
+            size: 40,
+            ops: vec![
+                SSAOp::IntSub {
+                    dst: SSAVar::new("sp", 1, 8),
+                    a: SSAVar::new("sp", 0, 8),
+                    b: SSAVar::new("const:200", 0, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("slot", 1, 8),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::new("const:178", 0, 8),
+                },
+                SSAOp::Store {
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("slot", 1, 8),
+                    val: SSAVar::new("x1", 0, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("slot", 2, 8),
+                    a: SSAVar::new("sp", 1, 8),
+                    b: SSAVar::new("const:178", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("x8", 1, 8),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("slot", 2, 8),
+                },
+                SSAOp::IntAdd {
+                    dst: SSAVar::new("arg_addr", 1, 8),
+                    a: SSAVar::new("x8", 1, 8),
+                    b: SSAVar::new("const:8", 0, 8),
+                },
+                SSAOp::Load {
+                    dst: SSAVar::new("x0", 1, 8),
+                    space: "ram".to_string(),
+                    addr: SSAVar::new("arg_addr", 1, 8),
+                },
+            ],
+        }];
+
+        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+            function_name: "sym._main",
+            ptr_bits: 64,
+            inferred_signature: InferredSignature {
+                function_name: "sym._main".to_string(),
+                signature: "int64_t sym._main(int32_t arg1, int8_t **arg2)".to_string(),
+                ret_type: "int64_t".to_string(),
+                params: vec![
+                    InferredSignatureParam {
+                        name: "arg1".to_string(),
+                        param_type: "int32_t".to_string(),
+                    },
+                    InferredSignatureParam {
+                        name: "arg2".to_string(),
+                        param_type: "int8_t **".to_string(),
+                    },
+                ],
+                callconv: "aarch64".to_string(),
+                arch: "aarch64".to_string(),
+                confidence: 96,
+                callconv_confidence: 92,
+            },
+            recovered_vars: &[],
+            ssa_blocks: &ssa_blocks,
+            parsed_context,
+            local_structs: LocalStructArtifacts::default(),
+            interproc_summary_set: None,
+            diagnostics: TypeWritebackDiagnostics::default(),
+        });
+
+        assert!(
+            analysis
+                .type_facts
+                .array_index_certificates
+                .iter()
+                .any(|cert| {
+                    cert.element_stride == 8
+                        && cert.field_offset == 0
+                        && matches!(cert.base, Some(ArrayIndexBase::Param { index: 1 }))
+                }),
+            "expected typed spilled argv pointer array certificate, got {:?}",
+            analysis.type_facts.array_index_certificates
+        );
+    }
+
+    #[test]
     fn external_struct_pointer_strength_reduced_index_certifies_nested_array_fields() {
         let mut parsed_context = ParsedExternalContext::default();
         parsed_context.external_type_db.structs.insert(
@@ -17631,5 +17851,35 @@ mod tests {
         assert!(certified_names.contains("scores[2]"), "{certified_names:?}");
         assert!(certified_names.contains("flags"), "{certified_names:?}");
         assert!(certified_names.contains("id"), "{certified_names:?}");
+        assert_eq!(
+            analysis.type_facts.scalar_array_render_candidates,
+            vec![
+                ScalarArrayRenderCandidate {
+                    block_addr: 0x4012d0,
+                    op_index: 6,
+                    is_write: false,
+                    field_offset: 0x10,
+                    element_stride: 40,
+                    access_width: 4,
+                },
+                ScalarArrayRenderCandidate {
+                    block_addr: 0x4012d0,
+                    op_index: 8,
+                    is_write: false,
+                    field_offset: 4,
+                    element_stride: 40,
+                    access_width: 2,
+                },
+                ScalarArrayRenderCandidate {
+                    block_addr: 0x4012d0,
+                    op_index: 9,
+                    is_write: false,
+                    field_offset: 0,
+                    element_stride: 40,
+                    access_width: 4,
+                },
+            ],
+            "render candidates must stay in deterministic op-site order"
+        );
     }
 }

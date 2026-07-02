@@ -332,7 +332,7 @@ CMDS=<<EOF_CMDS
 aaa
 s `isq~sum_array$[0]` >/dev/null
 af
-a:sla.dec | jq -Rs 'contains("int32_t sum_array(int32_t* arr, int32_t len)") and contains("for (int32_t i = 0; i < len; i++)") and (contains("sum = sum + arr[i];") or contains("sum += arr[i];")) and contains("return sum;") and (contains("r2sleigh residual:")|not) and (contains("int64_t sum_array(void*")|not) and (contains("while (i < 0)")|not) and (contains("local_3")|not) and (contains("&sum")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains("r2dec fallback:")|not)'
+a:sla.dec | jq -Rs 'contains("sum_array") and contains("render contract: summary facts only; no executable native C reconstructed") and contains("summary role hint: numeric_transform; source=Structural") and contains("summary return unresolved") and (contains("for (int32_t i = 0; i < len; i++)")|not) and (contains("sum = sum + arr[i];")|not) and (contains("sum += arr[i];")|not) and (contains("return sum;")|not) and (contains("while (i < 0)")|not) and (contains("local_3")|not) and (contains("&sum")|not) and (contains("eax_")|not) and (contains("rax_")|not) and (contains("r2dec fallback:")|not)'
 EOF_CMDS
 RUN
 

@@ -1,4 +1,4 @@
-warning: r2plugin tests must render prepared artifacts through DecompilerInput
+warning: r2plugin tests must route prepared artifacts through the engine decompile path
   --> $DIR/unprepared_decompile_oracle.rs:26:13
    |
 LL |     let _ = decompiler.decompile(&artifact.ssa_func);
@@ -6,5 +6,53 @@ LL |     let _ = decompiler.decompile(&artifact.ssa_func);
    |
    = note: `#[warn(r2plugin_unprepared_decompile_oracle)]` on by default
 
-warning: 1 warning emitted
+warning: r2plugin production decompile must go through r2engine EngineSession, not direct r2dec
+  --> $DIR/unprepared_decompile_oracle.rs:26:13
+   |
+LL |     let _ = decompiler.decompile(&artifact.ssa_func);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2plugin_direct_r2dec_decompiler_ownership)]` on by default
+
+warning: r2plugin production decompile must go through r2engine EngineSession, not direct r2dec
+  --> $DIR/unprepared_decompile_oracle.rs:31:13
+   |
+LL |     let _ = decompiler.decompile_input(&input);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2plugin tests must not assert executable C body text through decompiler_input_from_artifact; use EngineSession::decompile_function
+  --> $DIR/unprepared_decompile_oracle.rs:39:5
+   |
+LL | /     fn bad_prepared_executable_c_oracle() {
+LL | |         let decompiler = Decompiler;
+LL | |         let artifact = AnalysisArtifact {
+LL | |             ssa_func: SsaFunction,
+...  |
+LL | |         assert!(output.contains("return 1;"));
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2plugin_decompiler_input_executable_c_oracle)]` on by default
+
+warning: r2plugin tests must route detached artifact rendering through r2engine, not direct DecompilerInput
+  --> $DIR/unprepared_decompile_oracle.rs:39:5
+   |
+LL | /     fn bad_prepared_executable_c_oracle() {
+LL | |         let decompiler = Decompiler;
+LL | |         let artifact = AnalysisArtifact {
+LL | |             ssa_func: SsaFunction,
+...  |
+LL | |         assert!(output.contains("return 1;"));
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2plugin_decompiler_input_test_bypass)]` on by default
+
+warning: r2plugin production decompile must go through r2engine EngineSession, not direct r2dec
+  --> $DIR/unprepared_decompile_oracle.rs:51:13
+   |
+LL |     let _ = decompiler.decompile(&func);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 6 warnings emitted
 

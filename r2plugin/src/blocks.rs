@@ -32,8 +32,4 @@ impl BlockSlice {
     pub(crate) fn as_slice(&self) -> &[R2ILBlock] {
         &self.blocks
     }
-
-    pub(crate) fn into_inner(self) -> Vec<R2ILBlock> {
-        self.blocks
-    }
 }

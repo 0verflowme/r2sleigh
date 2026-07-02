@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use r2ssa::{SSAFunction, SSAOp, SSAVar};
 use r2types::{
-    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionTypeFacts, StackSlotKey,
-    VisibleBinding, VisibleBindingKind,
+    CTypeLike, ExternalStackBase, ExternalStackSlotRole, FunctionFacts, FunctionTypeFacts,
+    StackSlotKey, VisibleBinding, VisibleBindingKind,
 };
 
 use crate::analysis::utils;
@@ -163,7 +163,13 @@ impl VariableRecovery {
         }
     }
 
+    /// Set canonical function facts for type/layout-guided variable recovery.
+    pub fn set_function_facts(&mut self, function_facts: &FunctionFacts) {
+        self.type_facts = function_facts.type_facts().clone().canonicalized();
+    }
+
     /// Set externally recovered type/layout facts.
+    #[cfg(test)]
     pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
         self.type_facts = type_facts.canonicalized();
     }

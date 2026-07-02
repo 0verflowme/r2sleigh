@@ -1,12 +1,11 @@
 use crate::blocks::BlockSlice;
 use crate::context::require_ctx_view;
 use crate::helpers::effective_ptr_bits;
-use crate::{ArchSpec, R2ILBlock, R2ILContext, parse_addr_name_map};
+use crate::{ArchSpec, R2ILBlock, R2ILContext};
 use serde::Serialize;
 use serde_json::json;
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
@@ -196,6 +195,24 @@ fn sym_symbol_map() -> &'static Mutex<HashMap<u64, String>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn parse_sym_symbol_map_payload(json_str: &str) -> HashMap<u64, String> {
+    serde_json::from_str::<HashMap<String, String>>(json_str)
+        .ok()
+        .map(|map| {
+            map.into_iter()
+                .filter_map(|(key, value)| {
+                    let addr = key
+                        .strip_prefix("0x")
+                        .or_else(|| key.strip_prefix("0X"))
+                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                        .or_else(|| key.parse().ok());
+                    addr.map(|addr| (addr, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r2sym_set_symbol_map_json(json: *const c_char) -> i32 {
     if json.is_null() {
@@ -207,7 +224,7 @@ pub extern "C" fn r2sym_set_symbol_map_json(json: *const c_char) -> i32 {
             Err(_) => return 0,
         }
     };
-    let parsed = parse_addr_name_map(json_str);
+    let parsed = parse_sym_symbol_map_payload(json_str);
     match sym_symbol_map().lock() {
         Ok(mut map) => {
             *map = parsed;
@@ -266,504 +283,11 @@ struct SymExecSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     runtime_diagnostics: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    semantic: Option<CompiledSemanticInfo>,
+    semantic: Option<r2sym::CompiledSemanticInfo>,
 }
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct CompiledSemanticInfo {
-    pub(crate) schema_version: u32,
-    pub(crate) stage: String,
-    pub(crate) granularity: String,
-    pub(crate) execution: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) seed_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) replay_seed_fingerprint: Option<String>,
-    pub(crate) query_plan: r2sym::QueryPlan,
-    pub(crate) type_plan: r2sym::TypePlan,
-    pub(crate) decompile_plan: r2sym::DecompilePlan,
-    pub(crate) slice_class: String,
-    pub(crate) residual_reasons: Vec<String>,
-    pub(crate) ambiguous_target_count: usize,
-    pub(crate) ambiguous_targets: Vec<String>,
-    pub(crate) closure_functions: usize,
-    pub(crate) helper_functions: usize,
-    pub(crate) derived_summaries: usize,
-    pub(crate) summary_attempted: usize,
-    pub(crate) summary_budget_exhausted: usize,
-    pub(crate) summary_scc_count: usize,
-    pub(crate) region_count: usize,
-    pub(crate) control_region_count: usize,
-    pub(crate) memory_region_count: usize,
-    pub(crate) memory_fact_count: usize,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub(crate) native_region_summary_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) native_region_summary_kinds: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub(crate) native_worker_summary_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) native_worker_summary_kinds: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) memory_summaries: Vec<MemorySummaryInfo>,
-    pub(crate) compiled_condition_count: usize,
-    pub(crate) exact_compiled_condition_count: usize,
-    pub(crate) actionable_compiled_condition_count: usize,
-    pub(crate) branches_pruned: usize,
-    pub(crate) branches_unknown: usize,
-    pub(crate) skipped_large_cfg: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) interpreter_diagnostic: Option<InterpreterDispatchInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) interpreter: Option<InterpreterDispatchInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) vm_step: Option<VmStepSummaryInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) vm_transfer: Option<VmStepSummaryInfo>,
-    pub(crate) cache_hit: bool,
-}
-
-#[derive(Debug, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct MemorySummaryInfo {
-    pub(crate) anchor: String,
-    pub(crate) region: String,
-    pub(crate) offset_lo: i64,
-    pub(crate) offset_hi: i64,
-    pub(crate) size: u32,
-    pub(crate) exact_offset: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) binding: Option<String>,
-    pub(crate) expr: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) value_expr: Option<String>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct InterpreterDispatchInfo {
-    pub(crate) kind: String,
-    pub(crate) dispatch_header: String,
-    pub(crate) dispatch_targets: usize,
-    pub(crate) selector: Option<String>,
-    pub(crate) back_edges: usize,
-    pub(crate) score: i32,
-}
-
-fn interpreter_dispatch_info_from_sym(
-    interpreter: &r2sym::InterpreterDispatchSummary,
-) -> InterpreterDispatchInfo {
-    InterpreterDispatchInfo {
-        kind: match interpreter.kind {
-            r2sym::InterpreterKind::SwitchDispatch => "switch_dispatch".to_string(),
-            r2sym::InterpreterKind::IndirectDispatch => "indirect_dispatch".to_string(),
-        },
-        dispatch_header: format!("0x{:x}", interpreter.dispatch_header),
-        dispatch_targets: interpreter.dispatch_targets,
-        selector: interpreter.selector.clone(),
-        back_edges: interpreter.back_edges,
-        score: interpreter.score,
-    }
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct VmStateUpdateInfo {
-    pub(crate) output: String,
-    pub(crate) expr: String,
-    pub(crate) value: String,
-    pub(crate) exact: bool,
-    pub(crate) confidence: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct VmGuardConditionInfo {
-    pub(crate) expr: String,
-    pub(crate) value: String,
-    pub(crate) expect_nonzero: bool,
-    pub(crate) exact: bool,
-    pub(crate) confidence: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct VmGuardedExitInfo {
-    pub(crate) target: String,
-    pub(crate) guard: VmGuardConditionInfo,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct VmMemoryConditionInfo {
-    pub(crate) region: String,
-    pub(crate) offset_lo: i64,
-    pub(crate) offset_hi: i64,
-    pub(crate) size: u32,
-    pub(crate) exact_offset: bool,
-    pub(crate) confidence: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) binding: Option<String>,
-    pub(crate) expr: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) value_expr: Option<String>,
-    pub(crate) exact_value: bool,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct VmTransferArmInfo {
-    pub(crate) handler_target: String,
-    pub(crate) case_values: Vec<u64>,
-    pub(crate) region_blocks: Vec<String>,
-    pub(crate) exit_targets: Vec<String>,
-    pub(crate) exit_guards: Vec<VmGuardedExitInfo>,
-    pub(crate) state_updates: Vec<VmStateUpdateInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) selector_update: Option<VmStateUpdateInfo>,
-    pub(crate) memory_reads: Vec<VmMemoryConditionInfo>,
-    pub(crate) memory_writes: Vec<VmMemoryConditionInfo>,
-    pub(crate) residual_guards: bool,
-    pub(crate) residual_memory_effects: bool,
-    pub(crate) exact: bool,
-    pub(crate) confidence: String,
-    pub(crate) redispatch: bool,
-    pub(crate) may_return: bool,
-    pub(crate) truncated: bool,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) struct VmStepSummaryInfo {
-    pub(crate) kind: String,
-    pub(crate) loop_header: String,
-    pub(crate) dispatch_header: String,
-    pub(crate) selector: Option<String>,
-    pub(crate) dispatch_targets: Vec<String>,
-    pub(crate) default_target: Option<String>,
-    pub(crate) case_values_by_target: BTreeMap<String, Vec<u64>>,
-    pub(crate) loop_latches: Vec<String>,
-    pub(crate) state_inputs: Vec<String>,
-    pub(crate) state_outputs: Vec<String>,
-    pub(crate) step_blocks: Vec<String>,
-    pub(crate) handler_regions: BTreeMap<String, Vec<String>>,
-    pub(crate) handler_state_inputs: BTreeMap<String, Vec<String>>,
-    pub(crate) handler_state_outputs: BTreeMap<String, Vec<String>>,
-    pub(crate) handler_state_updates: BTreeMap<String, Vec<VmStateUpdateInfo>>,
-    pub(crate) handler_exit_guards: BTreeMap<String, Vec<VmGuardedExitInfo>>,
-    pub(crate) handler_memory_read_effects: BTreeMap<String, Vec<VmMemoryConditionInfo>>,
-    pub(crate) handler_memory_write_effects: BTreeMap<String, Vec<VmMemoryConditionInfo>>,
-    pub(crate) handler_memory_reads: BTreeMap<String, usize>,
-    pub(crate) handler_memory_writes: BTreeMap<String, usize>,
-    pub(crate) handler_calls: BTreeMap<String, usize>,
-    pub(crate) handler_conditional_branches: BTreeMap<String, usize>,
-    pub(crate) handler_exit_targets: BTreeMap<String, Vec<String>>,
-    pub(crate) redispatch_handlers: Vec<String>,
-    pub(crate) returning_handlers: Vec<String>,
-    pub(crate) truncated_handlers: Vec<String>,
-    pub(crate) transfers: Vec<VmTransferArmInfo>,
-}
-
-fn render_vm_value_expr(value: &r2sym::VmValueExpr) -> String {
-    match value {
-        r2sym::VmValueExpr::Const(value) => format!("0x{value:x}"),
-        r2sym::VmValueExpr::Var(name) | r2sym::VmValueExpr::Expr(name) => name.clone(),
-        r2sym::VmValueExpr::Unary { op, arg } => {
-            let op = match op {
-                r2sym::VmUnaryOp::Neg => "-",
-                r2sym::VmUnaryOp::BitNot => "~",
-                r2sym::VmUnaryOp::BoolNot => "!",
-            };
-            format!("({}{})", op, render_vm_value_expr(arg))
-        }
-        r2sym::VmValueExpr::Binary { op, lhs, rhs } => {
-            let op = match op {
-                r2sym::VmBinaryOp::Add => "+",
-                r2sym::VmBinaryOp::Sub => "-",
-                r2sym::VmBinaryOp::Mul => "*",
-                r2sym::VmBinaryOp::Div => "/",
-                r2sym::VmBinaryOp::Rem => "%",
-                r2sym::VmBinaryOp::And => "&",
-                r2sym::VmBinaryOp::Or => "|",
-                r2sym::VmBinaryOp::Xor => "^",
-                r2sym::VmBinaryOp::Shl => "<<",
-                r2sym::VmBinaryOp::LShr | r2sym::VmBinaryOp::AShr => ">>",
-                r2sym::VmBinaryOp::Eq => "==",
-                r2sym::VmBinaryOp::Ne => "!=",
-                r2sym::VmBinaryOp::Lt | r2sym::VmBinaryOp::SLt => "<",
-                r2sym::VmBinaryOp::Le | r2sym::VmBinaryOp::SLe => "<=",
-                r2sym::VmBinaryOp::BoolAnd => "&&",
-                r2sym::VmBinaryOp::BoolOr => "||",
-            };
-            format!(
-                "({} {} {})",
-                render_vm_value_expr(lhs),
-                op,
-                render_vm_value_expr(rhs)
-            )
-        }
-    }
-}
-
-fn render_semantic_confidence(confidence: r2sym::SemanticConfidence) -> String {
-    match confidence {
-        r2sym::SemanticConfidence::Exact => "exact",
-        r2sym::SemanticConfidence::Likely => "likely",
-        r2sym::SemanticConfidence::Heuristic => "heuristic",
-        r2sym::SemanticConfidence::Residual => "residual",
-    }
-    .to_string()
-}
-
-fn vm_state_update_info_from_sym(update: &r2sym::VmStateUpdate) -> VmStateUpdateInfo {
-    VmStateUpdateInfo {
-        output: update.output.clone(),
-        expr: update.expr.clone(),
-        value: render_vm_value_expr(&update.value),
-        exact: update.exact,
-        confidence: render_semantic_confidence(update.confidence()),
-    }
-}
-
-fn vm_guard_condition_info_from_sym(guard: &r2sym::VmGuardCondition) -> VmGuardConditionInfo {
-    VmGuardConditionInfo {
-        expr: guard.expr.clone(),
-        value: render_vm_value_expr(&guard.value),
-        expect_nonzero: guard.expect_nonzero,
-        exact: guard.exact,
-        confidence: render_semantic_confidence(guard.confidence()),
-    }
-}
-
-fn vm_guarded_exit_info_from_sym(guarded: &r2sym::VmGuardedExit) -> VmGuardedExitInfo {
-    VmGuardedExitInfo {
-        target: format!("0x{:x}", guarded.target),
-        guard: vm_guard_condition_info_from_sym(&guarded.guard),
-    }
-}
-
-fn vm_memory_condition_info_from_sym(
-    condition: &r2sym::VmMemoryCondition,
-) -> VmMemoryConditionInfo {
-    VmMemoryConditionInfo {
-        region: format!(
-            "{}:{}#{}",
-            match condition.region.kind {
-                r2sym::MemoryRegionKind::Stack => "stack",
-                r2sym::MemoryRegionKind::Global => "global",
-                r2sym::MemoryRegionKind::Input => "input",
-                r2sym::MemoryRegionKind::Heap => "heap",
-                r2sym::MemoryRegionKind::Replay => "replay",
-                r2sym::MemoryRegionKind::EscapedUnknown => "unknown",
-            },
-            condition.region.name,
-            condition.region.id
-        ),
-        offset_lo: condition.offset_lo,
-        offset_hi: condition.offset_hi,
-        size: condition.size,
-        exact_offset: condition.exact_offset,
-        confidence: render_semantic_confidence(condition.confidence()),
-        binding: condition.binding.clone(),
-        expr: condition.expr.clone(),
-        value_expr: condition.value_expr.clone(),
-        exact_value: condition.exact_value,
-    }
-}
-
-fn vm_transfer_arm_info_from_sym(transfer: &r2sym::VmTransferArm) -> VmTransferArmInfo {
-    VmTransferArmInfo {
-        handler_target: format!("0x{:x}", transfer.handler_target),
-        case_values: transfer.case_values.clone(),
-        region_blocks: transfer
-            .region_blocks
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        exit_targets: transfer
-            .exit_targets
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        exit_guards: transfer
-            .exit_guards
-            .iter()
-            .map(vm_guarded_exit_info_from_sym)
-            .collect(),
-        state_updates: transfer
-            .state_updates
-            .iter()
-            .map(vm_state_update_info_from_sym)
-            .collect(),
-        selector_update: transfer
-            .selector_update
-            .as_ref()
-            .map(vm_state_update_info_from_sym),
-        memory_reads: transfer
-            .memory_reads
-            .iter()
-            .map(vm_memory_condition_info_from_sym)
-            .collect(),
-        memory_writes: transfer
-            .memory_writes
-            .iter()
-            .map(vm_memory_condition_info_from_sym)
-            .collect(),
-        residual_guards: transfer.residual_guards,
-        residual_memory_effects: transfer.residual_memory_effects,
-        exact: transfer.exact,
-        confidence: render_semantic_confidence(transfer.confidence()),
-        redispatch: transfer.redispatch,
-        may_return: transfer.may_return,
-        truncated: transfer.truncated,
-    }
-}
-
-fn vm_step_summary_info_from_sym(vm_step: &r2sym::VmStepSummary) -> VmStepSummaryInfo {
-    VmStepSummaryInfo {
-        kind: match vm_step.kind {
-            r2sym::InterpreterKind::SwitchDispatch => "switch_dispatch".to_string(),
-            r2sym::InterpreterKind::IndirectDispatch => "indirect_dispatch".to_string(),
-        },
-        loop_header: format!("0x{:x}", vm_step.loop_header),
-        dispatch_header: format!("0x{:x}", vm_step.dispatch_header),
-        selector: vm_step.selector.clone(),
-        dispatch_targets: vm_step
-            .dispatch_targets
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        default_target: vm_step.default_target.map(|addr| format!("0x{addr:x}")),
-        case_values_by_target: vm_step
-            .case_values_by_target
-            .iter()
-            .map(|(target, values)| (format!("0x{target:x}"), values.clone()))
-            .collect(),
-        loop_latches: vm_step
-            .loop_latches
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        state_inputs: vm_step.state_inputs.clone(),
-        state_outputs: vm_step.state_outputs.clone(),
-        step_blocks: vm_step
-            .step_blocks
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        handler_regions: vm_step
-            .handler_regions
-            .iter()
-            .map(|(target, blocks)| {
-                (
-                    format!("0x{target:x}"),
-                    blocks.iter().map(|addr| format!("0x{addr:x}")).collect(),
-                )
-            })
-            .collect(),
-        handler_state_inputs: vm_step
-            .handler_state_inputs
-            .iter()
-            .map(|(target, inputs)| (format!("0x{target:x}"), inputs.clone()))
-            .collect(),
-        handler_state_outputs: vm_step
-            .handler_state_outputs
-            .iter()
-            .map(|(target, outputs)| (format!("0x{target:x}"), outputs.clone()))
-            .collect(),
-        handler_state_updates: vm_step
-            .handler_state_updates
-            .iter()
-            .map(|(target, updates)| {
-                (
-                    format!("0x{target:x}"),
-                    updates.iter().map(vm_state_update_info_from_sym).collect(),
-                )
-            })
-            .collect(),
-        handler_exit_guards: vm_step
-            .handler_exit_guards
-            .iter()
-            .map(|(target, guards)| {
-                (
-                    format!("0x{target:x}"),
-                    guards.iter().map(vm_guarded_exit_info_from_sym).collect(),
-                )
-            })
-            .collect(),
-        handler_memory_read_effects: vm_step
-            .handler_memory_read_effects
-            .iter()
-            .map(|(target, conditions)| {
-                (
-                    format!("0x{target:x}"),
-                    conditions
-                        .iter()
-                        .map(vm_memory_condition_info_from_sym)
-                        .collect(),
-                )
-            })
-            .collect(),
-        handler_memory_write_effects: vm_step
-            .handler_memory_write_effects
-            .iter()
-            .map(|(target, conditions)| {
-                (
-                    format!("0x{target:x}"),
-                    conditions
-                        .iter()
-                        .map(vm_memory_condition_info_from_sym)
-                        .collect(),
-                )
-            })
-            .collect(),
-        handler_memory_reads: vm_step
-            .handler_memory_reads
-            .iter()
-            .map(|(target, count)| (format!("0x{target:x}"), *count))
-            .collect(),
-        handler_memory_writes: vm_step
-            .handler_memory_writes
-            .iter()
-            .map(|(target, count)| (format!("0x{target:x}"), *count))
-            .collect(),
-        handler_calls: vm_step
-            .handler_calls
-            .iter()
-            .map(|(target, count)| (format!("0x{target:x}"), *count))
-            .collect(),
-        handler_conditional_branches: vm_step
-            .handler_conditional_branches
-            .iter()
-            .map(|(target, count)| (format!("0x{target:x}"), *count))
-            .collect(),
-        handler_exit_targets: vm_step
-            .handler_exit_targets
-            .iter()
-            .map(|(target, exits)| {
-                (
-                    format!("0x{target:x}"),
-                    exits.iter().map(|addr| format!("0x{addr:x}")).collect(),
-                )
-            })
-            .collect(),
-        redispatch_handlers: vm_step
-            .redispatch_handlers
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        returning_handlers: vm_step
-            .returning_handlers
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        truncated_handlers: vm_step
-            .truncated_handlers
-            .iter()
-            .map(|addr| format!("0x{addr:x}"))
-            .collect(),
-        transfers: vm_step
-            .transfers
-            .iter()
-            .map(vm_transfer_arm_info_from_sym)
-            .collect(),
-    }
 }
 
 #[derive(Serialize)]
@@ -1015,7 +539,7 @@ fn build_sym_exec_summary(
         assumption_usage,
         assumption_conditioned,
         summary_conditioned,
-        semantic.map(compiled_semantic_info),
+        semantic.map(r2sym::compiled_semantic_info),
     )
 }
 
@@ -1026,7 +550,7 @@ fn build_sym_exec_summary_with_semantic_info(
     assumption_usage: r2ssa::AssumptionUsageReport,
     assumption_conditioned: bool,
     summary_conditioned: bool,
-    semantic: Option<CompiledSemanticInfo>,
+    semantic: Option<r2sym::CompiledSemanticInfo>,
 ) -> SymExecSummary {
     let mut runtime_diagnostics = Vec::new();
     if stats.runtime_missing_exception_handler > 0 {
@@ -1423,255 +947,6 @@ fn final_constraint_precision_string(precision: r2sym::FinalConstraintPrecision)
         r2sym::FinalConstraintPrecision::Unknown => "unknown",
     }
     .to_string()
-}
-
-pub(crate) fn compiled_semantic_info(compiled: &r2sym::SemanticArtifact) -> CompiledSemanticInfo {
-    compiled_semantic_info_with_seed(compiled, None)
-}
-
-fn memory_summary_region_label(region: &r2sym::BackwardMemoryRegion) -> String {
-    match region {
-        r2sym::BackwardMemoryRegion::Argument { index } => format!("arg{index}"),
-        r2sym::BackwardMemoryRegion::Region(region) => format!("{:?}:{}", region.kind, region.name),
-    }
-}
-
-fn native_worker_summary_kind_label(kind: r2sym::NativeWorkerSummaryKind) -> &'static str {
-    match kind {
-        r2sym::NativeWorkerSummaryKind::ProgramOrchestrator => "program_orchestrator",
-        r2sym::NativeWorkerSummaryKind::MemoryTransfer => "memory_transfer",
-        r2sym::NativeWorkerSummaryKind::FileTransfer => "file_transfer",
-        r2sym::NativeWorkerSummaryKind::MemoryRead => "memory_read",
-        r2sym::NativeWorkerSummaryKind::MemoryWrite => "memory_write",
-        r2sym::NativeWorkerSummaryKind::MemoryEscape => "memory_escape",
-        r2sym::NativeWorkerSummaryKind::MemoryFree => "memory_free",
-        r2sym::NativeWorkerSummaryKind::StringScan => "string_scan",
-        r2sym::NativeWorkerSummaryKind::HashFold => "hash_fold",
-        r2sym::NativeWorkerSummaryKind::TableWalk => "table_walk",
-        r2sym::NativeWorkerSummaryKind::PathWalk => "path_walk",
-        r2sym::NativeWorkerSummaryKind::DirectoryTraversal => "directory_traversal",
-        r2sym::NativeWorkerSummaryKind::RecordStream => "record_stream",
-        r2sym::NativeWorkerSummaryKind::FieldSelection => "field_selection",
-        r2sym::NativeWorkerSummaryKind::OutputStream => "output_stream",
-        r2sym::NativeWorkerSummaryKind::FormatRender => "format_render",
-        r2sym::NativeWorkerSummaryKind::MetadataProbe => "metadata_probe",
-        r2sym::NativeWorkerSummaryKind::SortMerge => "sort_merge",
-        r2sym::NativeWorkerSummaryKind::NumericTransform => "numeric_transform",
-        r2sym::NativeWorkerSummaryKind::Parser => "parser",
-        r2sym::NativeWorkerSummaryKind::DiagnosticWrapper => "diagnostic_wrapper",
-        r2sym::NativeWorkerSummaryKind::FormatArgumentFetch => "format_argument_fetch",
-        r2sym::NativeWorkerSummaryKind::Allocation => "allocation",
-        r2sym::NativeWorkerSummaryKind::Lifetime => "lifetime",
-        r2sym::NativeWorkerSummaryKind::Synchronization => "synchronization",
-        r2sym::NativeWorkerSummaryKind::Atomic => "atomic",
-        r2sym::NativeWorkerSummaryKind::Unknown => "unknown",
-    }
-}
-
-fn native_worker_summary_kinds(native: Option<&r2sym::NativeArtifactBody>) -> Vec<String> {
-    native
-        .into_iter()
-        .flat_map(|body| body.summary.worker_summaries.iter())
-        .map(|summary| native_worker_summary_kind_label(summary.kind).to_string())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn native_region_summary_kinds(native: Option<&r2sym::NativeArtifactBody>) -> Vec<String> {
-    native
-        .into_iter()
-        .flat_map(|body| body.summary.region_summaries.iter())
-        .map(|summary| native_worker_summary_kind_label(summary.kind).to_string())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn semantic_memory_summaries(native: Option<&r2sym::NativeArtifactBody>) -> Vec<MemorySummaryInfo> {
-    let mut summaries = native
-        .into_iter()
-        .flat_map(|body| body.regions.values())
-        .flat_map(|region| {
-            region.memory.iter().map(|fact| {
-                let term = &fact.value.term;
-                MemorySummaryInfo {
-                    anchor: format!("0x{:x}", region.anchor),
-                    region: memory_summary_region_label(&term.region),
-                    offset_lo: term.offset_lo,
-                    offset_hi: term.offset_hi,
-                    size: term.size,
-                    exact_offset: term.exact_offset,
-                    binding: term.binding.clone(),
-                    expr: term.expr.clone(),
-                    value_expr: term.value_expr.clone(),
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    summaries.sort();
-    summaries.dedup();
-    summaries
-}
-
-fn compiled_semantic_info_with_replay_seed(
-    compiled: &r2sym::SemanticArtifact,
-    replay_seed: &r2sym::ReplaySeed,
-) -> CompiledSemanticInfo {
-    compiled_semantic_info_with_seed(
-        compiled,
-        Some(r2sym::stable_replay_seed_fingerprint(replay_seed)),
-    )
-}
-
-fn compiled_semantic_info_with_seed(
-    compiled: &r2sym::SemanticArtifact,
-    replay_seed_fingerprint: Option<u64>,
-) -> CompiledSemanticInfo {
-    let native = compiled.native_body();
-    let memory_summaries = semantic_memory_summaries(native);
-    let native_worker_summary_kinds = native_worker_summary_kinds(native);
-    let native_region_summary_kinds = native_region_summary_kinds(native);
-    let memory_fact_count = memory_summaries.len();
-    CompiledSemanticInfo {
-        schema_version: r2sym::SEMANTIC_ARTIFACT_SCHEMA_VERSION,
-        stage: match compiled.stage {
-            r2sym::RefinementStage::Raw => "raw",
-            r2sym::RefinementStage::Compiled => "compiled",
-            r2sym::RefinementStage::Residual => "residual",
-        }
-        .to_string(),
-        granularity: match compiled.granularity {
-            r2sym::ArtifactGranularity::WholeFunction => "whole_function",
-            r2sym::ArtifactGranularity::Regioned => "regioned",
-            r2sym::ArtifactGranularity::SummaryOnly => "summary_only",
-        }
-        .to_string(),
-        execution: match compiled.execution {
-            r2sym::ExecutionModel::Native => "native",
-            r2sym::ExecutionModel::Vm => "vm",
-        }
-        .to_string(),
-        seed_mode: replay_seed_fingerprint.map(|_| "replay".to_string()),
-        replay_seed_fingerprint: replay_seed_fingerprint
-            .map(|fingerprint| format!("0x{fingerprint:x}")),
-        query_plan: compiled.query_plan(),
-        type_plan: compiled.type_plan(),
-        decompile_plan: compiled.decompile_plan(),
-        slice_class: compiled
-            .slice_class()
-            .map(|slice_class| match slice_class {
-                r2sym::SliceClass::Wrapper => "wrapper",
-                r2sym::SliceClass::Worker => "worker",
-                r2sym::SliceClass::RecursiveGroup => "recursive_group",
-                r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
-                r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
-                r2sym::SliceClass::GenericLarge => "generic_large",
-            })
-            .unwrap_or("worker")
-            .to_string(),
-        residual_reasons: compiled
-            .diagnostics
-            .residual_reasons
-            .iter()
-            .map(|reason| {
-                match reason {
-                    r2sym::ResidualReason::MissingArch => "missing_arch",
-                    r2sym::ResidualReason::LargeCfg => "large_cfg",
-                    r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-                    r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
-                    r2sym::ResidualReason::InterpreterRequiresStepSummary => {
-                        "interpreter_requires_step_summary"
-                    }
-                }
-                .to_string()
-            })
-            .collect(),
-        ambiguous_target_count: compiled.ambiguous_targets().len(),
-        ambiguous_targets: compiled
-            .ambiguous_targets()
-            .into_iter()
-            .map(|target| format!("0x{target:x}"))
-            .collect(),
-        closure_functions: compiled
-            .native_body()
-            .map(|body| body.summary.closure_functions)
-            .unwrap_or(0),
-        helper_functions: compiled
-            .native_body()
-            .map(|body| body.summary.helper_functions)
-            .unwrap_or(0),
-        derived_summaries: compiled
-            .native_body()
-            .map(|body| body.summary.derived_summaries)
-            .unwrap_or(0),
-        summary_attempted: compiled
-            .native_body()
-            .map(|body| body.summary.derived_diagnostics.attempted)
-            .unwrap_or(0),
-        summary_budget_exhausted: compiled
-            .native_body()
-            .map(|body| {
-                body.summary.derived_diagnostics.budget_exhausted
-                    + body.summary.derived_diagnostics.scc_budget_exhausted
-            })
-            .unwrap_or(0),
-        summary_scc_count: compiled
-            .native_body()
-            .map(|body| body.summary.derived_diagnostics.scc_count)
-            .unwrap_or(0),
-        region_count: native.map(|body| body.regions.len()).unwrap_or(0),
-        control_region_count: native
-            .map(|body| {
-                body.regions
-                    .values()
-                    .filter(|region| !region.control.is_empty())
-                    .count()
-            })
-            .unwrap_or(0),
-        memory_region_count: native
-            .map(|body| {
-                body.regions
-                    .values()
-                    .filter(|region| !region.memory.is_empty())
-                    .count()
-            })
-            .unwrap_or(0),
-        memory_fact_count,
-        native_region_summary_count: native
-            .map(|body| body.summary.region_summaries.len())
-            .unwrap_or(0),
-        native_region_summary_kinds,
-        native_worker_summary_count: native
-            .map(|body| body.summary.worker_summaries.len())
-            .unwrap_or(0),
-        native_worker_summary_kinds,
-        memory_summaries,
-        compiled_condition_count: compiled.actionable_control_count(),
-        exact_compiled_condition_count: compiled.exact_control_count(),
-        actionable_compiled_condition_count: compiled.actionable_control_count(),
-        branches_pruned: compiled.diagnostics.branches_pruned,
-        branches_unknown: compiled.diagnostics.branches_unknown,
-        skipped_large_cfg: compiled.diagnostics.skipped_large_cfg,
-        interpreter_diagnostic: compiled
-            .diagnostics
-            .interpreter
-            .as_ref()
-            .map(interpreter_dispatch_info_from_sym),
-        interpreter: compiled
-            .vm_body()
-            .and_then(|body| body.interpreter.as_ref())
-            .map(interpreter_dispatch_info_from_sym),
-        vm_step: compiled
-            .vm_body()
-            .and_then(|body| body.step_summary.as_ref())
-            .map(vm_step_summary_info_from_sym),
-        vm_transfer: compiled
-            .vm_body()
-            .and_then(|body| body.transfer_summary.as_ref())
-            .map(vm_step_summary_info_from_sym),
-        cache_hit: compiled.diagnostics.cache_hit,
-    }
 }
 
 fn path_solution_from_result<'ctx>(
@@ -2535,47 +1810,6 @@ pub extern "C" fn r2sym_function_scope(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn r2sym_compile_semantics_scope(
-    ctx: *const R2ILContext,
-    functions: *const R2ILFunctionBlocks,
-    num_functions: usize,
-    entry_addr: u64,
-    external_context_json: *const c_char,
-) -> *mut c_char {
-    let Some(ctx_view) = require_ctx_view(ctx) else {
-        return sym_error_json("missing disassembler context");
-    };
-    let Some(scope) = (unsafe {
-        build_symbolic_scope_from_ffi(functions, num_functions, ctx_view.arch, entry_addr)
-    }) else {
-        return sym_error_json("failed to build symbolic scope");
-    };
-    let scope = match scope_with_external_assumptions(&scope, ctx_view.arch, external_context_json)
-    {
-        Ok(scope) => scope,
-        Err(err) => return sym_error_json(err),
-    };
-    let Some(prepared) = scope_root_prepared(&scope) else {
-        return sym_error_json("failed to build root SSA function");
-    };
-    let symbol_map = symbol_map_snapshot();
-    let z3_ctx = Context::thread_local();
-    let query_config = r2engine::default_symbolic_query_config(merge_states_enabled());
-    let compiled = r2sym::compile_semantic_artifact_with_scope(
-        &z3_ctx,
-        prepared,
-        Some(&scope),
-        ctx_view.arch,
-        &symbol_map,
-        query_config.summary_profile,
-    );
-    match serde_json::to_string(&compiled_semantic_info(&compiled)) {
-        Ok(s) => CString::new(s).map_or(ptr::null_mut(), |c| c.into_raw()),
-        Err(_) => sym_error_json("failed to serialize compiled semantics output"),
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn r2sym_paths_scope(
     ctx: *const R2ILContext,
     functions: *const R2ILFunctionBlocks,
@@ -3116,7 +2350,7 @@ pub extern "C" fn r2sym_explore_to_replay_scope(
             assumption_usage,
             assumption_conditioned,
             summary_conditioned,
-            Some(compiled_semantic_info_with_replay_seed(
+            Some(r2sym::compiled_semantic_info_with_replay_seed(
                 &compiled,
                 &replay_seed,
             )),
@@ -3254,7 +2488,7 @@ pub extern "C" fn r2sym_solve_to_replay_scope(
             assumption_usage,
             assumption_conditioned,
             summary_conditioned,
-            Some(compiled_semantic_info_with_replay_seed(
+            Some(r2sym::compiled_semantic_info_with_replay_seed(
                 &compiled,
                 &replay_seed,
             )),

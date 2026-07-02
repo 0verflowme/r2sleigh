@@ -281,9 +281,6 @@ fn stack_var_for_addr_var(
         ptr_arith: &empty_ptrs,
         stack_slots: inputs.stack_slots,
         forwarded_values: &HashMap::new(),
-        function_names: inputs.env.function_names,
-        strings: inputs.env.strings,
-        symbols: inputs.env.symbols,
         type_oracle: inputs.env.type_oracle,
     };
     let rendered = lower.var_name(addr);
@@ -475,9 +472,6 @@ fn forwarded_expr_for_value(
         ptr_arith: &empty_ptrs,
         stack_slots: &use_info.stack_slots,
         forwarded_values: &use_info.forwarded_values,
-        function_names: env.function_names,
-        strings: env.strings,
-        symbols: env.symbols,
         type_oracle: env.type_oracle,
     };
     Some(lower.expr_for_ssa_name(&prov.source))

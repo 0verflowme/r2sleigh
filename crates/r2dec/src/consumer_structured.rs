@@ -7,28 +7,35 @@ pub(crate) struct RoutedBody {
 }
 
 pub(crate) fn primary_body_for_semantic_route<'a, 'o, F>(
-    route: &crate::SemanticRoutePlan,
+    route: &r2types::DecompileRouteFacts,
     structurer: &mut crate::ControlFlowStructurer<'a, 'o>,
     _linearize: F,
 ) -> RoutedBody
 where
     F: FnMut() -> Vec<CStmt>,
 {
-    match route {
-        crate::SemanticRoutePlan::StructuredWorker { reason } => RoutedBody {
-            body_stmt: semantic_worker_comment_only_body("structured_worker", reason),
+    match route.kind {
+        r2types::DecompileRouteKind::StructuredWorker => RoutedBody {
+            body_stmt: semantic_worker_comment_only_body(
+                "structured_worker",
+                crate::route_reason(route),
+            ),
             use_conservative_locals: true,
             is_linear_fallback: false,
         },
-        crate::SemanticRoutePlan::LinearWorker { reason }
-        | crate::SemanticRoutePlan::SummaryIslands { reason } => RoutedBody {
-            body_stmt: semantic_worker_comment_only_body("summary_route", reason),
-            use_conservative_locals: true,
-            is_linear_fallback: false,
-        },
-        crate::SemanticRoutePlan::VmSummary { .. }
-        | crate::SemanticRoutePlan::FallbackComment { .. }
-        | crate::SemanticRoutePlan::Standard => RoutedBody {
+        r2types::DecompileRouteKind::LinearWorker | r2types::DecompileRouteKind::SummaryIslands => {
+            RoutedBody {
+                body_stmt: semantic_worker_comment_only_body(
+                    "summary_route",
+                    crate::route_reason(route),
+                ),
+                use_conservative_locals: true,
+                is_linear_fallback: false,
+            }
+        }
+        r2types::DecompileRouteKind::VmSummary
+        | r2types::DecompileRouteKind::FallbackComment
+        | r2types::DecompileRouteKind::Standard => RoutedBody {
             body_stmt: structurer.structure(),
             use_conservative_locals: false,
             is_linear_fallback: false,

@@ -87,41 +87,6 @@ fn vm_summary_stats_comment(func_name: &str, vm_step: &r2sym::VmStepSummary) -> 
     )
 }
 
-fn render_vm_signature(type_facts: &FunctionTypeFacts, func_name: &str) -> String {
-    let Some(signature) = type_facts.render_authorized_signature() else {
-        return format!("void {func_name}(void)");
-    };
-    let ret_ty = signature
-        .ret_type
-        .as_ref()
-        .map(crate::type_like_to_ctype)
-        .unwrap_or(crate::CType::Void);
-    let params = if signature.params.is_empty() {
-        "void".to_string()
-    } else {
-        signature
-            .params
-            .iter()
-            .enumerate()
-            .map(|(idx, param)| {
-                let ty = param
-                    .ty
-                    .as_ref()
-                    .map(crate::type_like_to_ctype)
-                    .unwrap_or(crate::CType::Unknown);
-                let name = if param.name.trim().is_empty() {
-                    format!("arg{}", idx + 1)
-                } else {
-                    param.name.clone()
-                };
-                format!("{ty} {name}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    format!("{ret_ty} {func_name}({params})")
-}
-
 fn render_vm_handler_comment_block(out: &mut String, vm_step: &r2sym::VmStepSummary, target: u64) {
     let case_values = vm_step
         .case_values_by_target
@@ -196,7 +161,7 @@ fn render_vm_handler_comment_block(out: &mut String, vm_step: &r2sym::VmStepSumm
 
 pub(crate) fn render_vm_semantic_summary(
     func_name: &str,
-    type_facts: &FunctionTypeFacts,
+    _type_facts: &FunctionTypeFacts,
     semantic_artifact: &r2sym::SemanticArtifact,
 ) -> Option<String> {
     let vm_body = semantic_artifact.vm_body()?;
@@ -207,24 +172,27 @@ pub(crate) fn render_vm_semantic_summary(
     let selector = vm_step.selector.as_deref().unwrap_or("dispatch_selector");
     let mut out = String::new();
 
-    let _ = writeln!(out, "{} {{", render_vm_signature(type_facts, func_name));
     let _ = writeln!(
         out,
-        "    /* {} */",
+        "/* VM summary-only route for {}; executable C refused: missing native render proof */",
+        crate::sanitize_comment_text(func_name)
+    );
+    let _ = writeln!(
+        out,
+        "/* {} */",
         vm_summary_stats_comment(func_name, vm_step)
     );
-    let _ = writeln!(out, "    /* selector: {selector} */");
+    let _ = writeln!(out, "/* selector: {selector} */");
     for target in &vm_step.dispatch_targets {
         render_vm_handler_comment_block(&mut out, vm_step, *target);
     }
     if let Some(default_target) = vm_step.default_target
         && !vm_step.dispatch_targets.contains(&default_target)
     {
-        let _ = writeln!(out, "    /* default_target=0x{:x} */", default_target);
+        let _ = writeln!(out, "/* default_target=0x{:x} */", default_target);
     } else if vm_step.default_target.is_none() {
-        let _ = writeln!(out, "    /* no default target recovered */");
+        let _ = writeln!(out, "/* no default target recovered */");
     }
-    let _ = writeln!(out, "}}");
     Some(out)
 }
 

@@ -89,7 +89,7 @@ pub(crate) fn semantic_fallback_comment(
     if function_facts.has_assumption_conflicts() {
         reason.push_str(&format!(
             "; assumption_conflicts={}",
-            function_facts.assumption_usage.conflicts.len()
+            function_facts.assumption_usage().conflicts.len()
         ));
     }
     if let Some(rollup) = function_facts.summary_rollup() {
@@ -97,7 +97,7 @@ pub(crate) fn semantic_fallback_comment(
             reason.push_str(&format!("; summary_return={return_relation:?}"));
         }
         let certified_out_params =
-            crate::consumer_summary::certified_out_param_labels(&function_facts.types);
+            crate::consumer_summary::certified_out_param_labels(function_facts.type_facts());
         if !certified_out_params.is_empty() {
             reason.push_str("; out_params=[");
             reason.push_str(&certified_out_params.join(", "));

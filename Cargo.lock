@@ -802,6 +802,7 @@ dependencies = [
  "r2sym",
  "r2types",
  "serde",
+ "serde_json",
  "z3",
 ]
 
@@ -847,7 +848,6 @@ name = "r2sleigh-export"
 version = "0.1.0"
 dependencies = [
  "hex",
- "r2dec",
  "r2il",
  "r2sleigh-lift",
  "r2ssa",
@@ -870,7 +870,6 @@ dependencies = [
 name = "r2sleigh-plugin"
 version = "0.1.0"
 dependencies = [
- "r2dec",
  "r2engine",
  "r2il",
  "r2sleigh-export",

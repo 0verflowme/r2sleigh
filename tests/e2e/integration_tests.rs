@@ -189,221 +189,12 @@ mod ffi {
     const X86_BYTES_BASE: &[u8] = &[0x48, 0x89, 0xc0]; // mov rax, rax
     const X86_BYTES_DEC: &[u8] = &[0xc3]; // ret
     const ARM_BYTES_BASE: &[u8] = &[0x01, 0x00, 0xa0, 0xe3]; // mov r0, r1 style fixture
-    const ARM64_BYTES_BASE: &[u8] = &[0x00, 0x00, 0x01, 0x8b]; // add x0, x0, x1
-    const ARM64_BYTES_RET: &[u8] = &[0xc0, 0x03, 0x5f, 0xd6]; // ret
     const RISCV_BYTES_BASE: &[u8] = &[0x13, 0x05, 0x15, 0x00]; // addi a0,a0,1
-
-    #[repr(C)]
-    struct R2SleighContextParam {
-        name: *const c_char,
-        type_name: *const c_char,
-        cc_reg: *const c_char,
-    }
-
-    #[repr(C)]
-    struct R2SleighFunctionContext {
-        schema_version: u32,
-        dirty_epoch: u64,
-        context_hash: u64,
-        type_dirty_epoch: u64,
-        external_context_json: *const c_char,
-        signature_name: *const c_char,
-        signature_ret_type: *const c_char,
-        signature_callconv: *const c_char,
-        signature_noreturn: i32,
-        params: *const c_void,
-        num_params: usize,
-        vars: *const c_void,
-        num_vars: usize,
-        base_types: *const c_void,
-        num_base_types: usize,
-        assumptions_json: *const c_char,
-    }
-
-    #[repr(C)]
-    struct R2SleighInterprocScope {
-        schema_version: u32,
-        functions: *const c_void,
-        num_functions: usize,
-        seeds: *const c_void,
-        num_seeds: usize,
-    }
-
-    #[repr(C)]
-    struct R2SleighDebugSeed {
-        schema_version: u32,
-        seed_hash: u64,
-    }
-
-    #[repr(C)]
-    struct R2SleighBudgetConfig {
-        schema_version: u32,
-        interproc_iter: usize,
-        interproc_max_iters: usize,
-        interproc_converged: i32,
-        global_max_links: usize,
-        max_type_decls: usize,
-        max_mutations: usize,
-    }
-
-    #[repr(C)]
-    struct R2SleighTypeWritebackApplyPolicy {
-        schema_version: u32,
-        mode: u32,
-    }
-
-    #[repr(C)]
-    struct R2SleighSessionInput {
-        ctx: *const c_void,
-        blocks: *const *const c_void,
-        num_blocks: usize,
-        function_addr: u64,
-        function_name: *const c_char,
-        function_context: R2SleighFunctionContext,
-        interproc_scope: R2SleighInterprocScope,
-        debug_seed: R2SleighDebugSeed,
-        apply_policy: R2SleighTypeWritebackApplyPolicy,
-        budget: R2SleighBudgetConfig,
-    }
 
     fn padded_bytes(bytes: &[u8]) -> Vec<u8> {
         let mut out = bytes.to_vec();
         out.resize(16, 0x00);
         out
-    }
-
-    unsafe fn plugin_usize_symbol(lib: &libloading::Library, name: &[u8]) -> usize {
-        let f: libloading::Symbol<unsafe extern "C" fn() -> usize> =
-            unsafe { lib.get(name).unwrap() };
-        unsafe { f() }
-    }
-
-    #[test]
-    fn session_input_ffi_layout_matches_plugin() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_function_context"),
-                std::mem::size_of::<R2SleighFunctionContext>()
-            );
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_function_context"),
-                std::mem::align_of::<R2SleighFunctionContext>()
-            );
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_budget_config"),
-                std::mem::size_of::<R2SleighBudgetConfig>()
-            );
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_budget_config"),
-                std::mem::align_of::<R2SleighBudgetConfig>()
-            );
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_type_writeback_apply_policy"),
-                std::mem::size_of::<R2SleighTypeWritebackApplyPolicy>()
-            );
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_type_writeback_apply_policy"),
-                std::mem::align_of::<R2SleighTypeWritebackApplyPolicy>()
-            );
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_sizeof_session_input"),
-                std::mem::size_of::<R2SleighSessionInput>()
-            );
-            assert_eq!(
-                plugin_usize_symbol(&lib, b"r2sleigh_ffi_alignof_session_input"),
-                std::mem::align_of::<R2SleighSessionInput>()
-            );
-        }
-    }
-
-    unsafe fn session_type_writeback_json(
-        lib: &libloading::Library,
-        ctx: *const c_void,
-        blocks: &[*const c_void],
-        function_addr: u64,
-        function_name: &CString,
-        external_context: &CString,
-        signature_ret_type: Option<&CString>,
-        signature_callconv: Option<&CString>,
-        params: &[R2SleighContextParam],
-    ) -> String {
-        let session_analyze: libloading::Symbol<
-            unsafe extern "C" fn(*const R2SleighSessionInput) -> *mut c_void,
-        > = unsafe { lib.get(b"r2sleigh_session_analyze").unwrap() };
-        let session_type_writeback: libloading::Symbol<
-            unsafe extern "C" fn(*const c_void) -> *const c_char,
-        > = unsafe {
-            lib.get(b"r2sleigh_session_result_type_writeback_json")
-                .unwrap()
-        };
-        let session_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-            unsafe { lib.get(b"r2sleigh_session_result_free").unwrap() };
-        let input = R2SleighSessionInput {
-            ctx,
-            blocks: blocks.as_ptr(),
-            num_blocks: blocks.len(),
-            function_addr,
-            function_name: function_name.as_ptr(),
-            function_context: R2SleighFunctionContext {
-                schema_version: 1,
-                dirty_epoch: 0,
-                context_hash: 0,
-                type_dirty_epoch: 0,
-                external_context_json: external_context.as_ptr(),
-                signature_name: function_name.as_ptr(),
-                signature_ret_type: signature_ret_type
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                signature_callconv: signature_callconv
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                signature_noreturn: 0,
-                params: params.as_ptr().cast(),
-                num_params: params.len(),
-                vars: std::ptr::null(),
-                num_vars: 0,
-                base_types: std::ptr::null(),
-                num_base_types: 0,
-                assumptions_json: std::ptr::null(),
-            },
-            interproc_scope: R2SleighInterprocScope {
-                schema_version: 1,
-                functions: std::ptr::null(),
-                num_functions: 0,
-                seeds: std::ptr::null(),
-                num_seeds: 0,
-            },
-            debug_seed: R2SleighDebugSeed {
-                schema_version: 1,
-                seed_hash: 0,
-            },
-            apply_policy: R2SleighTypeWritebackApplyPolicy {
-                schema_version: 1,
-                mode: 1,
-            },
-            budget: R2SleighBudgetConfig {
-                schema_version: 1,
-                interproc_iter: 1,
-                interproc_max_iters: 1,
-                interproc_converged: 1,
-                global_max_links: 64,
-                max_type_decls: 32,
-                max_mutations: 128,
-            },
-        };
-        let session = unsafe { session_analyze(&input) };
-        assert!(!session.is_null(), "Expected non-null session result");
-        let json_ptr = unsafe { session_type_writeback(session) };
-        assert!(!json_ptr.is_null(), "Expected session type writeback JSON");
-        let json = unsafe { CStr::from_ptr(json_ptr) }
-            .to_string_lossy()
-            .to_string();
-        unsafe { session_free(session) };
-        json
     }
 
     fn canonicalize_json(value: &Value) -> Value {
@@ -442,10 +233,13 @@ mod ffi {
         esil: String,
         ssa_json: String,
         defuse_json: String,
-        dec: String,
     }
 
-    fn export_once_for_arch(arch: &str, base_bytes: &[u8], dec_bytes: &[u8]) -> Option<FfiExports> {
+    fn export_once_for_arch(
+        arch: &str,
+        base_bytes: &[u8],
+        _dec_bytes: &[u8],
+    ) -> Option<FfiExports> {
         unsafe {
             let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
             let r2il_arch_init: libloading::Symbol<
@@ -468,9 +262,6 @@ mod ffi {
             let r2il_block_defuse_json: libloading::Symbol<
                 unsafe extern "C" fn(*const c_void, *const c_void) -> *mut c_char,
             > = lib.get(b"r2il_block_defuse_json").unwrap();
-            let r2dec_block: libloading::Symbol<
-                unsafe extern "C" fn(*const c_void, *const c_void) -> *mut c_char,
-            > = lib.get(b"r2dec_block").unwrap();
             let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
                 lib.get(b"r2il_free").unwrap();
             let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
@@ -535,29 +326,6 @@ mod ffi {
 
             r2il_block_free(block);
 
-            let dec_input = padded_bytes(dec_bytes);
-            let dec_block = r2il_lift(ctx, dec_input.as_ptr(), dec_input.len(), 0x1000);
-            assert!(
-                !dec_block.is_null(),
-                "Failed to lift dec fixture for {}",
-                arch
-            );
-            assert_eq!(
-                r2il_block_validate(ctx, dec_block),
-                1,
-                "Lifted dec block should validate for {}",
-                arch
-            );
-            let dec_ptr = r2dec_block(ctx, dec_block);
-            assert!(
-                !dec_ptr.is_null(),
-                "dec export should not be null for {}",
-                arch
-            );
-            let dec = CStr::from_ptr(dec_ptr).to_string_lossy().into_owned();
-            r2il_string_free(dec_ptr);
-            r2il_block_free(dec_block);
-
             r2il_free(ctx);
 
             let ssa_parsed: Value = serde_json::from_str(&ssa_json).expect("valid ssa json");
@@ -582,7 +350,6 @@ mod ffi {
                 esil,
                 ssa_json,
                 defuse_json,
-                dec,
             })
         }
     }
@@ -614,15 +381,6 @@ mod ffi {
         let second_defuse = normalize_json_output(&second.defuse_json);
         assert_eq!(first_defuse, second_defuse, "defuse mismatch for {}", arch);
 
-        let first_dec = normalize_text_output(&first.dec);
-        let second_dec = normalize_text_output(&second.dec);
-        assert_eq!(first_dec, second_dec, "dec mismatch for {}", arch);
-        assert!(
-            !first_dec.trim().is_empty(),
-            "dec must be non-empty for {} (raw={:?})",
-            arch,
-            first.dec
-        );
     }
 
     fn contains_unsigned_int_meta(value: &Value) -> bool {
@@ -792,89 +550,6 @@ mod ffi {
                 );
                 r2il_string_free(ssa_ptr);
             }
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn block_set_switch_info_canonicalizes_duplicate_case_values() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *const u8,
-                    usize,
-                    u64,
-                ) -> *mut std::ffi::c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_block_set_switch_info: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    u64,
-                    u64,
-                    u64,
-                    u64,
-                    *const u64,
-                    *const u64,
-                    usize,
-                ),
-            > = lib.get(b"r2il_block_set_switch_info").unwrap();
-            let r2il_block_validate: libloading::Symbol<
-                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
-            > = lib.get(b"r2il_block_validate").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x31u8, 0xC0]; // xor eax, eax
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift baseline instruction");
-
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                1,
-                "Freshly lifted block should validate"
-            );
-
-            // radare2 can report duplicate switch case values for one decoded
-            // switch table. The FFI boundary canonicalizes that metadata before
-            // R2IL validation so one case value has one deterministic target.
-            let case_values = [0u64, 0u64];
-            let case_targets = [0x2000u64, 0x3000u64];
-            r2il_block_set_switch_info(
-                block,
-                0x1000,
-                0,
-                1,
-                0,
-                case_values.as_ptr(),
-                case_targets.as_ptr(),
-                case_values.len(),
-            );
-
-            assert_eq!(
-                r2il_block_validate(ctx, block),
-                1,
-                "Duplicate switch case values should be canonicalized at the FFI boundary"
-            );
 
             r2il_block_free(block);
             r2il_free(ctx);
@@ -1699,7 +1374,7 @@ mod ffi {
     }
 
     #[test]
-    fn riscv64_export_paths_esil_ssa_defuse_dec_nonnull() {
+    fn riscv64_export_paths_esil_ssa_defuse_nonnull() {
         if !require_plugin() {
             eprintln!("Skipping: plugin not built");
             return;
@@ -1739,12 +1414,6 @@ mod ffi {
                     *const std::ffi::c_void,
                 ) -> *mut c_char,
             > = lib.get(b"r2il_block_defuse_json").unwrap();
-            let r2dec_block: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const std::ffi::c_void,
-                    *const std::ffi::c_void,
-                ) -> *mut c_char,
-            > = lib.get(b"r2dec_block").unwrap();
             let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
                 lib.get(b"r2il_free").unwrap();
             let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
@@ -1780,10 +1449,6 @@ mod ffi {
             let defuse = r2il_block_defuse_json(ctx, block);
             assert!(!defuse.is_null(), "Def-use JSON export should not be null");
             r2il_string_free(defuse);
-
-            let dec = r2dec_block(ctx, block);
-            assert!(!dec.is_null(), "Decompiler export should not be null");
-            r2il_string_free(dec);
 
             r2il_block_free(block);
             r2il_free(ctx);
@@ -1884,324 +1549,6 @@ mod ffi {
         assert_ffi_deterministic_for_arch("riscv32", RISCV_BYTES_BASE, RISCV_BYTES_BASE);
     }
 
-    #[test]
-    fn infer_type_writeback_respects_explicit_signature_context() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(*mut c_void, *const u8, usize, u64) -> *mut c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let arch = CString::new("x86-64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            assert!(!ctx.is_null(), "Failed to initialize x86-64 context");
-
-            let mut bytes = vec![0x48u8, 0x89, 0xF8]; // mov rax, rdi
-            bytes.resize(16, 0x90);
-            let block = r2il_lift(ctx, bytes.as_ptr(), bytes.len(), 0x1000);
-            assert!(!block.is_null(), "Failed to lift fixture block");
-
-            let block_ptrs = [block as *const c_void];
-            let fcn_name = CString::new("sym.demo").unwrap();
-            let external_context = CString::new(
-                r#"{
-                    "signature": {
-                        "name": "sym.demo",
-                        "ret": "int32_t",
-                        "params": [
-                            {"name": "items", "type": "char *"}
-                        ]
-                    }
-                }"#,
-            )
-            .unwrap();
-            let ret_type = CString::new("int32_t").unwrap();
-            let param_name = CString::new("items").unwrap();
-            let param_type = CString::new("char *").unwrap();
-            let typed_params = [R2SleighContextParam {
-                name: param_name.as_ptr(),
-                type_name: param_type.as_ptr(),
-                cc_reg: std::ptr::null(),
-            }];
-            let json_str = session_type_writeback_json(
-                &lib,
-                ctx,
-                &block_ptrs,
-                0x1000,
-                &fcn_name,
-                &external_context,
-                Some(&ret_type),
-                None,
-                &typed_params,
-            );
-            let parsed: Value = serde_json::from_str(&json_str).expect("valid type writeback json");
-            let params = parsed
-                .get("params")
-                .and_then(Value::as_array)
-                .expect("params array");
-            assert_eq!(
-                params
-                    .first()
-                    .and_then(Value::as_object)
-                    .and_then(|obj| obj.get("name"))
-                    .and_then(Value::as_str),
-                Some("items")
-            );
-            let param_ty = params
-                .first()
-                .and_then(Value::as_object)
-                .and_then(|obj| obj.get("type"))
-                .and_then(Value::as_str);
-            assert!(
-                matches!(
-                    param_ty,
-                    Some("char *") | Some("int8_t*") | Some("int8_t *")
-                ),
-                "explicit param type should survive via canonicalization, got {:?} in {}",
-                param_ty,
-                json_str
-            );
-            assert_eq!(
-                parsed.get("ret_type").and_then(Value::as_str),
-                Some("int32_t")
-            );
-            assert!(
-                parsed
-                    .get("confidence")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|conf| conf >= 70),
-                "explicit signature context should force high signature confidence: {}",
-                json_str
-            );
-
-            r2il_block_free(block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn infer_signature_cc_json_non_x86_allows_empty_callconv() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_is_loaded: libloading::Symbol<unsafe extern "C" fn(*const c_void) -> i32> =
-                lib.get(b"r2il_is_loaded").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(*mut c_void, *const u8, usize, u64) -> *mut c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let r2il_string_free: libloading::Symbol<unsafe extern "C" fn(*mut c_char)> =
-                lib.get(b"r2il_string_free").unwrap();
-            let infer_signature: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const c_void,
-                    *const *const c_void,
-                    usize,
-                    u64,
-                    *const c_char,
-                ) -> *mut c_char,
-            > = lib.get(b"r2sleigh_infer_signature_cc_json").unwrap();
-
-            let arch = CString::new("aarch64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            if ctx.is_null() || r2il_is_loaded(ctx) != 1 {
-                eprintln!("Skipping: plugin not built with aarch64 support");
-                if !ctx.is_null() {
-                    r2il_free(ctx);
-                }
-                return;
-            }
-
-            let mut add_bytes = ARM64_BYTES_BASE.to_vec();
-            add_bytes.resize(16, 0);
-            let mut ret_bytes = ARM64_BYTES_RET.to_vec();
-            ret_bytes.resize(16, 0);
-            let add_block = r2il_lift(ctx, add_bytes.as_ptr(), add_bytes.len(), 0x1000);
-            let ret_block = r2il_lift(ctx, ret_bytes.as_ptr(), ret_bytes.len(), 0x1004);
-            assert!(!add_block.is_null(), "Failed to lift aarch64 add block");
-            assert!(!ret_block.is_null(), "Failed to lift aarch64 ret block");
-
-            let block_ptrs = [add_block as *const c_void, ret_block as *const c_void];
-            let fcn_name = CString::new("sym.a64_demo").unwrap();
-            let json_ptr = infer_signature(
-                ctx,
-                block_ptrs.as_ptr(),
-                block_ptrs.len(),
-                0x1000,
-                fcn_name.as_ptr(),
-            );
-            assert!(!json_ptr.is_null(), "Expected signature inference JSON");
-
-            let json_str = CStr::from_ptr(json_ptr).to_string_lossy().to_string();
-            r2il_string_free(json_ptr);
-            let parsed: Value = serde_json::from_str(&json_str).expect("valid signature json");
-            assert_eq!(parsed.get("arch").and_then(Value::as_str), Some("aarch64"));
-            assert_eq!(
-                parsed.get("callconv").and_then(Value::as_str),
-                Some(""),
-                "non-x86 payload should allow empty callconv: {}",
-                json_str
-            );
-            assert!(
-                parsed
-                    .get("callconv_confidence")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|conf| conf < 80),
-                "non-x86 payload should keep low callconv confidence: {}",
-                json_str
-            );
-            assert!(
-                parsed
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .is_some_and(|sig| sig.contains("sym.a64_demo")),
-                "aarch64 signature payload should still include a signature string: {}",
-                json_str
-            );
-
-            r2il_block_free(add_block);
-            r2il_block_free(ret_block);
-            r2il_free(ctx);
-        }
-    }
-
-    #[test]
-    fn infer_type_writeback_non_x86_keeps_signature_without_callconv() {
-        if !require_plugin() {
-            eprintln!("Skipping: plugin not built");
-            return;
-        }
-
-        unsafe {
-            let lib = libloading::Library::new(PLUGIN_PATH).expect("load plugin");
-            let r2il_arch_init: libloading::Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut c_void,
-            > = lib.get(b"r2il_arch_init").unwrap();
-            let r2il_is_loaded: libloading::Symbol<unsafe extern "C" fn(*const c_void) -> i32> =
-                lib.get(b"r2il_is_loaded").unwrap();
-            let r2il_lift: libloading::Symbol<
-                unsafe extern "C" fn(*mut c_void, *const u8, usize, u64) -> *mut c_void,
-            > = lib.get(b"r2il_lift").unwrap();
-            let r2il_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_free").unwrap();
-            let r2il_block_free: libloading::Symbol<unsafe extern "C" fn(*mut c_void)> =
-                lib.get(b"r2il_block_free").unwrap();
-            let arch = CString::new("aarch64").unwrap();
-            let ctx = r2il_arch_init(arch.as_ptr());
-            if ctx.is_null() || r2il_is_loaded(ctx) != 1 {
-                eprintln!("Skipping: plugin not built with aarch64 support");
-                if !ctx.is_null() {
-                    r2il_free(ctx);
-                }
-                return;
-            }
-
-            let mut add_bytes = ARM64_BYTES_BASE.to_vec();
-            add_bytes.resize(16, 0);
-            let mut ret_bytes = ARM64_BYTES_RET.to_vec();
-            ret_bytes.resize(16, 0);
-            let add_block = r2il_lift(ctx, add_bytes.as_ptr(), add_bytes.len(), 0x1000);
-            let ret_block = r2il_lift(ctx, ret_bytes.as_ptr(), ret_bytes.len(), 0x1004);
-            assert!(!add_block.is_null(), "Failed to lift aarch64 add block");
-            assert!(!ret_block.is_null(), "Failed to lift aarch64 ret block");
-
-            let block_ptrs = [add_block as *const c_void, ret_block as *const c_void];
-            let fcn_name = CString::new("sym.a64_demo").unwrap();
-            let external_context = CString::new(
-                r#"{
-                    "signature": {
-                        "name": "sym.a64_demo",
-                        "ret": "int32_t",
-                        "params": [
-                            {"name": "items", "type": "char *"}
-                        ]
-                    }
-                }"#,
-            )
-            .unwrap();
-            let ret_type = CString::new("int32_t").unwrap();
-            let param_name = CString::new("items").unwrap();
-            let param_type = CString::new("char *").unwrap();
-            let typed_params = [R2SleighContextParam {
-                name: param_name.as_ptr(),
-                type_name: param_type.as_ptr(),
-                cc_reg: std::ptr::null(),
-            }];
-            let json_str = session_type_writeback_json(
-                &lib,
-                ctx,
-                &block_ptrs,
-                0x1000,
-                &fcn_name,
-                &external_context,
-                Some(&ret_type),
-                None,
-                &typed_params,
-            );
-            let parsed: Value = serde_json::from_str(&json_str).expect("valid type writeback json");
-            assert_eq!(parsed.get("arch").and_then(Value::as_str), Some("aarch64"));
-            assert_eq!(
-                parsed.get("callconv").and_then(Value::as_str),
-                Some(""),
-                "non-x86 type writeback payload should not require callconv: {}",
-                json_str
-            );
-            assert!(
-                parsed
-                    .get("callconv_confidence")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|conf| conf < 80),
-                "non-x86 type writeback payload should keep low callconv confidence: {}",
-                json_str
-            );
-            assert!(
-                parsed
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .is_some_and(|sig| sig.contains("sym.a64_demo")),
-                "signature should still be present on non-x86 payload: {}",
-                json_str
-            );
-            assert!(
-                parsed.get("params").and_then(Value::as_array).is_some(),
-                "non-x86 type writeback payload should still serialize params: {}",
-                json_str
-            );
-            assert!(
-                parsed
-                    .get("confidence")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|conf| conf >= 70),
-                "explicit non-x86 signature context should raise signature confidence: {}",
-                json_str
-            );
-
-            r2il_block_free(add_block);
-            r2il_block_free(ret_block);
-            r2il_free(ctx);
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]

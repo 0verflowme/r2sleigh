@@ -1,0 +1,22 @@
+warning: certified r2dec stack owner helpers must call a FunctionFacts-owned predicate instead of recomposing proof from render facts or stack alias/provenance helpers
+  --> $DIR/certified_stack_owner_proof_recomposition.rs:31:9
+   |
+LL |         self.render_facts.has_stack_slot_offset(offset)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2dec_certified_stack_owner_proof_recomposition)]` on by default
+
+warning: certified r2dec stack owner helpers must call a FunctionFacts-owned predicate instead of recomposing proof from render facts or stack alias/provenance helpers
+  --> $DIR/certified_stack_owner_proof_recomposition.rs:37:9
+   |
+LL |         self.preferred_stack_alias_name(name)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: certified r2dec stack owner helpers must call a FunctionFacts-owned predicate instead of recomposing proof from render facts or stack alias/provenance helpers
+  --> $DIR/certified_stack_owner_proof_recomposition.rs:41:9
+   |
+LL |         self.stack_slot_provenance_for_name(name)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 3 warnings emitted
+

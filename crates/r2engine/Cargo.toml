@@ -12,7 +12,10 @@ r2sym = { path = "../r2sym" }
 r2types = { path = "../r2types" }
 r2dec = { path = "../r2dec" }
 serde.workspace = true
+serde_json.workspace = true
 z3.workspace = true
+
+[dev-dependencies]
 
 [features]
 default = []

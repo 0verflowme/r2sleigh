@@ -50,6 +50,16 @@ pub struct ArrayIndexCertificate {
     pub element_stride: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScalarArrayRenderCandidate {
+    pub block_addr: u64,
+    pub op_index: usize,
+    pub is_write: bool,
+    pub field_offset: u64,
+    pub element_stride: u64,
+    pub access_width: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OutParamCertificateEvidence {
     SemanticTypeSeed,
@@ -642,6 +652,7 @@ pub struct FunctionTypeFacts {
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub field_access_certificates: Vec<FieldAccessCertificate>,
     pub array_index_certificates: Vec<ArrayIndexCertificate>,
+    pub scalar_array_render_candidates: Vec<ScalarArrayRenderCandidate>,
     pub out_param_certificates: Vec<OutParamCertificate>,
     pub signature_certificate: Option<SignatureCertificate>,
     pub interproc_diagnostics: InterprocFactDiagnostics,
@@ -665,6 +676,7 @@ pub struct FunctionTypeFactInputs {
     pub local_field_accesses: Vec<LocalFieldAccessFact>,
     pub field_access_certificates: Vec<FieldAccessCertificate>,
     pub array_index_certificates: Vec<ArrayIndexCertificate>,
+    pub scalar_array_render_candidates: Vec<ScalarArrayRenderCandidate>,
     pub out_param_certificates: Vec<OutParamCertificate>,
     pub signature_certificate: Option<SignatureCertificate>,
     pub interproc_diagnostics: InterprocFactDiagnostics,
@@ -696,6 +708,7 @@ impl FunctionTypeFacts {
             && self.slot_field_profiles.is_empty()
             && self.field_access_certificates.is_empty()
             && self.array_index_certificates.is_empty()
+            && self.scalar_array_render_candidates.is_empty()
             && self.out_param_certificates.is_empty()
             && self.signature_certificate.is_none()
             && self.interproc_diagnostics == InterprocFactDiagnostics::default()
@@ -719,6 +732,7 @@ impl FunctionTypeFacts {
             local_field_accesses: Vec::new(),
             field_access_certificates: self.field_access_certificates,
             array_index_certificates: self.array_index_certificates,
+            scalar_array_render_candidates: self.scalar_array_render_candidates,
             out_param_certificates: self.out_param_certificates,
             signature_certificate: self.signature_certificate,
             interproc_diagnostics: self.interproc_diagnostics,
@@ -1278,6 +1292,10 @@ impl FunctionTypeFactsBuilder {
             std::mem::take(&mut self.inputs.array_index_certificates);
         array_index_certificates.sort();
         array_index_certificates.dedup();
+        let mut scalar_array_render_candidates =
+            std::mem::take(&mut self.inputs.scalar_array_render_candidates);
+        scalar_array_render_candidates.sort();
+        scalar_array_render_candidates.dedup();
         let mut out_param_certificates = std::mem::take(&mut self.inputs.out_param_certificates);
         out_param_certificates.retain(OutParamCertificate::has_source_identity);
         out_param_certificates.sort();
@@ -1331,6 +1349,7 @@ impl FunctionTypeFactsBuilder {
             slot_field_profiles,
             field_access_certificates,
             array_index_certificates,
+            scalar_array_render_candidates,
             out_param_certificates,
             signature_certificate,
             interproc_diagnostics,

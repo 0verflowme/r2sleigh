@@ -102,16 +102,6 @@ where
         self.insert_arc(key, Arc::new(value))
     }
 
-    pub fn retain<F>(&self, keep: F) -> bool
-    where
-        F: FnMut(&K, &Arc<V>) -> bool,
-    {
-        self.inner
-            .write()
-            .expect("engine cache write lock poisoned")
-            .retain(keep)
-    }
-
     pub fn counters(&self) -> CacheCounters {
         *self
             .counters
@@ -138,10 +128,6 @@ where
             .read()
             .expect("engine cache read lock poisoned")
             .len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -232,19 +218,6 @@ where
             value,
             evicted_count,
         }
-    }
-
-    fn retain<F>(&mut self, mut keep: F) -> bool
-    where
-        F: FnMut(&K, &Arc<V>) -> bool,
-    {
-        let before = self.entries.len();
-        self.entries.retain(|key, (value, _)| keep(key, value));
-        self.order.clear();
-        for (key, (_, ticket)) in &self.entries {
-            self.order.insert(*ticket, key.clone());
-        }
-        self.entries.len() != before
     }
 
     fn len(&self) -> usize {

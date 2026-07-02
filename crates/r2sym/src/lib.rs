@@ -44,6 +44,7 @@ pub mod query;
 pub mod r2api;
 pub mod replay;
 pub mod runtime;
+pub mod semantic_report;
 pub mod semantics;
 pub mod sim;
 pub mod solver;
@@ -108,6 +109,11 @@ pub use replay::{
 pub use runtime::{
     install_runtime_hooks_for_scope, seed_default_state_for_arch, seed_memory_regions_for_arch,
     seed_scope_state_for_arch,
+};
+pub use semantic_report::{
+    CompiledSemanticInfo, InterpreterDispatchInfo, MemorySummaryInfo, VmGuardConditionInfo,
+    VmGuardedExitInfo, VmMemoryConditionInfo, VmStateUpdateInfo, VmStepSummaryInfo,
+    VmTransferArmInfo, compiled_semantic_info, compiled_semantic_info_with_replay_seed,
 };
 pub use semantics::{
     ArtifactBuildPlan, ArtifactGranularity, CheckedClaim, ControlFact, DecompilePlan,

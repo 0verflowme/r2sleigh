@@ -26,9 +26,25 @@ fn bad_artifact_oracle(decompiler: &Decompiler, artifact: AnalysisArtifact) {
     let _ = decompiler.decompile(&artifact.ssa_func);
 }
 
-fn good_prepared_oracle(decompiler: &Decompiler, artifact: AnalysisArtifact) {
+fn bad_prepared_oracle(decompiler: &Decompiler, artifact: AnalysisArtifact) {
     let input = decompiler_input_from_artifact(artifact);
     let _ = decompiler.decompile_input(&input);
+}
+
+mod tests {
+    use super::{
+        decompiler_input_from_artifact, AnalysisArtifact, Decompiler, SsaFunction,
+    };
+
+    fn bad_prepared_executable_c_oracle() {
+        let decompiler = Decompiler;
+        let artifact = AnalysisArtifact {
+            ssa_func: SsaFunction,
+        };
+        let input = decompiler_input_from_artifact(artifact);
+        let output = decompiler.decompile_input(&input);
+        assert!(output.contains("return 1;"));
+    }
 }
 
 fn allowed_raw_ssa_unit_test(decompiler: &Decompiler, func: SsaFunction) {

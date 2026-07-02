@@ -18,21 +18,21 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use r2dec::{Decompiler, DecompilerConfig};
-//! use r2ssa::SSAFunction;
+//! use r2dec::{Decompiler, DecompilerConfig, DecompilerInput};
 //!
-//! let func: SSAFunction = /* ... */;
+//! let input: DecompilerInput = /* built by r2engine from prepared FunctionFacts */;
 //! let config = DecompilerConfig::default();
 //! let decompiler = Decompiler::new(config);
-//! let c_code = decompiler.decompile(&func);
+//! let c_code = decompiler.decompile_input(&input);
 //! println!("{}", c_code);
 //! ```
 
 pub(crate) mod address;
 pub(crate) mod analysis;
 pub mod ast;
-pub mod codegen;
+pub(crate) mod codegen;
 pub(crate) mod consumer_fallback;
+#[cfg(test)]
 pub(crate) mod consumer_linear;
 pub(crate) mod consumer_structured;
 pub(crate) mod consumer_summary;
@@ -48,25 +48,27 @@ pub mod structure;
 pub mod variable;
 
 pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
-pub use codegen::{CodeGenConfig, CodeGenerator, generate};
+pub use codegen::CodeGenConfig;
 pub use fold::lower_ssa_ops_to_stmts;
 pub use highlight::highlight_c_ansi;
-pub use planner::SemanticRoutePlan;
 pub use region::{Region, RegionAnalyzer};
 pub use structure::{ControlFlowStructurer, ControlRenderProof, ControlRenderProofKind};
 pub use variable::VariableRecovery;
 
+use crate::codegen::CodeGenerator;
 use crate::fold::FoldingContext;
 use crate::fold::context::{EffectRenderProof, EffectRenderProofKind, FoldArchConfig, FoldInputs};
 use r2ssa::SSAFunction;
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
-    CTypeLike, ExternalRegisterParamSpec, ExternalTypeDb, FunctionFacts, FunctionSignatureSpec,
-    FunctionType, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding,
-    VisibleBindingKind,
+    CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec,
+    ExternalStackBase, ExternalStackSlotRole, FunctionFacts, FunctionSignatureSpec,
+    FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle, VisibleBinding, VisibleBindingKind,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(test)]
+use r2types::{ExternalTypeDb, FunctionType};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 fn is_generic_arg_name(name: &str) -> bool {
@@ -75,23 +77,6 @@ fn is_generic_arg_name(name: &str) -> bool {
         .strip_prefix("arg")
         .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
         .unwrap_or(false)
-}
-
-fn should_skip_runtime_type_inference(
-    prepared: Option<&r2ssa::SsaArtifact>,
-    _type_facts: &FunctionTypeFacts,
-    function_facts: &FunctionFacts,
-) -> bool {
-    let _ = (prepared, function_facts);
-    false
-}
-
-fn should_use_prepared_semantic_view(
-    prepared: Option<&r2ssa::SsaArtifact>,
-    function_facts: &FunctionFacts,
-) -> bool {
-    let _ = function_facts;
-    prepared.is_some()
 }
 
 fn seed_runtime_type_hints_from_facts_and_recovery(
@@ -1153,31 +1138,32 @@ pub fn artifact_guard_fallback_comment(func_name: &str, reason: &str) -> String 
     planner::artifact_guard_fallback_comment(func_name, reason)
 }
 
-pub fn render_semantic_worker_linearization(
-    plan: &r2types::TypeWritebackPlan,
-    semantic_artifact: Option<&r2sym::SemanticArtifact>,
-    reason: &str,
-) -> String {
-    consumer_linear::render_semantic_worker_linearization(plan, semantic_artifact, reason)
-}
-
 pub fn render_vm_semantic_summary(
     func_name: &str,
     function_facts: &FunctionFacts,
 ) -> Option<String> {
+    let route = function_facts.decompile_route()?;
+    if route.kind != r2types::DecompileRouteKind::VmSummary
+        || route.render_permission.kind != r2sym::RenderPermissionKind::SummaryComment
+    {
+        return None;
+    }
     consumer_vm::render_vm_semantic_summary(
         func_name,
-        &function_facts.types,
-        function_facts.semantics.as_ref()?,
+        function_facts.type_facts(),
+        function_facts.semantic_artifact()?,
     )
 }
 
 pub fn render_semantic_worker_summary(
     func_name: &str,
     function_facts: &FunctionFacts,
-    route: &SemanticRoutePlan,
     config: DecompilerConfig,
 ) -> Option<String> {
+    let route = function_facts.decompile_route()?;
+    if route.render_permission.kind != r2sym::RenderPermissionKind::SummaryComment {
+        return None;
+    }
     Decompiler::new(config).semantic_worker_summary_output_for_route(
         func_name,
         function_facts,
@@ -1259,32 +1245,167 @@ fn looped_standard_output_residual_reason(
 #[cfg(test)]
 fn certifying_render_residual_reason(
     prepared: Option<&r2ssa::SsaArtifact>,
+    control_facts: Option<&r2types::FunctionControlFacts>,
     cfg_summary: &r2ssa::CFGRiskSummary,
     func: &CFunction,
 ) -> Option<String> {
-    certifying_render_residual_reason_with_proofs(prepared, cfg_summary, func, None)
+    certifying_render_residual_reason_with_proofs(prepared, control_facts, cfg_summary, func, None)
 }
 
 fn certifying_render_residual_reason_with_proofs(
     prepared: Option<&r2ssa::SsaArtifact>,
+    control_facts: Option<&r2types::FunctionControlFacts>,
     cfg_summary: &r2ssa::CFGRiskSummary,
     func: &CFunction,
     render_proofs: Option<&[ControlRenderProof]>,
 ) -> Option<String> {
     let (rendered, render_proof_failures) =
         function_control_render_nodes_with_proofs(func, render_proofs);
-    let inventory = prepared.map(control_certificate_inventory);
+    let inventory = prepared
+        .is_some()
+        .then(|| control_certificate_inventory(control_facts));
 
-    structured_control_residual_reason_for_nodes(
+    let mut reasons = Vec::new();
+    if let Some(reason) = structured_control_residual_reason_for_nodes(
         inventory.as_ref(),
         cfg_summary,
         &rendered,
         &render_proof_failures,
-    )
+    ) {
+        reasons.push(reason);
+    }
+    if render_proofs.is_some()
+        && let Some(reason) = certified_control_transfer_residual_reason(func)
+    {
+        reasons.push(reason);
+    }
+
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
+}
+
+fn certified_control_transfer_residual_reason(func: &CFunction) -> Option<String> {
+    for (index, stmt) in func.body.iter().enumerate() {
+        if let Some(reason) =
+            certified_control_transfer_stmt_residual_reason(stmt, RenderNodeId::root_child(index))
+        {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+fn certified_control_transfer_stmt_residual_reason(
+    stmt: &CStmt,
+    id: RenderNodeId,
+) -> Option<String> {
+    match stmt {
+        CStmt::Break => Some(format!(
+            "unproved control transfer break at {id}; exact case/loop exit facts required"
+        )),
+        CStmt::Continue => Some(format!(
+            "unproved control transfer continue at {id}; exact loop iteration facts required"
+        )),
+        CStmt::Goto(label) => Some(format!(
+            "unproved control transfer goto {label} at {id}; exact irreducible-edge facts required"
+        )),
+        CStmt::Block(stmts) => certified_control_transfer_stmts_residual_reason(stmts, id),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            certified_control_transfer_stmt_residual_reason(then_body, id.child(0)).or_else(|| {
+                else_body.as_deref().and_then(|stmt| {
+                    certified_control_transfer_stmt_residual_reason(stmt, id.child(1))
+                })
+            })
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            certified_control_transfer_stmt_residual_reason(body, id.child(0))
+        }
+        CStmt::For { init, body, .. } => init
+            .as_deref()
+            .and_then(|stmt| certified_control_transfer_stmt_residual_reason(stmt, id.child(0)))
+            .or_else(|| certified_control_transfer_stmt_residual_reason(body, id.child(1))),
+        CStmt::Switch { cases, default, .. } => {
+            for (case_index, case) in cases.iter().enumerate() {
+                let case_id = id.child(case_index);
+                if let Some(reason) =
+                    certified_control_transfer_stmts_residual_reason(&case.body, case_id.clone())
+                {
+                    return Some(reason);
+                }
+                if !certified_stmt_list_is_terminal(&case.body) {
+                    return Some(format!(
+                        "unproved switch case fallthrough at {case_id}; exact case-exit/fallthrough facts required"
+                    ));
+                }
+            }
+            if let Some(default_body) = default {
+                let default_id = id.child(cases.len());
+                if let Some(reason) = certified_control_transfer_stmts_residual_reason(
+                    default_body,
+                    default_id.clone(),
+                ) {
+                    return Some(reason);
+                }
+                if !certified_stmt_list_is_terminal(default_body) {
+                    return Some(format!(
+                        "unproved switch default fallthrough at {default_id}; exact case-exit/fallthrough facts required"
+                    ));
+                }
+            }
+            None
+        }
+        CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Empty
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => None,
+    }
+}
+
+fn certified_control_transfer_stmts_residual_reason(
+    stmts: &[CStmt],
+    id: RenderNodeId,
+) -> Option<String> {
+    for (index, stmt) in stmts.iter().enumerate() {
+        if let Some(reason) = certified_control_transfer_stmt_residual_reason(stmt, id.child(index))
+        {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+fn certified_stmt_list_is_terminal(stmts: &[CStmt]) -> bool {
+    stmts.last().is_some_and(certified_stmt_is_terminal)
+}
+
+fn certified_stmt_is_terminal(stmt: &CStmt) -> bool {
+    match stmt {
+        CStmt::Return(_) => true,
+        CStmt::Block(stmts) => certified_stmt_list_is_terminal(stmts),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            certified_stmt_is_terminal(then_body)
+                && else_body.as_deref().is_some_and(certified_stmt_is_terminal)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ControlRenderCounts {
+    branches: usize,
     loops: usize,
     switches: usize,
 }
@@ -1319,6 +1440,7 @@ impl std::fmt::Display for RenderNodeId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlRenderNodeKind {
+    Branch,
     Loop,
     Switch,
 }
@@ -1326,6 +1448,7 @@ enum ControlRenderNodeKind {
 impl ControlRenderNodeKind {
     fn label(self) -> &'static str {
         match self {
+            Self::Branch => "branch",
             Self::Loop => "loop",
             Self::Switch => "switch",
         }
@@ -1334,7 +1457,8 @@ impl ControlRenderNodeKind {
     fn matches_proof_kind(self, proof_kind: ControlRenderProofKind) -> bool {
         matches!(
             (self, proof_kind),
-            (Self::Loop, ControlRenderProofKind::Loop)
+            (Self::Branch, ControlRenderProofKind::Branch)
+                | (Self::Loop, ControlRenderProofKind::Loop)
                 | (Self::Switch, ControlRenderProofKind::Switch)
         )
     }
@@ -1345,6 +1469,8 @@ struct ControlRenderNode {
     id: RenderNodeId,
     kind: ControlRenderNodeKind,
     proof_anchor: Option<u64>,
+    proof_branch_condition: Option<r2ssa::PredicateId>,
+    proof_branch_condition_value: Option<r2ssa::ValueId>,
     proof_loop_condition: Option<r2ssa::PredicateId>,
     proof_loop_condition_value: Option<r2ssa::ValueId>,
     proof_loop_body_blocks: Vec<u64>,
@@ -1359,6 +1485,16 @@ struct ControlRenderNode {
     switch_has_placeholder_selector: bool,
     switch_has_nonliteral_case: bool,
     switch_has_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchCertificateSummary {
+    anchor: u64,
+    proof_node: String,
+    condition: r2ssa::PredicateId,
+    condition_value: r2ssa::ValueId,
+    true_target: u64,
+    false_target: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1387,6 +1523,7 @@ struct SwitchCertificateSummary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ControlCertificateInventory {
+    branches: Vec<BranchCertificateSummary>,
     loops: Vec<LoopCertificateSummary>,
     switches: Vec<SwitchCertificateSummary>,
 }
@@ -1394,47 +1531,55 @@ struct ControlCertificateInventory {
 impl ControlCertificateInventory {
     fn counts(&self) -> ControlRenderCounts {
         ControlRenderCounts {
+            branches: self.branches.len(),
             loops: self.loops.len(),
             switches: self.switches.len(),
         }
     }
 }
 
-fn control_certificate_inventory(prepared: &r2ssa::SsaArtifact) -> ControlCertificateInventory {
-    let certificates = prepared.certificates();
-    let predicates = prepared.predicates();
+fn control_certificate_inventory(
+    control_facts: Option<&r2types::FunctionControlFacts>,
+) -> ControlCertificateInventory {
     ControlCertificateInventory {
-        loops: certificates
-            .loops
-            .values()
-            .map(|cert| LoopCertificateSummary {
-                anchor: cert.header,
-                proof_node: cert.proof_node.to_string(),
-                condition: cert.condition,
-                condition_value: cert.condition.and_then(|id| {
-                    predicates
-                        .predicates
-                        .get(&id)
-                        .map(|predicate| predicate.condition)
-                }),
-                body: sorted_u64s(&cert.body),
-                latches: sorted_u64s(&cert.latches),
-                exits: sorted_u64s(&cert.exits),
-                has_condition: cert.condition.is_some(),
+        branches: control_facts
+            .into_iter()
+            .flat_map(|facts| facts.branch_predicates.values())
+            .map(|fact| BranchCertificateSummary {
+                anchor: fact.block_addr,
+                proof_node: format!("FunctionFacts.branch_predicate:{:?}", fact.id),
+                condition: fact.id,
+                condition_value: fact.condition,
+                true_target: fact.true_target,
+                false_target: fact.false_target,
             })
             .collect(),
-        switches: certificates
-            .switches
-            .values()
-            .map(|cert| SwitchCertificateSummary {
-                anchor: cert.block_addr,
-                proof_node: cert.proof_node.to_string(),
-                selector: cert.selector,
-                case_targets: sorted_switch_cases(&cert.cases),
-                default_target: cert.default,
-                cases: cert.cases.len(),
-                case_values: sorted_switch_case_values(&cert.cases),
-                has_default: cert.default.is_some(),
+        loops: control_facts
+            .into_iter()
+            .flat_map(|facts| facts.loops.values())
+            .map(|fact| LoopCertificateSummary {
+                anchor: fact.header,
+                proof_node: fact.proof_node.clone(),
+                condition: fact.condition,
+                condition_value: fact.condition_value,
+                body: sorted_u64s(&fact.body),
+                latches: sorted_u64s(&fact.latches),
+                exits: sorted_u64s(&fact.exits),
+                has_condition: fact.condition.is_some(),
+            })
+            .collect(),
+        switches: control_facts
+            .into_iter()
+            .flat_map(|facts| facts.switches.values())
+            .map(|fact| SwitchCertificateSummary {
+                anchor: fact.block_addr,
+                proof_node: fact.proof_node.clone(),
+                selector: fact.selector,
+                case_targets: sorted_switch_cases(&fact.cases),
+                default_target: fact.default,
+                cases: fact.cases.len(),
+                case_values: sorted_switch_case_values(&fact.cases),
+                has_default: fact.default.is_some(),
             })
             .collect(),
     }
@@ -1465,7 +1610,7 @@ fn structured_control_residual_reason_for_counts(
 ) -> Option<String> {
     let cfg_has_loop = cfg_summary.loop_count > 0 || cfg_summary.back_edge_count > 0;
     let cfg_has_switch = cfg_summary.switch_block_count > 0;
-    let rendered_has_control = rendered.loops > 0 || rendered.switches > 0;
+    let rendered_has_control = rendered.branches > 0 || rendered.loops > 0 || rendered.switches > 0;
 
     if !cfg_has_loop && !cfg_has_switch && !rendered_has_control {
         return None;
@@ -1492,6 +1637,12 @@ fn structured_control_residual_reason_for_counts(
         reasons.push(format!(
             "rendered {} loop construct(s) with only {} LoopCertificate(s)",
             rendered.loops, certified.loops
+        ));
+    }
+    if rendered.branches > certified.branches {
+        reasons.push(format!(
+            "rendered {} branch construct(s) with only {} FunctionFacts branch predicate(s)",
+            rendered.branches, certified.branches
         ));
     }
     if rendered.loops > 0 && rendered.loops < certified.loops {
@@ -1568,6 +1719,7 @@ fn control_render_counts_from_nodes(nodes: &[ControlRenderNode]) -> ControlRende
     let mut counts = ControlRenderCounts::default();
     for node in nodes {
         match node.kind {
+            ControlRenderNodeKind::Branch => counts.branches += 1,
             ControlRenderNodeKind::Loop => counts.loops += 1,
             ControlRenderNodeKind::Switch => counts.switches += 1,
         }
@@ -1631,9 +1783,51 @@ fn control_node_certificate_shape_failures(
         .iter()
         .map(|cert| (cert.anchor, cert))
         .collect::<std::collections::BTreeMap<_, _>>();
+    let branches_by_anchor = inventory
+        .branches
+        .iter()
+        .map(|cert| (cert.anchor, cert))
+        .collect::<std::collections::BTreeMap<_, _>>();
 
     for node in rendered {
         match node.kind {
+            ControlRenderNodeKind::Branch => {
+                let Some(anchor) = node.proof_anchor else {
+                    reasons.push(format!(
+                        "rendered branch node {} lacks FunctionFacts branch predicate proof identity",
+                        node.id
+                    ));
+                    continue;
+                };
+                match branches_by_anchor.get(&anchor).copied() {
+                    Some(cert) => {
+                        if node.proof_branch_condition != Some(cert.condition) {
+                            reasons.push(format!(
+                                "rendered branch node {} predicate proof {:?} disagrees with {} at 0x{:x} predicate {:?}",
+                                node.id,
+                                node.proof_branch_condition,
+                                cert.proof_node,
+                                cert.anchor,
+                                cert.condition
+                            ));
+                        }
+                        if node.proof_branch_condition_value != Some(cert.condition_value) {
+                            reasons.push(format!(
+                                "rendered branch node {} condition value proof {:?} disagrees with {} at 0x{:x} condition value {:?}",
+                                node.id,
+                                node.proof_branch_condition_value,
+                                cert.proof_node,
+                                cert.anchor,
+                                cert.condition_value
+                            ));
+                        }
+                    }
+                    None => reasons.push(format!(
+                        "rendered branch node {} proof anchor 0x{:x} has no matching FunctionFacts branch predicate",
+                        node.id, anchor
+                    )),
+                }
+            }
             ControlRenderNodeKind::Loop => {
                 let Some(anchor) = node.proof_anchor else {
                     reasons.push(format!(
@@ -1830,6 +2024,8 @@ fn attach_control_render_proofs(
             continue;
         }
         node.proof_anchor = Some(proof.anchor);
+        node.proof_branch_condition = proof.branch_condition;
+        node.proof_branch_condition_value = proof.branch_condition_value;
         node.proof_loop_condition = proof.loop_condition;
         node.proof_loop_condition_value = proof.loop_condition_value;
         node.proof_loop_body_blocks = proof.loop_body_blocks;
@@ -1861,6 +2057,8 @@ fn collect_stmt_control_render_nodes(
                 id: id.clone(),
                 kind: ControlRenderNodeKind::Loop,
                 proof_anchor: None,
+                proof_branch_condition: None,
+                proof_branch_condition_value: None,
                 proof_loop_condition: None,
                 proof_loop_condition_value: None,
                 proof_loop_body_blocks: Vec::new(),
@@ -1885,6 +2083,8 @@ fn collect_stmt_control_render_nodes(
                 id: id.clone(),
                 kind: ControlRenderNodeKind::Loop,
                 proof_anchor: None,
+                proof_branch_condition: None,
+                proof_branch_condition_value: None,
                 proof_loop_condition: None,
                 proof_loop_condition_value: None,
                 proof_loop_body_blocks: Vec::new(),
@@ -1915,6 +2115,27 @@ fn collect_stmt_control_render_nodes(
             else_body,
             ..
         } => {
+            nodes.push(ControlRenderNode {
+                id: id.clone(),
+                kind: ControlRenderNodeKind::Branch,
+                proof_anchor: None,
+                proof_branch_condition: None,
+                proof_branch_condition_value: None,
+                proof_loop_condition: None,
+                proof_loop_condition_value: None,
+                proof_loop_body_blocks: Vec::new(),
+                proof_loop_latches: Vec::new(),
+                proof_loop_exits: Vec::new(),
+                proof_switch_selector: None,
+                proof_switch_cases: Vec::new(),
+                proof_switch_default: None,
+                loop_has_condition: false,
+                switch_cases: 0,
+                switch_case_values: Vec::new(),
+                switch_has_placeholder_selector: false,
+                switch_has_nonliteral_case: false,
+                switch_has_default: false,
+            });
             collect_stmt_control_render_nodes(then_body, id.child(0), nodes);
             if let Some(else_body) = else_body.as_deref() {
                 collect_stmt_control_render_nodes(else_body, id.child(1), nodes);
@@ -1934,6 +2155,8 @@ fn collect_stmt_control_render_nodes(
                 id: id.clone(),
                 kind: ControlRenderNodeKind::Switch,
                 proof_anchor: None,
+                proof_branch_condition: None,
+                proof_branch_condition_value: None,
                 proof_loop_condition: None,
                 proof_loop_condition_value: None,
                 proof_loop_body_blocks: Vec::new(),
@@ -2020,6 +2243,73 @@ fn residual_function_for_unproven_loop(mut func: CFunction, reason: String) -> C
     func
 }
 
+fn residual_function_for_render_boundary(func_name: &str, reason: &str) -> CFunction {
+    let mut func = CFunction::new(func_name.to_string(), CType::Unknown);
+    func.body = vec![CStmt::comment(sanitize_comment_text(reason))];
+    func
+}
+
+fn route_reason(route: &DecompileRouteFacts) -> &str {
+    route
+        .reason
+        .as_deref()
+        .or(route.fallback_comment.as_deref())
+        .unwrap_or("non-standard decompile route")
+}
+
+fn route_fallback_comment(route: &DecompileRouteFacts) -> Option<&str> {
+    (route.kind == DecompileRouteKind::FallbackComment)
+        .then(|| {
+            route
+                .fallback_comment
+                .as_deref()
+                .or(route.reason.as_deref())
+        })
+        .flatten()
+}
+
+fn route_is_standard(route: &DecompileRouteFacts) -> bool {
+    route.kind == DecompileRouteKind::Standard
+}
+
+fn route_is_summary_boundary(route: &DecompileRouteFacts) -> bool {
+    matches!(
+        route.kind,
+        DecompileRouteKind::StructuredWorker
+            | DecompileRouteKind::SummaryIslands
+            | DecompileRouteKind::LinearWorker
+            | DecompileRouteKind::VmSummary
+    )
+}
+
+fn residual_function_for_summary_route_boundary(
+    func_name: &str,
+    route: &DecompileRouteFacts,
+) -> CFunction {
+    let (label, reason) = match route.kind {
+        DecompileRouteKind::StructuredWorker => ("structured_worker", route_reason(route)),
+        DecompileRouteKind::SummaryIslands | DecompileRouteKind::LinearWorker => {
+            ("summary_route", route_reason(route))
+        }
+        DecompileRouteKind::VmSummary => ("vm_summary", route_reason(route)),
+        DecompileRouteKind::Standard | DecompileRouteKind::FallbackComment => {
+            ("summary_route", "non-standard decompile route")
+        }
+    };
+    let mut func = CFunction::new(func_name.to_string(), CType::Unknown);
+    func.body = vec![
+        CStmt::comment(format!(
+            "r2dec summary: {} for {}",
+            label,
+            sanitize_comment_text(reason)
+        )),
+        CStmt::comment(
+            "render contract: summary facts only; no executable native C reconstructed".to_string(),
+        ),
+    ];
+    func
+}
+
 fn render_permission_refusal_comment(
     func_name: &str,
     permission: Option<&r2sym::RenderPermission>,
@@ -2035,17 +2325,49 @@ fn render_permission_residual_reason(
     let permission = permission?;
     match permission.kind {
         r2sym::RenderPermissionKind::Residual => Some(format!(
-            "engine render permission residual: {}",
+            "r2dec residual: engine render permission residual: {}",
             permission.reason
         )),
         r2sym::RenderPermissionKind::Refuse => Some(format!(
-            "engine render permission refusal: {}",
+            "r2dec residual: engine render permission refusal: {}",
             permission.reason
         )),
-        r2sym::RenderPermissionKind::CertifiedC | r2sym::RenderPermissionKind::SummaryComment => {
-            None
+        r2sym::RenderPermissionKind::SummaryComment => Some(format!(
+            "r2dec residual: engine render permission summary-only: {}",
+            permission.reason
+        )),
+        r2sym::RenderPermissionKind::CertifiedC => {
+            (permission.owner != r2sym::ProofOwner::R2engine).then(|| {
+                format!(
+                    "r2dec residual: CertifiedC render permission from non-engine proof owner {:?}: {}",
+                    permission.owner, permission.reason
+                )
+            })
         }
     }
+}
+
+fn render_permission_allows_executable_c(permission: Option<&r2sym::RenderPermission>) -> bool {
+    permission.is_some_and(|permission| {
+        permission.kind == r2sym::RenderPermissionKind::CertifiedC
+            && permission.owner == r2sym::ProofOwner::R2engine
+    })
+}
+
+fn summary_only_semantics_standard_render_residual_reason(
+    function_facts: &FunctionFacts,
+) -> Option<String> {
+    let route = function_facts.decompile_route()?;
+    if route.kind != r2types::DecompileRouteKind::Standard {
+        return None;
+    }
+    if route.render_permission.kind != r2sym::RenderPermissionKind::CertifiedC {
+        return None;
+    }
+    let semantics = function_facts.semantic_artifact()?;
+    (semantics.granularity == r2sym::ArtifactGranularity::SummaryOnly).then(|| {
+        "r2dec residual: summary-only semantic artifact cannot authorize Standard executable C; route must stay summary/residual until native CFG/control/dataflow facts are certified".to_string()
+    })
 }
 
 fn missing_decompile_route_residual_comment(func_name: &str) -> String {
@@ -2063,13 +2385,20 @@ struct CertifiedOutputCounts {
     memory_like_accesses: usize,
     field_accesses: usize,
     array_accesses: usize,
+    raw_address_call_args: usize,
+    raw_pointer_arithmetic_derefs: usize,
+    residual_comments: usize,
     field_members: Vec<String>,
+    return_field_members: Vec<String>,
     call_nodes: Vec<RenderNodeId>,
     expression_nodes: Vec<RenderNodeId>,
     return_nodes: Vec<RenderNodeId>,
     memory_nodes: Vec<RenderNodeId>,
     field_nodes: Vec<(RenderNodeId, String)>,
     array_nodes: Vec<RenderNodeId>,
+    raw_address_call_arg_nodes: Vec<RenderNodeId>,
+    raw_pointer_arithmetic_nodes: Vec<RenderNodeId>,
+    residual_comment_nodes: Vec<RenderNodeId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2119,23 +2448,153 @@ fn certified_effect_proof_counts(
     }
 }
 
+fn call_render_facts_from_effect_proofs(
+    effect_render_proofs: &[EffectRenderProof],
+) -> r2types::FunctionCallRenderFacts {
+    let by_callsite = effect_render_proofs
+        .iter()
+        .filter(|proof| proof.kind == EffectRenderProofKind::Call)
+        .map(|proof| {
+            let callsite = r2types::CallsiteKey {
+                block_addr: proof.block_addr,
+                op_index: proof.op_idx,
+            };
+            (
+                callsite,
+                r2types::CallsiteRenderFact {
+                    callsite,
+                    target: proof.target,
+                    disposition: proof
+                        .call_disposition
+                        .unwrap_or(r2types::CallsiteRenderDisposition::NestedExpression),
+                    proof_values: proof.values.clone(),
+                    residual_reason: None,
+                },
+            )
+        })
+        .collect();
+    r2types::FunctionCallRenderFacts { by_callsite }
+}
+
+fn certified_callsite_expected_argument_values(
+    function_facts: &FunctionFacts,
+    cert: &r2types::CallsiteArgumentFacts,
+) -> Vec<r2ssa::ValueId> {
+    let mut expected = cert
+        .argument_values
+        .iter()
+        .map(|arg| arg.value)
+        .collect::<Vec<_>>();
+    if let Some(max_arity) = function_facts
+        .callee_resolution()
+        .and_then(|resolution| resolution.identity_for_callsite(cert.callsite))
+        .and_then(r2types::CalleeIdentity::non_variadic_known_arity)
+    {
+        expected.truncate(max_arity);
+    }
+    expected
+}
+
 fn return_value_has_certified_call_result_effect(
-    prepared: &r2ssa::SsaArtifact,
+    call_result_facts: Option<&r2types::FunctionCallResultFacts>,
     effect_render_proofs: &[EffectRenderProof],
     value: r2ssa::ValueId,
 ) -> bool {
-    let certificates = prepared.certificates();
-    let Some(call_result) = certificates.call_results.get(&value) else {
-        return false;
-    };
-    let Some(callsite) = certificates.callsites.get(&call_result.call_site) else {
+    let Some(call_result) = call_result_facts.and_then(|facts| facts.result_for_value(value))
+    else {
         return false;
     };
     effect_render_proofs.iter().any(|proof| {
         proof.kind == EffectRenderProofKind::Call
-            && proof.block_addr == callsite.block_addr
-            && proof.op_idx == callsite.op_index
+            && proof.block_addr == call_result.callsite.block_addr
+            && proof.op_idx == call_result.callsite.op_index
     })
+}
+
+fn certified_stack_local_identity_is_exact(
+    function_facts: &FunctionFacts,
+    name: &str,
+    offset: i64,
+) -> bool {
+    function_facts
+        .authorized_stack_slot_owner_render_by_offset(offset, name)
+        .is_some()
+}
+
+fn certified_recovered_stack_local_is_exact(
+    function_facts: &FunctionFacts,
+    emitted_vars: &HashSet<String>,
+    body_visible_names: &HashSet<String>,
+    name: &str,
+    stack_offset: Option<i64>,
+) -> bool {
+    let Some(offset) = stack_offset else {
+        return false;
+    };
+    (emitted_vars.contains(name) || body_visible_names.contains(name))
+        && certified_stack_local_identity_is_exact(function_facts, name, offset)
+}
+
+fn certified_stack_local_type_matches(
+    type_facts: &FunctionTypeFacts,
+    name: &str,
+    offset: i64,
+    rendered_ty: &CType,
+) -> bool {
+    typed_stack_local_type_for_name_offset(type_facts, name, offset)
+        .is_some_and(|certified_ty| certified_ty == *rendered_ty)
+}
+
+fn typed_stack_local_type_for_name_offset(
+    type_facts: &FunctionTypeFacts,
+    name: &str,
+    offset: i64,
+) -> Option<CType> {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let renderable_type = |ty: &CTypeLike| {
+        let ty = type_like_to_ctype(ty);
+        (!matches!(ty, CType::Unknown | CType::Void)).then_some(ty)
+    };
+
+    type_facts
+        .visible_bindings
+        .iter()
+        .find(|binding| {
+            matches!(
+                binding.kind,
+                VisibleBindingKind::Param
+                    | VisibleBindingKind::Local
+                    | VisibleBindingKind::StackObject
+            ) && binding.name.eq_ignore_ascii_case(normalized)
+                && binding
+                    .stack_slot
+                    .as_ref()
+                    .is_some_and(|slot| stack_slot_key_matches_offset(slot, offset))
+        })
+        .and_then(|binding| binding.ty.as_ref())
+        .and_then(renderable_type)
+        .or_else(|| {
+            type_facts
+                .stack_slots
+                .iter()
+                .find(|(slot_key, slot)| {
+                    matches!(
+                        slot.role,
+                        ExternalStackSlotRole::Local | ExternalStackSlotRole::StackArg
+                    ) && slot.name.eq_ignore_ascii_case(normalized)
+                        && stack_slot_key_matches_offset(slot_key, offset)
+                })
+                .and_then(|(_, slot)| slot.ty.as_ref())
+                .and_then(renderable_type)
+        })
+}
+
+fn stack_slot_key_matches_offset(slot: &StackSlotKey, offset: i64) -> bool {
+    slot.offset == offset
+        || (matches!(slot.base, ExternalStackBase::FramePointer) && -slot.offset == offset)
 }
 
 #[cfg(test)]
@@ -2158,7 +2617,12 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
     func: &CFunction,
     effect_render_proofs: Option<&[EffectRenderProof]>,
 ) -> Option<String> {
-    let certificates = prepared.certificates();
+    let empty_callsites = r2types::FunctionCallsiteFacts::default();
+    let callsite_facts = function_facts.callsites().unwrap_or(&empty_callsites);
+    let empty_call_results = r2types::FunctionCallResultFacts::default();
+    let call_result_facts = function_facts.call_results().unwrap_or(&empty_call_results);
+    let empty_render = r2types::FunctionRenderFacts::default();
+    let render_facts = function_facts.render().unwrap_or(&empty_render);
     let mut reasons = Vec::new();
 
     if func.body.is_empty() {
@@ -2167,12 +2631,15 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
     for local in &func.locals {
         match local.stack_offset {
             Some(offset)
-                if certificates
-                    .stack_slots
-                    .values()
-                    .any(|cert| cert.offset == offset) => {}
+                if certified_stack_local_identity_is_exact(function_facts, &local.name, offset)
+                    && certified_stack_local_type_matches(
+                        function_facts.type_facts(),
+                        &local.name,
+                        offset,
+                        &local.ty,
+                    ) => {}
             Some(offset) => reasons.push(format!(
-                "local {} at stack offset {} lacks StackSlotCertificate",
+                "local {} at stack offset {} lacks exact typed StackSlotCertificate",
                 local.name, offset
             )),
             None => reasons.push(format!(
@@ -2198,34 +2665,29 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
             .iter()
             .filter(|proof| proof.kind == EffectRenderProofKind::Call)
         {
-            match prepared.callsite_certificate_for_op(proof.block_addr, proof.op_idx) {
+            match callsite_facts.arguments_for_site(r2types::CallsiteKey {
+                block_addr: proof.block_addr,
+                op_index: proof.op_idx,
+            }) {
                 Some(cert) => {
                     if proof.target != Some(cert.target) {
                         reasons.push(format!(
-                            "rendered call proof at 0x{:x}:{} target proof {:?} disagrees with CallsiteCertificate target {:?}",
+                            "rendered call proof at 0x{:x}:{} target proof {:?} disagrees with FunctionCallsiteFacts target {:?}",
                             proof.block_addr, proof.op_idx, proof.target, cert.target
                         ));
                     }
-                    let expected = cert
-                        .argument_values
-                        .iter()
-                        .take(proof.values.len())
-                        .copied()
-                        .collect::<Vec<_>>();
-                    if proof.values.len() > cert.argument_values.len() || proof.values != expected {
+                    let expected =
+                        certified_callsite_expected_argument_values(function_facts, cert);
+                    if proof.values != expected {
                         reasons.push(format!(
-                            "rendered call proof at 0x{:x}:{} argument value proof {:?} disagrees with CallsiteCertificate argument values {:?}",
+                            "rendered call proof at 0x{:x}:{} argument value proof {:?} disagrees with FunctionCallsiteFacts argument values {:?}",
                             proof.block_addr, proof.op_idx, proof.values, cert.argument_values
                         ));
                     }
                     for value in &proof.values {
-                        if !certificates
-                            .expressions
-                            .get(value)
-                            .is_some_and(|cert| cert.renderable)
-                        {
+                        if !render_facts.expression_is_renderable(*value) {
                             reasons.push(format!(
-                                "rendered call proof at 0x{:x}:{} argument value {:?} lacks renderable ExpressionCertificate",
+                                "rendered call proof at 0x{:x}:{} argument value {:?} lacks renderable FunctionRenderFacts expression",
                                 proof.block_addr, proof.op_idx, value
                             ));
                         }
@@ -2233,7 +2695,7 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 }
                 None => {
                     reasons.push(format!(
-                        "rendered call proof at 0x{:x}:{} has no matching CallsiteCertificate",
+                        "rendered call proof at 0x{:x}:{} has no matching FunctionCallsiteFacts callsite",
                         proof.block_addr, proof.op_idx
                     ));
                 }
@@ -2243,16 +2705,14 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
             .iter()
             .filter(|proof| proof.kind == EffectRenderProofKind::Expression)
         {
-            match proof.value.and_then(|value| {
-                certificates
-                    .expressions
-                    .get(&value)
-                    .map(|cert| (value, cert))
-            }) {
+            match proof
+                .value
+                .and_then(|value| render_facts.expression_for_value(value).map(|cert| (value, cert)))
+            {
                 Some((value, cert)) => {
                     if !cert.renderable {
                         reasons.push(format!(
-                            "rendered expression proof at 0x{:x}:{} value {:?} lacks renderable ExpressionCertificate",
+                            "rendered expression proof at 0x{:x}:{} value {:?} lacks renderable FunctionRenderFacts expression",
                             proof.block_addr, proof.op_idx, value
                         ));
                     }
@@ -2271,18 +2731,18 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                     {
                         match cert.defining_inst.and_then(|inst| prepared.inst_op_site(inst)) {
                             Some((block_addr, op_idx)) => reasons.push(format!(
-                                "rendered expression proof at 0x{:x}:{} value {:?} was neither defined nor consumed at the rendered op site; value was defined at 0x{:x}:{}",
+                                "rendered expression proof at 0x{:x}:{} value {:?} was neither defined nor consumed at the rendered op site; FunctionRenderFacts value was defined at 0x{:x}:{}",
                                 proof.block_addr, proof.op_idx, value, block_addr, op_idx
                             )),
                             None => reasons.push(format!(
-                                "rendered expression proof at 0x{:x}:{} value {:?} was not consumed at the rendered op site and lacks defining op-site ExpressionCertificate",
+                                "rendered expression proof at 0x{:x}:{} value {:?} was not consumed at the rendered op site and lacks defining op-site FunctionRenderFacts expression",
                                 proof.block_addr, proof.op_idx, value
                             )),
                         }
                     }
                 }
                 None => reasons.push(format!(
-                    "rendered expression proof at 0x{:x}:{} value {:?} has no matching ExpressionCertificate",
+                    "rendered expression proof at 0x{:x}:{} value {:?} has no matching FunctionRenderFacts expression",
                     proof.block_addr, proof.op_idx, proof.value
                 )),
             }
@@ -2294,25 +2754,24 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
             )
         }) {
             let is_write = proof.kind == EffectRenderProofKind::MemoryWrite;
-            match prepared.memory_certificate_for_op_site(proof.block_addr, proof.op_idx, is_write)
-            {
+            match render_facts.memory_access_for_op(proof.block_addr, proof.op_idx, is_write) {
                 Some(cert) => {
                     if proof.address != Some(cert.address) {
                         reasons.push(format!(
-                            "rendered memory proof at 0x{:x}:{} address proof {:?} disagrees with MemoryAccessCertificate address {:?}",
+                            "rendered memory proof at 0x{:x}:{} address proof {:?} disagrees with FunctionRenderFacts memory address {:?}",
                             proof.block_addr, proof.op_idx, proof.address, cert.address
                         ));
                     }
                     if proof.value != cert.value {
                         reasons.push(format!(
-                            "rendered memory proof at 0x{:x}:{} value proof {:?} disagrees with MemoryAccessCertificate value {:?}",
+                            "rendered memory proof at 0x{:x}:{} value proof {:?} disagrees with FunctionRenderFacts memory value {:?}",
                             proof.block_addr, proof.op_idx, proof.value, cert.value
                         ));
                     }
                 }
                 None => {
                     reasons.push(format!(
-                        "rendered memory proof at 0x{:x}:{} has no matching MemoryAccessCertificate",
+                        "rendered memory proof at 0x{:x}:{} has no matching FunctionRenderFacts memory access",
                         proof.block_addr, proof.op_idx
                     ));
                 }
@@ -2322,17 +2781,17 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
             .iter()
             .filter(|proof| proof.kind == EffectRenderProofKind::Return)
         {
-            match prepared.return_certificate_for_op(proof.block_addr, proof.op_idx) {
+            match render_facts.return_for_op(proof.block_addr, proof.op_idx) {
                 Some(cert) => {
                     if proof.value != Some(cert.value) {
                         reasons.push(format!(
-                            "rendered return proof at 0x{:x}:{} value proof {:?} disagrees with ReturnValueCertificate value {:?}",
+                            "rendered return proof at 0x{:x}:{} value proof {:?} disagrees with FunctionRenderFacts return value {:?}",
                             proof.block_addr, proof.op_idx, proof.value, cert.value
                         ));
                     }
                     if proof.value.is_some_and(|value| {
                         return_value_has_certified_call_result_effect(
-                            prepared,
+                            Some(call_result_facts),
                             effect_render_proofs,
                             value,
                         )
@@ -2340,9 +2799,8 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                         continue;
                     }
                     match proof.value.and_then(|value| {
-                        certificates
-                            .expressions
-                            .get(&value)
+                        render_facts
+                            .expression_for_value(value)
                             .map(|cert| (value, cert))
                     }) {
                         Some((value, expr_cert)) => {
@@ -2352,7 +2810,7 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                                     .map(|var| var.display_name())
                                     .unwrap_or_else(|| "<unknown>".to_string());
                                 reasons.push(format!(
-                                    "rendered return proof at 0x{:x}:{} value {:?} ({}) lacks renderable ExpressionCertificate",
+                                    "rendered return proof at 0x{:x}:{} value {:?} ({}) lacks renderable FunctionRenderFacts expression",
                                     proof.block_addr, proof.op_idx, value, value_name
                                 ));
                             }
@@ -2365,42 +2823,53 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                             let consumed_at_rendered_site = rendered_inst
                                 .and_then(|inst| prepared.graph().inst(inst))
                                 .is_some_and(|inst| inst.inputs.contains(&value));
-                            if !defined_at_rendered_site && !consumed_at_rendered_site {
+                            let bound_by_return_certificate = proof.value == Some(cert.value);
+                            if !defined_at_rendered_site
+                                && !consumed_at_rendered_site
+                                && !bound_by_return_certificate
+                            {
                                 match expr_cert
                                     .defining_inst
                                     .and_then(|inst| prepared.inst_op_site(inst))
                                 {
                                     Some((block_addr, op_idx)) => reasons.push(format!(
-                                        "rendered return proof at 0x{:x}:{} value {:?} was neither defined nor consumed at the rendered op site; value was defined at 0x{:x}:{}",
+                                        "rendered return proof at 0x{:x}:{} value {:?} was neither defined nor consumed at the rendered op site; FunctionRenderFacts value was defined at 0x{:x}:{}",
                                         proof.block_addr, proof.op_idx, value, block_addr, op_idx
                                     )),
                                     None => reasons.push(format!(
-                                        "rendered return proof at 0x{:x}:{} value {:?} was not consumed at the rendered op site and lacks defining op-site ExpressionCertificate",
+                                        "rendered return proof at 0x{:x}:{} value {:?} was not consumed at the rendered op site and lacks defining op-site FunctionRenderFacts expression",
                                         proof.block_addr, proof.op_idx, value
                                     )),
                                 }
                             }
                         }
                         None => reasons.push(format!(
-                            "rendered return proof at 0x{:x}:{} value {:?} has no matching ExpressionCertificate",
+                            "rendered return proof at 0x{:x}:{} value {:?} has no matching FunctionRenderFacts expression",
                             proof.block_addr, proof.op_idx, proof.value
                         )),
                     }
                 }
                 None => {
                     reasons.push(format!(
-                        "rendered return proof at 0x{:x}:{} has no matching ReturnValueCertificate",
+                        "rendered return proof at 0x{:x}:{} has no matching FunctionRenderFacts return",
                         proof.block_addr, proof.op_idx
                     ));
                 }
             }
         }
         let proof_counts = certified_effect_proof_counts(effect_render_proofs);
-        if counts.calls < certificates.callsites.len() {
+        let call_render_facts = call_render_facts_from_effect_proofs(effect_render_proofs);
+        let missing_source_callsite = callsite_facts
+            .by_callsite
+            .keys()
+            .find(|callsite| call_render_facts.fact_for_site(**callsite).is_none());
+        if let Some(callsite) = missing_source_callsite {
             reasons.push(format!(
-                "rendered {} executable call(s) from {} source CallsiteCertificate(s); missing callsite effects must residualize instead of disappearing",
+                "rendered {} executable call(s) from {} source FunctionCallsiteFacts callsite(s); first missing callsite 0x{:x}:{}; missing callsite effects must residualize instead of disappearing",
                 counts.calls,
-                certificates.callsites.len()
+                callsite_facts.by_callsite.len(),
+                callsite.block_addr,
+                callsite.op_index
             ));
         }
         if counts.calls > proof_counts.calls {
@@ -2410,8 +2879,14 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 .map(|id| format!("; first missing node {id}"))
                 .unwrap_or_default();
             reasons.push(format!(
-                "rendered {} call(s) with only {} rendered CallsiteCertificate proof(s){}",
+                "rendered {} call(s) with only {} rendered FunctionCallsiteFacts proof(s){}",
                 counts.calls, proof_counts.calls, first_missing
+            ));
+        }
+        if proof_counts.calls > counts.calls {
+            reasons.push(format!(
+                "rendered FunctionCallsiteFacts proof recorded {} call effect(s), but final AST contains only {} executable call(s); dropped callsite effects must residualize instead of disappearing",
+                proof_counts.calls, counts.calls
             ));
         }
         if counts.expression_roots > proof_counts.expressions {
@@ -2421,15 +2896,11 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 .map(|id| format!("; first missing node {id}"))
                 .unwrap_or_default();
             reasons.push(format!(
-                "rendered {} pure expression assignment(s) with only {} rendered ExpressionCertificate proof(s){}",
+                "rendered {} pure expression assignment(s) with only {} rendered FunctionRenderFacts expression proof(s){}",
                 counts.expression_roots, proof_counts.expressions, first_missing
             ));
         }
-        let return_proofs = if proof_counts.returns > 0 {
-            proof_counts.returns.max(certificates.returns.len())
-        } else {
-            0
-        };
+        let return_proofs = proof_counts.returns;
         if counts.returns_with_value > return_proofs {
             let first_missing = counts
                 .return_nodes
@@ -2437,18 +2908,18 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 .map(|id| format!("; first missing node {id}"))
                 .unwrap_or_default();
             reasons.push(format!(
-                "rendered {} value return(s) with only {} rendered ReturnValueCertificate proof(s){}",
+                "rendered {} value return(s) with only {} rendered FunctionRenderFacts return proof(s){}",
                 counts.returns_with_value, return_proofs, first_missing
             ));
         }
+        if proof_counts.returns > counts.returns_with_value {
+            reasons.push(format!(
+                "rendered FunctionRenderFacts proof recorded {} return effect(s), but final AST contains only {} value return(s); dropped return effects must residualize instead of disappearing",
+                proof_counts.returns, counts.returns_with_value
+            ));
+        }
         let raw_memory_proofs = proof_counts.memory_reads + proof_counts.memory_writes;
-        let memory_proofs = if raw_memory_proofs > 0
-            || (proof_counts.returns > 0 && counts.returns_with_value > proof_counts.returns)
-        {
-            raw_memory_proofs.max(certificates.memory_accesses.len())
-        } else {
-            0
-        };
+        let memory_proofs = raw_memory_proofs;
         if counts.memory_like_accesses > memory_proofs {
             let first_missing = counts
                 .memory_nodes
@@ -2456,82 +2927,89 @@ fn certified_standard_output_residual_reason_with_effect_proofs(
                 .map(|id| format!("; first missing node {id}"))
                 .unwrap_or_default();
             reasons.push(format!(
-                "rendered {} memory-like access(es) with only {} rendered MemoryAccessCertificate proof(s){}",
+                "rendered {} memory-like access(es) with only {} rendered FunctionRenderFacts memory proof(s){}",
                 counts.memory_like_accesses, memory_proofs, first_missing
             ));
         }
-    } else {
-        if counts.calls > certificates.callsites.len() {
-            let first_missing = counts
-                .call_nodes
-                .get(certificates.callsites.len())
-                .map(|id| format!("; first missing node {id}"))
-                .unwrap_or_default();
-            reasons.push(format!(
-                "rendered {} call(s) with only {} CallsiteCertificate(s){}",
-                counts.calls,
-                certificates.callsites.len(),
-                first_missing
-            ));
-        }
-        if counts.returns_with_value > certificates.returns.len() {
-            let first_missing = counts
-                .return_nodes
-                .get(certificates.returns.len())
-                .map(|id| format!("; first missing node {id}"))
-                .unwrap_or_default();
-            reasons.push(format!(
-                "rendered {} value return(s) with only {} ReturnValueCertificate(s){}",
-                counts.returns_with_value,
-                certificates.returns.len(),
-                first_missing
-            ));
-        }
-    }
-    if effect_render_proofs.is_none()
-        && counts.memory_like_accesses > certificates.memory_accesses.len()
+    } else if counts.calls > 0
+        || counts.expression_roots > 0
+        || counts.returns_with_value > 0
+        || counts.memory_like_accesses > 0
     {
-        let first_missing = counts
-            .memory_nodes
-            .get(certificates.memory_accesses.len())
-            .map(|id| format!("; first missing node {id}"))
-            .unwrap_or_default();
         reasons.push(format!(
-            "rendered {} memory-like access(es) with only {} MemoryAccessCertificate(s){}",
-            counts.memory_like_accesses,
-            certificates.memory_accesses.len(),
-            first_missing
+            "missing exact FunctionFacts render proof for certified Standard output: rendered calls={}, expression_roots={}, value_returns={}, memory_like_accesses={}",
+            counts.calls, counts.expression_roots, counts.returns_with_value, counts.memory_like_accesses
         ));
     }
-    if counts.field_accesses > 0
-        && !field_accesses_are_certified(&function_facts.types, &function_facts.proof, &counts)
-    {
+    let proved_member_counts = effect_render_proofs
+        .map(|proofs| proved_member_access_counts(render_facts, proofs))
+        .unwrap_or_default();
+    if counts.field_accesses > 0 && !field_accesses_are_certified(&proved_member_counts, &counts) {
         let first_node = counts
             .field_nodes
             .first()
             .map(|(id, member)| format!("; first field node {id}.{member}"))
             .unwrap_or_default();
         reasons.push(format!(
-            "rendered {} field access(es) without type-layout certificates{}",
+            "rendered {} field access(es) without FunctionRenderFacts member-access proof{}",
             counts.field_accesses, first_node
         ));
     }
-    if counts.array_accesses > 0
-        && !array_accesses_are_certified(&function_facts.types, &function_facts.proof, &counts)
+    if !counts.return_field_members.is_empty()
+        && !return_field_members_are_authoritatively_certified(&proved_member_counts, &counts)
     {
-        let certified_arrays = function_facts
-            .proof
-            .certified_array_indexes
-            .max(function_facts.types.array_index_certificates.len());
+        let first_member = counts
+            .return_field_members
+            .first()
+            .map(|member| format!("; first returned member {member}"))
+            .unwrap_or_default();
+        reasons.push(format!(
+            "rendered returned field access(es) without FunctionRenderFacts member-access proof{}",
+            first_member
+        ));
+    }
+    if counts.array_accesses > 0 && !array_accesses_are_certified(render_facts, &counts) {
         let first_missing = counts
             .array_nodes
-            .get(certified_arrays)
-            .or_else(|| counts.array_nodes.first())
+            .first()
             .map(|id| format!("; first array node {id}"))
             .unwrap_or_default();
         reasons.push(format!(
-            "rendered {} array access(es) with only {} ArrayIndexCertificate(s){}",
-            counts.array_accesses, certified_arrays, first_missing
+            "rendered {} array access(es) without exact FunctionRenderFacts array-access proof{}",
+            counts.array_accesses, first_missing
+        ));
+    }
+    if counts.raw_pointer_arithmetic_derefs > 0 {
+        let first_node = counts
+            .raw_pointer_arithmetic_nodes
+            .first()
+            .map(|id| format!("; first raw pointer arithmetic node {id}"))
+            .unwrap_or_default();
+        reasons.push(format!(
+            "rendered {} raw pointer-arithmetic dereference(s); typed field/array accesses must render through FunctionFacts certificates{}",
+            counts.raw_pointer_arithmetic_derefs, first_node
+        ));
+    }
+    if counts.raw_address_call_args > 0 {
+        let first_node = counts
+            .raw_address_call_arg_nodes
+            .first()
+            .map(|id| format!("; first raw address call argument node {id}"))
+            .unwrap_or_default();
+        reasons.push(format!(
+            "rendered {} raw address-like call argument(s); pointer/string call arguments must render through FunctionFacts certificates{}",
+            counts.raw_address_call_args, first_node
+        ));
+    }
+    if counts.residual_comments > 0 {
+        let first_node = counts
+            .residual_comment_nodes
+            .first()
+            .map(|id| format!("; first residual node {id}"))
+            .unwrap_or_default();
+        reasons.push(format!(
+            "rendered {} residual comment(s) inside certified Standard output; residuals must replace the whole executable body{}",
+            counts.residual_comments, first_node
         ));
     }
     raw_names.sort();
@@ -2557,7 +3035,7 @@ fn expression_proof_is_materialized_phi_copy(
     prepared: &r2ssa::SsaArtifact,
     proof: &EffectRenderProof,
     value: r2ssa::ValueId,
-    cert: &r2ssa::semantic::ExpressionCertificate,
+    cert: &r2types::ExpressionRenderFact,
 ) -> bool {
     if !proof.materialized_phi_copy || cert.value != value {
         return false;
@@ -2583,110 +3061,79 @@ fn expression_proof_is_materialized_phi_copy(
 }
 
 fn array_accesses_are_certified(
-    type_facts: &FunctionTypeFacts,
-    proof: &r2sym::ProofCoverage,
+    render_facts: &r2types::FunctionRenderFacts,
     counts: &CertifiedOutputCounts,
 ) -> bool {
-    let certified_count = proof
-        .certified_array_indexes
-        .max(type_facts.array_index_certificates.len());
-    if certified_count >= counts.array_accesses {
-        return true;
-    }
-    if type_facts.array_index_certificates.is_empty() {
-        return false;
-    }
-    if counts.field_members.is_empty() {
-        return certified_count > 0;
-    }
-
-    let certified_names = certified_array_field_names(type_facts);
-    !certified_names.is_empty()
-        && counts
-            .field_members
-            .iter()
-            .all(|member| certified_names.contains(&member.to_ascii_lowercase()))
+    let _ = render_facts;
+    let _ = counts;
+    false
 }
 
-fn certified_array_field_names(type_facts: &FunctionTypeFacts) -> BTreeSet<String> {
-    let certified_offsets = type_facts
-        .array_index_certificates
-        .iter()
-        .map(|cert| cert.field_offset)
-        .collect::<BTreeSet<_>>();
-    let mut names = BTreeSet::new();
-
-    for cert in &type_facts.field_access_certificates {
-        if certified_offsets.contains(&cert.field_offset) {
-            names.insert(cert.field_name.to_ascii_lowercase());
+fn proved_member_access_counts(
+    render_facts: &r2types::FunctionRenderFacts,
+    effect_render_proofs: &[EffectRenderProof],
+) -> BTreeMap<String, usize> {
+    let mut proved = BTreeMap::<String, usize>::new();
+    for proof in effect_render_proofs.iter().filter(|proof| {
+        matches!(
+            proof.kind,
+            EffectRenderProofKind::MemoryRead | EffectRenderProofKind::MemoryWrite
+        )
+    }) {
+        let is_write = proof.kind == EffectRenderProofKind::MemoryWrite;
+        let Some(memory) =
+            render_facts.memory_access_for_op(proof.block_addr, proof.op_idx, is_write)
+        else {
+            continue;
+        };
+        if proof.address != Some(memory.address) || proof.value != memory.value {
+            continue;
+        }
+        for member in render_facts
+            .member_accesses_by_op
+            .get(&(proof.block_addr, proof.op_idx, is_write))
+            .into_iter()
+            .flatten()
+            .filter(|member| {
+                member.access == memory.access
+                    && member.object == memory.object
+                    && member.access_width == memory.width
+            })
+        {
+            *proved
+                .entry(member.field_name.to_ascii_lowercase())
+                .or_default() += 1;
         }
     }
-    for fields in type_facts.slot_field_profiles.values() {
-        for offset in fields.keys() {
-            if certified_offsets.contains(offset) {
-                names.insert(format!("f_{offset:x}"));
-            }
-        }
-    }
-    for structure in type_facts.external_type_db.structs.values() {
-        for (offset, field) in &structure.fields {
-            if certified_offsets.contains(offset) {
-                names.insert(field.name.to_ascii_lowercase());
-            }
-        }
-    }
-    for union in type_facts.external_type_db.unions.values() {
-        for (offset, field) in &union.fields {
-            if certified_offsets.contains(offset) {
-                names.insert(field.name.to_ascii_lowercase());
-            }
-        }
-    }
-
-    names
+    proved
 }
 
 fn field_accesses_are_certified(
-    type_facts: &FunctionTypeFacts,
-    proof: &r2sym::ProofCoverage,
+    proved_member_counts: &BTreeMap<String, usize>,
     counts: &CertifiedOutputCounts,
 ) -> bool {
-    let certified_count = proof
-        .certified_field_accesses
-        .max(type_facts.field_access_certificates.len());
-    if certified_count >= counts.field_accesses {
-        return true;
+    let mut rendered = BTreeMap::<String, usize>::new();
+    for (_, member) in &counts.field_nodes {
+        *rendered.entry(member.to_ascii_lowercase()).or_default() += 1;
     }
 
-    let certified_names = certified_layout_field_names(type_facts);
-    !counts.field_members.is_empty()
-        && counts
-            .field_members
-            .iter()
-            .all(|member| certified_names.contains(&member.to_ascii_lowercase()))
+    rendered
+        .into_iter()
+        .all(|(field, count)| proved_member_counts.get(&field).copied().unwrap_or(0) >= count)
 }
 
-fn certified_layout_field_names(type_facts: &FunctionTypeFacts) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    for cert in &type_facts.field_access_certificates {
-        names.insert(cert.field_name.to_ascii_lowercase());
+fn return_field_members_are_authoritatively_certified(
+    proved_member_counts: &BTreeMap<String, usize>,
+    counts: &CertifiedOutputCounts,
+) -> bool {
+    let mut returned = BTreeMap::<String, usize>::new();
+    for member in &counts.return_field_members {
+        *returned.entry(member.to_ascii_lowercase()).or_default() += 1;
     }
-    for profile in type_facts.slot_field_profiles.values() {
-        for name in profile.values() {
-            names.insert(name.to_ascii_lowercase());
-        }
-    }
-    for structure in type_facts.external_type_db.structs.values() {
-        for field in structure.fields.values() {
-            names.insert(field.name.to_ascii_lowercase());
-        }
-    }
-    for union in type_facts.external_type_db.unions.values() {
-        for field in union.fields.values() {
-            names.insert(field.name.to_ascii_lowercase());
-        }
-    }
-    names
+
+    returned
+        .into_iter()
+        .all(|(field, count)| proved_member_counts.get(&field).copied().unwrap_or(0) >= count)
 }
 
 fn collect_certified_stmt_contract(
@@ -2788,6 +3235,7 @@ fn collect_certified_stmt_contract(
         CStmt::Return(Some(expr)) => {
             counts.returns_with_value += 1;
             counts.return_nodes.push(id.clone());
+            collect_expr_field_members(expr, &mut counts.return_field_members);
             collect_certified_expr_contract(expr, id.child(0), counts, raw_names);
         }
         CStmt::Return(None)
@@ -2796,8 +3244,23 @@ fn collect_certified_stmt_contract(
         | CStmt::Continue
         | CStmt::Goto(_)
         | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
+        | CStmt::Comment(_) => {
+            if let CStmt::Comment(text) = stmt
+                && (text.contains("r2sleigh residual:") || text.contains("r2dec residual:"))
+            {
+                counts.residual_comments += 1;
+                counts.residual_comment_nodes.push(id);
+            }
+        }
     }
+}
+
+fn collect_expr_field_members(expr: &CExpr, members: &mut Vec<String>) {
+    expr.visit(&mut |node| {
+        if let CExpr::Member { member, .. } | CExpr::PtrMember { member, .. } = node {
+            members.push(member.clone());
+        }
+    });
 }
 
 fn assignment_rhs_requires_expression_certificate(expr: &CExpr) -> bool {
@@ -2851,7 +3314,12 @@ fn collect_certified_expr_contract(
             counts.call_nodes.push(id.clone());
             collect_certified_expr_contract(func, id.child(0), counts, raw_names);
             for (index, arg) in args.iter().enumerate() {
-                collect_certified_expr_contract(arg, id.child(index + 1), counts, raw_names);
+                let arg_id = id.child(index + 1);
+                if certified_expr_is_raw_address_call_arg(arg) {
+                    counts.raw_address_call_args += 1;
+                    counts.raw_address_call_arg_nodes.push(arg_id.clone());
+                }
+                collect_certified_expr_contract(arg, arg_id, counts, raw_names);
             }
         }
         CExpr::Subscript { base, index } => {
@@ -2871,6 +3339,10 @@ fn collect_certified_expr_contract(
         CExpr::Deref(inner) => {
             counts.memory_like_accesses += 1;
             counts.memory_nodes.push(id.clone());
+            if certified_expr_is_raw_pointer_arithmetic(inner) {
+                counts.raw_pointer_arithmetic_derefs += 1;
+                counts.raw_pointer_arithmetic_nodes.push(id.clone());
+            }
             collect_certified_expr_contract(inner, id.child(0), counts, raw_names);
         }
         CExpr::Unary { operand, .. }
@@ -2907,6 +3379,39 @@ fn collect_certified_expr_contract(
     }
 }
 
+fn certified_expr_is_raw_address_call_arg(expr: &CExpr) -> bool {
+    const MIN_ADDRESS_LIKE_LITERAL: u64 = 0x1000;
+
+    match expr {
+        CExpr::UIntLit(value) => *value >= MIN_ADDRESS_LIKE_LITERAL,
+        CExpr::IntLit(value) => {
+            u64::try_from(*value).is_ok_and(|value| value >= MIN_ADDRESS_LIKE_LITERAL)
+        }
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => {
+            certified_expr_is_raw_address_call_arg(expr)
+        }
+        CExpr::Binary { left, right, .. } => {
+            certified_expr_is_raw_address_call_arg(left)
+                || certified_expr_is_raw_address_call_arg(right)
+        }
+        CExpr::Unary { operand, .. } => certified_expr_is_raw_address_call_arg(operand),
+        _ => false,
+    }
+}
+
+fn certified_expr_is_raw_pointer_arithmetic(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::Binary { op, .. } => matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl | BinaryOp::Shr
+        ),
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => {
+            certified_expr_is_raw_pointer_arithmetic(expr)
+        }
+        _ => false,
+    }
+}
+
 fn is_uncertified_render_var_name(name: &str) -> bool {
     let stripped = name.trim_start_matches('&');
     let lower = stripped.to_ascii_lowercase();
@@ -2917,6 +3422,7 @@ fn is_uncertified_render_var_name(name: &str) -> bool {
         || lower.starts_with("stack_")
         || lower.starts_with("local_")
         || lower.starts_with("var_")
+        || lower.starts_with("value_")
         || is_unversioned_raw_register_label(stripped)
         || is_ssa_versioned_register_label(stripped)
 }
@@ -3066,7 +3572,7 @@ fn summary_non_void_return_type(
     _semantic_artifact: &r2sym::SemanticArtifact,
 ) -> Option<CType> {
     function_facts
-        .types
+        .type_facts()
         .render_authorized_signature()
         .and_then(|sig| sig.ret_type.as_ref())
         .map(type_like_to_ctype)
@@ -3225,17 +3731,7 @@ fn merge_params_with_external_signature(
         return recovered_params;
     }
 
-    let signature_is_authoritative = signature.ret_type.is_some()
-        || signature
-            .params
-            .iter()
-            .any(|param| param.ty.is_some() || !is_generic_arg_name(&param.name));
-    let target_len = if signature_is_authoritative {
-        signature.params.len()
-    } else {
-        recovered_params.len().max(signature.params.len())
-    };
-    (0..target_len)
+    (0..signature.params.len())
         .map(|idx| {
             let fallback_name = format!("arg{}", idx + 1);
             let mut param = recovered_params.get(idx).cloned().unwrap_or(ast::CParam {
@@ -3255,6 +3751,35 @@ fn merge_params_with_external_signature(
             param
         })
         .collect()
+}
+
+fn params_from_authorized_signature(signature: &FunctionSignatureSpec) -> Vec<ast::CParam> {
+    signature
+        .params
+        .iter()
+        .enumerate()
+        .map(|(idx, param)| ast::CParam {
+            ty: param
+                .ty
+                .as_ref()
+                .map(type_like_to_ctype)
+                .expect("render-authorized signature parameter types checked before rendering"),
+            name: if param.name.trim().is_empty() || is_generic_arg_name(&param.name) {
+                format!("arg{}", idx + 1)
+            } else {
+                param.name.clone()
+            },
+        })
+        .collect()
+}
+
+fn signature_has_complete_render_param_types(signature: &FunctionSignatureSpec) -> bool {
+    signature.params.iter().all(|param| {
+        param
+            .ty
+            .as_ref()
+            .is_some_and(|ty| !matches!(type_like_to_ctype(ty), CType::Unknown))
+    })
 }
 
 fn register_alias_names(reg_name: &str) -> Vec<String> {
@@ -3337,21 +3862,24 @@ fn build_param_register_aliases(
     recovered_params: &[(r2ssa::SSAVar, ast::CParam)],
     register_params: &[ExternalRegisterParamSpec],
     abi_arg_regs: &[String],
+    allow_positional_aliases: bool,
 ) -> std::collections::HashMap<String, String> {
     let mut aliases = std::collections::HashMap::new();
 
-    for (idx, reg_name) in abi_arg_regs.iter().enumerate() {
-        let Some(param) = params.get(idx) else {
-            continue;
-        };
-        for alias in register_alias_names(reg_name) {
-            aliases.insert(alias, param.name.clone());
+    if allow_positional_aliases {
+        for (idx, reg_name) in abi_arg_regs.iter().enumerate() {
+            let Some(param) = params.get(idx) else {
+                continue;
+            };
+            for alias in register_alias_names(reg_name) {
+                aliases.insert(alias, param.name.clone());
+            }
         }
-    }
 
-    for (idx, (ssa_var, _)) in recovered_params.iter().enumerate() {
-        if let Some(param) = params.get(idx) {
-            aliases.insert(ssa_var.name.to_ascii_lowercase(), param.name.clone());
+        for (idx, (ssa_var, _)) in recovered_params.iter().enumerate() {
+            if let Some(param) = params.get(idx) {
+                aliases.insert(ssa_var.name.to_ascii_lowercase(), param.name.clone());
+            }
         }
     }
 
@@ -3562,103 +4090,55 @@ pub struct LocalStructFieldAccess {
 
 #[derive(Debug, Clone, Default)]
 pub struct DecompilerContext {
-    /// Function address to name mapping.
+    #[cfg(test)]
     pub function_names: std::collections::HashMap<u64, String>,
-    /// String literal addresses.
+    #[cfg(test)]
     pub strings: std::collections::HashMap<u64, String>,
-    /// Symbol/global variable names.
+    #[cfg(test)]
     pub symbols: std::collections::HashMap<u64, String>,
     /// Canonical combined type and semantic facts.
-    pub function_facts: FunctionFacts,
+    function_facts: FunctionFacts,
 }
 
 impl DecompilerContext {
     fn canonicalize_function_facts(mut function_facts: FunctionFacts) -> FunctionFacts {
-        function_facts.types = function_facts.types.canonicalized();
-        function_facts.refresh_plans();
+        function_facts.canonicalize_type_facts();
         function_facts
     }
 
     pub fn type_facts(&self) -> &FunctionTypeFacts {
-        &self.function_facts.types
+        self.function_facts.type_facts()
     }
 
+    #[cfg(test)]
     pub fn type_facts_mut(&mut self) -> &mut FunctionTypeFacts {
-        &mut self.function_facts.types
+        self.function_facts.__test_type_facts_mut()
     }
 
     pub fn semantic_artifact(&self) -> Option<&r2sym::SemanticArtifact> {
-        self.function_facts.semantics.as_ref()
+        self.function_facts.semantic_artifact()
     }
 
-    pub fn from_analysis_inputs(
-        mut type_facts: FunctionTypeFacts,
-        function_names: std::collections::HashMap<u64, String>,
-        strings: std::collections::HashMap<u64, String>,
-        symbols: std::collections::HashMap<u64, String>,
-        ptr_bits: u32,
-    ) -> Self {
-        r2types::enrich_known_function_signatures_from_names(
-            &mut type_facts,
-            &function_names,
-            ptr_bits,
-        );
-        r2types::enrich_known_function_signatures_from_names(&mut type_facts, &symbols, ptr_bits);
-        Self {
-            function_names,
-            strings,
-            symbols,
-            function_facts: FunctionFacts::new(type_facts.canonicalized(), None),
-        }
+    pub fn function_facts(&self) -> &FunctionFacts {
+        &self.function_facts
     }
 
-    pub fn from_function_facts(
-        mut function_facts: FunctionFacts,
-        function_names: std::collections::HashMap<u64, String>,
-        strings: std::collections::HashMap<u64, String>,
-        symbols: std::collections::HashMap<u64, String>,
-        ptr_bits: u32,
-    ) -> Self {
-        r2types::enrich_known_function_signatures_from_names(
-            &mut function_facts.types,
-            &function_names,
-            ptr_bits,
-        );
-        r2types::enrich_known_function_signatures_from_names(
-            &mut function_facts.types,
-            &symbols,
-            ptr_bits,
-        );
+    pub fn from_function_facts(function_facts: FunctionFacts) -> Self {
         let function_facts = Self::canonicalize_function_facts(function_facts);
         Self {
-            function_names,
-            strings,
-            symbols,
+            #[cfg(test)]
+            function_names: std::collections::HashMap::new(),
+            #[cfg(test)]
+            strings: std::collections::HashMap::new(),
+            #[cfg(test)]
+            symbols: std::collections::HashMap::new(),
             function_facts,
         }
     }
 
-    pub fn with_function_names(
-        mut self,
-        function_names: std::collections::HashMap<u64, String>,
-    ) -> Self {
-        self.function_names = function_names;
-        self
-    }
-
-    pub fn with_strings(mut self, strings: std::collections::HashMap<u64, String>) -> Self {
-        self.strings = strings;
-        self
-    }
-
-    pub fn with_symbols(mut self, symbols: std::collections::HashMap<u64, String>) -> Self {
-        self.symbols = symbols;
-        self
-    }
-
+    #[cfg(test)]
     pub fn with_type_facts(mut self, type_facts: FunctionTypeFacts) -> Self {
-        self.function_facts.types = type_facts.canonicalized();
-        self.function_facts.refresh_plans();
+        self.function_facts.replace_type_facts(type_facts);
         self
     }
 
@@ -3675,63 +4155,24 @@ impl DecompilerContext {
         self
     }
 
-    fn route_facts_to_plan(route: &r2types::DecompileRouteFacts) -> SemanticRoutePlan {
-        match route.kind {
-            r2types::DecompileRouteKind::Standard => SemanticRoutePlan::Standard,
-            r2types::DecompileRouteKind::StructuredWorker => SemanticRoutePlan::StructuredWorker {
-                reason: route.reason.clone().unwrap_or_default(),
-            },
-            r2types::DecompileRouteKind::SummaryIslands => SemanticRoutePlan::SummaryIslands {
-                reason: route.reason.clone().unwrap_or_default(),
-            },
-            r2types::DecompileRouteKind::LinearWorker => SemanticRoutePlan::LinearWorker {
-                reason: route.reason.clone().unwrap_or_default(),
-            },
-            r2types::DecompileRouteKind::VmSummary => SemanticRoutePlan::VmSummary {
-                reason: route.reason.clone().unwrap_or_default(),
-            },
-            r2types::DecompileRouteKind::FallbackComment => SemanticRoutePlan::FallbackComment {
-                comment: route
-                    .fallback_comment
-                    .clone()
-                    .or_else(|| route.reason.clone())
-                    .unwrap_or_default(),
-            },
-        }
-    }
-
     fn effective_render_permission(&self) -> Option<&r2sym::RenderPermission> {
         self.function_facts
             .decompile_route()
             .map(|route| &route.render_permission)
     }
 
-    fn skip_runtime_type_inference(&self, prepared: Option<&r2ssa::SsaArtifact>) -> bool {
+    fn skip_runtime_type_inference(&self, prepared: &r2ssa::SsaArtifact) -> bool {
+        let _ = prepared;
         self.function_facts
             .decompile_route()
-            .map(|route| route.skip_runtime_type_inference)
-            .unwrap_or_else(|| {
-                should_skip_runtime_type_inference(
-                    prepared,
-                    &self.function_facts.types,
-                    &self.function_facts,
-                )
-            })
+            .is_some_and(|route| route.skip_runtime_type_inference)
     }
 
-    fn use_prepared_semantic_view(&self, prepared: Option<&r2ssa::SsaArtifact>) -> bool {
+    fn use_prepared_semantic_view(&self, prepared: &r2ssa::SsaArtifact) -> bool {
+        let _ = prepared;
         self.function_facts
             .decompile_route()
-            .map(|route| route.use_prepared_semantic_view)
-            .unwrap_or_else(|| should_use_prepared_semantic_view(prepared, &self.function_facts))
-    }
-
-    fn route_for(&self, func_name: &str, cfg_summary: &r2ssa::CFGRiskSummary) -> SemanticRoutePlan {
-        let _ = (func_name, cfg_summary);
-        if let Some(route) = self.function_facts.decompile_route() {
-            return Self::route_facts_to_plan(route);
-        }
-        SemanticRoutePlan::Standard
+            .is_some_and(|route| route.use_prepared_semantic_view)
     }
 }
 
@@ -3739,7 +4180,7 @@ impl DecompilerContext {
 pub struct DecompilerInput {
     pub prepared_ssa: r2ssa::SsaArtifact,
     pub interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
-    pub context: DecompilerContext,
+    context: DecompilerContext,
 }
 
 impl DecompilerInput {
@@ -3766,10 +4207,19 @@ impl DecompilerInput {
         mut self,
         interproc_summary_set: Option<r2ssa::InterprocSummarySet>,
     ) -> Self {
-        self.context.function_facts.summary_view =
-            r2types::InterprocSummaryView::new(interproc_summary_set.clone());
+        self.context
+            .function_facts
+            .set_summary_set(interproc_summary_set.clone());
         self.interproc_summary_set = interproc_summary_set;
         self
+    }
+
+    pub fn context(&self) -> &DecompilerContext {
+        &self.context
+    }
+
+    pub fn function_facts(&self) -> &FunctionFacts {
+        self.context.function_facts()
     }
 }
 
@@ -3796,22 +4246,8 @@ impl Decompiler {
         self
     }
 
-    /// Set function names for call target resolution.
-    pub fn set_function_names(&mut self, names: std::collections::HashMap<u64, String>) {
-        self.context.function_names = names;
-    }
-
-    /// Set string literals for address resolution.
-    pub fn set_strings(&mut self, strings: std::collections::HashMap<u64, String>) {
-        self.context.strings = strings;
-    }
-
-    /// Set symbol names for global variable resolution.
-    pub fn set_symbols(&mut self, symbols: std::collections::HashMap<u64, String>) {
-        self.context.symbols = symbols;
-    }
-
     /// Set externally recovered known function signatures keyed by name.
+    #[cfg(test)]
     pub fn set_known_function_signatures<T>(
         &mut self,
         signatures: std::collections::HashMap<String, T>,
@@ -3825,14 +4261,15 @@ impl Decompiler {
     }
 
     /// Set externally recovered host type database.
+    #[cfg(test)]
     pub fn set_external_type_db(&mut self, external_type_db: ExternalTypeDb) {
         self.context.type_facts_mut().external_type_db = external_type_db;
     }
 
     /// Set externally recovered type facts.
+    #[cfg(test)]
     pub fn set_type_facts(&mut self, type_facts: FunctionTypeFacts) {
-        self.context.function_facts.types = type_facts.canonicalized();
-        self.context.function_facts.refresh_plans();
+        self.context.function_facts.replace_type_facts(type_facts);
     }
 
     pub fn set_function_facts(&mut self, function_facts: FunctionFacts) {
@@ -3843,56 +4280,16 @@ impl Decompiler {
         &self,
         func_name: &str,
         function_facts: &FunctionFacts,
-        route: &planner::SemanticRoutePlan,
+        route: &DecompileRouteFacts,
     ) -> Option<String> {
-        match route {
-            planner::SemanticRoutePlan::VmSummary { .. } => {
-                crate::consumer_vm::render_vm_semantic_summary(
-                    func_name,
-                    &function_facts.types,
-                    function_facts.semantics.as_ref()?,
-                )
-            }
-            _ => None,
+        if route.kind != DecompileRouteKind::VmSummary {
+            return None;
         }
-    }
-
-    /// Decompile an SSA function to C code.
-    pub fn decompile(&self, func: &SSAFunction) -> String {
-        let func_name = func
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-        let semantic_route = self.context.route_for(&func_name, &func.cfg_risk_summary());
-        if let SemanticRoutePlan::FallbackComment { comment } = &semantic_route {
-            return comment.clone();
-        }
-        if let Some(comment) = render_permission_refusal_comment(
-            &func_name,
-            self.context.effective_render_permission(),
-        ) {
-            return comment;
-        }
-        if let Some(output) = self.vm_summary_output_for_route(
-            &func_name,
-            &self.context.function_facts,
-            &semantic_route,
-        ) {
-            return output;
-        }
-        if let Some(output) = self.semantic_worker_summary_output_for_route(
-            &func_name,
-            &self.context.function_facts,
-            &semantic_route,
-        ) {
-            return output;
-        }
-        // Build the C function
-        let c_func = self.build_function(func);
-
-        // Generate code
-        let mut codegen = CodeGenerator::new(self.config.codegen.clone());
-        codegen.generate_function(&c_func)
+        crate::consumer_vm::render_vm_semantic_summary(
+            func_name,
+            function_facts.type_facts(),
+            function_facts.semantic_artifact()?,
+        )
     }
 
     /// Decompile a prepared function with an explicit typed context payload.
@@ -3902,14 +4299,11 @@ impl Decompiler {
             .name
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-        if input.context.function_facts.decompile_route().is_none() {
+        let Some(semantic_route) = input.context.function_facts.decompile_route() else {
             return missing_decompile_route_residual_comment(&func_name);
-        }
-        let semantic_route = input
-            .context
-            .route_for(&func_name, &func.cfg_risk_summary());
-        if let SemanticRoutePlan::FallbackComment { comment } = &semantic_route {
-            return comment.clone();
+        };
+        if let Some(comment) = route_fallback_comment(semantic_route) {
+            return comment.to_string();
         }
         if let Some(comment) = render_permission_refusal_comment(
             &func_name,
@@ -3917,17 +4311,22 @@ impl Decompiler {
         ) {
             return comment;
         }
+        if let Some(reason) =
+            summary_only_semantics_standard_render_residual_reason(&input.context.function_facts)
+        {
+            return artifact_guard_fallback_comment(&func_name, &reason);
+        }
         if let Some(output) = self.vm_summary_output_for_route(
             &func_name,
             &input.context.function_facts,
-            &semantic_route,
+            semantic_route,
         ) {
             return output;
         }
         if let Some(output) = self.semantic_worker_summary_output_for_route(
             &func_name,
             &input.context.function_facts,
-            &semantic_route,
+            semantic_route,
         ) {
             return output;
         }
@@ -3939,7 +4338,40 @@ impl Decompiler {
     /// Build a C function from a prepared function + typed context payload.
     pub fn build_function_from_input(&self, input: &DecompilerInput) -> CFunction {
         let decompiler = Self::new(self.config.clone()).with_context(input.context.clone());
-        decompiler.build_function_internal(input.prepared_ssa.function(), Some(&input.prepared_ssa))
+        let func = input.prepared_ssa.function();
+        let func_name = func
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        let Some(semantic_route) = decompiler.context.function_facts.decompile_route() else {
+            return residual_function_for_render_boundary(
+                &func_name,
+                &missing_decompile_route_residual_comment(&func_name),
+            );
+        };
+        if let Some(comment) = route_fallback_comment(semantic_route) {
+            return residual_function_for_render_boundary(&func_name, comment);
+        }
+        if let Some(comment) = render_permission_refusal_comment(
+            &func_name,
+            decompiler.context.effective_render_permission(),
+        ) {
+            return residual_function_for_render_boundary(&func_name, &comment);
+        }
+        if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
+            &decompiler.context.function_facts,
+        ) {
+            return residual_function_for_render_boundary(&func_name, &reason);
+        }
+        if route_is_summary_boundary(semantic_route) {
+            return residual_function_for_summary_route_boundary(&func_name, semantic_route);
+        }
+        if let Some(reason) =
+            render_permission_residual_reason(decompiler.context.effective_render_permission())
+        {
+            return residual_function_for_render_boundary(&func_name, &reason);
+        }
+        decompiler.build_function_internal(func, &input.prepared_ssa, semantic_route)
     }
 
     pub(crate) fn stmt_has_content(stmt: &CStmt) -> bool {
@@ -4189,7 +4621,7 @@ impl Decompiler {
         &self,
         func_name: &str,
         function_facts: &FunctionFacts,
-        route: &planner::SemanticRoutePlan,
+        route: &DecompileRouteFacts,
     ) -> Option<String> {
         consumer_summary::render_for_route(
             func_name,
@@ -4290,19 +4722,51 @@ impl Decompiler {
         }
     }
 
-    /// Build a C function from an SSA function.
-    pub fn build_function(&self, func: &SSAFunction) -> CFunction {
-        self.build_function_internal(func, None)
-    }
-
     fn build_function_internal(
         &self,
         func: &SSAFunction,
-        prepared: Option<&r2ssa::SsaArtifact>,
+        prepared: &r2ssa::SsaArtifact,
+        semantic_route: &DecompileRouteFacts,
     ) -> CFunction {
         // Materialize phis on non-critical edges to reduce SSA artifacts in output.
         let normalized_func = normalize::materialize_phis(func);
         let func = &normalized_func;
+        let func_name = func
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+        let certified_rendering_required =
+            render_permission_allows_executable_c(self.context.effective_render_permission());
+        let certified_standard_mode =
+            certified_rendering_required && route_is_standard(semantic_route);
+        if route_is_standard(semantic_route) && !certified_rendering_required {
+            let reason = render_permission_residual_reason(self.context.effective_render_permission())
+                .unwrap_or_else(|| {
+                    "r2dec residual: Standard executable rendering requires engine-owned CertifiedC permission".to_string()
+                });
+            return residual_function_for_render_boundary(&func_name, &reason);
+        }
+        let render_signature = self.context.type_facts().render_authorized_signature();
+        if certified_standard_mode {
+            let Some(signature) = render_signature else {
+                return residual_function_for_render_boundary(
+                    &func_name,
+                    "r2dec residual: certified Standard header lacks FunctionTypeFacts render-authorized signature",
+                );
+            };
+            if signature.ret_type.is_none() {
+                return residual_function_for_render_boundary(
+                    &func_name,
+                    "r2dec residual: certified Standard header lacks FunctionTypeFacts render-authorized return type",
+                );
+            }
+            if !signature_has_complete_render_param_types(signature) {
+                return residual_function_for_render_boundary(
+                    &func_name,
+                    "r2dec residual: certified Standard header has incomplete FunctionTypeFacts render-authorized parameter types",
+                );
+            }
+        }
 
         // Recover variables
         let mut var_recovery = VariableRecovery::new_with_abi(
@@ -4312,7 +4776,7 @@ impl Decompiler {
             self.config.arg_regs.clone(),
             self.config.ret_regs.clone(),
         );
-        var_recovery.set_type_facts(self.context.type_facts().clone());
+        var_recovery.set_function_facts(&self.context.function_facts);
         var_recovery.recover(func);
 
         let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
@@ -4322,9 +4786,6 @@ impl Decompiler {
                 self.config.arg_regs.clone(),
                 self.config.ret_regs.clone(),
             );
-            if !self.context.function_names.is_empty() {
-                type_inference.set_function_names(self.context.function_names.clone());
-            }
             type_inference.set_external_signature(
                 self.context
                     .type_facts()
@@ -4347,11 +4808,7 @@ impl Decompiler {
                 type_inference
                     .set_external_type_db(self.context.type_facts().external_type_db.clone());
             }
-            if let Some(prepared) = prepared {
-                type_inference.set_prepared_ssa(prepared);
-            } else {
-                type_inference.set_decompile_prep_facts(func.decompile_prep_facts());
-            }
+            type_inference.set_prepared_ssa(prepared);
             type_inference.infer_function(func);
             type_inference
         });
@@ -4381,8 +4838,6 @@ impl Decompiler {
             .as_ref()
             .map(|oracle| oracle as &dyn TypeOracle);
 
-        let callee_resolution = self.context.function_facts.callee_resolution();
-
         let recovered_param_infos: Vec<_> = var_recovery
             .parameters()
             .iter()
@@ -4401,19 +4856,25 @@ impl Decompiler {
                 )
             })
             .collect();
-        let render_signature = self.context.type_facts().render_authorized_signature();
-        let params = merge_params_with_external_signature(
-            recovered_param_infos
-                .iter()
-                .map(|(_, param)| param.clone())
-                .collect(),
-            render_signature,
-        );
+        let params = if certified_standard_mode {
+            params_from_authorized_signature(
+                render_signature.expect("certified Standard mode checked render signature"),
+            )
+        } else {
+            merge_params_with_external_signature(
+                recovered_param_infos
+                    .iter()
+                    .map(|(_, param)| param.clone())
+                    .collect(),
+                render_signature,
+            )
+        };
         let param_register_aliases = build_param_register_aliases(
             &params,
             &recovered_param_infos,
             &self.context.type_facts().register_params,
             &self.config.arg_regs,
+            !certified_standard_mode,
         );
         for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
             let Some(param) = params.get(idx) else {
@@ -4434,15 +4895,24 @@ impl Decompiler {
                 .entry(reg_alias.to_ascii_lowercase())
                 .or_insert_with(|| param.ty.clone());
         }
-        let inferred_ret_type = type_inference
-            .as_ref()
-            .map(|type_inference| self.infer_return_type(func, type_inference))
-            .or_else(|| {
-                render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
-            })
-            .unwrap_or(CType::Unknown);
+        let inferred_ret_type = if certified_standard_mode {
+            CType::Unknown
+        } else {
+            type_inference
+                .as_ref()
+                .map(|type_inference| self.infer_return_type(func, type_inference))
+                .or_else(|| {
+                    render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+                })
+                .unwrap_or(CType::Unknown)
+        };
         let signature_ret_type =
             render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
+        let fold_function_return_type = if certified_standard_mode {
+            signature_ret_type.as_ref()
+        } else {
+            signature_ret_type.as_ref().or(Some(&inferred_ret_type))
+        };
         let fold_arch = FoldArchConfig {
             ptr_size: self.config.ptr_size,
             sp_name: self.config.sp_name.clone(),
@@ -4459,56 +4929,57 @@ impl Decompiler {
         let use_prepared_semantic_view = self.context.use_prepared_semantic_view(prepared);
         let prepared_semantic_view = use_prepared_semantic_view.then(|| {
             analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
-                prepared: prepared.expect("prepared semantic view requires prepared artifact"),
+                prepared,
                 abi_arg_regs: &self.config.arg_regs,
-                callee_resolution,
-                callsite_facts: self.context.function_facts.callsites(),
-                call_result_facts: self.context.function_facts.call_results(),
-                control_facts: self.context.function_facts.control(),
                 stack_slots: &self.context.type_facts().stack_slots,
                 visible_bindings: &self.context.type_facts().visible_bindings,
                 param_register_aliases: &param_register_aliases,
+                function_facts: &self.context.function_facts,
+                #[cfg(test)]
+                certified_rendering_required,
             })
         });
+        let certified_empty_type_hints = HashMap::new();
+        let fold_type_hints = if certified_standard_mode {
+            &certified_empty_type_hints
+        } else {
+            &type_hints
+        };
+        let fold_type_oracle = if certified_standard_mode {
+            None
+        } else {
+            type_oracle
+        };
         let fold_inputs = FoldInputs {
             arch: &fold_arch,
+            #[cfg(test)]
             function_names: &self.context.function_names,
+            #[cfg(test)]
             strings: &self.context.strings,
+            #[cfg(test)]
             symbols: &self.context.symbols,
-            callee_facts: &self.context.type_facts().callee_facts,
-            callee_resolution,
-            callsite_facts: self.context.function_facts.callsites(),
-            call_result_facts: self.context.function_facts.call_results(),
-            control_facts: self.context.function_facts.control(),
+            function_facts: &self.context.function_facts,
+            #[cfg(test)]
+            certified_rendering_required,
             stack_slots: &self.context.type_facts().stack_slots,
+            field_access_certificates: &self.context.type_facts().field_access_certificates,
             #[cfg(test)]
             external_stack_vars: &self.context.type_facts().external_stack_vars,
             visible_bindings: &self.context.type_facts().visible_bindings,
             external_type_db: &self.context.type_facts().external_type_db,
-            semantic_artifact: self.context.semantic_artifact(),
             param_register_aliases: &param_register_aliases,
-            type_hints: &type_hints,
-            type_oracle,
-            function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
-            prepared_ssa: prepared,
-            summary_view: Some(&self.context.function_facts.summary_view),
+            type_hints: fold_type_hints,
+            type_oracle: fold_type_oracle,
+            function_return_type: fold_function_return_type,
+            prepared_ssa: Some(prepared),
             prepared_semantic_view: prepared_semantic_view.as_ref(),
-            prepared_objects: prepared.map(|artifact| artifact.objects()),
-            prepared_memory: prepared.map(|artifact| artifact.memory()),
-            prepared_call_sites: prepared.map(|artifact| artifact.call_sites()),
+            prepared_objects: Some(prepared.objects()),
+            prepared_memory: Some(prepared.memory()),
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
         fold_ctx.analyze_blocks(&fold_blocks);
         fold_ctx.analyze_function_structure(func);
-        let func_name = func
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-        let semantic_route = self.context.route_for(&func_name, &func.cfg_risk_summary());
-        let certified_standard_mode = prepared.is_some()
-            && self.context.effective_render_permission().is_some()
-            && matches!(semantic_route, planner::SemanticRoutePlan::Standard);
         if certified_standard_mode {
             fold_ctx.clear_effect_render_proofs();
         }
@@ -4518,11 +4989,19 @@ impl Decompiler {
 
         // Get set of variables that survive folding before structuring.
         let emitted_vars = structurer.emitted_var_names();
-        let routed_body = consumer_structured::primary_body_for_semantic_route(
-            &semantic_route,
-            &mut structurer,
-            || self.linearize_function_body(func, &fold_ctx),
-        );
+        let routed_body = if certified_standard_mode && route_is_standard(semantic_route) {
+            consumer_structured::RoutedBody {
+                body_stmt: structurer.structure_preserving_render_proof_identity(),
+                use_conservative_locals: false,
+                is_linear_fallback: false,
+            }
+        } else {
+            consumer_structured::primary_body_for_semantic_route(
+                semantic_route,
+                &mut structurer,
+                || self.linearize_function_body(func, &fold_ctx),
+            )
+        };
         let mut use_conservative_locals = routed_body.use_conservative_locals;
         let mut is_linear_fallback = routed_body.is_linear_fallback;
         let mut body_stmt = routed_body.body_stmt;
@@ -4538,7 +5017,7 @@ impl Decompiler {
         };
 
         if !certified_standard_mode
-            && matches!(semantic_route, planner::SemanticRoutePlan::Standard)
+            && route_is_standard(semantic_route)
             && !Self::stmt_has_content(&body_stmt)
         {
             let folded_reason = structurer
@@ -4553,9 +5032,7 @@ impl Decompiler {
             effect_render_proofs.clear();
         }
 
-        if !certified_standard_mode
-            || matches!(semantic_route, planner::SemanticRoutePlan::Standard)
-        {
+        if !certified_standard_mode && route_is_standard(semantic_route) {
             body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt);
             body_stmt = fold_ctx.prune_dead_temp_assignments_in_stmt(body_stmt);
             if !is_linear_fallback {
@@ -4608,19 +5085,44 @@ impl Decompiler {
                 .locals()
                 .iter()
                 .filter(|v| {
-                    !v.stack_offset
-                        .is_some_and(|offset| param_home_offsets.contains(&offset))
+                    let not_param_home = !v
+                        .stack_offset
+                        .is_some_and(|offset| param_home_offsets.contains(&offset));
+                    if certified_standard_mode {
+                        not_param_home
+                            && certified_recovered_stack_local_is_exact(
+                                &self.context.function_facts,
+                                &emitted_vars,
+                                &body_visible_names,
+                                &v.name,
+                                v.stack_offset,
+                            )
+                    } else {
+                        not_param_home
+                    }
                 })
                 .map(|v| ast::CLocal {
-                    ty: choose_more_specific_runtime_type(
-                        type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
+                    ty: if certified_standard_mode {
+                        v.stack_offset
+                            .and_then(|offset| {
+                                typed_stack_local_type_for_name_offset(
+                                    self.context.type_facts(),
+                                    &v.name,
+                                    offset,
+                                )
                             })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        runtime_type_hint_for_name(&type_hints, &v.name),
-                    ),
+                            .unwrap_or(CType::Unknown)
+                    } else {
+                        choose_more_specific_runtime_type(
+                            type_inference
+                                .as_ref()
+                                .map(|type_inference| {
+                                    type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
+                                })
+                                .unwrap_or_else(|| v.ty.clone()),
+                            runtime_type_hint_for_name(&type_hints, &v.name),
+                        )
+                    },
                     name: v.name.clone(),
                     stack_offset: v.stack_offset,
                 })
@@ -4630,23 +5132,49 @@ impl Decompiler {
                 .locals()
                 .iter()
                 .filter(|v| {
-                    !v.stack_offset
-                        .is_some_and(|offset| param_home_offsets.contains(&offset))
-                        && (emitted_vars.contains(&v.name)
-                            || body_visible_names.contains(&v.name)
-                            || v.stack_offset
-                                .is_some_and(|offset| body_visible_stack_offsets.contains(&offset)))
+                    let not_param_home = !v
+                        .stack_offset
+                        .is_some_and(|offset| param_home_offsets.contains(&offset));
+                    if certified_standard_mode {
+                        not_param_home
+                            && certified_recovered_stack_local_is_exact(
+                                &self.context.function_facts,
+                                &emitted_vars,
+                                &body_visible_names,
+                                &v.name,
+                                v.stack_offset,
+                            )
+                    } else {
+                        not_param_home
+                            && (emitted_vars.contains(&v.name)
+                                || body_visible_names.contains(&v.name)
+                                || v.stack_offset.is_some_and(|offset| {
+                                    body_visible_stack_offsets.contains(&offset)
+                                }))
+                    }
                 })
                 .map(|v| ast::CLocal {
-                    ty: choose_more_specific_runtime_type(
-                        type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
+                    ty: if certified_standard_mode {
+                        v.stack_offset
+                            .and_then(|offset| {
+                                typed_stack_local_type_for_name_offset(
+                                    self.context.type_facts(),
+                                    &v.name,
+                                    offset,
+                                )
                             })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        runtime_type_hint_for_name(&type_hints, &v.name),
-                    ),
+                            .unwrap_or(CType::Unknown)
+                    } else {
+                        choose_more_specific_runtime_type(
+                            type_inference
+                                .as_ref()
+                                .map(|type_inference| {
+                                    type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
+                                })
+                                .unwrap_or_else(|| v.ty.clone()),
+                            runtime_type_hint_for_name(&type_hints, &v.name),
+                        )
+                    },
                     name: v.name.clone(),
                     stack_offset: v.stack_offset,
                 })
@@ -4661,32 +5189,29 @@ impl Decompiler {
 
         let mut c_function = CFunction {
             name: func_name,
-            ret_type: render_signature
-                .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
-                .unwrap_or_else(|| inferred_ret_type.clone()),
+            ret_type: if certified_standard_mode {
+                signature_ret_type
+                    .clone()
+                    .expect("certified Standard mode checked render return type")
+            } else {
+                render_signature
+                    .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+                    .unwrap_or_else(|| inferred_ret_type.clone())
+            },
             params,
             locals,
             body,
         };
-        let appended_stack_return = if certified_standard_mode
-            && matches!(semantic_route, planner::SemanticRoutePlan::Standard)
+        if !certified_standard_mode
+            && route_is_standard(semantic_route)
             && !matches!(c_function.ret_type, CType::Void | CType::Unknown)
             && !c_function.body.iter().any(summary_stmt_contains_return)
             && let Some(expr) = fold_ctx.unique_scalar_stack_return_expr()
         {
             c_function.body.push(CStmt::Return(Some(expr)));
-            true
-        } else {
-            false
-        };
-        if appended_stack_return && certified_standard_mode {
-            effect_render_proofs = fold_ctx.effect_render_proofs();
         }
-        if prepared.is_some() && matches!(semantic_route, planner::SemanticRoutePlan::Standard) {
+        if !certified_standard_mode && route_is_standard(semantic_route) {
             fold_ctx.prune_duplicate_call_statements_by_source(&mut c_function.body);
-        }
-        if certified_standard_mode {
-            fold_ctx.prune_duplicate_tail_call_statements(&mut c_function.body);
         }
         if certified_standard_mode {
             append_semantic_summary_return_comment_to_function_if_needed(
@@ -4704,9 +5229,6 @@ impl Decompiler {
         // Linear fallback intentionally keeps its raw expression-builder output.
         if !certified_standard_mode && !is_linear_fallback {
             let mut known_function_names = HashSet::new();
-            for name in self.context.function_names.values() {
-                known_function_names.insert(name.to_ascii_lowercase());
-            }
             for name in self.context.type_facts().known_function_signatures.keys() {
                 known_function_names.insert(name.to_ascii_lowercase());
             }
@@ -4716,25 +5238,14 @@ impl Decompiler {
             rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
             prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
             prune_unused_pure_locals(&mut c_function);
-        } else if matches!(semantic_route, planner::SemanticRoutePlan::Standard) {
-            prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
-            materialize_certified_raw_carrier_locals(&mut c_function, &fold_ctx);
-            prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
-            prune_unused_pure_locals(&mut c_function);
-            if !is_linear_fallback {
-                let body = CStmt::Block(std::mem::take(&mut c_function.body));
-                c_function.body = self.stmt_to_vec(ControlFlowStructurer::cleanup(body));
-            }
         }
-        if matches!(semantic_route, planner::SemanticRoutePlan::Standard) {
+        if route_is_standard(semantic_route) {
             let residual_reason =
                 render_permission_residual_reason(self.context.effective_render_permission())
                     .or_else(|| {
-                        (prepared.is_some()
-                            && matches!(semantic_route, planner::SemanticRoutePlan::Standard))
-                        .then(|| {
+                        route_is_standard(semantic_route).then(|| {
                             certified_standard_output_residual_reason_with_effect_proofs(
-                                prepared.expect("certified mode requires prepared SSA"),
+                                prepared,
                                 &self.context.function_facts,
                                 &c_function,
                                 certified_standard_mode.then_some(effect_render_proofs.as_slice()),
@@ -4743,7 +5254,8 @@ impl Decompiler {
                     })
                     .or_else(|| {
                         certifying_render_residual_reason_with_proofs(
-                            prepared,
+                            Some(prepared),
+                            self.context.function_facts.control(),
                             &func.cfg_risk_summary(),
                             &c_function,
                             certified_standard_mode.then_some(control_render_proofs.as_slice()),
@@ -5240,448 +5752,6 @@ fn prune_dead_temp_assignments_in_function_body(
     };
 }
 
-fn materialize_certified_raw_carrier_locals(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
-    let mut assigned = Vec::new();
-    collect_raw_carrier_assignment_names(&func.body, &mut assigned);
-    let mut referenced = assigned.clone();
-    collect_raw_carrier_read_names(&func.body, &mut referenced);
-    if referenced.is_empty() {
-        return;
-    }
-
-    let mut used_names = collect_stmt_var_names(&func.body);
-    used_names.extend(
-        func.params
-            .iter()
-            .map(|param| param.name.to_ascii_lowercase()),
-    );
-    used_names.extend(
-        func.locals
-            .iter()
-            .map(|local| local.name.to_ascii_lowercase()),
-    );
-
-    let mut rename_map = BTreeMap::new();
-    let mut carrier_defs = BTreeMap::new();
-    let assigned_set = assigned
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    for raw in referenced {
-        let lower = raw.to_ascii_lowercase();
-        if rename_map.contains_key(&lower) {
-            continue;
-        }
-        if !assigned_set.contains(&lower) {
-            let Some(definition) = fold_ctx.certified_raw_carrier_definition(&raw) else {
-                continue;
-            };
-            carrier_defs.insert(lower.clone(), definition);
-        }
-        let mut index = rename_map.len();
-        let clean = loop {
-            let candidate = format!("value_{index}");
-            if !used_names.contains(&candidate) {
-                used_names.insert(candidate.clone());
-                break candidate;
-            }
-            index += 1;
-        };
-        rename_map.insert(lower, (clean, certified_raw_carrier_type(&raw)));
-    }
-
-    let mut declared = HashSet::new();
-    rewrite_certified_raw_carrier_stmts(&mut func.body, &rename_map, &carrier_defs, &mut declared);
-}
-
-fn collect_raw_carrier_assignment_names(stmts: &[CStmt], out: &mut Vec<String>) {
-    for stmt in stmts {
-        match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                ..
-            }) => {
-                if let CExpr::Var(name) = left.as_ref()
-                    && is_ssa_versioned_register_label(name)
-                {
-                    out.push(name.clone());
-                }
-            }
-            CStmt::Decl { name, .. } if is_ssa_versioned_register_label(name) => {
-                out.push(name.clone());
-            }
-            CStmt::Block(stmts) => collect_raw_carrier_assignment_names(stmts, out),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                collect_raw_carrier_assignment_names_from_stmt(then_body, out);
-                if let Some(else_body) = else_body {
-                    collect_raw_carrier_assignment_names_from_stmt(else_body, out);
-                }
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => {
-                collect_raw_carrier_assignment_names_from_stmt(body, out)
-            }
-            CStmt::Switch { cases, default, .. } => {
-                for case in cases {
-                    collect_raw_carrier_assignment_names(&case.body, out);
-                }
-                if let Some(default) = default {
-                    collect_raw_carrier_assignment_names(default, out);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_raw_carrier_assignment_names_from_stmt(stmt: &CStmt, out: &mut Vec<String>) {
-    collect_raw_carrier_assignment_names(std::slice::from_ref(stmt), out);
-}
-
-fn collect_raw_carrier_read_names(stmts: &[CStmt], out: &mut Vec<String>) {
-    for stmt in stmts {
-        match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => {
-                collect_raw_carrier_read_names_from_expr(right, out);
-                if !matches!(left.as_ref(), CExpr::Var(name) if is_ssa_versioned_register_label(name))
-                {
-                    collect_raw_carrier_read_names_from_expr(left, out);
-                }
-            }
-            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
-                collect_raw_carrier_read_names_from_expr(expr, out);
-            }
-            CStmt::Decl {
-                init: Some(expr), ..
-            } => collect_raw_carrier_read_names_from_expr(expr, out),
-            CStmt::Block(stmts) => collect_raw_carrier_read_names(stmts, out),
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                collect_raw_carrier_read_names_from_expr(cond, out);
-                collect_raw_carrier_read_names_from_stmt(then_body, out);
-                if let Some(else_body) = else_body {
-                    collect_raw_carrier_read_names_from_stmt(else_body, out);
-                }
-            }
-            CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-                collect_raw_carrier_read_names_from_expr(cond, out);
-                collect_raw_carrier_read_names_from_stmt(body, out);
-            }
-            CStmt::For {
-                init,
-                cond,
-                update,
-                body,
-            } => {
-                if let Some(init) = init {
-                    collect_raw_carrier_read_names_from_stmt(init, out);
-                }
-                if let Some(cond) = cond {
-                    collect_raw_carrier_read_names_from_expr(cond, out);
-                }
-                if let Some(update) = update {
-                    collect_raw_carrier_read_names_from_expr(update, out);
-                }
-                collect_raw_carrier_read_names_from_stmt(body, out);
-            }
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => {
-                collect_raw_carrier_read_names_from_expr(expr, out);
-                for case in cases {
-                    collect_raw_carrier_read_names_from_expr(&case.value, out);
-                    collect_raw_carrier_read_names(&case.body, out);
-                }
-                if let Some(default) = default {
-                    collect_raw_carrier_read_names(default, out);
-                }
-            }
-            CStmt::Decl { init: None, .. }
-            | CStmt::Return(None)
-            | CStmt::Break
-            | CStmt::Continue
-            | CStmt::Goto(_)
-            | CStmt::Label(_)
-            | CStmt::Comment(_)
-            | CStmt::Empty => {}
-        }
-    }
-}
-
-fn collect_raw_carrier_read_names_from_stmt(stmt: &CStmt, out: &mut Vec<String>) {
-    collect_raw_carrier_read_names(std::slice::from_ref(stmt), out);
-}
-
-fn collect_raw_carrier_read_names_from_expr(expr: &CExpr, out: &mut Vec<String>) {
-    match expr {
-        CExpr::Var(name) if is_ssa_versioned_register_label(name) => out.push(name.clone()),
-        CExpr::Deref(inner) | CExpr::AddrOf(inner) | CExpr::Paren(inner) | CExpr::Sizeof(inner) => {
-            collect_raw_carrier_read_names_from_expr(inner, out)
-        }
-        CExpr::Cast { expr, .. } | CExpr::Unary { operand: expr, .. } => {
-            collect_raw_carrier_read_names_from_expr(expr, out);
-        }
-        CExpr::Binary { left, right, .. } => {
-            collect_raw_carrier_read_names_from_expr(left, out);
-            collect_raw_carrier_read_names_from_expr(right, out);
-        }
-        CExpr::Subscript { base, index } => {
-            collect_raw_carrier_read_names_from_expr(base, out);
-            collect_raw_carrier_read_names_from_expr(index, out);
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            collect_raw_carrier_read_names_from_expr(base, out);
-        }
-        CExpr::Call { func, args } => {
-            collect_raw_carrier_read_names_from_expr(func, out);
-            for arg in args {
-                collect_raw_carrier_read_names_from_expr(arg, out);
-            }
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            collect_raw_carrier_read_names_from_expr(cond, out);
-            collect_raw_carrier_read_names_from_expr(then_expr, out);
-            collect_raw_carrier_read_names_from_expr(else_expr, out);
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                collect_raw_carrier_read_names_from_expr(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn rewrite_certified_raw_carrier_stmts(
-    stmts: &mut Vec<CStmt>,
-    rename_map: &BTreeMap<String, (String, CType)>,
-    carrier_defs: &BTreeMap<String, CExpr>,
-    declared: &mut HashSet<String>,
-) {
-    let mut rewritten = Vec::with_capacity(stmts.len());
-    for mut stmt in std::mem::take(stmts) {
-        let mut reads = Vec::new();
-        collect_raw_carrier_read_names_from_stmt(&stmt, &mut reads);
-        for raw in reads {
-            let lower = raw.to_ascii_lowercase();
-            if declared.contains(&lower) {
-                continue;
-            }
-            let Some((clean, ty)) = rename_map.get(&lower) else {
-                continue;
-            };
-            let Some(mut init) = carrier_defs.get(&lower).cloned() else {
-                continue;
-            };
-            rewrite_certified_raw_carrier_expr(&mut init, rename_map);
-            declared.insert(lower);
-            rewritten.push(CStmt::Decl {
-                ty: ty.clone(),
-                name: clean.clone(),
-                init: Some(init),
-            });
-        }
-        rewrite_certified_raw_carrier_stmt(&mut stmt, rename_map, carrier_defs, declared);
-        rewritten.push(stmt);
-    }
-    *stmts = rewritten;
-}
-
-fn rewrite_certified_raw_carrier_stmt(
-    stmt: &mut CStmt,
-    rename_map: &BTreeMap<String, (String, CType)>,
-    carrier_defs: &BTreeMap<String, CExpr>,
-    declared: &mut HashSet<String>,
-) {
-    match stmt {
-        CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) => {
-            rewrite_certified_raw_carrier_expr(right, rename_map);
-            if let CExpr::Var(raw_name) = left.as_ref() {
-                let lower = raw_name.to_ascii_lowercase();
-                if let Some((clean, ty)) = rename_map.get(&lower) {
-                    if declared.insert(lower) {
-                        *stmt = CStmt::Decl {
-                            ty: ty.clone(),
-                            name: clean.clone(),
-                            init: Some((**right).clone()),
-                        };
-                    } else {
-                        **left = CExpr::Var(clean.clone());
-                    }
-                    return;
-                }
-            }
-            rewrite_certified_raw_carrier_expr(left, rename_map);
-        }
-        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
-            rewrite_certified_raw_carrier_expr(expr, rename_map);
-        }
-        CStmt::Decl { ty, name, init } => {
-            if let Some(init) = init {
-                rewrite_certified_raw_carrier_expr(init, rename_map);
-            }
-            let lower = name.to_ascii_lowercase();
-            if let Some((clean, clean_ty)) = rename_map.get(&lower) {
-                *name = clean.clone();
-                *ty = clean_ty.clone();
-                declared.insert(lower);
-            }
-        }
-        CStmt::Block(stmts) => {
-            rewrite_certified_raw_carrier_stmts(stmts, rename_map, carrier_defs, declared)
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            rewrite_certified_raw_carrier_expr(cond, rename_map);
-            rewrite_certified_raw_carrier_stmt(then_body, rename_map, carrier_defs, declared);
-            if let Some(else_body) = else_body {
-                rewrite_certified_raw_carrier_stmt(else_body, rename_map, carrier_defs, declared);
-            }
-        }
-        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-            rewrite_certified_raw_carrier_expr(cond, rename_map);
-            rewrite_certified_raw_carrier_stmt(body, rename_map, carrier_defs, declared);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                rewrite_certified_raw_carrier_stmt(init, rename_map, carrier_defs, declared);
-            }
-            if let Some(cond) = cond {
-                rewrite_certified_raw_carrier_expr(cond, rename_map);
-            }
-            if let Some(update) = update {
-                rewrite_certified_raw_carrier_expr(update, rename_map);
-            }
-            rewrite_certified_raw_carrier_stmt(body, rename_map, carrier_defs, declared);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            rewrite_certified_raw_carrier_expr(expr, rename_map);
-            for case in cases {
-                rewrite_certified_raw_carrier_expr(&mut case.value, rename_map);
-                rewrite_certified_raw_carrier_stmts(
-                    &mut case.body,
-                    rename_map,
-                    carrier_defs,
-                    declared,
-                );
-            }
-            if let Some(default) = default {
-                rewrite_certified_raw_carrier_stmts(default, rename_map, carrier_defs, declared);
-            }
-        }
-        CStmt::Return(None)
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_)
-        | CStmt::Empty => {}
-    }
-}
-
-fn rewrite_certified_raw_carrier_expr(
-    expr: &mut CExpr,
-    rename_map: &BTreeMap<String, (String, CType)>,
-) {
-    match expr {
-        CExpr::Var(name) => {
-            if let Some((clean, _)) = rename_map.get(&name.to_ascii_lowercase()) {
-                *name = clean.clone();
-            }
-        }
-        CExpr::Deref(inner) | CExpr::AddrOf(inner) | CExpr::Paren(inner) | CExpr::Sizeof(inner) => {
-            rewrite_certified_raw_carrier_expr(inner, rename_map)
-        }
-        CExpr::Cast { expr, .. } | CExpr::Unary { operand: expr, .. } => {
-            rewrite_certified_raw_carrier_expr(expr, rename_map);
-        }
-        CExpr::Binary { left, right, .. } => {
-            rewrite_certified_raw_carrier_expr(left, rename_map);
-            rewrite_certified_raw_carrier_expr(right, rename_map);
-        }
-        CExpr::Subscript { base, index } => {
-            rewrite_certified_raw_carrier_expr(base, rename_map);
-            rewrite_certified_raw_carrier_expr(index, rename_map);
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            rewrite_certified_raw_carrier_expr(base, rename_map);
-        }
-        CExpr::Call { func, args } => {
-            rewrite_certified_raw_carrier_expr(func, rename_map);
-            for arg in args {
-                rewrite_certified_raw_carrier_expr(arg, rename_map);
-            }
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            rewrite_certified_raw_carrier_expr(cond, rename_map);
-            rewrite_certified_raw_carrier_expr(then_expr, rename_map);
-            rewrite_certified_raw_carrier_expr(else_expr, rename_map);
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                rewrite_certified_raw_carrier_expr(item, rename_map);
-            }
-        }
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_) => {}
-    }
-}
-
-fn certified_raw_carrier_type(name: &str) -> CType {
-    let base = name
-        .rsplit_once('_')
-        .map(|(base, _)| base)
-        .unwrap_or(name)
-        .to_ascii_lowercase();
-    match base.as_str() {
-        "al" | "ah" | "bl" | "bh" | "cl" | "ch" | "dl" | "dh" => CType::i8(),
-        "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" | "sp" => CType::i16(),
-        base if base.starts_with('e') || base.starts_with('w') => CType::i32(),
-        _ => CType::i64(),
-    }
-}
-
 fn prune_unused_pure_locals(func: &mut CFunction) {
     loop {
         let live_reads = collect_function_local_reads(func);
@@ -5971,10 +6041,13 @@ pub fn infer_local_struct_field_accesses(
         return Vec::new();
     }
 
-    let function_names = std::collections::HashMap::new();
-    let strings = std::collections::HashMap::new();
-    let symbols = std::collections::HashMap::new();
     let type_hints = std::collections::HashMap::new();
+    #[cfg(test)]
+    let function_names = std::collections::HashMap::new();
+    #[cfg(test)]
+    let strings = std::collections::HashMap::new();
+    #[cfg(test)]
+    let symbols = std::collections::HashMap::new();
     let mut param_register_aliases = std::collections::HashMap::new();
     let mut arg_slot_map = std::collections::HashMap::new();
 
@@ -5992,8 +6065,11 @@ pub fn infer_local_struct_field_accesses(
         sp_name: &config.sp_name,
         fp_name: &config.fp_name,
         ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
+        #[cfg(test)]
         function_names: &function_names,
+        #[cfg(test)]
         strings: &strings,
+        #[cfg(test)]
         symbols: &symbols,
         callee_facts: analysis::empty_callee_facts(),
         callee_resolution: None,
@@ -6128,33 +6204,17 @@ pub(crate) fn test_native_semantic_artifact(
 }
 
 #[cfg(test)]
-pub(crate) fn leaked_test_semantic_artifact(
-    artifact: r2sym::SemanticArtifact,
-) -> &'static r2sym::SemanticArtifact {
-    Box::leak(Box::new(artifact))
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::SSAFunction;
     use r2types::{
         ArrayIndexBase, ArrayIndexCertificate, ExternalField, ExternalRegisterParamSpec,
-        ExternalStruct, FieldAccessCertificate, FunctionFacts, FunctionParamSpec,
-        FunctionSignatureSpec, FunctionTypeFacts,
+        ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, ExternalStruct,
+        FieldAccessCertificate, FunctionFacts, FunctionParamSpec, FunctionRenderFacts,
+        FunctionSignatureSpec, FunctionTypeFacts, Signedness,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-    fn ssa_from_ops(ops: Vec<R2ILOp>, arch: &ArchSpec) -> SSAFunction {
-        let mut block = R2ILBlock::new(0x1000, 4);
-        for op in ops {
-            block.push(op);
-        }
-        SSAFunction::from_blocks_with_arch(&[block], Some(arch))
-            .expect("SSA function should build")
-            .with_name("stable_demo")
-    }
 
     fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
@@ -6177,26 +6237,22 @@ mod tests {
             function_names: Box::leak(Box::new(HashMap::new())),
             strings: Box::leak(Box::new(HashMap::new())),
             symbols: Box::leak(Box::new(HashMap::new())),
-            callee_facts: Box::leak(Box::new(BTreeMap::new())),
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
+            function_facts: crate::fold::context::empty_function_facts(),
+            #[cfg(test)]
+            certified_rendering_required: false,
             stack_slots: Box::leak(Box::new(BTreeMap::new())),
+            field_access_certificates: &[],
             external_stack_vars: Box::leak(Box::new(HashMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
             external_type_db: Box::leak(Box::new(ExternalTypeDb::default())),
-            semantic_artifact: None,
             param_register_aliases: Box::leak(Box::new(HashMap::new())),
             type_hints: Box::leak(Box::new(HashMap::new())),
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
-            summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_call_sites: None,
         })
     }
 
@@ -6215,6 +6271,68 @@ mod tests {
             proof_coverage: r2sym::ProofCoverage::default(),
             render_permission,
         }
+    }
+
+    fn test_summary_decompile_route(
+        kind: r2types::DecompileRouteKind,
+        reason: &str,
+    ) -> r2types::DecompileRouteFacts {
+        test_decompile_route(
+            kind,
+            reason,
+            None,
+            r2sym::RenderPermission::summary(r2sym::ProofOwner::R2engine, reason),
+        )
+    }
+
+    fn render_semantic_worker_summary(
+        func_name: &str,
+        function_facts: &FunctionFacts,
+        route: &r2types::DecompileRouteFacts,
+        config: DecompilerConfig,
+    ) -> Option<String> {
+        let function_facts = function_facts.clone().with_decompile_route(route.clone());
+        super::render_semantic_worker_summary(func_name, &function_facts, config)
+    }
+
+    #[test]
+    fn standard_certified_c_requires_r2engine_proof_owner() {
+        let arch = test_arch_for_decompile();
+        let ops = vec![
+            R2ILOp::Copy {
+                dst: Varnode::register(0x00, 8),
+                src: Varnode::constant(7, 8),
+            },
+            R2ILOp::Return {
+                target: Varnode::register(0x00, 8),
+            },
+        ];
+        let prepared = prepared_from_ops(ops, &arch);
+        let route = test_decompile_route(
+            r2types::DecompileRouteKind::Standard,
+            "non-engine certified fixture",
+            None,
+            r2sym::RenderPermission::certified(
+                r2sym::ProofOwner::R2sym,
+                "non-engine certified fixture",
+            ),
+        );
+        let function_facts =
+            FunctionFacts::new(FunctionTypeFacts::default(), None).with_decompile_route(route);
+        let input = DecompilerInput::new(
+            prepared,
+            DecompilerContext::default().with_function_facts(function_facts),
+        );
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+
+        assert!(
+            output.contains("CertifiedC render permission from non-engine proof owner R2sym"),
+            "wrong-owner CertifiedC must residualize before executable Standard rendering, got:\n{output}"
+        );
+        assert!(
+            !output.contains("return 7;"),
+            "wrong-owner CertifiedC must not emit executable C, got:\n{output}"
+        );
     }
 
     #[test]
@@ -6319,6 +6437,28 @@ mod tests {
             .with_name("stable_demo")
     }
 
+    fn prepared_standard_input_with_type_facts(
+        prepared: r2ssa::SsaArtifact,
+        type_facts: FunctionTypeFacts,
+        reason: &str,
+    ) -> DecompilerInput {
+        let function_facts = FunctionFacts::new(type_facts, None)
+            .with_callsites(test_callsite_facts(&prepared))
+            .with_call_results(test_call_result_facts(&prepared))
+            .with_call_render(test_call_render_facts(&prepared))
+            .with_render(test_render_facts(&prepared))
+            .with_decompile_route(test_decompile_route(
+                r2types::DecompileRouteKind::Standard,
+                reason,
+                None,
+                r2sym::RenderPermission::certified(r2sym::ProofOwner::R2engine, reason),
+            ));
+        DecompilerInput::new(
+            prepared,
+            DecompilerContext::default().with_function_facts(function_facts),
+        )
+    }
+
     fn expression_value_for_op(
         prepared: &r2ssa::SsaArtifact,
         block_addr: u64,
@@ -6334,6 +6474,246 @@ mod tests {
             .iter()
             .find_map(|(value, cert)| (cert.defining_inst == Some(inst)).then_some(*value))
             .expect("prepared op-site should define expression value")
+    }
+
+    fn test_function_facts_with_prepared_render(prepared: &r2ssa::SsaArtifact) -> FunctionFacts {
+        FunctionFacts::new(FunctionTypeFacts::default(), None)
+            .with_callsites(test_callsite_facts(prepared))
+            .with_call_results(test_call_result_facts(prepared))
+            .with_call_render(test_call_render_facts(prepared))
+            .with_render(test_render_facts(prepared))
+    }
+
+    fn test_callsite_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallsiteFacts {
+        let by_callsite = prepared
+            .certificates()
+            .callsites
+            .values()
+            .filter_map(|cert| {
+                let (block_addr, op_index) = prepared.inst_op_site(cert.at)?;
+                let callsite = r2types::CallsiteKey {
+                    block_addr,
+                    op_index,
+                };
+                Some((
+                    callsite,
+                    r2types::CallsiteArgumentFacts {
+                        callsite,
+                        call_site_id: cert.call_site,
+                        at: cert.at,
+                        target: cert.target,
+                        direct_target: cert.direct_target,
+                        argument_values: cert
+                            .argument_values
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
+                            .collect(),
+                        register_argument_locations: Vec::new(),
+                        stack_argument_locations: Vec::new(),
+                    },
+                ))
+            })
+            .collect();
+        r2types::FunctionCallsiteFacts { by_callsite }
+    }
+
+    fn test_call_result_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallResultFacts {
+        let mut by_value = BTreeMap::new();
+        let mut by_callsite = BTreeMap::<r2types::CallsiteKey, Vec<r2ssa::ValueId>>::new();
+        for cert in prepared.certificates().call_results.values() {
+            let Some(callsite_cert) = prepared.certificates().callsites.get(&cert.call_site) else {
+                continue;
+            };
+            let callsite = r2types::CallsiteKey {
+                block_addr: callsite_cert.block_addr,
+                op_index: callsite_cert.op_index,
+            };
+            by_callsite.entry(callsite).or_default().push(cert.value);
+            by_value.insert(
+                cert.value,
+                r2types::CallResultFact {
+                    callsite,
+                    call_site_id: cert.call_site,
+                    at: cert.at,
+                    value: cert.value,
+                    width: cert.width,
+                    carrier: cert.carrier.clone(),
+                    owner: cert.owner.clone(),
+                },
+            );
+        }
+        r2types::FunctionCallResultFacts {
+            by_value,
+            by_callsite,
+        }
+    }
+
+    fn test_call_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallRenderFacts {
+        let call_results = test_call_result_facts(prepared);
+        let by_callsite = prepared
+            .certificates()
+            .callsites
+            .values()
+            .map(|cert| {
+                let callsite = r2types::CallsiteKey {
+                    block_addr: cert.block_addr,
+                    op_index: cert.op_index,
+                };
+                let disposition = if call_results
+                    .results_for_site(callsite)
+                    .any(|result| matches!(result.owner, Some(r2ssa::ValueOwner::StackSlot { .. })))
+                {
+                    r2types::CallsiteRenderDisposition::AssignedResult
+                } else {
+                    r2types::CallsiteRenderDisposition::SideEffectStatement
+                };
+                (
+                    callsite,
+                    r2types::CallsiteRenderFact {
+                        callsite,
+                        target: Some(cert.target),
+                        disposition,
+                        proof_values: cert.argument_values.clone(),
+                        residual_reason: None,
+                    },
+                )
+            })
+            .collect();
+        r2types::FunctionCallRenderFacts { by_callsite }
+    }
+
+    fn test_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionRenderFacts {
+        let certificates = prepared.certificates();
+        r2types::FunctionRenderFacts {
+            expressions: certificates
+                .expressions
+                .iter()
+                .map(|(value, cert)| {
+                    (
+                        *value,
+                        r2types::ExpressionRenderFact {
+                            value: cert.value,
+                            defining_inst: cert.defining_inst,
+                            width: cert.width,
+                            renderable: cert.renderable,
+                        },
+                    )
+                })
+                .collect(),
+            string_literals_by_value: BTreeMap::new(),
+            memory_accesses: certificates
+                .memory_accesses
+                .iter()
+                .map(|(access, cert)| {
+                    (
+                        *access,
+                        r2types::MemoryAccessRenderFact {
+                            access: cert.access,
+                            block_addr: cert.block_addr,
+                            op_index: cert.op_index,
+                            object: cert.object,
+                            address: cert.address,
+                            value: cert.value,
+                            is_write: cert.is_write,
+                            width: cert.width,
+                        },
+                    )
+                })
+                .collect(),
+            memory_accesses_by_op: certificates.memory_accesses_by_op.clone(),
+            member_accesses_by_op: BTreeMap::new(),
+            array_accesses_by_op: BTreeMap::new(),
+            returns_by_op: certificates
+                .returns
+                .iter()
+                .map(|cert| {
+                    (
+                        (cert.block_addr, cert.op_index),
+                        r2types::ReturnValueRenderFact {
+                            block_addr: cert.block_addr,
+                            op_index: cert.op_index,
+                            value: cert.value,
+                            width: cert.width,
+                        },
+                    )
+                })
+                .collect(),
+            stack_slot_offsets: certificates
+                .stack_slots
+                .iter()
+                .map(|(object, cert)| (*object, cert.offset))
+                .collect(),
+        }
+    }
+
+    struct TestMemberRenderFact<'a> {
+        block_addr: u64,
+        op_index: usize,
+        is_write: bool,
+        field_name: &'a str,
+        field_offset: u64,
+        access_width: u32,
+    }
+
+    struct TestArrayRenderFact {
+        block_addr: u64,
+        op_index: usize,
+        is_write: bool,
+        field_offset: u64,
+        element_stride: u64,
+        access_width: u32,
+    }
+
+    fn add_member_render_fact(
+        function_facts: &mut FunctionFacts,
+        prepared: &r2ssa::SsaArtifact,
+        fact: TestMemberRenderFact<'_>,
+    ) {
+        let cert = prepared
+            .memory_certificate_for_op_site(fact.block_addr, fact.op_index, fact.is_write)
+            .expect("prepared memory certificate for member render fact");
+        function_facts
+            .__test_render_facts_mut()
+            .member_accesses_by_op
+            .entry((fact.block_addr, fact.op_index, fact.is_write))
+            .or_default()
+            .push(r2types::MemberAccessRenderFact {
+                access: cert.access,
+                block_addr: fact.block_addr,
+                op_index: fact.op_index,
+                object: cert.object,
+                is_write: fact.is_write,
+                field_offset: fact.field_offset,
+                field_name: fact.field_name.to_string(),
+                access_width: fact.access_width,
+            });
+    }
+
+    fn add_array_render_fact(
+        function_facts: &mut FunctionFacts,
+        prepared: &r2ssa::SsaArtifact,
+        fact: TestArrayRenderFact,
+    ) {
+        let cert = prepared
+            .memory_certificate_for_op_site(fact.block_addr, fact.op_index, fact.is_write)
+            .expect("prepared memory certificate for array render fact");
+        function_facts
+            .__test_render_facts_mut()
+            .array_accesses_by_op
+            .entry((fact.block_addr, fact.op_index, fact.is_write))
+            .or_default()
+            .push(r2types::ArrayAccessRenderFact {
+                access: cert.access,
+                block_addr: fact.block_addr,
+                op_index: fact.op_index,
+                object: cert.object,
+                is_write: fact.is_write,
+                field_offset: fact.field_offset,
+                element_stride: fact.element_stride,
+                access_width: fact.access_width,
+            });
     }
 
     fn test_arch_for_decompile() -> ArchSpec {
@@ -6377,6 +6757,7 @@ mod tests {
             &[],
             &register_params,
             &["rdi".to_string(), "rsi".to_string()],
+            true,
         );
 
         assert_eq!(aliases.get("rdi").map(String::as_str), Some("arr"));
@@ -6429,6 +6810,16 @@ mod tests {
         }
     }
 
+    fn straightline_cfg_summary() -> r2ssa::CFGRiskSummary {
+        r2ssa::CFGRiskSummary {
+            block_count: 1,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        }
+    }
+
     #[test]
     fn looped_standard_output_refuses_loop_cfg_without_rendered_loop_structure() {
         let func = CFunction::new("loop_fold", CType::u64()).with_body(vec![CStmt::Return(Some(
@@ -6454,7 +6845,7 @@ mod tests {
     #[test]
     fn standard_structured_output_requires_prepared_control_certificates() {
         let func = CFunction::new("loop_fold", CType::u64());
-        let reason = certifying_render_residual_reason(None, &loop_cfg_summary(), &func)
+        let reason = certifying_render_residual_reason(None, None, &loop_cfg_summary(), &func)
             .expect("missing certificates should refuse loop rendering");
 
         assert!(
@@ -6480,6 +6871,7 @@ mod tests {
 
         let reason = structured_control_residual_reason_for_counts(
             Some(ControlRenderCounts {
+                branches: 0,
                 loops: 1,
                 switches: 0,
             }),
@@ -6501,6 +6893,7 @@ mod tests {
 
         let reason = structured_control_residual_reason_for_counts(
             Some(ControlRenderCounts {
+                branches: 0,
                 loops: 0,
                 switches: 1,
             }),
@@ -6538,6 +6931,7 @@ mod tests {
 
         let reason = structured_control_residual_reason_for_counts(
             Some(ControlRenderCounts {
+                branches: 0,
                 loops: 0,
                 switches: 1,
             }),
@@ -6548,6 +6942,496 @@ mod tests {
 
         assert!(
             reason.contains("rendered 2 switch construct(s) with only 1 SwitchCertificate(s)"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn standard_structured_output_refuses_branch_without_function_facts_predicate() {
+        let func = CFunction::new("spurious_if", CType::u64()).with_body(vec![CStmt::if_stmt(
+            CExpr::var("cond"),
+            CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
+            None,
+        )]);
+        let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
+            loops: Vec::new(),
+            switches: Vec::new(),
+        };
+        let cfg = r2ssa::CFGRiskSummary {
+            block_count: 2,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(&func, Some(&[]));
+
+        let reason = structured_control_residual_reason_for_nodes(
+            Some(&inventory),
+            &cfg,
+            &nodes,
+            &proof_failures,
+        )
+        .expect("rendered if without FunctionFacts branch proof must residualize");
+
+        assert!(reason.contains("branch node stmt:0"), "{reason}");
+        assert!(reason.contains("lacks render proof identity"), "{reason}");
+        assert!(
+            reason.contains("with only 0 FunctionFacts branch predicate"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn standard_structured_output_accepts_exact_function_facts_branch_predicate() {
+        let func = CFunction::new("certified_if", CType::u64()).with_body(vec![CStmt::if_stmt(
+            CExpr::var("cond"),
+            CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
+            None,
+        )]);
+        let inventory = ControlCertificateInventory {
+            branches: vec![BranchCertificateSummary {
+                anchor: 0x401000,
+                proof_node: "FunctionFacts.branch_predicate:PredicateId(7)".to_string(),
+                condition: r2ssa::PredicateId(7),
+                condition_value: r2ssa::ValueId(11),
+                true_target: 0x401010,
+                false_target: 0x401020,
+            }],
+            loops: Vec::new(),
+            switches: Vec::new(),
+        };
+        let cfg = r2ssa::CFGRiskSummary {
+            block_count: 3,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Branch,
+                anchor: 0x401000,
+                branch_condition: Some(r2ssa::PredicateId(7)),
+                branch_condition_value: Some(r2ssa::ValueId(11)),
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            }]),
+        );
+
+        let reason = structured_control_residual_reason_for_nodes(
+            Some(&inventory),
+            &cfg,
+            &nodes,
+            &proof_failures,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn standard_structured_output_refuses_branch_predicate_value_mismatch() {
+        let func =
+            CFunction::new("bad_if_predicate", CType::u64()).with_body(vec![CStmt::if_stmt(
+                CExpr::var("cond"),
+                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
+                None,
+            )]);
+        let inventory = ControlCertificateInventory {
+            branches: vec![BranchCertificateSummary {
+                anchor: 0x401000,
+                proof_node: "FunctionFacts.branch_predicate:PredicateId(7)".to_string(),
+                condition: r2ssa::PredicateId(7),
+                condition_value: r2ssa::ValueId(11),
+                true_target: 0x401010,
+                false_target: 0x401020,
+            }],
+            loops: Vec::new(),
+            switches: Vec::new(),
+        };
+        let cfg = r2ssa::CFGRiskSummary {
+            block_count: 3,
+            loop_count: 0,
+            back_edge_count: 0,
+            switch_block_count: 0,
+            max_switch_cases: 0,
+        };
+        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Branch,
+                anchor: 0x401000,
+                branch_condition: Some(r2ssa::PredicateId(8)),
+                branch_condition_value: Some(r2ssa::ValueId(12)),
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            }]),
+        );
+
+        let reason = structured_control_residual_reason_for_nodes(
+            Some(&inventory),
+            &cfg,
+            &nodes,
+            &proof_failures,
+        )
+        .expect("branch predicate mismatch must residualize");
+
+        assert!(reason.contains("branch node stmt:0"), "{reason}");
+        assert!(
+            reason.contains("predicate proof Some(PredicateId(8))"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("condition value proof Some(ValueId(12))"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn standard_structured_output_refuses_loop_without_function_facts_loop_structure() {
+        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
+        let func =
+            CFunction::new("uncertified_loop", CType::u64()).with_body(vec![CStmt::while_loop(
+                CExpr::var("cond"),
+                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
+            )]);
+        let (nodes, proof_failures) = function_control_render_nodes_with_proofs(
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Loop,
+                anchor: 0x401000,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: Some(r2ssa::PredicateId(1)),
+                loop_condition_value: Some(r2ssa::ValueId(10)),
+                loop_body_blocks: vec![0x401000, 0x401010],
+                loop_latches: vec![0x401010],
+                loop_exits: vec![0x401020],
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            }]),
+        );
+        let inventory = control_certificate_inventory(None);
+
+        let direct_reason = structured_control_residual_reason_for_nodes(
+            Some(&inventory),
+            &loop_cfg_summary(),
+            &nodes,
+            &proof_failures,
+        )
+        .expect("rendered loop without FunctionFacts loop proof must residualize");
+        let route_reason = certifying_render_residual_reason_with_proofs(
+            Some(&prepared),
+            None,
+            &loop_cfg_summary(),
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Loop,
+                anchor: 0x401000,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: Some(r2ssa::PredicateId(1)),
+                loop_condition_value: Some(r2ssa::ValueId(10)),
+                loop_body_blocks: vec![0x401000, 0x401010],
+                loop_latches: vec![0x401010],
+                loop_exits: vec![0x401020],
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            }]),
+        )
+        .expect("certified route must not recover loop proof from prepared SSA side channels");
+
+        assert!(
+            direct_reason.contains("with only 0 LoopCertificate"),
+            "{direct_reason}"
+        );
+        assert!(
+            route_reason.contains("with only 0 LoopCertificate"),
+            "{route_reason}"
+        );
+    }
+
+    #[test]
+    fn standard_structured_output_accepts_exact_function_facts_loop_structure() {
+        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
+        let func =
+            CFunction::new("certified_loop", CType::u64()).with_body(vec![CStmt::while_loop(
+                CExpr::var("cond"),
+                CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
+            )]);
+        let control = r2types::FunctionControlFacts {
+            loops: BTreeMap::from([(
+                r2ssa::LoopId(1),
+                r2types::LoopStructureFact {
+                    loop_id: r2ssa::LoopId(1),
+                    proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(1))
+                        .to_string(),
+                    header: 0x401000,
+                    condition: Some(r2ssa::PredicateId(1)),
+                    condition_value: Some(r2ssa::ValueId(10)),
+                    body: vec![0x401000, 0x401010],
+                    latches: vec![0x401010],
+                    exits: vec![0x401020],
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        };
+
+        let reason = certifying_render_residual_reason_with_proofs(
+            Some(&prepared),
+            Some(&control),
+            &loop_cfg_summary(),
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Loop,
+                anchor: 0x401000,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: Some(r2ssa::PredicateId(1)),
+                loop_condition_value: Some(r2ssa::ValueId(10)),
+                loop_body_blocks: vec![0x401000, 0x401010],
+                loop_latches: vec![0x401010],
+                loop_exits: vec![0x401020],
+                switch_selector: None,
+                switch_cases: Vec::new(),
+                switch_default: None,
+            }]),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn standard_structured_output_refuses_switch_without_function_facts_selector() {
+        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
+        let func =
+            CFunction::new("uncertified_switch", CType::u64()).with_body(vec![CStmt::Switch {
+                expr: CExpr::var("sel"),
+                cases: vec![ast::SwitchCase {
+                    value: CExpr::uint(0),
+                    body: vec![CStmt::Break],
+                }],
+                default: None,
+            }]);
+
+        let reason = certifying_render_residual_reason_with_proofs(
+            Some(&prepared),
+            None,
+            &switch_cfg_summary(),
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Switch,
+                anchor: 0x401020,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: Some(r2ssa::ValueId(7)),
+                switch_cases: vec![(0, 0x401100)],
+                switch_default: None,
+            }]),
+        )
+        .expect("rendered switch without FunctionFacts selector proof must residualize");
+
+        assert!(reason.contains("with only 0 SwitchCertificate"), "{reason}");
+    }
+
+    #[test]
+    fn standard_structured_output_accepts_exact_function_facts_switch_selector() {
+        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
+        let func =
+            CFunction::new("certified_switch", CType::u64()).with_body(vec![CStmt::Switch {
+                expr: CExpr::var("sel"),
+                cases: vec![ast::SwitchCase {
+                    value: CExpr::uint(0),
+                    body: vec![CStmt::Return(Some(CExpr::uint(0)))],
+                }],
+                default: None,
+            }]);
+        let control = r2types::FunctionControlFacts {
+            switches: BTreeMap::from([(
+                0x401020,
+                r2types::SwitchSelectorFact {
+                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
+                    block_addr: 0x401020,
+                    selector: Some(r2ssa::ValueId(7)),
+                    cases: vec![(0, 0x401100)],
+                    default: None,
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        };
+
+        let reason = certifying_render_residual_reason_with_proofs(
+            Some(&prepared),
+            Some(&control),
+            &switch_cfg_summary(),
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Switch,
+                anchor: 0x401020,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: Some(r2ssa::ValueId(7)),
+                switch_cases: vec![(0, 0x401100)],
+                switch_default: None,
+            }]),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn standard_structured_output_refuses_unproved_switch_case_break() {
+        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
+        let control = r2types::FunctionControlFacts {
+            switches: BTreeMap::from([(
+                0x401020,
+                r2types::SwitchSelectorFact {
+                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
+                    block_addr: 0x401020,
+                    selector: Some(r2ssa::ValueId(7)),
+                    cases: vec![(0, 0x401100)],
+                    default: None,
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        };
+        let func = CFunction::new("case_break", CType::u64()).with_body(vec![CStmt::Switch {
+            expr: CExpr::var("sel"),
+            cases: vec![ast::SwitchCase {
+                value: CExpr::uint(0),
+                body: vec![CStmt::Break],
+            }],
+            default: None,
+        }]);
+
+        let reason = certifying_render_residual_reason_with_proofs(
+            Some(&prepared),
+            Some(&control),
+            &switch_cfg_summary(),
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Switch,
+                anchor: 0x401020,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: Some(r2ssa::ValueId(7)),
+                switch_cases: vec![(0, 0x401100)],
+                switch_default: None,
+            }]),
+        )
+        .expect("case break without case-exit proof must residualize");
+
+        assert!(
+            reason.contains("unproved control transfer break"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn standard_structured_output_refuses_unproved_continue_and_goto() {
+        for (stmt, expected) in [
+            (CStmt::Continue, "unproved control transfer continue"),
+            (
+                CStmt::Goto("block_401000".to_string()),
+                "unproved control transfer goto",
+            ),
+        ] {
+            let func = CFunction::new("unproved_transfer", CType::u64()).with_body(vec![stmt]);
+
+            let reason = certifying_render_residual_reason_with_proofs(
+                None,
+                None,
+                &straightline_cfg_summary(),
+                &func,
+                Some(&[]),
+            )
+            .expect("unproved control transfer must residualize");
+
+            assert!(reason.contains(expected), "{reason}");
+        }
+    }
+
+    #[test]
+    fn standard_structured_output_refuses_implicit_switch_case_fallthrough() {
+        let prepared = prepared_from_ops(Vec::new(), &test_arch_for_decompile());
+        let control = r2types::FunctionControlFacts {
+            switches: BTreeMap::from([(
+                0x401020,
+                r2types::SwitchSelectorFact {
+                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x401020).to_string(),
+                    block_addr: 0x401020,
+                    selector: Some(r2ssa::ValueId(7)),
+                    cases: vec![(0, 0x401100)],
+                    default: None,
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        };
+        let func =
+            CFunction::new("case_fallthrough", CType::u64()).with_body(vec![CStmt::Switch {
+                expr: CExpr::var("sel"),
+                cases: vec![ast::SwitchCase {
+                    value: CExpr::uint(0),
+                    body: vec![CStmt::expr(CExpr::assign(CExpr::var("x"), CExpr::uint(1)))],
+                }],
+                default: None,
+            }]);
+
+        let reason = certifying_render_residual_reason_with_proofs(
+            Some(&prepared),
+            Some(&control),
+            &switch_cfg_summary(),
+            &func,
+            Some(&[ControlRenderProof {
+                kind: ControlRenderProofKind::Switch,
+                anchor: 0x401020,
+                branch_condition: None,
+                branch_condition_value: None,
+                loop_condition: None,
+                loop_condition_value: None,
+                loop_body_blocks: Vec::new(),
+                loop_latches: Vec::new(),
+                loop_exits: Vec::new(),
+                switch_selector: Some(r2ssa::ValueId(7)),
+                switch_cases: vec![(0, 0x401100)],
+                switch_default: None,
+            }]),
+        )
+        .expect("implicit switch fallthrough without exact case-exit proof must residualize");
+
+        assert!(
+            reason.contains("unproved switch case fallthrough"),
             "{reason}"
         );
     }
@@ -6570,6 +7454,7 @@ mod tests {
                 default: Some(vec![CStmt::Break]),
             }]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: Vec::new(),
             switches: vec![SwitchCertificateSummary {
                 anchor: 0x401020,
@@ -6622,6 +7507,7 @@ mod tests {
                 default: None,
             }]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: Vec::new(),
             switches: vec![SwitchCertificateSummary {
                 anchor: 0x401020,
@@ -6673,6 +7559,7 @@ mod tests {
                 default: None,
             }]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: Vec::new(),
             switches: vec![SwitchCertificateSummary {
                 anchor: 0x401020,
@@ -6690,6 +7577,8 @@ mod tests {
             Some(&[ControlRenderProof {
                 kind: ControlRenderProofKind::Switch,
                 anchor: 0x401020,
+                branch_condition: None,
+                branch_condition_value: None,
                 loop_condition: None,
                 loop_condition_value: None,
                 loop_body_blocks: Vec::new(),
@@ -6733,6 +7622,7 @@ mod tests {
                 default: None,
             }]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: Vec::new(),
             switches: vec![SwitchCertificateSummary {
                 anchor: 0x401020,
@@ -6785,6 +7675,7 @@ mod tests {
             },
         ]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: Vec::new(),
             switches: vec![SwitchCertificateSummary {
                 anchor: 0x401020,
@@ -6802,6 +7693,8 @@ mod tests {
             Some(&[ControlRenderProof {
                 kind: ControlRenderProofKind::Switch,
                 anchor: 0x401020,
+                branch_condition: None,
+                branch_condition_value: None,
                 loop_condition: None,
                 loop_condition_value: None,
                 loop_body_blocks: Vec::new(),
@@ -6837,6 +7730,7 @@ mod tests {
                 CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
             )]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: vec![LoopCertificateSummary {
                 anchor: 0x401000,
                 proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
@@ -6879,6 +7773,7 @@ mod tests {
                 CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
             )]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: vec![LoopCertificateSummary {
                 anchor: 0x401000,
                 proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
@@ -6897,6 +7792,8 @@ mod tests {
             Some(&[ControlRenderProof {
                 kind: ControlRenderProofKind::Loop,
                 anchor: 0x401000,
+                branch_condition: None,
+                branch_condition_value: None,
                 loop_condition: Some(r2ssa::PredicateId(1)),
                 loop_condition_value: Some(r2ssa::ValueId(10)),
                 loop_body_blocks: vec![0x401000, 0x401018],
@@ -6930,6 +7827,7 @@ mod tests {
                 CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
             )]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: vec![LoopCertificateSummary {
                 anchor: 0x401000,
                 proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
@@ -6948,6 +7846,8 @@ mod tests {
             Some(&[ControlRenderProof {
                 kind: ControlRenderProofKind::Loop,
                 anchor: 0x401000,
+                branch_condition: None,
+                branch_condition_value: None,
                 loop_condition: Some(r2ssa::PredicateId(2)),
                 loop_condition_value: Some(r2ssa::ValueId(10)),
                 loop_body_blocks: vec![0x401000, 0x401010],
@@ -6987,6 +7887,7 @@ mod tests {
             ),
         ]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: vec![LoopCertificateSummary {
                 anchor: 0x401000,
                 proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
@@ -7005,6 +7906,8 @@ mod tests {
             Some(&[ControlRenderProof {
                 kind: ControlRenderProofKind::Loop,
                 anchor: 0x401000,
+                branch_condition: None,
+                branch_condition_value: None,
                 loop_condition: Some(r2ssa::PredicateId(1)),
                 loop_condition_value: Some(r2ssa::ValueId(11)),
                 loop_body_blocks: vec![0x401000, 0x401010],
@@ -7043,6 +7946,7 @@ mod tests {
                 CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
             )]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: vec![LoopCertificateSummary {
                 anchor: 0x401000,
                 proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
@@ -7086,6 +7990,7 @@ mod tests {
                 CStmt::expr(CExpr::assign(CExpr::var("acc"), CExpr::uint(1))),
             )]);
         let inventory = ControlCertificateInventory {
+            branches: Vec::new(),
             loops: vec![LoopCertificateSummary {
                 anchor: 0x401000,
                 proof_node: r2ssa::ProofNodeId::loop_certificate(0x401000, r2ssa::LoopId(0))
@@ -7386,7 +8291,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_external_signature_does_not_shrink_richer_recovered_header_params() {
+    fn generic_external_signature_still_owns_header_arity() {
         let recovered = vec![
             ast::CParam {
                 ty: CType::Int(32),
@@ -7406,10 +8311,13 @@ mod tests {
         let params = merge_params_with_external_signature(recovered, Some(&signature));
         assert_eq!(
             params.len(),
-            3,
-            "generic external signature should not hide richer recovered params"
+            2,
+            "certified signature arity must be the visible header authority even when generic"
         );
-        assert_eq!(params[2].name, "arg3");
+        assert!(
+            params.iter().all(|param| param.name != "arg3"),
+            "local recovery must not append surplus header params beyond FunctionFacts signature"
+        );
     }
 
     #[test]
@@ -7431,7 +8339,7 @@ mod tests {
     #[test]
     fn decompile_is_stable_with_external_param_names_and_local_order() {
         let arch = test_arch_for_decompile();
-        let func = ssa_from_ops(
+        let prepared = prepared_from_ops(
             vec![
                 R2ILOp::Load {
                     dst: Varnode::unique(0x10, 8),
@@ -7465,7 +8373,6 @@ mod tests {
             &arch,
         );
 
-        let mut decompiler = Decompiler::new(DecompilerConfig::x86_64());
         let signature = signature_spec(
             Some(CType::Int(64)),
             vec![
@@ -7473,16 +8380,21 @@ mod tests {
                 ("aaa_second", Some(CType::Int(64))),
             ],
         );
-        decompiler.set_type_facts(FunctionTypeFacts {
-            signature_certificate: external_signature_certificate(&signature),
-            merged_signature: Some(signature),
-            ..FunctionTypeFacts::default()
-        });
+        let input = prepared_standard_input_with_type_facts(
+            prepared,
+            FunctionTypeFacts {
+                signature_certificate: external_signature_certificate(&signature),
+                merged_signature: Some(signature),
+                ..FunctionTypeFacts::default()
+            },
+            "prepared stability test route",
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
 
-        let built_first = decompiler.build_function(&func);
-        let built_second = decompiler.build_function(&func);
-        let first = decompiler.decompile(&func);
-        let second = decompiler.decompile(&func);
+        let built_first = decompiler.build_function_from_input(&input);
+        let built_second = decompiler.build_function_from_input(&input);
+        let first = decompiler.decompile_input(&input);
+        let second = decompiler.decompile_input(&input);
 
         assert_eq!(first, second, "decompiled text should be byte-stable");
         assert!(first.contains("stable_demo(int64_t zzz_first, int64_t aaa_second)"));
@@ -7510,9 +8422,9 @@ mod tests {
     }
 
     #[test]
-    fn decompile_is_stable_for_predicate_heavy_return() {
+    fn decompile_residual_for_predicate_heavy_return_without_complete_render_proof_is_stable() {
         let arch = test_arch_for_decompile();
-        let func = ssa_from_ops(
+        let prepared = prepared_from_ops(
             vec![
                 R2ILOp::IntSub {
                     dst: Varnode::unique(0x20, 4),
@@ -7538,54 +8450,45 @@ mod tests {
             ],
             &arch,
         );
-
+        let signature = signature_spec(Some(CType::Int(32)), vec![("arg1", Some(CType::Int(64)))]);
+        let input = prepared_standard_input_with_type_facts(
+            prepared,
+            FunctionTypeFacts {
+                signature_certificate: external_signature_certificate(&signature),
+                merged_signature: Some(signature),
+                ..FunctionTypeFacts::default()
+            },
+            "prepared predicate-heavy builder stability route",
+        );
         let decompiler = Decompiler::new(DecompilerConfig::x86_64());
-        let built_first = decompiler.build_function(&func);
-        let built_second = decompiler.build_function(&func);
-        let first = decompiler.decompile(&func);
-        let second = decompiler.decompile(&func);
+        let built_first = decompiler.build_function_from_input(&input);
+        let built_second = decompiler.build_function_from_input(&input);
+        let first = decompiler.decompile_input(&input);
+        let second = decompiler.decompile_input(&input);
 
         assert_eq!(first, second, "predicate-heavy text should be byte-stable");
         assert_eq!(
             built_first.body, built_second.body,
             "predicate-heavy AST should be stable across builds"
         );
-        let return_expr = built_first
-            .body
-            .iter()
-            .find_map(|stmt| match stmt {
-                CStmt::Return(Some(expr)) => Some(expr),
-                _ => None,
-            })
-            .expect("predicate-heavy function should end in a value return");
-        fn peel_predicate_wrapper(expr: &CExpr) -> &CExpr {
-            match expr {
-                CExpr::Cast { expr, .. } | CExpr::Paren(expr) => peel_predicate_wrapper(expr),
-                other => other,
-            }
-        }
-        let predicate = peel_predicate_wrapper(return_expr);
         assert!(
-            matches!(
-                predicate,
-                CExpr::Binary {
-                    op: BinaryOp::Ne,
-                    left,
-                    right,
-                } if matches!(left.as_ref(), CExpr::Var(name) if name == "arg1")
-                    && matches!(right.as_ref(), CExpr::IntLit(19))
-            ),
-            "decompiled predicate should lower to arg1 != 19, got {return_expr:?}"
+            built_first
+                .body
+                .iter()
+                .all(|stmt| !matches!(stmt, CStmt::Return(_))),
+            "incomplete predicate render proof must not emit executable return: {:?}",
+            built_first.body
         );
         assert!(
-            !format!("{:?}", built_first.body).contains("zf_"),
-            "decompiled predicate AST should not leak flag temporaries: {:?}",
+            format!("{:?}", built_first.body).contains("certified render contract failed")
+                && format!("{:?}", built_first.body).contains("summary return unresolved"),
+            "predicate-heavy route should residualize explicitly, got {:?}",
             built_first.body
         );
     }
 
     #[test]
-    fn decompile_input_preserves_function_header_and_emits_stable_output() {
+    fn decompile_input_residualizes_uncertified_header_and_return_memory() {
         let arch = test_arch_for_decompile();
         let ops = vec![
             R2ILOp::Load {
@@ -7602,7 +8505,6 @@ mod tests {
                 target: Varnode::register(0x00, 8),
             },
         ];
-        let func = ssa_from_ops(ops.clone(), &arch);
         let prepared = prepared_from_ops(ops, &arch);
         let type_facts = FunctionTypeFacts {
             merged_signature: Some(signature_spec(
@@ -7626,30 +8528,161 @@ mod tests {
             ));
         let context = DecompilerContext::default().with_function_facts(function_facts);
 
-        let mut legacy = Decompiler::new(DecompilerConfig::x86_64());
-        legacy.set_type_facts(context.type_facts().clone());
         let input = DecompilerInput::new(prepared, context);
         let typed = Decompiler::new(DecompilerConfig::x86_64());
 
-        let legacy_fn = legacy.build_function(&func);
         let typed_fn = typed.build_function_from_input(&input);
         let typed_text = typed.decompile_input(&input);
 
-        assert_eq!(legacy_fn.name, typed_fn.name);
-        assert_eq!(legacy_fn.ret_type, typed_fn.ret_type);
-        assert_eq!(legacy_fn.params, typed_fn.params);
+        assert_eq!(typed_fn.name, "stable_demo");
+        assert_eq!(typed_fn.ret_type, CType::Unknown);
         assert!(typed_text.contains("stable_demo"));
-        assert!(typed_text.contains("return"));
-        assert!(typed_text.contains("arg2"), "{typed_text}");
+        assert!(
+            typed_text.contains(
+                "certified Standard header lacks FunctionTypeFacts render-authorized signature"
+            ),
+            "{typed_text}"
+        );
+        assert!(
+            !typed_text.contains("int64_t stable_demo"),
+            "certified route must not preserve a header from uncertified merged_signature facts:\n{typed_text}"
+        );
+        assert!(
+            !typed_text.contains("\n    return "),
+            "certified route must not render executable return through an uncertified memory load:\n{typed_text}"
+        );
+        assert!(
+            !typed_text.contains("rax_") && !typed_text.contains("rbp"),
+            "residualized certified output must not leak raw carriers:\n{typed_text}"
+        );
+    }
+
+    #[test]
+    fn decompile_input_preserves_render_authorized_header_but_residualizes_uncertified_body() {
+        let arch = test_arch_for_decompile();
+        let ops = vec![
+            R2ILOp::Load {
+                dst: Varnode::unique(0x10, 8),
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x20, 8),
+            },
+            R2ILOp::IntAdd {
+                dst: Varnode::register(0x00, 8),
+                a: Varnode::unique(0x10, 8),
+                b: Varnode::register(0x18, 8),
+            },
+            R2ILOp::Return {
+                target: Varnode::register(0x00, 8),
+            },
+        ];
+        let prepared = prepared_from_ops(ops, &arch);
+        let signature = signature_spec(
+            Some(CType::Int(64)),
+            vec![
+                ("arg1", Some(CType::Int(64))),
+                ("arg2", Some(CType::Int(64))),
+            ],
+        );
+        let type_facts = FunctionTypeFacts {
+            signature_certificate: external_signature_certificate(&signature),
+            merged_signature: Some(signature),
+            ..FunctionTypeFacts::default()
+        };
+        let function_facts =
+            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
+                r2types::DecompileRouteKind::Standard,
+                "test-certified standard route",
+                None,
+                r2sym::RenderPermission::certified(
+                    r2sym::ProofOwner::R2engine,
+                    "test-certified standard route",
+                ),
+            ));
+        let context = DecompilerContext::default().with_function_facts(function_facts);
+        let input = DecompilerInput::new(prepared, context);
+        let typed = Decompiler::new(DecompilerConfig::x86_64());
+
+        let typed_fn = typed.build_function_from_input(&input);
+        let typed_text = typed.decompile_input(&input);
+
+        assert_eq!(typed_fn.ret_type, CType::Int(64));
+        assert_eq!(typed_fn.params.len(), 2);
+        assert_eq!(typed_fn.params[0].name, "arg1");
+        assert_eq!(typed_fn.params[1].name, "arg2");
+        assert!(
+            typed_text.contains("int64_t stable_demo(int64_t arg1, int64_t arg2)"),
+            "render-authorized signature should own the certified header, got:\n{typed_text}"
+        );
+        assert!(
+            typed_text.contains("certified render contract failed")
+                || typed_text.contains("uncertified return expression"),
+            "body must still residualize without effect proof, got:\n{typed_text}"
+        );
+        assert!(
+            !typed_text.contains("\n    return "),
+            "certified route must not render executable return through an uncertified memory load:\n{typed_text}"
+        );
+    }
+
+    #[test]
+    fn decompile_input_residualizes_render_authorized_header_with_unknown_param_type() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let signature = signature_spec(
+            Some(CType::Int(64)),
+            vec![("arg1", Some(CType::Int(64))), ("arg2", None)],
+        );
+        let type_facts = FunctionTypeFacts {
+            signature_certificate: external_signature_certificate(&signature),
+            merged_signature: Some(signature),
+            ..FunctionTypeFacts::default()
+        };
+        let function_facts =
+            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
+                r2types::DecompileRouteKind::Standard,
+                "test-certified standard route",
+                None,
+                r2sym::RenderPermission::certified(
+                    r2sym::ProofOwner::R2engine,
+                    "test-certified standard route",
+                ),
+            ));
+        let input = DecompilerInput::new(
+            prepared,
+            DecompilerContext::default().with_function_facts(function_facts),
+        );
+
+        let typed_text = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+
+        assert!(
+            typed_text.contains("certified Standard header has incomplete FunctionTypeFacts render-authorized parameter types"),
+            "{typed_text}"
+        );
+        assert!(
+            !typed_text.contains("stable_demo(int64_t arg1, unknown_t arg2)"),
+            "certified Standard must residualize incomplete render-authorized signatures:\n{typed_text}"
+        );
     }
 
     #[test]
     fn decompile_input_without_route_facts_residualizes() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x10, 4),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::unique(0x10, 4),
+                },
+            ],
             &arch,
         );
         let input = DecompilerInput::new(prepared, DecompilerContext::default());
@@ -7667,12 +8700,44 @@ mod tests {
     }
 
     #[test]
-    fn decompile_input_honors_engine_selected_route() {
+    fn build_function_from_input_without_route_facts_residualizes_ast() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
                 target: Varnode::constant(0, 8),
             }],
+            &arch,
+        );
+        let input = DecompilerInput::new(prepared, DecompilerContext::default());
+
+        let func = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
+
+        assert!(
+            func.body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Comment(text) if text.contains("missing FunctionFacts::decompile_route"))),
+            "missing route facts must produce an explicit residual AST, got {func:?}"
+        );
+        assert!(
+            !func.body.iter().any(summary_stmt_contains_return),
+            "missing route facts must not render executable return AST, got {func:?}"
+        );
+    }
+
+    #[test]
+    fn decompile_input_honors_engine_selected_route() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x10, 4),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::unique(0x10, 4),
+                },
+            ],
             &arch,
         );
         let function_facts = FunctionFacts::default().with_decompile_route(test_decompile_route(
@@ -7716,13 +8781,77 @@ mod tests {
     }
 
     #[test]
+    fn public_summary_renderer_requires_function_facts_route_permission() {
+        let semantic_artifact = large_cfg_worker_artifact(
+            r2sym::RefinementStage::Residual,
+            vec![r2sym::ResidualReason::LargeCfg],
+            Vec::new(),
+        );
+        let function_facts =
+            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact));
+
+        assert!(
+            super::render_semantic_worker_summary(
+                "sym.worker",
+                &function_facts,
+                DecompilerConfig::default(),
+            )
+            .is_none(),
+            "summary rendering must not infer route permission from semantics alone"
+        );
+
+        let certified_route_facts =
+            function_facts
+                .clone()
+                .with_decompile_route(test_decompile_route(
+                    r2types::DecompileRouteKind::LinearWorker,
+                    "wrong permission for summary route",
+                    None,
+                    r2sym::RenderPermission::certified(
+                        r2sym::ProofOwner::R2engine,
+                        "wrong permission for summary route",
+                    ),
+                ));
+        assert!(
+            super::render_semantic_worker_summary(
+                "sym.worker",
+                &certified_route_facts,
+                DecompilerConfig::default(),
+            )
+            .is_none(),
+            "summary rendering must require summary-comment permission, not only a route kind"
+        );
+
+        let summary_route_facts = function_facts.with_decompile_route(test_decompile_route(
+            r2types::DecompileRouteKind::LinearWorker,
+            "engine-selected summary route",
+            None,
+            r2sym::RenderPermission::summary(
+                r2sym::ProofOwner::R2engine,
+                "engine-selected summary route",
+            ),
+        ));
+        let output = super::render_semantic_worker_summary(
+            "sym.worker",
+            &summary_route_facts,
+            DecompilerConfig::default(),
+        )
+        .expect("facts-owned summary route should render");
+
+        assert!(
+            output.contains("render contract: residual summary only; no certified native C")
+                && !output.contains("return 0;")
+                && !output.contains("switch ("),
+            "facts-owned summary route must remain comment-only, got:\n{output}"
+        );
+    }
+
+    #[test]
     fn decompiler_context_reads_callee_resolution_from_function_facts() {
         let callsite = r2types::CallsiteKey {
             block_addr: 0x401000,
             op_index: 2,
         };
-        let function_names = std::collections::HashMap::from([(0x402000, "sym.helper".into())]);
-        let symbols = std::collections::HashMap::new();
         let identity_key = r2types::CalleeIdentityKey::Named("sym.helper".to_string());
         let mut callee_resolution = r2types::CalleeResolutionFacts::default();
         callee_resolution.by_key.insert(
@@ -7732,13 +8861,7 @@ mod tests {
         callee_resolution.by_callsite.insert(callsite, identity_key);
         let function_facts = FunctionFacts::default().with_callee_resolution(callee_resolution);
 
-        let context = DecompilerContext::from_function_facts(
-            function_facts,
-            function_names,
-            std::collections::HashMap::new(),
-            symbols,
-            64,
-        );
+        let context = DecompilerContext::from_function_facts(function_facts);
 
         assert!(
             context
@@ -7747,6 +8870,20 @@ mod tests {
                 .and_then(|resolution| resolution.identity_for_callsite(callsite))
                 .is_some(),
             "callee resolution must be retained on FunctionFacts"
+        );
+    }
+
+    #[test]
+    fn decompiler_context_does_not_enrich_type_facts_from_names() {
+        let context = DecompilerContext::from_function_facts(FunctionFacts::default());
+
+        assert!(
+            context
+                .function_facts
+                .type_facts()
+                .known_function_signatures
+                .is_empty(),
+            "r2dec must consume FunctionFacts type evidence, not enrich signatures from names locally"
         );
     }
 
@@ -7811,6 +8948,182 @@ mod tests {
     }
 
     #[test]
+    fn build_function_from_input_nonstandard_routes_residualize_ast() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let function_facts = FunctionFacts::default().with_decompile_route(test_decompile_route(
+            r2types::DecompileRouteKind::LinearWorker,
+            "engine-selected summary route",
+            None,
+            r2sym::RenderPermission::summary(
+                r2sym::ProofOwner::R2engine,
+                "engine-selected summary route",
+            ),
+        ));
+        let input = DecompilerInput::new(
+            prepared,
+            DecompilerContext::default().with_function_facts(function_facts),
+        );
+
+        let built = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
+
+        assert!(
+            built
+                .body
+                .iter()
+                .all(|stmt| matches!(stmt, CStmt::Comment(_))),
+            "summary route AST must be comment-only, got {:?}",
+            built.body
+        );
+        assert!(
+            !built
+                .body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "summary route AST must not contain executable returns: {:?}",
+            built.body
+        );
+    }
+
+    #[test]
+    fn build_function_from_input_standard_summary_permission_residualizes_ast() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let function_facts = FunctionFacts::default().with_decompile_route(test_decompile_route(
+            r2types::DecompileRouteKind::Standard,
+            "standard route but summary-only permission",
+            None,
+            r2sym::RenderPermission::summary(
+                r2sym::ProofOwner::R2engine,
+                "standard route but summary-only permission",
+            ),
+        ));
+        let input = DecompilerInput::new(
+            prepared,
+            DecompilerContext::default().with_function_facts(function_facts),
+        );
+
+        let built = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
+
+        assert!(
+            format!("{:?}", built.body).contains("summary-only"),
+            "summary-only permission should explain the residual: {:?}",
+            built.body
+        );
+        assert!(
+            !built
+                .body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "summary-only permission must not produce executable returns: {:?}",
+            built.body
+        );
+        assert!(
+            built.locals.is_empty(),
+            "summary-only permission must fail closed before local recovery: {:?}",
+            built.locals
+        );
+
+        let decompiler =
+            Decompiler::new(DecompilerConfig::x86_64()).with_context(input.context.clone());
+        let route = decompiler
+            .context
+            .function_facts
+            .decompile_route()
+            .expect("test route");
+        let direct_built = decompiler.build_function_internal(
+            input.prepared_ssa.function(),
+            &input.prepared_ssa,
+            route,
+        );
+        assert!(
+            direct_built
+                .body
+                .iter()
+                .all(|stmt| matches!(stmt, CStmt::Comment(_))),
+            "internal Standard path must fail closed before structuring executable C: {:?}",
+            direct_built.body
+        );
+        assert!(
+            direct_built.locals.is_empty(),
+            "internal Standard path must fail closed before local recovery: {:?}",
+            direct_built.locals
+        );
+    }
+
+    #[test]
+    fn decompile_input_standard_certified_summary_only_semantics_residualizes() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let semantic_artifact = test_native_semantic_artifact(
+            r2sym::RefinementStage::Compiled,
+            r2sym::ArtifactGranularity::SummaryOnly,
+            r2sym::SliceClass::Worker,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        let function_facts =
+            FunctionFacts::new(FunctionTypeFacts::default(), Some(semantic_artifact))
+                .with_decompile_route(test_decompile_route(
+                    r2types::DecompileRouteKind::Standard,
+                    "bad standard route over summary-only semantics",
+                    None,
+                    r2sym::RenderPermission::certified(
+                        r2sym::ProofOwner::R2engine,
+                        "bad standard route over summary-only semantics",
+                    ),
+                ));
+        let input = DecompilerInput::new(
+            prepared,
+            DecompilerContext::default().with_function_facts(function_facts),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+
+        let output = decompiler.decompile_input(&input);
+        let built = decompiler.build_function_from_input(&input);
+
+        assert!(
+            output
+                .contains("summary-only semantic artifact cannot authorize Standard executable C"),
+            "summary-only semantics must reject certified Standard output, got:\n{output}"
+        );
+        assert!(
+            !output.contains("return 0;"),
+            "summary-only semantics must not render executable returns, got:\n{output}"
+        );
+        assert!(
+            format!("{:?}", built.body)
+                .contains("summary-only semantic artifact cannot authorize Standard executable C"),
+            "AST boundary should carry the same residual reason, got {:?}",
+            built.body
+        );
+        assert!(
+            !built
+                .body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "summary-only Standard contradiction must not produce executable returns: {:?}",
+            built.body
+        );
+    }
+
+    #[test]
     fn decompile_input_honors_engine_render_permission_residual() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
@@ -7852,7 +9165,7 @@ mod tests {
         );
         let func = CFunction::new("bad_temp", CType::i64())
             .with_body(vec![CStmt::Return(Some(CExpr::var("tmp:_2")))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
             .expect("raw temp should break certified rendering");
@@ -7870,6 +9183,15 @@ mod tests {
             reason.contains("rendered uncertified raw artifact name"),
             "{reason}"
         );
+
+        let func = CFunction::new("bad_value_carrier", CType::i64())
+            .with_body(vec![CStmt::Return(Some(CExpr::var("value_0")))]);
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("generated carrier locals should break certified rendering");
+        assert!(
+            reason.contains("rendered uncertified raw artifact name"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -7883,6 +9205,8 @@ mod tests {
         assert!(is_uncertified_render_var_name("EAX"));
         assert!(is_uncertified_render_var_name("RAX"));
         assert!(is_uncertified_render_var_name("x0"));
+        assert!(is_uncertified_render_var_name("value_0"));
+        assert!(is_uncertified_render_var_name("value_3e480"));
         assert!(!is_uncertified_render_var_name("sha_state"));
 
         let arch = test_arch_for_decompile();
@@ -7892,7 +9216,7 @@ mod tests {
             }],
             &arch,
         );
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let func = CFunction::new("bad_temp_addr", CType::i64())
             .with_body(vec![CStmt::Return(Some(CExpr::var("&TMP:_2")))]);
 
@@ -7916,7 +9240,7 @@ mod tests {
         let func = CFunction::new("bad_reg", CType::i64()).with_body(vec![CStmt::Return(Some(
             CExpr::binary(BinaryOp::Add, CExpr::var("r10_1"), CExpr::var("r8d_2")),
         ))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
             .expect("raw SSA register should break certified rendering");
@@ -7945,7 +9269,7 @@ mod tests {
                 CExpr::var("result"),
                 CExpr::binary(BinaryOp::Add, CExpr::uint(1), CExpr::uint(2)),
             ))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
             &prepared,
@@ -7957,7 +9281,7 @@ mod tests {
 
         assert!(
             reason.contains("pure expression assignment")
-                && reason.contains("ExpressionCertificate")
+                && reason.contains("FunctionRenderFacts expression")
                 && reason.contains("stmt:0.0.1"),
             "{reason}"
         );
@@ -7980,11 +9304,12 @@ mod tests {
                 CExpr::var("result"),
                 CExpr::binary(BinaryOp::Add, CExpr::uint(1), CExpr::uint(2)),
             ))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Expression,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: None,
             address: None,
             value: Some(value),
@@ -8019,11 +9344,12 @@ mod tests {
                 CExpr::binary(BinaryOp::Add, CExpr::uint(1), CExpr::uint(2)),
             ),
         )]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Expression,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: None,
             address: None,
             value: Some(r2ssa::ValueId(999)),
@@ -8041,7 +9367,7 @@ mod tests {
 
         assert!(
             reason.contains("expression proof at 0x1000:0 value Some(ValueId(999))")
-                && reason.contains("ExpressionCertificate"),
+                && reason.contains("FunctionRenderFacts expression"),
             "{reason}"
         );
     }
@@ -8071,11 +9397,12 @@ mod tests {
                 CExpr::binary(BinaryOp::Add, CExpr::var("tmp"), CExpr::uint(3)),
             ),
         )]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Expression,
             block_addr: 0x1000,
             op_idx: 1,
+            call_disposition: None,
             target: None,
             address: None,
             value: Some(first_value),
@@ -8111,13 +9438,16 @@ mod tests {
         let func = CFunction::new("bad_call", CType::Void).with_body(vec![CStmt::expr(
             CExpr::call(CExpr::var("helper"), vec![CExpr::uint(1)]),
         )]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
             .expect("call without callsite cert should break certified rendering");
 
-        assert!(reason.contains("CallsiteCertificate"), "{reason}");
-        assert!(reason.contains("first missing node stmt:0.0"), "{reason}");
+        assert!(
+            reason.contains("missing exact FunctionFacts render proof"),
+            "{reason}"
+        );
+        assert!(reason.contains("rendered calls=1"), "{reason}");
     }
 
     #[test]
@@ -8132,7 +9462,7 @@ mod tests {
         assert_eq!(prepared.certificates().callsites.len(), 1);
         let func = CFunction::new("bad_call", CType::Void)
             .with_body(vec![CStmt::expr(CExpr::call(CExpr::var("helper"), vec![]))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
             &prepared,
@@ -8143,7 +9473,8 @@ mod tests {
         .expect("call without exact emitted proof should break certified rendering");
 
         assert!(
-            reason.contains("rendered 1 call(s) with only 0 rendered CallsiteCertificate proof(s)"),
+            reason
+                .contains("rendered 1 call(s) with only 0 rendered FunctionCallsiteFacts proof(s)"),
             "{reason}"
         );
         assert!(reason.contains("first missing node stmt:0.0"), "{reason}");
@@ -8161,7 +9492,7 @@ mod tests {
         assert_eq!(prepared.certificates().callsites.len(), 1);
         let func = CFunction::new("missing_call", CType::Void)
             .with_body(vec![CStmt::comment("no executable call rendered")]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
             &prepared,
@@ -8172,7 +9503,9 @@ mod tests {
         .expect("missing source call effect should break certified rendering");
 
         assert!(
-            reason.contains("rendered 0 executable call(s) from 1 source CallsiteCertificate(s)")
+            reason.contains(
+                "rendered 0 executable call(s) from 1 source FunctionCallsiteFacts callsite(s)"
+            ) && reason.contains("first missing callsite 0x1000:0")
                 && reason.contains("missing callsite effects must residualize"),
             "{reason}"
         );
@@ -8192,11 +9525,12 @@ mod tests {
             .expect("callsite certificate");
         let func = CFunction::new("call_ok", CType::Void)
             .with_body(vec![CStmt::expr(CExpr::call(CExpr::var("helper"), vec![]))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Call,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: Some(call.target),
             address: None,
             value: None,
@@ -8236,11 +9570,12 @@ mod tests {
         let func = CFunction::new("bad_call_arg", CType::Void).with_body(vec![CStmt::expr(
             CExpr::call(CExpr::var("helper"), vec![CExpr::uint(7)]),
         )]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Call,
             block_addr: 0x1000,
             op_idx: 1,
+            call_disposition: None,
             target: Some(call.target),
             address: None,
             value: None,
@@ -8261,9 +9596,143 @@ mod tests {
             "{reason}"
         );
         assert!(
-            reason.contains("CallsiteCertificate argument values"),
+            reason.contains("FunctionCallsiteFacts argument values"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_address_arithmetic_call_argument() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Call {
+                target: Varnode::constant(0x401000, 8),
+            }],
+            &arch,
+        );
+        let call = prepared
+            .callsite_certificate_for_op(0x1000, 0)
+            .expect("callsite certificate");
+        let func =
+            CFunction::new("bad_call_arg_address_math", CType::Void).with_body(vec![CStmt::expr(
+                CExpr::call(
+                    CExpr::var("helper"),
+                    vec![CExpr::binary(
+                        BinaryOp::Add,
+                        CExpr::uint(0x1000_2000),
+                        CExpr::uint(658),
+                    )],
+                ),
+            )]);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
+        let effect_proofs = [EffectRenderProof {
+            kind: EffectRenderProofKind::Call,
+            block_addr: 0x1000,
+            op_idx: 0,
+            call_disposition: None,
+            target: Some(call.target),
+            address: None,
+            value: None,
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        }];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("address arithmetic call argument must residualize without FunctionFacts proof");
+
+        assert!(
+            reason.contains("raw address-like call argument")
+                && reason.contains("FunctionFacts certificates"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_call_argument_prefix_proof() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Call {
+                target: Varnode::constant(0x401000, 8),
+            }],
+            &arch,
+        );
+        let callsite = r2types::CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let target = r2ssa::ValueId(7);
+        let first_arg = r2ssa::ValueId(11);
+        let second_arg = r2ssa::ValueId(12);
+        let function_facts = FunctionFacts::default()
+            .with_callsites(r2types::FunctionCallsiteFacts {
+                by_callsite: BTreeMap::from([(
+                    callsite,
+                    r2types::CallsiteArgumentFacts {
+                        callsite,
+                        call_site_id: r2ssa::CallSiteId(0),
+                        at: r2ssa::InstId(0),
+                        target,
+                        direct_target: Some(0x401000),
+                        argument_values: vec![
+                            r2types::CallArgumentValueFact {
+                                index: 0,
+                                value: first_arg,
+                            },
+                            r2types::CallArgumentValueFact {
+                                index: 1,
+                                value: second_arg,
+                            },
+                        ],
+                        register_argument_locations: Vec::new(),
+                        stack_argument_locations: Vec::new(),
+                    },
+                )]),
+            })
+            .with_render(r2types::FunctionRenderFacts {
+                expressions: BTreeMap::from([(
+                    first_arg,
+                    r2types::ExpressionRenderFact {
+                        value: first_arg,
+                        defining_inst: None,
+                        width: 64,
+                        renderable: true,
+                    },
+                )]),
+                ..r2types::FunctionRenderFacts::default()
+            });
+        let func = CFunction::new("bad_call_prefix", CType::Void).with_body(vec![CStmt::expr(
+            CExpr::call(CExpr::var("helper"), vec![CExpr::uint(1)]),
+        )]);
+        let effect_proofs = [EffectRenderProof {
+            kind: EffectRenderProofKind::Call,
+            block_addr: callsite.block_addr,
+            op_idx: callsite.op_index,
+            call_disposition: None,
+            target: Some(target),
+            address: None,
+            value: None,
+            values: vec![first_arg],
+            materialized_phi_copy: false,
+        }];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("prefix-only call argument proof must break certified rendering");
+
+        assert!(
+            reason.contains("argument value proof [ValueId(11)]"),
+            "{reason}"
+        );
+        assert!(reason.contains("ValueId(12)"), "{reason}");
     }
 
     #[test]
@@ -8277,11 +9746,12 @@ mod tests {
         );
         let func = CFunction::new("bad_call_target", CType::Void)
             .with_body(vec![CStmt::expr(CExpr::call(CExpr::var("helper"), vec![]))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Call,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: Some(r2ssa::ValueId(999)),
             address: None,
             value: None,
@@ -8301,7 +9771,7 @@ mod tests {
             reason.contains("call proof at 0x1000:0 target proof Some(ValueId(999))"),
             "{reason}"
         );
-        assert!(reason.contains("CallsiteCertificate target"), "{reason}");
+        assert!(reason.contains("FunctionCallsiteFacts target"), "{reason}");
     }
 
     #[test]
@@ -8316,7 +9786,7 @@ mod tests {
         assert_eq!(prepared.certificates().returns.len(), 1);
         let func = CFunction::new("bad_return", CType::i64())
             .with_body(vec![CStmt::Return(Some(CExpr::uint(0)))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
             &prepared,
@@ -8328,7 +9798,7 @@ mod tests {
 
         assert!(
             reason.contains(
-                "rendered 1 value return(s) with only 0 rendered ReturnValueCertificate proof(s)"
+                "rendered 1 value return(s) with only 0 rendered FunctionRenderFacts return proof(s)"
             ),
             "{reason}"
         );
@@ -8349,11 +9819,12 @@ mod tests {
             .expect("return certificate");
         let func = CFunction::new("return_ok", CType::i64())
             .with_body(vec![CStmt::Return(Some(CExpr::uint(0)))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Return,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: None,
             address: None,
             value: Some(cert.value),
@@ -8399,11 +9870,12 @@ mod tests {
         );
         let func = CFunction::new("return_bad_expr", CType::i64())
             .with_body(vec![CStmt::Return(Some(CExpr::Var("opaque".to_string())))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Return,
             block_addr: 0x1000,
             op_idx: 1,
+            call_disposition: None,
             target: None,
             address: None,
             value: Some(cert.value),
@@ -8421,7 +9893,7 @@ mod tests {
 
         assert!(
             reason.contains("return proof at 0x1000:1 value")
-                && reason.contains("lacks renderable ExpressionCertificate"),
+                && reason.contains("lacks renderable FunctionRenderFacts expression"),
             "{reason}"
         );
     }
@@ -8437,11 +9909,12 @@ mod tests {
         );
         let func = CFunction::new("bad_return_value", CType::i64())
             .with_body(vec![CStmt::Return(Some(CExpr::uint(0)))]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::Return,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: None,
             address: None,
             value: Some(r2ssa::ValueId(999)),
@@ -8461,7 +9934,69 @@ mod tests {
             reason.contains("return proof at 0x1000:0 value proof Some(ValueId(999))"),
             "{reason}"
         );
-        assert!(reason.contains("ReturnValueCertificate value"), "{reason}");
+        assert!(
+            reason.contains("FunctionRenderFacts return value"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_second_return_hidden_by_source_return_fact() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Return {
+                    target: Varnode::constant(0, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::constant(1, 8),
+                },
+            ],
+            &arch,
+        );
+        assert_eq!(prepared.certificates().returns.len(), 2);
+        let first = prepared
+            .return_certificate_for_op(0x1000, 0)
+            .expect("first return certificate");
+        let func = CFunction::new("bad_second_return", CType::i64()).with_body(vec![
+            CStmt::Return(Some(CExpr::uint(0))),
+            CStmt::Return(Some(CExpr::uint(1))),
+        ]);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
+        assert_eq!(
+            function_facts
+                .render()
+                .map(|render| render.returns_by_op.len()),
+            Some(2),
+            "fixture must expose two source return facts"
+        );
+        let effect_proofs = [EffectRenderProof {
+            kind: EffectRenderProofKind::Return,
+            block_addr: 0x1000,
+            op_idx: 0,
+            call_disposition: None,
+            target: None,
+            address: None,
+            value: Some(first.value),
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        }];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("unproved second return must break certified rendering");
+
+        assert!(
+            reason.contains(
+                "rendered 2 value return(s) with only 1 rendered FunctionRenderFacts return proof(s)"
+            ),
+            "{reason}"
+        );
+        assert!(reason.contains("first missing node stmt:1"), "{reason}");
     }
 
     #[test]
@@ -8479,7 +10014,7 @@ mod tests {
         let func = CFunction::new("bad_memory", CType::Void).with_body(vec![CStmt::expr(
             CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
         )]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
 
         let reason = certified_standard_output_residual_reason_with_effect_proofs(
             &prepared,
@@ -8491,11 +10026,80 @@ mod tests {
 
         assert!(
             reason.contains(
-                "rendered 1 memory-like access(es) with only 0 rendered MemoryAccessCertificate proof(s)"
+                "rendered 1 memory-like access(es) with only 0 rendered FunctionRenderFacts memory proof(s)"
             ),
             "{reason}"
         );
         assert!(reason.contains("first missing node stmt:0.0"), "{reason}");
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_second_memory_access_hidden_by_source_memory_fact() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::register(0x00, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::register(0x08, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x18, 8),
+                },
+            ],
+            &arch,
+        );
+        assert_eq!(prepared.certificates().memory_accesses.len(), 2);
+        let first = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("first memory certificate");
+        let func = CFunction::new("bad_second_memory", CType::Void).with_body(vec![
+            CStmt::expr(CExpr::assign(
+                CExpr::var("x"),
+                CExpr::deref(CExpr::var("p")),
+            )),
+            CStmt::expr(CExpr::assign(
+                CExpr::var("y"),
+                CExpr::deref(CExpr::var("q")),
+            )),
+        ]);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
+        assert_eq!(
+            function_facts
+                .render()
+                .map(|render| render.memory_accesses.len()),
+            Some(2),
+            "fixture must expose two source memory facts"
+        );
+        let effect_proofs = [EffectRenderProof {
+            kind: EffectRenderProofKind::MemoryRead,
+            block_addr: 0x1000,
+            op_idx: 0,
+            call_disposition: None,
+            target: None,
+            address: Some(first.address),
+            value: first.value,
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        }];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("unproved second memory access must break certified rendering");
+
+        assert!(
+            reason.contains(
+                "rendered 2 memory-like access(es) with only 1 rendered FunctionRenderFacts memory proof(s)"
+            ),
+            "{reason}"
+        );
+        assert!(reason.contains("first missing node stmt:1.0.1"), "{reason}");
     }
 
     #[test]
@@ -8512,7 +10116,7 @@ mod tests {
         let func = CFunction::new("memory_ok", CType::Void).with_body(vec![CStmt::expr(
             CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
         )]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let cert = prepared
             .memory_certificate_for_op_site(0x1000, 0, false)
             .expect("memory certificate");
@@ -8520,6 +10124,7 @@ mod tests {
             kind: EffectRenderProofKind::MemoryRead,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: None,
             address: Some(cert.address),
             value: cert.value,
@@ -8535,6 +10140,58 @@ mod tests {
         );
 
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_raw_pointer_arithmetic_deref() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Load {
+                dst: Varnode::register(0x00, 8),
+                space: SpaceId::Ram,
+                addr: Varnode::register(0x10, 8),
+            }],
+            &arch,
+        );
+        let func = CFunction::new("raw_pointer_math", CType::Void).with_body(vec![CStmt::expr(
+            CExpr::assign(
+                CExpr::var("x"),
+                CExpr::deref(CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::var("arr"),
+                    CExpr::binary(BinaryOp::Mul, CExpr::var("idx"), CExpr::int(56)),
+                )),
+            ),
+        )]);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
+        let cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("memory certificate");
+        let effect_proofs = [EffectRenderProof {
+            kind: EffectRenderProofKind::MemoryRead,
+            block_addr: 0x1000,
+            op_idx: 0,
+            call_disposition: None,
+            target: None,
+            address: Some(cert.address),
+            value: cert.value,
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        }];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("raw pointer arithmetic must not replace typed array/member proof");
+
+        assert!(
+            reason.contains("raw pointer-arithmetic dereference")
+                && reason.contains("FunctionFacts certificates"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -8554,11 +10211,12 @@ mod tests {
         let func = CFunction::new("bad_memory_value", CType::Void).with_body(vec![CStmt::expr(
             CExpr::assign(CExpr::var("x"), CExpr::deref(CExpr::var("p"))),
         )]);
-        let function_facts = FunctionFacts::new(FunctionTypeFacts::default(), None);
+        let function_facts = test_function_facts_with_prepared_render(&prepared);
         let effect_proofs = [EffectRenderProof {
             kind: EffectRenderProofKind::MemoryRead,
             block_addr: 0x1000,
             op_idx: 0,
+            call_disposition: None,
             target: None,
             address: Some(r2ssa::ValueId(998)),
             value: cert.value.map(|_| r2ssa::ValueId(999)),
@@ -8585,7 +10243,611 @@ mod tests {
     }
 
     #[test]
+    fn certified_standard_output_rejects_stack_local_with_offset_only_evidence() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(Vec::new(), &arch);
+        let render = FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
+            ..FunctionRenderFacts::default()
+        };
+        let function_facts =
+            FunctionFacts::new(FunctionTypeFacts::default(), None).with_render(render);
+        let mut func = CFunction::new("local_offset_only", CType::Void)
+            .with_body(vec![CStmt::Comment("body".to_string())]);
+        func.locals.push(ast::CLocal {
+            ty: CType::Int(32),
+            name: "buf".to_string(),
+            stack_offset: Some(-8),
+        });
+
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("offset-only stack evidence must not certify a friendly local");
+
+        assert!(
+            reason.contains("local buf at stack offset -8 lacks exact typed StackSlotCertificate"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_accepts_exact_typed_stack_local_identity() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(Vec::new(), &arch);
+        let render = FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
+            ..FunctionRenderFacts::default()
+        };
+        let type_facts = FunctionTypeFacts {
+            stack_slots: BTreeMap::from([(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: 8,
+                },
+                ExternalStackSlotSpec {
+                    name: "buf".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    base: ExternalStackBase::FramePointer,
+                    role: ExternalStackSlotRole::Local,
+                    ..ExternalStackSlotSpec::default()
+                },
+            )]),
+            ..FunctionTypeFacts::default()
+        };
+        let function_facts = FunctionFacts::new(type_facts, None).with_render(render);
+        let mut func = CFunction::new("local_exact", CType::Void)
+            .with_body(vec![CStmt::Comment("body".to_string())]);
+        func.locals.push(ast::CLocal {
+            ty: CType::Int(32),
+            name: "buf".to_string(),
+            stack_offset: Some(-8),
+        });
+
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn certified_standard_output_rejects_stack_local_type_mismatch() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(Vec::new(), &arch);
+        let render = FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
+            ..FunctionRenderFacts::default()
+        };
+        let type_facts = FunctionTypeFacts {
+            stack_slots: BTreeMap::from([(
+                StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: 8,
+                },
+                ExternalStackSlotSpec {
+                    name: "buf".to_string(),
+                    ty: Some(CTypeLike::Int {
+                        bits: 32,
+                        signedness: Signedness::Signed,
+                    }),
+                    base: ExternalStackBase::FramePointer,
+                    role: ExternalStackSlotRole::Local,
+                    ..ExternalStackSlotSpec::default()
+                },
+            )]),
+            ..FunctionTypeFacts::default()
+        };
+        let function_facts = FunctionFacts::new(type_facts, None).with_render(render);
+        let mut func = CFunction::new("local_type_mismatch", CType::Void)
+            .with_body(vec![CStmt::Comment("body".to_string())]);
+        func.locals.push(ast::CLocal {
+            ty: CType::UInt(32),
+            name: "buf".to_string(),
+            stack_offset: Some(-8),
+        });
+
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("renderer-local stack local type must not override FunctionTypeFacts");
+
+        assert!(
+            reason.contains("local buf at stack offset -8 lacks exact typed StackSlotCertificate"),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn certified_standard_output_accepts_type_layout_certified_member_access() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::register(0x00, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 8),
+                },
+            ],
+            &arch,
+        );
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        function_facts.replace_type_facts(FunctionTypeFacts {
+            field_access_certificates: vec![FieldAccessCertificate {
+                slot: 0,
+                field_offset: 0,
+                field_name: "len".to_string(),
+                field_type: Some("uint64_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        });
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 0,
+                is_write: false,
+                field_name: "len",
+                field_offset: 0,
+                access_width: 8,
+            },
+        );
+        let func = CFunction::new("field_ok", CType::i64()).with_body(vec![CStmt::Return(Some(
+            CExpr::Member {
+                base: Box::new(CExpr::var("arg0")),
+                member: "len".to_string(),
+            },
+        ))]);
+        let memory_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("memory certificate");
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 1)
+            .expect("return certificate");
+        let effect_proofs = [
+            EffectRenderProof {
+                kind: EffectRenderProofKind::MemoryRead,
+                block_addr: 0x1000,
+                op_idx: 0,
+                call_disposition: None,
+                target: None,
+                address: Some(memory_cert.address),
+                value: memory_cert.value,
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+            EffectRenderProof {
+                kind: EffectRenderProofKind::Return,
+                block_addr: 0x1000,
+                op_idx: 1,
+                call_disposition: None,
+                target: None,
+                address: None,
+                value: Some(return_cert.value),
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+        ];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_member_fact_without_rendered_memory_proof() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::register(0x00, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 8),
+                },
+            ],
+            &arch,
+        );
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 0,
+                is_write: false,
+                field_name: "len",
+                field_offset: 0,
+                access_width: 8,
+            },
+        );
+        let func =
+            CFunction::new("field_unproved_memory", CType::i64()).with_body(vec![CStmt::Return(
+                Some(CExpr::Member {
+                    base: Box::new(CExpr::var("arg0")),
+                    member: "len".to_string(),
+                }),
+            )]);
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 1)
+            .expect("return certificate");
+        let effect_proofs = [EffectRenderProof {
+            kind: EffectRenderProofKind::Return,
+            block_addr: 0x1000,
+            op_idx: 1,
+            call_disposition: None,
+            target: None,
+            address: None,
+            value: Some(return_cert.value),
+            values: Vec::new(),
+            materialized_phi_copy: false,
+        }];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("member fact without emitted memory proof must not certify final member syntax");
+
+        assert!(
+            reason.contains(
+                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
+            ) && reason.contains("len"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_refuses_member_fact_from_unrendered_op() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::register(0x00, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::register(0x08, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x18, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 8),
+                },
+            ],
+            &arch,
+        );
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 1,
+                is_write: false,
+                field_name: "len",
+                field_offset: 0,
+                access_width: 8,
+            },
+        );
+        let func = CFunction::new("field_wrong_op", CType::i64()).with_body(vec![CStmt::Return(
+            Some(CExpr::Member {
+                base: Box::new(CExpr::var("arg0")),
+                member: "len".to_string(),
+            }),
+        )]);
+        let memory_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("first memory certificate");
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 2)
+            .expect("return certificate");
+        let effect_proofs = [
+            EffectRenderProof {
+                kind: EffectRenderProofKind::MemoryRead,
+                block_addr: 0x1000,
+                op_idx: 0,
+                call_disposition: None,
+                target: None,
+                address: Some(memory_cert.address),
+                value: memory_cert.value,
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+            EffectRenderProof {
+                kind: EffectRenderProofKind::Return,
+                block_addr: 0x1000,
+                op_idx: 2,
+                call_disposition: None,
+                target: None,
+                address: None,
+                value: Some(return_cert.value),
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+        ];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        )
+        .expect("member fact from an unrendered op must not certify final member syntax");
+
+        assert!(
+            reason.contains(
+                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
+            ) && reason.contains("len"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_accepts_multiple_returned_members_with_layout_proofs() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x10, 4),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x20, 4),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x18, 8),
+                },
+                R2ILOp::IntAdd {
+                    dst: Varnode::register(0x00, 4),
+                    a: Varnode::unique(0x10, 4),
+                    b: Varnode::unique(0x20, 4),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 4),
+                },
+            ],
+            &arch,
+        );
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        function_facts.replace_type_facts(FunctionTypeFacts {
+            field_access_certificates: vec![
+                FieldAccessCertificate {
+                    slot: 0,
+                    field_offset: 0,
+                    field_name: "f_0".to_string(),
+                    field_type: Some("int32_t".to_string()),
+                },
+                FieldAccessCertificate {
+                    slot: 0,
+                    field_offset: 0x30,
+                    field_name: "f_30".to_string(),
+                    field_type: Some("int32_t".to_string()),
+                },
+            ],
+            ..FunctionTypeFacts::default()
+        });
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 0,
+                is_write: false,
+                field_name: "f_0",
+                field_offset: 0,
+                access_width: 4,
+            },
+        );
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 1,
+                is_write: false,
+                field_name: "f_30",
+                field_offset: 0x30,
+                access_width: 4,
+            },
+        );
+        let func = CFunction::new("field_pair_ok", CType::i32()).with_body(vec![CStmt::Return(
+            Some(CExpr::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(CExpr::PtrMember {
+                    base: Box::new(CExpr::var("obj")),
+                    member: "f_0".to_string(),
+                }),
+                right: Box::new(CExpr::PtrMember {
+                    base: Box::new(CExpr::var("obj")),
+                    member: "f_30".to_string(),
+                }),
+            }),
+        )]);
+        let first_memory_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("first memory certificate");
+        let second_memory_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 1, false)
+            .expect("second memory certificate");
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 3)
+            .expect("return certificate");
+        let effect_proofs = [
+            EffectRenderProof {
+                kind: EffectRenderProofKind::MemoryRead,
+                block_addr: 0x1000,
+                op_idx: 0,
+                call_disposition: None,
+                target: None,
+                address: Some(first_memory_cert.address),
+                value: first_memory_cert.value,
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+            EffectRenderProof {
+                kind: EffectRenderProofKind::MemoryRead,
+                block_addr: 0x1000,
+                op_idx: 1,
+                call_disposition: None,
+                target: None,
+                address: Some(second_memory_cert.address),
+                value: second_memory_cert.value,
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+            EffectRenderProof {
+                kind: EffectRenderProofKind::Return,
+                block_addr: 0x1000,
+                op_idx: 3,
+                call_disposition: None,
+                target: None,
+                address: None,
+                value: Some(return_cert.value),
+                values: Vec::new(),
+                materialized_phi_copy: false,
+            },
+        ];
+
+        let reason = certified_standard_output_residual_reason_with_effect_proofs(
+            &prepared,
+            &function_facts,
+            &func,
+            Some(&effect_proofs),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn certified_standard_output_rejects_returned_member_missing_layout_proof() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x10, 4),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::unique(0x10, 4),
+                },
+            ],
+            &arch,
+        );
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        function_facts.replace_type_facts(FunctionTypeFacts {
+            field_access_certificates: vec![FieldAccessCertificate {
+                slot: 0,
+                field_offset: 0,
+                field_name: "f_0".to_string(),
+                field_type: Some("int32_t".to_string()),
+            }],
+            ..FunctionTypeFacts::default()
+        });
+        let func =
+            CFunction::new("field_pair_missing", CType::i32()).with_body(vec![CStmt::Return(
+                Some(CExpr::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(CExpr::PtrMember {
+                        base: Box::new(CExpr::var("obj")),
+                        member: "f_0".to_string(),
+                    }),
+                    right: Box::new(CExpr::PtrMember {
+                        base: Box::new(CExpr::var("obj")),
+                        member: "f_30".to_string(),
+                    }),
+                }),
+            )]);
+
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 0,
+                is_write: false,
+                field_name: "f_0",
+                field_offset: 0,
+                access_width: 4,
+            },
+        );
+
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("every returned member must have a FunctionRenderFacts member proof");
+
+        assert!(
+            reason.contains("FunctionRenderFacts member-access proof"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_rejects_external_layout_member_without_field_certificate() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        function_facts.replace_type_facts(FunctionTypeFacts {
+            external_type_db: ExternalTypeDb {
+                structs: [(
+                    "node".to_string(),
+                    ExternalStruct {
+                        name: "node".to_string(),
+                        fields: [(
+                            0,
+                            ExternalField {
+                                name: "len".to_string(),
+                                offset: 0,
+                                ty: Some("uint64_t".to_string()),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..ExternalTypeDb::default()
+            },
+            ..FunctionTypeFacts::default()
+        });
+        let func =
+            CFunction::new("field_external_only", CType::i64()).with_body(vec![CStmt::Return(
+                Some(CExpr::Member {
+                    base: Box::new(CExpr::var("arg0")),
+                    member: "len".to_string(),
+                }),
+            )]);
+
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("external layout alone must not certify executable member syntax");
+
+        assert!(
+            reason.contains(
+                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
+            ) && reason.contains("len"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn certified_standard_output_rejects_member_name_not_in_layout_certificate() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -8605,20 +10867,26 @@ mod tests {
             },
             None,
         );
-        let func = CFunction::new("field_ok", CType::i64()).with_body(vec![CStmt::Return(Some(
+        let func = CFunction::new("field_bad", CType::i64()).with_body(vec![CStmt::Return(Some(
             CExpr::Member {
                 base: Box::new(CExpr::var("arg0")),
-                member: "len".to_string(),
+                member: "capacity".to_string(),
             },
         ))]);
 
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func);
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("mismatched member name must residualize");
 
-        assert_eq!(reason, None);
+        assert!(
+            reason.contains(
+                "rendered 1 field access(es) without FunctionRenderFacts member-access proof"
+            ) && reason.contains("capacity"),
+            "{reason}"
+        );
     }
 
     #[test]
-    fn certified_standard_output_accepts_repeated_array_member_access_with_layout_proof() {
+    fn certified_standard_output_rejects_repeated_array_member_access_without_array_render_proof() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![
@@ -8657,202 +10925,189 @@ mod tests {
                 right: Box::new(indexed_len()),
             }),
         )]);
-        let function_facts = FunctionFacts::new(
-            FunctionTypeFacts {
-                array_index_certificates: vec![ArrayIndexCertificate {
-                    slot: 0,
-                    base: Some(ArrayIndexBase::Param { index: 0 }),
-                    field_offset: 0,
-                    element_stride: 8,
-                }],
-                external_type_db: ExternalTypeDb {
-                    structs: [(
-                        "node".to_string(),
-                        ExternalStruct {
-                            name: "node".to_string(),
-                            fields: [(
-                                0,
-                                ExternalField {
-                                    name: "len".to_string(),
-                                    offset: 0,
-                                    ty: Some("int64_t".to_string()),
-                                },
-                            )]
-                            .into_iter()
-                            .collect(),
-                        },
-                    )]
-                    .into_iter()
-                    .collect(),
-                    ..ExternalTypeDb::default()
-                },
-                ..FunctionTypeFacts::default()
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        function_facts.replace_type_facts(FunctionTypeFacts {
+            array_index_certificates: vec![ArrayIndexCertificate {
+                slot: 0,
+                base: Some(ArrayIndexBase::Param { index: 0 }),
+                field_offset: 0,
+                element_stride: 8,
+            }],
+            field_access_certificates: vec![FieldAccessCertificate {
+                slot: 0,
+                field_offset: 0,
+                field_name: "len".to_string(),
+                field_type: Some("int64_t".to_string()),
+            }],
+            external_type_db: ExternalTypeDb {
+                structs: [(
+                    "node".to_string(),
+                    ExternalStruct {
+                        name: "node".to_string(),
+                        fields: [(
+                            0,
+                            ExternalField {
+                                name: "len".to_string(),
+                                offset: 0,
+                                ty: Some("int64_t".to_string()),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..ExternalTypeDb::default()
             },
-            None,
+            ..FunctionTypeFacts::default()
+        });
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 0,
+                is_write: false,
+                field_name: "len",
+                field_offset: 0,
+                access_width: 8,
+            },
+        );
+        add_member_render_fact(
+            &mut function_facts,
+            &prepared,
+            TestMemberRenderFact {
+                block_addr: 0x1000,
+                op_index: 1,
+                is_write: false,
+                field_name: "len",
+                field_offset: 0,
+                access_width: 8,
+            },
         );
 
-        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func);
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func)
+            .expect("array member syntax must residualize without exact array render proof");
 
-        assert_eq!(reason, None);
+        assert!(
+            reason.contains(
+                "rendered 2 array access(es) without exact FunctionRenderFacts array-access proof"
+            ),
+            "{reason}"
+        );
     }
 
     #[test]
-    fn explicit_external_struct_context_drives_arm64_indexed_member_rendering() {
-        use std::collections::BTreeMap;
-
-        let block = r2ssa::SSABlock {
-            addr: 0x100000e40,
-            size: 96,
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("SP", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:10", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    val: r2ssa::SSAVar::new("X0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
-                    val: r2ssa::SSAVar::new("W1", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 2, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 2, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 2, 8),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("X10", 1, 8),
-                    src: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                },
-                SSAOp::IntMult {
-                    dst: r2ssa::SSAVar::new("X10", 2, 8),
-                    a: r2ssa::SSAVar::new("X10", 1, 8),
-                    b: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                    a: r2ssa::SSAVar::new("X9", 1, 8),
-                    b: r2ssa::SSAVar::new("X10", 2, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X9", 2, 8),
-                    src: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 3, 8),
-                    a: r2ssa::SSAVar::new("X9", 2, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
-                    val: r2ssa::SSAVar::new("W2", 0, 4),
-                },
-                SSAOp::Return {
-                    target: r2ssa::SSAVar::new("X0", 0, 8),
-                },
-            ],
-        };
-
-        let raw = R2ILBlock {
-            addr: block.addr,
-            size: block.size,
-            ops: vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        };
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("sym._test_struct_array_index");
-
-        let struct_name = "sla_struct_explicit_demo".to_string();
-        let mut type_db = ExternalTypeDb::default();
-        type_db.structs.insert(
-            struct_name.clone(),
-            ExternalStruct {
-                name: struct_name.clone(),
-                fields: BTreeMap::from([
-                    (
-                        8,
-                        ExternalField {
-                            name: "third".to_string(),
-                            offset: 8,
-                            ty: Some("int32_t".to_string()),
-                        },
-                    ),
-                    (
-                        0x34,
-                        ExternalField {
-                            name: "fourteenth".to_string(),
-                            offset: 0x34,
-                            ty: Some("int32_t".to_string()),
-                        },
-                    ),
-                ]),
-            },
-        );
-
-        let mut decompiler = Decompiler::new(DecompilerConfig::aarch64());
-        let signature = signature_spec(
-            Some(CType::Int(64)),
+    fn certified_standard_output_residualizes_repeated_array_member_access_without_render_node_identity()
+     {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
             vec![
-                ("arg1", Some(CType::ptr(CType::Struct(struct_name)))),
-                ("arg2", Some(CType::Int(32))),
-                ("arg3", Some(CType::Int(32))),
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x10, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::Load {
+                    dst: Varnode::unique(0x20, 8),
+                    space: SpaceId::Ram,
+                    addr: Varnode::register(0x10, 8),
+                },
+                R2ILOp::IntAdd {
+                    dst: Varnode::register(0x00, 8),
+                    a: Varnode::unique(0x10, 8),
+                    b: Varnode::unique(0x20, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x00, 8),
+                },
             ],
+            &arch,
         );
-        decompiler.set_type_facts(FunctionTypeFacts {
-            signature_certificate: external_signature_certificate(&signature),
-            merged_signature: Some(signature),
-            external_type_db: type_db,
+        let indexed_len = || CExpr::Member {
+            base: Box::new(CExpr::Subscript {
+                base: Box::new(CExpr::var("arr")),
+                index: Box::new(CExpr::var("idx")),
+            }),
+            member: "len".to_string(),
+        };
+        let func = CFunction::new("array_member_ok", CType::i64()).with_body(vec![CStmt::Return(
+            Some(CExpr::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(indexed_len()),
+                right: Box::new(indexed_len()),
+            }),
+        )]);
+        let mut function_facts = test_function_facts_with_prepared_render(&prepared);
+        function_facts.replace_type_facts(FunctionTypeFacts {
+            array_index_certificates: vec![ArrayIndexCertificate {
+                slot: 0,
+                base: Some(ArrayIndexBase::Param { index: 0 }),
+                field_offset: 0,
+                element_stride: 8,
+            }],
+            field_access_certificates: vec![FieldAccessCertificate {
+                slot: 0,
+                field_offset: 0,
+                field_name: "len".to_string(),
+                field_type: Some("int64_t".to_string()),
+            }],
+            external_type_db: ExternalTypeDb {
+                structs: [(
+                    "node".to_string(),
+                    ExternalStruct {
+                        name: "node".to_string(),
+                        fields: [(
+                            0,
+                            ExternalField {
+                                name: "len".to_string(),
+                                offset: 0,
+                                ty: Some("int64_t".to_string()),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..ExternalTypeDb::default()
+            },
             ..FunctionTypeFacts::default()
         });
+        for op_index in [0, 1] {
+            add_member_render_fact(
+                &mut function_facts,
+                &prepared,
+                TestMemberRenderFact {
+                    block_addr: 0x1000,
+                    op_index,
+                    is_write: false,
+                    field_name: "len",
+                    field_offset: 0,
+                    access_width: 8,
+                },
+            );
+            add_array_render_fact(
+                &mut function_facts,
+                &prepared,
+                TestArrayRenderFact {
+                    block_addr: 0x1000,
+                    op_index,
+                    is_write: false,
+                    field_offset: 0,
+                    element_stride: 8,
+                    access_width: 8,
+                },
+            );
+        }
 
-        let output = decompiler.decompile(&func);
-        assert!(
-            output.contains("struct sla_struct_explicit_demo* arg1")
-                || output.contains("struct sla_struct_explicit_demo * arg1"),
-            "explicit struct-typed header should survive, got:\n{output}"
-        );
-        assert!(
-            output.contains("third"),
-            "explicit external field metadata should drive member rendering, got:\n{output}"
-        );
-        assert!(
-            !output.contains("&stack_8") && !output.contains("*(arg2 * 56"),
-            "indexed member render should not fall back to stack-rooted pointer math, got:\n{output}"
-        );
+        let reason = certified_standard_output_residual_reason(&prepared, &function_facts, &func);
+
+        let reason = reason.expect("array syntax without render-node identity must residualize");
+        assert!(reason.contains("rendered 2 array access(es) without exact FunctionRenderFacts"));
+        assert!(reason.contains("first array node"));
     }
 
     #[test]
@@ -9857,6 +12112,19 @@ mod tests {
             },
             ..FunctionTypeFacts::default()
         });
+        let type_facts = decompiler.context.type_facts().clone();
+        let mut route = test_decompile_route(
+            r2types::DecompileRouteKind::Standard,
+            "x86 struct-array pipeline test route",
+            None,
+            r2sym::RenderPermission::certified(
+                r2sym::ProofOwner::R2engine,
+                "x86 struct-array pipeline test route",
+            ),
+        );
+        route.use_prepared_semantic_view = false;
+        decompiler
+            .set_function_facts(FunctionFacts::new(type_facts, None).with_decompile_route(route));
 
         let normalized_func = normalize::materialize_phis(&func);
         let func = &normalized_func;
@@ -9922,6 +12190,7 @@ mod tests {
             &recovered_param_infos,
             &decompiler.context.type_facts().register_params,
             &config.arg_regs,
+            true,
         );
         for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
             let Some(param) = params.get(idx) else {
@@ -9967,17 +12236,16 @@ mod tests {
             function_names: &decompiler.context.function_names,
             strings: &decompiler.context.strings,
             symbols: &decompiler.context.symbols,
-            callee_facts: &decompiler.context.type_facts().callee_facts,
-            callee_resolution: None,
-            callsite_facts: decompiler.context.function_facts.callsites(),
-            call_result_facts: decompiler.context.function_facts.call_results(),
-            control_facts: decompiler.context.function_facts.control(),
+            function_facts: &decompiler.context.function_facts,
+            certified_rendering_required: render_permission_allows_executable_c(
+                decompiler.context.effective_render_permission(),
+            ),
             stack_slots: &decompiler.context.type_facts().stack_slots,
+            field_access_certificates: &decompiler.context.type_facts().field_access_certificates,
             #[cfg(test)]
             external_stack_vars: &decompiler.context.type_facts().external_stack_vars,
             visible_bindings: &decompiler.context.type_facts().visible_bindings,
             external_type_db: &decompiler.context.type_facts().external_type_db,
-            semantic_artifact: decompiler.context.semantic_artifact(),
             param_register_aliases: &param_register_aliases,
             type_hints: &type_hints,
             type_oracle: combined_type_oracle
@@ -9985,11 +12253,9 @@ mod tests {
                 .map(|oracle| oracle as &dyn TypeOracle),
             function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
             prepared_ssa: None,
-            summary_view: Some(&decompiler.context.function_facts.summary_view),
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_call_sites: None,
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
@@ -9999,382 +12265,39 @@ mod tests {
         let eax2 = fold_ctx.get_expr(&r2ssa::SSAVar::new("EAX", 2, 4));
         let ecx1 = fold_ctx.get_expr(&r2ssa::SSAVar::new("ECX", 1, 4));
         let stmts = fold_ctx.fold_block(&fold_blocks[0], fold_blocks[0].addr);
-        let return_expr = stmts
-            .iter()
-            .find_map(|stmt| match stmt {
-                CStmt::Return(Some(expr)) => Some(expr.clone()),
-                _ => None,
-            })
-            .expect("expected return expression");
         let mut structurer = ControlFlowStructurer::new(func, &fold_ctx);
         let body_stmt = structurer.structure();
         let normalized_body_stmt = fold_ctx.normalize_final_stmt_calls(body_stmt.clone());
-        let output = decompiler.decompile(func);
 
         assert!(
-            matches!(eax2, CExpr::Member { .. } | CExpr::PtrMember { .. }),
-            "expected decompiler pipeline get_expr(EAX_2) to keep member load, got {eax2:?}; params={params:?}; param_aliases={param_register_aliases:?}; type_hints={type_hints:?}"
+            !matches!(eax2, CExpr::Member { .. } | CExpr::PtrMember { .. })
+                && !matches!(ecx1, CExpr::Member { .. } | CExpr::PtrMember { .. }),
+            "uncertified internal pipeline must not invent member loads without render certificates, eax2={eax2:?}, ecx1={ecx1:?}; params={params:?}; param_aliases={param_register_aliases:?}; type_hints={type_hints:?}"
         );
         assert!(
-            matches!(ecx1, CExpr::Member { .. } | CExpr::PtrMember { .. }),
-            "expected decompiler pipeline get_expr(ECX_1) to keep member load, got {ecx1:?}; params={params:?}; param_aliases={param_register_aliases:?}; type_hints={type_hints:?}"
+            stmts.iter().all(|stmt| !matches!(stmt, CStmt::Return(_)))
+                && format!("{stmts:?}").contains("uncertified memory store")
+                && format!("{stmts:?}").contains("missing certified value return"),
+            "incomplete FunctionFacts must residualize this block instead of fabricating a return, got {stmts:?}"
         );
         assert!(
-            format!("{return_expr:?}").contains("f_34")
-                && format!("{return_expr:?}").contains("f_8"),
-            "expected folded return to keep semantic member loads, got {return_expr:?}; eax2={eax2:?}; ecx1={ecx1:?}; params={params:?}; param_aliases={param_register_aliases:?}; type_hints={type_hints:?}"
-        );
-        assert!(
-            format!("{body_stmt:?}").contains("f_34") && format!("{body_stmt:?}").contains("f_8"),
-            "expected structurer body to keep semantic member loads, got {body_stmt:?}; return_expr={return_expr:?}"
-        );
-        assert!(
-            format!("{normalized_body_stmt:?}").contains("f_34")
-                && format!("{normalized_body_stmt:?}").contains("f_8"),
-            "expected normalized body to keep semantic member loads, got {normalized_body_stmt:?}; body_stmt={body_stmt:?}"
-        );
-        assert!(
-            output.contains("[idx].f_34") && output.contains("[idx].f_8"),
-            "expected final decompile output to keep semantic member loads, got:\n{output}\nbody_stmt={body_stmt:?}\nnormalized_body_stmt={normalized_body_stmt:?}"
-        );
-    }
-
-    #[test]
-    fn decompile_observed_arm64_struct_array_keeps_indexed_member_loads() {
-        let block = r2ssa::SSABlock {
-            addr: 0x100000e40,
-            size: 96,
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("SP", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:10", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    val: r2ssa::SSAVar::new("X0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
-                    val: r2ssa::SSAVar::new("W1", 0, 4),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:6780", 1, 8),
-                    src: r2ssa::SSAVar::new("SP", 1, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6780", 1, 8),
-                    val: r2ssa::SSAVar::new("W2", 0, 4),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:6780", 2, 8),
-                    src: r2ssa::SSAVar::new("SP", 1, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:24c00", 1, 4),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6780", 2, 8),
-                },
-                SSAOp::IntZExt {
-                    dst: r2ssa::SSAVar::new("X8", 1, 8),
-                    src: r2ssa::SSAVar::new("tmp:24c00", 1, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 2, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 2, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 2, 8),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("X10", 1, 8),
-                    src: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                },
-                SSAOp::IntMult {
-                    dst: r2ssa::SSAVar::new("X10", 2, 8),
-                    a: r2ssa::SSAVar::new("X10", 1, 8),
-                    b: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                    a: r2ssa::SSAVar::new("X9", 1, 8),
-                    b: r2ssa::SSAVar::new("X10", 2, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X9", 2, 8),
-                    src: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 3, 8),
-                    a: r2ssa::SSAVar::new("X9", 2, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
-                    val: r2ssa::SSAVar::new("W2", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 3, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X8", 2, 8),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6500", 3, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 4, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:26b00", 2, 4),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 4, 8),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("X9", 3, 8),
-                    src: r2ssa::SSAVar::new("tmp:26b00", 2, 4),
-                },
-                SSAOp::IntMult {
-                    dst: r2ssa::SSAVar::new("X9", 4, 8),
-                    a: r2ssa::SSAVar::new("X9", 3, 8),
-                    b: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:12480", 2, 8),
-                    a: r2ssa::SSAVar::new("X8", 2, 8),
-                    b: r2ssa::SSAVar::new("X9", 4, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X8", 3, 8),
-                    src: r2ssa::SSAVar::new("tmp:12480", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 5, 8),
-                    a: r2ssa::SSAVar::new("X8", 3, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:24c00", 2, 4),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 5, 8),
-                },
-                SSAOp::IntZExt {
-                    dst: r2ssa::SSAVar::new("X8", 4, 8),
-                    src: r2ssa::SSAVar::new("tmp:24c00", 2, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 4, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X9", 5, 8),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6500", 4, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 6, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 6, 8),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("X10", 3, 8),
-                    src: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                },
-                SSAOp::IntMult {
-                    dst: r2ssa::SSAVar::new("X10", 4, 8),
-                    a: r2ssa::SSAVar::new("X10", 3, 8),
-                    b: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:12480", 3, 8),
-                    a: r2ssa::SSAVar::new("X9", 5, 8),
-                    b: r2ssa::SSAVar::new("X10", 4, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X9", 6, 8),
-                    src: r2ssa::SSAVar::new("tmp:12480", 3, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 7, 8),
-                    a: r2ssa::SSAVar::new("X9", 6, 8),
-                    b: r2ssa::SSAVar::new("const:34", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: "ram".to_string(),
-                    addr: r2ssa::SSAVar::new("tmp:6400", 7, 8),
-                },
-                SSAOp::IntZExt {
-                    dst: r2ssa::SSAVar::new("X9", 7, 8),
-                    src: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:sum", 1, 8),
-                    a: r2ssa::SSAVar::new("X8", 4, 8),
-                    b: r2ssa::SSAVar::new("X9", 7, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X0", 1, 8),
-                    src: r2ssa::SSAVar::new("tmp:sum", 1, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("PC", 1, 8),
-                    src: r2ssa::SSAVar::new("X30", 0, 8),
-                },
-                SSAOp::Return {
-                    target: r2ssa::SSAVar::new("PC", 1, 8),
-                },
-            ],
-        };
-
-        let raw = R2ILBlock {
-            addr: block.addr,
-            size: block.size,
-            ops: vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        };
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("sym._test_struct_array_index");
-
-        let struct_name = "sla_struct_explicit_demo_full".to_string();
-        let mut type_db = ExternalTypeDb::default();
-        type_db.structs.insert(
-            struct_name.clone(),
-            ExternalStruct {
-                name: struct_name.clone(),
-                fields: std::collections::BTreeMap::from([
-                    (
-                        0,
-                        ExternalField {
-                            name: "f_0".to_string(),
-                            offset: 0,
-                            ty: Some("int32_t".to_string()),
-                        },
-                    ),
-                    (
-                        8,
-                        ExternalField {
-                            name: "f_8".to_string(),
-                            offset: 8,
-                            ty: Some("int32_t".to_string()),
-                        },
-                    ),
-                    (
-                        0x34,
-                        ExternalField {
-                            name: "f_34".to_string(),
-                            offset: 0x34,
-                            ty: Some("int32_t".to_string()),
-                        },
-                    ),
-                ]),
-            },
-        );
-
-        let mut decompiler = Decompiler::new(DecompilerConfig::aarch64());
-        let signature = signature_spec(
-            Some(CType::Int(64)),
-            vec![
-                ("arg1", Some(CType::ptr(CType::Struct(struct_name.clone())))),
-                ("arg2", Some(CType::Int(32))),
-                ("arg3", Some(CType::Int(32))),
-            ],
-        );
-        decompiler.set_type_facts(FunctionTypeFacts {
-            signature_certificate: external_signature_certificate(&signature),
-            merged_signature: Some(signature),
-            external_type_db: type_db,
-            ..FunctionTypeFacts::default()
-        });
-
-        let built = decompiler.build_function(&func);
-        let output = decompiler.decompile(&func);
-        assert!(
-            output.contains("[arg2].f_8"),
-            "indexed-member path should preserve field 0x8, got:\n{output}"
-        );
-        assert!(
-            output.contains("[arg2].f_34"),
-            "indexed-member path should preserve field 0x34, got:\n{output}"
-        );
-        let return_expr = built
-            .body
-            .iter()
-            .find_map(|stmt| match stmt {
-                CStmt::Return(Some(expr)) => Some(expr),
-                _ => None,
-            })
-            .expect("observed arm64 struct-array path should have a value return");
-        fn expr_contains_member(expr: &CExpr, expected: &str) -> bool {
-            let mut found = false;
-            expr.visit(&mut |node| match node {
-                CExpr::Member { member, .. } | CExpr::PtrMember { member, .. } => {
-                    found |= member == expected;
-                }
-                _ => {}
-            });
-            found
-        }
-        assert!(
-            expr_contains_member(return_expr, "f_8") && expr_contains_member(return_expr, "f_34"),
-            "observed arm64 struct-array return should keep semantic member loads, got {return_expr:?}"
-        );
-        assert!(
-            !format!("{return_expr:?}").contains("arg2 * 38"),
-            "observed arm64 struct-array return should not expose scaled raw-index arithmetic, got {return_expr:?}"
+            !format!("{body_stmt:?}").contains("f_34")
+                && !format!("{body_stmt:?}").contains("f_8")
+                && !format!("{normalized_body_stmt:?}").contains("f_34")
+                && !format!("{normalized_body_stmt:?}").contains("f_8"),
+            "uncertified structuring must not preserve fake member loads, body={body_stmt:?}; normalized={normalized_body_stmt:?}"
         );
     }
 
     #[test]
     fn decompiler_prepends_vm_semantic_summary_comment() {
-        let func = ssa_from_ops(
+        let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
                 target: Varnode::constant(0, 8),
             }],
             &test_arch_for_decompile(),
         );
 
-        let mut decompiler = Decompiler::new(DecompilerConfig::default());
         let vm_step = r2sym::VmStepSummary {
             kind: r2sym::InterpreterKind::SwitchDispatch,
             loop_header: 0x1000,
@@ -10555,10 +12478,12 @@ mod tests {
                         "test-selected vm summary",
                     ),
                 ));
-        decompiler = decompiler
-            .with_context(DecompilerContext::default().with_function_facts(function_facts));
+        let input = DecompilerInput::new(
+            prepared,
+            DecompilerContext::default().with_function_facts(function_facts),
+        );
 
-        let output = decompiler.decompile(&func);
+        let output = Decompiler::new(DecompilerConfig::default()).decompile_input(&input);
         assert!(
             output.contains("r2dec semantic summary: vm_summary"),
             "expected VM semantic summary output, got:\n{output}"
@@ -10654,20 +12579,18 @@ mod tests {
             ),
         ));
         assert!(function_facts.has_summary_conflicts());
-        let context = DecompilerContext::from_function_facts(
-            function_facts,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            64,
-        );
+        let context = DecompilerContext::from_function_facts(function_facts);
         let input = DecompilerInput::new(prepared, context);
         assert!(input.context.function_facts.has_summary_conflicts());
         let output = Decompiler::new(DecompilerConfig::default()).decompile_input(&input);
 
         assert!(
-            output.starts_with("void stable_demo(void)"),
-            "summary routes must not present typed signatures as native C headers, got:\n{output}"
+            output.starts_with("/* summary-only route for stable_demo;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void stable_demo(void)"),
+            "summary routes must not present even void C wrappers, got:\n{output}"
         );
         assert!(
             !output.contains("int32_t status"),
@@ -10735,9 +12658,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.copy_worker",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -10814,9 +12738,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.dense_worker",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("dense native-linear worker summary should render");
@@ -10842,9 +12767,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.structured_worker",
             &function_facts,
-            &SemanticRoutePlan::StructuredWorker {
-                reason: "engine-selected structured summary route".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::StructuredWorker,
+                "engine-selected structured summary route",
+            ),
             DecompilerConfig::default(),
         )
         .expect("structured worker summary route should render");
@@ -10852,8 +12778,12 @@ mod tests {
         assert!(output.contains("semantic route: structured_worker_summary"));
         assert!(output.contains("render contract: summary facts only"));
         assert!(
-            output.starts_with("void sym.structured_worker(void)"),
-            "summary routes must use a non-authoritative void wrapper, got:\n{output}"
+            output.starts_with("/* summary-only route for sym.structured_worker;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void sym.structured_worker(void)"),
+            "summary routes must not use non-authoritative C wrappers, got:\n{output}"
         );
         assert!(
             !output.contains("int sym.structured_worker")
@@ -10916,15 +12846,20 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.copy_worker",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
 
         assert!(
-            output.starts_with("void sym.copy_worker(void)"),
+            output.starts_with("/* summary-only route for sym.copy_worker;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void sym.copy_worker(void)"),
             "summary routes must not present canonical signatures as native C headers, got:\n{output}"
         );
         assert!(!output.contains("(void* dst"));
@@ -10985,9 +12920,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.copy_residual_len",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -11053,16 +12989,21 @@ mod tests {
         let output = render_semantic_worker_summary(
             "or",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "named native-worker summary projection".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "named native-worker summary projection",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
 
         assert!(
-            output.starts_with("void or(void)"),
-            "summary routes must use a non-authoritative void wrapper, got:\n{output}"
+            output.starts_with("/* summary-only route for or;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void or(void)"),
+            "summary routes must not use non-authoritative C wrappers, got:\n{output}"
         );
         assert!(
             !output.lines().next().unwrap_or_default().contains("arg"),
@@ -11114,16 +13055,21 @@ mod tests {
         let output = render_semantic_worker_summary(
             "fcn.00004129",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "named native-worker summary projection".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "named native-worker summary projection",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
         let header = output.lines().next().unwrap_or_default();
 
         assert!(
-            header.starts_with("void fcn.00004129(void)"),
+            header.starts_with("/* summary-only route for fcn.00004129;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void fcn.00004129(void)"),
             "summary routes must not use uncertified merged signatures for headers, got:\n{output}"
         );
         assert!(
@@ -11182,17 +13128,22 @@ mod tests {
         let output = render_semantic_worker_summary(
             "fcn.00004129",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "named native-worker summary projection".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "named native-worker summary projection",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
         let header = output.lines().next().unwrap_or_default();
 
         assert!(
-            header.starts_with("void fcn.00004129(void)"),
-            "summary routes must use a non-authoritative void wrapper, got:\n{output}"
+            header.starts_with("/* summary-only route for fcn.00004129;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void fcn.00004129(void)"),
+            "summary routes must not use non-authoritative C wrappers, got:\n{output}"
         );
         assert!(
             !header.contains("summary_input")
@@ -11311,9 +13262,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.copy_file_data",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "named file worker summary".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "named file worker summary",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -11390,15 +13342,20 @@ mod tests {
         let output = render_semantic_worker_summary(
             "main",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "named program orchestrator summary".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "named program orchestrator summary",
+            ),
             DecompilerConfig::default(),
         )
         .expect("program orchestrator summary should render");
 
         assert!(
-            output.starts_with("void main(void)"),
+            output.starts_with("/* summary-only route for main;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void main(void)"),
             "summary-only role evidence must not become a native main signature, got:\n{output}"
         );
         assert!(!output.contains("int main(int argc"));
@@ -11454,9 +13411,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.str_worker",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -11526,9 +13484,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.parse_worker",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -11608,9 +13567,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.parse_worker",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -11701,9 +13661,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.out_param_parse",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -11765,15 +13726,20 @@ mod tests {
         let output = render_semantic_worker_summary(
             "fcn.000068f0",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("metadata summary should render");
 
         assert!(
-            output.starts_with("void fcn.000068f0(void)"),
+            output.starts_with("/* summary-only route for fcn.000068f0;"),
+            "summary routes must start with an explicit refusal comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("void fcn.000068f0(void)"),
             "summary routes must not present typed params as native C headers, got:\n{output}"
         );
         assert!(!output.contains("uint64_t size"));
@@ -11847,9 +13813,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym._md5_process_block",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("hash summary should render");
@@ -11937,9 +13904,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "count_bytes",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "named native-worker summary projection".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "named native-worker summary projection",
+            ),
             DecompilerConfig::default(),
         )
         .expect("predicated byte-count summary should render");
@@ -12059,9 +14027,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.rpl_mbrtowc",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("parser and scan summary should render");
@@ -12114,9 +14083,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.diagnose",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -12168,9 +14138,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.printf_fetchargs",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("worker summary should render");
@@ -12302,9 +14273,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.scan",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "large native worker summarized as typed islands".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "large native worker summarized as typed islands",
+            ),
             DecompilerConfig::default(),
         )
         .expect("summary island output");
@@ -12408,9 +14380,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "fnv_fold",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "large native worker summarized as typed islands".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "large native worker summarized as typed islands",
+            ),
             DecompilerConfig::default(),
         )
         .expect("hash fold summary should render");
@@ -12529,9 +14502,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "table_walk",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "large native worker summarized as typed islands".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "large native worker summarized as typed islands",
+            ),
             DecompilerConfig::default(),
         )
         .expect("table walk summary should stay comment-only without hard proof");
@@ -12653,9 +14627,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "readlinebuffer_delim",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("summary-only primary region should render without a large-cfg skip bit");
@@ -12739,9 +14714,10 @@ mod tests {
         let output = render_semantic_worker_summary(
             "sym.name_ranked_table",
             &function_facts,
-            &SemanticRoutePlan::LinearWorker {
-                reason: "guarded structuring unavailable".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                "guarded structuring unavailable",
+            ),
             DecompilerConfig::default(),
         )
         .expect("weak summary comments should render");
@@ -12811,14 +14787,16 @@ mod tests {
         let output = render_semantic_worker_summary(
             "dbg.print_current_files",
             &function_facts,
-            &SemanticRoutePlan::SummaryIslands {
-                reason: "named native-worker summary projection".to_string(),
-            },
+            &test_summary_decompile_route(
+                r2types::DecompileRouteKind::SummaryIslands,
+                "named native-worker summary projection",
+            ),
             DecompilerConfig::default(),
         )
         .expect("weak format summary should render as bounded summary comments");
 
-        assert!(output.contains("void dbg.print_current_files(void)"));
+        assert!(output.starts_with("/* summary-only route for dbg.print_current_files;"));
+        assert!(!output.contains("void dbg.print_current_files(void)"));
         assert!(output.contains("worker summary: format_render"));
         assert!(output.contains("summary_roles=0"));
         assert!(!output.contains("render_formatted_output(summary_input0);"));
@@ -12914,7 +14892,7 @@ mod tests {
             },
             Some(semantic_artifact),
         );
-        function_facts.summary_view.rollup = Some(r2types::SummaryEffectRollup {
+        function_facts.__test_set_summary_rollup(r2types::SummaryEffectRollup {
             root_return_relation: Some(r2ssa::SummaryReturnRelation::Arg(0)),
             ..r2types::SummaryEffectRollup::default()
         });
@@ -12963,7 +14941,7 @@ mod tests {
             },
             Some(semantic_artifact),
         );
-        function_facts.summary_view.rollup = Some(r2types::SummaryEffectRollup {
+        function_facts.__test_set_summary_rollup(r2types::SummaryEffectRollup {
             root_return_relation: Some(r2ssa::SummaryReturnRelation::HeapAlloc),
             ..r2types::SummaryEffectRollup::default()
         });

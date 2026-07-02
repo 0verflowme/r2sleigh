@@ -66,6 +66,47 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    pub(super) fn expr_contains_structured_memory_syntax(expr: &CExpr) -> bool {
+        match expr {
+            CExpr::Subscript { .. } | CExpr::Member { .. } | CExpr::PtrMember { .. } => true,
+            CExpr::Unary { operand, .. }
+            | CExpr::Cast { expr: operand, .. }
+            | CExpr::Sizeof(operand)
+            | CExpr::AddrOf(operand)
+            | CExpr::Deref(operand)
+            | CExpr::Paren(operand) => Self::expr_contains_structured_memory_syntax(operand),
+            CExpr::Binary { left, right, .. } => {
+                Self::expr_contains_structured_memory_syntax(left)
+                    || Self::expr_contains_structured_memory_syntax(right)
+            }
+            CExpr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_contains_structured_memory_syntax(cond)
+                    || Self::expr_contains_structured_memory_syntax(then_expr)
+                    || Self::expr_contains_structured_memory_syntax(else_expr)
+            }
+            CExpr::Call { func, args } => {
+                Self::expr_contains_structured_memory_syntax(func)
+                    || args
+                        .iter()
+                        .any(Self::expr_contains_structured_memory_syntax)
+            }
+            CExpr::Comma(items) => items
+                .iter()
+                .any(Self::expr_contains_structured_memory_syntax),
+            CExpr::IntLit(_)
+            | CExpr::UIntLit(_)
+            | CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::Var(_)
+            | CExpr::SizeofType(_) => false,
+        }
+    }
+
     pub(super) fn expr_is_scalar_memory_candidate(expr: &CExpr) -> bool {
         match expr {
             CExpr::Deref(_)
@@ -314,23 +355,6 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn resolve_return_candidate(&self, expr: &CExpr) -> CExpr {
         self.resolve_return_candidate_in_context(expr, self.return_context_for_expr(expr))
-    }
-
-    pub(crate) fn certified_raw_carrier_definition(&self, name: &str) -> Option<CExpr> {
-        let mut candidates = vec![name.to_string()];
-        if let Some((base, version)) = name.rsplit_once('_')
-            && !base.is_empty()
-            && version.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            candidates.push(format!("{}_{}", base.to_ascii_uppercase(), version));
-        }
-        candidates.into_iter().find_map(|candidate| {
-            let context = self.return_context_for_name(&candidate);
-            self.semanticized_raw_definition_candidate_in_context(&candidate, context)
-                .or_else(|| self.lookup_definition(&candidate))
-                .or_else(|| self.best_visible_definition_in_context(&candidate, context))
-                .map(|expr| self.resolve_return_candidate_in_context(&expr, context))
-        })
     }
 
     fn resolve_return_candidate_in_context(
@@ -1310,15 +1334,6 @@ impl<'a> FoldingContext<'a> {
             }
         }
 
-        if let Some(addr) = parse_address_from_var_name(&var.name) {
-            if let Some(sym) = self.lookup_symbol(addr) {
-                return sym.clone();
-            }
-            if let Some(name) = self.lookup_function(addr) {
-                return name.clone();
-            }
-        }
-
         // Check if coalescing mapped this SSA name to a merged name
         let display = var.display_name();
         if let Some(alias) = self.var_aliases_map().get(&display) {
@@ -1345,25 +1360,6 @@ impl<'a> FoldingContext<'a> {
     /// Convert a constant variable to a C expression.
     pub(crate) fn const_to_expr(&self, var: &SSAVar) -> CExpr {
         let val = parse_const_value(&var.name).unwrap_or(0);
-
-        // Only resolve addresses that are plausibly code/data (not small literals)
-        if val > 0xff {
-            // Check if this is a function address (e.g., for lea rdi, [main])
-            if let Some(name) = self.lookup_function(val) {
-                return CExpr::Var(name.clone());
-            }
-
-            // Check if this is a string address
-            if let Some(s) = self.lookup_string(val) {
-                return CExpr::StringLit(s.clone());
-            }
-
-            // Check if this is a symbol address
-            if let Some(s) = self.lookup_symbol(val) {
-                return CExpr::Var(s.clone());
-            }
-        }
-
         if val > 0x7fffffff {
             CExpr::UIntLit(val)
         } else {

@@ -8,6 +8,9 @@ struct EngineSummaryDecompileRequest {
     fallback_comment: Option<String>,
 }
 
+struct EngineFunctionDecompileRequest;
+struct EngineAnalyzeRequest;
+
 impl EngineSummaryDecompileRequest {
     fn guarded_worker_summary() -> Self {
         Self {
@@ -16,10 +19,27 @@ impl EngineSummaryDecompileRequest {
     }
 }
 
+impl EngineFunctionDecompileRequest {
+    fn full_semantics_for_function() -> Self {
+        Self
+    }
+}
+
+impl EngineAnalyzeRequest {
+    fn from_input_with_compile_missing_semantics() -> Self {
+        Self
+    }
+}
+
 struct EngineSession;
 
 impl EngineSession {
+    fn new(_: usize) -> Self {
+        Self
+    }
+
     fn decompile_summary(&self, _: EngineSummaryDecompileRequest) {}
+    fn cached_analyze(&self) {}
 }
 
 enum EngineSemanticMode {
@@ -37,9 +57,23 @@ fn analysis_policy_for_depth(_: u32) -> usize {
     0
 }
 
+fn function_exceeds_auto_callback_budget() -> bool {
+    true
+}
+
+fn sleigh_mode_allows_deep_auto_callbacks() -> bool {
+    true
+}
+
+fn auto_callback_policy_for_depth(_: u32) -> bool {
+    true
+}
+
 fn r2sleigh_interproc_helper_scope_budget_allows(_: usize, _: u32) -> i32 {
     0
 }
+
+fn build_interproc_summary_set_with_scope_facts() {}
 
 mod r2dec {
     pub fn render_semantic_worker_linearization() -> String {
@@ -78,6 +112,8 @@ mod r2engine {
     pub fn should_use_direct_named_native_worker_type_projection() -> bool {
         false
     }
+
+    pub fn auto_callback_plan_for_policy() {}
 }
 
 mod benign {
@@ -99,6 +135,9 @@ fn main() {
     let _ = &*TYPE_WRITEBACK_CACHE;
     let _ = caller_prefers_bounded_type_plan();
     let _ = analysis_policy_for_depth(0);
+    let _ = function_exceeds_auto_callback_budget();
+    let _ = sleigh_mode_allows_deep_auto_callbacks();
+    let _ = auto_callback_policy_for_depth(2);
     let _ = r2sleigh_interproc_helper_scope_budget_allows(1, 1);
     let _ = EngineTypeAnalysisRequest {
         caller_prefers_bounded_type_plan: true,
@@ -131,8 +170,14 @@ fn main() {
     let _ = r2engine::EngineSemanticRoutePlan;
     let _ = r2engine::should_use_direct_named_native_worker_decompile();
     let _ = r2engine::should_use_direct_named_native_worker_type_projection();
+    r2engine::auto_callback_plan_for_policy();
     let session = EngineSession;
+    let _ = EngineSession::new(256);
     session.decompile_summary(EngineSummaryDecompileRequest::guarded_worker_summary());
+    session.cached_analyze();
+    let _ = EngineFunctionDecompileRequest::full_semantics_for_function();
+    let _ = EngineAnalyzeRequest::from_input_with_compile_missing_semantics();
+    build_interproc_summary_set_with_scope_facts();
     let _ = EngineSemanticMode::Full;
     let _ = EngineSemanticMode::Optional;
 }

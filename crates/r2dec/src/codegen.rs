@@ -36,7 +36,7 @@ impl Default for CodeGenConfig {
 }
 
 /// C code generator.
-pub struct CodeGenerator {
+pub(crate) struct CodeGenerator {
     config: CodeGenConfig,
     output: String,
     indent_level: usize,
@@ -44,7 +44,7 @@ pub struct CodeGenerator {
 
 impl CodeGenerator {
     /// Create a new code generator.
-    pub fn new(config: CodeGenConfig) -> Self {
+    pub(crate) fn new(config: CodeGenConfig) -> Self {
         Self {
             config,
             output: String::new(),
@@ -53,7 +53,7 @@ impl CodeGenerator {
     }
 
     /// Generate code for a function.
-    pub fn generate_function(&mut self, func: &CFunction) -> String {
+    pub(crate) fn generate_function(&mut self, func: &CFunction) -> String {
         self.output.clear();
         let (locals, body) = inline_local_declaration_initializers(func);
 
@@ -102,14 +102,15 @@ impl CodeGenerator {
     }
 
     /// Generate code for a statement.
-    pub fn generate_stmt(&mut self, stmt: &CStmt) -> String {
+    pub(crate) fn generate_stmt(&mut self, stmt: &CStmt) -> String {
         self.output.clear();
         self.emit_stmt(stmt);
         self.output.clone()
     }
 
     /// Generate code for an expression.
-    pub fn generate_expr(&mut self, expr: &CExpr) -> String {
+    #[cfg(test)]
+    pub(crate) fn generate_expr(&mut self, expr: &CExpr) -> String {
         self.output.clear();
         self.emit_expr(expr, 0);
         self.output.clone()
@@ -588,8 +589,8 @@ impl CodeGenerator {
     }
 }
 
-/// Generate C code for a function.
-pub fn generate(func: &CFunction) -> String {
+#[cfg(test)]
+fn generate(func: &CFunction) -> String {
     let mut codegen = CodeGenerator::new(CodeGenConfig::default());
     codegen.generate_function(func)
 }

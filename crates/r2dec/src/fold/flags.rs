@@ -28,6 +28,7 @@ pub(super) struct CompareTuple {
     context: CompareContext,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SymbolicConditionToken {
     Atom(String),
@@ -55,12 +56,14 @@ enum SymbolicConditionToken {
     Or,
 }
 
+#[cfg(test)]
 struct SymbolicConditionExprParser<'ctx, 'a> {
     ctx: &'ctx FoldingContext<'a>,
     tokens: Vec<SymbolicConditionToken>,
     pos: usize,
 }
 
+#[cfg(test)]
 impl<'ctx, 'a> SymbolicConditionExprParser<'ctx, 'a> {
     fn new(ctx: &'ctx FoldingContext<'a>, text: &str) -> Option<Self> {
         Some(Self {
@@ -260,6 +263,7 @@ impl<'ctx, 'a> SymbolicConditionExprParser<'ctx, 'a> {
     }
 }
 
+#[cfg(test)]
 fn tokenize_symbolic_condition(text: &str) -> Option<Vec<SymbolicConditionToken>> {
     let mut tokens = Vec::new();
     let chars = text.chars().collect::<Vec<_>>();
@@ -414,27 +418,17 @@ impl<'a> FoldingContext<'a> {
             .and_then(|view| view.branch_expr_for_block(block_addr).cloned())
     }
 
-    fn symbolic_branch_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
-        match self
-            .inputs
-            .semantic_artifact?
-            .exact_branch_truth_for_block(block_addr)
-        {
-            Some(true) => Some(CExpr::IntLit(1)),
-            Some(false) => Some(CExpr::IntLit(0)),
-            None => None,
-        }
-    }
-
+    #[cfg(test)]
     fn symbolic_actionable_compiled_condition(
         &self,
         block_addr: u64,
     ) -> Option<&r2sym::BackwardConditionSummary> {
         self.inputs
-            .semantic_artifact?
+            .semantic_artifact()?
             .actionable_compiled_condition_for_block(block_addr)
     }
 
+    #[cfg(test)]
     fn symbolic_actionable_compiled_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
         let compiled = self.symbolic_actionable_compiled_condition(block_addr)?;
         SymbolicConditionExprParser::new(self, compiled.simplified.trim())
@@ -442,6 +436,7 @@ impl<'a> FoldingContext<'a> {
             .map(|expr| self.finalize_condition_expr(expr))
     }
 
+    #[cfg(test)]
     fn symbolic_actionable_memory_condition_expr(&self, block_addr: u64) -> Option<CExpr> {
         fn memory_term_rank(term: &r2sym::BackwardMemoryCondition) -> (u8, bool, bool, i64, i64) {
             let evidence_rank = match term.evidence().tier {
@@ -461,7 +456,7 @@ impl<'a> FoldingContext<'a> {
 
         let term = self
             .inputs
-            .semantic_artifact?
+            .semantic_artifact()?
             .actionable_memory_terms_for_block(block_addr)
             .into_iter()
             .filter(|term| {
@@ -634,29 +629,6 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|(lhs, rhs)| generic_scalar_expr(lhs) || generic_scalar_expr(rhs))
     }
 
-    fn condition_candidate_contains_call_result_owner(&self, expr: &CExpr) -> bool {
-        let mut found = false;
-        expr.visit(&mut |node| {
-            if found {
-                return;
-            }
-            match node {
-                CExpr::Call { .. } => {
-                    found = true;
-                }
-                CExpr::Var(name) => {
-                    found = self.call_result_source_for_ssa_name(name).is_some()
-                        || self.local_post_call_source_for_ssa_name(name).is_some()
-                        || self
-                            .materialized_call_result_source_for_visible_name(name)
-                            .is_some();
-                }
-                _ => {}
-            }
-        });
-        found
-    }
-
     fn expand_generic_scalar_predicate_aliases(&self, expr: CExpr, depth: u32) -> CExpr {
         if depth > MAX_PREDICATE_OPERAND_DEPTH {
             return expr;
@@ -706,6 +678,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub fn extract_condition_from_block(&self, block: &FunctionSSABlock) -> Option<CExpr> {
+        if self.requires_certified_rendering() || self.inputs.prepared_ssa.is_some() {
+            return self
+                .certified_branch_condition_from_block(block)
+                .map(|(expr, _, _)| expr);
+        }
         let (branch_idx, cond) =
             block
                 .ops
@@ -740,48 +717,18 @@ impl<'a> FoldingContext<'a> {
         });
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
-        let strong_has_call_result_owner = strong_prepared
-            .as_ref()
-            .is_some_and(|expr| self.condition_candidate_contains_call_result_owner(expr));
-
-        if let Some(cond) = self.symbolic_actionable_compiled_condition_expr(block.addr)
-            && matches!(cond, CExpr::IntLit(_) | CExpr::UIntLit(_))
-        {
-            return Some(cond);
-        }
-
-        if !strong_has_call_result_owner
-            && let Some(cond) = self.symbolic_actionable_memory_condition_expr(block.addr)
-        {
-            return Some(cond);
-        }
-
-        if !strong_has_call_result_owner
-            && let Some(cond) = self.symbolic_actionable_compiled_condition_expr(block.addr)
-        {
-            return Some(cond);
-        }
-
-        if !strong_has_call_result_owner
-            && let Some(cond) = self.symbolic_branch_condition_expr(block.addr)
-        {
-            return Some(cond);
-        }
-
         if strong_prepared.is_some() {
             return strong_prepared;
         }
 
-        let exact_compiled = self.symbolic_actionable_compiled_condition(block.addr);
-        let allow_legacy_flag_provenance = exact_compiled.is_none()
-            && ![
-                prepared_branch_candidate.as_ref(),
-                prepared_block_candidate.as_ref(),
-                prepared_var_candidate.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|expr| !self.prepared_candidate_needs_legacy_compare_help(expr));
+        let allow_legacy_flag_provenance = ![
+            prepared_branch_candidate.as_ref(),
+            prepared_block_candidate.as_ref(),
+            prepared_var_candidate.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|expr| !self.prepared_candidate_needs_legacy_compare_help(expr));
 
         let prev_block_addr = self.current_block_addr.replace(Some(block.addr));
         let prev_op_idx = self.current_op_idx.replace(Some(branch_idx));
@@ -874,6 +821,30 @@ impl<'a> FoldingContext<'a> {
         self.current_block_addr.set(prev_block_addr);
         self.current_op_idx.set(prev_op_idx);
         result
+    }
+
+    pub(super) fn certified_branch_condition_from_block(
+        &self,
+        block: &FunctionSSABlock,
+    ) -> Option<(CExpr, r2ssa::PredicateId, r2ssa::ValueId)> {
+        let cond = block.ops.iter().rev().find_map(|op| match op {
+            SSAOp::CBranch { cond, .. } => Some(cond),
+            _ => None,
+        })?;
+        let predicate = self.control_facts()?.branch_for_block(block.addr)?;
+        if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
+            return None;
+        }
+        let expr = predicate
+            .comparison
+            .as_ref()
+            .and_then(|comparison| self.prepared_compare_provenance_expr(comparison))?;
+        let expr = self.finalize_condition_expr(expr);
+        (!self.is_degenerate_constant_condition(&expr)).then_some((
+            expr,
+            predicate.id,
+            predicate.condition,
+        ))
     }
 
     fn branch_compare_provenance_expr(
@@ -1108,11 +1079,42 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn prepared_compare_provenance_expr(&self, prov: &PredicateComparisonFact) -> Option<CExpr> {
+        if self.requires_certified_rendering() {
+            return self.certified_compare_provenance_expr(prov);
+        }
         let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
         let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
         let compare_width = lhs_var.size.max(rhs_var.size);
         let lhs = self.resolve_prepared_predicate_operand_with_width(lhs_var, compare_width);
         let rhs = self.resolve_prepared_predicate_operand_with_width(rhs_var, compare_width);
+        self.compare_provenance_expr_from_operands(prov, lhs, rhs)
+    }
+
+    fn certified_compare_provenance_expr(&self, prov: &PredicateComparisonFact) -> Option<CExpr> {
+        let lhs_var = self.prepared_var_for_value_id(prov.lhs)?;
+        let rhs_var = self.prepared_var_for_value_id(prov.rhs)?;
+        let compare_width = lhs_var.size.max(rhs_var.size);
+        let lhs = self.certified_predicate_operand_expr(lhs_var, compare_width)?;
+        let rhs = self.certified_predicate_operand_expr(rhs_var, compare_width)?;
+        self.compare_provenance_expr_from_operands(prov, lhs, rhs)
+    }
+
+    fn certified_predicate_operand_expr(&self, var: &SSAVar, compare_width: u32) -> Option<CExpr> {
+        if var.is_const() {
+            return Some(utils::compare_const_to_expr_with_width(
+                var,
+                compare_width.max(var.size),
+            ));
+        }
+        self.render_certified_value_expr_for_var(var)
+    }
+
+    fn compare_provenance_expr_from_operands(
+        &self,
+        prov: &PredicateComparisonFact,
+        lhs: CExpr,
+        rhs: CExpr,
+    ) -> Option<CExpr> {
         match prov.kind {
             PreparedCompareKind::Equal => Some(CExpr::binary(BinaryOp::Eq, lhs, rhs)),
             PreparedCompareKind::NotEqual => Some(CExpr::binary(BinaryOp::Ne, lhs, rhs)),

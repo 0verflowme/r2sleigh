@@ -21,21 +21,16 @@ fn engine_route_policy_never_uses_renderer_route_type() {
             .replace('\\', "/");
         let text = fs::read_to_string(&file).expect("source file should be UTF-8");
         for (line_idx, line) in text.lines().enumerate() {
-            if !line.contains("r2dec::SemanticRoutePlan") {
+            if !line.contains("r2dec::SemanticRoutePlan") && !line.contains("to_decompiler_route") {
                 continue;
             }
-            let allowed_conversion = rel == "route.rs"
-                && (line.contains("to_decompiler_route")
-                    || line.contains("=> r2dec::SemanticRoutePlan::"));
-            if !allowed_conversion {
-                violations.push(format!("{}:{} {}", rel, line_idx + 1, line.trim()));
-            }
+            violations.push(format!("{}:{} {}", rel, line_idx + 1, line.trim()));
         }
     }
 
     assert!(
         violations.is_empty(),
-        "r2engine route policy must use EngineSemanticRoutePlan and convert to r2dec only at the renderer boundary.\n\
+        "r2engine route policy must not depend on renderer route types or conversion helpers.\n\
          Violations:\n{}",
         violations.join("\n")
     );

@@ -1,4 +1,4 @@
-use r2ssa::{ObjectKind, SSAOp, SSAVar};
+use r2ssa::{ObjectId, ObjectKind, SSAOp, SSAVar};
 use r2types::{
     ExternalStackBase, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey, VisibleBinding,
     VisibleBindingKind,
@@ -95,6 +95,80 @@ impl<'a> FoldingContext<'a> {
                 .as_ref()
                 .is_some_and(|slot| Self::stack_slot_matches_offset(slot, offset))
         })
+    }
+
+    fn certified_stack_owner_candidate_names(&self, offset: i64) -> Vec<String> {
+        let prepared_alias = self
+            .prepared_stack_alias_view()
+            .and_then(|view| view.stack_alias_for_offset(offset))
+            .and_then(|alias| self.preferred_prepared_stack_alias_name(alias));
+        let mut names: Vec<String> = prepared_alias.into_iter().collect();
+        names.extend(
+            self.inputs
+                .visible_bindings
+                .iter()
+                .filter(move |binding| {
+                    matches!(
+                        binding.kind,
+                        VisibleBindingKind::Param
+                            | VisibleBindingKind::Local
+                            | VisibleBindingKind::StackObject
+                    ) && binding
+                        .stack_slot
+                        .as_ref()
+                        .is_some_and(|slot| Self::stack_slot_matches_offset(slot, offset))
+                })
+                .map(|binding| binding.name.trim().to_string()),
+        );
+        names.extend(
+            self.inputs
+                .stack_slots
+                .iter()
+                .filter(move |(slot_key, slot)| {
+                    matches!(
+                        slot.role,
+                        ExternalStackSlotRole::Local | ExternalStackSlotRole::StackArg
+                    ) && Self::stack_slot_matches_offset(slot_key, offset)
+                })
+                .map(|(_, slot)| slot.name.trim().to_string()),
+        );
+        names
+    }
+
+    pub(super) fn certified_stack_var_name_for_object_offset(
+        &self,
+        object: ObjectId,
+        offset: i64,
+    ) -> Option<String> {
+        let function_facts = self.inputs.function_facts;
+        self.certified_stack_owner_candidate_names(offset)
+            .into_iter()
+            .filter(|name| {
+                !name.is_empty()
+                    && !self.is_reserved_param_alias_name(name)
+                    && !super::op_lower::is_generic_stack_placeholder_alias(name)
+            })
+            .find(|name| {
+                function_facts
+                    .authorized_stack_slot_owner_render(object, offset, name)
+                    .is_some()
+            })
+    }
+
+    fn certified_stack_var_name_for_offset(&self, offset: i64) -> Option<String> {
+        let function_facts = self.inputs.function_facts;
+        self.certified_stack_owner_candidate_names(offset)
+            .into_iter()
+            .filter(|name| {
+                !name.is_empty()
+                    && !self.is_reserved_param_alias_name(name)
+                    && !super::op_lower::is_generic_stack_placeholder_alias(name)
+            })
+            .find(|name| {
+                function_facts
+                    .authorized_stack_slot_owner_render_by_offset(offset, name)
+                    .is_some()
+            })
     }
 
     pub(super) fn is_reserved_param_alias_name(&self, name: &str) -> bool {
@@ -221,6 +295,9 @@ impl<'a> FoldingContext<'a> {
         let lower = reg_name.to_ascii_lowercase();
         if let Some(alias) = self.inputs.param_register_aliases.get(&lower) {
             return Some(alias.clone());
+        }
+        if self.requires_certified_rendering() {
+            return None;
         }
         self.inputs.arch.arg_alias_for_register_name(reg_name)
     }
@@ -531,6 +608,9 @@ impl<'a> FoldingContext<'a> {
 
     /// Resolve a stack variable name by signed stack offset.
     pub fn resolve_stack_var(&self, offset: i64) -> Option<String> {
+        if self.requires_certified_rendering() {
+            return self.certified_stack_var_name_for_offset(offset);
+        }
         if let Some(alias_name) = self
             .prepared_stack_alias_view()
             .and_then(|view| view.stack_alias_for_offset(offset))

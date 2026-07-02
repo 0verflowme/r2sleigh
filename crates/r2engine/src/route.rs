@@ -116,97 +116,26 @@ pub enum EnginePlan {
     RefuseWithEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineSemanticRoutePlan {
-    Standard,
-    StructuredWorker { reason: String },
-    SummaryIslands { reason: String },
-    LinearWorker { reason: String },
-    VmSummary { reason: String },
-    FallbackComment { comment: String },
-}
-
-impl EngineSemanticRoutePlan {
-    pub fn to_decompiler_route(&self) -> r2dec::SemanticRoutePlan {
-        match self {
-            Self::Standard => r2dec::SemanticRoutePlan::Standard,
-            Self::StructuredWorker { reason } => r2dec::SemanticRoutePlan::StructuredWorker {
-                reason: reason.clone(),
-            },
-            Self::SummaryIslands { reason } => r2dec::SemanticRoutePlan::SummaryIslands {
-                reason: reason.clone(),
-            },
-            Self::LinearWorker { reason } => r2dec::SemanticRoutePlan::LinearWorker {
-                reason: reason.clone(),
-            },
-            Self::VmSummary { reason } => r2dec::SemanticRoutePlan::VmSummary {
-                reason: reason.clone(),
-            },
-            Self::FallbackComment { comment } => r2dec::SemanticRoutePlan::FallbackComment {
-                comment: comment.clone(),
-            },
-        }
-    }
-}
-
-fn decompile_route_kind(route: &EngineSemanticRoutePlan) -> r2types::DecompileRouteKind {
-    match route {
-        EngineSemanticRoutePlan::Standard => r2types::DecompileRouteKind::Standard,
-        EngineSemanticRoutePlan::StructuredWorker { .. } => {
-            r2types::DecompileRouteKind::StructuredWorker
-        }
-        EngineSemanticRoutePlan::SummaryIslands { .. } => {
-            r2types::DecompileRouteKind::SummaryIslands
-        }
-        EngineSemanticRoutePlan::LinearWorker { .. } => r2types::DecompileRouteKind::LinearWorker,
-        EngineSemanticRoutePlan::VmSummary { .. } => r2types::DecompileRouteKind::VmSummary,
-        EngineSemanticRoutePlan::FallbackComment { .. } => {
-            r2types::DecompileRouteKind::FallbackComment
-        }
-    }
-}
-
-pub fn decompile_route_facts_from_decision(
-    decision: &EngineRouteDecision,
+fn provisional_decompile_route(
+    kind: r2types::DecompileRouteKind,
+    reason: Option<String>,
+    fallback_comment: Option<String>,
 ) -> r2types::DecompileRouteFacts {
+    let render_reason = fallback_comment
+        .clone()
+        .or_else(|| reason.clone())
+        .unwrap_or_else(|| "engine route not finalized".to_string());
     r2types::DecompileRouteFacts {
-        kind: decompile_route_kind(&decision.route),
-        reason: decision.route_reason.clone(),
-        fallback_comment: match &decision.route {
-            EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
-            _ => None,
-        },
-        skip_runtime_type_inference: decision.skip_runtime_type_inference,
-        use_prepared_semantic_view: decision.use_prepared_semantic_view,
-        proof_coverage: decision.proof_coverage.clone(),
-        render_permission: decision.render_permission.clone(),
-    }
-}
-
-pub fn decompile_route_from_facts(route: &r2types::DecompileRouteFacts) -> EngineSemanticRoutePlan {
-    match route.kind {
-        r2types::DecompileRouteKind::Standard => EngineSemanticRoutePlan::Standard,
-        r2types::DecompileRouteKind::StructuredWorker => {
-            EngineSemanticRoutePlan::StructuredWorker {
-                reason: route.reason.clone().unwrap_or_default(),
-            }
-        }
-        r2types::DecompileRouteKind::SummaryIslands => EngineSemanticRoutePlan::SummaryIslands {
-            reason: route.reason.clone().unwrap_or_default(),
-        },
-        r2types::DecompileRouteKind::LinearWorker => EngineSemanticRoutePlan::LinearWorker {
-            reason: route.reason.clone().unwrap_or_default(),
-        },
-        r2types::DecompileRouteKind::VmSummary => EngineSemanticRoutePlan::VmSummary {
-            reason: route.reason.clone().unwrap_or_default(),
-        },
-        r2types::DecompileRouteKind::FallbackComment => EngineSemanticRoutePlan::FallbackComment {
-            comment: route
-                .fallback_comment
-                .clone()
-                .or_else(|| route.reason.clone())
-                .unwrap_or_default(),
-        },
+        kind,
+        reason,
+        fallback_comment,
+        skip_runtime_type_inference: !matches!(kind, r2types::DecompileRouteKind::Standard),
+        use_prepared_semantic_view: matches!(kind, r2types::DecompileRouteKind::Standard),
+        proof_coverage: r2sym::ProofCoverage::default(),
+        render_permission: r2sym::RenderPermission::refuse(
+            r2sym::ProofOwner::R2engine,
+            render_reason,
+        ),
     }
 }
 
@@ -259,13 +188,7 @@ impl<'a> EngineRouteContext<'a> {
 pub struct EngineRouteDecision {
     pub request: EngineRequestKind,
     pub plan: EnginePlan,
-    pub route: EngineSemanticRoutePlan,
-    pub route_reason: Option<String>,
-    pub skip_runtime_type_inference: bool,
-    pub use_prepared_semantic_view: bool,
-    pub proof_coverage: r2sym::ProofCoverage,
-    pub render_permission: r2sym::RenderPermission,
-    pub refusal: Option<String>,
+    pub route: r2types::DecompileRouteFacts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -324,7 +247,7 @@ impl EngineTypedRouteDecision {
 
     pub fn reason(&self) -> Option<String> {
         match self {
-            Self::Decompile(decision) => decision.route_reason.clone(),
+            Self::Decompile(decision) => decision.route.reason.clone(),
             Self::Types(decision) => decision.reason.clone(),
             Self::Profile(decision) => decision.reason.clone(),
         }
@@ -332,21 +255,21 @@ impl EngineTypedRouteDecision {
 
     pub fn refusal(&self) -> Option<String> {
         match self {
-            Self::Decompile(decision) => decision.refusal.clone(),
+            Self::Decompile(decision) => decision.route.fallback_comment.clone(),
             Self::Types(_) | Self::Profile(_) => None,
         }
     }
 
     pub fn proof_coverage(&self) -> Option<r2sym::ProofCoverage> {
         match self {
-            Self::Decompile(decision) => Some(decision.proof_coverage.clone()),
+            Self::Decompile(decision) => Some(decision.route.proof_coverage.clone()),
             Self::Types(_) | Self::Profile(_) => None,
         }
     }
 
     pub fn render_permission(&self) -> Option<r2sym::RenderPermission> {
         match self {
-            Self::Decompile(decision) => Some(decision.render_permission.clone()),
+            Self::Decompile(decision) => Some(decision.route.render_permission.clone()),
             Self::Types(_) | Self::Profile(_) => None,
         }
     }
@@ -492,7 +415,8 @@ fn raw_const_addr_for_preprobe(varnode: &r2il::Varnode) -> Option<u64> {
     matches!(varnode.space, r2il::SpaceId::Const | r2il::SpaceId::Ram).then_some(varnode.offset)
 }
 
-pub fn decompile_probe_decision(
+#[cfg(test)]
+pub(crate) fn decompile_probe_decision(
     blocks: &[R2ILBlock],
     function_addr: u64,
     canonical_name: &str,
@@ -502,7 +426,7 @@ pub fn decompile_probe_decision(
     decompile_probe_decision_for_identity(blocks, &identity)
 }
 
-pub fn decompile_probe_decision_for_identity(
+pub(crate) fn decompile_probe_decision_for_identity(
     blocks: &[R2ILBlock],
     identity: &EngineFunctionIdentity,
 ) -> DecompileProbeDecision {
@@ -539,21 +463,29 @@ pub fn should_guard_program_orchestrator_decompile(block_count: usize, op_count:
     block_count > 4 || op_count > 96
 }
 
-pub fn semantic_route_from_artifact_plan(
+pub(crate) fn semantic_route_from_artifact_plan(
     semantic_artifact: &r2sym::SemanticArtifact,
-) -> Option<EngineSemanticRoutePlan> {
+) -> Option<r2types::DecompileRouteFacts> {
     match semantic_artifact.decompile_plan() {
         r2sym::DecompilePlan::NativeLinear { reason }
             if native_linear_artifact_plan_allows_summary_route(semantic_artifact) =>
         {
-            Some(EngineSemanticRoutePlan::LinearWorker { reason })
+            Some(provisional_decompile_route(
+                r2types::DecompileRouteKind::LinearWorker,
+                Some(reason),
+                None,
+            ))
         }
-        r2sym::DecompilePlan::NativeSummaryIslands { reason } => {
-            Some(EngineSemanticRoutePlan::SummaryIslands { reason })
-        }
-        r2sym::DecompilePlan::VmSummaryOnly { reason } => {
-            Some(EngineSemanticRoutePlan::VmSummary { reason })
-        }
+        r2sym::DecompilePlan::NativeSummaryIslands { reason } => Some(provisional_decompile_route(
+            r2types::DecompileRouteKind::SummaryIslands,
+            Some(reason),
+            None,
+        )),
+        r2sym::DecompilePlan::VmSummaryOnly { reason } => Some(provisional_decompile_route(
+            r2types::DecompileRouteKind::VmSummary,
+            Some(reason),
+            None,
+        )),
         _ => None,
     }
 }
@@ -597,29 +529,6 @@ fn native_linear_artifact_plan_allows_summary_route(
         )
 }
 
-pub fn has_primary_summary_only_native_worker(semantic_artifact: &r2sym::SemanticArtifact) -> bool {
-    semantic_artifact.granularity == r2sym::ArtifactGranularity::SummaryOnly
-        && semantic_artifact
-            .native_body()
-            .is_some_and(|native| native.has_primary_non_name_summary_islands())
-}
-
-pub fn has_renderable_primary_summary_only_native_worker(function_facts: &FunctionFacts) -> bool {
-    function_facts
-        .semantic_artifact()
-        .is_some_and(has_primary_summary_only_native_worker)
-}
-
-pub fn named_worker_summary_route(
-    named_worker_guarded: bool,
-    function_facts: &FunctionFacts,
-) -> Option<EngineSemanticRoutePlan> {
-    (named_worker_guarded && has_renderable_primary_summary_only_native_worker(function_facts))
-        .then(|| EngineSemanticRoutePlan::SummaryIslands {
-            reason: "named native-worker summary projection".to_string(),
-        })
-}
-
 pub(super) fn proof_coverage_from_type_facts(
     type_facts: &FunctionTypeFacts,
 ) -> r2sym::ProofCoverage {
@@ -636,7 +545,7 @@ pub(super) fn proof_coverage_from_type_facts(
 
 pub fn select_engine_plan(
     request: EngineRequestKind,
-    route: Option<&EngineSemanticRoutePlan>,
+    route: Option<&r2types::DecompileRouteFacts>,
     function_facts: Option<&FunctionFacts>,
 ) -> EnginePlan {
     match request {
@@ -653,30 +562,38 @@ pub fn select_engine_plan(
         EngineRequestKind::SymbolicQuery => EnginePlan::SemanticStructured,
         EngineRequestKind::Profile | EngineRequestKind::DebugFacts => EnginePlan::PreparedOnly,
         EngineRequestKind::Decompile => match route {
-            Some(EngineSemanticRoutePlan::Standard) | None => EnginePlan::FastLocal,
-            Some(EngineSemanticRoutePlan::FallbackComment { .. }) => EnginePlan::RefuseWithEvidence,
-            Some(EngineSemanticRoutePlan::VmSummary { .. })
-            | Some(EngineSemanticRoutePlan::SummaryIslands { .. })
-            | Some(EngineSemanticRoutePlan::LinearWorker { .. }) => EnginePlan::SemanticSummary,
-            Some(EngineSemanticRoutePlan::StructuredWorker { .. }) => {
+            Some(route) if route.kind == r2types::DecompileRouteKind::FallbackComment => {
+                EnginePlan::RefuseWithEvidence
+            }
+            Some(route)
+                if matches!(
+                    route.kind,
+                    r2types::DecompileRouteKind::VmSummary
+                        | r2types::DecompileRouteKind::SummaryIslands
+                        | r2types::DecompileRouteKind::LinearWorker
+                ) =>
+            {
+                EnginePlan::SemanticSummary
+            }
+            Some(route) if route.kind == r2types::DecompileRouteKind::StructuredWorker => {
                 EnginePlan::SemanticStructured
             }
+            Some(_) | None => EnginePlan::FastLocal,
         },
     }
 }
 
-pub fn plan_decompile_request(
+#[cfg(test)]
+pub(crate) fn plan_decompile_request(
     func_name: &str,
     function_facts: &FunctionFacts,
     prepared: Option<&SsaArtifact>,
-    type_facts: &FunctionTypeFacts,
     cfg_summary: &CFGRiskSummary,
 ) -> EngineRequestPlan {
     EngineRequestPlan::decompile(decompile_route_decision(
         func_name,
         function_facts,
         prepared,
-        type_facts,
         cfg_summary,
     ))
 }
@@ -706,34 +623,54 @@ pub fn plan_profile_request() -> EngineRequestPlan {
     EngineRequestPlan::profile(profile_route_decision())
 }
 
-pub fn semantic_route_plan(
+pub(crate) fn semantic_route_plan(
     func_name: &str,
     function_facts: &FunctionFacts,
     cfg_summary: &CFGRiskSummary,
-) -> EngineSemanticRoutePlan {
+) -> r2types::DecompileRouteFacts {
     let context = EngineRouteContext::new(func_name, function_facts, cfg_summary);
     semantic_route_plan_from_context(&context)
 }
 
-pub fn semantic_route_plan_from_context(
+pub(crate) fn semantic_route_plan_from_context(
     context: &EngineRouteContext<'_>,
-) -> EngineSemanticRoutePlan {
+) -> r2types::DecompileRouteFacts {
     if let Some(reason) = preferred_vm_summary_reason(context.function_facts) {
-        return EngineSemanticRoutePlan::VmSummary { reason };
+        return provisional_decompile_route(
+            r2types::DecompileRouteKind::VmSummary,
+            Some(reason),
+            None,
+        );
     }
     if let Some(comment) =
         preferred_semantic_fallback_comment(context.func_name, context.function_facts)
     {
-        return EngineSemanticRoutePlan::FallbackComment { comment };
+        return provisional_decompile_route(
+            r2types::DecompileRouteKind::FallbackComment,
+            Some(comment.clone()),
+            Some(comment),
+        );
     }
     if let Some(reason) = preferred_semantic_summary_islands_reason(context) {
-        return EngineSemanticRoutePlan::SummaryIslands { reason };
+        return provisional_decompile_route(
+            r2types::DecompileRouteKind::SummaryIslands,
+            Some(reason),
+            None,
+        );
     }
     if let Some(reason) = preferred_semantic_structuring_reason(context) {
-        return EngineSemanticRoutePlan::StructuredWorker { reason };
+        return provisional_decompile_route(
+            r2types::DecompileRouteKind::StructuredWorker,
+            Some(reason),
+            None,
+        );
     }
     if let Some(reason) = preferred_semantic_linearization_reason(context) {
-        return EngineSemanticRoutePlan::LinearWorker { reason };
+        return provisional_decompile_route(
+            r2types::DecompileRouteKind::LinearWorker,
+            Some(reason),
+            None,
+        );
     }
     if let Some(route) = context
         .function_facts
@@ -743,14 +680,22 @@ pub fn semantic_route_plan_from_context(
     {
         return route;
     }
-    EngineSemanticRoutePlan::Standard
+    if let Some(comment) =
+        preferred_unrenderable_summary_fallback_comment(context.func_name, context.function_facts)
+    {
+        return provisional_decompile_route(
+            r2types::DecompileRouteKind::FallbackComment,
+            Some(comment.clone()),
+            Some(comment),
+        );
+    }
+    provisional_decompile_route(r2types::DecompileRouteKind::Standard, None, None)
 }
 
-pub fn decompile_route_decision(
+pub(crate) fn decompile_route_decision(
     func_name: &str,
     function_facts: &FunctionFacts,
     prepared: Option<&SsaArtifact>,
-    type_facts: &FunctionTypeFacts,
     cfg_summary: &CFGRiskSummary,
 ) -> EngineRouteDecision {
     let route = semantic_route_plan(func_name, function_facts, cfg_summary);
@@ -759,126 +704,81 @@ pub fn decompile_route_decision(
         Some(&route),
         Some(function_facts),
     );
-    let route_reason = semantic_route_reason(&route);
-    let refusal = match &route {
-        EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
-        _ => None,
-    };
     let proof_coverage = prepared
         .map(|prepared| r2sym::ProofCoverage::from_prepared_certificates(prepared.certificates()))
         .unwrap_or_default()
-        .merge(function_facts.proof.clone())
-        .merge(proof_coverage_from_type_facts(type_facts));
+        .merge(function_facts.proof_coverage().clone())
+        .merge(proof_coverage_from_type_facts(function_facts.type_facts()));
     let render_permission = render_permission_for_decompile_route(
         &route,
         cfg_summary,
         &proof_coverage,
         prepared.is_some(),
     );
+    let mut route = route;
+    route.skip_runtime_type_inference =
+        should_skip_runtime_type_inference(prepared, function_facts);
+    route.use_prepared_semantic_view = should_use_prepared_semantic_view(prepared, function_facts);
+    route.proof_coverage = proof_coverage;
+    route.render_permission = render_permission;
     EngineRouteDecision {
         request: EngineRequestKind::Decompile,
         plan,
-        skip_runtime_type_inference: should_skip_runtime_type_inference(
-            prepared,
-            type_facts,
-            function_facts,
-        ),
-        use_prepared_semantic_view: should_use_prepared_semantic_view(prepared, function_facts),
         route,
-        route_reason,
-        proof_coverage,
-        render_permission,
-        refusal,
     }
 }
 
-pub fn decompile_route_decision_with_route(
-    mut decision: EngineRouteDecision,
-    route: EngineSemanticRoutePlan,
-    cfg_summary: &CFGRiskSummary,
-    prepared_available: bool,
-) -> EngineRouteDecision {
-    decision.route = route;
-    decision.plan = select_engine_plan(EngineRequestKind::Decompile, Some(&decision.route), None);
-    decision.route_reason = semantic_route_reason(&decision.route);
-    decision.refusal = match &decision.route {
-        EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
-        _ => None,
-    };
-    decision.render_permission = render_permission_for_decompile_route(
-        &decision.route,
-        cfg_summary,
-        &decision.proof_coverage,
-        prepared_available,
-    );
-    decision
-}
-
 fn render_permission_for_decompile_route(
-    route: &EngineSemanticRoutePlan,
+    route: &r2types::DecompileRouteFacts,
     cfg_summary: &CFGRiskSummary,
     proof_coverage: &r2sym::ProofCoverage,
     prepared_available: bool,
 ) -> r2sym::RenderPermission {
-    match route {
-        EngineSemanticRoutePlan::Standard => {
+    match route.kind {
+        r2types::DecompileRouteKind::Standard => {
             proof_coverage.standard_control_render_permission(cfg_summary, prepared_available)
         }
-        EngineSemanticRoutePlan::FallbackComment { comment } => {
-            r2sym::RenderPermission::refuse(r2sym::ProofOwner::R2engine, comment.clone())
-        }
-        EngineSemanticRoutePlan::VmSummary { reason }
-        | EngineSemanticRoutePlan::SummaryIslands { reason }
-        | EngineSemanticRoutePlan::LinearWorker { reason }
-        | EngineSemanticRoutePlan::StructuredWorker { reason } => {
-            r2sym::RenderPermission::summary(r2sym::ProofOwner::R2engine, reason.clone())
-        }
+        r2types::DecompileRouteKind::FallbackComment => r2sym::RenderPermission::refuse(
+            r2sym::ProofOwner::R2engine,
+            route
+                .fallback_comment
+                .clone()
+                .or_else(|| route.reason.clone())
+                .unwrap_or_else(|| "engine decompile route refused".to_string()),
+        ),
+        r2types::DecompileRouteKind::VmSummary
+        | r2types::DecompileRouteKind::SummaryIslands
+        | r2types::DecompileRouteKind::LinearWorker
+        | r2types::DecompileRouteKind::StructuredWorker => r2sym::RenderPermission::summary(
+            r2sym::ProofOwner::R2engine,
+            route
+                .reason
+                .clone()
+                .unwrap_or_else(|| "engine selected summary route".to_string()),
+        ),
     }
 }
 
-pub(crate) fn decompiler_context_with_route_decision(
-    context: r2dec::DecompilerContext,
-    decision: &EngineRouteDecision,
-) -> r2dec::DecompilerContext {
-    let mut function_facts = context.function_facts.clone();
-    function_facts.set_decompile_route(Some(decompile_route_facts_from_decision(decision)));
-    context.with_function_facts(function_facts)
+#[cfg(test)]
+pub(crate) fn semantic_route_reason(route: &r2types::DecompileRouteFacts) -> Option<String> {
+    route
+        .reason
+        .clone()
+        .or_else(|| route.fallback_comment.clone())
 }
 
-pub fn semantic_route_reason(route: &EngineSemanticRoutePlan) -> Option<String> {
-    match route {
-        EngineSemanticRoutePlan::StructuredWorker { reason }
-        | EngineSemanticRoutePlan::SummaryIslands { reason }
-        | EngineSemanticRoutePlan::LinearWorker { reason }
-        | EngineSemanticRoutePlan::VmSummary { reason } => Some(reason.clone()),
-        EngineSemanticRoutePlan::FallbackComment { comment } => Some(comment.clone()),
-        EngineSemanticRoutePlan::Standard => None,
-    }
-}
-
-pub fn detached_semantic_route_plan(
+#[cfg(test)]
+pub(crate) fn detached_semantic_route_plan(
     func_name: &str,
     blocks: &[R2ILBlock],
     function_facts: &FunctionFacts,
-) -> Option<EngineSemanticRoutePlan> {
+) -> Option<r2types::DecompileRouteFacts> {
     let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
     Some(semantic_route_plan(
         func_name,
         function_facts,
         &ssa_func.cfg_risk_summary(),
     ))
-}
-
-pub fn detached_semantic_linearization_reason(
-    func_name: &str,
-    blocks: &[R2ILBlock],
-    function_facts: &FunctionFacts,
-) -> Option<String> {
-    match detached_semantic_route_plan(func_name, blocks, function_facts)? {
-        EngineSemanticRoutePlan::LinearWorker { reason }
-        | EngineSemanticRoutePlan::SummaryIslands { reason } => Some(reason),
-        _ => None,
-    }
 }
 
 pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
@@ -1021,9 +921,8 @@ pub fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) ->
         && (capability.has_native_regions || capability.has_summary_islands)
 }
 
-pub fn should_skip_runtime_type_inference(
+pub(crate) fn should_skip_runtime_type_inference(
     prepared: Option<&SsaArtifact>,
-    _type_facts: &FunctionTypeFacts,
     function_facts: &FunctionFacts,
 ) -> bool {
     if prefer_symbolic_large_worker_decompile(function_facts) {
@@ -1073,9 +972,39 @@ fn preferred_semantic_fallback_comment(
             .residual_reasons
             .contains(&r2sym::ResidualReason::InterpreterRequiresStepSummary)
     {
-        return r2dec::semantic_fallback_comment(func_name, function_facts.semantics.as_ref());
+        return crate::semantic_fallback_comment_for_facts(func_name, function_facts);
     }
     None
+}
+
+fn preferred_unrenderable_summary_fallback_comment(
+    func_name: &str,
+    function_facts: &FunctionFacts,
+) -> Option<String> {
+    let artifact = function_facts.semantic_artifact()?;
+    if artifact.granularity != r2sym::ArtifactGranularity::SummaryOnly
+        || artifact.diagnostics.skipped_large_cfg
+        || !matches!(
+            artifact.decompile_plan(),
+            r2sym::DecompilePlan::NativeLinear { .. }
+        )
+    {
+        return None;
+    }
+    let native = artifact.native_body()?;
+    if native_body_has_renderable_worker_summary(native) {
+        return None;
+    }
+    Some(
+        crate::semantic_fallback_comment_for_facts(func_name, function_facts).unwrap_or_else(
+            || {
+                crate::artifact_guard_fallback_comment(
+                    func_name,
+                    "summary-only native linear artifact without renderable worker summary",
+                )
+            },
+        ),
+    )
 }
 
 fn preferred_semantic_linearization_reason(context: &EngineRouteContext<'_>) -> Option<String> {
@@ -1357,7 +1286,7 @@ fn worker_summary_has_known_length(summary: &r2sym::NativeWorkerSummary) -> bool
 }
 
 fn has_weak_summary_arg_contract_conflict(function_facts: &FunctionFacts) -> bool {
-    let Some(signature) = function_facts.types.render_authorized_signature() else {
+    let Some(signature) = function_facts.type_facts().render_authorized_signature() else {
         return false;
     };
     let Some(native) = function_facts

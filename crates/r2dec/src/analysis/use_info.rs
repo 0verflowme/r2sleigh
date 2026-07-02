@@ -2471,9 +2471,6 @@ fn collect_definitions(
                         ptr_arith: &scratch.info.ptr_arith,
                         stack_slots: &scratch.info.stack_slots,
                         forwarded_values: &scratch.info.forwarded_values,
-                        function_names: env.function_names,
-                        strings: env.strings,
-                        symbols: env.symbols,
                         type_oracle: env.type_oracle,
                     };
                     if let Some(prov) = scratch.info.forwarded_values.get(&key) {
@@ -2548,9 +2545,6 @@ fn rebuild_definitions(
                     ptr_arith: &scratch.info.ptr_arith,
                     stack_slots: &scratch.info.stack_slots,
                     forwarded_values: &scratch.info.forwarded_values,
-                    function_names: env.function_names,
-                    strings: env.strings,
-                    symbols: env.symbols,
                     type_oracle: env.type_oracle,
                 };
                 if let Some(prov) = scratch.info.forwarded_values.get(&key) {
@@ -5109,9 +5103,6 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                 ptr_arith: &scratch.info.ptr_arith,
                 stack_slots: &scratch.info.stack_slots,
                 forwarded_values: &scratch.info.forwarded_values,
-                function_names: env.function_names,
-                strings: env.strings,
-                symbols: env.symbols,
                 type_oracle: env.type_oracle,
             };
             let post_call_query = PostCallResultQuery {
@@ -5360,13 +5351,16 @@ fn analyze_call_args(scratch: &mut UseScratch, blocks: &[SSABlock], env: &PassEn
                     ptr_arith: &scratch.info.ptr_arith,
                     stack_slots: &scratch.info.stack_slots,
                     forwarded_values: &scratch.info.forwarded_values,
-                    function_names: env.function_names,
-                    strings: env.strings,
-                    symbols: env.symbols,
                     type_oracle: env.type_oracle,
                 };
-                let call_expr =
-                    call_result_expr_for_call_at(&scratch.info, &lower, block.addr, call_idx, op);
+                let call_expr = call_result_expr_for_call_at(
+                    &scratch.info,
+                    &lower,
+                    block.addr,
+                    call_idx,
+                    op,
+                    env,
+                );
                 if let Some(call_expr) = call_expr {
                     record_call_result_expr(&mut scratch.info, (block.addr, call_idx), &call_expr);
                     bind_call_result_alias_definitions(
@@ -5442,13 +5436,10 @@ fn bind_single_use_call_result_definitions(
                 ptr_arith: &scratch.info.ptr_arith,
                 stack_slots: &scratch.info.stack_slots,
                 forwarded_values: &scratch.info.forwarded_values,
-                function_names: env.function_names,
-                strings: env.strings,
-                symbols: env.symbols,
                 type_oracle: env.type_oracle,
             };
             let call_expr =
-                call_result_expr_for_call_at(&scratch.info, &lower, block.addr, op_idx, op);
+                call_result_expr_for_call_at(&scratch.info, &lower, block.addr, op_idx, op, env);
             let Some(call_expr) = call_expr else {
                 continue;
             };
@@ -5552,9 +5543,6 @@ fn bind_call_result_alias_definitions(
                     ptr_arith: &info.ptr_arith,
                     stack_slots: &info.stack_slots,
                     forwarded_values: &info.forwarded_values,
-                    function_names: env.function_names,
-                    strings: env.strings,
-                    symbols: env.symbols,
                     type_oracle: env.type_oracle,
                 };
                 let query = PostCallResultQuery {
@@ -5659,6 +5647,7 @@ fn call_result_expr_for_call_at(
     block_addr: u64,
     op_idx: usize,
     op: &SSAOp,
+    env: &PassEnv<'_>,
 ) -> Option<CExpr> {
     let bindings = info
         .call_args
@@ -5672,19 +5661,50 @@ fn call_result_expr_for_call_at(
         args.push(rendered);
     }
 
-    let func = match op {
-        SSAOp::Call { target } => lower.get_expr(target),
-        SSAOp::CallInd { target } => {
-            let resolved = lower.get_expr(target);
-            match resolved {
-                CExpr::Var(_) => resolved,
-                other => CExpr::Deref(Box::new(other)),
+    let func = if let Some(identity) = resolved_callee_expr_for_site(block_addr, op_idx, env) {
+        identity
+    } else {
+        match op {
+            SSAOp::Call { target } => lower.get_expr(target),
+            SSAOp::CallInd { target } => {
+                let resolved = lower.get_expr(target);
+                match resolved {
+                    CExpr::Var(_) => resolved,
+                    other => CExpr::Deref(Box::new(other)),
+                }
             }
+            _ => return None,
         }
-        _ => return None,
     };
 
     Some(CExpr::call(func, args))
+}
+
+fn resolved_callee_expr_for_site(
+    block_addr: u64,
+    op_idx: usize,
+    env: &PassEnv<'_>,
+) -> Option<CExpr> {
+    let resolved = CalleeResolutionFacts::resolve_target_policy(CalleeTargetResolutionRequest {
+        identity: CalleeTargetIdentityRequest {
+            resolution: env.callee_resolution,
+            callsite: Some(CallsiteKey {
+                block_addr,
+                op_index: op_idx,
+            }),
+            prepared_identity: None,
+            prepared_direct_target: None,
+            direct_target_context: None,
+        },
+        callee_facts: env.callee_facts,
+    })?;
+    Some(CExpr::Var(
+        resolved
+            .identity
+            .display_name
+            .clone()
+            .unwrap_or_else(|| resolved.identity.primary_key()),
+    ))
 }
 
 fn call_arg_expr_for_definition(
@@ -5700,25 +5720,7 @@ fn call_arg_expr_for_definition(
             0,
             &mut HashSet::new(),
         ),
-        SemanticCallArg::StringAddr(addr) => Some(
-            lower
-                .strings
-                .get(&addr)
-                .map(|s| CExpr::StringLit(s.clone()))
-                .or_else(|| {
-                    lower
-                        .symbols
-                        .get(&addr)
-                        .map(|name| CExpr::Var(name.clone()))
-                })
-                .or_else(|| {
-                    lower
-                        .function_names
-                        .get(&addr)
-                        .map(|name| CExpr::Var(name.clone()))
-                })
-                .unwrap_or(CExpr::UIntLit(addr)),
-        ),
+        SemanticCallArg::StringAddr(_) => None,
         SemanticCallArg::FallbackExpr(expr) => Some(expr),
     }?;
 
@@ -6491,15 +6493,6 @@ fn visible_call_arg_seed_expr(lower: &LowerCtx<'_>, var: &SSAVar) -> CExpr {
         return lower.get_expr(var);
     }
 
-    if let Some(addr) = crate::address::parse_address_from_var_name(&var.name)
-        && let Some(name) = lower
-            .function_names
-            .get(&addr)
-            .or_else(|| lower.symbols.get(&addr))
-    {
-        return CExpr::Var(name.clone());
-    }
-
     CExpr::Var(lower.var_name(var))
 }
 
@@ -6580,8 +6573,15 @@ fn call_result_expr_for_post_call_source(
     }
 
     let call_op = query.ops.get(call_idx)?;
-    call_result_expr_for_call_at(query.info, query.lower, query.block_addr, call_idx, call_op)
-        .map(|expr| (call_idx, expr))
+    call_result_expr_for_call_at(
+        query.info,
+        query.lower,
+        query.block_addr,
+        call_idx,
+        call_op,
+        query.env,
+    )
+    .map(|expr| (call_idx, expr))
 }
 
 fn is_post_call_result_alias_for_call(
@@ -6890,8 +6890,15 @@ fn latest_preceding_call_expr(
         .take(use_idx)
         .rev()
         .find(|(_, op)| matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }))?;
-    call_result_expr_for_call_at(query.info, query.lower, query.block_addr, call_idx, call_op)
-        .map(|expr| (call_idx, expr))
+    call_result_expr_for_call_at(
+        query.info,
+        query.lower,
+        query.block_addr,
+        call_idx,
+        call_op,
+        query.env,
+    )
+    .map(|expr| (call_idx, expr))
 }
 
 fn merge_arm64_stack_home_call_args(
@@ -7651,24 +7658,11 @@ fn semantic_call_arg_string_addr_inner(
         return None;
     }
 
-    if let Some(addr) = call_arg_expr_literal_value(expr, 0)
-        && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
-    {
-        return Some(addr);
-    }
-
     if let Some(addr) = constish_call_arg_address(expr, env) {
         return Some(addr);
     }
 
     if let Some(addr) = hex_digit_offset_call_arg_address(expr, env, 0) {
-        return Some(addr);
-    }
-
-    if var.is_const()
-        && let Some(addr) = utils::parse_const_value(&var.name)
-        && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
-    {
         return Some(addr);
     }
 
@@ -7749,12 +7743,6 @@ fn semantic_call_arg_addr_from_expr(
 
     match expr {
         CExpr::Var(name) => {
-            if let Some(addr) = utils::parse_const_value(name)
-                && (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr))
-            {
-                return Some(addr);
-            }
-
             if !visited.insert(name.clone()) {
                 return None;
             }
@@ -7865,28 +7853,8 @@ fn lookup_call_arg_definition_expr(info: &UseInfo, name: &str) -> Option<CExpr> 
         })
 }
 
-fn constish_call_arg_address(expr: &CExpr, env: &PassEnv<'_>) -> Option<u64> {
-    let addr = match expr {
-        CExpr::UIntLit(value) => Some(*value),
-        CExpr::IntLit(value) if *value >= 0 => Some(*value as u64),
-        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-            constish_call_arg_address(inner, env)
-        }
-        CExpr::Binary {
-            op: BinaryOp::Add,
-            left,
-            right,
-        } => match (
-            constish_call_arg_address(left, env),
-            constish_call_arg_address(right, env),
-        ) {
-            (Some(a), Some(b)) => a.checked_add(b),
-            _ => None,
-        },
-        _ => None,
-    }?;
-
-    (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr)).then_some(addr)
+fn constish_call_arg_address(_expr: &CExpr, _env: &PassEnv<'_>) -> Option<u64> {
+    None
 }
 
 fn hex_digit_offset_call_arg_address(expr: &CExpr, env: &PassEnv<'_>, depth: u32) -> Option<u64> {
@@ -7922,7 +7890,8 @@ fn hex_digit_offset_call_arg_address(expr: &CExpr, env: &PassEnv<'_>, depth: u32
         _ => return None,
     };
 
-    (env.strings.contains_key(&addr) || env.symbols.contains_key(&addr)).then_some(addr)
+    let _ = (addr, env);
+    None
 }
 
 fn reinterpret_decimal_digits_as_hex_call_arg(expr: &CExpr, depth: u32) -> Option<u64> {
@@ -8414,11 +8383,8 @@ fn call_arg_expr_resolves_to_literal(expr: &CExpr, env: &PassEnv<'_>, depth: u32
         _ => None,
     };
 
-    addr.is_some_and(|value| {
-        env.function_names.contains_key(&value)
-            || env.strings.contains_key(&value)
-            || env.symbols.contains_key(&value)
-    })
+    let _ = (addr, env);
+    false
 }
 
 fn call_arg_expr_literal_value(expr: &CExpr, depth: u32) -> Option<u64> {
@@ -9622,9 +9588,6 @@ mod tests {
             ptr_arith: &info.ptr_arith,
             stack_slots: &info.stack_slots,
             forwarded_values: &info.forwarded_values,
-            function_names: env.function_names,
-            strings: env.strings,
-            symbols: env.symbols,
             type_oracle: env.type_oracle,
         };
         let producers = block
@@ -9716,9 +9679,30 @@ mod tests {
         fixture
             .type_hints
             .insert("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8))));
+        let callsite = CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 2,
+        };
+        let callee_facts = BTreeMap::from([(
+            0x1000025d8,
+            imported_callee_fact(0x1000025d8, "sym.imp.atoi"),
+        )]);
+        let symbols = HashMap::new();
+        let known_function_signatures = HashMap::new();
+        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
+            [(callsite, 0x1000025d8)],
+            &r2types::CalleeIdentityContext {
+                function_names: &fixture.function_names,
+                symbols: &symbols,
+                callee_facts: &callee_facts,
+                known_function_signatures: &known_function_signatures,
+            },
+        );
         let base_env = fixture.env();
         let env = PassEnv {
             ret_reg_name: "x0",
+            callee_facts: &callee_facts,
+            callee_resolution: Some(&resolution),
             ..base_env
         };
 
@@ -9961,9 +9945,6 @@ mod tests {
             ptr_arith: &info.ptr_arith,
             stack_slots: &info.stack_slots,
             forwarded_values: &info.forwarded_values,
-            function_names: env.function_names,
-            strings: env.strings,
-            symbols: env.symbols,
             type_oracle: env.type_oracle,
         };
         let helper_idx = block
@@ -9977,10 +9958,11 @@ mod tests {
             block.addr,
             helper_idx,
             &block.ops[helper_idx],
+            &env,
         );
         assert!(
-            expr.is_some(),
-            "expected helper call expression synthesis to succeed for direct-X0 reuse shape, helper args={:?}, x8_32={:?}, load_10={:?}",
+            expr.is_none(),
+            "direct-X0 reuse shape must not synthesize helper call-result expressions without canonical call-result ownership proof, helper args={:?}, x8_32={:?}, load_10={:?}",
             info.call_args.get(&(block.addr, helper_idx)),
             info.semantic_values.get("X8_32"),
             info.semantic_values.get("tmp:24d00_10")

@@ -7,18 +7,17 @@ mod tests {
         FoldArchConfig, FoldInputs,
         analysis::{
             CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, PassEnv,
-            PreparedSemanticView, ScalarValue, StackInfo, StackSlotProvenance, StackSlotValueKind,
-            UseInfo,
+            PreparedSemanticView, ScalarValue, SemanticValue, StackSlotProvenance,
+            StackSlotValueKind,
         },
     };
-    use crate::fold::context::EffectRenderProofKind;
+    use crate::fold::context::{EffectRenderProofKind, empty_function_facts};
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2types::{
         CalleeArgEffect, CalleeFact, CalleeReturnRelation, ExternalField, ExternalStackBase,
-        ExternalStackVarSpec, ExternalStruct, ExternalTypeDb, FunctionParamSpec,
-        FunctionSignatureSpec, FunctionTypeFacts, Signedness, SolvedTypes, SolverDiagnostics,
-        StackSlotKey, StructShape, TypeArena, TypeId, TypeOracle, VisibleBinding,
-        VisibleBindingKind,
+        ExternalStackVarSpec, ExternalStruct, ExternalTypeDb, FieldAccessCertificate,
+        Signedness, SolvedTypes, SolverDiagnostics, StackSlotKey, StructShape, TypeArena, TypeId,
+        TypeOracle, VisibleBinding, VisibleBindingKind,
     };
     use crate::analysis::PtrArith;
 
@@ -141,9 +140,44 @@ mod tests {
     fn insert_authorized_call_args(
         ctx: &mut FoldingContext<'_>,
         source_call: (u64, usize),
-        args: Vec<crate::analysis::CallArgBinding>,
+        mut args: Vec<crate::analysis::CallArgBinding>,
     ) {
         authorize_call_arg_sources(ctx, &args);
+        let argument_values = args
+            .iter_mut()
+            .enumerate()
+            .map(|(index, binding)| {
+                let value = binding
+                    .source_value_id
+                    .unwrap_or(r2ssa::ValueId(10_000 + index as u32));
+                binding.source_value_id = Some(value);
+                r2types::CallArgumentValueFact { index, value }
+            })
+            .collect::<Vec<_>>();
+        let mut callsite_facts = ctx
+            .inputs
+            .function_facts
+            .callsites()
+            .cloned()
+            .unwrap_or_default();
+        let callsite = r2types::CallsiteKey {
+            block_addr: source_call.0,
+            op_index: source_call.1,
+        };
+        callsite_facts.by_callsite.insert(
+            callsite,
+            r2types::CallsiteArgumentFacts {
+                callsite,
+                call_site_id: r2ssa::CallSiteId(source_call.1 as u32),
+                at: r2ssa::InstId(source_call.1 as u32),
+                target: r2ssa::ValueId(9_999),
+                direct_target: None,
+                argument_values,
+                register_argument_locations: Vec::new(),
+                stack_argument_locations: Vec::new(),
+            },
+        );
+        install_function_callsite_facts(ctx, callsite_facts);
         ctx.state
             .analysis_ctx
             .use_info
@@ -191,10 +225,14 @@ mod tests {
                 known_function_signatures: &known_signatures,
             },
         );
-        if !callee_facts.is_empty() {
-            ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
-        }
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        mutate_function_facts(ctx, |function_facts| {
+            if !callee_facts.is_empty() {
+                let mut type_facts = function_facts.type_facts().clone();
+                type_facts.callee_facts = callee_facts;
+                function_facts.replace_type_facts(type_facts);
+            }
+            function_facts.set_callee_resolution(resolution);
+        });
     }
 
     fn install_indirect_callsite_identity(
@@ -216,7 +254,12 @@ mod tests {
         if r2types::callee_name_is_import_like(target_name) {
             identity = identity.with_import_linkage_evidence();
         }
-        let mut resolution = ctx.inputs.callee_resolution.cloned().unwrap_or_default();
+        let mut resolution = ctx
+            .inputs
+            .function_facts
+            .callee_resolution()
+            .cloned()
+            .unwrap_or_default();
         resolution.by_key.insert(key.clone(), identity);
         resolution.by_callsite.insert(
             r2types::CallsiteKey {
@@ -225,7 +268,9 @@ mod tests {
             },
             key,
         );
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        mutate_function_facts(ctx, |function_facts| {
+            function_facts.set_callee_resolution(resolution);
+        });
     }
 
     fn install_known_one_arg_signature(ctx: &mut FoldingContext<'_>) {
@@ -329,6 +374,22 @@ mod tests {
         prepared_from_r2il_blocks(&[entry], &arch).with_name(name)
     }
 
+    fn prepared_zero_arg_helper_return(name: &str) -> r2ssa::SsaArtifact {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+        prepared_from_r2il_blocks(&[entry], &arch).with_name(name)
+    }
+
     fn result_call_arg(
         expr: CExpr,
         source_call: (u64, usize),
@@ -359,22 +420,6 @@ mod tests {
             param_index: None,
             param_name: None,
             source_reg: None,
-        }
-    }
-
-    fn signature_spec(
-        ret: Option<CType>,
-        params: Vec<(&str, Option<CType>)>,
-    ) -> FunctionSignatureSpec {
-        FunctionSignatureSpec {
-            ret_type: ret.as_ref().map(crate::ctype_to_type_like),
-            params: params
-                .into_iter()
-                .map(|(name, ty)| FunctionParamSpec {
-                    name: name.to_string(),
-                    ty: ty.as_ref().map(crate::ctype_to_type_like),
-                })
-            .collect(),
         }
     }
 
@@ -426,12 +471,13 @@ mod tests {
     }
 
     fn install_minimal_import_callee_facts(ctx: &mut FoldingContext<'_>, facts: &[(u64, &str)]) {
-        ctx.inputs.callee_facts = Box::leak(Box::new(
+        install_function_callee_facts(
+            ctx,
             facts
                 .iter()
                 .map(|(addr, name)| (*addr, minimal_import_callee_fact(*addr, name)))
                 .collect(),
-        ));
+        );
     }
 
     fn visible_stack_binding(name: &str, ty: Option<CType>, offset: i64) -> VisibleBinding {
@@ -508,33 +554,27 @@ mod tests {
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
         let empty_str = Box::leak(Box::new(HashMap::new()));
-        let empty_callee = Box::leak(Box::new(BTreeMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             arch,
             function_names: empty_u64,
             strings: empty_u64,
             symbols: empty_u64,
-            callee_facts: empty_callee,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
+            function_facts: empty_function_facts(),
+            certified_rendering_required: false,
             stack_slots: empty_stack_slots,
+            field_access_certificates: &[],
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
-            semantic_artifact: None,
             param_register_aliases: empty_str,
             type_hints: empty_ty,
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
-            summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_call_sites: None,
         })
     }
 
@@ -559,34 +599,50 @@ mod tests {
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
         let empty_str = Box::leak(Box::new(HashMap::new()));
-        let empty_callee = Box::leak(Box::new(BTreeMap::new()));
         let empty_ty = Box::leak(Box::new(HashMap::new()));
         FoldingContext::from_inputs(FoldInputs {
             arch,
             function_names: empty_u64,
             strings: empty_u64,
             symbols: empty_u64,
-            callee_facts: empty_callee,
-            callee_resolution: None,
-            callsite_facts: None,
-            call_result_facts: None,
-            control_facts: None,
+            function_facts: empty_function_facts(),
+            certified_rendering_required: false,
             stack_slots: empty_stack_slots,
+            field_access_certificates: &[],
             external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
             external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
-            semantic_artifact: None,
             param_register_aliases: empty_str,
             type_hints: empty_ty,
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
-            summary_view: None,
             prepared_semantic_view: None,
             prepared_objects: None,
             prepared_memory: None,
-            prepared_call_sites: None,
         })
+    }
+
+    #[test]
+    fn certified_rendering_rejects_stable_stack_value_cache() {
+        let mut ctx = make_x86_64_ctx();
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .stable_stack_values
+            .insert(-8, SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(7))));
+
+        assert!(
+            ctx.stable_stack_value_for_offset(-8).is_some(),
+            "non-certified rendering may use local stable stack cache"
+        );
+
+        install_certified_function_facts(&mut ctx);
+
+        assert!(
+            ctx.stable_stack_value_for_offset(-8).is_none(),
+            "certified rendering must require FunctionFacts stack/render evidence instead of local stable stack cache"
+        );
     }
 
     fn test_callsite_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallsiteFacts {
@@ -696,8 +752,80 @@ mod tests {
         }
     }
 
+    fn test_call_result_facts_with_owner_for_source(
+        prepared: &r2ssa::SsaArtifact,
+        source_call: (u64, usize),
+    ) -> r2types::FunctionCallResultFacts {
+        let mut facts = test_call_result_facts(prepared);
+        let callsite = r2types::CallsiteKey {
+            block_addr: source_call.0,
+            op_index: source_call.1,
+        };
+        let values = facts
+            .by_callsite
+            .get(&callsite)
+            .cloned()
+            .unwrap_or_default();
+        for value in values {
+            if let Some(fact) = facts.by_value.get_mut(&value) {
+                fact.owner = Some(r2ssa::ValueOwner::StackSlot {
+                    object: r2ssa::ObjectId(1),
+                    offset: -8,
+                });
+            }
+        }
+        facts
+    }
+
+    fn install_stack_owner_function_facts(
+        ctx: &mut FoldingContext<'_>,
+        prepared: &r2ssa::SsaArtifact,
+        call_result_facts: r2types::FunctionCallResultFacts,
+        name: &str,
+        offset: i64,
+    ) {
+        let mut render_facts = test_render_facts(prepared);
+        for fact in call_result_facts.by_value.values() {
+            if let Some(r2ssa::ValueOwner::StackSlot {
+                object,
+                offset: owner_offset,
+            }) = fact.owner
+            {
+                render_facts.stack_slot_offsets.insert(object, owner_offset);
+            }
+        }
+        mutate_function_facts(ctx, |function_facts| {
+            function_facts.replace_type_facts(r2types::FunctionTypeFacts {
+                stack_slots: BTreeMap::from([(
+                    StackSlotKey {
+                        base: ExternalStackBase::StackPointer,
+                        offset,
+                    },
+                    r2types::ExternalStackSlotSpec {
+                        name: name.to_string(),
+                        ty: Some(r2types::CTypeLike::Int {
+                            bits: 64,
+                            signedness: r2types::Signedness::Unsigned,
+                        }),
+                        role: r2types::ExternalStackSlotRole::Local,
+                        ..r2types::ExternalStackSlotSpec::default()
+                    },
+                )]),
+                ..r2types::FunctionTypeFacts::default()
+            });
+            function_facts.set_call_results(call_result_facts);
+            function_facts.set_render(render_facts);
+        });
+    }
+
     fn test_control_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionControlFacts {
         let predicates = prepared.predicates();
+        let certificates = prepared.certificates();
+        let sorted_u64s = |values: &[u64]| {
+            let mut values = values.to_vec();
+            values.sort_unstable();
+            values
+        };
         let branch_predicates = predicates
             .predicates
             .values()
@@ -738,6 +866,27 @@ mod tests {
                 )
             })
             .collect();
+        let loops = certificates
+            .loops
+            .iter()
+            .map(|(loop_id, cert)| {
+                (
+                    *loop_id,
+                    r2types::LoopStructureFact {
+                        loop_id: *loop_id,
+                        proof_node: cert.proof_node.to_string(),
+                        header: cert.header,
+                        condition: cert.condition,
+                        condition_value: cert
+                            .condition
+                            .and_then(|id| predicates.predicates.get(&id).map(|p| p.condition)),
+                        body: sorted_u64s(&cert.body),
+                        latches: sorted_u64s(&cert.latches),
+                        exits: sorted_u64s(&cert.exits),
+                    },
+                )
+            })
+            .collect();
         let switches = predicates
             .switches
             .iter()
@@ -745,6 +894,7 @@ mod tests {
                 (
                     *block_addr,
                     r2types::SwitchSelectorFact {
+                        proof_node: r2ssa::ProofNodeId::switch_certificate(*block_addr).to_string(),
                         block_addr: switch.block_addr,
                         selector: switch.selector,
                         cases: switch.cases.clone(),
@@ -756,8 +906,240 @@ mod tests {
         r2types::FunctionControlFacts {
             branch_predicates,
             block_assumptions,
+            loops,
             switches,
         }
+    }
+
+    fn test_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionRenderFacts {
+        let certificates = prepared.certificates();
+        r2types::FunctionRenderFacts {
+            expressions: certificates
+                .expressions
+                .iter()
+                .map(|(value, cert)| {
+                    (
+                        *value,
+                        r2types::ExpressionRenderFact {
+                            value: cert.value,
+                            defining_inst: cert.defining_inst,
+                            width: cert.width,
+                            renderable: cert.renderable,
+                        },
+                    )
+                })
+                .collect(),
+            string_literals_by_value: BTreeMap::new(),
+            memory_accesses: certificates
+                .memory_accesses
+                .iter()
+                .map(|(access, cert)| {
+                    (
+                        *access,
+                        r2types::MemoryAccessRenderFact {
+                            access: cert.access,
+                            block_addr: cert.block_addr,
+                            op_index: cert.op_index,
+                            object: cert.object,
+                            address: cert.address,
+                            value: cert.value,
+                            is_write: cert.is_write,
+                            width: cert.width,
+                        },
+                    )
+                })
+                .collect(),
+            memory_accesses_by_op: certificates.memory_accesses_by_op.clone(),
+            member_accesses_by_op: BTreeMap::new(),
+            array_accesses_by_op: BTreeMap::new(),
+            returns_by_op: certificates
+                .returns
+                .iter()
+                .map(|cert| {
+                    (
+                        (cert.block_addr, cert.op_index),
+                        r2types::ReturnValueRenderFact {
+                            block_addr: cert.block_addr,
+                            op_index: cert.op_index,
+                            value: cert.value,
+                            width: cert.width,
+                        },
+                    )
+                })
+                .collect(),
+            stack_slot_offsets: certificates
+                .stack_slots
+                .iter()
+                .map(|(object, cert)| (*object, cert.offset))
+                .collect(),
+        }
+    }
+
+    fn install_function_facts(ctx: &mut FoldingContext<'_>, facts: r2types::FunctionFacts) {
+        ctx.inputs.function_facts = Box::leak(Box::new(facts));
+    }
+
+    fn mutate_function_facts(
+        ctx: &mut FoldingContext<'_>,
+        update: impl FnOnce(&mut r2types::FunctionFacts),
+    ) {
+        let mut facts = ctx.inputs.function_facts.clone();
+        update(&mut facts);
+        install_function_facts(ctx, facts);
+    }
+
+    fn install_function_callee_facts(
+        ctx: &mut FoldingContext<'_>,
+        facts: BTreeMap<u64, r2types::CalleeFact>,
+    ) {
+        mutate_function_facts(ctx, |function_facts| {
+            let mut type_facts = function_facts.type_facts().clone();
+            type_facts.callee_facts = facts;
+            function_facts.replace_type_facts(type_facts);
+        });
+    }
+
+    fn function_facts_for_prepared(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionFacts {
+        r2types::FunctionFacts::new(r2types::FunctionTypeFacts::default(), None)
+            .with_callsites(test_callsite_facts(prepared))
+            .with_call_results(test_call_result_facts(prepared))
+            .with_call_render(test_call_render_facts(prepared))
+            .with_control(test_control_facts(prepared))
+            .with_render(test_render_facts(prepared))
+    }
+
+    fn install_function_callsite_facts(
+        ctx: &mut FoldingContext<'_>,
+        facts: r2types::FunctionCallsiteFacts,
+    ) {
+        mutate_function_facts(ctx, |function_facts| function_facts.set_callsites(facts));
+    }
+
+    fn remove_function_callsite_facts(ctx: &mut FoldingContext<'_>) {
+        install_function_callsite_facts(ctx, r2types::FunctionCallsiteFacts::default());
+    }
+
+    fn install_function_call_result_facts(
+        ctx: &mut FoldingContext<'_>,
+        facts: r2types::FunctionCallResultFacts,
+    ) {
+        mutate_function_facts(ctx, |function_facts| function_facts.set_call_results(facts));
+    }
+
+    fn remove_function_call_result_facts(ctx: &mut FoldingContext<'_>) {
+        install_function_call_result_facts(ctx, r2types::FunctionCallResultFacts::default());
+    }
+
+    fn install_function_call_render_facts(
+        ctx: &mut FoldingContext<'_>,
+        facts: r2types::FunctionCallRenderFacts,
+    ) {
+        mutate_function_facts(ctx, |function_facts| function_facts.set_call_render(facts));
+    }
+
+    fn remove_function_call_render_facts(ctx: &mut FoldingContext<'_>) {
+        install_function_call_render_facts(ctx, r2types::FunctionCallRenderFacts::default());
+    }
+
+    fn install_function_control_facts(
+        ctx: &mut FoldingContext<'_>,
+        facts: r2types::FunctionControlFacts,
+    ) {
+        mutate_function_facts(ctx, |function_facts| function_facts.set_control(facts));
+    }
+
+    fn install_function_render_facts(
+        ctx: &mut FoldingContext<'_>,
+        facts: r2types::FunctionRenderFacts,
+    ) {
+        mutate_function_facts(ctx, |function_facts| function_facts.set_render(facts));
+    }
+
+    fn remove_function_render_facts(ctx: &mut FoldingContext<'_>) {
+        install_function_render_facts(ctx, r2types::FunctionRenderFacts::default());
+    }
+
+    fn certified_standard_route_for_test(reason: &str) -> r2types::DecompileRouteFacts {
+        r2types::DecompileRouteFacts {
+            kind: r2types::DecompileRouteKind::Standard,
+            reason: Some(reason.to_string()),
+            fallback_comment: None,
+            skip_runtime_type_inference: true,
+            use_prepared_semantic_view: true,
+            proof_coverage: r2sym::ProofCoverage::default(),
+            render_permission: r2sym::RenderPermission::certified(
+                r2sym::ProofOwner::R2engine,
+                reason,
+            ),
+        }
+    }
+
+    fn install_certified_function_facts(ctx: &mut FoldingContext<'_>) {
+        let facts = ctx
+            .inputs
+            .function_facts
+            .clone()
+            .with_decompile_route(certified_standard_route_for_test("test certified Standard"));
+        install_function_facts(ctx, facts);
+        ctx.inputs.certified_rendering_required = false;
+    }
+
+    fn install_string_literal_render_fact(
+        ctx: &mut FoldingContext<'_>,
+        value: r2ssa::ValueId,
+        address: u64,
+        text: &str,
+    ) {
+        let mut render_facts = ctx
+            .inputs
+            .function_facts
+            .render()
+            .cloned()
+            .unwrap_or_else(r2types::FunctionRenderFacts::default);
+        render_facts.string_literals_by_value.insert(
+            value,
+            r2types::function_facts::StringLiteralRenderFact {
+                value,
+                address,
+                text: text.to_string(),
+                source: r2types::function_facts::StringLiteralRenderSource::TypedFunctionFacts,
+            },
+        );
+        install_function_render_facts(ctx, render_facts);
+    }
+
+    fn test_call_render_facts(prepared: &r2ssa::SsaArtifact) -> r2types::FunctionCallRenderFacts {
+        let call_results = test_call_result_facts(prepared);
+        let by_callsite = prepared
+            .certificates()
+            .callsites
+            .values()
+            .map(|cert| {
+                let callsite = r2types::CallsiteKey {
+                    block_addr: cert.block_addr,
+                    op_index: cert.op_index,
+                };
+                let disposition = if call_results
+                    .results_for_site(callsite)
+                    .any(|result| matches!(result.owner, Some(r2ssa::ValueOwner::StackSlot { .. })))
+                {
+                    r2types::CallsiteRenderDisposition::AssignedResult
+                } else {
+                    r2types::CallsiteRenderDisposition::SideEffectStatement
+                };
+                (
+                    callsite,
+                    r2types::CallsiteRenderFact {
+                        callsite,
+                        target: Some(cert.target),
+                        disposition,
+                        proof_values: cert.argument_values.clone(),
+                        residual_reason: None,
+                    },
+                )
+            })
+            .collect();
+        r2types::FunctionCallRenderFacts { by_callsite }
     }
 
     fn make_x86_64_ctx_with_prepared<'a>(
@@ -765,10 +1147,7 @@ mod tests {
     ) -> FoldingContext<'a> {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
-        ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
-        ctx.inputs.call_result_facts =
-            Some(Box::leak(Box::new(test_call_result_facts(prepared_ssa))));
-        ctx.inputs.control_facts = Some(Box::leak(Box::new(test_control_facts(prepared_ssa))));
+        install_function_facts(&mut ctx, function_facts_for_prepared(prepared_ssa));
         ctx
     }
 
@@ -777,10 +1156,7 @@ mod tests {
     ) -> FoldingContext<'a> {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.prepared_ssa = Some(prepared_ssa);
-        ctx.inputs.callsite_facts = Some(Box::leak(Box::new(test_callsite_facts(prepared_ssa))));
-        ctx.inputs.call_result_facts =
-            Some(Box::leak(Box::new(test_call_result_facts(prepared_ssa))));
-        ctx.inputs.control_facts = Some(Box::leak(Box::new(test_control_facts(prepared_ssa))));
+        install_function_facts(&mut ctx, function_facts_for_prepared(prepared_ssa));
         ctx
     }
 
@@ -867,6 +1243,101 @@ mod tests {
         assert!(ctx.visible_names_share_stack_slot("buf", "local_8"));
         assert!(!ctx.visible_names_share_stack_slot("buf", "len"));
         assert!(!ctx.visible_names_share_stack_slot("not_stack_a", "not_stack_b"));
+    }
+
+    #[test]
+    fn certified_visible_stack_storage_requires_typed_render_fact() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_stack_name");
+        let render_facts = || r2types::FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
+            ..r2types::FunctionRenderFacts::default()
+        };
+        let stack_binding = |ty| VisibleBinding {
+            name: "buf".to_string(),
+            ty,
+            kind: VisibleBindingKind::Local,
+            stack_slot: Some(StackSlotKey {
+                base: ExternalStackBase::FramePointer,
+                offset: 8,
+            }),
+            param_index: None,
+            source_reg: None,
+        };
+
+        let mut missing_type_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_function_render_facts(&mut missing_type_ctx, render_facts());
+        install_certified_function_facts(&mut missing_type_ctx);
+        missing_type_ctx.inputs.visible_bindings =
+            Box::leak(Box::new(vec![stack_binding(None)]));
+        missing_type_ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .insert_stack_slot_for_name("buf", StackSlotProvenance::new(-8));
+
+        assert_eq!(
+            missing_type_ctx.stack_offset_for_visible_storage_name("local_8"),
+            None,
+            "certified rendering must not accept syntax-derived stack aliases"
+        );
+        assert_eq!(
+            missing_type_ctx.stack_offset_for_visible_storage_name("arg_8"),
+            None,
+            "certified rendering must not accept arg_N stack aliases without typed proof"
+        );
+        assert_eq!(
+            missing_type_ctx.stack_offset_for_visible_storage_name("buf"),
+            None,
+            "a canonical stack name without a renderable type is not exact proof"
+        );
+        assert!(
+            missing_type_ctx
+                .stack_offsets_for_visible_storage_name("buf")
+                .is_empty(),
+            "plural stack-offset lookup must not bypass certified exact identity"
+        );
+        assert_eq!(
+            missing_type_ctx
+                .stack_slot_provenance_for_name("buf")
+                .map(|slot| slot.offset),
+            None,
+            "renderer-local UseInfo stack provenance is not certified stack ownership"
+        );
+
+        let mut typed_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_function_render_facts(&mut typed_ctx, render_facts());
+        typed_ctx.inputs.visible_bindings = Box::leak(Box::new(vec![stack_binding(Some(
+            crate::ctype_to_type_like(&CType::Int(32)),
+        ))]));
+        typed_ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .insert_stack_slot_for_name("buf", StackSlotProvenance::new(-8));
+
+        assert_eq!(
+            typed_ctx.stack_offset_for_visible_storage_name("buf"),
+            Some(-8),
+            "typed canonical stack identity plus render facts should authorize the offset"
+        );
+        assert_eq!(
+            typed_ctx.stack_offsets_for_visible_storage_name("buf"),
+            vec![-8],
+            "plural stack-offset lookup should expose only certified offsets"
+        );
+        assert_eq!(
+            typed_ctx
+                .stack_slot_provenance_for_name("buf")
+                .map(|slot| slot.offset),
+            Some(-8),
+            "exact typed/render stack evidence should authorize matching UseInfo provenance"
+        );
     }
 
     #[test]
@@ -1115,84 +1586,6 @@ mod tests {
     }
 
     #[test]
-    fn test_call_args_clamp_non_variadic_signature() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401000, "sym.imp.memcpy".to_string());
-        ctx.set_function_names(names);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.memcpy".to_string(),
-            FunctionType {
-                return_type: CType::void_ptr(),
-                params: vec![CType::void_ptr(), CType::void_ptr(), CType::u64()],
-                variadic: false,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![
-                call_arg(CExpr::Var("a".to_string())),
-                call_arg(CExpr::Var("b".to_string())),
-                call_arg(CExpr::Var("c".to_string())),
-                call_arg(CExpr::Var("d".to_string())),
-            ],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401000", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 3, "non-variadic call should clamp to arity");
-    }
-
-    #[test]
-    fn typed_callee_resolution_overrides_raw_fold_identity_maps() {
-        let mut ctx = FoldingContext::new(64);
-        ctx.set_function_names(HashMap::from([(0x401000, "sym.local".to_string())]));
-        let typed_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
-        let symbols = HashMap::new();
-        let callee_facts = BTreeMap::new();
-        let known_signatures = HashMap::new();
-        let resolution = r2types::CalleeResolutionFacts::from_direct_call_targets(
-            [(
-                r2types::CallsiteKey {
-                    block_addr: 0x1000,
-                    op_index: 0,
-                },
-                0x401000,
-            )],
-            &r2types::CalleeIdentityContext {
-                function_names: &typed_names,
-                symbols: &symbols,
-                callee_facts: &callee_facts,
-                known_function_signatures: &known_signatures,
-            },
-        );
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
-
-        let identity = ctx.callee_identity_for_direct_target(0x401000);
-
-        assert_eq!(identity.display_name.as_deref(), Some("sym.imp.printf"));
-        assert!(identity.is_imported_name_hint());
-        assert!(
-            !ctx.callee_target_policy_for_identity(&identity).imported,
-            "typed function names alone are hints, not imported-call policy authority"
-        );
-    }
-
-    #[test]
     fn callsite_identity_controls_policy_when_rendered_callee_is_poisoned() {
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
@@ -1225,7 +1618,10 @@ mod tests {
                 known_function_signatures: &known_signatures,
             },
         );
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(resolution);
+        });
 
         let poisoned_callee = CExpr::Var("sym.local_two_arg".to_string());
         assert!(
@@ -1352,8 +1748,10 @@ mod tests {
                 known_function_signatures: &known_signatures,
             },
         );
-        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(resolution);
+        });
         let source_id = CallSiteId::from(source_call);
         ctx.state.analysis_ctx.ownership.call_ownership.insert(
             source_id,
@@ -1432,11 +1830,10 @@ mod tests {
         });
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)
             .with_name("prepared_direct_call_normalization");
-        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        let ctx = make_x86_64_ctx_with_prepared(&prepared);
 
         assert!(
-            ctx.inputs.callee_resolution.is_none(),
+            ctx.inputs.callee_resolution().is_none(),
             "test must prove the prepared direct target fallback, not typed resolution"
         );
 
@@ -1449,7 +1846,7 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(CExpr::Var("sym.poisoned".to_string()), vec![CExpr::IntLit(7)]),
-            "prepared direct targets and raw function-name maps must not repair rendered call targets without typed callsite resolution"
+            "prepared direct targets must not repair rendered call targets without typed callsite resolution"
         );
     }
 
@@ -1463,7 +1860,6 @@ mod tests {
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)
             .with_name("typed_direct_call_normalization");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.set_function_names(HashMap::from([(0x401050, "sym.raw_helper".to_string())]));
         install_callsite_resolution(&mut ctx, (0x1000, 0), 0x401050, "sym.helper", None);
 
         let normalized = ctx.normalize_call_expr_for_source_call(
@@ -1475,7 +1871,7 @@ mod tests {
         assert_eq!(
             normalized,
             CExpr::call(CExpr::Var("sym.helper".to_string()), vec![CExpr::IntLit(7)]),
-            "typed callsite resolution must outrank rendered callee text and raw function-name maps"
+            "typed callsite resolution must outrank rendered callee text"
         );
     }
 
@@ -1539,11 +1935,13 @@ mod tests {
     #[test]
     fn unresolved_source_call_does_not_authorize_raw_rendered_target_policy() {
         let mut ctx = FoldingContext::new(64);
-        ctx.set_function_names(HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]));
-        ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
-            0x401000,
-            minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
-        )])));
+        install_function_callee_facts(
+            &mut ctx,
+            BTreeMap::from([(
+                0x401000,
+                minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
+            )]),
+        );
         ctx.set_known_function_signatures(HashMap::from([(
             "sym.imp.one_arg".to_string(),
             FunctionType {
@@ -1584,10 +1982,13 @@ mod tests {
     #[test]
     fn unresolved_source_call_does_not_authorize_rendered_import_name_policy_or_signature() {
         let mut ctx = FoldingContext::new(64);
-        ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
-            0x401000,
-            minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
-        )])));
+        install_function_callee_facts(
+            &mut ctx,
+            BTreeMap::from([(
+                0x401000,
+                minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
+            )]),
+        );
         ctx.set_known_function_signatures(HashMap::from([(
             "sym.imp.one_arg".to_string(),
             FunctionType {
@@ -1642,11 +2043,13 @@ mod tests {
         });
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("prepared_policy");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        ctx.set_function_names(HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]));
-        ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
-            0x401000,
-            minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
-        )])));
+        install_function_callee_facts(
+            &mut ctx,
+            BTreeMap::from([(
+                0x401000,
+                minimal_import_callee_fact(0x401000, "sym.imp.one_arg"),
+            )]),
+        );
         ctx.set_known_function_signatures(HashMap::from([(
             "sym.imp.one_arg".to_string(),
             FunctionType {
@@ -2036,43 +2439,6 @@ mod tests {
     }
 
     #[test]
-    fn source_call_identity_residualizes_authoritative_source_result_call_arg() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(
-            &mut ctx,
-            source_call,
-            0x401000,
-            "sym.imp.one_arg",
-            Some(FunctionType {
-                return_type: CType::Void,
-                params: vec![CType::Int(32)],
-                variadic: false,
-            }),
-        );
-
-        let poisoned_func = CExpr::Var("sym.local_two_arg".to_string());
-        let binding = crate::analysis::CallArgBinding::result(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
-                poisoned_func.clone(),
-                vec![CExpr::IntLit(7), CExpr::IntLit(9)],
-            )),
-        )
-        .with_source_call(source_call.0, source_call.1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .insert(source_call, vec![binding]);
-
-        assert_eq!(
-            ctx.render_authoritative_source_args_for_call(source_call),
-            vec![FoldingContext::unresolved_call_arg_expr()],
-            "authoritative source replay must refuse uncertified nested call arguments",
-        );
-    }
-
-    #[test]
     fn source_keyed_normalization_uses_typed_identity_for_poisoned_cached_call() {
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
@@ -2339,6 +2705,85 @@ mod tests {
     }
 
     #[test]
+    fn certified_visible_owner_rhs_rejects_cached_source_call_without_callsite_proof() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x9000, 4);
+        entry.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("no_replay_callsite");
+        let mut ctx = make_x86_64_ctx();
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        let source_call = (0x1000, 1);
+        let source_id = CallSiteId::from(source_call);
+        ctx.state.analysis_ctx.ownership.call_ownership.insert(
+            source_id,
+            CallOwnershipFact {
+                source: source_id,
+                owner: Some(CallOwner {
+                    visible_name: "owned_result".to_string(),
+                    kind: CallOwnerKind::StableLocal,
+                }),
+                aliases: BTreeSet::new(),
+                direct_aliases: BTreeSet::new(),
+            },
+        );
+        ctx.state
+            .analysis_ctx
+            .ownership
+            .visible_owner_sources
+            .insert("owned_result".to_string(), source_id);
+        ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
+            source_call,
+            CExpr::call(CExpr::Var("sym.local.cached".to_string()), vec![CExpr::IntLit(7)]),
+        );
+
+        assert_eq!(
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name("owned_result"),
+            None,
+            "certified replay must not emit cached call_result_exprs without a certified callsite"
+        );
+    }
+
+    #[test]
+    fn certified_visible_owner_rhs_rejects_synthesized_call_without_owner_fact() {
+        let prepared = prepared_zero_arg_helper_call("certified_replay_callsite");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        ctx.set_external_stack_vars(HashMap::from([(
+            -8,
+            stack_var_spec("owned_result", Some(CType::u64()), Some("rbp")),
+        )]));
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                source_call,
+                crate::analysis::PreparedCallView {
+                    result_owner: Some(CExpr::Var("owned_result".to_string())),
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+        ctx.state.analysis_ctx.use_info.call_result_exprs.insert(
+            source_call,
+            CExpr::call(
+                CExpr::Var("sym.local.poisoned".to_string()),
+                vec![CExpr::IntLit(7)],
+            ),
+        );
+
+        assert_eq!(
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name("owned_result"),
+            None,
+            "certified replay must not synthesize a visible owner call without FunctionFacts owner proof"
+        );
+    }
+
+    #[test]
     fn recovered_direct_call_rhs_rejects_rendered_key_without_source_provenance() {
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
@@ -2509,45 +2954,6 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_variadic_source_call_replay_residualizes_uncertified_nested_call_arg() {
-        let mut ctx = FoldingContext::new(64);
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(
-            &mut ctx,
-            source_call,
-            0x401000,
-            "sym.imp.printf",
-            Some(FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            }),
-        );
-        let poisoned_func = CExpr::Var("sym.local_logger".to_string());
-        let binding = crate::analysis::CallArgBinding::result(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::call(
-                poisoned_func.clone(),
-                vec![
-                    CExpr::StringLit("value=%d\n".to_string()),
-                    CExpr::Var("x".to_string()),
-                ],
-            )),
-        )
-        .with_source_call(source_call.0, source_call.1);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .insert(source_call, vec![binding]);
-
-        assert_eq!(
-            ctx.render_authoritative_source_args_for_call(source_call),
-            vec![FoldingContext::unresolved_call_arg_expr()],
-            "variadic typed source calls must not render uncertified nested call arguments",
-        );
-    }
-
-    #[test]
     fn callsite_identity_does_not_printf_clamp_when_rendered_callee_is_poisoned() {
         let mut ctx = FoldingContext::new(64);
         let typed_names = HashMap::from([(0x401000, "sym.imp.printf".to_string())]);
@@ -2580,7 +2986,10 @@ mod tests {
                 known_function_signatures: &known_signatures,
             },
         );
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(resolution);
+        });
 
         let poisoned_callee = CExpr::Var("sym.local_logger".to_string());
         assert_eq!(
@@ -2653,8 +3062,10 @@ mod tests {
                 known_function_signatures: &known_signatures,
             },
         );
-        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(resolution);
+        });
 
         let poisoned_callee = CExpr::Var("sym.local_copy".to_string());
         assert!(
@@ -2696,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn call_with_args_lowering_uses_typed_callsite_identity_without_prepared_view() {
+    fn call_with_args_lowering_residualizes_typed_identity_without_callsite_facts() {
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
         install_indirect_callsite_identity(&mut ctx, source_call, "sym.imp.printf", None);
@@ -2711,18 +3122,14 @@ mod tests {
             )
             .expect("call-with-args fallback statement");
 
-        assert_eq!(
-            stmt,
-            CStmt::Expr(CExpr::call(
-                CExpr::Var("sym.imp.printf".to_string()),
-                vec![]
-            )),
-            "call-with-args lowering must use typed callsite identity instead of the rendered target variable",
+        assert!(
+            matches!(&stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments")),
+            "typed callee identity alone must not authorize executable call-with-args output: {stmt:?}",
         );
     }
 
     #[test]
-    fn indirect_call_with_args_lowering_uses_typed_callsite_identity_without_prepared_view() {
+    fn indirect_call_with_args_lowering_residualizes_typed_identity_without_callsite_facts() {
         let mut ctx = FoldingContext::new(64);
         let source_call = (0x1000, 0);
         install_indirect_callsite_identity(&mut ctx, source_call, "sym.imp.printf", None);
@@ -2737,115 +3144,9 @@ mod tests {
             )
             .expect("indirect call-with-args fallback statement");
 
-        assert_eq!(
-            stmt,
-            CStmt::Expr(CExpr::call(
-                CExpr::Var("sym.imp.printf".to_string()),
-                vec![]
-            )),
-            "indirect call-with-args lowering must use typed callsite identity instead of the rendered target variable",
-        );
-    }
-
-    #[test]
-    fn test_call_args_do_not_clamp_variadic_signature() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401010, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401010, "sym.imp.printf")]);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![
-                call_arg(CExpr::Var("fmt".to_string())),
-                call_arg(CExpr::Var("x".to_string())),
-                call_arg(CExpr::Var("y".to_string())),
-            ],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401010", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(
-            args.len(),
-            3,
-            "variadic call should keep all discovered call arguments"
-        );
-    }
-
-    #[test]
-    fn test_printf_call_args_do_not_clamp_to_literal_placeholder_count() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401010, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401010, "sym.imp.printf")]);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x40229e,
-            "Unknown test: %d\\n".to_string(),
-        )])));
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![
-                string_addr_call_arg(0x40229e),
-                call_arg(CExpr::Var("x".to_string())),
-                call_arg(CExpr::Var("y".to_string())),
-            ],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401010", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(
-            args,
-            vec![
-                CExpr::StringLit("Unknown test: %d\\n".to_string()),
-                CExpr::Var("x".to_string()),
-                CExpr::Var("y".to_string()),
-            ],
-            "printf literal placeholders must not delete certified trailing args, got {args:?}"
+        assert!(
+            matches!(&stmt, CStmt::Comment(comment) if comment.contains("uncertified indirect-call arguments")),
+            "typed callee identity alone must not authorize executable indirect call-with-args output: {stmt:?}",
         );
     }
 
@@ -2876,390 +3177,6 @@ mod tests {
             comment.contains("uncertified indirect-call arguments"),
             "unproven indirect call arguments must not render as executable C: {comment}"
         );
-    }
-
-    #[test]
-    fn test_call_args_keep_stable_semantic_pointer_arg_shape() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401020, "sym.imp.atoi".to_string());
-        ctx.set_function_names(names);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            "arg2".to_string(),
-            crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Root(
-                crate::analysis::ValueRef::from(make_var("arg2", 0, 8)),
-            )),
-        );
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Deref(Box::new(CExpr::binary(
-                BinaryOp::Add,
-                CExpr::Var("arg2".to_string()),
-                CExpr::IntLit(8),
-            ))))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401020", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        match &args[0] {
-            CExpr::Subscript { .. } => {}
-            CExpr::Deref(inner) => match inner.as_ref() {
-                CExpr::Binary {
-                    op: BinaryOp::Add,
-                    left,
-                    right,
-                } => {
-                    assert_eq!(left.as_ref(), &CExpr::Var("arg2".to_string()));
-                    assert_eq!(right.as_ref(), &CExpr::IntLit(8));
-                }
-                other => panic!("expected stable pointer arithmetic call arg, got: {other:?}"),
-            },
-            other => panic!("unexpected call arg shape: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_call_args_resolve_const_add_string_literal() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401030, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        let mut strings = HashMap::new();
-        strings.insert(0x402010, "hello".to_string());
-        ctx.inputs.strings = Box::leak(Box::new(strings));
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::binary(
-                BinaryOp::Add,
-                CExpr::UIntLit(0x402000),
-                CExpr::IntLit(0x10),
-            ))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401030", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert_eq!(args[0], CExpr::StringLit("hello".to_string()));
-    }
-
-    #[test]
-    fn test_imported_call_args_prefer_semantic_root_over_stack_placeholder_chain() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401040, "sym.imp.atoi".to_string());
-        ctx.set_function_names(names);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .definitions
-            .insert("stack_178".to_string(), CExpr::Var("arg2".to_string()));
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Deref(Box::new(CExpr::binary(
-                BinaryOp::Add,
-                CExpr::Deref(Box::new(CExpr::binary(
-                    BinaryOp::Add,
-                    CExpr::Var("stack_178".to_string()),
-                    CExpr::IntLit(160),
-                ))),
-                CExpr::IntLit(8),
-            ))))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401040", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert!(
-            !matches!(&args[0], CExpr::Var(name) if name.contains("stack_178")),
-            "imported call arg should not keep stack placeholder chain, got: {:?}",
-            args[0]
-        );
-        assert!(
-            expr_contains_var(&args[0], "arg2"),
-            "imported call arg should keep semantic root, got: {:?}",
-            args[0]
-        );
-    }
-
-    #[test]
-    fn test_imported_call_args_use_stack_info_alias_without_definition_override() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401040, "sym.imp.atoi".to_string());
-        ctx.set_function_names(names);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(0x178, "arg2".to_string());
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Deref(Box::new(CExpr::binary(
-                BinaryOp::Add,
-                CExpr::Deref(Box::new(CExpr::binary(
-                    BinaryOp::Add,
-                    CExpr::Var("stack_178".to_string()),
-                    CExpr::IntLit(160),
-                ))),
-                CExpr::IntLit(8),
-            ))))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401040", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert!(
-            !expr_contains_var(&args[0], "stack_178"),
-            "imported call arg should not keep stack placeholder root, got: {:?}",
-            args[0]
-        );
-        assert!(
-            expr_contains_var(&args[0], "arg2"),
-            "imported call arg should keep canonical stack alias root, got: {:?}",
-            args[0]
-        );
-    }
-
-    #[test]
-    fn test_imported_call_arg_does_not_promote_uncertified_stack_placeholder_to_slot() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401040, "sym.imp.atoi".to_string());
-        ctx.set_function_names(names);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Var("stack_20".to_string()))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401040", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert!(
-            expr_contains_var(&args[0], "stack_20"),
-            "uncertified placeholder should remain visibly uncertified, got: {:?}",
-            args[0]
-        );
-        assert!(
-            !expr_contains_var(&args[0], "slot_p20")
-                && !expr_contains_var(&args[0], "slot_20")
-                && !expr_contains_var(&args[0], "frame_base"),
-            "uncertified stack placeholder must not become a canonical slot, got: {:?}",
-            args[0]
-        );
-    }
-
-    #[test]
-    fn test_imported_call_arg_var_resolves_temp_backed_string_literal() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401030, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        let mut strings = HashMap::new();
-        strings.insert(0x40229e, "Unknown test: %d\\n".to_string());
-        ctx.inputs.strings = Box::leak(Box::new(strings));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "t6".to_string(),
-            CExpr::binary(
-                BinaryOp::Add,
-                CExpr::UIntLit(0x402000),
-                CExpr::IntLit(0x29e),
-            ),
-        );
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Var("t6".to_string()))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401030", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert_eq!(args[0], CExpr::StringLit("Unknown test: %d\\n".to_string()));
-    }
-
-    #[test]
-    fn test_imported_call_arg_addr_of_stack_slot_resolves_string_literal() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401030, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        let mut strings = HashMap::new();
-        strings.insert(0x40229e, "Unknown test: %d\\n".to_string());
-        ctx.inputs.strings = Box::leak(Box::new(strings));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "stack_68".to_string(),
-            CExpr::binary(
-                BinaryOp::Add,
-                CExpr::UIntLit(0x402000),
-                CExpr::IntLit(0x29e),
-            ),
-        );
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::addr_of(CExpr::Var("stack_68".to_string())))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401030", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert_eq!(args[0], CExpr::StringLit("Unknown test: %d\\n".to_string()));
     }
 
     #[test]
@@ -3618,426 +3535,6 @@ mod tests {
         assert!(
             stmts.is_empty(),
             "shadow imported-call result assignment should be suppressed once a named owner exists, got {stmts:?}"
-        );
-    }
-
-    #[test]
-    fn x86_calldefine_result_owner_survives_stack_store_reload_chain() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
-            0x401150,
-            "sym.imp.malloc".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.imp.malloc".to_string(),
-            FunctionType {
-                return_type: CType::ptr(CType::Int(8)),
-                params: vec![CType::Int(64)],
-                variadic: false,
-            },
-        )]));
-        ctx.inputs.external_stack_vars = Box::leak(Box::new(HashMap::from([
-            (
-                -0x18,
-                stack_var_spec("src", Some(CType::ptr(CType::Int(8))), Some("rbp")),
-            ),
-            (
-                -0x20,
-                stack_var_spec("len", Some(CType::Int(64)), Some("rbp")),
-            ),
-            (
-                -0x8,
-                stack_var_spec("buf", Some(CType::ptr(CType::Int(8))), Some("rbp")),
-            ),
-        ])));
-        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
-            visible_stack_binding("src", Some(CType::ptr(CType::Int(8))), -0x18),
-            visible_stack_binding("len", Some(CType::Int(64)), -0x20),
-            visible_stack_binding("buf", Some(CType::ptr(CType::Int(8))), -0x8),
-        ]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
-            ("rdi".to_string(), "src".to_string()),
-            ("rsi".to_string(), "len".to_string()),
-        ])));
-
-        let rbp = make_var("rbp", 1, 8);
-        let src = make_var("rdi", 0, 8);
-        let len = make_var("rsi", 0, 8);
-        let src_slot = make_var("tmp:src_slot", 1, 8);
-        let len_slot = make_var("tmp:len_slot", 1, 8);
-        let buf_slot = make_var("tmp:buf_slot", 1, 8);
-        let len_load = make_var("tmp:11f80", 1, 8);
-        let rax_1 = make_var("rax", 1, 8);
-        let rax_2 = make_var("rax", 2, 8);
-        let rdi_1 = make_var("rdi", 1, 8);
-        let rax_3 = make_var("rax", 3, 8);
-        let buf_store = make_var("tmp:6b00", 3, 8);
-        let buf_load = make_var("tmp:11f80", 2, 8);
-        let cmp_tmp = make_var("tmp:3ea80", 1, 8);
-
-        let block = make_block(vec![
-            SSAOp::IntAdd {
-                dst: src_slot.clone(),
-                a: rbp.clone(),
-                b: make_var("const:ffffffffffffffe8", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: src_slot.clone(),
-                val: src.clone(),
-            },
-            SSAOp::IntAdd {
-                dst: len_slot.clone(),
-                a: rbp.clone(),
-                b: make_var("const:ffffffffffffffe0", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: len_slot.clone(),
-                val: len.clone(),
-            },
-            SSAOp::Load {
-                dst: len_load.clone(),
-                space: "ram".to_string(),
-                addr: len_slot,
-            },
-            SSAOp::Copy {
-                dst: rax_1.clone(),
-                src: len_load,
-            },
-            SSAOp::IntAdd {
-                dst: rax_2.clone(),
-                a: rax_1,
-                b: make_var("const:1", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: rdi_1,
-                src: rax_2,
-            },
-            SSAOp::Call {
-                target: make_var("ram:401150", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax_3.clone() },
-            SSAOp::IntAdd {
-                dst: buf_slot.clone(),
-                a: rbp,
-                b: make_var("const:fffffffffffffff8", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: buf_store.clone(),
-                src: rax_3,
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: buf_slot.clone(),
-                val: buf_store.clone(),
-            },
-            SSAOp::Load {
-                dst: buf_load.clone(),
-                space: "ram".to_string(),
-                addr: buf_slot,
-            },
-            SSAOp::Copy {
-                dst: cmp_tmp.clone(),
-                src: buf_load.clone(),
-            },
-        ]);
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let source_call = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_result_source_by_alias
-            .get(&buf_load.display_name())
-            .copied();
-        assert_eq!(
-            source_call,
-            Some((block.addr, 8)),
-            "expected stack reload of the malloc result to keep the call-result source, got {:?}",
-            ctx.state.analysis_ctx.use_info.call_result_source_by_alias
-        );
-        assert_eq!(
-            ctx.get_expr(&buf_load),
-            CExpr::Var("buf".to_string()),
-            "expected stack reload of the malloc result to prefer the owned local; aliases={:?}; var_aliases={:?}; stack_slots={:?}",
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .call_result_aliases
-                .get(&(block.addr, 8)),
-            ctx.state.analysis_ctx.use_info.var_aliases,
-            ctx.state.analysis_ctx.use_info.stack_slots
-        );
-        assert_eq!(
-            ctx.get_expr(&cmp_tmp),
-            if ctx.get_expr(&cmp_tmp) == CExpr::Var("buf".to_string()) {
-                CExpr::Var("buf".to_string())
-            } else {
-                CExpr::call(
-                    CExpr::Var("sym.imp.malloc".to_string()),
-                    vec![CExpr::binary(
-                        BinaryOp::Add,
-                        CExpr::Var("len".to_string()),
-                        CExpr::IntLit(1),
-                    )],
-                )
-            },
-            "expected copied stack reload of the malloc result to keep a stable malloc-result shape"
-        );
-        let entry_stmts = ctx.fold_block(&block, block.addr);
-        assert!(
-            entry_stmts.iter().any(|stmt| {
-                matches!(
-                    stmt,
-                    CStmt::Expr(CExpr::Binary {
-                        op: BinaryOp::Assign,
-                        left,
-                        right,
-                    }) if matches!(left.as_ref(), CExpr::Var(name) if name == "buf")
-                        && matches!(
-                            right.as_ref(),
-                            CExpr::Call { func, args }
-                                if **func == CExpr::Var("sym.imp.malloc".to_string())
-                                    && args
-                                        == &vec![CExpr::binary(
-                                            BinaryOp::Add,
-                                            CExpr::Var("len".to_string()),
-                                            CExpr::IntLit(1),
-                                        )]
-                        )
-                )
-            }),
-            "expected stack store of copied malloc result to fold back to `buf = malloc(len + 1)`, got {entry_stmts:?}"
-        );
-    }
-
-    #[test]
-    fn x86_imported_memcpy_reuses_named_malloc_owner_from_negative_stack_slot() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x401140, "sym.imp.memcpy".to_string()),
-            (0x401150, "sym.imp.malloc".to_string()),
-        ])));
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym.imp.malloc".to_string(),
-                FunctionType {
-                    return_type: CType::ptr(CType::Int(8)),
-                    params: vec![CType::Int(64)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.memcpy".to_string(),
-                FunctionType {
-                    return_type: CType::ptr(CType::Int(8)),
-                    params: vec![
-                        CType::ptr(CType::Int(8)),
-                        CType::ptr(CType::Int(8)),
-                        CType::Int(64),
-                    ],
-                    variadic: false,
-                },
-            ),
-        ]));
-        let mut src_home = stack_var_spec("src_home", Some(CType::ptr(CType::Int(8))), Some("rbp"));
-        src_home.role = r2types::ExternalStackSlotRole::ParamHome;
-        src_home.param_index = Some(0);
-        src_home.param_name = Some("src".to_string());
-        src_home.source_reg = Some("rdi".to_string());
-        let mut len_home = stack_var_spec("len_home", Some(CType::Int(64)), Some("rbp"));
-        len_home.role = r2types::ExternalStackSlotRole::ParamHome;
-        len_home.param_index = Some(1);
-        len_home.param_name = Some("len".to_string());
-        len_home.source_reg = Some("rsi".to_string());
-        ctx.set_external_stack_vars(HashMap::from([
-            (-0x18, src_home),
-            (-0x20, len_home),
-            (
-                -0x8,
-                stack_var_spec("buf", Some(CType::ptr(CType::Int(8))), Some("rbp")),
-            ),
-        ]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
-            ("rdi".to_string(), "src".to_string()),
-            ("rsi".to_string(), "len".to_string()),
-        ])));
-
-        let rbp = make_var("rbp", 1, 8);
-        let src = make_var("rdi", 0, 8);
-        let len = make_var("rsi", 0, 8);
-        let src_slot = make_var("tmp:src_slot", 1, 8);
-        let len_slot = make_var("tmp:len_slot", 1, 8);
-        let buf_slot = make_var("tmp:buf_slot", 1, 8);
-        let len_load1 = make_var("tmp:11f80", 1, 8);
-        let rax_1 = make_var("rax", 1, 8);
-        let rax_2 = make_var("rax", 2, 8);
-        let rdi_1 = make_var("rdi", 1, 8);
-        let rax_3 = make_var("rax", 3, 8);
-        let buf_store = make_var("tmp:6b00", 3, 8);
-        let len_load2 = make_var("tmp:11f80", 3, 8);
-        let src_load = make_var("tmp:11f80", 4, 8);
-        let buf_load = make_var("tmp:11f80", 5, 8);
-        let rdx_2 = make_var("rdx", 2, 8);
-        let rcx_2 = make_var("rcx", 2, 8);
-        let rax_5 = make_var("rax", 5, 8);
-        let rsi_2 = make_var("rsi", 2, 8);
-        let rdi_3 = make_var("rdi", 3, 8);
-
-        let block = make_block(vec![
-            SSAOp::IntAdd {
-                dst: src_slot.clone(),
-                a: rbp.clone(),
-                b: make_var("const:ffffffffffffffe8", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: src_slot.clone(),
-                val: src,
-            },
-            SSAOp::IntAdd {
-                dst: len_slot.clone(),
-                a: rbp.clone(),
-                b: make_var("const:ffffffffffffffe0", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: len_slot.clone(),
-                val: len,
-            },
-            SSAOp::Load {
-                dst: len_load1.clone(),
-                space: "ram".to_string(),
-                addr: len_slot.clone(),
-            },
-            SSAOp::Copy {
-                dst: rax_1.clone(),
-                src: len_load1,
-            },
-            SSAOp::IntAdd {
-                dst: rax_2.clone(),
-                a: rax_1,
-                b: make_var("const:1", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: rdi_1,
-                src: rax_2,
-            },
-            SSAOp::Call {
-                target: make_var("ram:401150", 0, 8),
-            },
-            SSAOp::CallDefine { dst: rax_3.clone() },
-            SSAOp::IntAdd {
-                dst: buf_slot.clone(),
-                a: rbp.clone(),
-                b: make_var("const:fffffffffffffff8", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: buf_store,
-                src: rax_3,
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: buf_slot.clone(),
-                val: make_var("tmp:6b00", 3, 8),
-            },
-            SSAOp::IntAdd {
-                dst: make_var("tmp:4700", 6, 8),
-                a: rbp.clone(),
-                b: make_var("const:ffffffffffffffe0", 0, 8),
-            },
-            SSAOp::Load {
-                dst: len_load2.clone(),
-                space: "ram".to_string(),
-                addr: make_var("tmp:4700", 6, 8),
-            },
-            SSAOp::Copy {
-                dst: rdx_2.clone(),
-                src: len_load2,
-            },
-            SSAOp::IntAdd {
-                dst: make_var("tmp:4700", 7, 8),
-                a: rbp.clone(),
-                b: make_var("const:ffffffffffffffe8", 0, 8),
-            },
-            SSAOp::Load {
-                dst: src_load.clone(),
-                space: "ram".to_string(),
-                addr: make_var("tmp:4700", 7, 8),
-            },
-            SSAOp::Copy {
-                dst: rcx_2.clone(),
-                src: src_load,
-            },
-            SSAOp::IntAdd {
-                dst: make_var("tmp:4700", 8, 8),
-                a: rbp.clone(),
-                b: make_var("const:fffffffffffffff8", 0, 8),
-            },
-            SSAOp::Load {
-                dst: buf_load.clone(),
-                space: "ram".to_string(),
-                addr: make_var("tmp:4700", 8, 8),
-            },
-            SSAOp::Copy {
-                dst: rax_5.clone(),
-                src: buf_load.clone(),
-            },
-            SSAOp::Copy {
-                dst: rsi_2,
-                src: rcx_2,
-            },
-            SSAOp::Copy {
-                dst: rdi_3,
-                src: rax_5,
-            },
-            SSAOp::Call {
-                target: make_var("ram:401140", 0, 8),
-            },
-        ]);
-
-        let memcpy_idx = block.ops.len() - 1;
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let memcpy_args = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .get(&(block.addr, memcpy_idx))
-            .expect("memcpy args");
-        assert!(
-            matches!(
-                memcpy_args.first(),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::Semantic(crate::analysis::SemanticValue::Load { addr, .. }),
-                    role: crate::analysis::CallArgRole::Input,
-                    ..
-                }) if matches!(addr.base, crate::analysis::BaseRef::StackSlot(-8))
-            ),
-            "expected memcpy dst arg to remain owned by the negative stack slot, got {memcpy_args:?}"
-        );
-        assert!(
-            !matches!(
-                memcpy_args.get(1),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(name)),
-                    ..
-                }) if name.eq_ignore_ascii_case("rsi") || name.eq_ignore_ascii_case("esi")
-            ),
-            "expected memcpy src arg to avoid transient register fallback, got {memcpy_args:?}"
-        );
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        assert!(
-            stmts.iter().any(|stmt| matches!(
-                stmt,
-                CStmt::Expr(CExpr::Call { func, args })
-                    if **func == CExpr::Var("sym.imp.memcpy".to_string())
-                        && args.len() == 3
-                        && matches!(args.first(), Some(CExpr::Var(name)) if name == "buf")
-            )),
-            "expected imported memcpy to reuse the named malloc owner, got {stmts:?}; call_args={memcpy_args:?}"
         );
     }
 
@@ -4864,32 +4361,15 @@ mod tests {
                 .call_result_source_by_alias
                 .get(&dup_load.display_name())
                 .copied(),
-            Some((block.addr, 11)),
-            "expected dup stack reload to keep the malloc call-result source, got {:?}",
+            None,
+            "prepared owner text alone must not make a stack reload authoritative call-result source evidence, got {:?}",
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias
         );
         assert_eq!(
             ctx.stable_owned_call_result_name_for_source((block.addr, 11))
                 .as_deref(),
-            Some("dup"),
-            "stack-backed call-result ownership must come from prepared semantic authority"
-        );
-        assert_eq!(
-            ctx.get_expr(&dup_load),
-            CExpr::Var("dup".to_string()),
-            "expected dup stack reload to prefer the owned malloc result, got {:?}; aliases={:?}; defs={:?}; semantic={:?}",
-            ctx.get_expr(&dup_load),
-            ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .definitions
-                .get(&dup_load.display_name()),
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .semantic_values
-                .get(&dup_load.display_name())
+            None,
+            "prepared owner text alone must not authorize stable call-result ownership without canonical facts"
         );
         assert_eq!(
             ctx.get_expr(&make_var("rax", 4, 8)),
@@ -4909,7 +4389,7 @@ mod tests {
                 CExpr::binary(
                     BinaryOp::Add,
                     CExpr::call(
-                        CExpr::Var("sym.imp.strlen".to_string()),
+                        CExpr::Var("ram:401140".to_string()),
                         vec![CExpr::Var("s".to_string())],
                     ),
                     CExpr::IntLit(1),
@@ -4928,10 +4408,10 @@ mod tests {
                 CExpr::IntLit(1),
             ))
         );
-        assert_eq!(
+        assert_ne!(
             ctx.get_expr(&final_ret),
-            CExpr::Var("dup".to_string()),
-            "expected the final return register copy to stay bound to dup instead of the earlier len result, got {:?}; aliases={:?}; defs={:?}; semantic={:?}",
+            CExpr::Var("len".to_string()),
+            "final return register copy must not reuse the earlier len result when dup ownership is unproven, got {:?}; aliases={:?}; defs={:?}; semantic={:?}",
             ctx.get_expr(&final_ret),
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
             ctx.state
@@ -5064,157 +4544,6 @@ mod tests {
             "source-keyed owned strlen call expression should rewrite to len; call_sources={:?}; aliases={:?}",
             ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
             ctx.state.analysis_ctx.use_info.call_result_aliases
-        );
-    }
-
-    #[test]
-    fn x86_imported_malloc_arg_reuses_owned_strlen_inside_add() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x401140, "sym.imp.strlen".to_string()),
-            (0x401190, "sym.imp.malloc".to_string()),
-        ])));
-        install_minimal_import_callee_facts(
-            &mut ctx,
-            &[
-                (0x401140, "sym.imp.strlen"),
-                (0x401190, "sym.imp.malloc"),
-            ],
-        );
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym.imp.strlen".to_string(),
-                FunctionType {
-                    return_type: CType::UInt(64),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.malloc".to_string(),
-                FunctionType {
-                    return_type: CType::ptr(CType::Int(8)),
-                    params: vec![CType::UInt(64)],
-                    variadic: false,
-                },
-            ),
-        ]));
-        let mut s_home = stack_var_spec("s_home", Some(CType::ptr(CType::Int(8))), Some("rbp"));
-        s_home.role = r2types::ExternalStackSlotRole::ParamHome;
-        s_home.param_index = Some(0);
-        s_home.param_name = Some("s".to_string());
-        s_home.source_reg = Some("rdi".to_string());
-        ctx.set_external_stack_vars(HashMap::from([
-            (-0x18, s_home),
-            (
-                -0x8,
-                stack_var_spec("len", Some(CType::UInt(64)), Some("rbp")),
-            ),
-        ]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
-            "rdi".to_string(),
-            "s".to_string(),
-        )])));
-
-        let rbp = make_var("rbp", 1, 8);
-        let s_slot = make_var("tmp:s_slot", 1, 8);
-        let s_load = make_var("tmp:11f80", 1, 8);
-        let len_slot = make_var("tmp:len_slot", 1, 8);
-        let len_store = make_var("tmp:6b00", 1, 8);
-        let len_load = make_var("tmp:11f80", 2, 8);
-        let len_tmp = make_var("rax", 3, 8);
-        let malloc_arg = make_var("rax", 4, 8);
-
-        let block = make_block(vec![
-            SSAOp::IntAdd {
-                dst: s_slot.clone(),
-                a: rbp.clone(),
-                b: make_var("const:ffffffffffffffe8", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: s_slot.clone(),
-                val: make_var("rdi", 0, 8),
-            },
-            SSAOp::Load {
-                dst: s_load.clone(),
-                space: "ram".to_string(),
-                addr: s_slot.clone(),
-            },
-            SSAOp::Copy {
-                dst: make_var("rax", 1, 8),
-                src: s_load,
-            },
-            SSAOp::Copy {
-                dst: make_var("rdi", 1, 8),
-                src: make_var("rax", 1, 8),
-            },
-            SSAOp::Call {
-                target: make_var("ram:401140", 0, 8),
-            },
-            SSAOp::CallDefine {
-                dst: make_var("rax", 2, 8),
-            },
-            SSAOp::IntAdd {
-                dst: len_slot.clone(),
-                a: rbp,
-                b: make_var("const:fffffffffffffff8", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: len_store.clone(),
-                src: make_var("rax", 2, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: len_slot.clone(),
-                val: len_store,
-            },
-            SSAOp::Load {
-                dst: len_load.clone(),
-                space: "ram".to_string(),
-                addr: len_slot,
-            },
-            SSAOp::Copy {
-                dst: len_tmp.clone(),
-                src: len_load,
-            },
-            SSAOp::IntAdd {
-                dst: malloc_arg.clone(),
-                a: len_tmp,
-                b: make_var("const:1", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rdi", 3, 8),
-                src: malloc_arg,
-            },
-            SSAOp::Call {
-                target: make_var("ram:401190", 0, 8),
-            },
-        ]);
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let call_idx = block
-            .ops
-            .iter()
-            .position(|op| matches!(op, SSAOp::Call { target } if target.display_name() == "ram:401190_0"))
-            .expect("malloc call index");
-        let rendered = ctx.render_call_args_for_callee(
-            &CExpr::Var("const:401190".to_string()),
-            ctx.call_args_map()
-                .get(&(block.addr, call_idx))
-                .cloned()
-                .expect("malloc call args"),
-        );
-        assert_eq!(
-            rendered,
-            vec![CExpr::binary(
-                BinaryOp::Add,
-                CExpr::Var("len".to_string()),
-                CExpr::IntLit(1),
-            )],
-            "expected imported malloc arg to reuse len + 1, got {rendered:?}; call_args={:?}; aliases={:?}",
-            ctx.call_args_map().get(&(block.addr, call_idx)),
-            ctx.state.analysis_ctx.use_info.call_result_source_by_alias
         );
     }
 
@@ -5433,403 +4762,6 @@ mod tests {
                 .semantic_values
                 .get(&final_ret.display_name())
         );
-    }
-
-    #[test]
-    fn x86_my_strdup_like_body_and_exit_blocks_fold_to_memcpy_and_return_dup() {
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    cond: Varnode::constant(1, 1),
-                    target: Varnode::constant(0x1008, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: Varnode::constant(0x1008, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: Varnode::register(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
-        func.get_block_mut(0x1000).expect("entry").ops = vec![
-            SSAOp::IntAdd {
-                dst: make_var("tmp:s_slot", 1, 8),
-                a: make_var("rbp", 1, 8),
-                b: make_var("const:ffffffffffffffe8", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: make_var("tmp:s_slot", 1, 8),
-                val: make_var("rdi", 0, 8),
-            },
-            SSAOp::Load {
-                dst: make_var("tmp:11f80", 1, 8),
-                space: "ram".to_string(),
-                addr: make_var("tmp:s_slot", 1, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rdi", 1, 8),
-                src: make_var("tmp:11f80", 1, 8),
-            },
-            SSAOp::Call {
-                target: make_var("ram:401140", 0, 8),
-            },
-            SSAOp::CallDefine {
-                dst: make_var("rax", 2, 8),
-            },
-            SSAOp::IntAdd {
-                dst: make_var("tmp:len_slot", 1, 8),
-                a: make_var("rbp", 1, 8),
-                b: make_var("const:fffffffffffffff8", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: make_var("tmp:len_slot", 1, 8),
-                val: make_var("rax", 2, 8),
-            },
-            SSAOp::Load {
-                dst: make_var("tmp:11f80", 2, 8),
-                space: "ram".to_string(),
-                addr: make_var("tmp:len_slot", 1, 8),
-            },
-            SSAOp::IntAdd {
-                dst: make_var("rax", 4, 8),
-                a: make_var("tmp:11f80", 2, 8),
-                b: make_var("const:1", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rdi", 3, 8),
-                src: make_var("rax", 4, 8),
-            },
-            SSAOp::Call {
-                target: make_var("ram:401190", 0, 8),
-            },
-            SSAOp::CallDefine {
-                dst: make_var("rax", 5, 8),
-            },
-            SSAOp::IntAdd {
-                dst: make_var("tmp:dup_slot", 1, 8),
-                a: make_var("rbp", 1, 8),
-                b: make_var("const:fffffffffffffff0", 0, 8),
-            },
-            SSAOp::Store {
-                space: "ram".to_string(),
-                addr: make_var("tmp:dup_slot", 1, 8),
-                val: make_var("rax", 5, 8),
-            },
-            SSAOp::Load {
-                dst: make_var("tmp:11f80", 3, 8),
-                space: "ram".to_string(),
-                addr: make_var("tmp:dup_slot", 1, 8),
-            },
-            SSAOp::IntSub {
-                dst: make_var("tmp:3eb80", 1, 8),
-                a: make_var("tmp:11f80", 3, 8),
-                b: make_var("const:0", 0, 8),
-            },
-            SSAOp::IntEqual {
-                dst: make_var("zf", 3, 1),
-                a: make_var("tmp:3eb80", 1, 8),
-                b: make_var("const:0", 0, 8),
-            },
-            SSAOp::CBranch {
-                target: make_var("ram:1008", 0, 8),
-                cond: make_var("zf", 3, 1),
-            },
-        ];
-        func.get_block_mut(0x1004).expect("body").ops = vec![
-            SSAOp::Load {
-                dst: make_var("tmp:11f80", 4, 8),
-                space: "ram".to_string(),
-                addr: make_var("tmp:len_slot", 1, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rax", 6, 8),
-                src: make_var("tmp:11f80", 4, 8),
-            },
-            SSAOp::IntAdd {
-                dst: make_var("tmp:4700", 8, 8),
-                a: make_var("rax", 6, 8),
-                b: make_var("const:1", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rdx", 3, 8),
-                src: make_var("tmp:4700", 8, 8),
-            },
-            SSAOp::Load {
-                dst: make_var("tmp:11f80", 5, 8),
-                space: "ram".to_string(),
-                addr: make_var("tmp:s_slot", 1, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rcx", 3, 8),
-                src: make_var("tmp:11f80", 5, 8),
-            },
-            SSAOp::Load {
-                dst: make_var("tmp:11f80", 6, 8),
-                space: "ram".to_string(),
-                addr: make_var("tmp:dup_slot", 1, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rax", 7, 8),
-                src: make_var("tmp:11f80", 6, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rsi", 3, 8),
-                src: make_var("rcx", 3, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rdi", 5, 8),
-                src: make_var("rax", 7, 8),
-            },
-            SSAOp::Call {
-                target: make_var("ram:401170", 0, 8),
-            },
-            SSAOp::CallDefine {
-                dst: make_var("rax", 8, 8),
-            },
-            SSAOp::Branch {
-                target: make_var("ram:1008", 0, 8),
-            },
-        ];
-        func.get_block_mut(0x1008).expect("exit").ops = vec![
-            SSAOp::Load {
-                dst: make_var("tmp:11f80", 8, 8),
-                space: "ram".to_string(),
-                addr: make_var("tmp:dup_slot", 1, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rax", 10, 8),
-                src: make_var("tmp:11f80", 8, 8),
-            },
-            SSAOp::Return {
-                target: make_var("rip", 1, 8),
-            },
-        ];
-
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x401140, "sym.imp.strlen".to_string()),
-            (0x401170, "sym.imp.memcpy".to_string()),
-            (0x401190, "sym.imp.malloc".to_string()),
-        ])));
-        install_minimal_import_callee_facts(
-            &mut ctx,
-            &[
-                (0x401140, "sym.imp.strlen"),
-                (0x401170, "sym.imp.memcpy"),
-                (0x401190, "sym.imp.malloc"),
-            ],
-        );
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym.imp.strlen".to_string(),
-                FunctionType {
-                    return_type: CType::UInt(64),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.malloc".to_string(),
-                FunctionType {
-                    return_type: CType::ptr(CType::Int(8)),
-                    params: vec![CType::UInt(64)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.memcpy".to_string(),
-                FunctionType {
-                    return_type: CType::ptr(CType::Unknown),
-                    params: vec![
-                        CType::ptr(CType::Unknown),
-                        CType::ptr(CType::Int(8)),
-                        CType::UInt(64),
-                    ],
-                    variadic: false,
-                },
-            ),
-        ]));
-        let mut s_home = stack_var_spec("s_home", Some(CType::ptr(CType::Int(8))), Some("rbp"));
-        s_home.role = r2types::ExternalStackSlotRole::ParamHome;
-        s_home.param_index = Some(0);
-        s_home.param_name = Some("s".to_string());
-        s_home.source_reg = Some("rdi".to_string());
-        ctx.set_external_stack_vars(HashMap::from([
-            (-0x18, s_home),
-            (
-                -0x8,
-                stack_var_spec("len", Some(CType::UInt(64)), Some("rbp")),
-            ),
-            (
-                -0x10,
-                stack_var_spec("dup", Some(CType::ptr(CType::Int(8))), Some("rbp")),
-            ),
-        ]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
-            "rdi".to_string(),
-            "s".to_string(),
-        )])));
-        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
-            call_view_by_site: BTreeMap::from([
-                (
-                    (0x1000, 4),
-                    crate::analysis::PreparedCallView {
-                        result_owner: Some(CExpr::Var("len".to_string())),
-                        ..crate::analysis::PreparedCallView::default()
-                    },
-                ),
-                (
-                    (0x1000, 11),
-                    crate::analysis::PreparedCallView {
-                        result_owner: Some(CExpr::Var("dup".to_string())),
-                        ..crate::analysis::PreparedCallView::default()
-                    },
-                ),
-            ]),
-            ..PreparedSemanticView::default()
-        })));
-
-        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
-        ctx.analyze_blocks(&fold_blocks);
-        ctx.analyze_function_structure(&func);
-
-        assert!(
-            ctx.state
-                .analysis_ctx
-                .ownership
-                .has_visible_owner_name("dup"),
-            "expected semantic ownership facts to keep dup as a visible owned call result, got {:?}",
-            ctx.state.analysis_ctx.ownership
-        );
-        let malloc_source = ctx
-            .state
-            .analysis_ctx
-            .ownership
-            .source_for_alias("tmp:11f80_8")
-            .expect("malloc result source");
-        let malloc_fact = ctx
-            .state
-            .analysis_ctx
-            .ownership
-            .ownership_for_source(malloc_source)
-            .expect("malloc ownership fact");
-        assert!(
-            malloc_fact
-                .owner
-                .as_ref()
-                .is_some_and(|owner| owner.visible_name == "dup"),
-            "expected malloc ownership to resolve to dup, got {malloc_fact:?}"
-        );
-
-        let cond_expr = ctx
-            .extract_condition_from_block(func.get_block(0x1000).expect("entry"))
-            .expect("entry condition");
-        assert!(
-            matches!(
-                &cond_expr,
-                CExpr::Binary {
-                    op: BinaryOp::Eq,
-                    left,
-                    right,
-                } if matches!(left.as_ref(), CExpr::Var(name) if name == "dup")
-                    && matches!(right.as_ref(), CExpr::IntLit(0))
-            ) || matches!(
-                &cond_expr,
-                CExpr::Unary {
-                    op: UnaryOp::Not,
-                    operand,
-                } if matches!(operand.as_ref(), CExpr::Var(name) if name == "dup")
-            ),
-            "expected my_strdup null-check to reuse the owned dup alias, got {cond_expr:?}"
-        );
-        assert!(
-            !expr_contains_var(&cond_expr, "tmp:11f80"),
-            "my_strdup null-check should not leak the stack reload temp, got {cond_expr:?}"
-        );
-
-        let body_block = func.get_block(0x1004).expect("body");
-        let call_idx = body_block
-            .ops
-            .iter()
-            .position(
-                |op| matches!(op, SSAOp::Call { target } if target.display_name() == "ram:401170_0"),
-            )
-            .expect("memcpy call index");
-        let rendered_args = ctx.render_call_args_for_callee(
-            &CExpr::Var("const:401170".to_string()),
-            ctx.call_args_map()
-                .get(&(body_block.addr, call_idx))
-                .cloned()
-                .expect("memcpy call args"),
-        );
-        assert_eq!(
-            rendered_args,
-            vec![
-                CExpr::Var("dup".to_string()),
-                CExpr::Var("s".to_string()),
-                CExpr::binary(
-                    BinaryOp::Add,
-                    CExpr::AddrOf(Box::new(CExpr::Var("len".to_string()))),
-                    CExpr::IntLit(1),
-                ),
-            ],
-            "expected direct imported memcpy args to keep certified dup/s and avoid collapsing unproven stack scalar len, got {rendered_args:?}; call_args={:?}; stable_stack_values={:?}; tmp4700={:?}; rdx3={:?}",
-            ctx.call_args_map().get(&(body_block.addr, call_idx)),
-            ctx.state.analysis_ctx.use_info.stable_stack_values,
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .semantic_values
-                .get("tmp:4700_8"),
-            ctx.state.analysis_ctx.use_info.semantic_values.get("RDX_3"),
-        );
-
-        let body_stmts = ctx.fold_block(func.get_block(0x1004).expect("body"), 0x1004);
-        assert!(
-            body_stmts.iter().any(|stmt| {
-                matches!(
-                    stmt,
-                    CStmt::Expr(CExpr::Call { func, args })
-                        if **func == CExpr::Var("sym.imp.memcpy".to_string())
-                            && args
-                                == &vec![
-                                    CExpr::Var("dup".to_string()),
-                                    CExpr::Var("s".to_string()),
-                                    CExpr::binary(
-                                        BinaryOp::Add,
-                                        CExpr::AddrOf(Box::new(CExpr::Var("len".to_string()))),
-                                        CExpr::IntLit(1),
-                                    ),
-                                ]
-                )
-            }),
-            "expected body block to keep certified memcpy args while preserving unproven stack-scalar residual, got {body_stmts:?}"
-        );
-
-        let exit_stmts = ctx.fold_block(func.get_block(0x1008).expect("exit"), 0x1008);
-        let Some(CStmt::Return(Some(exit_expr))) = exit_stmts.last() else {
-            panic!("exit block should fold to return dup, got {exit_stmts:?}");
-        };
-        assert_eq!(exit_expr, &CExpr::Var("dup".to_string()));
     }
 
     #[test]
@@ -6160,98 +5092,6 @@ mod tests {
     }
 
     #[test]
-    fn x86_local_branch_condition_for_no_calldefine_imported_result_uses_call_expr() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
-            0x401130,
-            "sym.imp.strcmp".to_string(),
-        )])));
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x403014,
-            "secret123".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.imp.strcmp".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8)), CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        )]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([(
-            "rdi".to_string(),
-            "password".to_string(),
-        )])));
-
-        let block = make_block(vec![
-            SSAOp::Copy {
-                dst: make_var("rsi", 1, 8),
-                src: make_var("const:403014", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("rdi", 1, 8),
-                src: make_var("rdi", 0, 8),
-            },
-            SSAOp::Call {
-                target: make_var("ram:401130", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: make_var("cf", 2, 1),
-                src: make_var("const:0", 0, 1),
-            },
-            SSAOp::Copy {
-                dst: make_var("of", 2, 1),
-                src: make_var("const:0", 0, 1),
-            },
-            SSAOp::IntAnd {
-                dst: make_var("tmp:70400", 1, 4),
-                a: make_var("EAX", 0, 4),
-                b: make_var("EAX", 0, 4),
-            },
-            SSAOp::IntEqual {
-                dst: make_var("ZF", 2, 1),
-                a: make_var("tmp:70400", 1, 4),
-                b: make_var("const:0", 0, 4),
-            },
-            SSAOp::BoolNot {
-                dst: make_var("tmp:12800", 1, 1),
-                src: make_var("ZF", 2, 1),
-            },
-            SSAOp::CBranch {
-                cond: make_var("tmp:12800", 1, 1),
-                target: make_var("const:401140", 0, 8),
-            },
-        ]);
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let cond_expr = ctx
-            .extract_condition_from_block(&block)
-            .expect("local branch condition");
-        assert!(
-            matches!(
-                cond_expr,
-                CExpr::Binary {
-                    op: BinaryOp::Ne,
-                    ref left,
-                    ref right,
-                } if matches!(
-                    left.as_ref(),
-                    CExpr::Call { func, args }
-                        if **func == CExpr::Var("sym.imp.strcmp".to_string())
-                            && args
-                                == &vec![
-                                    CExpr::Var("password".to_string()),
-                                    CExpr::StringLit("secret123".to_string()),
-                                ]
-                ) && matches!(right.as_ref(), CExpr::IntLit(0))
-            ),
-            "expected no-calldefine imported-result branch condition to use the call expression, got {cond_expr:?}; call_sources={:?}; defs={:?}",
-            ctx.state.analysis_ctx.use_info.call_result_source_by_alias,
-            ctx.state.analysis_ctx.use_info.definitions
-        );
-    }
-
-    #[test]
     fn x86_local_branch_condition_for_calldefine_imported_result_uses_source_carrier() {
         let mut ctx = make_x86_64_ctx();
         ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
@@ -6345,237 +5185,6 @@ mod tests {
     }
 
     #[test]
-    fn test_imported_call_arg_var_uses_semantic_alias_to_resolve_string_literal() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401030, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        let mut strings = HashMap::new();
-        strings.insert(0x40229e, "Unknown test: %d\\n".to_string());
-        ctx.inputs.strings = Box::leak(Box::new(strings));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert("tmp:fmt_1".to_string(), "t19".to_string());
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            "tmp:fmt_1".to_string(),
-            analysis::SemanticValue::Scalar(analysis::ScalarValue::Expr(CExpr::binary(
-                BinaryOp::Add,
-                CExpr::UIntLit(0x402000),
-                CExpr::IntLit(0x29e),
-            ))),
-        );
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Var("t19".to_string()))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401030", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert_eq!(args[0], CExpr::StringLit("Unknown test: %d\\n".to_string()));
-    }
-
-    #[test]
-    fn test_imported_call_arg_rendered_alias_uses_ssa_definition_chain_for_string_literal() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401030, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401030, "sym.imp.printf")]);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        let mut strings = HashMap::new();
-        strings.insert(0x100002292, "usage: vuln_test <n>\\n".to_string());
-        ctx.inputs.strings = Box::leak(Box::new(strings));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .var_aliases
-            .insert("X0_13".to_string(), "t17".to_string());
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .definitions
-            .insert("t17".to_string(), CExpr::IntLit(658));
-        ctx.state.analysis_ctx.use_info.definitions.insert(
-            "X0_13".to_string(),
-            CExpr::binary(
-                BinaryOp::Add,
-                CExpr::Var("X0_4".to_string()),
-                CExpr::IntLit(658),
-            ),
-        );
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .definitions
-            .insert("X0_4".to_string(), CExpr::UIntLit(0x100002000));
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Var("t17".to_string()))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401030", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert_eq!(
-            args[0],
-            CExpr::StringLit("usage: vuln_test <n>\\n".to_string())
-        );
-    }
-
-    #[test]
-    fn test_imported_call_arg_phi_root_prefers_string_literal_source() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401030, "sym.imp.printf".to_string());
-        ctx.set_function_names(names);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        let mut strings = HashMap::new();
-        strings.insert(0x100002638, "Unknown test: %d\\n".to_string());
-        ctx.inputs.strings = Box::leak(Box::new(strings));
-        ctx.state.analysis_ctx.use_info.phi_sources.insert(
-            "X0_1".to_string(),
-            vec![
-                make_var("const:100002638", 0, 8),
-                make_var("stack_178", 0, 8),
-            ],
-        );
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Var("X0_1".to_string()))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401030", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert_eq!(args[0], CExpr::StringLit("Unknown test: %d\\n".to_string()));
-    }
-
-    #[test]
-    fn test_imported_call_arg_phi_root_prefers_semantic_pointer_source_over_stack_placeholder() {
-        let mut ctx = FoldingContext::new(64);
-        let mut names = HashMap::new();
-        names.insert(0x401040, "sym.imp.atoi".to_string());
-        ctx.set_function_names(names);
-        let mut sigs = HashMap::new();
-        sigs.insert(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        );
-        ctx.set_known_function_signatures(sigs);
-        ctx.state.analysis_ctx.use_info.phi_sources.insert(
-            "X0_1".to_string(),
-            vec![make_var("arg2", 0, 8), make_var("stack_178", 0, 8)],
-        );
-        ctx.state
-            .analysis_ctx
-            .stack_info
-            .stack_vars
-            .insert(0x178, "arg2".to_string());
-        insert_authorized_call_args(
-            &mut ctx,
-            (0x1000, 0),
-            vec![call_arg(CExpr::Var("X0_1".to_string()))],
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401040", 0, 8),
-                },
-                0x1000,
-                0,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert!(
-            expr_contains_var(&args[0], "arg2"),
-            "expected semantic pointer root to win, got: {:?}",
-            args[0]
-        );
-        assert!(
-            !expr_contains_var(&args[0], "stack_178") && !expr_contains_var(&args[0], "X0_1"),
-            "phi-root imported arg should not keep placeholder or merged SSA var, got: {:?}",
-            args[0]
-        );
-    }
-
-    #[test]
     fn certified_phi_source_resolution_refuses_divergent_sources() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -6584,6 +5193,7 @@ mod tests {
         });
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("phi_refusal");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.state.analysis_ctx.use_info.phi_sources.insert(
             "RAX_3".to_string(),
             vec![
@@ -7062,6 +5672,152 @@ mod tests {
     }
 
     #[test]
+    fn certified_switch_selector_requires_control_fact() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::register(0x10, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("switch_selector_fact");
+        let selector = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.eq_ignore_ascii_case("rdi") && value.var.version == 0)
+            .map(|value| value.id)
+            .expect("rdi selector value");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_render_facts(&mut ctx, test_render_facts(&prepared));
+        install_function_control_facts(&mut ctx, r2types::FunctionControlFacts {
+            switches: BTreeMap::from([(
+                0x1000,
+                r2types::SwitchSelectorFact {
+                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x1000).to_string(),
+                    block_addr: 0x1000,
+                    selector: Some(selector),
+                    cases: Vec::new(),
+                    default: None,
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        });
+        install_certified_function_facts(&mut ctx);
+
+        let (expr, proof_selector) = ctx
+            .resolve_switch_expr_for_block_with_selector(0x1000)
+            .expect("control fact should authorize switch selector rendering");
+
+        assert_eq!(proof_selector, Some(selector));
+        assert!(
+            matches!(expr, CExpr::Var(ref name) if name.eq_ignore_ascii_case("rdi") || name == "arg1"),
+            "expected selector from canonical FunctionFacts control evidence, got {expr:?}"
+        );
+    }
+
+    #[test]
+    fn certified_switch_selector_roots_without_control_fact_residualize() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::register(0x10, 8),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("switch_selector_root_only");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.state
+            .analysis_ctx
+            .semantic_mut()
+            .switch_selector_roots
+            .insert(
+                0x1000,
+                crate::analysis::SemanticValue::Scalar(crate::analysis::ScalarValue::Root(
+                    crate::analysis::ValueRef::new(make_var("rdi", 0, 8)),
+                )),
+            );
+
+        assert_eq!(
+            ctx.resolve_switch_expr_for_block_with_selector(0x1000),
+            None,
+            "certified rendering must refuse local switch selector roots without FunctionFacts control proof"
+        );
+    }
+
+    #[test]
+    fn certified_switch_selector_rejects_prepared_view_without_control_fact() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::register(0x10, 8),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("switch_selector_prepared_only");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            switch_selector_expr_by_block: BTreeMap::from([(
+                0x1000,
+                CExpr::Var("prepared_selector".to_string()),
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        assert_eq!(
+            ctx.resolve_switch_expr_for_block_with_selector(0x1000),
+            None,
+            "certified switch rendering must not treat PreparedSemanticView selector text as FunctionFacts control proof"
+        );
+    }
+
+    #[test]
+    fn certified_switch_selector_requires_matching_control_fact_block() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::register(0x10, 8),
+        });
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("switch_selector_wrong_block");
+        let selector = prepared
+            .graph()
+            .values
+            .iter()
+            .find(|value| value.var.name.eq_ignore_ascii_case("rdi") && value.var.version == 0)
+            .map(|value| value.id)
+            .expect("rdi selector value");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_render_facts(&mut ctx, test_render_facts(&prepared));
+        install_function_control_facts(&mut ctx, r2types::FunctionControlFacts {
+            switches: BTreeMap::from([(
+                0x2000,
+                r2types::SwitchSelectorFact {
+                    proof_node: r2ssa::ProofNodeId::switch_certificate(0x2000).to_string(),
+                    block_addr: 0x2000,
+                    selector: Some(selector),
+                    cases: Vec::new(),
+                    default: None,
+                },
+            )]),
+            ..r2types::FunctionControlFacts::default()
+        });
+        install_certified_function_facts(&mut ctx);
+
+        assert_eq!(
+            ctx.resolve_switch_expr_for_block_with_selector(0x1000),
+            None,
+            "certified rendering must not reuse a single switch selector proof from a different block"
+        );
+    }
+
+    #[test]
     fn typed_ssa_var_storage_filters_exclude_const_and_memory_sources() {
         let ctx = FoldingContext::new(64);
         let block = make_block(vec![
@@ -7102,13 +5858,13 @@ mod tests {
     }
 
     #[test]
-    fn typed_ssa_var_storage_filters_resolve_memory_without_stealing_constant_path() {
+    fn typed_ssa_var_storage_filters_keep_raw_memory_and_constant_numeric() {
         let mut ctx = FoldingContext::new(64);
         ctx.set_function_names(HashMap::from([(0x401000, "target".to_string())]));
 
         assert_eq!(
             ctx.get_expr(&make_var("ram:401000", 0, 8)),
-            CExpr::Var("target".to_string())
+            CExpr::Var("ram:401000".to_string())
         );
         assert_eq!(
             ctx.get_expr(&make_var("const:402000", 0, 8)),
@@ -8050,7 +6806,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_ram_address_load_resolves_symbol_via_typed_memory_kind() {
+    fn raw_ram_address_load_ignores_symbol_map_without_typed_fact() {
         let addr = make_var("ram:404000", 0, 8);
         let dst = make_var("tmp:load", 1, 8);
         let mut ctx = FoldingContext::new(64);
@@ -8061,11 +6817,18 @@ mod tests {
 
         let expr = ctx.render_canonical_load_expr(&dst, &addr, CType::u64());
 
-        assert_eq!(expr, CExpr::Var("obj.global_value".to_string()));
+        assert!(
+            matches!(expr, CExpr::Deref(_)),
+            "raw symbol map must not authorize global load rendering, got {expr:?}"
+        );
+        assert!(
+            !format!("{expr:?}").contains("obj.global_value"),
+            "raw symbol name must not leak into executable load expression: {expr:?}"
+        );
     }
 
     #[test]
-    fn raw_ram_address_store_target_resolves_symbol_via_typed_memory_kind() {
+    fn raw_ram_address_store_target_ignores_symbol_map_without_typed_fact() {
         let addr = make_var("ram:404000", 0, 8);
         let mut ctx = FoldingContext::new(64);
         ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([(
@@ -8075,7 +6838,14 @@ mod tests {
 
         let expr = ctx.render_canonical_store_target_expr(&addr, 8, CType::u64());
 
-        assert_eq!(expr, CExpr::Var("obj.global_value".to_string()));
+        assert!(
+            matches!(expr, CExpr::Deref(_)),
+            "raw symbol map must not authorize global store target rendering, got {expr:?}"
+        );
+        assert!(
+            !format!("{expr:?}").contains("obj.global_value"),
+            "raw symbol name must not leak into executable store target: {expr:?}"
+        );
     }
 
     #[test]
@@ -8556,7 +7326,7 @@ mod tests {
 
         let mut render_visited = HashSet::new();
         let direct = ctx
-            .render_access_expr_from_addr(&shape, 4, 0, &mut render_visited)
+            .render_access_expr_from_addr(&shape, 4, false, 0, &mut render_visited)
             .expect("normalized indexed address should render");
         assert!(
             matches!(direct, CExpr::Member { .. } | CExpr::PtrMember { .. }),
@@ -8565,7 +7335,7 @@ mod tests {
 
         let mut render_zero_visited = HashSet::new();
         let direct_zero = ctx
-            .render_access_expr_from_addr(&shape, 0, 0, &mut render_zero_visited)
+            .render_access_expr_from_addr(&shape, 0, false, 0, &mut render_zero_visited)
             .expect("normalized indexed address should render even without explicit elem_size");
         assert!(
             matches!(direct_zero, CExpr::Member { .. } | CExpr::PtrMember { .. }),
@@ -11879,119 +10649,6 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_direct_call_result_materializes_callee_saved_owner_once() {
-        let x0_ret = make_var("X0", 1, 8);
-        let x20_owner = make_var("X20", 1, 8);
-        let cond = make_var("tmp:pred", 1, 1);
-        let block = make_block(vec![
-            SSAOp::Call {
-                target: make_var("const:401000", 0, 8),
-            },
-            SSAOp::CallDefine {
-                dst: x0_ret.clone(),
-            },
-            SSAOp::Copy {
-                dst: x20_owner.clone(),
-                src: x0_ret,
-            },
-            SSAOp::IntEqual {
-                dst: cond.clone(),
-                a: x20_owner,
-                b: make_var("const:0", 0, 8),
-            },
-            SSAOp::CBranch {
-                cond: cond.clone(),
-                target: make_var("const:2000", 0, 8),
-            },
-        ]);
-
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
-            0x401000,
-            "sym._kernel_helper".to_string(),
-        )])));
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let source_call = (block.addr, 0);
-        assert!(
-            ctx.should_materialize_call_result_at_source(source_call)
-                .is_some(),
-            "expected callee-saved call-result owner for source {:?}; aliases={:?}",
-            source_call,
-            ctx.call_result_aliases_map().get(&source_call)
-        );
-        let source_expr = ctx
-            .call_result_exprs_map()
-            .get(&source_call)
-            .expect("source call expression")
-            .clone();
-        assert_eq!(
-            ctx.normalize_assignment_predicate_rhs(CExpr::binary(
-                BinaryOp::Eq,
-                source_expr.clone(),
-                CExpr::IntLit(0),
-            )),
-            CExpr::binary(
-                BinaryOp::Eq,
-                source_expr,
-                CExpr::IntLit(0),
-            ),
-            "a bare rendered call expression is not source provenance"
-        );
-        let pre_fold_branch_cond = ctx
-            .extract_condition_from_block(&block)
-            .expect("pre-fold local branch condition");
-        assert_eq!(
-            pre_fold_branch_cond,
-            CExpr::binary(
-                BinaryOp::Eq,
-                CExpr::Var("x20_1".to_string()),
-                CExpr::IntLit(0),
-            ),
-            "expected pre-fold branch condition to reuse owned call result, got {pre_fold_branch_cond:?}"
-        );
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        let Some(CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        })) = stmts.first()
-        else {
-            panic!("expected call result owner assignment, got {stmts:?}");
-        };
-        assert_eq!(left.as_ref(), &CExpr::Var("x20_1".to_string()));
-        assert!(
-            matches!(right.as_ref(), CExpr::Call { .. }),
-            "expected owner to materialize the call once, got {right:?}"
-        );
-        assert!(
-            stmts.iter().skip(1).all(|stmt| {
-                !matches!(
-                    stmt,
-                    CStmt::Expr(CExpr::Binary {
-                        right,
-                        ..
-                    }) if matches!(right.as_ref(), CExpr::Call { .. })
-                )
-            }),
-            "shadow call-result copies should be suppressed after call-site owner materialization: {stmts:?}"
-        );
-
-        let branch_cond = ctx
-            .extract_condition_from_block(&block)
-            .expect("local branch condition");
-        assert_eq!(
-            branch_cond,
-            CExpr::binary(
-                BinaryOp::Eq,
-                CExpr::Var("x20_1".to_string()),
-                CExpr::IntLit(0),
-            ),
-            "expected branch condition to reuse owned call result, got {branch_cond:?}"
-        );
-    }
-
-    #[test]
     fn aarch64_second_call_result_condition_does_not_reuse_prior_owner() {
         let first_ret = make_var("X0", 1, 8);
         let first_owner = make_var("X20", 1, 8);
@@ -12105,7 +10762,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_aarch64_second_call_result_condition_uses_post_call_copy() {
+    fn prepared_aarch64_second_call_result_condition_residualizes_without_owner_render_proof() {
         let arch = make_test_arch_aarch64_kernel_regs();
         let mut entry = R2ILBlock::new(0x1000, 0x18);
         entry.push(R2ILOp::Copy {
@@ -12165,6 +10822,7 @@ mod tests {
         let prepared =
             prepared_from_r2il_blocks(&[entry, fallthrough, taken], &arch).with_name("kernel_copy");
         let mut ctx = make_aarch64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
             (0x401000, "sym._first_helper".to_string()),
             (0x402000, "sym._second_helper".to_string()),
@@ -12193,30 +10851,18 @@ mod tests {
         let second_owner = second_source
             .and_then(|source| ctx.stable_owned_call_result_name_for_source(source));
 
-        let condition = ctx
-            .extract_condition_from_block(entry)
-            .expect("prepared branch condition");
-        let rendered = format!("{condition:?}");
+        let condition = ctx.extract_condition_from_block(entry);
+        assert!(
+            second_source.is_some_and(|(addr, _)| addr == 0x1000),
+            "expected x8 post-call copy to keep source-keyed call evidence, got {second_source:?}"
+        );
         assert_eq!(
-            second_owner.as_deref(),
-            Some("x8_3"),
-            "expected x8 post-call copy to resolve to the second call owner"
+            second_owner, None,
+            "a post-call register copy is source evidence, not stable result-owner proof"
         );
         assert!(
-            !rendered.contains("x20")
-                && !rendered.contains("X20")
-                && !rendered.contains("w10_1")
-                && !rendered.contains("sym._first_helper")
-                && !matches!(
-                    &condition,
-                    CExpr::Binary { left, .. }
-                        if matches!(
-                            left.as_ref(),
-                            CExpr::Var(name)
-                                if name == "arg1" || name.eq_ignore_ascii_case("x0")
-                        )
-                ),
-            "prepared predicate should use the second call result, not the restored first-call owner: {condition:?}; prepared_candidate={prepared_candidate:?}; second_source={second_source:?}; second_owner={second_owner:?}",
+            condition.is_none(),
+            "missing stable owner/render proof must residualize instead of rendering a guessed predicate: {condition:?}; prepared_candidate={prepared_candidate:?}; second_source={second_source:?}; second_owner={second_owner:?}",
         );
     }
 
@@ -12750,6 +11396,502 @@ mod tests {
     }
 
     #[test]
+    fn uncertified_internal_call_rejects_return_register_owner_fallback_without_facts() {
+        let mut ctx = make_x86_64_ctx();
+        let source_call = (0x1000, 0);
+        install_callsite_resolution(
+            &mut ctx,
+            source_call,
+            0x401000,
+            "sym.local.internal",
+            None,
+        );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(
+                source_call,
+                CExpr::call(CExpr::Var("sym.local.internal".to_string()), Vec::new()),
+            );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(source_call, BTreeSet::from(["RAX_1".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert("RAX_1".to_string());
+
+        assert!(
+            ctx.source_call_allows_return_register_owner(source_call),
+            "typed internal identity may classify the call but cannot prove result ownership"
+        );
+        assert_eq!(
+            ctx.fallback_owned_call_result_return_name_for_source(source_call),
+            None,
+            "return-register call-result ownership must come from FunctionFacts, not a direct alias fallback"
+        );
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "missing call-result owner facts must not invent rax as a stable owner"
+        );
+    }
+
+    #[test]
+    fn certified_internal_call_rejects_return_register_owner_fallback_without_facts() {
+        let prepared = prepared_zero_arg_helper_call("certified_return_register_owner");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        install_callsite_resolution(
+            &mut ctx,
+            source_call,
+            0x401050,
+            "sym.local.internal",
+            None,
+        );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(
+                source_call,
+                CExpr::call(CExpr::Var("sym.local.internal".to_string()), Vec::new()),
+            );
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(source_call, BTreeSet::from(["RAX_1".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert("RAX_1".to_string());
+
+        assert!(
+            ctx.source_call_allows_return_register_owner(source_call),
+            "callee identity can identify an internal call but cannot certify result ownership"
+        );
+        assert_eq!(
+            ctx.fallback_owned_call_result_return_name_for_source(source_call),
+            None,
+            "certified rendering must refuse direct return-register owner fallback without FunctionFacts ownership evidence"
+        );
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "missing ownership evidence must residualize instead of inventing rax as a stable owner"
+        );
+        assert_eq!(
+            ctx.materializable_call_result_expr_for_call_expr(
+                source_call,
+                &CExpr::call(CExpr::Var("sym.local.internal".to_string()), Vec::new()),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn certified_call_result_rejects_renderer_local_ownership_without_prepared_owner() {
+        let prepared = prepared_zero_arg_helper_call("certified_local_ownership_owner");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        let source_id = CallSiteId::from(source_call);
+        ctx.state.analysis_ctx.ownership.call_ownership.insert(
+            source_id,
+            CallOwnershipFact {
+                source: source_id,
+                owner: Some(CallOwner {
+                    visible_name: "fake_result".to_string(),
+                    kind: CallOwnerKind::StableLocal,
+                }),
+                aliases: BTreeSet::new(),
+                direct_aliases: BTreeSet::new(),
+            },
+        );
+        ctx.state
+            .analysis_ctx
+            .ownership
+            .visible_owner_sources
+            .insert("fake_result".to_string(), source_id);
+        ctx.state
+            .analysis_ctx
+            .ownership
+            .alias_sources
+            .insert("fake_alias".to_string(), source_id);
+
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "certified rendering must not trust renderer-local ownership maps without FunctionFacts result owner evidence"
+        );
+        assert_eq!(
+            ctx.source_call_for_visible_owner_name("fake_result"),
+            None,
+            "certified visible owner lookup must be backed by prepared FunctionFacts ownership"
+        );
+        assert_eq!(
+            ctx.call_result_source_for_ssa_name("fake_alias"),
+            None,
+            "certified SSA-name source lookup must be backed by FunctionFacts call-result evidence"
+        );
+        assert!(
+            !ctx.should_preserve_owned_call_result_visible_name("fake_result"),
+            "certified preservation must not trust renderer-local ownership maps without FunctionFacts result owner evidence"
+        );
+        assert_eq!(
+            ctx.materialized_call_result_source_for_visible_name("fake_result"),
+            None,
+            "certified materialization source lookup must not trust renderer-local ownership maps without FunctionFacts result owner evidence"
+        );
+    }
+
+    #[test]
+    fn uncertified_call_result_alias_rejects_non_return_register_owner_fallback_without_facts() {
+        let mut ctx = make_aarch64_ctx();
+        let source_call = (0x1000, 0);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(source_call, BTreeSet::from(["X20_1".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert("X20_1".to_string());
+
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "non-return register call-result ownership must come from FunctionFacts, not a direct alias fallback"
+        );
+    }
+
+    #[test]
+    fn certified_call_result_alias_rejects_non_return_register_owner_without_facts() {
+        let arch = make_test_arch_aarch64_kernel_regs();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Call {
+            target: Varnode::ram(0x401000, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_non_return_register_owner");
+        let mut ctx = make_aarch64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 0);
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(source_call, BTreeSet::from(["X20_1".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert("X20_1".to_string());
+
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "certified rendering must refuse direct non-return register owner fallback without FunctionFacts ownership evidence"
+        );
+        assert_eq!(
+            ctx.should_materialize_call_result_at_source(source_call),
+            None,
+            "materialization must not recover a local register owner after certified ownership refused"
+        );
+    }
+
+    #[test]
+    fn certified_call_result_alias_accepts_prepared_function_facts_owner() {
+        let prepared = prepared_zero_arg_helper_call("certified_prepared_owner");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        let source_call = (0x1000, 1);
+        let call_result_facts = test_call_result_facts_with_owner_for_source(&prepared, source_call);
+        install_stack_owner_function_facts(
+            &mut ctx,
+            &prepared,
+            call_result_facts,
+            "helper_result",
+            -8,
+        );
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![visible_stack_binding(
+            "helper_result",
+            None,
+            -8,
+        )]));
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                source_call,
+                crate::analysis::PreparedCallView {
+                    result_owner: Some(CExpr::Var("helper_result".to_string())),
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_aliases
+            .insert(source_call, BTreeSet::from(["RDI_1".to_string()]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .direct_call_result_aliases
+            .insert("RDI_1".to_string());
+
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call)
+                .as_deref(),
+            Some("helper_result"),
+            "certified rendering must keep FunctionFacts/prepared result ownership while ignoring local alias fallback"
+        );
+    }
+
+    #[test]
+    fn certified_stack_home_store_suppression_requires_value_owner_fact() {
+        let prepared = prepared_zero_arg_helper_call("certified_stack_home_store_direct_owner");
+        let source_call = (0x1000, 1);
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let call_result_facts = test_call_result_facts_with_owner_for_source(&prepared, source_call);
+        install_stack_owner_function_facts(
+            &mut ctx,
+            &prepared,
+            call_result_facts.clone(),
+            "helper_result",
+            -8,
+        );
+        let callsite = r2types::CallsiteKey {
+            block_addr: source_call.0,
+            op_index: source_call.1,
+        };
+        let mut call_render = test_call_render_facts(&prepared);
+        call_render
+            .by_callsite
+            .get_mut(&callsite)
+            .expect("call-render fact")
+            .disposition = r2types::CallsiteRenderDisposition::AssignedResult;
+        install_function_call_render_facts(&mut ctx, call_render);
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![visible_stack_binding(
+            "helper_result",
+            None,
+            -8,
+        )]));
+
+        let value = call_result_facts
+            .results_for_site(r2types::CallsiteKey {
+                block_addr: source_call.0,
+                op_index: source_call.1,
+            })
+            .next()
+            .expect("call-result fact")
+            .value;
+        let val = prepared.value_var(value).expect("call result var").clone();
+        let addr = make_var("tmp:stack_home", 1, 8);
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            addr.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("rbp".to_string()),
+                CExpr::IntLit(-8),
+            ),
+        );
+
+        assert!(
+            ctx.is_materialized_call_result_stack_home_store(&addr, &val),
+            "exact FunctionFacts call-result owner should suppress the redundant stack-home store"
+        );
+    }
+
+    #[test]
+    fn certified_stack_home_store_suppression_rejects_local_recovered_value() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::register(0x00, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_stack_home_store_local_recovered_value");
+        let source_call = (0x1000, 1);
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let mut facts = test_call_result_facts_with_owner_for_source(&prepared, source_call);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let copied = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Copy { dst, .. } if dst.name.eq_ignore_ascii_case("RDI") => Some(dst),
+                _ => None,
+            })
+            .expect("post-call copy");
+        let copied_value = prepared
+            .graph()
+            .value_id_for_var(copied)
+            .expect("copied value id");
+        facts.by_value.remove(&copied_value);
+        install_function_call_result_facts(&mut ctx, facts);
+        let callsite = r2types::CallsiteKey {
+            block_addr: source_call.0,
+            op_index: source_call.1,
+        };
+        let mut call_render = test_call_render_facts(&prepared);
+        call_render
+            .by_callsite
+            .get_mut(&callsite)
+            .expect("call-render fact")
+            .disposition = r2types::CallsiteRenderDisposition::AssignedResult;
+        install_function_call_render_facts(&mut ctx, call_render);
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![visible_stack_binding(
+            "helper_result",
+            None,
+            -8,
+        )]));
+        let addr = make_var("tmp:stack_home", 1, 8);
+        ctx.state.analysis_ctx.use_info.definitions.insert(
+            addr.display_name(),
+            CExpr::binary(
+                BinaryOp::Add,
+                CExpr::Var("rbp".to_string()),
+                CExpr::IntLit(-8),
+            ),
+        );
+
+        assert_eq!(
+            ctx.local_post_call_source_for_ssa_name_in_block(block, &copied.display_name(), 0),
+            None,
+            "certified local source recovery must already refuse before raw adjacency"
+        );
+        assert!(
+            !ctx.is_materialized_call_result_stack_home_store(&addr, copied),
+            "certified stack-home suppression must require the stored value's own FunctionFacts call-result owner"
+        );
+    }
+
+    #[test]
+    fn certified_call_result_owner_rejects_prepared_name_without_call_result_fact() {
+        let prepared = prepared_zero_arg_helper_call("certified_prepared_owner_without_fact");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                source_call,
+                crate::analysis::PreparedCallView {
+                    result_owner: Some(CExpr::Var("helper_result".to_string())),
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "prepared owner names must be backed by canonical FunctionFacts call-result owner evidence"
+        );
+        assert_eq!(
+            ctx.stable_owned_call_result_expr_for_source(source_call),
+            None,
+            "certified rendering must reject prepared owner names without call-result facts"
+        );
+    }
+
+    #[test]
+    fn certified_call_result_owner_rejects_prepared_expression_owner() {
+        let prepared = prepared_zero_arg_helper_call("certified_prepared_expression_owner");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        let poisoned_owner = CExpr::call(CExpr::Var("sym.local.poisoned".to_string()), Vec::new());
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                source_call,
+                crate::analysis::PreparedCallView {
+                    result_owner: Some(poisoned_owner.clone()),
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "prepared call-result ownership must resolve to a stable owner name"
+        );
+        assert_eq!(
+            ctx.stable_owned_call_result_expr_for_source(source_call),
+            None,
+            "certified rendering must not treat a prepared expression as call-result owner evidence"
+        );
+        assert_eq!(
+            ctx.materializable_call_result_expr_for_call_expr(source_call, &poisoned_owner),
+            None,
+            "prepared owner expressions must not authorize executable call-result materialization"
+        );
+    }
+
+    #[test]
+    fn certified_visible_owner_lookup_rejects_prepared_return_register_owner() {
+        let prepared = prepared_zero_arg_helper_call("certified_return_register_owner_name");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let source_call = (0x1000, 1);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                source_call,
+                crate::analysis::PreparedCallView {
+                    result_owner: Some(CExpr::Var("RAX_1".to_string())),
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        assert_eq!(
+            ctx.stable_owned_call_result_name_for_source(source_call),
+            None,
+            "certified result owner names must reject return-register placeholders"
+        );
+        assert_eq!(
+            ctx.source_call_for_visible_owner_name("RAX_1"),
+            None,
+            "rejected prepared owner names must not authorize visible source-call lookup"
+        );
+        assert_eq!(
+            ctx.recovered_owned_call_result_definition_rhs_for_visible_name("RAX_1"),
+            None,
+            "rejected return-register owner names must not synthesize executable call replay"
+        );
+    }
+
+    #[test]
     fn raw_import_name_hints_do_not_authorize_imported_call_policy() {
         let mut ctx = make_aarch64_ctx();
         assert!(!ctx.is_imported_call_target(&CExpr::Var(
@@ -12785,10 +11927,13 @@ mod tests {
     #[test]
     fn raw_callee_fact_name_does_not_resolve_normalized_alias_without_typed_resolution() {
         let mut ctx = make_aarch64_ctx();
-        ctx.inputs.callee_facts = Box::leak(Box::new(BTreeMap::from([(
-            0x401000,
-            minimal_callee_fact(0x401000, "sym.imp.printf"),
-        )])));
+        install_function_callee_facts(
+            &mut ctx,
+            BTreeMap::from([(
+                0x401000,
+                minimal_callee_fact(0x401000, "sym.imp.printf"),
+            )]),
+        );
 
         let identity = ctx.callee_identity_for_name("printf");
 
@@ -12817,8 +11962,10 @@ mod tests {
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             });
-        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(resolution);
+        });
 
         let identity = ctx.callee_identity_for_name("printf");
 
@@ -12847,8 +11994,10 @@ mod tests {
                 callee_facts: &callee_facts,
                 known_function_signatures: &known_signatures,
             });
-        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(resolution);
+        });
 
         let identity = ctx.callee_identity_for_name("printf");
 
@@ -12919,7 +12068,7 @@ mod tests {
     }
 
     #[test]
-    fn call_source_proof_raw_owner_recovery_requires_exact_unambiguous_source() {
+    fn call_source_proof_raw_owner_recovery_rejects_alias_owner_without_function_facts() {
         fn seed_owner(ctx: &mut FoldingContext<'_>, source_call: (u64, usize), alias: &str) {
             ctx.state
                 .analysis_ctx
@@ -12954,8 +12103,8 @@ mod tests {
         seed_owner(&mut exact_ctx, exact_call, "X20_1");
         assert_eq!(
             exact_ctx.stable_owned_call_result_expr_for_raw_call(&helper_call),
-            Some(CExpr::Var("x20_1".to_string())),
-            "one exact source proof may recover its stable owner"
+            None,
+            "one exact source proof still cannot recover a stable owner without FunctionFacts call-result ownership"
         );
 
         let mut ambiguous_ctx = make_aarch64_ctx();
@@ -13005,7 +12154,7 @@ mod tests {
     }
 
     #[test]
-    fn call_source_proof_certified_rendered_call_requires_exact_unambiguous_source() {
+    fn call_source_proof_certified_rendered_call_rejects_prepared_owner_without_function_fact() {
         let prepared = prepared_zero_arg_helper_call("certified_source");
         let helper_call = CExpr::call(
             CExpr::Var("sym.helper".to_string()),
@@ -13013,9 +12162,24 @@ mod tests {
         );
 
         let mut exact_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut exact_ctx);
         exact_ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         let exact_call = (0x1000, 1);
         install_callsite_resolution(&mut exact_ctx, exact_call, 0x401050, "sym.helper", None);
+        install_function_call_result_facts(
+            &mut exact_ctx,
+            test_call_result_facts_with_owner_for_source(&prepared, exact_call),
+        );
+        exact_ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                exact_call,
+                crate::analysis::PreparedCallView {
+                    result_owner: Some(CExpr::Var("helper_result".to_string())),
+                    ..crate::analysis::PreparedCallView::default()
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
         exact_ctx
             .state
             .analysis_ctx
@@ -13026,8 +12190,8 @@ mod tests {
         assert!(exact_ctx.is_certified_rendered_call_expr(&helper_call));
         assert_eq!(
             exact_ctx.stable_owner_for_certified_rendered_call_expr(&helper_call),
-            Some(CExpr::Var("helper_result".to_string())),
-            "exact certified source proof may recover its stable owner"
+            None,
+            "certified rendered calls must not recover owners from PreparedSemanticView text"
         );
         assert_eq!(
             exact_ctx.record_certified_call_render_proofs_for_stmt(&CStmt::Return(Some(
@@ -13038,6 +12202,7 @@ mod tests {
         );
 
         let mut ambiguous_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ambiguous_ctx);
         ambiguous_ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         let first_call = (0x1000, 1);
         let second_call = (0x1008, 0);
@@ -13075,6 +12240,7 @@ mod tests {
         );
 
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         let source_call = (0x1000, 1);
         install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
@@ -13112,6 +12278,7 @@ mod tests {
         });
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("no_call_certificate");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         let source_call = (0x1000, 1);
         let helper_call = CExpr::call(
             CExpr::Var("sym.helper".to_string()),
@@ -13141,9 +12308,41 @@ mod tests {
     }
 
     #[test]
+    fn certified_duplicate_call_pruning_requires_callsite_proof() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x9000, 4);
+        entry.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("no_prune_fake_call");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        let helper_call = CExpr::call(CExpr::Var("sym.helper".to_string()), Vec::new());
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .call_result_exprs
+            .insert(source_call, helper_call.clone());
+        install_call_owner(&mut ctx, source_call, "helper_result", "RAX_1");
+
+        let mut duplicate_body = vec![
+            CStmt::Expr(helper_call.clone()),
+            CStmt::Expr(helper_call.clone()),
+        ];
+        ctx.prune_duplicate_call_statements_by_source(&mut duplicate_body);
+        assert_eq!(
+            duplicate_body.len(),
+            2,
+            "certified duplicate-call pruning must not use rendered equality without FunctionFacts callsite proof"
+        );
+    }
+
+    #[test]
     fn call_source_proof_certified_rendered_call_rejects_typed_rendered_contradiction() {
         let prepared = prepared_zero_arg_helper_call("certified_contradiction");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         let source_call = (0x1000, 1);
         install_callsite_resolution(
             &mut ctx,
@@ -15028,7 +14227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_epilogue_load_does_not_mask_merged_return_register_phi() {
+    fn certified_control_epilogue_renders_same_root_return_register_phi() {
         use r2il::{R2ILBlock, R2ILOp, RegisterDef, Varnode};
 
         let mut arch = make_test_arch_x86_64();
@@ -15066,18 +14265,80 @@ mod tests {
         let prepared = prepared_from_r2il_blocks(&[entry, left, right, exit], &arch);
         let func = prepared.function();
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.analyze_blocks(&func.blocks().cloned().collect::<Vec<_>>());
         ctx.analyze_function_structure(func);
 
         let exit_block = func.get_block(0x100c).expect("exit block");
         let stmts = ctx.fold_block(exit_block, exit_block.addr);
-        let Some(CStmt::Return(Some(expr))) = stmts.last() else {
-            panic!("expected trailing return statement, got {stmts:?}");
-        };
-        assert_eq!(
-            expr,
-            &CExpr::IntLit(1),
-            "control epilogue load should not mask merged return-register phi"
+        assert!(
+            stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::IntLit(1))))),
+            "certified fold-block rendering must render same-root return-register phi through upstream proof: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| {
+                matches!(stmt, CStmt::Comment(text) if text.contains("missing certified value return"))
+            }),
+            "same-root return-register phi should not residualize: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn certified_control_epilogue_residualizes_divergent_return_register_phi() {
+        use r2il::{R2ILBlock, R2ILOp, RegisterDef, Varnode};
+
+        let mut arch = make_test_arch_x86_64();
+        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        let mut entry = R2ILBlock::new(0x2100, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x2108, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut left = R2ILBlock::new(0x2104, 4);
+        left.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::constant(1, 8),
+        });
+        left.push(R2ILOp::Branch {
+            target: Varnode::constant(0x210c, 8),
+        });
+        let mut right = R2ILBlock::new(0x2108, 4);
+        right.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::constant(2, 8),
+        });
+        right.push(R2ILOp::Branch {
+            target: Varnode::constant(0x210c, 8),
+        });
+        let mut exit = R2ILBlock::new(0x210c, 4);
+        exit.push(R2ILOp::Load {
+            dst: Varnode::register(0x30, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x28, 8),
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry, left, right, exit], &arch);
+        let func = prepared.function();
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.analyze_blocks(&func.blocks().cloned().collect::<Vec<_>>());
+        ctx.analyze_function_structure(func);
+
+        let exit_block = func.get_block(0x210c).expect("exit block");
+        let stmts = ctx.fold_block(exit_block, exit_block.addr);
+        assert!(
+            stmts.iter().any(|stmt| {
+                matches!(stmt, CStmt::Comment(text) if text.contains("missing certified value return for control-only exit"))
+            }),
+            "divergent return-register phi must residualize without a stronger path proof: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "divergent control return phi must not render executable C: {stmts:?}"
         );
     }
 
@@ -17320,919 +16581,6 @@ mod tests {
     }
 
     #[test]
-    fn observed_live_arm64_imported_atoi_arg_uses_semantic_argv_root() {
-        use crate::analysis::{PassEnv, StackInfo, UseInfo};
-
-        let sp1 = make_var("SP", 1, 8);
-        let frame_base = make_var("tmp:frame", 1, 8);
-        let slot_178 = make_var("tmp:slot", 1, 8);
-        let slot_argv = make_var("tmp:slot", 2, 8);
-        let reload_slot = make_var("tmp:6500", 6, 8);
-        let reloaded_frame = make_var("X8", 9, 8);
-        let argv_addr = make_var("tmp:6500", 7, 8);
-        let argv_root = make_var("X8", 10, 8);
-        let arg_addr = make_var("tmp:6500", 8, 8);
-        let arg_value = make_var("X0", 5, 8);
-
-        let entry = SSABlock {
-            addr: 0x1000,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: sp1.clone(),
-                    a: make_var("SP", 0, 8),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: frame_base.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:3e0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_178.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_178,
-                    val: frame_base.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_argv.clone(),
-                    a: frame_base,
-                    b: make_var("const:a0", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_argv,
-                    val: make_var("X1", 0, 8),
-                },
-            ],
-        };
-
-        let call_block = SSABlock {
-            addr: 0x1010,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: reload_slot.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: reloaded_frame.clone(),
-                    space: "ram".to_string(),
-                    addr: reload_slot,
-                },
-                SSAOp::IntAdd {
-                    dst: argv_addr.clone(),
-                    a: reloaded_frame,
-                    b: make_var("const:a0", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: argv_root.clone(),
-                    space: "ram".to_string(),
-                    addr: argv_addr,
-                },
-                SSAOp::IntAdd {
-                    dst: arg_addr.clone(),
-                    a: argv_root.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: arg_value.clone(),
-                    space: "ram".to_string(),
-                    addr: arg_addr,
-                },
-                SSAOp::Call {
-                    target: make_var("const:401040", 0, 8),
-                },
-            ],
-        };
-
-        let mut function_names = HashMap::new();
-        function_names.insert(0x401040, "sym.imp.atoi".to_string());
-        let strings: HashMap<u64, String> = HashMap::new();
-        let symbols: HashMap<u64, String> = HashMap::new();
-        let param_register_aliases = HashMap::from([
-            ("x0".to_string(), "argc".to_string()),
-            ("x1".to_string(), "argv".to_string()),
-            ("x2".to_string(), "envp".to_string()),
-        ]);
-        let type_hints =
-            HashMap::from([("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8))))]);
-        let caller_saved_regs = HashSet::new();
-        let arg_regs = vec![
-            "x0".to_string(),
-            "x1".to_string(),
-            "x2".to_string(),
-            "x3".to_string(),
-            "x4".to_string(),
-            "x5".to_string(),
-            "x6".to_string(),
-            "x7".to_string(),
-        ];
-        let env = PassEnv {
-            ptr_size: 64,
-            sp_name: "sp",
-            fp_name: "x29",
-            ret_reg_name: "x0",
-            function_names: &function_names,
-            strings: &strings,
-            symbols: &symbols,
-            callee_facts: crate::analysis::empty_callee_facts(),
-            callee_resolution: None,
-            summary_view: None,
-            arg_regs: &arg_regs,
-            param_register_aliases: &param_register_aliases,
-            caller_saved_regs: &caller_saved_regs,
-            type_hints: &type_hints,
-            type_oracle: None,
-        };
-
-        let blocks = vec![entry, call_block];
-        let use_info = UseInfo::analyze(&blocks, &env);
-        let stack_info = StackInfo::analyze(&blocks, &use_info, &env);
-        assert!(
-            matches!(
-                use_info.semantic_values.get("X8_10"),
-                Some(crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
-                    base: crate::analysis::BaseRef::Value(value_ref),
-                    index: None,
-                    scale_bytes: 0,
-                    offset_bytes: 0,
-                })) if value_ref.var == make_var("X1", 0, 8)
-            ),
-            "expected argv root to stay semantic across blocks, got {:?}; stable_stack_values={:?}; type_hints={:?}; aliases={:?}",
-            use_info.semantic_values.get("X8_10"),
-            use_info.stable_stack_values,
-            use_info.type_hints,
-            use_info.var_aliases
-        );
-        assert!(
-            matches!(
-                use_info.semantic_values.get("X0_5"),
-                Some(crate::analysis::SemanticValue::Load {
-                    addr: crate::analysis::NormalizedAddr {
-                        base: crate::analysis::BaseRef::Value(_),
-                        ..
-                    },
-                    ..
-                })
-            ),
-            "expected imported atoi arg load to keep value-rooted semantic addr, got {:?}",
-            use_info.semantic_values.get("X0_5")
-        );
-
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(function_names));
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        )]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(param_register_aliases));
-        ctx.inputs.type_hints = Box::leak(Box::new(type_hints));
-        ctx.state.analysis_ctx.use_info = use_info;
-        ctx.state.analysis_ctx.stack_info = stack_info;
-
-        let mut visited = HashSet::new();
-        let semantic = ctx.render_semantic_value_by_name("X0_5", 0, &mut visited);
-        assert!(
-            semantic.is_some(),
-            "expected semantic value for observed imported atoi arg load, got {:?}",
-            ctx.state.analysis_ctx.use_info.semantic_values.get("X0_5")
-        );
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:401040", 0, 8),
-                },
-                0x1010,
-                6,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert!(
-            matches!(
-                &args[0],
-                CExpr::Subscript { base, index }
-                    if **base == CExpr::Var("argv".to_string()) && **index == CExpr::IntLit(1)
-            ),
-            "expected observed live arm64 atoi arg to render as argv[1], got: {:?}; semantic candidate: {:?}",
-            args[0],
-            semantic
-        );
-        assert!(
-            !matches!(&args[0], CExpr::Deref(_)) && !expr_contains_var(&args[0], "lr"),
-            "imported atoi arg should not regress to deref or transient register form, got: {:?}",
-            args[0]
-        );
-    }
-
-    #[test]
-    fn observed_live_arm64_main_first_atoi_arg_renders_semantically() {
-        let sp0 = make_var("SP", 0, 8);
-        let sp1 = make_var("SP", 1, 8);
-        let sp2 = make_var("SP", 2, 8);
-        let fp_slot = make_var("tmp:7b80", 1, 8);
-        let frame_base = make_var("tmp:11f80", 2, 8);
-        let slot_178 = make_var("tmp:6500", 1, 8);
-        let slot_argv = make_var("tmp:6500", 2, 8);
-        let slot_local0 = make_var("tmp:6980", 1, 8);
-        let slot_local1 = make_var("tmp:6980", 2, 8);
-        let call_slot = make_var("tmp:6500", 5, 8);
-        let call_frame = make_var("X8", 8, 8);
-        let argv_addr = make_var("tmp:6500", 6, 8);
-        let argv_root = make_var("X8", 9, 8);
-        let arg_addr = make_var("tmp:6500", 7, 8);
-        let arg_value = make_var("X0", 3, 8);
-
-        let entry = SSABlock {
-            addr: 0x100001308,
-            size: 48,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: sp1.clone(),
-                    a: sp0,
-                    b: make_var("const:ffffffffffffffe0", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: sp1.clone(),
-                    val: make_var("X28", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: make_var("tmp:3a600", 1, 8),
-                    a: sp1.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: make_var("tmp:3a600", 1, 8),
-                    val: make_var("X27", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: fp_slot.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: fp_slot.clone(),
-                    val: make_var("X29", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: make_var("tmp:3a600", 2, 8),
-                    a: fp_slot.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: make_var("tmp:3a600", 2, 8),
-                    val: make_var("X30", 0, 8),
-                },
-                SSAOp::IntSub {
-                    dst: sp2.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:550", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: frame_base.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:3e0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_178.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_178,
-                    val: frame_base.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_local0,
-                    a: fp_slot.clone(),
-                    b: make_var("const:ffffffffffffffec", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: make_var("tmp:6980", 1, 8),
-                    val: make_var("const:0", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("tmp:3a680", 2, 8),
-                    src: make_var("W0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_local1,
-                    a: fp_slot.clone(),
-                    b: make_var("const:ffffffffffffffe8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: make_var("tmp:6980", 2, 8),
-                    val: make_var("tmp:3a680", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_argv,
-                    a: frame_base,
-                    b: make_var("const:a0", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: make_var("tmp:6500", 2, 8),
-                    val: make_var("X1", 0, 8),
-                },
-            ],
-        };
-
-        let call_block = SSABlock {
-            addr: 0x100001368,
-            size: 44,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: call_slot.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: call_frame.clone(),
-                    space: "ram".to_string(),
-                    addr: call_slot,
-                },
-                SSAOp::IntAdd {
-                    dst: argv_addr.clone(),
-                    a: call_frame,
-                    b: make_var("const:a0", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: argv_root.clone(),
-                    space: "ram".to_string(),
-                    addr: argv_addr,
-                },
-                SSAOp::IntAdd {
-                    dst: arg_addr.clone(),
-                    a: argv_root.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: arg_value.clone(),
-                    space: "ram".to_string(),
-                    addr: arg_addr,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-            ],
-        };
-
-        let function_names = HashMap::from([(0x1000025d8, "sym.imp.atoi".to_string())]);
-        let _strings: HashMap<u64, String> = HashMap::new();
-        let _symbols: HashMap<u64, String> = HashMap::new();
-        let param_register_aliases = HashMap::from([
-            ("x0".to_string(), "argc".to_string()),
-            ("x1".to_string(), "argv".to_string()),
-            ("x2".to_string(), "envp".to_string()),
-        ]);
-        let type_hints = HashMap::from([
-            ("argc".to_string(), CType::Int(32)),
-            ("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-            ("envp".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-        ]);
-        let blocks = vec![entry, call_block];
-
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(function_names));
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        )]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(param_register_aliases));
-        ctx.inputs.type_hints = Box::leak(Box::new(type_hints));
-        ctx.analyze_blocks(&blocks);
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-                0x100001368,
-                6,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert!(
-            matches!(
-                &args[0],
-                CExpr::Subscript { base, index }
-                    if **base == CExpr::Var("argv".to_string()) && **index == CExpr::IntLit(1)
-            ),
-            "expected observed live main atoi arg to render as argv[1], got: {:?}",
-            args[0]
-        );
-
-        let folded_stmts = ctx.fold_block(&blocks[1], blocks[1].addr);
-        let folded_call_args = folded_stmts.iter().find_map(|stmt| {
-            let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-                return None;
-            };
-            Some(args)
-        });
-        let Some(folded_call_args) = folded_call_args else {
-            panic!("expected folded call statement, got {folded_stmts:?}");
-        };
-        assert!(
-            matches!(
-                folded_call_args.first(),
-                Some(CExpr::Subscript { base, index })
-                    if **base == CExpr::Var("argv".to_string()) && **index == CExpr::IntLit(1)
-            ),
-            "expected folded observed live main atoi arg to stay argv[1], got {folded_stmts:?}"
-        );
-    }
-
-    #[test]
-    fn observed_exact_live_arm64_main_first_atoi_arg_with_0x160_slot_renders_semantically() {
-        let _sp0 = make_var("SP", 0, 8);
-        let sp1 = make_var("SP", 1, 8);
-        let sp2 = make_var("SP", 2, 8);
-        let fp_slot = make_var("tmp:7b80", 1, 8);
-        let frame_base = make_var("tmp:11f80", 2, 8);
-        let slot_178 = make_var("tmp:6500", 1, 8);
-        let slot_argv = make_var("tmp:6500", 2, 8);
-        let call_slot = make_var("tmp:6500", 6, 8);
-        let call_frame = make_var("X8", 9, 8);
-        let argv_addr = make_var("tmp:6500", 7, 8);
-        let argv_root = make_var("X8", 10, 8);
-        let arg_addr = make_var("tmp:6500", 8, 8);
-        let arg_value = make_var("X0", 5, 8);
-
-        let entry = SSABlock {
-            addr: 0x100001308,
-            size: 48,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: sp2.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:550", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: fp_slot.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: frame_base.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:3e0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_178.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_178,
-                    val: frame_base.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_argv,
-                    a: frame_base,
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: make_var("tmp:6500", 2, 8),
-                    val: make_var("X1", 0, 8),
-                },
-            ],
-        };
-
-        let call_block = SSABlock {
-            addr: 0x100001368,
-            size: 44,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: call_slot.clone(),
-                    a: sp2,
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: call_frame.clone(),
-                    space: "ram".to_string(),
-                    addr: call_slot,
-                },
-                SSAOp::IntAdd {
-                    dst: argv_addr.clone(),
-                    a: call_frame,
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: argv_root.clone(),
-                    space: "ram".to_string(),
-                    addr: argv_addr,
-                },
-                SSAOp::IntAdd {
-                    dst: arg_addr.clone(),
-                    a: argv_root,
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: arg_value,
-                    space: "ram".to_string(),
-                    addr: arg_addr,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-            ],
-        };
-
-        let function_names = HashMap::from([(0x1000025d8, "sym.imp.atoi".to_string())]);
-        let param_register_aliases = HashMap::from([
-            ("x0".to_string(), "argc".to_string()),
-            ("x1".to_string(), "argv".to_string()),
-            ("x2".to_string(), "envp".to_string()),
-        ]);
-        let type_hints = HashMap::from([
-            ("argc".to_string(), CType::Int(32)),
-            ("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-            ("envp".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-        ]);
-        let caller_saved_regs = HashSet::new();
-        let arg_regs = vec![
-            "x0".to_string(),
-            "x1".to_string(),
-            "x2".to_string(),
-            "x3".to_string(),
-            "x4".to_string(),
-            "x5".to_string(),
-            "x6".to_string(),
-            "x7".to_string(),
-        ];
-        let env = PassEnv {
-            ptr_size: 64,
-            sp_name: "sp",
-            fp_name: "x29",
-            ret_reg_name: "x0",
-            function_names: &function_names,
-            strings: &HashMap::new(),
-            symbols: &HashMap::new(),
-            callee_facts: crate::analysis::empty_callee_facts(),
-            callee_resolution: None,
-            summary_view: None,
-            arg_regs: &arg_regs,
-            param_register_aliases: &param_register_aliases,
-            caller_saved_regs: &caller_saved_regs,
-            type_hints: &type_hints,
-            type_oracle: None,
-        };
-
-        let blocks = vec![entry, call_block];
-        let use_info = UseInfo::analyze(&blocks, &env);
-        let stack_info = StackInfo::analyze(&blocks, &use_info, &env);
-
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(function_names));
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.imp.atoi".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: false,
-            },
-        )]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(param_register_aliases));
-        ctx.inputs.type_hints = Box::leak(Box::new(type_hints));
-        ctx.state.analysis_ctx.use_info = use_info;
-        ctx.state.analysis_ctx.stack_info = stack_info;
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-                0x100001368,
-                6,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(args.len(), 1);
-        assert!(
-            matches!(
-                &args[0],
-                CExpr::Subscript { base, index }
-                    if **base == CExpr::Var("argv".to_string()) && **index == CExpr::IntLit(1)
-            ),
-            "expected exact live 0x160 slot to still render argv[1], got: {:?}; semantic X8_10={:?}; semantic X0_5={:?}; stable_stack={:?}; stable_memory={:?}",
-            args[0],
-            ctx.state.analysis_ctx.use_info.semantic_values.get("X8_10"),
-            ctx.state.analysis_ctx.use_info.semantic_values.get("X0_5"),
-            ctx.state.analysis_ctx.use_info.stable_stack_values,
-            ctx.state.analysis_ctx.use_info.stable_memory_values
-        );
-    }
-
-    #[test]
-    fn observed_live_arm64_usage_printf_renders_string_literal_and_argv0() {
-        let sp0 = make_var("SP", 0, 8);
-        let sp1 = make_var("SP", 1, 8);
-        let sp2 = make_var("SP", 2, 8);
-        let fp_slot = make_var("tmp:7b80", 1, 8);
-        let frame_base = make_var("tmp:11f80", 2, 8);
-        let slot_178 = make_var("tmp:6500", 1, 8);
-        let slot_argv = make_var("tmp:6500", 2, 8);
-        let call_slot = make_var("tmp:6500", 4, 8);
-        let call_frame = make_var("X8", 5, 8);
-        let argv_addr = make_var("tmp:6500", 5, 8);
-        let argv_root = make_var("X8", 6, 8);
-        let argv_deref_ptr = make_var("tmp:6800", 2, 8);
-        let argv0 = make_var("X8", 7, 8);
-        let stack_arg_base = make_var("X9", 2, 8);
-        let stack_arg_slot = make_var("tmp:6800", 3, 8);
-        let fmt_page = make_var("X0", 3, 8);
-        let fmt_final = make_var("X0", 4, 8);
-
-        let entry = SSABlock {
-            addr: 0x100001308,
-            size: 48,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: sp1.clone(),
-                    a: sp0,
-                    b: make_var("const:ffffffffffffffe0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: fp_slot.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::IntSub {
-                    dst: sp2.clone(),
-                    a: sp1.clone(),
-                    b: make_var("const:550", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: frame_base.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:3e0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_178.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_178,
-                    val: frame_base.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_argv,
-                    a: frame_base,
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: make_var("tmp:6500", 2, 8),
-                    val: make_var("X1", 0, 8),
-                },
-            ],
-        };
-
-        let call_block = SSABlock {
-            addr: 0x10000133c,
-            size: 44,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: call_slot.clone(),
-                    a: sp2.clone(),
-                    b: make_var("const:178", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: call_frame.clone(),
-                    space: "ram".to_string(),
-                    addr: call_slot,
-                },
-                SSAOp::IntAdd {
-                    dst: argv_addr.clone(),
-                    a: call_frame,
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: argv_root.clone(),
-                    space: "ram".to_string(),
-                    addr: argv_addr,
-                },
-                SSAOp::Copy {
-                    dst: argv_deref_ptr.clone(),
-                    src: argv_root,
-                },
-                SSAOp::Load {
-                    dst: argv0.clone(),
-                    space: "ram".to_string(),
-                    addr: argv_deref_ptr,
-                },
-                SSAOp::Copy {
-                    dst: stack_arg_base.clone(),
-                    src: sp2,
-                },
-                SSAOp::Copy {
-                    dst: stack_arg_slot.clone(),
-                    src: stack_arg_base,
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: stack_arg_slot,
-                    val: argv0,
-                },
-                SSAOp::Copy {
-                    dst: fmt_page,
-                    src: make_var("const:100002000", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("tmp:11e80", 5, 8),
-                    src: make_var("const:638", 0, 8),
-                },
-                SSAOp::IntCarry {
-                    dst: make_var("TMPCY", 6, 1),
-                    a: make_var("const:100002000", 0, 8),
-                    b: make_var("const:638", 0, 8),
-                },
-                SSAOp::IntSCarry {
-                    dst: make_var("TMPOV", 6, 1),
-                    a: make_var("const:100002000", 0, 8),
-                    b: make_var("const:638", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: make_var("tmp:11f80", 5, 8),
-                    a: make_var("const:100002000", 0, 8),
-                    b: make_var("const:638", 0, 8),
-                },
-                SSAOp::IntSLess {
-                    dst: make_var("TMPNG", 6, 1),
-                    a: make_var("const:100002638", 0, 8),
-                    b: make_var("const:0", 0, 8),
-                },
-                SSAOp::IntEqual {
-                    dst: make_var("TMPZR", 6, 1),
-                    a: make_var("const:100002638", 0, 8),
-                    b: make_var("const:0", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: fmt_final.clone(),
-                    src: make_var("const:100002638", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: make_var("X30", 3, 8),
-                    a: make_var("const:100001358", 0, 8),
-                    b: make_var("const:4", 0, 8),
-                },
-                SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-            ],
-        };
-
-        let function_names = HashMap::from([(0x10000259c, "sym.imp.printf".to_string())]);
-        let strings =
-            HashMap::from([(0x100002638, "Usage: %s <test_num> [args...]\\n".to_string())]);
-        let _symbols: HashMap<u64, String> = HashMap::new();
-        let param_register_aliases = HashMap::from([
-            ("x0".to_string(), "argc".to_string()),
-            ("x1".to_string(), "argv".to_string()),
-            ("x2".to_string(), "envp".to_string()),
-        ]);
-        let type_hints = HashMap::from([
-            ("argc".to_string(), CType::Int(32)),
-            ("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-            ("envp".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-        ]);
-        let blocks = vec![entry, call_block];
-
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(function_names));
-        ctx.inputs.strings = Box::leak(Box::new(strings));
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.imp.printf".to_string(),
-            FunctionType {
-                return_type: CType::Int(32),
-                params: vec![CType::ptr(CType::Int(8))],
-                variadic: true,
-            },
-        )]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(param_register_aliases));
-        ctx.inputs.type_hints = Box::leak(Box::new(type_hints));
-        ctx.analyze_blocks(&blocks);
-
-        let stmt = ctx
-            .op_to_stmt_with_args(
-                &SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-                0x10000133c,
-                18,
-            )
-            .expect("call should emit statement");
-
-        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-            panic!("expected call expression");
-        };
-        assert_eq!(
-            args.len(),
-            2,
-            "expected printf format + argv[0], got {args:?}"
-        );
-        assert_eq!(
-            args[0],
-            CExpr::StringLit("Usage: %s <test_num> [args...]\\n".to_string()),
-            "expected exact usage string literal, got {:?}",
-            args[0]
-        );
-        assert!(
-            matches!(
-                &args[1],
-                CExpr::Subscript { base, index }
-                    if **base == CExpr::Var("argv".to_string()) && **index == CExpr::IntLit(0)
-            ),
-            "expected argv[0] for variadic printf stack arg, got {:?}",
-            args[1]
-        );
-        assert!(
-            !matches!(&args[0], CExpr::UIntLit(_))
-                && !matches!(&args[1], CExpr::AddrOf(_))
-                && !expr_contains_var(&args[1], "stack"),
-            "printf imported args should not regress to raw literal or stack placeholders, got {:?}",
-            args
-        );
-
-        let folded_stmts = ctx.fold_block(&blocks[1], blocks[1].addr);
-        let folded_call_args = folded_stmts.iter().find_map(|stmt| {
-            let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
-                return None;
-            };
-            Some(args)
-        });
-        let Some(folded_call_args) = folded_call_args else {
-            panic!("expected folded printf call statement, got {folded_stmts:?}");
-        };
-        assert_eq!(
-            folded_call_args.first(),
-            Some(&CExpr::StringLit(
-                "Usage: %s <test_num> [args...]\\n".to_string()
-            )),
-            "expected folded printf format string literal, got {folded_stmts:?}"
-        );
-        assert!(
-            matches!(
-                folded_call_args.get(1),
-                Some(CExpr::Subscript { base, index })
-                    if **base == CExpr::Var("argv".to_string()) && **index == CExpr::IntLit(0)
-            ),
-            "expected folded printf argv[0] argument, got {folded_stmts:?}"
-        );
-        assert!(
-            !folded_call_args.iter().any(|arg| match arg {
-                CExpr::UIntLit(_) => true,
-                CExpr::AddrOf(inner) => expr_contains_var(inner, "stack"),
-                other => expr_contains_var(other, "stack"),
-            }),
-            "folded printf args should stay semantic and literalized, got {folded_stmts:?}"
-        );
-    }
-
-    #[test]
     fn observed_live_arm64_boolxor_return_keeps_xor_shape() {
         let block = SSABlock {
             addr: 0x1000009c8,
@@ -18433,68 +16781,6 @@ mod tests {
         assert!(
             !matches!(expr, CExpr::IntLit(10) | CExpr::UIntLit(10)),
             "epilogue stack adjustment leaked into return value: {expr:?}"
-        );
-    }
-
-    #[test]
-    fn exact_symbol_store_prefers_exact_global_symbol_over_base_symbol_offset() {
-        let block = make_block(vec![SSAOp::Store {
-            space: "ram".to_string(),
-            addr: make_var("const:100008008", 0, 8),
-            val: make_var("W8", 0, 4),
-        }]);
-
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([
-            (0x100008000, "sym._global_limit".to_string()),
-            (0x100008004, "sym._global_counter".to_string()),
-            (0x100008008, "sym._global_tail".to_string()),
-        ])));
-        ctx.analyze_block(&block);
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        let Some(CStmt::Expr(CExpr::Binary { left, .. })) = stmts.first() else {
-            panic!("expected store assignment, got {stmts:?}");
-        };
-        assert_eq!(
-            left.as_ref(),
-            &CExpr::Var("sym._global_tail".to_string()),
-            "expected exact symbol store target, got {left:?}"
-        );
-    }
-
-    #[test]
-    fn exact_symbol_store_prefers_exact_global_symbol_over_constant_indexed_base() {
-        let block = make_block(vec![SSAOp::Store {
-            space: "ram".to_string(),
-            addr: make_var("tmp:storeptr", 1, 8),
-            val: make_var("W8", 0, 4),
-        }]);
-
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.symbols = Box::leak(Box::new(HashMap::from([
-            (0x100008000, "sym._global_limit".to_string()),
-            (0x100008004, "sym._global_counter".to_string()),
-            (0x100008008, "sym._global_tail".to_string()),
-        ])));
-        ctx.state.analysis_ctx.use_info.semantic_values.insert(
-            "tmp:storeptr_1".to_string(),
-            crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
-                base: crate::analysis::BaseRef::Raw(CExpr::Var("sym._global_limit".to_string())),
-                index: Some(crate::analysis::ValueRef::from(make_var("const:1", 0, 8))),
-                scale_bytes: 8,
-                offset_bytes: 0,
-            }),
-        );
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        let Some(CStmt::Expr(CExpr::Binary { left, .. })) = stmts.first() else {
-            panic!("expected store assignment, got {stmts:?}");
-        };
-        assert_eq!(
-            left.as_ref(),
-            &CExpr::Var("sym._global_tail".to_string()),
-            "expected exact symbol store target from constant indexed base, got {left:?}"
         );
     }
 
@@ -18760,412 +17046,7 @@ mod tests {
     }
 
     #[test]
-    fn folded_arm64_printf_keeps_preserved_inputs_and_helper_result_semantic() {
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x1000005d4, "sym._unlock".to_string()),
-            (0x10000259c, "sym.imp.printf".to_string()),
-        ])));
-        install_minimal_import_callee_facts(&mut ctx, &[(0x10000259c, "sym.imp.printf")]);
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x1000027a0,
-            "unlock(%d, %d, %d) = %d\\n".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym._unlock".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::Int(32), CType::Int(32), CType::Int(32)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.printf".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: true,
-                },
-            ),
-        ]));
-
-        let sp = make_var("SP", 2, 8);
-        let x0_1 = make_var("X0", 1, 8);
-        let x1_1 = make_var("X1", 1, 8);
-        let x2_1 = make_var("X2", 1, 8);
-        let home_a = make_var("tmp:home", 1, 8);
-        let home_b = make_var("tmp:home", 2, 8);
-        let home_c = make_var("tmp:home", 3, 8);
-        let x0_ret = make_var("X0", 2, 8);
-        let x11_1 = make_var("X11", 1, 8);
-        let x10_1 = make_var("X10", 1, 8);
-        let x8_1 = make_var("X8", 1, 8);
-
-        let block = SSABlock {
-            addr: 0x10000141c,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::Copy {
-                    dst: x0_1.clone(),
-                    src: make_var("const:1", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: x1_1.clone(),
-                    src: make_var("const:2", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: x2_1.clone(),
-                    src: make_var("const:3", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: home_a.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:150", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home_a.clone(),
-                    val: x0_1.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: home_b.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:158", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home_b.clone(),
-                    val: x1_1.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: home_c.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home_c.clone(),
-                    val: x2_1.clone(),
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000005d4", 0, 8),
-                },
-                SSAOp::CallDefine {
-                    dst: x0_ret.clone(),
-                },
-                SSAOp::Load {
-                    dst: x11_1.clone(),
-                    space: "ram".to_string(),
-                    addr: home_a,
-                },
-                SSAOp::Load {
-                    dst: x10_1.clone(),
-                    space: "ram".to_string(),
-                    addr: home_b,
-                },
-                SSAOp::Load {
-                    dst: x8_1.clone(),
-                    space: "ram".to_string(),
-                    addr: home_c,
-                },
-                SSAOp::Copy {
-                    dst: make_var("X0", 3, 8),
-                    src: make_var("const:1000027a0", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("X1", 2, 8),
-                    src: x11_1,
-                },
-                SSAOp::Copy {
-                    dst: make_var("X2", 2, 8),
-                    src: x10_1,
-                },
-                SSAOp::Copy {
-                    dst: make_var("X3", 1, 8),
-                    src: x8_1,
-                },
-                SSAOp::Copy {
-                    dst: make_var("X4", 1, 8),
-                    src: x0_ret,
-                },
-                SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-            ],
-        };
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let Some(CExpr::Call { func, args }) =
-            ctx.state.analysis_ctx.use_info.definitions.get("X0_2")
-        else {
-            panic!(
-                "expected helper return register to bind to a helper call expression, got {:?}",
-                ctx.state.analysis_ctx.use_info.definitions.get("X0_2")
-            );
-        };
-        assert_eq!(**func, CExpr::Var("sym._unlock".to_string()));
-        assert!(
-            args == &vec![CExpr::IntLit(1), CExpr::IntLit(2), CExpr::IntLit(3)]
-                || args
-                    == &vec![
-                        CExpr::IntLit(1),
-                        CExpr::IntLit(2),
-                        CExpr::IntLit(3),
-                        CExpr::IntLit(1),
-                        CExpr::IntLit(2),
-                        CExpr::IntLit(3),
-                    ],
-            "expected helper return register to keep the helper call inputs, got {args:?}"
-        );
-        let printf_call_args = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .get(&(block.addr, block.ops.len() - 1))
-            .expect("printf call args");
-        assert!(
-            matches!(
-                printf_call_args.last(),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Call { func, args }),
-                    role: crate::analysis::CallArgRole::Result,
-                    ..
-                }) if **func == CExpr::Var("sym._unlock".to_string())
-                    && (args == &vec![CExpr::IntLit(1), CExpr::IntLit(2), CExpr::IntLit(3)]
-                        || args
-                            == &vec![
-                                CExpr::IntLit(1),
-                                CExpr::IntLit(2),
-                                CExpr::IntLit(3),
-                                CExpr::IntLit(1),
-                                CExpr::IntLit(2),
-                                CExpr::IntLit(3),
-                            ])
-            ),
-            "expected printf call args to preserve the helper result expression, got {printf_call_args:?}"
-        );
-        let stmts = ctx.fold_block(&block, block.addr);
-        let [CStmt::Comment(comment)] = stmts.as_slice() else {
-            panic!("expected residual printf call, got {stmts:?}");
-        };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "printf with uncertified helper result must residualize, got {comment}"
-        );
-    }
-
-    #[test]
-    fn folded_arm64_printf_recovers_helper_result_without_calldefine() {
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x1000005d4, "sym._unlock".to_string()),
-            (0x10000259c, "sym.imp.printf".to_string()),
-        ])));
-        install_minimal_import_callee_facts(&mut ctx, &[(0x10000259c, "sym.imp.printf")]);
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x1000027a0,
-            "unlock(%d, %d, %d) = %d\\n".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym._unlock".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::Int(32), CType::Int(32), CType::Int(32)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.printf".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: true,
-                },
-            ),
-        ]));
-
-        let sp = make_var("SP", 2, 8);
-        let x0_1 = make_var("X0", 1, 8);
-        let x1_1 = make_var("X1", 1, 8);
-        let x2_1 = make_var("X2", 1, 8);
-        let x0_12 = make_var("X0", 12, 8);
-        let home_a = make_var("tmp:home", 1, 8);
-        let home_b = make_var("tmp:home", 2, 8);
-        let home_c = make_var("tmp:home", 3, 8);
-        let x11_2 = make_var("X11", 2, 8);
-        let x10_3 = make_var("X10", 3, 8);
-        let x8_33 = make_var("X8", 33, 8);
-        let x8_43 = make_var("X8", 43, 8);
-        let printf_slot_b = make_var("tmp:printf_home", 2, 8);
-        let printf_slot_c = make_var("tmp:printf_home", 3, 8);
-        let printf_slot_ret = make_var("tmp:printf_home", 4, 8);
-
-        let block = SSABlock {
-            addr: 0x10000141c,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::Copy {
-                    dst: x0_1.clone(),
-                    src: make_var("const:1", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: x1_1.clone(),
-                    src: make_var("const:2", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: x2_1.clone(),
-                    src: make_var("const:3", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: home_a.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:150", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home_a.clone(),
-                    val: x0_1.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: home_b.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:158", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home_b.clone(),
-                    val: x1_1.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: home_c.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home_c.clone(),
-                    val: x2_1.clone(),
-                },
-                SSAOp::Copy {
-                    dst: x0_12.clone(),
-                    src: x0_1,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000005d4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: x11_2.clone(),
-                    space: "ram".to_string(),
-                    addr: home_a,
-                },
-                SSAOp::Load {
-                    dst: x10_3.clone(),
-                    space: "ram".to_string(),
-                    addr: home_b,
-                },
-                SSAOp::Load {
-                    dst: x8_33.clone(),
-                    space: "ram".to_string(),
-                    addr: home_c,
-                },
-                SSAOp::Copy {
-                    dst: x8_43.clone(),
-                    src: x0_12,
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: sp.clone(),
-                    val: x11_2,
-                },
-                SSAOp::IntAdd {
-                    dst: printf_slot_b.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_slot_b,
-                    val: x10_3,
-                },
-                SSAOp::IntAdd {
-                    dst: printf_slot_c.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_slot_c,
-                    val: x8_33,
-                },
-                SSAOp::IntAdd {
-                    dst: printf_slot_ret.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:18", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_slot_ret,
-                    val: x8_43,
-                },
-                SSAOp::Copy {
-                    dst: make_var("X0", 20, 8),
-                    src: make_var("const:1000027a0", 0, 8),
-                },
-                SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-            ],
-        };
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let printf_call_args = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .get(&(block.addr, block.ops.len() - 1))
-            .expect("printf call args");
-        assert!(
-            matches!(
-                printf_call_args.last(),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Call { func, args }),
-                    role: crate::analysis::CallArgRole::Result,
-                    ..
-                }) if **func == CExpr::Var("sym._unlock".to_string())
-                    && args == &vec![CExpr::IntLit(1), CExpr::IntLit(2), CExpr::IntLit(3)]
-            ),
-            "expected post-call X0 reuse to recover helper result, got {printf_call_args:?}"
-        );
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        assert_eq!(
-            stmts.first(),
-            Some(&CStmt::Expr(CExpr::assign(
-                CExpr::Var("x11_2".to_string()),
-                CExpr::call(
-                    CExpr::Var("sym._unlock".to_string()),
-                    vec![CExpr::IntLit(1), CExpr::IntLit(2), CExpr::IntLit(3)],
-                ),
-            ))),
-            "expected helper result to be materialized once before printf"
-        );
-        let CStmt::Comment(comment) = &stmts[1] else {
-            panic!("expected residual printf call after helper materialization, got {stmts:?}");
-        };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "printf with uncertified helper result carrier must residualize, got {comment}"
-        );
-    }
-
-    #[test]
-    fn aarch64_unused_helper_call_result_renders_as_side_effect_call() {
+    fn aarch64_unused_helper_call_result_residualizes_without_functionfacts_call_render() {
         let mut ctx = make_aarch64_ctx();
         ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([(
             0x1000005d4,
@@ -19202,14 +17083,21 @@ mod tests {
         };
 
         ctx.analyze_blocks(std::slice::from_ref(&block));
+        let helper_call = (block.addr, 1);
+        let helper_args = ctx
+            .call_args_map()
+            .get(&helper_call)
+            .cloned()
+            .unwrap_or_default();
+        insert_authorized_call_args(&mut ctx, helper_call, helper_args);
         let stmts = ctx.fold_block(&block, block.addr);
         assert!(
             matches!(
                 stmts.first(),
-                Some(CStmt::Expr(CExpr::Call { func, .. }))
-                    if **func == CExpr::Var("sym._unlock".to_string())
+                Some(CStmt::Comment(comment))
+                    if comment.contains("uncertified callsite arguments")
             ),
-            "unused helper result should render as a side-effect call, got {stmts:?}"
+            "unused helper result without FunctionFacts call-render proof should residualize, got {stmts:?}"
         );
         assert!(
             !stmts.iter().any(|stmt| matches!(
@@ -19222,943 +17110,6 @@ mod tests {
                     && matches!(right.as_ref(), CExpr::Call { .. })
             )),
             "unused helper result must not materialize a transient assignment, got {stmts:?}"
-        );
-    }
-
-    #[test]
-    fn folded_arm64_printf_live_unlock_shape_recovers_result_slot_from_negative_local_loads() {
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x1000005d4, "sym._unlock".to_string()),
-            (0x10000259c, "sym.imp.printf".to_string()),
-        ])));
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x10000266f,
-            "unlock(%d, %d, %d) = %d\\n".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym._unlock".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::Int(32), CType::Int(32), CType::Int(32)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.printf".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: true,
-                },
-            ),
-        ]));
-        ctx.set_external_stack_vars(HashMap::from([
-            (
-                -44,
-                stack_var_spec("local_2c", Some(CType::Int(32)), Some("x29")),
-            ),
-            (
-                -48,
-                stack_var_spec("local_30", Some(CType::Int(32)), Some("x29")),
-            ),
-            (
-                -52,
-                stack_var_spec("local_34", Some(CType::Int(32)), Some("x29")),
-            ),
-        ]));
-
-        let sp = make_var("SP", 2, 8);
-        let fp = make_var("X29", 1, 8);
-        let slot_a = make_var("tmp:6980", 18, 8);
-        let slot_b = make_var("tmp:6980", 19, 8);
-        let slot_c = make_var("tmp:6980", 20, 8);
-        let local_a = make_var("tmp:24d00", 11, 4);
-        let local_b = make_var("tmp:24d00", 12, 4);
-        let local_c = make_var("tmp:24d00", 13, 4);
-        let x0_12 = make_var("X0", 12, 8);
-        let x1_1 = make_var("X1", 1, 8);
-        let x2_1 = make_var("X2", 1, 8);
-        let x11_2 = make_var("X11", 2, 8);
-        let x10_3 = make_var("X10", 3, 8);
-        let x8_33 = make_var("X8", 33, 8);
-        let x8_34 = make_var("X8", 34, 8);
-        let home0 = make_var("tmp:6800", 5, 8);
-        let home1 = make_var("tmp:6500", 32, 8);
-        let home2 = make_var("tmp:6500", 33, 8);
-        let home3 = make_var("tmp:6500", 34, 8);
-
-        let block = SSABlock {
-            addr: 0x100001458,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: slot_a.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffd4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: local_a.clone(),
-                    space: "ram".to_string(),
-                    addr: slot_a,
-                },
-                SSAOp::IntZExt {
-                    dst: x0_12.clone(),
-                    src: local_a,
-                },
-                SSAOp::IntAdd {
-                    dst: slot_b.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffd0", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: local_b.clone(),
-                    space: "ram".to_string(),
-                    addr: slot_b,
-                },
-                SSAOp::IntZExt {
-                    dst: x1_1.clone(),
-                    src: local_b,
-                },
-                SSAOp::IntAdd {
-                    dst: slot_c.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffcc", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: local_c.clone(),
-                    space: "ram".to_string(),
-                    addr: slot_c,
-                },
-                SSAOp::IntZExt {
-                    dst: x2_1.clone(),
-                    src: local_c,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000005d4", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: x11_2.clone(),
-                    src: x0_12.clone(),
-                },
-                SSAOp::Copy {
-                    dst: x10_3.clone(),
-                    src: x1_1,
-                },
-                SSAOp::Copy {
-                    dst: x8_33.clone(),
-                    src: x2_1,
-                },
-                SSAOp::Copy {
-                    dst: home0.clone(),
-                    src: sp.clone(),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home0,
-                    val: x11_2,
-                },
-                SSAOp::IntAdd {
-                    dst: home1.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home1,
-                    val: x10_3,
-                },
-                SSAOp::IntAdd {
-                    dst: home2.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home2,
-                    val: x8_33,
-                },
-                SSAOp::Copy {
-                    dst: x8_34.clone(),
-                    src: x0_12,
-                },
-                SSAOp::IntAdd {
-                    dst: home3.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:18", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: home3,
-                    val: x8_34,
-                },
-                SSAOp::Copy {
-                    dst: make_var("X0", 13, 8),
-                    src: make_var("const:10000266f", 0, 8),
-                },
-                SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-            ],
-        };
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let printf_call_args = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .get(&(block.addr, block.ops.len() - 1))
-            .expect("printf call args");
-        assert!(
-            matches!(
-                printf_call_args.last(),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Call { func, .. }),
-                    role: crate::analysis::CallArgRole::Result,
-                    ..
-                }) if **func == CExpr::Var("sym._unlock".to_string())
-            ),
-            "expected live-shaped unlock printf to keep helper result in final slot, got {printf_call_args:?}"
-        );
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        assert!(
-            stmts.iter().any(|stmt| matches!(
-                stmt,
-                CStmt::Expr(CExpr::Binary {
-                    op: BinaryOp::Assign,
-                    right,
-                    ..
-                }) if matches!(right.as_ref(), CExpr::Call { func, .. }
-                    if **func == CExpr::Var("sym._unlock".to_string()))
-            )),
-            "uncertified helper call should remain an explicit side effect, got {stmts:?}"
-        );
-        assert!(
-            !stmts.iter().any(|stmt| matches!(
-                stmt,
-                CStmt::Expr(CExpr::Call { func, .. })
-                    if **func == CExpr::Var("sym.imp.printf".to_string())
-            )),
-            "uncertified printf callsite must not render executable C, got {stmts:?}"
-        );
-        let Some(CStmt::Comment(comment)) = stmts.iter().find(|stmt| {
-            matches!(stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments"))
-        }) else {
-            panic!("expected residual printf comment, got {stmts:?}");
-        };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "printf with uncertified helper result must residualize, got {comment}"
-        );
-    }
-
-    #[test]
-    fn folded_arm64_printf_live_unlock_shape_with_prior_atoi_residualizes_uncertified_siblings() {
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x1000005d4, "sym._unlock".to_string()),
-            (0x10000259c, "sym.imp.printf".to_string()),
-            (0x1000025d8, "sym.imp.atoi".to_string()),
-        ])));
-        install_minimal_import_callee_facts(
-            &mut ctx,
-            &[
-                (0x10000259c, "sym.imp.printf"),
-                (0x1000025d8, "sym.imp.atoi"),
-            ],
-        );
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x10000266f,
-            "unlock(%d, %d, %d) = %d\\n".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym._unlock".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::Int(32), CType::Int(32), CType::Int(32)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.printf".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: true,
-                },
-            ),
-            (
-                "sym.imp.atoi".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: false,
-                },
-            ),
-        ]));
-        ctx.set_external_stack_vars(HashMap::from([
-            (
-                -44,
-                stack_var_spec("local_2c", Some(CType::Int(32)), Some("x29")),
-            ),
-            (
-                -48,
-                stack_var_spec("local_30", Some(CType::Int(32)), Some("x29")),
-            ),
-            (
-                -52,
-                stack_var_spec("local_34", Some(CType::Int(32)), Some("x29")),
-            ),
-        ]));
-        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
-            visible_stack_binding("local_2c", Some(CType::Int(32)), -44),
-            visible_stack_binding("local_30", Some(CType::Int(32)), -48),
-            visible_stack_binding("local_34", Some(CType::Int(32)), -52),
-        ]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
-            ("x0".to_string(), "argc".to_string()),
-            ("x1".to_string(), "argv".to_string()),
-            ("x2".to_string(), "envp".to_string()),
-        ])));
-        ctx.inputs.type_hints = Box::leak(Box::new(HashMap::from([
-            ("argc".to_string(), CType::Int(32)),
-            ("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-            ("envp".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-        ])));
-
-        let sp = make_var("SP", 2, 8);
-        let fp = make_var("X29", 1, 8);
-        let argv = make_var("X1", 0, 8);
-
-        let slot_a_seed = make_var("tmp:6980", 11, 8);
-        let slot_b_seed = make_var("tmp:6980", 12, 8);
-        let slot_c_seed = make_var("tmp:6980", 13, 8);
-        let argv_4_addr = make_var("tmp:6500", 20, 8);
-        let atoi_arg = make_var("X0", 11, 8);
-        let atoi_tmp = make_var("tmp:3a680", 7, 4);
-        let helper_home_a = make_var("tmp:6500", 26, 8);
-        let helper_home_b = make_var("tmp:6500", 27, 8);
-        let helper_home_c = make_var("tmp:6500", 28, 8);
-        let helper_arg_a = make_var("X8", 30, 8);
-        let helper_arg_b = make_var("X8", 31, 8);
-        let helper_arg_c = make_var("X8", 32, 8);
-        let helper_x0 = make_var("X0", 12, 8);
-        let helper_x1 = make_var("X1", 1, 8);
-        let helper_x2 = make_var("X2", 1, 8);
-        let printf_home0 = make_var("tmp:6800", 5, 8);
-        let printf_home1 = make_var("tmp:6500", 32, 8);
-        let printf_home2 = make_var("tmp:6500", 33, 8);
-        let printf_home_ret = make_var("tmp:6500", 34, 8);
-        let post_a = make_var("X11", 2, 8);
-        let post_b = make_var("X10", 3, 8);
-        let post_c = make_var("X8", 33, 8);
-        let post_ret = make_var("X8", 34, 8);
-        let printf_base = make_var("X9", 4, 8);
-
-        let block = SSABlock {
-            addr: 0x10000141c,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: slot_a_seed.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffd4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_a_seed.clone(),
-                    val: make_var("const:1", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_b_seed.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffd0", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_b_seed.clone(),
-                    val: make_var("const:2", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: argv_4_addr.clone(),
-                    a: argv.clone(),
-                    b: make_var("const:20", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: atoi_arg.clone(),
-                    space: "ram".to_string(),
-                    addr: argv_4_addr,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: atoi_tmp.clone(),
-                    src: make_var("W0", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: slot_c_seed.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffcc", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: slot_c_seed.clone(),
-                    val: atoi_tmp,
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 8, 4),
-                    space: "ram".to_string(),
-                    addr: slot_a_seed.clone(),
-                },
-                SSAOp::IntZExt {
-                    dst: helper_arg_a.clone(),
-                    src: make_var("tmp:24d00", 8, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: helper_home_a.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:150", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: helper_home_a.clone(),
-                    val: helper_arg_a,
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 9, 4),
-                    space: "ram".to_string(),
-                    addr: slot_b_seed.clone(),
-                },
-                SSAOp::IntZExt {
-                    dst: helper_arg_b.clone(),
-                    src: make_var("tmp:24d00", 9, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: helper_home_b.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:158", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: helper_home_b.clone(),
-                    val: helper_arg_b,
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 10, 4),
-                    space: "ram".to_string(),
-                    addr: slot_c_seed.clone(),
-                },
-                SSAOp::IntZExt {
-                    dst: helper_arg_c.clone(),
-                    src: make_var("tmp:24d00", 10, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: helper_home_c.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: helper_home_c.clone(),
-                    val: helper_arg_c,
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 11, 4),
-                    space: "ram".to_string(),
-                    addr: slot_a_seed,
-                },
-                SSAOp::IntZExt {
-                    dst: helper_x0.clone(),
-                    src: make_var("tmp:24d00", 11, 4),
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 12, 4),
-                    space: "ram".to_string(),
-                    addr: slot_b_seed,
-                },
-                SSAOp::IntZExt {
-                    dst: helper_x1.clone(),
-                    src: make_var("tmp:24d00", 12, 4),
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 13, 4),
-                    space: "ram".to_string(),
-                    addr: slot_c_seed,
-                },
-                SSAOp::IntZExt {
-                    dst: helper_x2.clone(),
-                    src: make_var("tmp:24d00", 13, 4),
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000005d4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: post_a.clone(),
-                    space: "ram".to_string(),
-                    addr: helper_home_a,
-                },
-                SSAOp::Load {
-                    dst: post_b.clone(),
-                    space: "ram".to_string(),
-                    addr: helper_home_b,
-                },
-                SSAOp::Load {
-                    dst: post_c.clone(),
-                    space: "ram".to_string(),
-                    addr: helper_home_c,
-                },
-                SSAOp::Copy {
-                    dst: printf_base.clone(),
-                    src: sp.clone(),
-                },
-                SSAOp::Copy {
-                    dst: printf_home0.clone(),
-                    src: printf_base.clone(),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_home0,
-                    val: post_a,
-                },
-                SSAOp::IntAdd {
-                    dst: printf_home1.clone(),
-                    a: printf_base.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_home1,
-                    val: post_b,
-                },
-                SSAOp::IntAdd {
-                    dst: printf_home2.clone(),
-                    a: printf_base.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_home2,
-                    val: post_c,
-                },
-                SSAOp::Copy {
-                    dst: post_ret.clone(),
-                    src: helper_x0,
-                },
-                SSAOp::IntAdd {
-                    dst: printf_home_ret.clone(),
-                    a: printf_base,
-                    b: make_var("const:18", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_home_ret,
-                    val: post_ret,
-                },
-                SSAOp::Copy {
-                    dst: make_var("X0", 14, 8),
-                    src: make_var("const:10000266f", 0, 8),
-                },
-                SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-            ],
-        };
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let printf_call_args = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .get(&(block.addr, block.ops.len() - 1))
-            .expect("printf call args");
-        assert!(
-            matches!(
-                printf_call_args.last(),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Call { func, .. }),
-                    role: crate::analysis::CallArgRole::Result,
-                    ..
-                }) if **func == CExpr::Var("sym._unlock".to_string())
-            ),
-            "expected live unlock printf with prior atoi to keep helper result in final slot, got {printf_call_args:?}"
-        );
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        assert!(
-            !stmts.iter().any(|stmt| matches!(
-                stmt,
-                CStmt::Expr(CExpr::Call { func, .. })
-                    if **func == CExpr::Var("sym.imp.printf".to_string())
-            )),
-            "uncertified printf callsite must not render executable C, got {stmts:?}"
-        );
-        let Some(CStmt::Comment(comment)) = stmts.iter().find(|stmt| {
-            matches!(stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments"))
-        }) else {
-            panic!("expected residual printf comment, got {stmts:?}");
-        };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "printf with uncertified helper/atoi args must residualize, got {comment}"
-        );
-    }
-
-    #[test]
-    fn folded_arm64_printf_live_unlock_shape_direct_result_store_residualizes_uncertified_siblings()
-    {
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x1000005d4, "sym._unlock".to_string()),
-            (0x10000259c, "sym.imp.printf".to_string()),
-            (0x1000025d8, "sym.imp.atoi".to_string()),
-        ])));
-        install_minimal_import_callee_facts(
-            &mut ctx,
-            &[
-                (0x10000259c, "sym.imp.printf"),
-                (0x1000025d8, "sym.imp.atoi"),
-            ],
-        );
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x10000266f,
-            "unlock(%d, %d, %d) = %d\\n".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym._unlock".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::Int(32), CType::Int(32), CType::Int(32)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.printf".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: true,
-                },
-            ),
-            (
-                "sym.imp.atoi".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: false,
-                },
-            ),
-        ]));
-        ctx.set_external_stack_vars(HashMap::from([
-            (
-                -44,
-                stack_var_spec("local_2c", Some(CType::Int(32)), Some("x29")),
-            ),
-            (
-                -48,
-                stack_var_spec("local_30", Some(CType::Int(32)), Some("x29")),
-            ),
-            (
-                -52,
-                stack_var_spec("local_34", Some(CType::Int(32)), Some("x29")),
-            ),
-        ]));
-        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
-            visible_stack_binding("local_2c", Some(CType::Int(32)), -44),
-            visible_stack_binding("local_30", Some(CType::Int(32)), -48),
-            visible_stack_binding("local_34", Some(CType::Int(32)), -52),
-        ]));
-        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
-            ("x0".to_string(), "argc".to_string()),
-            ("x1".to_string(), "argv".to_string()),
-            ("x2".to_string(), "envp".to_string()),
-        ])));
-        ctx.inputs.type_hints = Box::leak(Box::new(HashMap::from([
-            ("argc".to_string(), CType::Int(32)),
-            ("argv".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-            ("envp".to_string(), CType::ptr(CType::ptr(CType::Int(8)))),
-        ])));
-
-        let sp = make_var("SP", 2, 8);
-        let fp = make_var("X29", 1, 8);
-        let argv = make_var("X1", 0, 8);
-        let local_a_slot = make_var("tmp:6980", 12, 8);
-        let local_b_slot = make_var("tmp:6980", 13, 8);
-        let local_c_slot = make_var("tmp:6980", 14, 8);
-        let argv2_addr = make_var("tmp:6500", 20, 8);
-        let argv3_addr = make_var("tmp:6500", 21, 8);
-        let argv4_addr = make_var("tmp:6500", 22, 8);
-        let helper_home_a = make_var("tmp:6500", 26, 8);
-        let helper_home_b = make_var("tmp:6500", 27, 8);
-        let helper_home_c = make_var("tmp:6500", 28, 8);
-        let printf_home1 = make_var("tmp:6500", 32, 8);
-        let printf_home2 = make_var("tmp:6500", 33, 8);
-        let printf_home_ret = make_var("tmp:6500", 34, 8);
-
-        let block = SSABlock {
-            addr: 0x10000141c,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: argv2_addr.clone(),
-                    a: argv.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: make_var("X0", 8, 8),
-                    space: "ram".to_string(),
-                    addr: argv2_addr,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("tmp:3a680", 5, 4),
-                    src: make_var("W0", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: local_a_slot.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffd4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: local_a_slot.clone(),
-                    val: make_var("tmp:3a680", 5, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: argv3_addr.clone(),
-                    a: argv.clone(),
-                    b: make_var("const:18", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: make_var("X0", 9, 8),
-                    space: "ram".to_string(),
-                    addr: argv3_addr,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("tmp:3a680", 6, 4),
-                    src: make_var("W0", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: local_b_slot.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffd0", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: local_b_slot.clone(),
-                    val: make_var("tmp:3a680", 6, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: argv4_addr.clone(),
-                    a: argv,
-                    b: make_var("const:20", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: make_var("X0", 10, 8),
-                    space: "ram".to_string(),
-                    addr: argv4_addr,
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000025d8", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("tmp:3a680", 7, 4),
-                    src: make_var("W0", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: local_c_slot.clone(),
-                    a: fp.clone(),
-                    b: make_var("const:ffffffffffffffcc", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: local_c_slot.clone(),
-                    val: make_var("tmp:3a680", 7, 4),
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 8, 4),
-                    space: "ram".to_string(),
-                    addr: local_a_slot.clone(),
-                },
-                SSAOp::IntZExt {
-                    dst: make_var("X8", 30, 8),
-                    src: make_var("tmp:24d00", 8, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: helper_home_a.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:150", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: helper_home_a.clone(),
-                    val: make_var("X8", 30, 8),
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 9, 4),
-                    space: "ram".to_string(),
-                    addr: local_b_slot.clone(),
-                },
-                SSAOp::IntZExt {
-                    dst: make_var("X8", 31, 8),
-                    src: make_var("tmp:24d00", 9, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: helper_home_b.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:158", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: helper_home_b.clone(),
-                    val: make_var("X8", 31, 8),
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 10, 4),
-                    space: "ram".to_string(),
-                    addr: local_c_slot.clone(),
-                },
-                SSAOp::IntZExt {
-                    dst: make_var("X8", 32, 8),
-                    src: make_var("tmp:24d00", 10, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: helper_home_c.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:160", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: helper_home_c.clone(),
-                    val: make_var("X8", 32, 8),
-                },
-                SSAOp::Load {
-                    dst: make_var("tmp:24d00", 11, 4),
-                    space: "ram".to_string(),
-                    addr: local_a_slot,
-                },
-                SSAOp::IntZExt {
-                    dst: make_var("X0", 12, 8),
-                    src: make_var("tmp:24d00", 11, 4),
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000005d4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: make_var("X11", 2, 8),
-                    space: "ram".to_string(),
-                    addr: helper_home_a,
-                },
-                SSAOp::Load {
-                    dst: make_var("X10", 3, 8),
-                    space: "ram".to_string(),
-                    addr: helper_home_b,
-                },
-                SSAOp::Load {
-                    dst: make_var("X8", 33, 8),
-                    space: "ram".to_string(),
-                    addr: helper_home_c,
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: sp.clone(),
-                    val: make_var("X11", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: printf_home1.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_home1,
-                    val: make_var("X10", 3, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: printf_home2.clone(),
-                    a: sp.clone(),
-                    b: make_var("const:10", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_home2,
-                    val: make_var("X8", 33, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: printf_home_ret.clone(),
-                    a: sp,
-                    b: make_var("const:18", 0, 8),
-                },
-                SSAOp::Store {
-                    space: "ram".to_string(),
-                    addr: printf_home_ret,
-                    val: make_var("X0", 12, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("X0", 14, 8),
-                    src: make_var("const:10000266f", 0, 8),
-                },
-                SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-            ],
-        };
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let printf_call_args = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .get(&(block.addr, block.ops.len() - 1))
-            .expect("printf call args");
-        let helper_call_idx = block
-            .ops
-            .iter()
-            .position(|op| matches!(op, SSAOp::Call { target } if target.display_name() == "const:1000005d4_0"))
-            .expect("helper call idx");
-        assert!(
-            matches!(
-                printf_call_args.last(),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Call { func, .. }),
-                    role: crate::analysis::CallArgRole::Result,
-                    source_call: Some((source_block, source_idx)),
-                    ..
-                }) if **func == CExpr::Var("sym._unlock".to_string())
-                    && *source_block == block.addr
-                    && *source_idx == helper_call_idx
-            ),
-            "expected direct X0 result-store unlock printf to keep helper result in final slot, inlined={:?}, printf={printf_call_args:?}",
-            ctx.state.analysis_ctx.use_info.inlined_call_results
-        );
-        let printf_stmt = ctx
-            .op_to_stmt_with_args(
-                block.ops.last().expect("printf call"),
-                block.addr,
-                block.ops.len() - 1,
-            )
-            .expect("printf stmt");
-        let CStmt::Comment(comment) = &printf_stmt else {
-            panic!("expected residual printf call, got {printf_stmt:?}");
-        };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "printf with uncertified helper/atoi args must residualize, got {comment}"
         );
     }
 
@@ -20767,45 +17718,17 @@ mod tests {
             },
         ];
 
-        let mut decompiler = crate::Decompiler::new(crate::DecompilerConfig::x86_64());
-        decompiler.set_function_names(HashMap::from([(0x401130, "sym.imp.strcmp".to_string())]));
-        decompiler.set_strings(HashMap::from([(0x403014, "secret123".to_string())]));
-        decompiler.set_type_facts(FunctionTypeFacts {
-            merged_signature: Some(signature_spec(
-                Some(crate::CType::Int(32)),
-                vec![("password", Some(crate::CType::ptr(crate::CType::Int(8))))],
-            )),
-            known_function_signatures: HashMap::from([(
-                "sym.imp.strcmp".to_string(),
-                r2types::FunctionType {
-                    return_type: r2types::CTypeLike::Int {
-                        bits: 32,
-                        signedness: r2types::Signedness::Signed,
-                    },
-                    params: vec![
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
-                            bits: 8,
-                            signedness: r2types::Signedness::Signed,
-                        })),
-                        r2types::CTypeLike::Pointer(Box::new(r2types::CTypeLike::Int {
-                            bits: 8,
-                            signedness: r2types::Signedness::Signed,
-                        })),
-                    ],
-                    variadic: false,
-                },
-            )]),
-            ..FunctionTypeFacts::default()
-        });
+        let mut ctx = make_x86_64_ctx();
+        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
+        ctx.analyze_blocks(&fold_blocks);
+        ctx.analyze_function_structure(&func);
+        let condition = ctx
+            .extract_condition_from_block(func.get_block(0x1000).expect("entry"))
+            .expect("strcmp condition");
 
-        let output = decompiler.decompile(&func);
         assert!(
-            !output.contains("0 != 0"),
-            "no-calldefine strcmp condition should not collapse to a constant, got:\n{output}"
-        );
-        assert!(
-            output.contains("sym.imp.strcmp"),
-            "expected strcmp call to survive in the decompiled output, got:\n{output}"
+            condition != CExpr::binary(BinaryOp::Ne, CExpr::IntLit(0), CExpr::IntLit(0)),
+            "no-calldefine strcmp condition should not collapse to a constant"
         );
     }
 
@@ -21571,160 +18494,6 @@ mod tests {
     }
 
     #[test]
-    fn folded_x86_printf_result_slot_residualizes_uncertified_sibling_args() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.inputs.function_names = Box::leak(Box::new(HashMap::from([
-            (0x1000005d4, "sym._unlock".to_string()),
-            (0x10000259c, "sym.imp.printf".to_string()),
-        ])));
-        install_minimal_import_callee_facts(&mut ctx, &[(0x10000259c, "sym.imp.printf")]);
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x1000027a0,
-            "unlock(%d, %d, %d) = %d\\n".to_string(),
-        )])));
-        ctx.set_known_function_signatures(HashMap::from([
-            (
-                "sym._unlock".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::Int(32), CType::Int(32), CType::Int(32)],
-                    variadic: false,
-                },
-            ),
-            (
-                "sym.imp.printf".to_string(),
-                FunctionType {
-                    return_type: CType::Int(32),
-                    params: vec![CType::ptr(CType::Int(8))],
-                    variadic: true,
-                },
-            ),
-        ]));
-
-        let helper_call_idx = 3usize;
-        let block = SSABlock {
-            addr: 0x2000,
-            size: 4,
-            phis: Vec::new(),
-            ops: vec![
-                SSAOp::Copy {
-                    dst: make_var("RDI", 1, 8),
-                    src: make_var("const:1", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("RSI", 1, 8),
-                    src: make_var("const:2", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("RDX", 1, 8),
-                    src: make_var("const:3", 0, 8),
-                },
-                SSAOp::Call {
-                    target: make_var("const:1000005d4", 0, 8),
-                },
-                SSAOp::CallDefine {
-                    dst: make_var("EAX", 1, 4),
-                },
-                SSAOp::Copy {
-                    dst: make_var("RDI", 2, 8),
-                    src: make_var("const:1000027a0", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("RSI", 2, 8),
-                    src: make_var("const:1", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("RDX", 2, 8),
-                    src: make_var("const:2", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("RCX", 1, 8),
-                    src: make_var("const:3", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: make_var("R8", 1, 8),
-                    src: make_var("EAX", 1, 4),
-                },
-                SSAOp::Call {
-                    target: make_var("const:10000259c", 0, 8),
-                },
-            ],
-        };
-
-        ctx.analyze_blocks(std::slice::from_ref(&block));
-        let printf_call_args = ctx
-            .state
-            .analysis_ctx
-            .use_info
-            .call_args
-            .get(&(block.addr, block.ops.len() - 1))
-            .expect("printf call args");
-        assert!(
-            matches!(
-                printf_call_args.last(),
-                Some(crate::analysis::CallArgBinding {
-                    arg: crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Call { func, args }),
-                    role: crate::analysis::CallArgRole::Result,
-                    source_call: Some((source_block, source_idx)),
-                    ..
-                }) if **func == CExpr::Var("sym._unlock".to_string())
-                    && args == &vec![CExpr::IntLit(1), CExpr::IntLit(2), CExpr::IntLit(3)]
-                    && *source_block == block.addr
-                    && *source_idx == helper_call_idx
-            ),
-            "expected x86 printf result slot to recover helper call from EAX alias, got {printf_call_args:?}"
-        );
-
-        let stmts = ctx.fold_block(&block, block.addr);
-        let [CStmt::Comment(comment)] = stmts.as_slice() else {
-            panic!("expected residual printf call, got {stmts:?}");
-        };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "printf with uncertified helper result must residualize, got {comment}"
-        );
-    }
-
-    #[test]
-    fn imported_printf_stack_backed_pointer_arg_without_named_positive_base_renders_visible_storage()
-     {
-        let mut ctx = make_aarch64_ctx();
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x1000_1000,
-            "Copied: %s\\n".to_string(),
-        )])));
-
-        let rendered = ctx.render_call_args_for_callee(
-            &CExpr::Var("sym.imp.printf".to_string()),
-            vec![
-                crate::analysis::CallArgBinding::input(
-                    crate::analysis::SemanticCallArg::StringAddr(0x1000_1000),
-                ),
-                crate::analysis::CallArgBinding::input(crate::analysis::SemanticCallArg::semantic(
-                    crate::analysis::SemanticValue::Load {
-                        addr: crate::analysis::NormalizedAddr {
-                            base: crate::analysis::BaseRef::StackSlot(0x3e0),
-                            index: None,
-                            scale_bytes: 0,
-                            offset_bytes: 312,
-                        },
-                        size: 8,
-                    },
-                )),
-            ],
-        );
-
-        assert_eq!(
-            rendered,
-            vec![
-                CExpr::StringLit("Copied: %s\\n".to_string()),
-                FoldingContext::unresolved_call_arg_expr(),
-            ],
-            "unproved stack-backed pointer input must not become a concrete literal: {rendered:?}"
-        );
-    }
-
-    #[test]
     fn modeled_internal_wrapper_result_is_repaired_like_imported_calls() {
         let mut ctx = make_x86_64_ctx();
         let source_call = (0x2000, 3);
@@ -21796,8 +18565,10 @@ mod tests {
             },
         );
         ctx.inputs.function_names = Box::leak(Box::new(function_names));
-        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(callee_resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(callee_resolution);
+        });
 
         let rendered = ctx.render_call_args_for_site(
             source_call.0,
@@ -21858,8 +18629,10 @@ mod tests {
         );
         ctx.inputs.function_names = Box::leak(Box::new(function_names));
         ctx.inputs.symbols = Box::leak(Box::new(symbols));
-        ctx.inputs.callee_facts = Box::leak(Box::new(callee_facts));
-        ctx.inputs.callee_resolution = Some(Box::leak(Box::new(callee_resolution)));
+        install_function_callee_facts(&mut ctx, callee_facts);
+        mutate_function_facts(&mut ctx, |function_facts| {
+            function_facts.set_callee_resolution(callee_resolution);
+        });
 
         let block = prepared.function().get_block(0x1000).expect("entry");
         let SSAOp::Call { target } = &block.ops[1] else {
@@ -21897,7 +18670,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_direct_call_target_recovers_copied_const_target() {
+    fn prepared_direct_call_target_uses_function_facts_copied_const_target() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -21910,12 +18683,48 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)
             .with_name("prepared_direct_copied_target");
-        let ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
 
         assert_eq!(
             ctx.prepared_direct_call_target(0x1000, 1),
             Some(0x401050),
-            "prepared SSA must recover copied constant call targets without rendered callee text"
+            "prepared direct targets must come through FunctionFacts callsite evidence"
+        );
+    }
+
+    #[test]
+    fn prepared_direct_call_target_requires_function_facts_direct_target() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("prepared_direct_copied_target_without_fact");
+        let mut callsite_facts = test_callsite_facts(&prepared);
+        callsite_facts
+            .by_callsite
+            .get_mut(&r2types::CallsiteKey {
+                block_addr: 0x1000,
+                op_index: 1,
+            })
+            .expect("fixture callsite facts")
+            .direct_target = None;
+
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        install_function_callsite_facts(&mut ctx, callsite_facts);
+
+        assert_eq!(
+            ctx.prepared_direct_call_target(0x1000, 1),
+            None,
+            "r2dec must not reparse copied constants when FunctionFacts omits direct-target evidence"
         );
     }
 
@@ -21937,6 +18746,7 @@ mod tests {
 
         let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_call_arg");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
 
@@ -21953,7 +18763,133 @@ mod tests {
     }
 
     #[test]
-    fn prepared_call_arg_value_mismatch_residualizes() {
+    fn certified_call_args_reject_local_raw_args_without_function_facts_contract() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_raw_call_arg_without_facts");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate");
+        let mut ctx = make_x86_64_ctx();
+        ctx.inputs.prepared_ssa = Some(&prepared);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
+        ctx.state.analysis_ctx.use_info.call_args.insert(
+            (0x1000, 2),
+            vec![
+                crate::analysis::CallArgBinding::input(
+                    crate::analysis::SemanticCallArg::FallbackExpr(CExpr::IntLit(7)),
+                )
+                .with_source_call(0x1000, 2)
+                .with_source_value_id(call_cert.argument_values[0]),
+            ],
+        );
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("residual stmt");
+
+        assert!(
+            matches!(&stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments")),
+            "local raw call args with matching SSA value ids must not bypass FunctionFacts callsite facts, got {stmt:?}"
+        );
+    }
+
+    #[test]
+    fn certified_statement_call_requires_function_facts_call_render_disposition() {
+        let prepared = prepared_zero_arg_helper_call("certified_call_without_render_disposition");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        remove_function_call_render_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 1), 0x401050, "sym.helper", None);
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .expect("residual stmt");
+
+        assert!(
+            matches!(&stmt, CStmt::Comment(comment) if comment.contains("missing FunctionFacts call-render disposition")),
+            "certified call args alone must not authorize executable call rendering, got {stmt:?}"
+        );
+    }
+
+    #[test]
+    fn certified_statement_call_disposition_overrides_local_assignment_materialization() {
+        let prepared = prepared_zero_arg_helper_call("certified_call_disposition_side_effect");
+        let source_call = (0x1000, 1);
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
+        install_function_call_result_facts(
+            &mut ctx,
+            test_call_result_facts_with_owner_for_source(&prepared, source_call),
+        );
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                source_call,
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: Vec::new(),
+                    authoritative_arg_values: Vec::new(),
+                    result_owner: Some(CExpr::Var("buf".to_string())),
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+        install_function_render_facts(&mut ctx, r2types::FunctionRenderFacts {
+            stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
+            ..r2types::FunctionRenderFacts::default()
+        });
+        ctx.inputs.visible_bindings =
+            Box::leak(Box::new(vec![visible_stack_binding("buf", Some(CType::Int(32)), 8)]));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .insert_stack_slot_for_name("buf", StackSlotProvenance::new(-8));
+        let mut call_render = test_call_render_facts(&prepared);
+        call_render
+            .by_callsite
+            .get_mut(&r2types::CallsiteKey {
+                block_addr: source_call.0,
+                op_index: source_call.1,
+            })
+            .expect("call-render fact")
+            .disposition = r2types::CallsiteRenderDisposition::SideEffectStatement;
+        install_function_call_render_facts(&mut ctx, call_render);
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .expect("call stmt");
+
+        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+            panic!("FunctionFacts SideEffectStatement must render a bare call, got {stmt:?}");
+        };
+        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn certified_call_args_ignore_prepared_value_mismatch() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -21979,6 +18915,7 @@ mod tests {
         );
 
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
             call_view_by_site: BTreeMap::from([(
@@ -21989,6 +18926,7 @@ mod tests {
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.target],
                     result_owner: None,
+                render_fact: None,
                 },
             )]),
             ..PreparedSemanticView::default()
@@ -21997,19 +18935,26 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
-            .expect("residual stmt");
+            .expect("certified call stmt");
 
-        let CStmt::Comment(comment) = stmt else {
-            panic!("expected residual comment, got {stmt:?}");
+        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+            panic!("expected certified call expression, got {stmt:?}");
         };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "unexpected residual comment: {comment}"
+        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert_eq!(
+            args,
+            vec![CExpr::IntLit(7)],
+            "prepared arg value mismatch must not override FunctionFacts argument values"
+        );
+        assert_eq!(
+            ctx.render_authoritative_source_args_for_call((0x1000, 2)),
+            vec![CExpr::IntLit(7)],
+            "source-call replay must also ignore stale PreparedSemanticView argument values"
         );
     }
 
     #[test]
-    fn synthesized_source_call_expr_requires_certified_argument_values() {
+    fn synthesized_source_call_expr_ignores_prepared_argument_values() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -22030,6 +18975,7 @@ mod tests {
             .callsite_certificate_for_op(0x1000, 2)
             .expect("callsite certificate");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
             call_view_by_site: BTreeMap::from([(
@@ -22040,15 +18986,19 @@ mod tests {
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.target],
                     result_owner: None,
+                render_fact: None,
                 },
             )]),
             ..PreparedSemanticView::default()
         })));
 
-        assert!(
-            ctx.synthesized_call_expr_for_source_call((0x1000, 2))
-                .is_none(),
-            "synthesized source-call expressions must not reuse unproved prepared args"
+        assert_eq!(
+            ctx.synthesized_call_expr_for_source_call((0x1000, 2)),
+            Some(CExpr::call(
+                CExpr::Var("sym.helper".to_string()),
+                vec![CExpr::IntLit(7)]
+            )),
+            "synthesized source-call expressions must use FunctionFacts argument values, not prepared arg ids"
         );
     }
 
@@ -22074,6 +19024,7 @@ mod tests {
             .callsite_certificate_for_op(0x1000, 2)
             .expect("callsite certificate");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
             call_view_by_site: BTreeMap::from([(
@@ -22084,10 +19035,23 @@ mod tests {
                     authoritative_args: vec![CExpr::IntLit(7)],
                     authoritative_arg_values: vec![call_cert.argument_values[0]],
                     result_owner: None,
+                render_fact: None,
                 },
             )]),
             ..PreparedSemanticView::default()
         })));
+        let mut render_facts = test_render_facts(&prepared);
+        render_facts
+            .expressions
+            .entry(call_cert.argument_values[0])
+            .and_modify(|fact| fact.renderable = true)
+            .or_insert(r2types::ExpressionRenderFact {
+                value: call_cert.argument_values[0],
+                defining_inst: None,
+                width: 8,
+                renderable: true,
+            });
+        install_function_render_facts(&mut ctx, render_facts);
 
         ctx.clear_effect_render_proofs();
 
@@ -22100,6 +19064,329 @@ mod tests {
         assert_eq!((proofs[0].block_addr, proofs[0].op_idx), (0x1000, 2));
         assert_eq!(proofs[0].target, Some(call_cert.target));
         assert_eq!(proofs[0].values, vec![call_cert.argument_values[0]]);
+    }
+
+    #[test]
+    fn certified_call_result_owner_alias_requires_certified_stack_identity() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::register(0x00, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_call_result_stack_alias");
+        let source_call = (0x1000, 1);
+        let call_results = test_call_result_facts_with_owner_for_source(&prepared, source_call);
+        let prepared_view = || PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                source_call,
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: Vec::new(),
+                    authoritative_arg_values: Vec::new(),
+                    result_owner: Some(CExpr::Var("buf".to_string())),
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        };
+
+        let mut uncertified_alias_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_function_call_result_facts(&mut uncertified_alias_ctx, call_results);
+        uncertified_alias_ctx.inputs.prepared_semantic_view =
+            Some(Box::leak(Box::new(prepared_view())));
+        uncertified_alias_ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .insert("alias".to_string(), source_call);
+        uncertified_alias_ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .insert_semantic_value_for_name(
+                "alias",
+                crate::analysis::SemanticValue::Address(crate::analysis::NormalizedAddr {
+                    base: crate::analysis::BaseRef::StackSlot(-8),
+                    index: None,
+                    scale_bytes: 0,
+                    offset_bytes: 0,
+                }),
+            );
+
+        assert_eq!(
+            uncertified_alias_ctx.stable_owned_call_result_name_for_source(source_call),
+            Some("buf".to_string()),
+            "fixture must have a FunctionFacts-backed prepared owner"
+        );
+        assert_eq!(
+            uncertified_alias_ctx.stable_owned_call_result_expr_for_name("alias", true),
+            None,
+            "semantic stack-owner aliases must not certify call-result ownership"
+        );
+
+        let mut certified_alias_ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_function_call_result_facts(
+            &mut certified_alias_ctx,
+            test_call_result_facts_with_owner_for_source(&prepared, source_call),
+        );
+        certified_alias_ctx.inputs.prepared_semantic_view =
+            Some(Box::leak(Box::new(prepared_view())));
+        install_function_render_facts(
+            &mut certified_alias_ctx,
+            r2types::FunctionRenderFacts {
+                stack_slot_offsets: BTreeMap::from([(r2ssa::ObjectId(1), -8)]),
+                ..r2types::FunctionRenderFacts::default()
+            },
+        );
+        certified_alias_ctx.inputs.visible_bindings =
+            Box::leak(Box::new(vec![visible_stack_binding(
+                "alias",
+                Some(CType::Int(32)),
+                8,
+            )]));
+        certified_alias_ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .call_result_source_by_alias
+            .insert("alias".to_string(), source_call);
+        certified_alias_ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .insert_stack_slot_for_name("alias", StackSlotProvenance::new(-8));
+
+        assert_eq!(
+            certified_alias_ctx.stable_owned_call_result_expr_for_name("alias", true),
+            Some(CExpr::Var("buf".to_string())),
+            "exact typed/render stack alias evidence should allow the prepared call-result owner"
+        );
+    }
+
+    #[test]
+    fn rendered_synthesized_source_call_requires_function_facts_callsite_proof() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_synth_rendered_call_without_function_facts");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("fixture callsite certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        remove_function_callsite_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: vec![CExpr::IntLit(7)],
+                    authoritative_arg_values: vec![call_cert.argument_values[0]],
+                    result_owner: None,
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        assert!(
+            ctx.synthesized_call_expr_for_source_call((0x1000, 2))
+                .is_none(),
+            "prepared SSA callsite certificates must not synthesize certified calls without FunctionFacts callsite evidence"
+        );
+        assert!(
+            ctx.record_certified_call_render_proof_for_source_call((0x1000, 2))
+                .is_none(),
+            "certified rendered-call proof recording must require FunctionFacts callsite evidence"
+        );
+        assert!(
+            ctx.effect_render_proofs().is_empty(),
+            "missing FunctionFacts callsite evidence must not leave partial render proofs"
+        );
+    }
+
+    #[test]
+    fn certified_source_call_rejects_prepared_view_call_arg_memory_proof() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0, 8),
+            src: Varnode::constant(0x5000, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x10, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_synth_rendered_call_mem_arg");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 3)
+            .expect("callsite certificate");
+        assert!(
+            prepared
+                .memory_certificate_for_op_site(0x1000, 1, false)
+                .is_some(),
+            "fixture must still have prepared memory evidence"
+        );
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 3),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: vec![CExpr::Deref(Box::new(CExpr::IntLit(0x5000)))],
+                    authoritative_arg_values: vec![call_cert.argument_values[0]],
+                    result_owner: None,
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        ctx.clear_effect_render_proofs();
+
+        assert!(
+            ctx.record_certified_call_render_proof_for_source_call((0x1000, 3))
+                .is_none(),
+            "prepared call view must not authorize certified call render proof"
+        );
+
+        let proofs = ctx.effect_render_proofs();
+        assert!(
+            proofs.is_empty(),
+            "prepared view must not leave partial certified call or memory proofs: {proofs:?}"
+        );
+    }
+
+    #[test]
+    fn certified_memory_load_store_authorized_by_function_render_memory_accesses() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x5000, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x6000, 8),
+            val: Varnode::constant(7, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_memory_facts");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+
+        ctx.current_block_addr.set(Some(0x1000));
+        ctx.current_op_idx.set(Some(0));
+        let load_stmt = ctx
+            .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
+            .expect("certified load statement");
+        assert!(
+            matches!(load_stmt, CStmt::Expr(CExpr::Binary { op: BinaryOp::Assign, .. })),
+            "FunctionRenderFacts memory access must authorize executable certified load assignment: {load_stmt:?}"
+        );
+
+        ctx.current_op_idx.set(Some(1));
+        let store_stmt = ctx
+            .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .expect("certified store statement");
+        assert!(
+            matches!(store_stmt, CStmt::Expr(CExpr::Binary { op: BinaryOp::Assign, .. })),
+            "FunctionRenderFacts memory access must authorize executable certified store assignment: {store_stmt:?}"
+        );
+    }
+
+    #[test]
+    fn certified_memory_load_store_reject_index_without_memory_access_fact() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x5000, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x6000, 8),
+            val: Varnode::constant(7, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_memory_index_without_fact");
+        let load_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("load memory certificate");
+        let store_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 1, true)
+            .expect("store memory certificate");
+        let mut render_facts = test_render_facts(&prepared);
+        render_facts.memory_accesses.remove(&load_cert.access);
+        render_facts.memory_accesses.remove(&store_cert.access);
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        install_function_render_facts(&mut ctx, render_facts);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+
+        ctx.current_block_addr.set(Some(0x1000));
+        ctx.current_op_idx.set(Some(0));
+        let load_stmt = ctx
+            .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
+            .expect("certified load residual");
+        assert!(
+            matches!(&load_stmt, CStmt::Comment(text) if text.contains("uncertified memory load at 0x1000:0")),
+            "memory_accesses_by_op without matching FunctionRenderFacts.memory_accesses entry must residualize load: {load_stmt:?}"
+        );
+
+        ctx.current_op_idx.set(Some(1));
+        let store_stmt = ctx
+            .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .expect("certified store residual");
+        assert!(
+            matches!(&store_stmt, CStmt::Comment(text) if text.contains("uncertified memory store at 0x1000:1")),
+            "memory_accesses_by_op without matching FunctionRenderFacts.memory_accesses entry must residualize store: {store_stmt:?}"
+        );
     }
 
     #[test]
@@ -22141,6 +19428,30 @@ mod tests {
             r2ssa::CallArgumentLocation::Stack { .. }
         ));
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let mut callsite_facts = test_callsite_facts(&prepared);
+        let call_facts = callsite_facts
+            .by_callsite
+            .get_mut(&r2types::CallsiteKey {
+                block_addr: 0x1000,
+                op_index: 2,
+            })
+            .expect("callsite facts");
+        call_facts.argument_values.push(r2types::CallArgumentValueFact {
+            index: 0,
+            value: call_cert.stack_argument_values[0].value,
+        });
+        install_function_callsite_facts(&mut ctx, callsite_facts);
+        let mut call_render = test_call_render_facts(&prepared);
+        call_render
+            .by_callsite
+            .get_mut(&r2types::CallsiteKey {
+                block_addr: 0x1000,
+                op_index: 2,
+            })
+            .expect("call-render facts")
+            .proof_values = vec![call_cert.stack_argument_values[0].value];
+        install_function_call_render_facts(&mut ctx, call_render);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
 
@@ -22153,11 +19464,15 @@ mod tests {
             panic!("expected certified call expression, got {stmt:?}");
         };
         assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
-        assert_eq!(args, vec![CExpr::IntLit(7)]);
+        assert_eq!(
+            args,
+            vec![CExpr::IntLit(7)],
+            "r2dec must consume the canonical FunctionFacts argument vector, not concatenate stack locations into duplicate args"
+        );
     }
 
     #[test]
-    fn uncertified_prepared_call_args_render_residual_comment() {
+    fn certified_zero_arg_call_ignores_prepared_fake_args() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Call {
@@ -22168,6 +19483,7 @@ mod tests {
             prepared_from_r2il_blocks(&[entry], &arch).with_name("uncertified_call_arg");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 0), 0x401050, "sym.helper", None);
         ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
             call_view_by_site: BTreeMap::from([(
                 (0x1000, 0),
@@ -22182,14 +19498,39 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
-            .expect("residual stmt");
+            .expect("certified call stmt");
+
+        let CStmt::Expr(CExpr::Call { func, args }) = stmt else {
+            panic!("expected certified zero-arg call, got {stmt:?}");
+        };
+        assert_eq!(*func, CExpr::Var("sym.helper".to_string()));
+        assert!(
+            args.is_empty(),
+            "prepared fake args must not override a zero-arg FunctionFacts callsite"
+        );
+    }
+
+    #[test]
+    fn certified_direct_call_lowering_residualizes_without_callsite_frame() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Call {
+            target: Varnode::constant(0x401050, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("direct_call_lowering");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx.op_to_stmt(&block.ops[0]).expect("residual stmt");
 
         let CStmt::Comment(comment) = stmt else {
-            panic!("expected residual comment, got {stmt:?}");
+            panic!("expected residual comment for direct certified call lowering, got {stmt:?}");
         };
         assert!(
-            comment.contains("uncertified callsite arguments"),
-            "unexpected residual comment: {comment}"
+            comment.contains("direct call lowering requires FunctionFacts callsite evidence"),
+            "direct certified call lowering must not emit executable zero-arg C: {comment}"
         );
     }
 
@@ -22288,7 +19629,106 @@ mod tests {
     }
 
     #[test]
-    fn certified_unknown_semantic_call_arg_residualizes_without_concrete_zero() {
+    fn non_certified_call_args_require_function_render_facts() {
+        let callsite = r2types::CallsiteKey {
+            block_addr: 0x1000,
+            op_index: 0,
+        };
+        let arg_value = r2ssa::ValueId(11);
+        let callsite_facts = || r2types::FunctionCallsiteFacts {
+            by_callsite: BTreeMap::from([(
+                callsite,
+                r2types::CallsiteArgumentFacts {
+                    callsite,
+                    call_site_id: r2ssa::CallSiteId(1),
+                    at: r2ssa::InstId(2),
+                    target: r2ssa::ValueId(10),
+                    direct_target: Some(0x401050),
+                    argument_values: vec![r2types::CallArgumentValueFact {
+                        index: 0,
+                        value: arg_value,
+                    }],
+                    register_argument_locations: vec![r2types::RegisterCallArgumentLocationFact {
+                        index: 0,
+                        value: arg_value,
+                        name: "rdi".to_string(),
+                        source_inst: Some(r2ssa::InstId(1)),
+                    }],
+                    stack_argument_locations: Vec::new(),
+                },
+            )]),
+        };
+
+        let mut source_name_ctx = make_x86_64_ctx();
+        install_function_callsite_facts(&mut source_name_ctx, callsite_facts());
+        source_name_ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(
+            &mut source_name_ctx,
+            (0x1000, 0),
+            0x401050,
+            "sym.helper",
+            None,
+        );
+        let mut source_name_binding = crate::analysis::CallArgBinding::input(
+            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::IntLit(7)),
+        );
+        source_name_binding.source_var_name = Some("__test_source".to_string());
+        source_name_ctx
+            .state
+            .analysis_ctx
+            .use_info
+            .call_args
+            .insert((0x1000, 0), vec![source_name_binding]);
+        let source_name_stmt = source_name_ctx
+            .op_to_stmt_with_args(
+                &SSAOp::Call {
+                    target: make_var("const:401050", 0, 8),
+                },
+                0x1000,
+                0,
+            )
+            .expect("residual stmt");
+        assert!(
+            matches!(&source_name_stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments")),
+            "source names must not authorize executable call args without a FunctionFacts value match: {source_name_stmt:?}"
+        );
+
+        let mut value_ctx = make_x86_64_ctx();
+        install_function_callsite_facts(&mut value_ctx, callsite_facts());
+        value_ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(
+            &mut value_ctx,
+            (0x1000, 0),
+            0x401050,
+            "sym.helper",
+            None,
+        );
+        value_ctx.state.analysis_ctx.use_info.call_args.insert(
+            (0x1000, 0),
+            vec![
+                crate::analysis::CallArgBinding::input(
+                    crate::analysis::SemanticCallArg::FallbackExpr(CExpr::IntLit(7)),
+                )
+                .with_source_value_id(arg_value),
+            ],
+        );
+        let value_stmt = value_ctx
+            .op_to_stmt_with_args(
+                &SSAOp::Call {
+                    target: make_var("const:401050", 0, 8),
+                },
+                0x1000,
+                0,
+            )
+            .expect("residual stmt");
+        assert!(
+            matches!(&value_stmt, CStmt::Comment(comment) if comment.contains("uncertified callsite arguments")),
+            "raw value-id matches must not authorize executable call args without FunctionRenderFacts: {value_stmt:?}"
+        );
+    }
+
+    #[test]
+    fn certified_call_arg_uses_function_facts_value_over_unknown_semantic_binding() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -22320,10 +19760,12 @@ mod tests {
                     authoritative_args: Vec::new(),
                     authoritative_arg_values: Vec::new(),
                     result_owner: None,
+                render_fact: None,
                 },
             )]),
             ..PreparedSemanticView::default()
         })));
+        install_certified_function_facts(&mut ctx);
         ctx.state.analysis_ctx.use_info.call_args.insert(
             (0x1000, 2),
             vec![
@@ -22356,14 +19798,15 @@ mod tests {
 
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
-            .expect("residual stmt");
+            .expect("certified call stmt");
 
-        let CStmt::Comment(comment) = stmt else {
-            panic!("expected residual comment, got {stmt:?}");
+        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
+            panic!("expected certified call expression, got {stmt:?}");
         };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "unknown semantic args must not render as a concrete zero: {comment}"
+        assert_eq!(
+            args,
+            vec![CExpr::IntLit(7)],
+            "FunctionFacts argument value proof must override stale unknown raw semantic binding"
         );
     }
 
@@ -22386,23 +19829,27 @@ mod tests {
         let prepared =
             prepared_from_r2il_blocks(&[entry], &arch).with_name("matching_string_addr_call_arg");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
-        ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
-            0x402000,
-            "matched".to_string(),
-        )])));
         install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
-        ctx.inputs.prepared_semantic_view =
-            Some(Box::leak(Box::new(PreparedSemanticView::default())));
-        ctx.state.analysis_ctx.use_info.call_args.insert(
-            (0x1000, 2),
-            vec![
-                crate::analysis::CallArgBinding::input(
-                    crate::analysis::SemanticCallArg::StringAddr(0x402000),
-                )
-                .with_source_call(0x1000, 2),
-            ],
-        );
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate");
+        install_string_literal_render_fact(&mut ctx, call_cert.argument_values[0], 0x402000, "matched");
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: vec![CExpr::StringLit("matched".to_string())],
+                    authoritative_arg_values: vec![call_cert.argument_values[0]],
+                    result_owner: None,
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
 
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
@@ -22416,7 +19863,63 @@ mod tests {
     }
 
     #[test]
-    fn certified_string_addr_call_arg_mismatch_residualizes() {
+    fn certified_prepared_string_arg_rejects_poisoned_render_text() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(0x402000, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("poisoned_prepared_string_arg");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate");
+        install_string_literal_render_fact(&mut ctx, call_cert.argument_values[0], 0x402000, "matched");
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: vec![CExpr::StringLit("poison".to_string())],
+                    authoritative_arg_values: vec![call_cert.argument_values[0]],
+                    result_owner: None,
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .expect("certified call stmt");
+
+        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
+            panic!("expected certified call expression for poisoned prepared string arg, got {stmt:?}");
+        };
+        assert_eq!(
+            args,
+            vec![CExpr::StringLit("matched".to_string())],
+            "prepared string text must be ignored in favor of FunctionFacts value evidence"
+        );
+    }
+
+    #[test]
+    fn certified_string_addr_call_arg_mismatch_uses_function_facts_value() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -22434,6 +19937,7 @@ mod tests {
         let prepared =
             prepared_from_r2il_blocks(&[entry], &arch).with_name("mismatched_string_addr_call_arg");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         ctx.inputs.strings = Box::leak(Box::new(HashMap::from([(
             0x403000,
@@ -22455,14 +19959,15 @@ mod tests {
         let block = prepared.function().get_block(0x1000).expect("entry");
         let stmt = ctx
             .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
-            .expect("residual stmt");
+            .expect("certified call stmt");
 
-        let CStmt::Comment(comment) = stmt else {
-            panic!("expected residual comment, got {stmt:?}");
+        let CStmt::Expr(CExpr::Call { args, .. }) = stmt else {
+            panic!("expected certified call expression, got {stmt:?}");
         };
-        assert!(
-            comment.contains("uncertified callsite arguments"),
-            "string arg address must match the certified value address: {comment}"
+        assert_eq!(
+            args,
+            vec![CExpr::IntLit(0x402000)],
+            "FunctionFacts value address must override stale raw string binding"
         );
     }
 
@@ -22630,6 +20135,110 @@ mod tests {
     }
 
     #[test]
+    fn certified_source_call_replay_requires_function_facts_callsite_args() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_source_call_no_functionfacts_args");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("prepared callsite certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        remove_function_callsite_facts(&mut ctx);
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: vec![CExpr::IntLit(99)],
+                    authoritative_arg_values: vec![call_cert.argument_values[0]],
+                    result_owner: None,
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+        ctx.state.analysis_ctx.use_info.call_args.insert(
+            (0x1000, 2),
+            vec![crate::analysis::CallArgBinding::input(
+                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::IntLit(88)),
+            )
+            .with_source_value_id(call_cert.argument_values[0])],
+        );
+
+        assert_eq!(
+            ctx.render_authoritative_source_args_for_call((0x1000, 2)),
+            Vec::<CExpr>::new(),
+            "certified source-call replay must not use PreparedSemanticView or local call_args_map without FunctionFacts callsite args"
+        );
+    }
+
+    #[test]
+    fn certified_source_call_replay_requires_function_render_arg_proof() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_source_call_no_render_arg_proof");
+        let call_cert = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("prepared callsite certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        remove_function_render_facts(&mut ctx);
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(PreparedSemanticView {
+            call_view_by_site: BTreeMap::from([(
+                (0x1000, 2),
+                crate::analysis::PreparedCallView {
+                    direct_target: Some(0x401050),
+                    callee_identity: Some(r2types::CalleeIdentity::from_name("sym.helper")),
+                    authoritative_args: vec![CExpr::IntLit(99)],
+                    authoritative_arg_values: vec![call_cert.argument_values[0]],
+                    result_owner: None,
+                render_fact: None,
+                },
+            )]),
+            ..PreparedSemanticView::default()
+        })));
+        ctx.state.analysis_ctx.use_info.call_args.insert(
+            (0x1000, 2),
+            vec![crate::analysis::CallArgBinding::input(
+                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::IntLit(88)),
+            )
+            .with_source_value_id(call_cert.argument_values[0])],
+        );
+
+        assert_eq!(
+            ctx.render_authoritative_source_args_for_call((0x1000, 2)),
+            Vec::<CExpr>::new(),
+            "certified source-call replay must not use PreparedSemanticView or local call_args_map when FunctionRenderFacts cannot render the canonical argument value"
+        );
+    }
+
+    #[test]
     fn return_inline_ssa_storage_carriers_inline_raw_tmp_and_const() {
         let mut ctx = make_x86_64_ctx();
         ctx.state.analysis_ctx.use_info.definitions.insert(
@@ -22792,38 +20401,6 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_result_replay_filters_stack_like_call_result_owners() {
-        for owner in ["local_buf", "stack_slot", "arg_slot", "arg1", "named_slot"] {
-            let mut ctx = make_x86_64_ctx();
-            if owner == "named_slot" {
-                ctx.state
-                    .analysis_ctx
-                    .stack_info
-                    .stack_vars
-                    .insert(-32, owner.to_string());
-            }
-            install_call_owner(&mut ctx, (0x1000, 0), owner, "rax_1");
-            ctx.state.analysis_ctx.use_info.call_args.insert(
-                (0x1000, 0),
-                vec![
-                    crate::analysis::CallArgBinding::result(
-                        crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                            "fallback".to_string(),
-                        )),
-                    )
-                    .with_source_call(0x1000, 0),
-                ],
-            );
-
-            assert_eq!(
-                ctx.render_authoritative_source_args_for_call((0x1000, 0)),
-                vec![CExpr::Var("fallback".to_string())],
-                "{owner} must not bypass the authoritative result-call-argument owner filter"
-            );
-        }
-    }
-
-    #[test]
     fn imported_input_binding_with_source_call_does_not_render_result_owner() {
         let mut ctx = make_x86_64_ctx();
         install_call_owner(&mut ctx, (0x1000, 0), "owned_result", "rax_1");
@@ -22837,28 +20414,6 @@ mod tests {
         );
 
         assert_eq!(rendered, CExpr::Var("input_arg".to_string()));
-    }
-
-    #[test]
-    fn authoritative_input_replay_with_source_call_does_not_render_result_owner() {
-        let mut ctx = make_x86_64_ctx();
-        install_call_owner(&mut ctx, (0x1000, 0), "owned_result", "rax_1");
-        ctx.state.analysis_ctx.use_info.call_args.insert(
-            (0x1000, 0),
-            vec![
-                crate::analysis::CallArgBinding::input(
-                    crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var(
-                        "input_arg".to_string(),
-                    )),
-                )
-                .with_source_call(0x1000, 0),
-            ],
-        );
-
-        assert_eq!(
-            ctx.render_authoritative_source_args_for_call((0x1000, 0)),
-            vec![CExpr::Var("input_arg".to_string())]
-        );
     }
 
     #[test]
@@ -22887,48 +20442,6 @@ mod tests {
             owner_expr_by_name: HashMap::from([(name.to_string(), owner)]),
             ..PreparedSemanticView::default()
         })));
-    }
-
-    #[test]
-    fn recovered_call_arg_promotes_prepared_owner_over_low_signal_sources() {
-        let cases = [
-            ("src_transient", CExpr::Var("rax_7".to_string())),
-            ("src_stack_placeholder", CExpr::Var("stack".to_string())),
-            ("src_low_quality", CExpr::Var("value_bad".to_string())),
-        ];
-
-        for (source_name, bad_expr) in cases {
-            let mut ctx = make_x86_64_ctx();
-            let source_call = (0x1000, 0);
-            install_callsite_resolution(&mut ctx, source_call, 0x401030, "sym.imp.printf", None);
-            let source = make_var(source_name, 1, 8);
-            ctx.state
-                .analysis_ctx
-                .use_info
-                .definitions
-                .insert(source.display_name(), bad_expr);
-            install_prepared_owner_for_name(
-                &mut ctx,
-                &source.display_name(),
-                CExpr::Var("good".to_string()),
-            );
-
-            let binding = crate::analysis::CallArgBinding::input(
-                crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
-            )
-            .with_source_var(&source);
-
-            assert_eq!(
-                ctx.render_call_args_for_site(
-                    source_call.0,
-                    source_call.1,
-                    &CExpr::Var("const:401030".to_string()),
-                    vec![binding],
-                ),
-                vec![CExpr::Var("good".to_string())],
-                "{source_name} should use prepared owner instead of low-signal source"
-            );
-        }
     }
 
     #[test]
@@ -23014,40 +20527,6 @@ mod tests {
             ctx.render_call_arg_for_callee(&CExpr::Var("sym.imp.printf".to_string()), binding),
             CExpr::Var("fallback".to_string()),
             "prepared address owners describe storage identity, not imported argument values"
-        );
-    }
-
-    #[test]
-    fn recovered_input_arg_preserves_stable_source_over_generic_entry_alias() {
-        let mut ctx = make_x86_64_ctx();
-        let source_call = (0x1000, 0);
-        install_callsite_resolution(&mut ctx, source_call, 0x401030, "sym.imp.printf", None);
-        let source = make_var("src_input", 1, 8);
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .definitions
-            .insert(source.display_name(), CExpr::Var("buf".to_string()));
-        ctx.state
-            .analysis_ctx
-            .use_info
-            .formatted_defs
-            .insert(source.display_name(), CExpr::Var("arg1".to_string()));
-
-        let binding = crate::analysis::CallArgBinding::input(
-            crate::analysis::SemanticCallArg::FallbackExpr(CExpr::Var("fallback".to_string())),
-        )
-        .with_source_var(&source);
-
-        assert_eq!(
-            ctx.render_call_args_for_site(
-                source_call.0,
-                source_call.1,
-                &CExpr::Var("const:401030".to_string()),
-                vec![binding],
-            ),
-            vec![CExpr::Var("buf".to_string())],
-            "input-role recovery must preserve a stable source over a generic entry arg alias"
         );
     }
 
@@ -23304,7 +20783,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_memory_load_uses_named_global_object_without_analysis_state() {
+    fn prepared_memory_load_ignores_raw_symbol_without_typed_global_fact() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -23341,7 +20820,572 @@ mod tests {
         else {
             panic!("expected assignment stmt, got {stmt:?}");
         };
-        assert_eq!(*right, CExpr::Var("obj.global_value".to_string()));
+        assert!(
+            matches!(right.as_ref(), CExpr::Deref(_)),
+            "raw symbol map must not authorize prepared global load rendering: {right:?}"
+        );
+        assert!(
+            !format!("{right:?}").contains("obj.global_value"),
+            "raw symbol name must not leak into prepared load expression: {right:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_uses_prepared_value_over_poisoned_local_definition() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_return_poison");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let SSAOp::Return { target } = &block.ops[1] else {
+            panic!("expected return op, got {:?}", block.ops[1]);
+        };
+        let target_name = target.display_name();
+        let target_value = prepared
+            .graph()
+            .value_id_for_var(target)
+            .expect("return target value id");
+        ctx.analyze_blocks(std::slice::from_ref(block));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert(target_name.clone(), CExpr::IntLit(99));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .formatted_defs
+            .insert(target_name.clone(), CExpr::IntLit(99));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions_by_value
+            .insert(target_value, CExpr::IntLit(99));
+        ctx.state.analysis_ctx.use_info.semantic_values.insert(
+            target_name.clone(),
+            crate::analysis::SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(99))),
+        );
+        ctx.state.analysis_ctx.use_info.semantic_values_by_value.insert(
+            target_value,
+            crate::analysis::SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(99))),
+        );
+
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts.iter().any(|stmt| matches!(
+                stmt,
+                CStmt::Return(Some(CExpr::IntLit(7) | CExpr::UIntLit(7)))
+            )),
+            "certified return must render from prepared value proof, not poisoned local definitions: {stmts:?}"
+        );
+        assert!(
+            !format!("{stmts:?}").contains("99"),
+            "poisoned local return expression must not reach certified output: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_requires_function_render_facts_not_prepared_certificate_only() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_return_without_function_render_facts");
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 1)
+            .expect("fixture must still carry prepared SSA return certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        remove_function_render_facts(&mut ctx);
+
+        assert_eq!(
+            ctx.certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index),
+            None,
+            "prepared SSA return/expression certificates alone must not authorize certified executable return rendering"
+        );
+    }
+
+    #[test]
+    fn certified_return_residualizes_when_return_for_op_missing() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_return_missing_fact");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
+        render_facts.returns_by_op.remove(&(0x1000, 1));
+        install_function_render_facts(&mut ctx, render_facts);
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts.iter().any(|stmt| matches!(
+                stmt,
+                CStmt::Comment(text) if text.contains("uncertified return expression at 0x1000:1")
+            )),
+            "missing FunctionRenderFacts return_for_op must residualize: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "prepared return certificate alone must not emit executable return: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_load_renders_with_return_expression_and_memory_facts() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x5000, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_return_load");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::Deref(_))))),
+            "returning a load may render only with FunctionRenderFacts memory proof: {stmts:?}"
+        );
+        assert!(
+            ctx.effect_render_proofs().iter().any(|proof| {
+                proof.kind == EffectRenderProofKind::MemoryRead
+                    && proof.block_addr == 0x1000
+                    && proof.op_idx == 0
+            }),
+            "certified load return must record exact memory proof"
+        );
+    }
+
+    #[test]
+    fn certified_return_load_rejects_index_without_memory_access_fact() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x5000, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_return_load_missing_memory_fact");
+        let load_cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("load memory certificate");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
+        render_facts.memory_accesses.remove(&load_cert.access);
+        install_function_render_facts(&mut ctx, render_facts);
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts.iter().any(|stmt| matches!(
+                stmt,
+                CStmt::Comment(text) if text.contains("uncertified return expression")
+            )),
+            "missing FunctionRenderFacts memory access must residualize load return: {stmts:?}"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(Some(CExpr::Deref(_))))),
+            "memory_accesses_by_op index alone must not authorize certified load return: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_residualizes_stack_reload_without_functionfacts_expression() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(1, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::unique(1, 8),
+            val: Varnode::register(0x10, 8),
+        });
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(2, 8),
+            a: Varnode::register(0x20, 8),
+            b: Varnode::constant(0xffff_ffff_ffff_fff8, 8),
+        });
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(2, 8),
+        });
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_return_stack_reload");
+        let return_cert = prepared
+            .return_certificate_for_op(0x1000, 4)
+            .expect("return certificate");
+        assert!(
+            prepared
+                .stack_reload_certificate_for_value(return_cert.value)
+                .is_some(),
+            "fixture must expose upstream stack reload proof for returned value"
+        );
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
+            ("RDI".to_string(), "src".to_string()),
+            ("rdi".to_string(), "src".to_string()),
+        ])));
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let target = match &block.ops[4] {
+            SSAOp::Return { target } => target,
+            op => panic!("expected return op, got {op:?}"),
+        };
+        let target_value = prepared
+            .graph()
+            .value_id_for_var(target)
+            .expect("return target value id");
+        ctx.analyze_blocks(std::slice::from_ref(block));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions_by_value
+            .insert(target_value, CExpr::Var("poison".to_string()));
+
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts.iter().any(|stmt| matches!(
+                stmt,
+                CStmt::Comment(text) if text.contains("uncertified return expression")
+            )),
+            "prepared StackReloadSourceCertificate alone must residualize until FunctionFacts carries the return expression proof, got {stmts:?}"
+        );
+        assert!(
+            !format!("{stmts:?}").contains("poison"),
+            "local fallback definition must not affect certified stack reload return: {stmts:?}"
+        );
+        assert!(
+            !format!("{stmts:?}").contains("RDI")
+                && !format!("{stmts:?}").contains("RBP")
+                && !format!("{stmts:?}").contains("Deref"),
+            "certified stack reload return must not leak raw storage: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "stack reload must not emit executable return without canonical FunctionFacts proof: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_call_requires_function_call_result_fact() {
+        let prepared = prepared_zero_arg_helper_return("certified_return_call_result");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
+
+        let return_cert = prepared
+            .certificates()
+            .returns
+            .first()
+            .expect("return certificate");
+        assert!(
+            prepared
+                .call_result_certificate_for_value(return_cert.value)
+                .is_some(),
+            "fixture must return the certified call-result value"
+        );
+
+        assert_eq!(
+            ctx.certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index),
+            Some((
+                CExpr::call(CExpr::Var("sym.helper".to_string()), Vec::new()),
+                return_cert.value,
+            )),
+            "FunctionFacts call-result evidence should authorize returning the synthesized helper call"
+        );
+    }
+
+    #[test]
+    fn certified_return_call_rejects_prepared_certificate_without_function_fact() {
+        let prepared = prepared_zero_arg_helper_return("certified_return_call_result_without_fact");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        remove_function_call_result_facts(&mut ctx);
+        let source_call = (0x1000, 1);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, source_call, 0x401050, "sym.helper", None);
+
+        let return_cert = prepared
+            .certificates()
+            .returns
+            .first()
+            .expect("return certificate");
+        assert!(
+            prepared
+                .call_result_certificate_for_value(return_cert.value)
+                .is_some(),
+            "fixture must still have the prepared SSA call-result certificate"
+        );
+        assert_eq!(
+            ctx.certified_call_result_fact_for_value(return_cert.value),
+            None,
+            "negative fixture must remove canonical FunctionFacts call-result evidence"
+        );
+
+        assert_eq!(
+            ctx.certified_return_expr_for_op(return_cert.block_addr, return_cert.op_index),
+            None,
+            "prepared SSA call-result certificates alone must not authorize executable return-call rendering"
+        );
+    }
+
+    #[test]
+    fn certified_appended_stack_return_requires_function_render_facts() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Return {
+            target: Varnode::register(0x00, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_stack_return_no_render");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        remove_function_render_facts(&mut ctx);
+        ctx.set_external_stack_vars(HashMap::from([(
+            -8,
+            stack_var_spec("buf", Some(crate::CType::Int(32)), Some("rbp")),
+        )]));
+        ctx.state.return_stack_slots.insert(-8);
+
+        assert_eq!(
+            ctx.resolve_stack_var(-8),
+            None,
+            "certified stack names require FunctionRenderFacts stack-slot evidence"
+        );
+        assert!(
+            ctx.unique_scalar_stack_return_expr().is_none(),
+            "certified rendering must not append a stack return from local slot recovery without FunctionFacts render evidence"
+        );
+    }
+
+    fn install_hash_field_layout(ctx: &mut FoldingContext<'_>) {
+        ctx.inputs.param_register_aliases = Box::leak(Box::new(HashMap::from([
+            ("RDI".to_string(), "arg0".to_string()),
+            ("rdi".to_string(), "arg0".to_string()),
+        ])));
+        ctx.set_type_hints(HashMap::from([
+            (
+                "RDI".to_string(),
+                CType::ptr(CType::Struct("DemoStruct".to_string())),
+            ),
+            (
+                "rdi".to_string(),
+                CType::ptr(CType::Struct("DemoStruct".to_string())),
+            ),
+            (
+                "arg0".to_string(),
+                CType::ptr(CType::Struct("DemoStruct".to_string())),
+            ),
+        ]));
+        ctx.inputs.external_type_db = Box::leak(Box::new(ExternalTypeDb {
+            structs: [(
+                "demostruct".to_string(),
+                ExternalStruct {
+                    name: "DemoStruct".to_string(),
+                    fields: [(
+                        8,
+                        ExternalField {
+                            name: "hash".to_string(),
+                            offset: 8,
+                            ty: Some("uint64_t".to_string()),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn certified_member_rendering_refuses_type_hint_field_without_certificate() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("field_without_cert");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        install_hash_field_layout(&mut ctx);
+
+        let addr = crate::analysis::NormalizedAddr {
+            base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::new(make_var(
+                "RDI", 0, 8,
+            ))),
+            index: None,
+            scale_bytes: 0,
+            offset_bytes: 8,
+        };
+        let mut visited = HashSet::new();
+        let expr = ctx.render_access_expr_from_addr(&addr, 8, false, 0, &mut visited);
+
+        assert!(
+            !matches!(expr.as_ref(), Some(CExpr::PtrMember { member, .. } | CExpr::Member { member, .. }) if member == "hash"),
+            "certified rendering must not emit member syntax from type hints without FieldAccessCertificate: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn certified_member_rendering_allows_exact_field_certificate() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch).with_name("field_with_cert");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_hash_field_layout(&mut ctx);
+        ctx.inputs.field_access_certificates = Box::leak(Box::new(vec![FieldAccessCertificate {
+            slot: 0,
+            field_offset: 8,
+            field_name: "hash".to_string(),
+            field_type: Some("uint64_t".to_string()),
+        }]));
+        let cert = prepared
+            .memory_certificate_for_op_site(0x1000, 0, false)
+            .expect("prepared load memory certificate");
+        let mut render_facts = ctx.inputs.function_facts.render_facts().clone();
+        render_facts
+            .member_accesses_by_op
+            .entry((0x1000, 0, false))
+            .or_default()
+            .push(r2types::MemberAccessRenderFact {
+                access: cert.access,
+                block_addr: 0x1000,
+                op_index: 0,
+                object: cert.object,
+                is_write: false,
+                field_offset: 8,
+                field_name: "hash".to_string(),
+                access_width: 8,
+            });
+        install_function_render_facts(&mut ctx, render_facts);
+        ctx.current_block_addr.set(Some(0x1000));
+        ctx.current_op_idx.set(Some(0));
+
+        let addr = crate::analysis::NormalizedAddr {
+            base: crate::analysis::BaseRef::Value(crate::analysis::ValueRef::new(make_var(
+                "RDI", 0, 8,
+            ))),
+            index: None,
+            scale_bytes: 0,
+            offset_bytes: 8,
+        };
+        let mut visited = HashSet::new();
+        let expr = ctx.render_access_expr_from_addr(&addr, 8, false, 0, &mut visited);
+
+        assert!(
+            matches!(expr.as_ref(), Some(CExpr::PtrMember { member, .. } | CExpr::Member { member, .. }) if member == "hash"),
+            "exact FieldAccessCertificate plus FunctionRenderFacts member proof should allow certified member rendering: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn certified_return_residualizes_unrenderable_value_despite_local_definition() {
+        let arch = make_test_arch_x86_64();
+        let userop_out = Varnode::unique(0x2222, 8);
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CallOther {
+            output: Some(userop_out.clone()),
+            userop: 99,
+            inputs: vec![Varnode::register(0x10, 8)],
+        });
+        entry.push(R2ILOp::Return { target: userop_out });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_return_unrenderable");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let SSAOp::Return { target } = &block.ops[1] else {
+            panic!("expected return op, got {:?}", block.ops[1]);
+        };
+        ctx.analyze_blocks(std::slice::from_ref(block));
+        ctx.state
+            .analysis_ctx
+            .use_info
+            .definitions
+            .insert(target.display_name(), CExpr::IntLit(5));
+
+        let stmts = ctx.fold_block(block, block.addr);
+
+        assert!(
+            stmts.iter().any(|stmt| {
+                matches!(stmt, CStmt::Comment(text) if text.contains("uncertified return expression"))
+            }),
+            "unrenderable certified return value must residualize: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "local fallback definition must not produce executable return for unrenderable proof: {stmts:?}"
+        );
     }
 
     #[test]
@@ -23488,7 +21532,7 @@ mod tests {
                 truth: true,
             }],
         );
-        ctx.inputs.control_facts = Some(Box::leak(Box::new(control_facts)));
+        install_function_control_facts(&mut ctx, control_facts);
 
         assert_ne!(
             lhs_value_id, cond_value_id,
@@ -23726,6 +21770,115 @@ mod tests {
     }
 
     #[test]
+    fn certified_local_post_call_source_refuses_even_with_function_call_result_fact() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::register(0x00, 8),
+        });
+
+        let prepared =
+            prepared_from_r2il_blocks(&[entry], &arch).with_name("certified_local_post_call");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let call_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }))
+            .expect("call op");
+        let copied = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Copy { dst, .. } if dst.name.eq_ignore_ascii_case("RDI") => Some(dst),
+                _ => None,
+            })
+            .expect("post-call copy");
+        let copied_value = prepared
+            .graph()
+            .value_id_for_var(copied)
+            .expect("copied value id");
+        assert!(
+            ctx.certified_call_result_fact_for_value(copied_value)
+                .is_some(),
+            "positive fixture must carry FunctionFacts call-result evidence for the copied value"
+        );
+
+        assert_eq!(
+            ctx.local_post_call_source_for_ssa_name_in_block(block, &copied.display_name(), 0),
+            None,
+            "certified rendering must not rediscover post-call provenance by local SSA adjacency"
+        );
+        assert_eq!(
+            ctx.call_result_source_for_ssa_name(&copied.display_name()),
+            Some((block.addr, call_idx)),
+            "FunctionFacts-backed call-result lookup remains the canonical source path"
+        );
+    }
+
+    #[test]
+    fn certified_local_post_call_source_rejects_prepared_adjacency_without_function_fact() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::register(0x00, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("certified_local_post_call_without_fact");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        remove_function_call_result_facts(&mut ctx);
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let copied = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Copy { dst, .. } if dst.name.eq_ignore_ascii_case("RDI") => Some(dst),
+                _ => None,
+            })
+            .expect("post-call copy");
+        let copied_value = prepared
+            .graph()
+            .value_id_for_var(copied)
+            .expect("copied value id");
+        assert!(
+            prepared
+                .call_result_certificate_for_value(copied_value)
+                .is_some(),
+            "negative fixture must still carry prepared SSA call-result evidence"
+        );
+        assert_eq!(
+            ctx.certified_call_result_fact_for_value(copied_value),
+            None,
+            "negative fixture must remove canonical FunctionFacts call-result evidence"
+        );
+
+        assert_eq!(
+            ctx.local_post_call_source_for_ssa_name_in_block(block, &copied.display_name(), 0),
+            None,
+            "certified local post-call source lookup must not trust SSA adjacency without FunctionFacts"
+        );
+    }
+
+    #[test]
     fn local_post_call_source_allows_depth_sixteen_but_limits_long_chains() {
         let ctx = make_x86_64_ctx();
         let rax = make_var("rax", 1, 8);
@@ -23762,6 +21915,42 @@ mod tests {
             ctx.local_post_call_source_for_ssa_name_in_block(&chained, &prev.display_name(), 0)
                 .is_none(),
             "copy-like source tracing must stop at the recursion budget"
+        );
+    }
+
+    #[test]
+    fn certified_semanticize_visible_expr_rejects_local_semantic_value() {
+        let mut uncertified = make_x86_64_ctx();
+        uncertified
+            .state
+            .analysis_ctx
+            .use_info
+            .semantic_values
+            .insert(
+                "tmp:poison_1".to_string(),
+                crate::analysis::SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(99))),
+            );
+        assert_eq!(
+            uncertified.debug_semanticize_visible_expr(&CExpr::Var("tmp:poison_1".to_string())),
+            CExpr::IntLit(99),
+            "non-certified semanticization still exposes local semantic values until that path is deleted"
+        );
+
+        let mut certified = make_x86_64_ctx();
+        install_certified_function_facts(&mut certified);
+        certified
+            .state
+            .analysis_ctx
+            .use_info
+            .semantic_values
+            .insert(
+                "tmp:poison_1".to_string(),
+                crate::analysis::SemanticValue::Scalar(ScalarValue::Expr(CExpr::IntLit(99))),
+            );
+        assert_eq!(
+            certified.debug_semanticize_visible_expr(&CExpr::Var("tmp:poison_1".to_string())),
+            CExpr::Var("tmp:poison_1".to_string()),
+            "certified semanticization must not rewrite from local semantic_values without FunctionFacts render proof"
         );
     }
 
@@ -24097,6 +22286,7 @@ mod tests {
         fn stable_owner_with_post_call_store_value<F>(
             offset: i64,
             store_value: Varnode,
+            install_function_facts: bool,
             seed_source: F,
         ) -> Option<String>
         where
@@ -24129,6 +22319,18 @@ mod tests {
             let prepared =
                 prepared_from_r2il_blocks(&[entry], &arch).with_name("stack_owner_fallback");
             let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+            if install_function_facts {
+                let source_call = (0x1000, 0);
+                let call_result_facts =
+                    test_call_result_facts_with_owner_for_source(&prepared, source_call);
+                install_stack_owner_function_facts(
+                    &mut ctx,
+                    &prepared,
+                    call_result_facts,
+                    "buf",
+                    offset,
+                );
+            }
             ctx.set_external_stack_vars(HashMap::from([(
                 -8,
                 stack_var_spec("buf", Some(CType::ptr(CType::Int(8))), Some("rbp")),
@@ -24164,9 +22366,12 @@ mod tests {
 
         let rbp_input = Varnode::register(0x20, 8);
         assert_eq!(
-            stable_owner_with_post_call_store_value(-8, rbp_input.clone(), |_, store_val, _| {
-                BTreeSet::from([store_val.to_string()])
-            }),
+            stable_owner_with_post_call_store_value(
+                -8,
+                rbp_input.clone(),
+                false,
+                |_, store_val, _| { BTreeSet::from([store_val.to_string()]) }
+            ),
             None,
             "alias-set ownership must not fabricate a post-call stack-local result owner"
         );
@@ -24174,6 +22379,7 @@ mod tests {
             stable_owner_with_post_call_store_value(
                 -8,
                 rbp_input.clone(),
+                false,
                 |ctx, store_val, source_call| {
                 ctx.state
                     .analysis_ctx
@@ -24190,6 +22396,7 @@ mod tests {
             stable_owner_with_post_call_store_value(
                 -8,
                 rbp_input.clone(),
+                false,
                 |ctx, store_val, source_call| {
                 ctx.state
                     .analysis_ctx
@@ -24206,6 +22413,7 @@ mod tests {
             stable_owner_with_post_call_store_value(
                 -8,
                 Varnode::register(0x00, 8),
+                true,
                 |_, _, _| { BTreeSet::new() }
             ),
             Some("buf".to_string()),
@@ -24215,6 +22423,7 @@ mod tests {
             stable_owner_with_post_call_store_value(
                 -8,
                 rbp_input.clone(),
+                false,
                 |ctx, store_val, source_call| {
                 ctx.state
                     .analysis_ctx
@@ -24231,6 +22440,7 @@ mod tests {
             stable_owner_with_post_call_store_value(
                 -8,
                 rbp_input.clone(),
+                false,
                 |ctx, store_val, source_call| {
                 ctx.state
                     .analysis_ctx
@@ -24247,7 +22457,7 @@ mod tests {
             "wrong lower-case source map entries must not bind a post-call stack local"
         );
         assert_eq!(
-            stable_owner_with_post_call_store_value(8, rbp_input, |_, store_val, _| {
+            stable_owner_with_post_call_store_value(8, rbp_input, false, |_, store_val, _| {
                 BTreeSet::from([store_val.to_string()])
             }),
             None,

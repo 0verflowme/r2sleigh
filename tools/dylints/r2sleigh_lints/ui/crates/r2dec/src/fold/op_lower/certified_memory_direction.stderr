@@ -1,0 +1,36 @@
+warning: certified r2dec structured memory rendering must require direction-exact FunctionRenderFacts evidence
+  --> $DIR/certified_memory_direction.rs:4:5
+   |
+LL | /     fn member_access_for_op_any_direction(&self) -> Option<()> {
+LL | |         Some(())
+LL | |     }
+   | |_____^
+   |
+   = note: `#[warn(r2dec_certified_member_field_certificate)]` on by default
+
+warning: certified r2dec structured memory rendering must require direction-exact FunctionRenderFacts evidence
+  --> $DIR/certified_memory_direction.rs:8:5
+   |
+LL | /     fn array_access_for_op_any_direction(&self) -> Option<()> {
+LL | |         Some(())
+LL | |     }
+   | |_____^
+
+warning: certified r2dec structured memory rendering must require direction-exact FunctionRenderFacts evidence
+  --> $DIR/certified_memory_direction.rs:18:5
+   |
+LL | /     fn certified_field_name_for_offset(&self) -> Option<()> {
+LL | |         self.render_facts.member_access_for_op_any_direction()
+LL | |     }
+   | |_____^
+
+warning: certified r2dec structured memory rendering must require direction-exact FunctionRenderFacts evidence
+  --> $DIR/certified_memory_direction.rs:22:5
+   |
+LL | /     fn certified_array_access_for_current_op(&self) -> Option<()> {
+LL | |         self.render_facts.array_access_for_op_any_direction()
+LL | |     }
+   | |_____^
+
+warning: 4 warnings emitted
+

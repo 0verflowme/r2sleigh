@@ -88,8 +88,11 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) sp_name: &'a str,
     pub(crate) fp_name: &'a str,
     pub(crate) ret_reg_name: &'a str,
+    #[cfg(test)]
     pub(crate) function_names: &'a HashMap<u64, String>,
+    #[cfg(test)]
     pub(crate) strings: &'a HashMap<u64, String>,
+    #[cfg(test)]
     pub(crate) symbols: &'a HashMap<u64, String>,
     pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
@@ -684,6 +687,7 @@ impl UseInfo {
             .or_else(|| self.definitions.get(&var.display_name()))
     }
 
+    #[cfg(test)]
     pub(crate) fn display_name_for_value_id(&self, value_id: ValueId) -> Option<String> {
         self.var_for_value_id(value_id).map(SSAVar::display_name)
     }

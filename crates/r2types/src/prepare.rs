@@ -2,6 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use r2ssa::{SSABlock, SSAOp, SSAVar, SSAVarNameKind};
 
+use crate::facts::parse_type_like_spec;
+use crate::signature_infer::RecoveredSignatureParam;
 use crate::writeback::RecoveredVariable;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -266,6 +268,76 @@ pub fn collect_pointer_arg_slots(vars: &[RecoveredVariable]) -> BTreeSet<usize> 
         .collect()
 }
 
+pub fn recover_signature_params_from_ssa(
+    ssa_blocks: &[SSABlock],
+    arch_name: Option<&str>,
+    metadata_reg_type_hints: &HashMap<String, TypeHint>,
+    semantic_typing_enabled: bool,
+    ptr_bits: u32,
+) -> Vec<RecoveredSignatureParam> {
+    let (arg_regs, _, _) = recover_vars_arch_profile(arch_name);
+    if arg_regs.is_empty() {
+        return Vec::new();
+    }
+
+    let signature_evidence =
+        semantic_typing_enabled.then(|| collect_signature_type_evidence_context(ssa_blocks));
+    let (usage_reg_type_hints, _pointer_var_keys) = if semantic_typing_enabled {
+        infer_usage_register_type_hints(ssa_blocks)
+    } else {
+        (HashMap::new(), HashSet::new())
+    };
+    let reg_type_hints = if semantic_typing_enabled {
+        merge_register_type_hints(metadata_reg_type_hints, &usage_reg_type_hints, arg_regs)
+    } else {
+        HashMap::new()
+    };
+
+    let mut seen_arg_regs: HashSet<String> = HashSet::new();
+    let mut params = Vec::new();
+
+    for block in ssa_blocks {
+        for op in &block.ops {
+            for src in op.sources() {
+                if src.version != 0 {
+                    continue;
+                }
+                let base_name = src.name.to_lowercase();
+                for (index, (canonical, aliases)) in arg_regs.iter().enumerate() {
+                    if !aliases.contains(&base_name.as_str()) || seen_arg_regs.contains(*canonical)
+                    {
+                        continue;
+                    }
+                    seen_arg_regs.insert(canonical.to_string());
+                    let hinted_type = if semantic_typing_enabled {
+                        recovered_arg_type_hint(
+                            &reg_type_hints,
+                            canonical,
+                            aliases,
+                            src,
+                            signature_evidence.as_ref(),
+                        )
+                    } else {
+                        None
+                    };
+                    let initial_ty = hinted_type
+                        .as_deref()
+                        .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
+                        .unwrap_or_else(|| size_to_type_like(src.size));
+                    params.push(RecoveredSignatureParam {
+                        name: format!("arg{index}"),
+                        ssa_var: src.clone(),
+                        initial_ty,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    params
+}
+
 pub fn recover_vars_from_ssa(
     ssa_blocks: &[SSABlock],
     arch_name: Option<&str>,
@@ -399,6 +471,20 @@ pub fn recover_vars_from_ssa(
 
     vars.sort_by_key(|v| v.delta);
     vars
+}
+
+fn size_to_type_like(size: u32) -> crate::CTypeLike {
+    let bits = match size {
+        1 => 8,
+        2 => 16,
+        4 => 32,
+        8 => 64,
+        _ => return crate::CTypeLike::Unknown,
+    };
+    crate::CTypeLike::Int {
+        bits,
+        signedness: crate::Signedness::Signed,
+    }
 }
 
 fn incoming_hint_should_replace(current: &TypeHint, incoming: &TypeHint) -> bool {
@@ -1378,5 +1464,50 @@ mod tests {
             let var = SSAVar::new(name, 0, 8);
             assert_eq!(ssa_var_is_register_like(&var), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn recovered_signature_params_follow_x86_64_arch_profile() {
+        let block = SSABlock {
+            addr: 0x401000,
+            size: 4,
+            ops: vec![SSAOp::Copy {
+                dst: SSAVar::new("tmp:0", 1, 8),
+                src: SSAVar::new("rdi", 0, 8),
+            }],
+        };
+
+        let params =
+            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true, 64);
+
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "arg0");
+        assert_eq!(params[0].ssa_var, SSAVar::new("rdi", 0, 8));
+        assert_eq!(
+            params[0].initial_ty,
+            crate::CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Signed,
+            }
+        );
+    }
+
+    #[test]
+    fn recovered_signature_params_follow_arm64_arch_profile() {
+        let block = SSABlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![SSAOp::Copy {
+                dst: SSAVar::new("tmp:0", 1, 8),
+                src: SSAVar::new("x1", 0, 8),
+            }],
+        };
+
+        let params =
+            recover_signature_params_from_ssa(&[block], Some("aarch64"), &HashMap::new(), true, 64);
+
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "arg1");
+        assert_eq!(params[0].ssa_var, SSAVar::new("x1", 0, 8));
     }
 }

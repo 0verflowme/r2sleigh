@@ -310,16 +310,10 @@ impl ProofCoverage {
             0
         };
         let cfg_switch_obligations = cfg_summary.switch_block_count;
-        if cfg_loop_obligations == 0 && cfg_switch_obligations == 0 {
-            return RenderPermission::certified(
-                ProofOwner::R2engine,
-                "standard route has no structured-control proof obligations",
-            );
-        }
         if !prepared_available {
             return RenderPermission::residual(
                 ProofOwner::R2engine,
-                "missing prepared SSA certificates for structured control",
+                "missing prepared SSA certificates for Standard executable rendering",
             );
         }
 
@@ -336,16 +330,33 @@ impl ProofCoverage {
                 cfg_switch_obligations, self.certified_switches
             ));
         }
+        if self.certified_signatures == 0 {
+            reasons
+                .push("Standard executable rendering requires a certified signature".to_string());
+        }
+        if self.certified_returns == 0
+            && self.certified_expressions == 0
+            && self.certified_memory_accesses == 0
+            && self.certified_callsites == 0
+        {
+            reasons.push(
+                "Standard executable rendering requires certified return/expression/memory/call evidence"
+                    .to_string(),
+            );
+        }
 
         if reasons.is_empty() {
             RenderPermission::certified(
                 ProofOwner::R2engine,
-                "standard route structured control is certificate-backed",
+                "standard route executable rendering is backed by certified control, type, and value evidence",
             )
         } else {
             RenderPermission::residual(
                 ProofOwner::R2engine,
-                format!("uncertified structured control: {}", reasons.join(", ")),
+                format!(
+                    "uncertified Standard executable rendering: {}",
+                    reasons.join(", ")
+                ),
             )
         }
     }
@@ -1190,10 +1201,34 @@ mod tests {
     }
 
     #[test]
-    fn proof_coverage_certifies_standard_control_when_counts_cover_cfg() {
+    fn proof_coverage_residualizes_standard_without_executable_evidence() {
+        let permission = ProofCoverage::default().standard_control_render_permission(
+            &r2ssa::CFGRiskSummary {
+                block_count: 1,
+                loop_count: 0,
+                back_edge_count: 0,
+                switch_block_count: 0,
+                max_switch_cases: 0,
+            },
+            true,
+        );
+
+        assert_eq!(permission.kind, RenderPermissionKind::Residual);
+        assert!(permission.reason.contains("certified signature"));
+        assert!(
+            permission
+                .reason
+                .contains("return/expression/memory/call evidence")
+        );
+    }
+
+    #[test]
+    fn proof_coverage_certifies_standard_when_control_type_and_value_counts_cover_cfg() {
         let permission = ProofCoverage {
             certified_loops: 1,
             certified_switches: 1,
+            certified_signatures: 1,
+            certified_returns: 1,
             ..ProofCoverage::default()
         }
         .standard_control_render_permission(

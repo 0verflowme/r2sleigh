@@ -3127,6 +3127,296 @@ mod tests {
     }
 
     #[test]
+    fn prepared_function_certifies_unique_return_phi_at_control_return() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1114,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let phi_dst = SSAVar::new("RAX", 1, 8);
+        function.get_block_mut(0x1114).expect("return block").phis = vec![PhiNode {
+            dst: phi_dst.clone(),
+            sources: vec![
+                (0x1104, SSAVar::constant(7, 8)),
+                (0x1110, SSAVar::constant(7, 8)),
+            ],
+        }];
+        function.get_block_mut(0x1114).expect("return block").ops = vec![SSAOp::Return {
+            target: SSAVar::new("RIP", 1, 8),
+        }];
+
+        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let cert = prepared
+            .return_certificate_for_op(0x1114, 0)
+            .expect("control return should certify unique return phi");
+        let value = prepared.value_var(cert.value).expect("return value var");
+        assert!(
+            value.name.eq_ignore_ascii_case("rax"),
+            "control return certificate must bind the return-register phi, got {value:?}"
+        );
+        assert_eq!(
+            cert.carrier,
+            Some(ReturnCarrier::Register {
+                name: value.name.clone()
+            })
+        );
+        assert!(
+            prepared
+                .certificates()
+                .expressions
+                .get(&cert.value)
+                .is_some_and(|expr| expr.renderable),
+            "identity return phi should carry a renderable expression certificate"
+        );
+    }
+
+    #[test]
+    fn prepared_function_does_not_render_memory_backed_return_phi_at_control_return() {
+        let blocks = vec![R2ILBlock {
+            addr: 0x1214,
+            size: 4,
+            ops: vec![R2ILOp::Return {
+                target: make_const(0, 8),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let mut function =
+            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let load = SSAVar::new("tmp:load", 1, 4);
+        let phi_dst = SSAVar::new("RAX", 1, 4);
+        function.get_block_mut(0x1214).expect("return block").phis = vec![PhiNode {
+            dst: phi_dst,
+            sources: vec![(0x1204, load.clone()), (0x1210, load.clone())],
+        }];
+        function.get_block_mut(0x1214).expect("return block").ops = vec![
+            SSAOp::Load {
+                dst: load,
+                space: "ram".to_string(),
+                addr: SSAVar::new("RDI", 0, 8),
+            },
+            SSAOp::Return {
+                target: SSAVar::new("RIP", 1, 8),
+            },
+        ];
+
+        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let cert = prepared
+            .return_certificate_for_op(0x1214, 1)
+            .expect("control return should identify the unique return phi");
+        assert!(
+            prepared
+                .certificates()
+                .expressions
+                .get(&cert.value)
+                .is_none_or(|expr| !expr.renderable),
+            "memory-backed return phi must not become a renderable expression certificate"
+        );
+    }
+
+    #[test]
+    fn prepared_function_certifies_stack_reload_at_control_return() {
+        let mut arch = make_x86_64_prep_arch();
+        arch.add_register(RegisterDef::new("rip", 0x30, 8));
+        let slot = make_unique(0x1880, 8);
+        let stored = make_unique(0x1888, 8);
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1880,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntAdd {
+                        dst: slot.clone(),
+                        a: make_reg(24, 8),
+                        b: make_const(u64::MAX - 7, 8),
+                    },
+                    R2ILOp::Call {
+                        target: make_const(0x401000, 8),
+                    },
+                    R2ILOp::Copy {
+                        dst: stored.clone(),
+                        src: make_reg(0, 8),
+                    },
+                    R2ILOp::Store {
+                        space: SpaceId::Ram,
+                        addr: slot.clone(),
+                        val: stored,
+                    },
+                    R2ILOp::Load {
+                        dst: make_reg(0, 8),
+                        space: SpaceId::Ram,
+                        addr: slot,
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1890, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1890,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0x30, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let return_op_idx = prepared
+            .function()
+            .get_block(0x1890)
+            .and_then(|block| {
+                block
+                    .ops
+                    .iter()
+                    .position(|op| matches!(op, SSAOp::Return { target } if target.name.eq_ignore_ascii_case("rip")))
+            })
+            .expect("control return op");
+        let cert = prepared
+            .return_certificate_for_op(0x1890, return_op_idx)
+            .expect("control return should certify the preceding stack reload");
+
+        assert_eq!(
+            cert.carrier,
+            Some(ReturnCarrier::Register {
+                name: "rax".to_string()
+            })
+        );
+        assert!(
+            prepared
+                .stack_reload_certificate_for_value(cert.value)
+                .is_some_and(|reload| reload.offset == -8),
+            "control return value must retain stack reload proof, got {cert:?}"
+        );
+        assert!(
+            prepared
+                .call_result_certificate_for_value(cert.value)
+                .is_some_and(|call| matches!(
+                    call.owner,
+                    Some(ValueOwner::StackSlot { offset: -8, .. })
+                )),
+            "control return value must retain malloc-result stack ownership"
+        );
+    }
+
+    #[test]
+    fn prepared_function_merges_zero_return_with_equal_stack_slot_at_control_return() {
+        let mut arch = make_x86_64_prep_arch();
+        arch.add_register(RegisterDef::new("rip", 0x30, 8));
+        let slot = make_unique(0x1900, 8);
+        let cmp_load = make_unique(0x1908, 8);
+        let cond = make_unique(0x1910, 1);
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1900,
+                size: 4,
+                ops: vec![
+                    R2ILOp::IntAdd {
+                        dst: slot.clone(),
+                        a: make_reg(24, 8),
+                        b: make_const(u64::MAX - 7, 8),
+                    },
+                    R2ILOp::Store {
+                        space: SpaceId::Ram,
+                        addr: slot.clone(),
+                        val: make_reg(8, 8),
+                    },
+                    R2ILOp::Load {
+                        dst: cmp_load.clone(),
+                        space: SpaceId::Ram,
+                        addr: slot.clone(),
+                    },
+                    R2ILOp::IntEqual {
+                        dst: cond.clone(),
+                        a: cmp_load,
+                        b: make_const(0, 8),
+                    },
+                    R2ILOp::CBranch {
+                        target: make_const(0x1908, 8),
+                        cond,
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1904,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Load {
+                        dst: make_reg(0, 8),
+                        space: SpaceId::Ram,
+                        addr: slot,
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x190c, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1908,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(0, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x190c, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x190c,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0x30, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
+
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
+        let return_op_idx = prepared
+            .function()
+            .get_block(0x190c)
+            .and_then(|block| {
+                block
+                    .ops
+                    .iter()
+                    .position(|op| matches!(op, SSAOp::Return { target } if target.name.eq_ignore_ascii_case("rip")))
+            })
+            .expect("control return op");
+        let cert = prepared
+            .return_certificate_for_op(0x190c, return_op_idx)
+            .expect("control return should merge equality-proven return values");
+
+        assert!(
+            prepared
+                .stack_reload_certificate_for_value(cert.value)
+                .is_some_and(|reload| reload.offset == -8),
+            "merged control return must use the stack-slot value, got {cert:?}"
+        );
+    }
+
+    #[test]
     fn ssa_artifact_graph_ids_are_deterministic() {
         let blocks = vec![
             R2ILBlock {

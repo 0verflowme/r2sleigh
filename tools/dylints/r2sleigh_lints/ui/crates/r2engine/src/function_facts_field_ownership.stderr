@@ -1,0 +1,28 @@
+warning: r2engine/r2dec must mutate FunctionFacts through r2types owner methods, not direct field assignment
+  --> $DIR/function_facts_field_ownership.rs:14:5
+   |
+LL |     function_facts.types = 1;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(r2types_function_facts_field_ownership)]` on by default
+
+warning: r2engine/r2dec must mutate FunctionFacts through r2types owner methods, not direct field assignment
+  --> $DIR/function_facts_field_ownership.rs:15:5
+   |
+LL |     function_facts.summary_view = 2;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2engine/r2dec must mutate FunctionFacts through r2types owner methods, not direct field assignment
+  --> $DIR/function_facts_field_ownership.rs:16:5
+   |
+LL |     function_facts.assumption_usage = 3;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: r2engine/r2dec must mutate FunctionFacts through r2types owner methods, not direct field assignment
+  --> $DIR/function_facts_field_ownership.rs:20:5
+   |
+LL |     context.function_facts.types = 4;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: 4 warnings emitted
+
